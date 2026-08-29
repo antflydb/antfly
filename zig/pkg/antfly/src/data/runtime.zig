@@ -4795,6 +4795,11 @@ pub const DataServer = struct {
     last_data_raft_reconciled_metadata_epoch: ?u64 = null,
     last_data_raft_storage_ownership_fingerprint: ?u64 = null,
     last_data_raft_status_fingerprint: ?u64 = null,
+    /// Last successfully reconciled local ownership scope. The post-drop
+    /// snapshot no longer contains a range-to-table edge, so retirement must
+    /// retain this compact predecessor view until its durable intent is
+    /// staged. Guarded by data_raft_reconcile_mutex.
+    last_data_raft_group_table_names: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
     reallocation_request_observation_mutex: std.atomic.Mutex = .unlocked,
     last_observed_reallocation_request_id: ?u128 = null,
     reallocation_disk_observation_fence: u64 = 0,
@@ -6922,6 +6927,9 @@ pub const DataServer = struct {
         var protocol_capability_it = self.data_raft_protocol_capabilities.valueIterator();
         while (protocol_capability_it.next()) |entry| self.alloc.destroy(entry.*);
         self.data_raft_protocol_capabilities.deinit(self.alloc);
+        var group_table_name_it = self.last_data_raft_group_table_names.valueIterator();
+        while (group_table_name_it.next()) |table_name| self.alloc.free(table_name.*);
+        self.last_data_raft_group_table_names.deinit(self.alloc);
         var protocol_activation_it = self.data_raft_protocol_activations.valueIterator();
         while (protocol_activation_it.next()) |entry| entry.*.release(self.alloc);
         self.data_raft_protocol_activations.deinit(self.alloc);
@@ -11627,6 +11635,74 @@ pub const DataServer = struct {
         self.data_raft_metadata_sync_requested.store(true, .release);
     }
 
+    fn snapshotTableNameForGroup(
+        snapshot: *const antfly.metadata_api.AdminSnapshot,
+        group_id: u64,
+    ) ?[]const u8 {
+        if (findRangeByGroupId(snapshot.ranges, group_id)) |range| {
+            if (findTableById(snapshot.tables, range.table_id)) |table| return table.name;
+        }
+        // Transition destinations can be locally provisioned before their
+        // range is public. Retain their table scope as well so rollback
+        // retirement is no broader than ordinary table-drop retirement.
+        for (snapshot.split_transitions) |transition| {
+            if (transition.source_group_id == group_id or transition.destination_group_id == group_id)
+                return transition.table_contract.table_name;
+        }
+        for (snapshot.merge_transitions) |transition| {
+            if (transition.donor_group_id == group_id or transition.receiver_group_id == group_id)
+                return transition.table_contract.table_name;
+        }
+        return null;
+    }
+
+    fn replicaRetirementTableName(
+        snapshot: *const antfly.metadata_api.AdminSnapshot,
+        previous: *const std.AutoHashMapUnmanaged(u64, []u8),
+        group_id: u64,
+    ) ?[]const u8 {
+        return snapshotTableNameForGroup(snapshot, group_id) orelse previous.get(group_id);
+    }
+
+    fn buildLocalDataRaftGroupTableNames(
+        self: *DataServer,
+        snapshot: *const antfly.metadata_api.AdminSnapshot,
+        local_intents: []const antfly.raft.PlacementIntent,
+    ) !std.AutoHashMapUnmanaged(u64, []u8) {
+        var names = std.AutoHashMapUnmanaged(u64, []u8).empty;
+        errdefer {
+            var it = names.valueIterator();
+            while (it.next()) |name| self.alloc.free(name.*);
+            names.deinit(self.alloc);
+        }
+        const capacity = std.math.cast(u32, local_intents.len) orelse
+            return error.DataRaftPlacementSetTooLarge;
+        try names.ensureTotalCapacity(self.alloc, capacity);
+        for (local_intents) |intent| {
+            const table_name = snapshotTableNameForGroup(snapshot, intent.record.group_id) orelse continue;
+            const owned_name = try self.alloc.dupe(u8, table_name);
+            const entry = names.getOrPutAssumeCapacity(intent.record.group_id);
+            if (entry.found_existing) {
+                self.alloc.free(owned_name);
+            } else {
+                entry.value_ptr.* = owned_name;
+            }
+        }
+        return names;
+    }
+
+    fn replaceLocalDataRaftGroupTableNames(
+        self: *DataServer,
+        replacement: *std.AutoHashMapUnmanaged(u64, []u8),
+    ) void {
+        var retired = self.last_data_raft_group_table_names;
+        self.last_data_raft_group_table_names = replacement.*;
+        replacement.* = .empty;
+        var it = retired.valueIterator();
+        while (it.next()) |name| self.alloc.free(name.*);
+        retired.deinit(self.alloc);
+    }
+
     /// Refresh only the immutable routing snapshot on an API request thread.
     /// Durable reconciliation can block on restore and catalog fsync, so the
     /// control worker owns it and requests merely signal immediate work.
@@ -11702,6 +11778,12 @@ pub const DataServer = struct {
                 self.retainDataRaftProtocolActivationGroups(active_group_ids);
             }
             return;
+        }
+        var next_group_table_names = try self.buildLocalDataRaftGroupTableNames(snapshot, local_intents.items);
+        defer {
+            var it = next_group_table_names.valueIterator();
+            while (it.next()) |name| self.alloc.free(name.*);
+            next_group_table_names.deinit(self.alloc);
         }
         // A split destination is placed before cutover publishes its range.
         // Persist its table generation before the Raft host can admit messages
@@ -11790,10 +11872,11 @@ pub const DataServer = struct {
                 reconcile.removals.len,
             );
             for (reconcile.removals, targets) |group_id, *target| {
-                const table_name = if (findRangeByGroupId(snapshot.ranges, group_id)) |range|
-                    if (findTableById(snapshot.tables, range.table_id)) |table| table.name else null
-                else
-                    null;
+                const table_name = replicaRetirementTableName(
+                    snapshot,
+                    &self.last_data_raft_group_table_names,
+                    group_id,
+                );
                 target.* = .{ .group_id = group_id, .table_name = table_name };
             }
             break :blk targets;
@@ -11856,6 +11939,7 @@ pub const DataServer = struct {
         const status_fingerprint = self.maintainDataRaftLeadership(snapshot, local_intents.items, registration.node_id);
         self.observeDataRaftStatusFingerprint(status_fingerprint);
         if (metadata_epoch != 0) self.last_data_raft_reconciled_metadata_epoch = metadata_epoch;
+        self.replaceLocalDataRaftGroupTableNames(&next_group_table_names);
     }
 
     /// Runs topology-stable leadership maintenance independently of durable
@@ -15874,7 +15958,7 @@ const RemoteMetadataSource = struct {
         var mutation_attempted = false;
         for (0..self.base_uris.len) |attempt| {
             if (platform_time.monotonicNs() >= deadline_ns)
-                return error.RaftMutationDeadlineExceeded;
+                return error.NotLeader;
             const index = self.metadataApiIndexForAttempt(attempt);
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
@@ -15882,7 +15966,7 @@ const RemoteMetadataSource = struct {
             var metadata_client = self.metadataClient(scratch);
             const head = metadata_client.fetchHeadWithBudget(self.base_uris[index], discovery_budget) catch |err| {
                 if (platform_time.monotonicNs() >= deadline_ns)
-                    return error.RaftMutationDeadlineExceeded;
+                    return error.NotLeader;
                 last_pre_admission_err = err;
                 continue;
             };
@@ -15891,14 +15975,14 @@ const RemoteMetadataSource = struct {
                 continue;
             };
             if (forwarding_hops_remaining == 0)
-                return error.RaftMutationForwardLimitReached;
+                return error.NotLeader;
             const forwarding = antfly.public_api.raft_mutation_forwarding.contextForDeadline(
                 platform_time.monotonicNs(),
                 deadline_ns,
                 50 * std.time.ns_per_ms,
                 forwarding_hops_remaining,
                 !mutation_attempted,
-            ) orelse return error.RaftMutationDeadlineExceeded;
+            ) orelse return error.NotLeader;
             const result = callFn(
                 self,
                 &metadata_client,
@@ -20126,6 +20210,28 @@ test "data runtime structural raft progress prefers durable restart state over p
     // Tests and explicitly non-Raft hosts retain the local fallback.
     try std.testing.expectEqual(@as(?u64, 13), structuralRaftAppliedIndex(null, 13));
     try std.testing.expectEqual(@as(?u64, null), structuralRaftAppliedIndex(null, null));
+}
+
+test "data runtime retirement scope survives post-drop snapshot removal" {
+    const dropped_snapshot: antfly.metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 9, .metadata_epoch = 2, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    var previous = std.AutoHashMapUnmanaged(u64, []u8).empty;
+    defer previous.deinit(std.testing.allocator);
+    const owned_name = try std.testing.allocator.dupe(u8, "docs");
+    defer std.testing.allocator.free(owned_name);
+    try previous.put(std.testing.allocator, 77, owned_name);
+    try std.testing.expectEqualStrings(
+        "docs",
+        DataServer.replicaRetirementTableName(&dropped_snapshot, &previous, 77).?,
+    );
+    try std.testing.expect(DataServer.replicaRetirementTableName(&dropped_snapshot, &previous, 78) == null);
 }
 
 test "data server can register a store without enabling data raft" {

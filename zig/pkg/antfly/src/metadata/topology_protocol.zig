@@ -62,11 +62,20 @@ pub const max_create_definition_bytes: usize = 2 * 1024 * 1024;
 /// definition, generated range records, and codec overhead.
 pub const max_transition_command_bytes: usize = 3 * 1024 * 1024;
 /// The decoder-only reconciliation bridge emits predecessor-compatible log
-/// entries as one locally atomic Raft batch. Bound both dimensions before
-/// admission so a malformed or unexpectedly broad plan cannot monopolize the
-/// metadata runtime or create unbounded replication work.
-pub const max_legacy_reconciliation_commands: usize = 4096;
+/// entries as one locally atomic Raft batch. Encoded bytes, rather than an
+/// arbitrary entry count, are the resource and replication bound: compact
+/// removals for a valid high-shard table must not fail solely because they
+/// cross a count threshold.
 pub const max_legacy_reconciliation_batch_bytes: usize = max_transition_command_bytes;
+/// Every legacy transition frame contains a one-byte tag and at least one
+/// u64 identity. Combine the wire-derived maximum with an explicit in-memory
+/// materialization ceiling: the compatibility path temporarily owns both
+/// command unions and encoded frames. 64K retains ample headroom above the
+/// largest supported initial topology while preventing a damaged catalog
+/// from creating a disproportionately large transient allocation.
+pub const min_legacy_transition_command_bytes: usize = @sizeOf(u8) + @sizeOf(u64);
+pub const max_legacy_reconciliation_commands: usize =
+    @min(64 * 1024, max_legacy_reconciliation_batch_bytes / min_legacy_transition_command_bytes);
 /// Largest legacy v1 membership vector that could fit in a command accepted
 /// by the topology proposal path. The decoder checks this before allocating,
 /// so a corrupt persisted frame cannot turn a compact metadata entry into an

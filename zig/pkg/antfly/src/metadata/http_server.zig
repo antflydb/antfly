@@ -1571,6 +1571,16 @@ pub const MetadataHttpServer = struct {
             );
             return ctx.status(426).text("metadata topology protocol upgrade required");
         }
+        if (err == error.MetadataTopologyCommandTooLarge) {
+            // Encoding rejected the complete legacy batch before Raft
+            // admission. Preserve that replay proof and return an actionable
+            // capacity response instead of a generic server error.
+            try ctx.setHeader(
+                routes.Routes.raft_mutation_outcome_header,
+                routes.Routes.raft_mutation_outcome_not_proposed,
+            );
+            return ctx.status(413).text("table topology is too large for this rolling-upgrade protocol");
+        }
         if (metadata_authority.isMutationNotAdmittedError(err)) {
             // Raft rejected this command before assigning a log index. Only
             // this narrower proof authorizes an at-most-once client to route

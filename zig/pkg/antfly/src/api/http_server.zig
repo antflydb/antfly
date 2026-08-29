@@ -12401,6 +12401,7 @@ pub const ApiHttpServer = struct {
         var drop_result = self.source.dropTableExact(self.alloc, table_name) catch |err| return switch (err) {
             error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table name"),
             error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
+            error.MetadataTopologyCommandTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "table topology is too large for the current rolling-upgrade protocol"),
             error.TableTransitionActive, error.TableGenerationChanged => try contextual_operations.textAlloc(self.alloc, 409, "table topology changed; retry with the current table state"),
             error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
             error.NotLeader => try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later"),

@@ -654,8 +654,11 @@ pub const MetadataHttpClient = struct {
             "committed-repair-required-v1",
         ) orelse return error.MetadataMutationOutcomeUnknown;
         if (outcome == .not_proposed and resp.status == 503) return error.NotLeader;
-        if (outcome == .not_proposed and resp.status == 413 and kind == .create_table)
-            return error.CreateTableRequestTooLarge;
+        if (outcome == .not_proposed and resp.status == 413)
+            return if (kind == .create_table)
+                error.CreateTableRequestTooLarge
+            else
+                error.MetadataTopologyCommandTooLarge;
         if (outcome == .not_proposed and resp.status == 426)
             return error.TableTopologyProtocolUpgradeRequired;
         if (outcome == .committed and kind == .create_table and resp.status == 201)
@@ -1749,6 +1752,22 @@ test "metadata http client surfaces typed rejection for forwarded table mutation
         upgrade_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
     );
     try std.testing.expectEqual(@as(usize, 1), upgrade_gate.attempts);
+
+    var topology_too_large = RejectingExecutor{
+        .header_name = routes.Routes.raft_mutation_outcome_header,
+        .header_value = routes.Routes.raft_mutation_outcome_not_proposed,
+        .outcome_value = routes.Routes.raft_mutation_outcome_not_proposed,
+        .status = 413,
+    };
+    var topology_too_large_client = MetadataHttpClient.init(
+        std.testing.allocator,
+        topology_too_large.executor(),
+    );
+    try std.testing.expectError(
+        error.MetadataTopologyCommandTooLarge,
+        topology_too_large_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), topology_too_large.attempts);
 }
 
 test "metadata http client preserves transport ambiguity for forwarded table mutations" {

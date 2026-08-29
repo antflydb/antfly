@@ -4319,6 +4319,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text("invalid table name");
             },
+            error.MetadataTopologyCommandTooLarge => {
+                _ = ctx.status(413);
+                return ctx.text("table topology is too large for the current rolling-upgrade protocol");
+            },
             error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => {
                 _ = ctx.status(409);
                 return ctx.text("table topology changed or is extension-owned");

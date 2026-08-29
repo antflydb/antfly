@@ -132,18 +132,20 @@ fn applyReconciliationPlanAndWaitAppliedWithContextImpl(
 
     var commands = std.ArrayList(metadata_storage.TransitionCommand).empty;
     defer commands.deinit(alloc);
-    const command_capacity = plan.placement_upserts.len +
-        plan.table_upserts.len +
-        plan.split_admissions.len +
-        plan.range_upserts.len +
-        plan.split_upserts.len +
-        plan.merge_upserts.len +
-        plan.placement_removals.len +
-        plan.table_removals.len +
-        plan.range_removals.len +
-        plan.split_removals.len +
-        plan.merge_removals.len +
+    const command_capacity = plan.placement_upserts.len +|
+        plan.table_upserts.len +|
+        plan.split_admissions.len +|
+        plan.range_upserts.len +|
+        plan.split_upserts.len +|
+        plan.merge_upserts.len +|
+        plan.placement_removals.len +|
+        plan.table_removals.len +|
+        plan.range_removals.len +|
+        plan.split_removals.len +|
+        plan.merge_removals.len +|
         @intFromBool(plan.clear_reallocation_request != null);
+    if (command_capacity > metadata_topology_protocol.max_legacy_reconciliation_commands)
+        return error.MetadataTopologyCommandTooLarge;
     try commands.ensureTotalCapacity(alloc, command_capacity);
 
     for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
@@ -1379,16 +1381,20 @@ fn prepareEncodedTransitionBatch(
     if (commands.len == 0) return error.EmptyProposalBatch;
     if (commands.len > metadata_topology_protocol.max_legacy_reconciliation_commands)
         return error.MetadataTopologyCommandTooLarge;
-
-    const entries = try service.alloc.alloc([]const u8, commands.len);
-    for (entries) |*entry| entry.* = &.{};
+    // The encoded-byte ceiling is the authoritative resource bound. A fixed
+    // command-count ceiling incorrectly rejected legitimate high-shard
+    // tables even when their compact predecessor-compatible commands fit in
+    // one bounded Raft batch. Grow incrementally so an attacker-controlled
+    // plan cannot force a large pointer array before its encoded size has
+    // been validated.
+    var entries = std.ArrayList([]const u8).empty;
     errdefer {
-        for (entries) |entry| service.alloc.free(entry);
-        service.alloc.free(entries);
+        for (entries.items) |entry| service.alloc.free(entry);
+        entries.deinit(service.alloc);
     }
 
     var total_bytes: usize = 0;
-    for (commands, 0..) |command, i| {
+    for (commands) |command| {
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record|
             metadata_table_manager.freeStore(service.alloc, record);
@@ -1399,14 +1405,43 @@ fn prepareEncodedTransitionBatch(
         );
         try metadata_storage.validateTransitionCommandDataGroupIds(safe_command);
         const encoded = try metadata_storage.encodeTransitionCommand(service.alloc, safe_command);
-        entries[i] = encoded;
-        total_bytes = std.math.add(usize, total_bytes, encoded.len) catch
+        total_bytes = std.math.add(usize, total_bytes, encoded.len) catch {
+            service.alloc.free(encoded);
             return error.MetadataTopologyCommandTooLarge;
+        };
         if (encoded.len > metadata_topology_protocol.max_transition_command_bytes or
             total_bytes > metadata_topology_protocol.max_legacy_reconciliation_batch_bytes)
+        {
+            service.alloc.free(encoded);
             return error.MetadataTopologyCommandTooLarge;
+        }
+        entries.append(service.alloc, encoded) catch |err| {
+            service.alloc.free(encoded);
+            return err;
+        };
     }
-    return .{ .entries = entries };
+    return .{ .entries = try entries.toOwnedSlice(service.alloc) };
+}
+
+test "metadata service legacy reconciliation batch admits compact plans beyond the former count ceiling" {
+    const alloc = std.testing.allocator;
+    const command_count: usize = 4097;
+    const commands = try alloc.alloc(metadata_storage.TransitionCommand, command_count);
+    defer alloc.free(commands);
+    for (commands, 0..) |*command, i| {
+        command.* = .{ .remove_range = .{ .group_id = 7001 + i } };
+    }
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+
+        fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
+            return true;
+        }
+    };
+    var service = FakeService{ .alloc = alloc };
+    var batch = try prepareEncodedTransitionBatch(&service, commands);
+    defer batch.deinit(alloc);
+    try std.testing.expectEqual(command_count, batch.entries.len);
 }
 
 pub const MetadataServiceDeps = struct {

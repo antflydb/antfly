@@ -234,6 +234,11 @@ pub const FileSnapshotStore = struct {
             defer self.alloc.free(existing);
             if (!std.mem.eql(u8, existing, encoded))
                 return error.SnapshotGenerationMismatch;
+            // A lost commit response is retried as begin/chunks/commit by the
+            // sender. The immutable committed artifact already owns this
+            // exact generation, so do not consume a second artifact's quota
+            // merely to manufacture an identical staging file.
+            return;
         } else |err| switch (err) {
             error.FileNotFound => {},
             // A corrupt committed artifact must not be silently replaced by a
@@ -269,12 +274,40 @@ pub const FileSnapshotStore = struct {
         defer lock.unlock();
         const path = try self.transferPath(snapshot_id, ".v2.part");
         defer self.alloc.free(path);
-        var file = try std.Io.Dir.cwd().openFile(io(self), path, .{ .mode = .read_write });
+        var committed = false;
+        var file = std.Io.Dir.cwd().openFile(io(self), path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => blk: {
+                const committed_path = try self.transferPath(snapshot_id, ".v2");
+                defer self.alloc.free(committed_path);
+                committed = true;
+                break :blk try std.Io.Dir.cwd().openFile(io(self), committed_path, .{});
+            },
+            else => return err,
+        };
         defer file.close(io(self));
         const header = try self.readArtifactHeader(&file);
         try requireGeneration(generation, header.generation);
         if (offset > header.data_len or body.len > header.data_len - offset)
             return error.InvalidSnapshotChunkRange;
+        if (committed) {
+            // Committed generations are immutable. An identical chunk is an
+            // idempotent retry; a different byte proves the caller is not
+            // retrying the generation described by its manifest.
+            var compared: usize = 0;
+            var buffer: [64 * 1024]u8 = undefined;
+            while (compared < body.len) {
+                const wanted = @min(buffer.len, body.len - compared);
+                const read = try file.readPositionalAll(
+                    io(self),
+                    buffer[0..wanted],
+                    header.data_offset + offset + compared,
+                );
+                if (read != wanted or !std.mem.eql(u8, buffer[0..read], body[compared..][0..read]))
+                    return error.SnapshotGenerationMismatch;
+                compared += read;
+            }
+            return;
+        }
         try file.writePositionalAll(io(self), body, header.data_offset + offset);
     }
 
@@ -984,6 +1017,68 @@ test "file snapshot store resumes chunks and atomically verifies commit" {
         error.FileNotFound,
         iface.vtable.get_snapshot_manifest.?(iface.ptr, std.testing.allocator, "snap-v2"),
     );
+}
+
+test "committed chunked snapshot protocol retry reuses one artifact quota" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/raft-snaps-committed-retry",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root_dir);
+    const body = "immutable-snapshot-data";
+    const manifest: snapshot_transfer.Manifest = .{
+        .group_id = 92,
+        .from = 1,
+        .to = 2,
+        .request_term = 4,
+        .metadata = .{ .index = 18, .term = 5 },
+        .data_len = body.len,
+        .digest = snapshot_transfer.digest(body),
+    };
+    const encoded = try snapshot_transfer.encode(std.testing.allocator, manifest);
+    defer std.testing.allocator.free(encoded);
+    const artifact_bytes = @sizeOf(u32) + encoded.len + body.len;
+    var store = try FileSnapshotStore.init(std.testing.allocator, .{
+        .root_dir = root_dir,
+        .artifact_policy = .{ .max_bytes = artifact_bytes, .max_count = 1 },
+    });
+    defer store.deinit();
+    const iface = store.store();
+    const generation = try testManifestGeneration(manifest);
+
+    try iface.vtable.begin_chunked_snapshot.?(iface.ptr, manifest, "retry");
+    try iface.vtable.put_snapshot_chunk.?(iface.ptr, "retry", generation, 0, body);
+    try std.testing.expect((try iface.vtable.commit_chunked_snapshot.?(
+        iface.ptr,
+        std.testing.allocator,
+        "retry",
+        generation,
+        false,
+    )) == null);
+    try std.testing.expectEqual(@as(usize, 1), (try store.artifactUsage()).count);
+
+    // Simulate loss of the commit response: the sender repeats the complete
+    // protocol, including chunks, under a quota that cannot hold staging and
+    // committed copies simultaneously.
+    try iface.vtable.begin_chunked_snapshot.?(iface.ptr, manifest, "retry");
+    try iface.vtable.put_snapshot_chunk.?(iface.ptr, "retry", generation, 0, body);
+    try std.testing.expectError(
+        error.SnapshotGenerationMismatch,
+        iface.vtable.put_snapshot_chunk.?(iface.ptr, "retry", generation, 0, "different"),
+    );
+    try std.testing.expect((try iface.vtable.commit_chunked_snapshot.?(
+        iface.ptr,
+        std.testing.allocator,
+        "retry",
+        generation,
+        false,
+    )) == null);
+    const usage = try store.artifactUsage();
+    try std.testing.expectEqual(@as(usize, 1), usage.count);
+    try std.testing.expectEqual(@as(u64, artifact_bytes), usage.bytes);
 }
 
 test "chunked snapshot generations fence stale upload and release requests" {

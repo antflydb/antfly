@@ -7619,7 +7619,10 @@ pub const ProvisionedTableWriteSource = struct {
                         retry_required = true;
                         continue;
                     };
-                    std.log.err("invalid dropped-table repair intent quarantined path={s}", .{path});
+                    // The corrupt input is no longer on the live recovery
+                    // path and remains visible through the quarantine metric.
+                    // Reserve error severity for a quarantine that failed.
+                    std.log.warn("invalid dropped-table repair intent quarantined path={s}", .{path});
                     continue;
                 }
                 std.log.warn("dropped-table repair intent read deferred path={s} err={s}", .{ path, @errorName(err) });
@@ -7714,7 +7717,7 @@ pub const ProvisionedTableWriteSource = struct {
                         retry_required = true;
                         continue;
                     };
-                    std.log.err("invalid replica-retirement intent quarantined path={s}", .{path});
+                    std.log.warn("invalid replica-retirement intent quarantined path={s}", .{path});
                     continue;
                 }
                 std.log.warn("replica-retirement intent read deferred path={s} err={s}", .{ path, @errorName(err) });
@@ -7928,38 +7931,14 @@ pub const ProvisionedTableWriteSource = struct {
         }
         self.replica_retirement_intent_mutex.unlock();
 
-        const ownership = self.replicaRetirementOwnershipSnapshot() orelse {
-            if (self.backend_runtime != null) self.scheduleDroppedTableRecovery();
-            return first_error orelse error.ReplicaRetirementOwnershipUnavailable;
-        };
-        for (prepared.intents) |intent| {
-            const group_id = intent.group_id;
-            const state = ownership.state(group_id) catch |err| {
-                first_error = first_error orelse err;
-                continue;
-            };
-            if (state == .retained) {
-                // The caller promises this method only after a durable catalog
-                // commit. Treat a retained record as an inconclusive proof.
-                first_error = first_error orelse error.ReplicaRetirementOwnershipInconclusive;
-                continue;
-            }
-            if (state == .retiring) {
-                first_error = first_error orelse error.ReplicaRetirementOwnershipInconclusive;
-                continue;
-            }
-            self.executeReplicaRetirementCleanup(prepared.alloc, group_id, intent.table_name) catch |err| {
-                first_error = first_error orelse err;
-                continue;
-            };
-            removeDroppedTableRepairIntent(intent.path) catch |err| {
-                first_error = first_error orelse err;
-            };
-        }
-        if (first_error) |err| {
-            if (self.backend_runtime != null) self.scheduleDroppedTableRecovery();
-            return err;
-        }
+        // Catalog removal and the committed sidecar are the synchronous
+        // durability boundary. Cache drains, exclusive read-cache waits,
+        // renames, and recursive deletion belong to the source-owned durable
+        // cleanup lane so metadata reconciliation latency is O(1) in the
+        // number of removed replicas. Standalone/test sources intentionally
+        // retain the existing inline fallback when no runtime is attached.
+        self.scheduleDroppedTableRecovery();
+        if (first_error) |err| return err;
     }
 
     pub fn requestReplicaRetirementRecovery(self: *ProvisionedTableWriteSource) void {
@@ -45737,10 +45716,7 @@ test "replica retirement journal distinguishes active retained and committed rem
     try std.Io.Dir.cwd().access(io_impl.io(), prepared.intents[0].path, .{});
 
     ownership.state = .retiring;
-    try std.testing.expectError(
-        error.ReplicaRetirementOwnershipInconclusive,
-        source.completePreparedReplicaRetirements(&prepared),
-    );
+    try source.completePreparedReplicaRetirements(&prepared);
     var committed_intent = try loadReplicaRetirementIntent(alloc, io_impl.io(), prepared.intents[0].path);
     defer committed_intent.deinit(alloc);
     try std.testing.expectEqual(ReplicaRetirementIntentPhase.committed, committed_intent.phase);
@@ -45799,10 +45775,7 @@ test "replica retirement journal batches preserve every group phase" {
         try std.testing.expectEqual(ReplicaRetirementIntentPhase.prepared, persisted.phase);
     }
 
-    try std.testing.expectError(
-        error.ReplicaRetirementOwnershipInconclusive,
-        source.completePreparedReplicaRetirements(&prepared),
-    );
+    try source.completePreparedReplicaRetirements(&prepared);
     for (prepared.intents, group_ids) |intent, group_id| {
         var persisted = try loadReplicaRetirementIntent(alloc, io_impl.io(), intent.path);
         defer persisted.deinit(alloc);

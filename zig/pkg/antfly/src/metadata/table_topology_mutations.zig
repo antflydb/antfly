@@ -271,6 +271,12 @@ fn dropCompatible(
     defer admission.deinit(alloc);
 
     if (workflow.dropTableCatalogLockedWithContext(svc, request, admission.table_id)) |_| {} else |err| {
+        // Batch construction and encoding complete before Raft admission.
+        // Preserve deterministic capacity failures so the API can report an
+        // actionable request/topology limit instead of claiming an unknown
+        // mutation outcome.
+        if (err == error.MetadataTopologyCommandTooLarge)
+            return err;
         svc.ensureLinearizableReadWithContext(request) catch return afterAdmission(err);
         verifyCompatibleTableDropProjection(
             svc,
