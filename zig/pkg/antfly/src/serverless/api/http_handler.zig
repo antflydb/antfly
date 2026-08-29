@@ -11981,7 +11981,7 @@ test "serverless public graph query rejects exact sort controls" {
     const generated_plain_body = try std.json.Stringify.valueAlloc(
         alloc,
         typed_plain_request.value,
-        .{},
+        .{ .emit_null_optional_fields = false },
     );
     defer alloc.free(generated_plain_body);
     try std.testing.expect((try handler.handleTablePublicGraphQueryRequest(

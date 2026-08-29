@@ -5458,18 +5458,15 @@ fn encodeQueryValueForRetrievalQuery(
         value.object.get("expand_strategy") != null)
         return error.UnsupportedRetrievalAgentRequest;
 
-    const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
-    defer alloc.free(encoded);
-
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var parsed = ant_json.parseFromSlice(QueryRequest, arena, encoded, .{}) catch
-        return error.InvalidRetrievalAgentRequest;
-    defer parsed.deinit();
-
-    var query_request = parsed.value;
+    // RetrievalQueryRequest is a strict schema extension of QueryRequest.
+    // Project its shared generated fields directly: reparsing the raw object
+    // would incorrectly present retrieval-only `tree_search` to the canonical
+    // QueryRequest parser and would add a full stringify/parse cycle per step.
+    var query_request = canonicalQueryRequestFromRetrieval(retrieval_query);
     applyClassificationRefinement(&query_request, classification_result, retrieval_query_index, refinement_pass);
     // The raw query predicates are already folded into this query's mandatory
     // set. Install that canonical set instead of conjoining the source query a
@@ -5491,9 +5488,22 @@ fn encodeQueryValueForRetrievalQuery(
     }
 
     // This is an internal request hop, so keep the canonical wire compact and
-    // omit absent optional fields rather than serializing a page of nulls.
-    // Admission still treats explicit null as omission for external clients.
+    // preserve the public absent-vs-null contract for optional fields.
     return try std.json.Stringify.valueAlloc(alloc, query_request, .{ .emit_null_optional_fields = false });
+}
+
+fn canonicalQueryRequestFromRetrieval(request: RetrievalQueryRequest) QueryRequest {
+    var canonical: QueryRequest = .{};
+    inline for (std.meta.fields(QueryRequest)) |field| {
+        if (!@hasField(RetrievalQueryRequest, field.name)) {
+            @compileError("RetrievalQueryRequest must extend QueryRequest; missing field " ++ field.name);
+        }
+        if (@TypeOf(@field(request, field.name)) != field.type) {
+            @compileError("RetrievalQueryRequest field type diverged from QueryRequest: " ++ field.name);
+        }
+        @field(canonical, field.name) = @field(request, field.name);
+    }
+    return canonical;
 }
 
 const MandatoryPredicates = struct {

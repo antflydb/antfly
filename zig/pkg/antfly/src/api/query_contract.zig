@@ -14241,19 +14241,15 @@ test "api query contract validates canonical hierarchy controls" {
     try std.testing.expect(!empty_direct.req.hierarchy_include_source);
     try std.testing.expect(!empty_direct.req.hierarchy_include_unit);
 
-    // Generated SDK request models serialize unset optional fields as null.
-    // A null hierarchy remains equivalent to omission and preserves the
-    // default result shape; only an object selects the hierarchy contract.
+    // Canonical optional fields are non-nullable: omission selects the default
+    // result shape, while an explicit null is a malformed request.
     const null_hierarchy =
         \\{
         \\  "full_text_search": {"match":"needle","field":"content"},
         \\  "hierarchy": null
         \\}
     ;
-    var null_default = try parseQueryRequest(alloc, null, "docs", null_hierarchy);
-    defer null_default.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.parent, null_default.req.return_mode);
-    try std.testing.expect(!null_default.req.hierarchy_grouped_matches);
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", null_hierarchy));
 }
 
 test "api query contract keeps generated schema strict when with is present" {

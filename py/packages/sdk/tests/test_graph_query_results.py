@@ -1,3 +1,5 @@
+from typing import Any, cast
+
 import pytest
 
 from antfly.client import AntflyClient
@@ -147,7 +149,7 @@ def test_canonical_query_decoder_binds_result_shape_to_request() -> None:
                 {"type": "shortest_path", "total": 1},
                 operation="path",
             ),
-            graph_dialect="legacy",
+            graph_dialect=cast(Any, "legacy"),
             expected_graph_queries=path_query,
         )
 
