@@ -6523,6 +6523,25 @@ pub const MetadataHttpService = struct {
         }
     }
 
+    pub fn listRaftQuarantinesForAdmin(
+        self: *MetadataHttpService,
+        alloc: std.mem.Allocator,
+    ) ![]raft_host.GroupQuarantineStatus {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        return try self.raft.host.http_host.listQuarantines(alloc);
+    }
+
+    pub fn resumeRaftQuarantineForAdmin(
+        self: *MetadataHttpService,
+        group_id: u64,
+        options: raft_host.ResumeQuarantineOptions,
+    ) !void {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        try self.raft.host.http_host.resumeQuarantinedGroup(group_id, options);
+    }
+
     /// Runs metadata projection and reconciliation without advancing Raft.
     /// Callers must concurrently drive `runRaftRoundOnly` at the configured
     /// tick cadence.

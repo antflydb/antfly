@@ -64,6 +64,9 @@ pub const HostConfig = struct {
 };
 
 pub const RuntimeHooks = raft_engine.runtime.multi_raft.RuntimeHooks;
+pub const GroupQuarantineStatus = raft_engine.runtime.multi_raft.GroupQuarantineStatus;
+pub const ResumeQuarantineOptions = raft_engine.runtime.multi_raft.ResumeQuarantineOptions;
+pub const QuarantineReason = raft_engine.runtime.QuarantineReason;
 
 pub const ReplicaDescriptorFactory = struct {
     ptr: *anyopaque,
@@ -178,6 +181,7 @@ pub const HostMetrics = struct {
     endpoint_removals: usize = 0,
     inbound_message_enqueues: usize = 0,
     inbound_message_drains: usize = 0,
+    quarantined_inbound_message_drops: usize = 0,
     pending_inbound_messages: usize = 0,
     pending_inbound_snapshot_bytes: usize = 0,
     inbound_snapshot_admission_denials: usize = 0,
@@ -193,6 +197,9 @@ pub const HostMetrics = struct {
     runtime_apply_queue_denials: usize = 0,
     runtime_oversized_outbound_ready_rejections: usize = 0,
     runtime_oversized_apply_ready_rejections: usize = 0,
+    runtime_quarantine_resume_attempts: usize = 0,
+    runtime_quarantine_resume_successes: usize = 0,
+    runtime_quarantine_resume_conflicts: usize = 0,
     runtime_snapshot_compaction_completions: usize = 0,
     runtime_snapshot_compaction_failures: usize = 0,
     runtime_snapshot_compaction_candidates: usize = 0,
@@ -610,8 +617,19 @@ pub const Host = struct {
         return self.runtime_host.groupQuarantine(group_id);
     }
 
-    pub fn resumeQuarantinedGroup(self: *Host, group_id: u64) !void {
-        try self.runtime_host.resumeQuarantinedGroup(group_id);
+    pub fn listQuarantines(
+        self: *const Host,
+        alloc: std.mem.Allocator,
+    ) ![]raft_engine.runtime.multi_raft.GroupQuarantineStatus {
+        return try self.runtime_host.listQuarantines(alloc);
+    }
+
+    pub fn resumeQuarantinedGroup(
+        self: *Host,
+        group_id: u64,
+        options: raft_engine.runtime.multi_raft.ResumeQuarantineOptions,
+    ) !void {
+        try self.runtime_host.resumeQuarantinedGroup(group_id, options);
     }
 
     pub fn bootstrapStatus(self: *const Host, group_id: u64) ?BootstrapStatus {
@@ -665,6 +683,7 @@ pub const Host = struct {
         var snapshot = self.metrics;
         snapshot.hosted_groups = runtime_metrics.group_count;
         snapshot.quarantined_groups = runtime_metrics.quarantined_group_count;
+        snapshot.quarantined_inbound_message_drops = runtime_metrics.quarantined_inbound_messages;
         snapshot.runtime_rounds = runtime_metrics.rounds;
         snapshot.runtime_ticked_groups = runtime_metrics.ticked_groups;
         snapshot.runtime_processed_groups = runtime_metrics.processed_groups;
@@ -679,6 +698,9 @@ pub const Host = struct {
         snapshot.runtime_apply_queue_denials = runtime_metrics.apply_queue_denials;
         snapshot.runtime_oversized_outbound_ready_rejections = runtime_metrics.oversized_outbound_ready_rejections;
         snapshot.runtime_oversized_apply_ready_rejections = runtime_metrics.oversized_apply_ready_rejections;
+        snapshot.runtime_quarantine_resume_attempts = runtime_metrics.quarantine_resume_attempts;
+        snapshot.runtime_quarantine_resume_successes = runtime_metrics.quarantine_resume_successes;
+        snapshot.runtime_quarantine_resume_conflicts = runtime_metrics.quarantine_resume_conflicts;
         snapshot.runtime_snapshot_compaction_completions = runtime_metrics.snapshot_compaction_completions;
         snapshot.runtime_snapshot_compaction_failures = runtime_metrics.snapshot_compaction_failures;
         snapshot.runtime_snapshot_compaction_candidates = runtime_metrics.snapshot_compaction_candidates;
@@ -790,10 +812,12 @@ pub const Host = struct {
 
         var drained: usize = 0;
         for (pending.items) |item| {
-            self.runtime_host.step(item.group_id, item.message) catch |err| switch (err) {
-                error.UnknownGroup => {},
+            const disposition = self.runtime_host.stepWithDisposition(item.group_id, item.message) catch |err| switch (err) {
+                error.UnknownGroup => null,
                 else => return err,
             };
+            if (disposition == .quarantined)
+                self.metrics.quarantined_inbound_message_drops +|= 1;
             drained += 1;
         }
         self.metrics.inbound_message_drains += drained;
@@ -806,16 +830,23 @@ pub const Host = struct {
         }
     }
 
+    fn mapGroupActivityError(err: anyerror) anyerror {
+        return if (err == error.GroupHardQuarantined)
+            error.GroupLeaderUnavailable
+        else
+            err;
+    }
+
     pub fn campaignGroup(self: *Host, group_id: u64) !void {
-        try self.runtime_host.campaignGroup(group_id);
+        self.runtime_host.campaignGroup(group_id) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn propose(self: *Host, group_id: u64, data: []const u8) !void {
-        try self.runtime_host.propose(group_id, data);
+        self.runtime_host.propose(group_id, data) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn proposeWithReceipt(self: *Host, group_id: u64, data: []const u8, accepted_index: *?u64) !void {
-        try self.runtime_host.proposeWithReceipt(group_id, data, accepted_index);
+        self.runtime_host.proposeWithReceipt(group_id, data, accepted_index) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn proposeBatchWithReceipt(
@@ -825,12 +856,12 @@ pub const Host = struct {
         accepted_first_index: *?u64,
         accepted_last_index: *?u64,
     ) !void {
-        try self.runtime_host.proposeBatchWithReceipt(
+        self.runtime_host.proposeBatchWithReceipt(
             group_id,
             payloads,
             accepted_first_index,
             accepted_last_index,
-        );
+        ) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn prepareProposalReceiptTracking(self: *Host, group_id: u64) !void {
@@ -850,7 +881,7 @@ pub const Host = struct {
     }
 
     pub fn transferLeader(self: *Host, group_id: u64, transferee: u64) !void {
-        try self.runtime_host.transferLeader(group_id, transferee);
+        self.runtime_host.transferLeader(group_id, transferee) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn handleSnapshotUpload(self: *Host, upload: transport.http_server.SnapshotUpload) !void {
@@ -908,19 +939,19 @@ pub const Host = struct {
     }
 
     pub fn forgetLeader(self: *Host, group_id: u64) !void {
-        try self.runtime_host.forgetLeader(group_id);
+        self.runtime_host.forgetLeader(group_id) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn readIndex(self: *Host, group_id: u64, request_ctx: []const u8) !void {
-        try self.runtime_host.readIndex(group_id, request_ctx);
+        self.runtime_host.readIndex(group_id, request_ctx) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn proposeConfChange(self: *Host, group_id: u64, conf_change: raft_engine.core.ConfChange) !void {
-        try self.runtime_host.proposeConfChange(group_id, conf_change);
+        self.runtime_host.proposeConfChange(group_id, conf_change) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn proposeConfChangeV2(self: *Host, group_id: u64, conf_change: raft_engine.core.ConfChangeV2) !void {
-        try self.runtime_host.proposeConfChangeV2(group_id, conf_change);
+        self.runtime_host.proposeConfChangeV2(group_id, conf_change) catch |err| return mapGroupActivityError(err);
     }
 
     pub fn raftStatus(self: *Host, group_id: u64) ?raft_engine.core.Status {
@@ -1255,8 +1286,19 @@ pub const HttpHost = struct {
         return self.host.quarantineStatus(group_id);
     }
 
-    pub fn resumeQuarantinedGroup(self: *HttpHost, group_id: u64) !void {
-        try self.host.resumeQuarantinedGroup(group_id);
+    pub fn listQuarantines(
+        self: *const HttpHost,
+        alloc: std.mem.Allocator,
+    ) ![]raft_engine.runtime.multi_raft.GroupQuarantineStatus {
+        return try self.host.listQuarantines(alloc);
+    }
+
+    pub fn resumeQuarantinedGroup(
+        self: *HttpHost,
+        group_id: u64,
+        options: raft_engine.runtime.multi_raft.ResumeQuarantineOptions,
+    ) !void {
+        try self.host.resumeQuarantinedGroup(group_id, options);
     }
 
     pub fn bootstrapStatus(self: *const HttpHost, group_id: u64) ?BootstrapStatus {
@@ -1723,7 +1765,10 @@ test "host drops stale inbound peer batch groups without leaking pending storage
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
     var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
-    var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+    var host = Host.init(std.testing.allocator, .{
+        .local_node_id = 1,
+        .runtime = .{ .max_single_apply_ready_bytes = 1 },
+    }, .{
         .descriptor_factory = factory.iface(),
     });
     defer host.deinit();
@@ -1775,6 +1820,23 @@ test "host drops stale inbound peer batch groups without leaking pending storage
 
     _ = try host.runRoundBounded(1, 1, 1);
     try std.testing.expectEqual(@as(usize, 2), host.metrics.inbound_message_drains);
+    try std.testing.expectEqual(@as(usize, 0), host.metrics.pending_inbound_messages);
+
+    // A single poisoned group must not terminate the shared progress driver.
+    try host.campaignGroup(41);
+    _ = try host.runRoundBounded(0, 1, 1);
+    try std.testing.expectEqual(.quarantined, host.status(41));
+    try std.testing.expectError(error.GroupLeaderUnavailable, host.campaignGroup(41));
+
+    try host.enqueueInboundBatch(.{
+        .peer_id = 1,
+        .groups = (&[_]raft_engine.runtime.transport_iface.GroupMessageBatch{.{
+            .group_id = 41,
+            .messages = (&[_]raft_engine.core.Message{known_msg_a})[0..],
+        }})[0..],
+    });
+    _ = try host.runRoundBounded(1, 1, 1);
+    try std.testing.expectEqual(@as(usize, 1), host.metrics.quarantined_inbound_message_drops);
     try std.testing.expectEqual(@as(usize, 0), host.metrics.pending_inbound_messages);
 }
 

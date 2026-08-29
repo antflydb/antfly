@@ -827,6 +827,9 @@ pub const ApiHttpServerConfig = struct {
     deployment_mode: common_config.DeploymentMode = .distributed,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     storage_maintenance: ?*@import("../storage/maintenance.zig").Coordinator = null,
+    /// Node-local Raft quarantine diagnostics and fenced recovery. The source
+    /// owns runtime serialization; handlers never access a Raft host directly.
+    raft_quarantine_admin: ?RaftQuarantineAdminSource = null,
     /// Dedicated bearer token for /admin/v1 operations when public API
     /// authentication is disabled. Admin routes fail closed when neither this
     /// token nor normal authenticated admin identity is available.
@@ -890,6 +893,34 @@ pub const ApiHttpServerConfig = struct {
     /// Optional node-wide resource owner. The owner must outlive ApiHttpServer.
     /// Cache budgets and concurrency are intentionally not HTTP/API config.
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+};
+
+pub const RaftQuarantineAdminSource = struct {
+    ptr: *anyopaque,
+    list_fn: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+    ) anyerror![]raft_host.GroupQuarantineStatus,
+    resume_fn: *const fn (
+        ptr: *anyopaque,
+        group_id: u64,
+        options: raft_host.ResumeQuarantineOptions,
+    ) anyerror!void,
+
+    pub fn list(
+        self: RaftQuarantineAdminSource,
+        alloc: std.mem.Allocator,
+    ) ![]raft_host.GroupQuarantineStatus {
+        return try self.list_fn(self.ptr, alloc);
+    }
+
+    pub fn resumeGroup(
+        self: RaftQuarantineAdminSource,
+        group_id: u64,
+        options: raft_host.ResumeQuarantineOptions,
+    ) !void {
+        try self.resume_fn(self.ptr, group_id, options);
+    }
 };
 
 pub const trusted_principal_header = "X-Antfly-Trusted-Principal";
@@ -16474,6 +16505,7 @@ fn extensionDependencyExists(dependencies: []const extension_domain.ExtensionDep
 pub fn requiresAdminPermission(path: []const u8) bool {
     if (isHaAdminPath(path)) return true;
     if (isStorageMaintenancePath(path)) return true;
+    if (std.mem.eql(u8, path, admin_routes.raft) or std.mem.startsWith(u8, path, admin_routes.raft ++ "/")) return true;
     if (isExtensionPath(path)) return true;
     if (std.mem.eql(u8, path, routes.Routes.transactions_cleanup)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
@@ -23799,6 +23831,13 @@ test "api http server treats only exact extension prefixes as admin routes" {
     try std.testing.expect(requiresAdminPermission("/extensions/v1/installed/memoryaf"));
     try std.testing.expect(!requiresAdminPermission("/extensions/v1/packagesXYZ"));
     try std.testing.expect(!requiresAdminPermission("/extensions/v1/installedXYZ"));
+}
+
+test "api http server treats only the raft admin namespace as admin routes" {
+    try std.testing.expect(requiresAdminPermission(admin_routes.raft));
+    try std.testing.expect(requiresAdminPermission(admin_routes.raft_quarantines));
+    try std.testing.expect(requiresAdminPermission("/admin/v1/raft/groups/41/quarantine/resume"));
+    try std.testing.expect(!requiresAdminPermission("/admin/v1/raftish"));
 }
 
 test "retrieval route delegates authorization to referenced tables" {

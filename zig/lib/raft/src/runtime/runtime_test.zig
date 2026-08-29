@@ -126,6 +126,49 @@ const FailingRemovalCatalog = struct {
     }
 };
 
+const ReadOnlyVersionedCatalog = struct {
+    record: *const runtime.ReplicaRecord,
+    upsert_calls: usize = 0,
+
+    fn iface(self: *@This()) runtime.replica_catalog_iface.ReplicaCatalog {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .capabilities = capabilities,
+                .upsert_replica = upsertReplica,
+                .remove_replica = removeReplica,
+                .list_replicas = listReplicas,
+            },
+        };
+    }
+
+    fn capabilities(_: *anyopaque) runtime.replica_catalog_iface.CatalogCapabilities {
+        return .{
+            .max_read_record_version = 2,
+            .max_write_record_version = 1,
+            .writes_explicit_snapshot_format = false,
+        };
+    }
+
+    fn upsertReplica(ptr: *anyopaque, _: runtime.ReplicaRecord) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.upsert_calls += 1;
+        return error.ReadOnlyVersionedCatalog;
+    }
+
+    fn removeReplica(_: *anyopaque, _: core.types.GroupId) !bool {
+        return false;
+    }
+
+    fn listReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) ![]runtime.ReplicaRecord {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const records = try alloc.alloc(runtime.ReplicaRecord, 1);
+        errdefer alloc.free(records);
+        records[0] = try self.record.clone(alloc);
+        return records;
+    }
+};
+
 const DiskBatcherRecorder = struct {
     alloc: std.mem.Allocator,
     stores: std.AutoHashMapUnmanaged(core.types.GroupId, *core.MemoryStorage) = .empty,
@@ -1756,7 +1799,11 @@ test "multi raft ensureReplica creates persisted replica and can remove it" {
         .commit_index = 2,
     });
 
-    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{});
+    var catalog = runtime.MemoryReplicaCatalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
+        .replica_catalog = catalog.catalog(),
+    });
     defer host.deinit();
 
     var peers = [_]core.types.NodeId{1};
@@ -1778,6 +1825,28 @@ test "multi raft ensureReplica creates persisted replica and can remove it" {
     });
     try std.testing.expect(result.created);
     try std.testing.expectEqual(@as(core.types.Index, 2), host.group(131).?.status().hard.commit_index);
+
+    var mismatched_peers = [_]core.types.NodeId{2};
+    try std.testing.expectError(error.LocalNodeIdMismatch, host.ensureReplica(.{
+        .group = .{
+            .group_id = 131,
+            .local_node_id = 2,
+            .raft_config = .{
+                .id = 2,
+                .group_id = 131,
+                .peers = mismatched_peers[0..],
+            },
+            .storage = store.storage(),
+        },
+        .bootstrap = .persisted,
+    }));
+    const persisted = try catalog.catalog().listReplicas(std.testing.allocator);
+    defer {
+        for (persisted) |*persisted_record| persisted_record.deinit(std.testing.allocator);
+        std.testing.allocator.free(persisted);
+    }
+    try std.testing.expectEqual(@as(usize, 1), persisted.len);
+    try std.testing.expectEqual(@as(core.types.NodeId, 1), persisted[0].local_node_id);
 
     try host.removeReplica(131);
     try std.testing.expect(host.group(131) == null);
@@ -2328,12 +2397,23 @@ test "multi raft drainReady quarantines an impossible outbound Ready hard ceilin
     // A quarantined group is not reconsidered every round, avoiding warning
     // and counter storms while preserving its Ready for operator recovery.
     try std.testing.expectError(error.GroupHardQuarantined, host.campaignGroup(258));
+    try std.testing.expectError(error.GroupHardQuarantined, host.resumeGroup(258));
     try std.testing.expectEqual(@as(usize, 0), (try host.drainReady(1)).processed_ready_steps);
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().oversized_outbound_ready_rejections);
-    try host.resumeGroup(258);
+    try std.testing.expectError(error.QuarantineIncidentChanged, host.resumeQuarantinedGroup(258, .{
+        .expected_incident_id = quarantine.incident_id + 1,
+        .new_limit_bytes = quarantine.observed_bytes,
+    }));
+    try host.resumeQuarantinedGroup(258, .{
+        .expected_incident_id = quarantine.incident_id,
+        .new_limit_bytes = quarantine.observed_bytes,
+    });
     try std.testing.expect(!host.isGroupQuiesced(258));
     try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().quarantined_group_count);
     try std.testing.expectEqual(@as(?runtime.GroupQuarantine, null), host.groupQuarantine(258));
+    try std.testing.expectEqual(@as(usize, 2), host.metricsSnapshot().quarantine_resume_attempts);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().quarantine_resume_successes);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().quarantine_resume_conflicts);
 }
 
 test "multi raft drainReady quarantines an impossible apply Ready hard ceiling" {
@@ -2628,6 +2708,62 @@ test "multi raft restoreReplicasFromCatalog reconstructs persisted replica" {
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().restored_replicas);
 }
 
+test "multi raft restore is read-only across decoder-first catalog upgrades" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = runtime.MemoryReplicaFactory.init(std.testing.allocator);
+    defer factory.deinit();
+    try factory.registerStore(144, &store);
+
+    var peers = [_]core.types.NodeId{1};
+    const record: runtime.ReplicaRecord = .{
+        .group_id = 144,
+        .local_node_id = 1,
+        .raft = .{ .peers = peers[0..] },
+        .bootstrap = .{ .fetch_snapshot = .{
+            .from = 2,
+            .locator = .{
+                .snapshot_id = "decoder-first",
+                .format = .chunked_manifest_v2,
+            },
+            .fetch_immediately = false,
+        } },
+    };
+    var catalog = ReadOnlyVersionedCatalog{ .record = &record };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
+        .replica_catalog = catalog.iface(),
+        .replica_factory = factory.factory(),
+    });
+    defer host.deinit();
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try host.restoreReplicasFromCatalog(std.testing.allocator),
+    );
+    try std.testing.expect(host.group(144) != null);
+    try std.testing.expectEqual(@as(usize, 0), catalog.upsert_calls);
+
+    // New admission is still rejected before any runtime or catalog side
+    // effect until this catalog activates the v2 writer.
+    var second_store = core.MemoryStorage.init(std.testing.allocator);
+    defer second_store.deinit();
+    try std.testing.expectError(error.ReplicaCatalogRecordUnsupported, host.ensureReplica(.{
+        .group = .{
+            .group_id = 145,
+            .local_node_id = 1,
+            .raft_config = .{
+                .id = 1,
+                .group_id = 145,
+                .peers = peers[0..],
+            },
+            .storage = second_store.storage(),
+        },
+        .bootstrap = record.bootstrap,
+    }));
+    try std.testing.expect(host.group(145) == null);
+    try std.testing.expectEqual(@as(usize, 0), catalog.upsert_calls);
+}
+
 test "runtime control plane restore_replicas can rejoin via snapshot bootstrap" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
@@ -2702,7 +2838,12 @@ test "runtime control plane restore_replicas can rejoin via snapshot bootstrap" 
 }
 
 test "multi raft restoreReplicasFromCatalog works with file replica catalog" {
-    const path = "/tmp/antflydb-raft-runtime-file-catalog.bin";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_path);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "replica-catalog.bin" });
+    defer std.testing.allocator.free(path);
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
     store.setHardState(.{

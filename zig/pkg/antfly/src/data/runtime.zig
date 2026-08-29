@@ -1780,6 +1780,10 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_executor_control_rejections_total", "counter", "Control executor lease acquisitions rejected during shutdown", lanes.control_rejections_total);
         }
         try health_metrics.appendPromMetric(writer, "antfly_raft_quarantined_groups", "gauge", "Raft groups stopped by a hard Ready safety invariant and awaiting explicit recovery", raft_metrics.quarantined_groups);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_quarantined_inbound_messages_dropped_total", "counter", "Inbound Raft messages isolated to quarantined groups", raft_metrics.quarantined_inbound_message_drops);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_quarantine_resume_attempts_total", "counter", "Fenced operator attempts to resume quarantined Raft groups", raft_metrics.runtime_quarantine_resume_attempts);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_quarantine_resume_successes_total", "counter", "Successful fenced resumes of quarantined Raft groups", raft_metrics.runtime_quarantine_resume_successes);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_quarantine_resume_conflicts_total", "counter", "Rejected stale quarantine incident acknowledgements", raft_metrics.runtime_quarantine_resume_conflicts);
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_completions_total", "counter", "Raft snapshot compactions published", raft_metrics.runtime_snapshot_compaction_completions);
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_failures_total", "counter", "Raft snapshot compaction build or publication failures", raft_metrics.runtime_snapshot_compaction_failures);
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_candidates", "gauge", "Raft groups currently queued for snapshot compaction", raft_metrics.runtime_snapshot_compaction_candidates);
@@ -5326,6 +5330,10 @@ pub const DataServer = struct {
         }
         api_server_cfg.shard_ops = self.localShardOperationAdapter();
         api_server_cfg.shard_db_adapter = self.localShardDbAdapter();
+        api_server_cfg.raft_quarantine_admin = if (self.data_raft != null)
+            self.raftQuarantineAdminSource()
+        else
+            null;
         // Legacy, non-Raft data servers must keep ordinary /batch requests on
         // TableWriteSource.batchGroupLocal. Installing this adapter there
         // would divert every no-header rolling-upgrade request into
@@ -6727,6 +6735,37 @@ pub const DataServer = struct {
             .ptr = self,
             .run_once = runRaftProgressOnce,
         };
+    }
+
+    fn raftQuarantineAdminSource(self: *DataServer) antfly.public_api.http_server.RaftQuarantineAdminSource {
+        return .{
+            .ptr = self,
+            .list_fn = listRaftQuarantinesForAdmin,
+            .resume_fn = resumeRaftQuarantineForAdmin,
+        };
+    }
+
+    fn listRaftQuarantinesForAdmin(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+    ) ![]antfly.raft.host.GroupQuarantineStatus {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const raft = self.data_raft orelse return error.RaftRuntimeUnavailable;
+        lockAtomic(&self.data_raft_mutex);
+        defer self.data_raft_mutex.unlock();
+        return try raft.host.http_host.listQuarantines(alloc);
+    }
+
+    fn resumeRaftQuarantineForAdmin(
+        ptr: *anyopaque,
+        group_id: u64,
+        options: antfly.raft.host.ResumeQuarantineOptions,
+    ) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const raft = self.data_raft orelse return error.RaftRuntimeUnavailable;
+        lockAtomic(&self.data_raft_mutex);
+        defer self.data_raft_mutex.unlock();
+        try raft.host.http_host.resumeQuarantinedGroup(group_id, options);
     }
 
     fn runRaftProgressOnce(ptr: *anyopaque) !void {

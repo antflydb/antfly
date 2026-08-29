@@ -142,6 +142,10 @@ pub const HostMetrics = struct {
     group_count: usize = 0,
     quiesced_group_count: usize = 0,
     quarantined_group_count: usize = 0,
+    quarantined_inbound_messages: usize = 0,
+    quarantine_resume_attempts: usize = 0,
+    quarantine_resume_successes: usize = 0,
+    quarantine_resume_conflicts: usize = 0,
     rounds: usize = 0,
     virtual_round: u64 = 0,
     virtual_time_ms: u64 = 0,
@@ -178,6 +182,25 @@ pub const HostMetrics = struct {
     snapshot_compaction_candidates: usize = 0,
     snapshot_compaction_bytes: usize = 0,
     snapshot_compaction_build_ns: u64 = 0,
+};
+
+pub const StepDisposition = enum {
+    applied,
+    quarantined,
+};
+
+pub const GroupQuarantineStatus = struct {
+    group_id: core.types.GroupId,
+    quarantine: scheduler_mod.GroupQuarantine,
+    current_limit: usize,
+    can_resume: bool,
+};
+
+pub const ResumeQuarantineOptions = struct {
+    expected_incident_id: u64,
+    /// Optional live safety-limit increase. It must be monotonic and cover the
+    /// retained Ready before the group can be resumed.
+    new_limit_bytes: ?usize = null,
 };
 
 const PendingApplyTask = struct {
@@ -517,7 +540,31 @@ pub const MultiRaft = struct {
     }
 
     pub fn ensureReplica(self: *MultiRaft, desc: replica_mod.ReplicaDescriptor) !replica_mod.EnsureReplicaResult {
+        // Reject deterministic conflicts before changing desired state. The
+        // runtime is single-owner, so this check and publication cannot race
+        // another local admission.
+        if (self.group(desc.group.group_id)) |existing| {
+            if (existing.localNodeId() != desc.group.local_node_id)
+                return error.LocalNodeIdMismatch;
+        }
+        // The catalog is durable desired state. Validate and publish admission
+        // before exposing a live group or fetching bytes. A later runtime
+        // failure intentionally leaves retryable admission debt for restart or
+        // reconciliation instead of an untracked live replica.
+        try self.persistReplicaRecord(desc);
+        return try self.installReplicaDescriptor(desc);
+    }
+
+    /// Reconstructs a replica from an already-durable catalog record. Restore
+    /// must never rewrite that record: decoder-first releases may legitimately
+    /// read a format that their predecessor-compatible writer cannot emit.
+    pub fn restoreReplica(self: *MultiRaft, desc: replica_mod.ReplicaDescriptor) !replica_mod.EnsureReplicaResult {
+        return try self.installReplicaDescriptor(desc);
+    }
+
+    fn installReplicaDescriptor(self: *MultiRaft, desc: replica_mod.ReplicaDescriptor) !replica_mod.EnsureReplicaResult {
         var result: replica_mod.EnsureReplicaResult = .{};
+        errdefer if (result.created) std.debug.assert(self.removeGroup(desc.group.group_id));
 
         if (self.group(desc.group.group_id)) |existing| {
             if (existing.localNodeId() != desc.group.local_node_id) return error.LocalNodeIdMismatch;
@@ -544,8 +591,6 @@ pub const MultiRaft = struct {
                 }
             },
         }
-
-        try self.persistReplicaRecord(desc);
 
         return result;
     }
@@ -575,7 +620,7 @@ pub const MultiRaft = struct {
         for (records) |*record| {
             if (self.groups.contains(record.group_id)) continue;
             const desc = try factory.instantiateReplica(record);
-            const result = try self.ensureReplica(desc);
+            const result = try self.restoreReplica(desc);
             if (result.created or result.resumed or result.fetched_snapshot) restored += 1;
         }
         self.metrics.restored_replicas += restored;
@@ -618,17 +663,71 @@ pub const MultiRaft = struct {
 
     pub fn resumeGroup(self: *MultiRaft, group_id: core.types.GroupId) !void {
         if (!self.groups.contains(group_id)) return error.UnknownGroup;
+        if (self.scheduler.isHardQuarantined(group_id))
+            return error.GroupHardQuarantined;
         _ = self.scheduler.resumeGroup(group_id);
         self.refreshMetricsTopology();
     }
 
     /// Explicitly acknowledge and retry a quarantined group after an operator
-    /// has corrected the configured limit or offending workload.
-    pub fn resumeQuarantinedGroup(self: *MultiRaft, group_id: core.types.GroupId) !void {
+    /// has corrected the configured limit. The incident fence prevents a
+    /// delayed retry from clearing a newer quarantine.
+    pub fn resumeQuarantinedGroup(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        options: ResumeQuarantineOptions,
+    ) !void {
+        self.metrics.quarantine_resume_attempts +|= 1;
         if (!self.groups.contains(group_id)) return error.UnknownGroup;
-        if (self.scheduler.groupQuarantine(group_id) == null) return error.GroupNotQuarantined;
-        _ = self.scheduler.resumeGroup(group_id);
+        const quarantine = self.scheduler.groupQuarantine(group_id) orelse return error.GroupNotQuarantined;
+        if (quarantine.incident_id != options.expected_incident_id) {
+            self.metrics.quarantine_resume_conflicts +|= 1;
+            return error.QuarantineIncidentChanged;
+        }
+        const configured_limit = switch (quarantine.reason) {
+            .outbound_ready_too_large => self.cfg.max_single_outbound_ready_bytes,
+            .apply_ready_too_large => self.cfg.max_single_apply_ready_bytes,
+        };
+        if (options.new_limit_bytes) |new_limit| {
+            if (new_limit < configured_limit or new_limit < quarantine.observed_bytes)
+                return error.InvalidQuarantineRecoveryLimit;
+            switch (quarantine.reason) {
+                .outbound_ready_too_large => self.cfg.max_single_outbound_ready_bytes = new_limit,
+                .apply_ready_too_large => self.cfg.max_single_apply_ready_bytes = new_limit,
+            }
+        } else if (configured_limit < quarantine.observed_bytes) {
+            return error.QuarantineLimitStillExceeded;
+        }
+        _ = try self.scheduler.resumeQuarantinedGroup(group_id, options.expected_incident_id);
+        self.metrics.quarantine_resume_successes +|= 1;
         self.refreshMetricsTopology();
+    }
+
+    pub fn listQuarantines(self: *const MultiRaft, alloc: std.mem.Allocator) ![]GroupQuarantineStatus {
+        const statuses = try alloc.alloc(GroupQuarantineStatus, self.scheduler.quarantinedGroupCount());
+        var initialized: usize = 0;
+        var it = self.groups.keyIterator();
+        while (it.next()) |group_id| {
+            const quarantine = self.scheduler.groupQuarantine(group_id.*) orelse continue;
+            const configured_limit = switch (quarantine.reason) {
+                .outbound_ready_too_large => self.cfg.max_single_outbound_ready_bytes,
+                .apply_ready_too_large => self.cfg.max_single_apply_ready_bytes,
+            };
+            statuses[initialized] = .{
+                .group_id = group_id.*,
+                .quarantine = quarantine,
+                .current_limit = configured_limit,
+                .can_resume = configured_limit >= quarantine.observed_bytes,
+            };
+            initialized += 1;
+        }
+        std.debug.assert(initialized == statuses.len);
+        std.mem.sort(GroupQuarantineStatus, statuses, {}, struct {
+            fn lessThan(_: void, lhs: GroupQuarantineStatus, rhs: GroupQuarantineStatus) bool {
+                return lhs.group_id < rhs.group_id;
+            }
+        }.lessThan);
+        return statuses;
     }
 
     pub fn isGroupQuiesced(self: *const MultiRaft, group_id: core.types.GroupId) bool {
@@ -784,10 +883,19 @@ pub const MultiRaft = struct {
         return snapshot;
     }
 
-    pub fn step(self: *MultiRaft, group_id: core.types.GroupId, msg: core.Message) !void {
-        try self.resumeOnActivity(group_id);
+    pub fn stepWithDisposition(self: *MultiRaft, group_id: core.types.GroupId, msg: core.Message) !StepDisposition {
+        if (try self.activityDisposition(group_id) == .quarantined) {
+            self.metrics.quarantined_inbound_messages +|= 1;
+            return .quarantined;
+        }
         const grp = self.group(group_id) orelse return error.UnknownGroup;
         try grp.step(msg);
+        return .applied;
+    }
+
+    pub fn step(self: *MultiRaft, group_id: core.types.GroupId, msg: core.Message) !void {
+        if (try self.stepWithDisposition(group_id, msg) == .quarantined)
+            return error.GroupHardQuarantined;
     }
 
     pub fn campaignGroup(self: *MultiRaft, group_id: core.types.GroupId) !void {
@@ -1939,11 +2047,17 @@ pub const MultiRaft = struct {
         self.pending_apply.items.len = retained;
     }
 
-    fn resumeOnActivity(self: *MultiRaft, group_id: core.types.GroupId) !void {
+    fn activityDisposition(self: *MultiRaft, group_id: core.types.GroupId) !StepDisposition {
         if (!self.groups.contains(group_id)) return error.UnknownGroup;
-        if (self.scheduler.isHardQuarantined(group_id)) return error.GroupHardQuarantined;
+        if (self.scheduler.isHardQuarantined(group_id)) return .quarantined;
         if (self.scheduler.resumeGroupOnActivity(group_id)) self.refreshMetricsTopology();
         self.scheduler.noteActivity(group_id);
+        return .applied;
+    }
+
+    fn resumeOnActivity(self: *MultiRaft, group_id: core.types.GroupId) !void {
+        if (try self.activityDisposition(group_id) == .quarantined)
+            return error.GroupHardQuarantined;
     }
 
     fn transportReceiver(self: *MultiRaft) transport_iface.TransportReceiver {
@@ -1957,7 +2071,7 @@ pub const MultiRaft = struct {
 
     fn transportHandleMessage(ptr: *anyopaque, group_id: core.types.GroupId, msg: core.Message) !void {
         const self: *MultiRaft = @ptrCast(@alignCast(ptr));
-        try self.step(group_id, msg);
+        _ = try self.stepWithDisposition(group_id, msg);
     }
 
     fn snapshotReceiver(self: *MultiRaft) snapshot_transport_iface.SnapshotReceiver {

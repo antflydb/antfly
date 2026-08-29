@@ -100,6 +100,45 @@ const ParsedGlobalQueryTable = struct {
     }
 };
 
+const RaftQuarantineView = struct {
+    group_id: u64,
+    incident_id: u64,
+    reason: raft_mod.host.QuarantineReason,
+    observed_bytes: usize,
+    configured_limit_at_detection: usize,
+    current_limit_bytes: usize,
+    first_observed_round: u64,
+    last_observed_round: u64,
+    occurrences: u64,
+    can_resume: bool,
+    suggested_action: []const u8,
+
+    fn fromStatus(status: raft_mod.host.GroupQuarantineStatus) RaftQuarantineView {
+        const quarantine = status.quarantine;
+        return .{
+            .group_id = status.group_id,
+            .incident_id = quarantine.incident_id,
+            .reason = quarantine.reason,
+            .observed_bytes = quarantine.observed_bytes,
+            .configured_limit_at_detection = quarantine.configured_limit,
+            .current_limit_bytes = status.current_limit,
+            .first_observed_round = quarantine.first_observed_round,
+            .last_observed_round = quarantine.last_observed_round,
+            .occurrences = quarantine.occurrences,
+            .can_resume = status.can_resume,
+            .suggested_action = if (status.can_resume)
+                "resume with the current incident_id"
+            else
+                "raise the matching Ready safety limit to at least observed_bytes, then resume with the current incident_id",
+        };
+    }
+};
+
+const ResumeRaftQuarantineRequest = struct {
+    expected_incident_id: u64,
+    new_limit_bytes: ?u64 = null,
+};
+
 fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlobalQueryTable {
     try query_contract.validatePublicQuerySortTupleContract(alloc, body);
     var parsed = metadata_openapi.server.parseGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
@@ -251,7 +290,8 @@ pub const AntflyApiHandler = struct {
     /// data-node protocol or internal-group routes on its admin listener.
     pub fn registerGeneratedRoutesWithProbes(self: *AntflyApiHandler, server: *httpx.Server) !void {
         try self.installMiddleware(server);
-        return self.registerRoutesWithOptions(server, false, true);
+        try self.registerRoutesWithOptions(server, false, true);
+        try self.registerRaftAdminRoutes(server);
     }
 
     fn installMiddleware(self: *AntflyApiHandler, server: *httpx.Server) !void {
@@ -503,6 +543,7 @@ pub const AntflyApiHandler = struct {
         try server.post(admin_routes.maintenance_compact, httpx.Handler.bind(self, compactStorage));
         try server.post(admin_routes.maintenance_vacuum, httpx.Handler.bind(self, vacuumStorage));
         try server.get(admin_routes.maintenance_jobs_prefix ++ "*", httpx.Handler.bind(self, getStorageMaintenanceJob));
+        try self.registerRaftAdminRoutes(server);
         try server.delete(admin_routes.maintenance_jobs_prefix ++ "*", httpx.Handler.bind(self, cancelStorageMaintenanceJob));
 
         const ha_internal_paths = [_][]const u8{ internal_routes.ha, internal_routes.ha ++ "/*" };
@@ -554,6 +595,12 @@ pub const AntflyApiHandler = struct {
         try server.post(document_artifact_prefix ++ routes.child_range_batch_suffix, httpx.Handler.bind(self, internalDocumentArtifactChildRangeBatch));
         try server.post(document_artifact_prefix ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalDocumentArtifactReprocess));
         try server.post(table_prefix ++ routes.artifacts_marker ++ ":artifact_name" ++ routes.reprocess_suffix, httpx.Handler.bind(self, internalTableArtifactReprocess));
+    }
+
+    fn registerRaftAdminRoutes(self: *AntflyApiHandler, server: anytype) !void {
+        try server.get(admin_routes.raft_quarantines, httpx.Handler.bind(self, listRaftQuarantines));
+        try server.get(admin_routes.raft_groups ++ "/:group_id" ++ admin_routes.raft_group_quarantine_suffix, httpx.Handler.bind(self, getRaftQuarantine));
+        try server.post(admin_routes.raft_groups ++ "/:group_id" ++ admin_routes.raft_group_quarantine_resume_suffix, httpx.Handler.bind(self, resumeRaftQuarantine));
     }
 
     fn registerProbes(self: *AntflyApiHandler, server: anytype) !void {
@@ -1125,6 +1172,107 @@ pub const AntflyApiHandler = struct {
 
     fn cancelStorageMaintenanceJob(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.readStorageMaintenanceJob(ctx, true);
+    }
+
+    fn raftQuarantineSource(self: *AntflyApiHandler) ?http_server_mod.RaftQuarantineAdminSource {
+        return self.api_server.cfg.raft_quarantine_admin;
+    }
+
+    fn authorizeRaftQuarantineAdmin(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        identity: *?AuthenticatedIdentity,
+    ) !?httpx.Response {
+        return try self.authorizeStorageMaintenance(ctx, identity);
+    }
+
+    fn listRaftQuarantines(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
+        if (try self.authorizeRaftQuarantineAdmin(ctx, &identity)) |response| return response;
+        const source = self.raftQuarantineSource() orelse
+            return textResponse(ctx, 503, "raft quarantine administration unavailable on this node");
+        const statuses = source.list(ctx.allocator) catch
+            return textResponse(ctx, 503, "raft quarantine status unavailable");
+        defer ctx.allocator.free(statuses);
+        const views = try ctx.allocator.alloc(RaftQuarantineView, statuses.len);
+        defer ctx.allocator.free(views);
+        for (statuses, views) |status, *view| view.* = .fromStatus(status);
+        return ctx.json(.{ .quarantines = views });
+    }
+
+    fn raftQuarantineGroupId(ctx: *httpx.Context) ?u64 {
+        const raw = ctx.param("group_id") orelse return null;
+        return std.fmt.parseUnsigned(u64, raw, 10) catch null;
+    }
+
+    fn getRaftQuarantine(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
+        if (try self.authorizeRaftQuarantineAdmin(ctx, &identity)) |response| return response;
+        const group_id = raftQuarantineGroupId(ctx) orelse return textResponse(ctx, 400, "invalid group id");
+        const source = self.raftQuarantineSource() orelse
+            return textResponse(ctx, 503, "raft quarantine administration unavailable on this node");
+        const statuses = source.list(ctx.allocator) catch
+            return textResponse(ctx, 503, "raft quarantine status unavailable");
+        defer ctx.allocator.free(statuses);
+        for (statuses) |status| if (status.group_id == group_id)
+            return ctx.json(RaftQuarantineView.fromStatus(status));
+        return textResponse(ctx, 404, "raft group is not quarantined on this node");
+    }
+
+    fn resumeRaftQuarantine(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
+        if (try self.authorizeRaftQuarantineAdmin(ctx, &identity)) |response| return response;
+        const group_id = raftQuarantineGroupId(ctx) orelse return textResponse(ctx, 400, "invalid group id");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing quarantine recovery request");
+        var parsed = std.json.parseFromSlice(ResumeRaftQuarantineRequest, ctx.allocator, body, .{
+            .ignore_unknown_fields = false,
+        }) catch return textResponse(ctx, 400, "invalid quarantine recovery request");
+        defer parsed.deinit();
+        const new_limit: ?usize = if (parsed.value.new_limit_bytes) |value|
+            std.math.cast(usize, value) orelse return textResponse(ctx, 400, "new_limit_bytes exceeds platform capacity")
+        else
+            null;
+        const source = self.raftQuarantineSource() orelse
+            return textResponse(ctx, 503, "raft quarantine administration unavailable on this node");
+        source.resumeGroup(group_id, .{
+            .expected_incident_id = parsed.value.expected_incident_id,
+            .new_limit_bytes = new_limit,
+        }) catch |err| {
+            std.log.warn(
+                "raft quarantine resume rejected group_id={} incident_id={} principal={s} error={s}",
+                .{
+                    group_id,
+                    parsed.value.expected_incident_id,
+                    if (identity) |authenticated| authenticated.username else "admin-bearer",
+                    @errorName(err),
+                },
+            );
+            return switch (err) {
+                error.UnknownGroup, error.GroupNotQuarantined => textResponse(ctx, 404, "raft group is not quarantined on this node"),
+                error.QuarantineIncidentChanged => textResponse(ctx, 409, "quarantine incident changed; refresh status before retrying"),
+                error.InvalidQuarantineRecoveryLimit => textResponse(ctx, 422, "new_limit_bytes must be monotonic and cover observed_bytes"),
+                error.QuarantineLimitStillExceeded => textResponse(ctx, 409, "current safety limit still does not cover the retained Ready"),
+                else => textResponse(ctx, 503, "raft quarantine recovery unavailable"),
+            };
+        };
+        std.log.info(
+            "raft quarantine resumed group_id={} incident_id={} principal={s} new_limit_bytes={?}",
+            .{
+                group_id,
+                parsed.value.expected_incident_id,
+                if (identity) |authenticated| authenticated.username else "admin-bearer",
+                new_limit,
+            },
+        );
+        return ctx.json(.{
+            .status = "resumed",
+            .group_id = group_id,
+            .incident_id = parsed.value.expected_incident_id,
+            .new_limit_bytes = new_limit,
+        });
     }
 
     fn internalRepairCancelState(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -7259,6 +7407,119 @@ test "httpx storage maintenance routes call typed operations directly" {
     defer canceled.deinit();
     try std.testing.expectEqual(@as(u16, 202), canceled.status.code);
     try std.testing.expect(std.mem.indexOf(u8, canceled.body.?, "\"state\":\"succeeded\"") != null);
+}
+
+test "httpx raft quarantine administration is authenticated and incident fenced" {
+    const alloc = std.testing.allocator;
+    const FakeQuarantineAdmin = struct {
+        resume_calls: usize = 0,
+        last_limit: ?usize = null,
+
+        fn source(self: *@This()) http_server_mod.RaftQuarantineAdminSource {
+            return .{ .ptr = self, .list_fn = list, .resume_fn = resumeGroup };
+        }
+
+        fn list(_: *anyopaque, list_alloc: std.mem.Allocator) ![]raft_mod.host.GroupQuarantineStatus {
+            const statuses = try list_alloc.alloc(raft_mod.host.GroupQuarantineStatus, 1);
+            statuses[0] = .{
+                .group_id = 41,
+                .quarantine = .{
+                    .incident_id = 77,
+                    .reason = .apply_ready_too_large,
+                    .observed_bytes = 8192,
+                    .configured_limit = 4096,
+                    .first_observed_round = 11,
+                    .last_observed_round = 12,
+                    .occurrences = 2,
+                },
+                .current_limit = 4096,
+                .can_resume = false,
+            };
+            return statuses;
+        }
+
+        fn resumeGroup(
+            ptr: *anyopaque,
+            group_id: u64,
+            options: raft_mod.host.ResumeQuarantineOptions,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (group_id != 41) return error.UnknownGroup;
+            if (options.expected_incident_id != 77) return error.QuarantineIncidentChanged;
+            if (options.new_limit_bytes == null or options.new_limit_bytes.? < 8192)
+                return error.InvalidQuarantineRecoveryLimit;
+            self.resume_calls += 1;
+            self.last_limit = options.new_limit_bytes;
+        }
+    };
+
+    var status_source = AuthStatusSource{};
+    var quarantine_admin = FakeQuarantineAdmin{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .raft_quarantine_admin = quarantine_admin.source(),
+        .admin_bearer_token = "raft-admin-secret",
+    }, status_source.iface(), null, null);
+    defer api_server.deinit();
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const list_url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_url, admin_routes.raft_quarantines });
+    defer alloc.free(list_url);
+
+    var unauthorized = try getWithRetry(&client, client_io.io(), list_url, null, 20);
+    defer unauthorized.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status.code);
+
+    const auth_headers = [_][2][]const u8{.{ "authorization", "Bearer raft-admin-secret" }};
+    var listed = try getWithRetry(&client, client_io.io(), list_url, &auth_headers, 20);
+    defer listed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), listed.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body.?, "\"incident_id\":77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body.?, "\"can_resume\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body.?, "\"suggested_action\"") != null);
+
+    const resume_url = try std.fmt.allocPrint(
+        alloc,
+        "{s}{s}/41{s}",
+        .{ base_url, admin_routes.raft_groups, admin_routes.raft_group_quarantine_resume_suffix },
+    );
+    defer alloc.free(resume_url);
+    const json_auth_headers = [_][2][]const u8{
+        .{ "authorization", "Bearer raft-admin-secret" },
+        .{ "content-type", "application/json" },
+    };
+    var stale = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        resume_url,
+        "{\"expected_incident_id\":76,\"new_limit_bytes\":8192}",
+        &json_auth_headers,
+        20,
+    );
+    defer stale.deinit();
+    try std.testing.expectEqual(@as(u16, 409), stale.status.code);
+
+    var resumed = try requestWithRetry(
+        &client,
+        client_io.io(),
+        .POST,
+        resume_url,
+        "{\"expected_incident_id\":77,\"new_limit_bytes\":8192}",
+        &json_auth_headers,
+        20,
+    );
+    defer resumed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resumed.status.code);
+    try std.testing.expectEqual(@as(usize, 1), quarantine_admin.resume_calls);
+    try std.testing.expectEqual(@as(?usize, 8192), quarantine_admin.last_limit);
 }
 
 test "httpx owned response preserves retryable JSON metadata" {

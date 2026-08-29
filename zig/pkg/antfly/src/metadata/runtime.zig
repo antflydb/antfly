@@ -250,6 +250,10 @@ pub const HealthSource = struct {
 
         try append(writer, "antfly_raft_hosted_groups", "gauge", "Number of raft groups hosted on this node", @intCast(host_metrics.hosted_groups));
         try append(writer, "antfly_raft_quarantined_groups", "gauge", "Number of raft groups stopped by a hard Ready safety invariant and awaiting explicit recovery", @intCast(host_metrics.quarantined_groups));
+        try append(writer, "antfly_raft_quarantined_inbound_messages_dropped_total", "counter", "Inbound Raft messages isolated to quarantined groups", host_metrics.quarantined_inbound_message_drops);
+        try append(writer, "antfly_raft_quarantine_resume_attempts_total", "counter", "Fenced operator attempts to resume quarantined Raft groups", host_metrics.runtime_quarantine_resume_attempts);
+        try append(writer, "antfly_raft_quarantine_resume_successes_total", "counter", "Successful fenced resumes of quarantined Raft groups", host_metrics.runtime_quarantine_resume_successes);
+        try append(writer, "antfly_raft_quarantine_resume_conflicts_total", "counter", "Rejected stale quarantine incident acknowledgements", host_metrics.runtime_quarantine_resume_conflicts);
         try append(writer, "antfly_raft_reconcile_rounds_total", "counter", "Total number of reconcile rounds", @intCast(host_metrics.reconcile_rounds));
         try append(writer, "antfly_raft_ensure_replica_calls_total", "counter", "Total ensure_replica calls", @intCast(host_metrics.ensure_replica_calls));
         try append(writer, "antfly_raft_remove_replica_calls_total", "counter", "Total remove_replica calls", @intCast(host_metrics.remove_replica_calls));

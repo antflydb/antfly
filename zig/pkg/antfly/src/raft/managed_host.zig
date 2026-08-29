@@ -295,8 +295,19 @@ pub const ManagedHost = struct {
         return self.host.quarantineStatus(group_id);
     }
 
-    pub fn resumeQuarantinedGroup(self: *ManagedHost, group_id: u64) !void {
-        try self.host.resumeQuarantinedGroup(group_id);
+    pub fn listQuarantines(
+        self: *const ManagedHost,
+        alloc: std.mem.Allocator,
+    ) ![]raft_engine.runtime.multi_raft.GroupQuarantineStatus {
+        return try self.host.listQuarantines(alloc);
+    }
+
+    pub fn resumeQuarantinedGroup(
+        self: *ManagedHost,
+        group_id: u64,
+        options: raft_engine.runtime.multi_raft.ResumeQuarantineOptions,
+    ) !void {
+        try self.host.resumeQuarantinedGroup(group_id, options);
     }
 
     pub fn bootstrapStatus(self: *const ManagedHost, group_id: u64) ?host_mod.BootstrapStatus {
@@ -585,8 +596,19 @@ pub const ManagedHttpHost = struct {
         return self.http_host.quarantineStatus(group_id);
     }
 
-    pub fn resumeQuarantinedGroup(self: *ManagedHttpHost, group_id: u64) !void {
-        try self.http_host.resumeQuarantinedGroup(group_id);
+    pub fn listQuarantines(
+        self: *const ManagedHttpHost,
+        alloc: std.mem.Allocator,
+    ) ![]raft_engine.runtime.multi_raft.GroupQuarantineStatus {
+        return try self.http_host.listQuarantines(alloc);
+    }
+
+    pub fn resumeQuarantinedGroup(
+        self: *ManagedHttpHost,
+        group_id: u64,
+        options: raft_engine.runtime.multi_raft.ResumeQuarantineOptions,
+    ) !void {
+        try self.http_host.resumeQuarantinedGroup(group_id, options);
     }
 
     pub fn bootstrapStatus(self: *const ManagedHttpHost, group_id: u64) ?host_mod.BootstrapStatus {

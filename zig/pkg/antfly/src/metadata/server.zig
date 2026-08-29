@@ -50,6 +50,23 @@ pub const MetadataServerDeps = struct {
     http: service.MetadataHttpServiceDeps = .{},
 };
 
+fn listMetadataRaftQuarantinesForAdmin(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+) ![]raft_host.GroupQuarantineStatus {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.listRaftQuarantinesForAdmin(alloc);
+}
+
+fn resumeMetadataRaftQuarantineForAdmin(
+    ptr: *anyopaque,
+    group_id: u64,
+    options: raft_host.ResumeQuarantineOptions,
+) !void {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    try svc.resumeRaftQuarantineForAdmin(group_id, options);
+}
+
 pub const MetadataServer = struct {
     alloc: std.mem.Allocator,
     svc: *service.MetadataHttpService,
@@ -214,6 +231,11 @@ pub const MetadataServer = struct {
             var api_server_cfg = cfg.api_server_cfg;
             api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();
+            api_server_cfg.raft_quarantine_admin = .{
+                .ptr = svc,
+                .list_fn = listMetadataRaftQuarantinesForAdmin,
+                .resume_fn = resumeMetadataRaftQuarantineForAdmin,
+            };
             api_server_cfg.backend_runtime = backend_runtime;
             api_server_cfg.restore_execution_guard = .{
                 .ptr = svc,
