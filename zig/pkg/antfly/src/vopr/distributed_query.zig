@@ -394,13 +394,13 @@ pub const Scenario = struct {
             if (self.mode.? == .service_rate) {
                 const group_11_usage_after = try self.service_rate_model.nodeUsage(service_nodes[0].id);
                 const group_22_usage_after = try self.service_rate_model.nodeUsage(service_nodes[1].id);
-                const group_11_operations = group_11_usage_after.operations - group_11_usage_before.?.operations;
-                const group_22_operations = group_22_usage_after.operations - group_22_usage_before.?.operations;
+                const group_11_units = group_11_usage_after.units - group_11_usage_before.?.units;
+                const group_22_units = group_22_usage_after.units - group_22_usage_before.?.units;
                 const group_11_charged_ns = group_11_usage_after.charged_ns - group_11_usage_before.?.charged_ns;
                 const group_22_charged_ns = group_22_usage_after.charged_ns - group_22_usage_before.?.charged_ns;
                 const expected_group_22_charged_ns: u64 = if (self.slowdown_healed) 30 else 120;
                 self.service_rate_sound = self.service_rate_sound and
-                    group_11_operations == 2 and group_22_operations == 2 and
+                    group_11_units == 2 and group_22_units == 2 and
                     group_11_charged_ns == 30 and
                     group_22_charged_ns == expected_group_22_charged_ns;
             }

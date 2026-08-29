@@ -400,7 +400,7 @@ pub const Scenario = struct {
                 overlapping_cost == 22 and
                 node_only_cost == 10 and
                 healed_cost == 5 and
-                usage.operations == 18 and
+                usage.units == 18 and
                 usage.charged_ns == 66 and
                 model.active.items.len == 0 and
                 self.compute_calls == 1 and stats.hits == 4 and stats.misses == 1 and

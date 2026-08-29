@@ -50,7 +50,7 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
         // than the compact default used by protocol-level VOPR scenarios.
         .tasks = .{ .stack_size = 8 * 1024 * 1024 },
         .network = .{ .max_sockets = options.max_sockets },
-        .instrumentation = .{ .enabled = false, .map_digest = 0x44535652 },
+        .instrumentation = .{ .enabled = options.prioritize_time, .map_digest = 0x44535652 },
     });
     defer vopr_io.deinit();
     const io = vopr_io.io();
@@ -71,7 +71,11 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
     defer background_jobs.deinit();
     backend_runtime.durable_jobs = background_jobs.lane();
 
-    var lifecycle = request_lifecycle.Hook{ .vopr_io = &vopr_io };
+    var ingress_release: std.Io.Event = .unset;
+    var lifecycle = request_lifecycle.Hook{
+        .vopr_io = &vopr_io,
+        .ingress_release = if (options.prioritize_time) &ingress_release else null,
+    };
     var data_lifecycle = request_lifecycle.DataHook{ .vopr_io = &vopr_io };
     var disconnect_probe = http_disconnect.Probe{ .vopr_io = &vopr_io };
     var metadata = StubMetadataExecutor{};
@@ -105,6 +109,7 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
         io: std.Io,
         request_uri: []const u8,
         half_close_request: bool,
+        request_timeout_ms: u64,
         response_status: ?u16 = null,
         request_error: ?anyerror = null,
         request_done: bool = false,
@@ -113,6 +118,7 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
             if (self.half_close_request) return self.requestWithHalfClose();
             var client = httpx.Client.initWithConfig(self.alloc, self.io, .{
                 .keep_alive = false,
+                .timeouts = .{ .request_ms = self.request_timeout_ms },
                 .retry_policy = .{ .max_retries = 0 },
             });
             defer client.deinit();
@@ -176,11 +182,13 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
         .io = io,
         .request_uri = request_uri,
         .half_close_request = options.half_close_request,
+        .request_timeout_ms = if (options.prioritize_time) 1 else 0,
     };
     if (options.partial_write_limit) |limit| try vopr_io.limitNextNetworkWrite(limit);
     _ = io.async(Shared.request, .{&shared});
 
     var shutdown_started = false;
+    var ingress_released = !options.prioritize_time;
     var enabled: vopr.transition.List = .{};
     defer enabled.deinit(alloc);
     var events: vopr.event.Sink = .{};
@@ -188,13 +196,19 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
     const scheduler = vopr_io.scheduler();
     var transitions: usize = 0;
     while (!scheduler.quiescent()) {
-        if (shared.request_done and !shutdown_started) {
+        if (shared.request_done and !ingress_released) {
+            ingress_release.set(io);
+            ingress_released = true;
+        }
+        if (shared.request_done and !shutdown_started and vopr_io.resourceSnapshot().open_sockets == 1) {
             shutdown_started = true;
             // Deterministic embedders publish stop first, keep driving the
             // borrowed scheduler until every owner has observed it, and only
-            // then join. Joining from a scheduled task can park that task
-            // behind listener cleanup while the external driver mistakes an
-            // empty ready set for completed teardown.
+            // then join. Wait for the completed request's client/server pair
+            // to release both reservations before publishing stop: the
+            // listener wake path itself needs a temporary connection pair and
+            // must remain available at the configured minimum socket budget;
+            // the listener alone is the required pre-teardown baseline.
             server.beginTeardown();
         }
         enabled.items.clearRetainingCapacity();
@@ -202,7 +216,10 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
         try enabled.canonicalize();
         try std.testing.expect(enabled.items.items.len != 0);
         var selected = enabled.items.items[0];
-        if (options.prioritize_time) {
+        const ingress_seen = vopr_io.instrumentation.count(
+            request_lifecycle.Hook.stableId(.{ .phase = .ingress }),
+        ) != 0;
+        if (options.prioritize_time and ingress_seen) {
             for (enabled.items.items) |candidate| {
                 if (std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) {
                     selected = candidate;
@@ -227,7 +244,7 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
         try std.testing.expect(shared.request_error != null);
         try std.testing.expectEqual(@as(?u16, null), shared.response_status);
     } else {
-        try std.testing.expect(shared.request_error == null);
+        if (shared.request_error) |err| return err;
         try std.testing.expectEqual(@as(?u16, 200), shared.response_status);
     }
     try std.testing.expect(shutdown_started);
@@ -240,9 +257,13 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
     try std.testing.expectEqual(@as(u64, 1), vopr_io.instrumentation.count(
         request_lifecycle.Hook.stableId(.{ .phase = .ingress }),
     ));
-    try std.testing.expectEqual(@as(u64, 1), vopr_io.instrumentation.count(
+    const response_ready_count = vopr_io.instrumentation.count(
         request_lifecycle.Hook.stableId(.{ .phase = .response_ready }),
-    ));
+    );
+    if (options.prioritize_time)
+        try std.testing.expect(response_ready_count <= 1)
+    else
+        try std.testing.expectEqual(@as(u64, 1), response_ready_count);
     try vopr_io.ensureNoCapabilityViolation();
 }
 

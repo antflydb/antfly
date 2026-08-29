@@ -443,13 +443,13 @@ state machine, or follower recovery participated.
 | Antfly-independent runtime boundary | `runtime.zig`, `sim_runtime.zig`; `VoprIo` composes the narrow atomic executor into its scheduler; Antfly `DurableJobLane` adapter | `zig build vopr-engine-test vopr-runtime-test` |
 | Deterministic `std.Io` tasks and synchronization | `vopr_io.zig`, `vopr_io_task.zig` | `zig build vopr-engine-test` in Debug and ReleaseSafe |
 | Typed strong-read capabilities | `raft/read_gate.zig` separates enqueue-only `ReadIndexRequester` from synchronous `ReadSafetyBarrier`; managed Raft services expose only initiation, while public table-read sources accept only the barrier type. DataServer implements the barrier with canonical matching-group ReadState plus applied-index completion, starts replicated sources with a fail-closed unavailable barrier, and installs `alreadyReadSafeBarrier` only after explicitly selecting direct non-Raft ownership. The three-owner production history exact-replays follower success/typed stale-leader rejection, old-to-new leader transfer and retry, logical timeout, cancellation cleanup, state-machine group retirement, and graph/full-index visibility. The former readable-lease API, no-op name, service adapters, and metrics were renamed or deleted directly; there are no compatibility aliases | `zig build raft-test root-test lib-data-runtime-test` |
-| Modeled files, durability, persistent sector corruption, torn synchronization, streams, datagrams, processes, global quotas, and endpoint-stable reversible listener connection limits | `vopr_io_file.zig`, `vopr_io_net.zig`, `vopr_io_process.zig`; virtual streams expose peer disconnect only after an ordered FIN is delivered behind all prior payload or after reset. The VOPR HTTP adapter maps that state into HTTPX's production-neutral H1 disconnect probe; no hard-disconnect-only alias remains | `zig build vopr-engine-test production-cluster-graph-cancellation-vopr-test` |
+| Modeled files, durability, persistent sector corruption, torn synchronization, streams, datagrams, processes, global quotas, and endpoint-stable reversible listener connection limits | `vopr_io_file.zig`, `vopr_io_net.zig`, `vopr_io_process.zig`; virtual streams distinguish an ordered write-half FIN from full peer read abandonment and hard reset. Both FIN and full-close control remain ordered behind prior payload, while only read abandonment/reset satisfies HTTPX's production-neutral H1 disconnect probe. The forward-only API is named for peer abandonment rather than generic disconnect, full close has its own stable transition identity, and this semantic change directly advances the virtual-OS replay model to v7 | `zig build vopr-engine-test data-server-vopr-test production-cluster-graph-cancellation-vopr-test` |
 | Stable optional safepoints | `vopr_io_instrumentation.zig` | `zig build vopr-engine-test` |
 | Clocks, timers, storage completions, and lifecycle faults | `time.zig`, `clock_fault.zig`, `fault.zig`, storage `sim_runtime.zig` | `zig build vopr-engine-test storage-vopr-runtime-test` |
 | Properties, observations, semantic coverage, cross-revision corpus quarantine, property history, and guided search | `property.zig`, `observation.zig`, `coverage.zig`, `corpus.zig`, `explorer.zig` | `zig build vopr-engine-test vopr-benchmark` |
 | Integrated retroactive flight recording and fielded temporal event queries | `flight_recorder.zig`, `event_query.zig`, `debug_recipe.zig`; bounded recordings own structured fields and verbose text outside canonical bytes, support conjunctive field/text filters and before/after windows, and are populated directly by runner-backed and custom metadata/domain replay paths. Every retained/failing campaign writes `.flight.json`, while every debug recipe packages a filtered reduced-replay window | `zig build vopr-engine-test vopr-meta-test`; `vopr events` and `vopr recipe` are argument-taking commands, not standalone test gates |
-| Saved cross-run event sets, validation, counting, and live streams | `event_set.zig` validates a versioned forward-only query DAG and evaluates selection, union/intersection/difference/complement, distinct/first/last moment, previous/next, and bounded sequence operations across canonical histories. Its tests execute every operator and reject forward references, malformed operators, duplicate names, v0 formats, and the former ad-hoc selector shape. `vopr events` accepts only this saved-plan format and exact-replayed traces, with repeated `--trace`, `--validate`, and `--count`; `event_stream.zig` and `runner.Config.event_observer` publish allocation-free bounded NDJSON whose built-in observer converts encoding overflow and sink failure into diagnostic counters. A runner-level test injects a sink failure and proves byte-identical canonical output against an unobserved run. Custom observers are synchronous and must not block or panic | `zig build vopr-engine-test vopr-meta-test` |
-| Reversible node and operation service rates | `service_rate.zig` registers stable node/operation identities, composes checked node-wide and operation-specific parts-per-million costs, charges logical time through borrowed `std.Io`, accounts usage, exposes active-effect count, and heals individual effects by stable fault ID. `fault.zig` and `deployment.zig` expose compatible service-rate fault identities and process/resource domains. Six production-neutral boundaries are integrated: query-cache request/hit/wait/producer work, DataServer Raft rounds, DataServer LSM-maintenance steps, distributed graph expand/hydrate/get-edges fanout, replication snapshot/stream steps, and serverless publish/enrichment/compaction/prune rounds. Focused histories prove exact slowed/healed behavior. Full-cluster v23 installs one shared model into DataServer, graph, and serverless owners, proves exact two-times pre-heal and baseline post-heal charging, continued public graph work, no live effects, visibility, cleanup, and exact replay | `zig build vopr-engine-test query-embedding-cache-vopr-test lib-data-runtime-test data-server-vopr-test distributed-query-vopr-test replication-backfill-vopr-test serverless-workflow-vopr-test production-cluster-service-rate-vopr-test`; query-cache/backfill and deadline/fault overlap in the same deployment remain roadmap breadth |
+| Saved cross-run event sets, validation, counting, and live streams | `event_set.zig` validates a versioned forward-only query DAG and evaluates selection, union/intersection/difference/complement, distinct/first/last moment, previous/next, and bounded sequence operations across canonical histories. Its tests execute every operator and reject forward references, malformed operators, duplicate names, v0 formats, and the former ad-hoc selector shape. `vopr events` accepts only this saved-plan format and exact-replayed traces, with repeated `--trace`, `--validate`, and `--count`. Forward-only `vopr-event-stream-v2` serializes into a caller-owned fixed-slot queue: publication cannot allocate, block, or invoke external code; drop-newest backpressure, oversize records, publication after close, delivery, and sink failures have separate saturating counters. Consumers drain complete NDJSON records outside the runner, failed delivery retains the oldest record for retry, and close still permits draining. Runner tests prove queue pressure leaves canonical output byte-identical to an unobserved run. Custom observers remain an expert synchronous interface and must not block or panic | `zig build vopr-engine-test vopr-meta-test` |
+| Reversible node and operation service rates | `service_rate.zig` registers unambiguous stable node/operation identities, composes checked node-wide and operation-specific parts-per-million costs, charges logical time through borrowed `std.Io`, and heals individual effects by stable fault ID. Active effects remain in canonical fault-ID order, so activation and healing order cannot change fractional rounding for the same active set. Accounting distinguishes charge calls, caller-defined work units, and logical nanoseconds both per node and per `(node, operation)` pair. `fault.zig` and `deployment.zig` expose compatible service-rate fault identities and process/resource domains. Six production-neutral boundaries are integrated: query-cache request/hit/wait/producer work, DataServer Raft rounds, DataServer LSM-maintenance steps, distributed graph expand/hydrate/get-edges fanout, replication snapshot/stream steps, and serverless publish/enrichment/compaction/prune rounds. Focused histories prove exact slowed/healed behavior; replication and serverless additionally assert exact per-operation usage. Full-cluster v23 installs one shared model into DataServer, graph, and serverless owners, proves exact two-times pre-heal and baseline post-heal charging, continued public graph work, no live effects, visibility, cleanup, and exact replay | `zig build vopr-engine-test query-embedding-cache-vopr-test lib-data-runtime-test data-server-vopr-test distributed-query-vopr-test replication-backfill-vopr-test serverless-workflow-vopr-test production-cluster-service-rate-vopr-test`; query-cache/backfill and deadline/fault overlap in the same deployment remain roadmap breadth |
 | Integrated per-history and aggregate run/results API with phased health evidence | `runner.zig`, `report.zig`, `health.zig`, `vopr_io.zig`, `vopr-results`; every runner history samples continuous/recovery/final health without changing canonical trace bytes, exact replay rematerializes the evidence, `VoprIo.healthSnapshot` supplies task/descriptor/storage data, and mature P0/P1 adapters add domain progress, recovery, consistency, allocator/crash classification, and cleanup | `zig build vopr-engine-test vopr-contract-test vopr-registry-test vopr-results` |
 | Integrated persistent local run/results index and usage query API | `run_index.zig`, `vopr-index`; atomically persisted `vopr-run-index-v1` projects per-history and aggregate results into canonical run, revision, property, fingerprint, corpus/quarantine, artifact, and budget records. CLI predicates and `vopr-run-index-query-v1` cover every dimension, and the same query renders a static local HTML summary | `zig build vopr-engine-test vopr-meta-test vopr-index` |
 | Automatic debug recipes and deterministic corpus merging | `debug_recipe.zig`, callback-based `reducer.zig`, `corpus.zig`; `vopr-recipe`, `vopr-corpus-merge` | `zig build vopr-engine-test vopr-meta-test` |
@@ -1186,6 +1186,16 @@ Focused gate: `clock-fault-vopr-test`.
 
 VOPR work has found concrete production and harness defects:
 
+- The first live-event observer called its output sink inline from the runner,
+  so a slow or blocked diagnostic consumer could perturb or deadlock a history
+  despite the feature being described as diagnostic-only. The forward-only v2
+  stream now publishes only into caller-owned bounded slots and drains sinks
+  outside execution, with explicit overflow, close, retry, and delivery
+  evidence. The same audit found that overlapping fractional service-rate
+  effects were evaluated in activation order and reordered by healing, making
+  rounded cost depend on fault history rather than the current active set.
+  Effects are now kept in canonical fault-ID order, and an order-sensitive
+  regression proves equivalent active sets have identical cost.
 - Transaction recovery retained the address of the temporary `DB` wrapper
   constructed inside `DB.open`, although the wrapper is returned by value.
   ReleaseSafe poisoned the stale address and recovery later entered the HA
@@ -1199,16 +1209,26 @@ VOPR work has found concrete production and harness defects:
   could try to wake through an unacquired/released `HttpRuntime` lease. Wakeup
   is now gated by the listener's atomic ownership publication; startup still
   observes the already-published stop on both sides of bind.
-- The v25 public-cancellation gate found that VOPR's HTTP disconnect adapter
-  recognized reset-style aborts but not an orderly client FIN, and the
-  production-owner cluster had not installed that backend-neutral probe on its
-  DataServers. Canceling a public request could therefore leave the listener
-  token unset while graph hydration completed. `VoprIo` now reports peer
-  disconnect only after the scheduled FIN (and all preceding bytes) is
-  delivered or after reset, every production-owner DataServer installs the
-  probe, and the gate proves canceled fanout has no completion before a clean
-  retry. The old hard-disconnect-only VOPR names were removed rather than
-  retained as aliases.
+- The v25 public-cancellation gate found that the production-owner cluster had
+  not installed VOPR's backend-neutral HTTP disconnect probe. Canceling a
+  public request could therefore leave the listener token unset while graph
+  hydration completed. The initial repair treated any ordered FIN as peer
+  abandonment; the later DataServer half-close gate exposed that a client may
+  validly finish request bytes with `shutdownWrite` while retaining its read
+  side for the response. `VoprIo` now carries write-half FIN and read-side
+  abandonment as distinct ordered controls behind all preceding bytes. Only a
+  full close or reset cancels the handler, and v25 still proves canceled fanout
+  has no completion before a clean retry. The ambiguous disconnect APIs were
+  renamed directly rather than retained as aliases.
+- The focused DataServer deadline scenario always preferred logical time from
+  startup but still required server ingress and response preparation. It could
+  therefore pass or fail based on whether the request reached the listener
+  before its timer, without exercising the cancellation seam its name claimed.
+  The deadline mode now enables the stable production request safepoints,
+  drives non-time work until ingress is observed, and only then lets logical
+  time win. Response preparation may be preempted or race safely with client
+  cancellation; admitted ingress, the client error, absence of a received
+  response, drained API leases, and cleanup remain mandatory.
 - The independent-domain checkpoint exposed a latent compile defect caused by
   a local durable-job-lane variable shadowing the `lane` method.
 - The distributed-fanout service-rate checkpoint exposed a stale native graph
@@ -1566,8 +1586,9 @@ VOPR work has found concrete production and harness defects:
 - Borrowed HTTP runtimes could not observe a peer reset because the native
   descriptor observer cannot inspect virtual socket handles; DataServer
   consequently disabled hard-disconnect cancellation under deterministic I/O.
-  httpx now accepts a backend-neutral reset probe, and `VoprIo` distinguishes
-  reset from ordered FIN even when unread pipelined bytes remain.
+  httpx now accepts a backend-neutral probe, and `VoprIo` distinguishes reset,
+  full read-side abandonment, and an ordered write-half FIN even when unread
+  pipelined bytes remain.
 - Supplying server TLS certificate and key paths only printed a warning and
   continued serving plaintext. Binding now rejects incomplete TLS
   configuration and fails closed before reserving runtime or socket capacity;
@@ -1588,10 +1609,13 @@ VOPR work has found concrete production and harness defects:
   the join could park behind listener cleanup while the external driver saw no
   ready transition and incorrectly declared the history complete; subsequent
   backend teardown then waited forever on the still-live API-lane lease. The
-  scenario now follows the required two-phase lifecycle: publish
-  `beginTeardown`, drive the scheduler to quiescence, then join. It also
-  requires zero outstanding API-lane leases. This was a harness lifecycle
-  defect, not a product-property failure.
+  scenario now waits for the completed request's client/server pair to return to the
+  listener-only descriptor baseline before publishing stop, because the
+  listener wake itself needs a temporary connection pair at minimum capacity,
+  then follows the required two-phase lifecycle: publish `beginTeardown`, drive
+  the scheduler to quiescence, and join. It also requires zero outstanding
+  API-lane leases. This was a harness lifecycle defect, not a product-property
+  failure.
 - Closing a virtual listener released the listening handle but retained
   completed server-side connections still waiting in its accept queue. A
   shutdown-wakeup connection therefore leaked one live socket and could leave
@@ -2239,7 +2263,7 @@ fault domains in the same replayable history.
 | Question | Current answer | Highest-value next work |
 | --- | --- | --- |
 | Where should Antfly add VOPR testing? | At production orchestration boundaries that combine durable state, ownership, public visibility, and recovery | Deepen the v26 production-owner cluster with in-flight authorization mutation, stale-generation/retry-exhaustion, and cancellation-under-fault composition, disk-capacity pressure, broader socket/topology faults, storage/process/restart/short-write overlaps, and query-cache/backfill/deadline service-rate composition; finish the repository-wide strong-read contract and managed-index publication/readiness; extend the durable-finalizer join seam into partition-worker recovery and global-query workflows; then compose metadata administration, MCP/A2A, cloud authentication, extension invocation, and live credential/provider replacement |
-| Which Antithesis ideas remain worth porting locally? | The large engine features, saved cross-run event-set programs, bounded live streams, and reversible logical service rates are implemented at the registered in-process boundary; query-cache, DataServer, graph, replication, and serverless work are production-charged seams, and v23 composes DataServer, graph, and serverless charging in one cluster | Transitive determinism auditing; nightly sharding, retention, quarantine review, notifications, and dashboards; compiler coverage as guidance when Zig instrumentation is stable; broader v23 service-rate ownership/deadline/fault combinations and production/search adoption |
+| Which Antithesis ideas remain worth porting locally? | The large engine features, saved cross-run event-set programs, non-blocking bounded live streams, and reversible logical service rates with per-node/per-operation evidence are implemented at the registered in-process boundary; query-cache, DataServer, graph, replication, and serverless work are production-charged seams, and v23 composes DataServer, graph, and serverless charging in one cluster | Transitive determinism auditing; nightly sharding, retention, quarantine review, notifications, and dashboards; compiler coverage as guidance when Zig instrumentation is stable; broader v23 service-rate ownership/deadline/fault combinations and production/search adoption |
 | Is distributed VOPR missing? | **Partly.** In-process application-level distributed VOPR exists: logical nodes, directional links, process/storage/resource domains, independent and overlapping link-plus-resource faults, selected-listener socket admission, quiet suffixes, and exact replay are integrated | Antithesis-style separate-address-space orchestration is not implemented, and whole-deployment breadth is incomplete. Co-resident HA/data-plane/serverless ownership, disk-capacity pressure, broader socket/storage/process/restart overlap, federated process agents, and live mixed binaries remain future or conditional work |
 | Are the features called finished actually finished? | Only within each narrowly stated **integrated** seam and its named green replay gate | Do not infer current aggregate health, transitive call-graph determinism, every cross-domain combination, arbitrary native/container determinism, or Antithesis product parity. Partial, ongoing, conditional, and explicitly excluded work remains unfinished |
 
@@ -2527,7 +2551,9 @@ accept-versus-shutdown, bounded connection/request admission, minimum socket
 capacity, descriptor reuse, and overload recovery. Hard disconnect now has a
 backend-neutral probe at the httpx handler boundary: native runtimes retain the
 shared descriptor observer, while `VoprIo` models reset separately from FIN and
-cancels an active handler even with unread pipelined input. Direct server TLS
+from full-close read abandonment. A write-half FIN preserves the response path;
+a full close or reset cancels an active handler even with unread pipelined
+input. Direct server TLS
 configuration fails closed before runtime or socket admission; the supported
 production boundary is explicit TLS termination at a reverse proxy or load
 balancer. Extend this suite when httpx gains a production server-side TLS
@@ -2741,8 +2767,12 @@ ownership is released.
   operators. Plans are forward-only validated DAGs with explicit result and
   match limits. `vopr events` accepts the saved format, clean-replays one or
   more histories, validates without running, or emits count-only/full results.
-  An optional runner observer streams canonical events as bounded NDJSON while
-  a history is active; observer overflow and write failure cannot affect replay.
+  A forward-only v2 runner observer serializes canonical events into a
+  caller-owned fixed-slot NDJSON queue while a history is active. Publication
+  cannot allocate, call external code, or block. Drop-newest overflow and
+  publication after close are counted; a separate consumer drains complete
+  records, retains the oldest record after sink failure, and may retry or drain
+  the remaining queue after close. None of those diagnostics affect replay.
   Saved plans require an explicit format and use prior-step indexes, for example:
 
   ```json
@@ -2948,13 +2978,16 @@ local replacement are integrated:
     previous/next/sequence operators, bounded cross-history evaluation,
     count-only CLI results, and repeated-run input. Operator-complete tests and
     CLI meta coverage reject obsolete/ad-hoc schemas rather than adapting them;
-    a runner-owned live NDJSON observer converts overflow or sink failure into
-    diagnostic evidence, with byte-equivalence against an unobserved history;
+    a runner-owned live NDJSON observer publishes into a fixed-slot queue with
+    explicit drop-newest backpressure and close semantics, while sink delivery
+    and retry occur outside execution. Queue pressure has byte-equivalence
+    against an unobserved history;
     and
-12. a reversible service-rate model with stable node and operation identities,
-    checked compositional multipliers, usage accounting, and a node-bound
-    borrowed-`std.Io` charge port. The generic fault and deployment registries
-    recognize this effect independently from pause and terminal CPU budgets;
+12. a reversible service-rate model with unambiguous stable node and operation
+    identities, checked compositional multipliers in canonical fault-ID order,
+    per-node and per-operation charge/unit/nanosecond accounting, and a
+    node-bound borrowed-`std.Io` charge port. The generic fault and deployment
+    registries recognize this effect independently from pause and terminal CPU budgets;
     the production query-embedding cache supplies the first reviewed adapter
     and exact-replay overlap/deadline/healing proof. DataServer supplies a
     second adapter at each Raft progress round, with node-local slowdown,

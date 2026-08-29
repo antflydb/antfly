@@ -581,10 +581,21 @@ test "replication backfill service rates compose and heal across production snap
     try std.testing.expect(state.service_charges[0] >= 2);
     try std.testing.expect(state.service_charges[1] >= 1);
     const usage = try state.service_model.?.nodeUsage(Scenario.service_node.id);
-    try std.testing.expectEqual(state.service_charges[0] + state.service_charges[1], usage.operations);
+    try std.testing.expectEqual(state.service_charges[0] + state.service_charges[1], usage.charges);
+    try std.testing.expectEqual(state.service_charges[0] + state.service_charges[1], usage.units);
     const expected_snapshot_ns = Scenario.snapshot_operation.base_cost_ns * (state.service_charges[0] + 4);
     const expected_stream_ns = Scenario.stream_operation.base_cost_ns * state.service_charges[1];
     try std.testing.expectEqual(expected_snapshot_ns + expected_stream_ns, usage.charged_ns);
+    try std.testing.expectEqualDeep(vopr.service_rate.Usage{
+        .charges = state.service_charges[0],
+        .units = state.service_charges[0],
+        .charged_ns = expected_snapshot_ns,
+    }, try state.service_model.?.operationUsage(Scenario.service_node.id, Scenario.snapshot_operation.id));
+    try std.testing.expectEqualDeep(vopr.service_rate.Usage{
+        .charges = state.service_charges[1],
+        .units = state.service_charges[1],
+        .charged_ns = expected_stream_ns,
+    }, try state.service_model.?.operationUsage(Scenario.service_node.id, Scenario.stream_operation.id));
     try std.testing.expectEqual(@as(usize, 0), state.service_model.?.active.items.len);
     try state.sim.ensureNoCapabilityViolation();
 }

@@ -20917,7 +20917,8 @@ test "DataServer LSM maintenance cost port composes and heals on borrowed VoprIo
     try std.testing.expect(done);
     if (failure) |err| return err;
     const usage = try model.nodeUsage(node.id);
-    try std.testing.expectEqual(@as(u64, 2), usage.operations);
+    try std.testing.expectEqual(@as(u64, 2), usage.charges);
+    try std.testing.expectEqual(@as(u64, 2), usage.units);
     try std.testing.expectEqual(@as(u64, 200), usage.charged_ns);
     try sim.ensureNoCapabilityViolation();
 }
@@ -31867,7 +31868,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             try self.service_rate_model.heal(self.node_slow_fault_id);
             slowdown_active = false;
             const usage_after = try self.service_rate_model.nodeUsage(self.slowed_node_id);
-            const charged_operations = usage_after.operations - usage_before.operations;
+            const charged_operations = usage_after.units - usage_before.units;
             const charged_ns = usage_after.charged_ns - usage_before.charged_ns;
             try std.testing.expect(charged_operations > 0);
             try std.testing.expectEqual(

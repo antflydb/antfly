@@ -25,7 +25,7 @@ const process_mod = @import("vopr_io_process.zig");
 const task_mod = @import("vopr_io_task.zig");
 const transition = @import("transition.zig");
 
-pub const model_version: u32 = 6;
+pub const model_version: u32 = 7;
 
 pub const Capability = enum(u6) {
     eager_async,
@@ -672,8 +672,8 @@ pub const VoprIo = struct {
         try self.network.abort(handle);
     }
 
-    pub fn socketPeerDisconnected(self: *const VoprIo, handle: std.Io.net.Socket.Handle) bool {
-        return self.network.peerDisconnected(handle);
+    pub fn socketPeerAbandonedConnection(self: *const VoprIo, handle: std.Io.net.Socket.Handle) bool {
+        return self.network.peerAbandonedConnection(handle);
     }
 
     pub fn setCpuTime(self: *VoprIo, process_ns: i64, thread_ns: i64) void {

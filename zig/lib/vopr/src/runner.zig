@@ -37,9 +37,9 @@ pub const Config = struct {
     /// Optional diagnostic-only ring. Recorder contents and capacity never
     /// participate in choices, observations, fingerprints, or replay.
     flight_recorder: ?*flight_recorder.Recorder = null,
-    /// Optional diagnostic-only live observer. The built-in bounded NDJSON
-    /// observer isolates sink failure and overflow from execution and replay;
-    /// custom synchronous observers must not block or panic.
+    /// Optional diagnostic-only live observer. The built-in buffered NDJSON
+    /// observer never calls its sink on this path and isolates queue overflow
+    /// from execution and replay. Custom observers must not block or panic.
     event_observer: ?event_stream.Observer = null,
 };
 
@@ -726,7 +726,7 @@ test "runner publishes canonical events without changing replay truth" {
     }
 }
 
-test "bounded NDJSON stream failure is diagnostic-only at the runner boundary" {
+test "bounded NDJSON stream backpressure is diagnostic-only at the runner boundary" {
     const Scenario = struct {
         pub const name: []const u8 = "runner-bounded-live-events";
         pub const version: u32 = 1;
@@ -753,23 +753,9 @@ test "bounded NDJSON stream failure is diagnostic-only at the runner boundary" {
             return world.done;
         }
     };
-    const FailingSink = struct {
-        attempts: u64 = 0,
-
-        fn write(ptr: *anyopaque, _: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.attempts += 1;
-            return error.InjectedEventStreamFailure;
-        }
-    };
-
-    var sink: FailingSink = .{};
-    var scratch: [512]u8 = undefined;
-    var stream = try event_stream.Ndjson.init(
-        "runner-bounded-live-events-history",
-        .{ .ptr = &sink, .write_fn = FailingSink.write },
-        &scratch,
-    );
+    const Stream = event_stream.BufferedNdjson(512);
+    var slots: [1]Stream.Slot = undefined;
+    var stream = try Stream.init("runner-bounded-live-events-history", &slots);
     var streamed_source = choice.Seeded.init(11);
     var streamed = try run(Scenario, std.testing.allocator, streamed_source.source(), .{
         .seed = 11,
@@ -789,9 +775,9 @@ test "bounded NDJSON stream failure is diagnostic-only at the runner boundary" {
     const plain_bytes = try plain.renderAlloc(std.testing.allocator);
     defer std.testing.allocator.free(plain_bytes);
     try std.testing.expectEqualSlices(u8, plain_bytes, streamed_bytes);
-    try std.testing.expectEqual(@as(u64, 1), sink.attempts);
-    try std.testing.expectEqual(@as(u64, 1), stream.stats.write_failures);
-    try std.testing.expectEqual(@as(u64, 1), stream.stats.dropped_disabled);
+    try std.testing.expectEqual(@as(u64, 1), stream.stats.enqueued);
+    try std.testing.expectEqual(@as(u64, 1), stream.stats.dropped_full);
+    try std.testing.expectEqual(@as(usize, 1), stream.pending());
 }
 
 test "runner automatically records phased health outside canonical replay bytes" {

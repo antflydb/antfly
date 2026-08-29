@@ -1013,8 +1013,13 @@ test "serverless workflow service rates compose and heal across publish and comp
     try std.testing.expectEqual(@as(u64, 1), adapter.charges[2]);
     try std.testing.expectEqual(@as(u64, 0), adapter.charges[3]);
     const usage = try model.nodeUsage(node.id);
-    try std.testing.expectEqual(@as(u64, 3), usage.operations);
+    try std.testing.expectEqual(@as(u64, 3), usage.charges);
+    try std.testing.expectEqual(@as(u64, 3), usage.units);
     try std.testing.expectEqual(@as(u64, 80), usage.charged_ns);
+    try std.testing.expectEqualDeep(vopr.service_rate.Usage{ .charges = 2, .units = 2, .charged_ns = 60 }, try model.operationUsage(node.id, operations[0].id));
+    try std.testing.expectEqualDeep(vopr.service_rate.Usage{ .charges = 1, .units = 1, .charged_ns = 20 }, try model.operationUsage(node.id, operations[2].id));
+    try std.testing.expectEqualDeep(vopr.service_rate.Usage{}, try model.operationUsage(node.id, operations[1].id));
+    try std.testing.expectEqualDeep(vopr.service_rate.Usage{}, try model.operationUsage(node.id, operations[3].id));
     try std.testing.expectEqual(@as(usize, 0), model.active.items.len);
     try fixture.sim.ensureNoCapabilityViolation();
 }

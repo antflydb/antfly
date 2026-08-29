@@ -17,6 +17,6 @@ pub const Probe = struct {
 
     fn isHardDisconnected(raw: ?*const anyopaque, handle: std.Io.net.Socket.Handle) bool {
         const self: *const Probe = @ptrCast(@alignCast(raw orelse return true));
-        return self.vopr_io.socketPeerDisconnected(handle);
+        return self.vopr_io.socketPeerAbandonedConnection(handle);
     }
 };

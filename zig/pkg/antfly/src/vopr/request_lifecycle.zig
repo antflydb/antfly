@@ -12,6 +12,10 @@ const data_runtime = @import("../data/runtime.zig");
 
 pub const Hook = struct {
     vopr_io: *vopr.vopr_io.VoprIo,
+    /// Optional harness-owned gate used to hold an admitted request at the
+    /// ingress boundary while the external VOPR driver schedules a fault or
+    /// deadline. Production code sees only the existing lifecycle interface.
+    ingress_release: ?*std.Io.Event = null,
 
     pub fn lifecycle(self: *Hook) http_server.RequestLifecycleHook {
         return .{ .ptr = self, .reach_fn = reach };
@@ -33,6 +37,8 @@ pub const Hook = struct {
     fn reach(ptr: *anyopaque, event: http_server.RequestLifecycleEvent) !void {
         const self: *Hook = @ptrCast(@alignCast(ptr));
         try self.vopr_io.safepoint(stableId(event));
+        if (event.phase == .ingress) if (self.ingress_release) |release|
+            release.waitUncancelable(self.vopr_io.io());
     }
 };
 

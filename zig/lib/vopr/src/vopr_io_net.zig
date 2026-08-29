@@ -101,6 +101,8 @@ const SocketState = struct {
     read_open: bool = true,
     write_open: bool = true,
     peer_write_open: bool = true,
+    peer_read_open: bool = true,
+    read_abandon_queued: bool = false,
     /// Unlike an orderly peer FIN, a hard abort means the peer abandoned both
     /// directions and an in-flight application request may be canceled even
     /// when pipelined bytes remain unread.
@@ -136,6 +138,7 @@ const Packet = struct {
     drop: bool,
     duplicate: bool,
     close_write: bool = false,
+    close_peer_read: bool = false,
     datagram: bool = false,
 };
 
@@ -508,12 +511,12 @@ pub const Network = struct {
         try self.wait_port.?.wake(socket_state.readResource(), std.math.maxInt(u32));
     }
 
-    /// True after an ordered peer FIN has been delivered or the peer has
-    /// aborted the connection. The FIN remains a scheduled packet, so all
-    /// preceding request bytes become readable before this flips true.
-    pub fn peerDisconnected(self: *const Network, handle: std.Io.net.Socket.Handle) bool {
+    /// True after the peer has abandoned its read side or hard-aborted the
+    /// connection. A write-half FIN alone is not abandonment: an HTTP client
+    /// may finish its request bytes and continue reading the response.
+    pub fn peerAbandonedConnection(self: *const Network, handle: std.Io.net.Socket.Handle) bool {
         const socket_state = self.getSocket(handle) orelse return true;
-        return socket_state.peer_hard_disconnected or !socket_state.peer_write_open;
+        return socket_state.peer_hard_disconnected or !socket_state.peer_read_open;
     }
 
     pub fn enumerateReady(self: *const Network, list: *transition.List, allocator: std.mem.Allocator) !void {
@@ -532,7 +535,7 @@ pub const Network = struct {
                 .actor_id = self.getSocket(packet.source).?.id,
                 .resource_id = self.getSocket(packet.destination).?.id,
                 .parameter = @intCast(packet.bytes.len),
-                .semantic_digest = if (packet.close_write) 0 else ids.digest(packet.bytes),
+                .semantic_digest = if (packet.close_write or packet.close_peer_read) 0 else ids.digest(packet.bytes),
             });
         }
     }
@@ -562,7 +565,14 @@ pub const Network = struct {
                     destination.?.peer_write_open = false;
                     try self.wait_port.?.wake(destination.?.readResource(), 1);
                 }
-            } else if (!packet.drop and destination != null and !destination.?.closed and destination.?.read_open) {
+            }
+            if (packet.close_peer_read) {
+                if (destination != null and !destination.?.closed) {
+                    destination.?.peer_read_open = false;
+                    try self.wait_port.?.wake(destination.?.writeResource(), 1);
+                }
+            }
+            if (!packet.close_write and !packet.close_peer_read and !packet.drop and destination != null and !destination.?.closed and destination.?.read_open) {
                 if (packet.datagram) {
                     const source_address = if (source) |source_state| source_state.address else std.Io.net.IpAddress{ .ip4 = .loopback(0) };
                     const initial_count = destination.?.datagrams.items.len;
@@ -817,20 +827,30 @@ pub const Network = struct {
     }
 
     fn closeWrite(self: *Network, socket_state: *SocketState) !void {
-        if (!socket_state.write_open) return;
+        const close_write = socket_state.write_open;
+        const close_peer_read = !socket_state.read_open and !socket_state.read_abandon_queued;
+        if (!close_write and !close_peer_read) return;
         socket_state.write_open = false;
+        if (close_peer_read) socket_state.read_abandon_queued = true;
         if (socket_state.peer) |peer_handle| if (self.getSocket(peer_handle)) |peer| {
             if (peer.closed) return;
             const sequence = try self.allocatePacketSequence(socket_state);
+            const identity_namespace = if (close_write and close_peer_read)
+                "vopr-io.stream-close"
+            else if (close_write)
+                "vopr-io.stream-fin"
+            else
+                "vopr-io.peer-read-abandoned";
             try self.packets.append(self.allocator, .{
-                .id = ids.derive("vopr-io.stream-fin", socket_state.id, sequence),
+                .id = ids.derive(identity_namespace, socket_state.id, sequence),
                 .sequence = sequence,
                 .source = socket_state.handle,
                 .destination = peer.handle,
                 .bytes = &.{},
                 .drop = false,
                 .duplicate = false,
-                .close_write = true,
+                .close_write = close_write,
+                .close_peer_read = close_peer_read,
             });
         };
     }
@@ -1007,7 +1027,9 @@ fn takeBool(value: *bool) bool {
 }
 
 fn packetName(packet: Packet) []const u8 {
+    if (packet.close_write and packet.close_peer_read) return "vopr-io.stream_close";
     if (packet.close_write) return "vopr-io.stream_fin";
+    if (packet.close_peer_read) return "vopr-io.peer_read_abandoned";
     if (packet.datagram) return if (packet.drop) "vopr-io.datagram_drop" else "vopr-io.datagram_deliver";
     return if (packet.drop) "vopr-io.packet_drop" else "vopr-io.packet_deliver";
 }
@@ -1376,7 +1398,7 @@ test "stream FIN never overtakes earlier payload when reordering is enabled" {
     );
     try network.shutdown(pair[0].handle, .send);
     network.faults.reorder = true;
-    try std.testing.expect(!network.peerDisconnected(pair[1].handle));
+    try std.testing.expect(!network.peerAbandonedConnection(pair[1].handle));
 
     var ready: transition.List = .{};
     defer ready.deinit(std.testing.allocator);
@@ -1387,20 +1409,37 @@ test "stream FIN never overtakes earlier payload when reordering is enabled" {
     try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
     try std.testing.expectEqualStrings("vopr-io.packet_deliver", ready.items.items[0].name);
     try std.testing.expect(try network.executeReady(ready.items.items[0].id, &sink, std.testing.allocator));
-    try std.testing.expect(!network.peerDisconnected(pair[1].handle));
+    try std.testing.expect(!network.peerAbandonedConnection(pair[1].handle));
 
     ready.items.clearRetainingCapacity();
     try network.enumerateReady(&ready, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
     try std.testing.expectEqualStrings("vopr-io.stream_fin", ready.items.items[0].name);
     try std.testing.expect(try network.executeReady(ready.items.items[0].id, &sink, std.testing.allocator));
-    try std.testing.expect(network.peerDisconnected(pair[1].handle));
+    try std.testing.expect(!network.peerAbandonedConnection(pair[1].handle));
 
     var bytes: [16]u8 = undefined;
     var buffers = [_][]u8{bytes[0..]};
     const received = try network.read(pair[1].handle, &buffers);
     try std.testing.expectEqualStrings("payload", bytes[0..received]);
     try std.testing.expectEqual(@as(usize, 0), try network.read(pair[1].handle, &buffers));
+
+    try std.testing.expect(network.close(&.{pair[0].handle}));
+    ready.items.clearRetainingCapacity();
+    try network.enumerateReady(&ready, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
+    try std.testing.expectEqualStrings("vopr-io.peer_read_abandoned", ready.items.items[0].name);
+    try std.testing.expect(try network.executeReady(ready.items.items[0].id, &sink, std.testing.allocator));
+    try std.testing.expect(network.peerAbandonedConnection(pair[1].handle));
+
+    const directly_closed = try network.createPair(.{ .family = .ip4, .mode = .stream }, 2);
+    try std.testing.expect(network.close(&.{directly_closed[0].handle}));
+    ready.items.clearRetainingCapacity();
+    try network.enumerateReady(&ready, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
+    try std.testing.expectEqualStrings("vopr-io.stream_close", ready.items.items[0].name);
+    try std.testing.expect(try network.executeReady(ready.items.items[0].id, &sink, std.testing.allocator));
+    try std.testing.expect(network.peerAbandonedConnection(directly_closed[1].handle));
 }
 
 test "stream delivery preserves bytes across reorder drop and duplicate faults" {
