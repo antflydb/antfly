@@ -21,7 +21,8 @@ class GraphAggregatesResult:
 
     Attributes:
         kind (GraphAggregatesResultKind): Stable discriminator for the graph result shape.
-        aggregates (GraphAggregatesResultAggregates):
+        aggregates (GraphAggregatesResultAggregates): Keys are the GraphIdentifiers selected by the corresponding
+            aggregate return projection.
         stats (GraphQueryStats):
     """
 

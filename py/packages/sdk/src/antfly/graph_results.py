@@ -18,6 +18,9 @@ from .graph_identifier_policy_generated import is_valid_graph_identifier
 _MAX_GRAPH_ALIASES = 64
 _MAX_GRAPH_EDGES = 64
 _MAX_GRAPH_ITEMS = 10_000
+_MAX_GRAPH_PATHS = 100
+_DEFAULT_TRAVERSAL_DEPTH = 1
+_DEFAULT_PATH_DEPTH = 10
 _MISSING = object()
 GraphResultDialect = Literal["auto", "canonical", "none"]
 GraphResultKind = Literal["bindings", "aggregates", "nodes", "paths"]
@@ -31,6 +34,16 @@ class _CanonicalResultContract(NamedTuple):
     node_mode: GraphNodeResultMode | None = None
     include_paths: bool = False
     include_documents: bool = False
+    max_depth: int | None = None
+    query_table: str | None = None
+    from_endpoint: tuple[str | None, str] | None = None
+    to_endpoint: tuple[str | None, str] | None = None
+    objective: str | None = None
+    direction: str | None = None
+    edge_types: frozenset[str] | None = None
+    edge_weight_min: float | None = None
+    edge_weight_max: float | None = None
+    starts: tuple[tuple[str | None, str], ...] | None = None
 
 
 def _invalid(path: str, message: str) -> NoReturn:
@@ -119,6 +132,75 @@ def _validate_endpoint(value: object, path: str) -> Mapping[str, Any]:
     if "table" in endpoint:
         _nonempty_string(endpoint["table"], f"{path}.table")
     return endpoint
+
+
+def _endpoint_identity(value: Mapping[str, Any]) -> tuple[str | None, str]:
+    table = value.get("table")
+    return (table if isinstance(table, str) else None, value["key"])
+
+
+def _contract_endpoint(value: object, path: str, query_table: str | None) -> tuple[str | None, str]:
+    endpoint = _validate_endpoint(value, path)
+    table, key = _endpoint_identity(endpoint)
+    return (None if table == query_table else table, key)
+
+
+def _endpoint_matches_contract(
+    actual: Mapping[str, Any],
+    expected: tuple[str | None, str],
+    query_table: str | None,
+) -> bool:
+    actual_table, actual_key = _endpoint_identity(actual)
+    expected_table, expected_key = expected
+    if actual_key != expected_key:
+        return False
+    if actual_table == expected_table:
+        return True
+    # The standalone decoder cannot distinguish an explicitly requested table
+    # from the implicit query table. High-level clients always provide it.
+    return query_table is None and actual_table is None and expected_table is not None
+
+
+def _operation_edge_contract(
+    operation: Mapping[str, Any],
+    path: str,
+) -> tuple[str, frozenset[str] | None, float | None, float | None]:
+    direction = operation.get("direction", "out")
+    if direction not in {"out", "in", "both"}:
+        _invalid(f"{path}.direction", "must be out, in, or both")
+    raw_types = operation.get("edge_types")
+    edge_types = None
+    if raw_types is not None:
+        edge_types = frozenset(
+            _nonempty_string(value, f"{path}.edge_types[{index}]", max_utf8_bytes=65_536)
+            for index, value in enumerate(_array(raw_types, f"{path}.edge_types"))
+        )
+    minimum = maximum = None
+    if "edge_weight" in operation:
+        weight = _object(operation["edge_weight"], f"{path}.edge_weight")
+        if "min" in weight:
+            minimum = _finite_nonnegative(weight["min"], f"{path}.edge_weight.min")
+        if "max" in weight:
+            maximum = _finite_nonnegative(weight["max"], f"{path}.edge_weight.max")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            _invalid(f"{path}.edge_weight", "minimum must not exceed maximum")
+    return direction, edge_types, minimum, maximum
+
+
+def _validate_edge_contract(
+    edge: Mapping[str, Any],
+    path: str,
+    contract: _CanonicalResultContract,
+) -> None:
+    if contract.direction != "both" and edge["direction"] != contract.direction:
+        _invalid(f"{path}.direction", "does not match the requested direction")
+    if contract.edge_types and edge["type"] not in contract.edge_types:
+        _invalid(f"{path}.type", "was not requested")
+    weight = float(edge["weight"])
+    if contract.edge_weight_min is not None and weight < contract.edge_weight_min:
+        _invalid(f"{path}.weight", "is below the requested minimum")
+    if contract.edge_weight_max is not None and weight > contract.edge_weight_max:
+        _invalid(f"{path}.weight", "exceeds the requested maximum")
 
 
 def _validate_path_edge(
@@ -210,6 +292,74 @@ def _validate_path(value: object, path: str) -> Mapping[str, Any]:
     return graph_path
 
 
+def _validate_path_contract(
+    graph_path: Mapping[str, Any],
+    path: str,
+    contract: _CanonicalResultContract,
+) -> None:
+    length = graph_path["length"]
+    if contract.max_depth is not None and length > contract.max_depth:
+        _invalid(f"{path}.length", "exceeds the requested max_depth")
+    if graph_path["objective"] != contract.objective:
+        _invalid(f"{path}.objective", "does not match the requested objective")
+    nodes = _array(graph_path["nodes"], f"{path}.nodes")
+    first = _object(nodes[0], f"{path}.nodes[0]")
+    last = _object(nodes[-1], f"{path}.nodes[{len(nodes) - 1}]")
+    if contract.from_endpoint is not None and not _endpoint_matches_contract(
+        first, contract.from_endpoint, contract.query_table
+    ):
+        _invalid(f"{path}.nodes[0]", "does not match the requested start endpoint")
+    if contract.to_endpoint is not None and not _endpoint_matches_contract(
+        last, contract.to_endpoint, contract.query_table
+    ):
+        _invalid(f"{path}.nodes[{len(nodes) - 1}]", "does not match the requested terminal endpoint")
+    for index, raw_edge in enumerate(_array(graph_path["edges"], f"{path}.edges")):
+        _validate_edge_contract(_object(raw_edge, f"{path}.edges[{index}]"), f"{path}.edges[{index}]", contract)
+
+
+def _path_is_loopless(graph_path: Mapping[str, Any]) -> bool:
+    identities = [_endpoint_identity(_object(node, "path.nodes")) for node in _array(graph_path["nodes"], "path.nodes")]
+    return len(identities) == len(set(identities))
+
+
+def _path_signature(graph_path: Mapping[str, Any]) -> tuple[object, ...]:
+    nodes = tuple(_endpoint_identity(_object(node, "path.nodes")) for node in _array(graph_path["nodes"], "path.nodes"))
+    edges = tuple(
+        (
+            _object(edge, "path.edges")["direction"],
+            _object(edge, "path.edges")["type"],
+        )
+        for edge in _array(graph_path["edges"], "path.edges")
+    )
+    return nodes, edges
+
+
+def _validate_path_collection(
+    paths: list[Mapping[str, Any]],
+    path: str,
+    contract: _CanonicalResultContract,
+) -> None:
+    if contract.node_mode != "k_shortest_paths":
+        return
+    seen: set[tuple[object, ...]] = set()
+    previous: float | None = None
+    for index, graph_path in enumerate(paths):
+        if not _path_is_loopless(graph_path):
+            _invalid(f"{path}[{index}].path", "must be loopless for k_shortest_paths")
+        signature = _path_signature(graph_path)
+        if signature in seen:
+            _invalid(f"{path}[{index}].path", "duplicates an earlier path")
+        seen.add(signature)
+        score = float(graph_path["objective_value"])
+        if previous is not None:
+            descending = contract.objective == "max_weight_product"
+            if (descending and score > previous and not _float_equal(score, previous)) or (
+                not descending and score < previous and not _float_equal(score, previous)
+            ):
+                _invalid(f"{path}[{index}].path.objective_value", "is out of objective order")
+        previous = score
+
+
 def _validate_result_node(value: object, path: str) -> Mapping[str, Any]:
     node = _object(value, path)
     _exact_keys(
@@ -255,6 +405,34 @@ def _validate_result_node(value: object, path: str) -> Mapping[str, Any]:
                 max_weight_product=False,
             )
     return node
+
+
+def _validate_result_node_contract(
+    node: Mapping[str, Any],
+    path: str,
+    contract: _CanonicalResultContract,
+) -> None:
+    depth = node["depth"]
+    if contract.max_depth is not None and depth > contract.max_depth:
+        _invalid(f"{path}.depth", "exceeds the requested max_depth")
+    starts = contract.starts
+    if starts is not None:
+        root: Mapping[str, Any] | None = None
+        if "path" in node:
+            raw_path = _array(node["path"], f"{path}.path")
+            root = _object(raw_path[0], f"{path}.path[0]")
+        elif depth == 0:
+            root = node
+        if root is not None and not any(
+            _endpoint_matches_contract(root, start, contract.query_table) for start in starts
+        ):
+            _invalid(path, "does not originate at a requested traversal identity")
+    for index, raw_edge in enumerate(_array(node.get("path_edges", []), f"{path}.path_edges")):
+        _validate_edge_contract(
+            _object(raw_edge, f"{path}.path_edges[{index}]"),
+            f"{path}.path_edges[{index}]",
+            contract,
+        )
 
 
 def _validate_stats(value: object, path: str, expected_items: int, *, allow_truncated: bool) -> None:
@@ -331,8 +509,8 @@ def _validate_nodes_result(value: Mapping[str, Any], path: str) -> None:
 def _validate_paths_result(value: Mapping[str, Any], path: str) -> None:
     _exact_keys(value, path, required=frozenset({"kind", "paths", "stats"}))
     raw_paths = _array(value["paths"], f"{path}.paths")
-    if len(raw_paths) > _MAX_GRAPH_ITEMS:
-        _invalid(path, f"paths must contain at most {_MAX_GRAPH_ITEMS} items")
+    if len(raw_paths) > _MAX_GRAPH_PATHS:
+        _invalid(path, f"paths must contain at most {_MAX_GRAPH_PATHS} items")
     for index, raw_item in enumerate(raw_paths):
         item_path = f"{path}.paths[{index}]"
         item = _object(raw_item, item_path)
@@ -343,7 +521,11 @@ def _validate_paths_result(value: Mapping[str, Any], path: str) -> None:
     _validate_stats(value["stats"], f"{path}.stats", len(raw_paths), allow_truncated=False)
 
 
-def _canonical_result_contract(value: object, path: str) -> _CanonicalResultContract:
+def _canonical_result_contract(
+    value: object,
+    path: str,
+    query_table: str | None = None,
+) -> _CanonicalResultContract:
     operation = _object(value, path)
     if "match" in operation:
         returned = _object(operation.get("return", _MISSING), f"{path}.return")
@@ -369,29 +551,103 @@ def _canonical_result_contract(value: object, path: str) -> _CanonicalResultCont
     if "traverse" in operation:
         traversal = _object(operation["traverse"], f"{path}.traverse")
         limit = _bounded_integer(traversal.get("limit", 100), f"{path}.traverse.limit", 1, _MAX_GRAPH_ITEMS)
+        max_depth = _bounded_integer(
+            traversal.get("max_depth", _DEFAULT_TRAVERSAL_DEPTH),
+            f"{path}.traverse.max_depth",
+            0,
+            _MAX_GRAPH_EDGES,
+        )
+        direction, edge_types, weight_min, weight_max = _operation_edge_contract(traversal, f"{path}.traverse")
+        selector = _object(traversal.get("start", _MISSING), f"{path}.traverse.start")
+        starts: tuple[tuple[str | None, str], ...] | None
+        if "keys" in selector:
+            starts = tuple(
+                (None, _nonempty_string(key, f"{path}.traverse.start.keys[{index}]"))
+                for index, key in enumerate(_array(selector["keys"], f"{path}.traverse.start.keys"))
+            )
+        elif "identities" in selector:
+            starts = tuple(
+                _contract_endpoint(endpoint, f"{path}.traverse.start.identities[{index}]", query_table)
+                for index, endpoint in enumerate(_array(selector["identities"], f"{path}.traverse.start.identities"))
+            )
+        else:
+            # A result_ref is resolved by the server and is not observable in
+            # the response contract without materializing the referenced rows.
+            starts = None
         return _CanonicalResultContract(
             "nodes",
             max_items=limit,
             node_mode="traversal",
             include_paths=traversal.get("include_paths") is True,
             include_documents=traversal.get("include_documents") is True,
+            max_depth=max_depth,
+            query_table=query_table,
+            direction=direction,
+            edge_types=edge_types,
+            edge_weight_min=weight_min,
+            edge_weight_max=weight_max,
+            starts=starts,
         )
     if "shortest_path" in operation:
         shortest_path = _object(operation["shortest_path"], f"{path}.shortest_path")
+        direction, edge_types, weight_min, weight_max = _operation_edge_contract(shortest_path, f"{path}.shortest_path")
+        objective = shortest_path.get("objective", "min_hops")
+        if objective not in {"min_hops", "min_weight_sum", "max_weight_product"}:
+            _invalid(f"{path}.shortest_path.objective", "has an unknown value")
         return _CanonicalResultContract(
             "paths",
             max_items=1,
             node_mode="shortest_path",
             include_documents=shortest_path.get("include_documents") is True,
+            max_depth=_bounded_integer(
+                shortest_path.get("max_depth", _DEFAULT_PATH_DEPTH),
+                f"{path}.shortest_path.max_depth",
+                1,
+                _MAX_GRAPH_EDGES,
+            ),
+            query_table=query_table,
+            from_endpoint=_contract_endpoint(
+                shortest_path.get("from", _MISSING), f"{path}.shortest_path.from", query_table
+            ),
+            to_endpoint=_contract_endpoint(shortest_path.get("to", _MISSING), f"{path}.shortest_path.to", query_table),
+            objective=objective,
+            direction=direction,
+            edge_types=edge_types,
+            edge_weight_min=weight_min,
+            edge_weight_max=weight_max,
         )
     if "k_shortest_paths" in operation:
         k_shortest_paths = _object(operation["k_shortest_paths"], f"{path}.k_shortest_paths")
         k = _bounded_integer(k_shortest_paths.get("k", _MISSING), f"{path}.k_shortest_paths.k", 1, 100)
+        direction, edge_types, weight_min, weight_max = _operation_edge_contract(
+            k_shortest_paths, f"{path}.k_shortest_paths"
+        )
+        objective = k_shortest_paths.get("objective", "min_hops")
+        if objective not in {"min_hops", "min_weight_sum", "max_weight_product"}:
+            _invalid(f"{path}.k_shortest_paths.objective", "has an unknown value")
         return _CanonicalResultContract(
             "paths",
             max_items=k,
             node_mode="k_shortest_paths",
             include_documents=k_shortest_paths.get("include_documents") is True,
+            max_depth=_bounded_integer(
+                k_shortest_paths.get("max_depth", _DEFAULT_PATH_DEPTH),
+                f"{path}.k_shortest_paths.max_depth",
+                1,
+                _MAX_GRAPH_EDGES,
+            ),
+            query_table=query_table,
+            from_endpoint=_contract_endpoint(
+                k_shortest_paths.get("from", _MISSING), f"{path}.k_shortest_paths.from", query_table
+            ),
+            to_endpoint=_contract_endpoint(
+                k_shortest_paths.get("to", _MISSING), f"{path}.k_shortest_paths.to", query_table
+            ),
+            objective=objective,
+            direction=direction,
+            edge_types=edge_types,
+            edge_weight_min=weight_min,
+            edge_weight_max=weight_max,
         )
     _invalid(path, "does not contain a supported graph operation")
 
@@ -460,6 +716,7 @@ def _validate_graph_result(
                     else:
                         if "path" in node or "path_edges" in node:
                             _invalid(f"{path}.nodes[{index}]", "contains a path that was not requested")
+                    _validate_result_node_contract(node, f"{path}.nodes[{index}]", contract)
     elif kind == "paths":
         _validate_paths_result(result, path)
         if contract is not None:
@@ -468,10 +725,22 @@ def _validate_graph_result(
             raw_paths = _array(result["paths"], f"{path}.paths")
             if len(raw_paths) > contract.max_items:
                 _invalid(path, "exceeds the requested result limit")
+            validated_paths: list[Mapping[str, Any]] = []
             if not contract.include_documents:
                 for index, raw_item in enumerate(raw_paths):
-                    if "document" in _object(raw_item, f"{path}.paths[{index}]"):
+                    item = _object(raw_item, f"{path}.paths[{index}]")
+                    if "document" in item:
                         _invalid(f"{path}.paths[{index}].document", "was returned without being requested")
+                    graph_path = _object(item["path"], f"{path}.paths[{index}].path")
+                    _validate_path_contract(graph_path, f"{path}.paths[{index}].path", contract)
+                    validated_paths.append(graph_path)
+            else:
+                for index, raw_item in enumerate(raw_paths):
+                    item = _object(raw_item, f"{path}.paths[{index}]")
+                    graph_path = _object(item["path"], f"{path}.paths[{index}].path")
+                    _validate_path_contract(graph_path, f"{path}.paths[{index}].path", contract)
+                    validated_paths.append(graph_path)
+            _validate_path_collection(validated_paths, f"{path}.paths", contract)
     else:
         _invalid(f"{path}.kind", f"has unknown canonical discriminator {kind!r}")
 
@@ -482,6 +751,7 @@ def decode_query_responses(
     graph_dialect: GraphResultDialect = "auto",
     expected_graph_operations: frozenset[str] | None = None,
     expected_graph_queries: Mapping[str, object] | None = None,
+    query_table: str | None = None,
 ) -> QueryResponses:
     """Validate canonical graph results against their request, then decode them."""
     if graph_dialect not in {"auto", "canonical", "none"}:
@@ -526,6 +796,7 @@ def decode_query_responses(
                     contract = _canonical_result_contract(
                         expected_graph_queries[name],
                         f"request.graph_queries[{name!r}]",
+                        query_table,
                     )
                 _validate_graph_result(
                     graph_result,

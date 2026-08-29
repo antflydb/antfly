@@ -18,7 +18,10 @@ T = TypeVar("T", bound="GraphQueryResults")
 
 @_attrs_define
 class GraphQueryResults:
-    """Canonical graph results keyed by graph_queries operation name."""
+    """Non-empty canonical graph results keyed exactly by graph_queries operation name. Keys use the versioned
+    GraphIdentifier policy.
+
+    """
 
     additional_properties: dict[
         str, GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | GraphPathsResult

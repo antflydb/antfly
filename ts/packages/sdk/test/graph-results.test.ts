@@ -64,18 +64,18 @@ describe("graph result admission", () => {
           paths: [
             {
               path: {
-                nodes: [{ key: "a" }, { key: "b" }, { key: "c" }],
+                nodes: [{ key: "a" }, { key: "x" }, { key: "b" }],
                 edges: [
                   {
                     from: { key: "a" },
-                    to: { key: "b" },
+                    to: { key: "x" },
                     direction: "out",
                     type: "related",
                     weight: 1e200,
                   },
                   {
-                    from: { key: "b" },
-                    to: { key: "c" },
+                    from: { key: "x" },
+                    to: { key: "b" },
                     direction: "out",
                     type: "related",
                     weight: 1e200,
@@ -351,5 +351,154 @@ describe("graph result admission", () => {
         [traversalWithPaths]
       )
     ).toThrow("is missing its requested path");
+  });
+
+  it("enforces observable path and traversal semantics from the request", () => {
+    const constrained = {
+      graph_queries: {
+        path: {
+          index: "graph_idx",
+          shortest_path: {
+            from: { key: "a", table: "docs" },
+            to: { key: "b", table: "entities" },
+            direction: "in",
+            edge_types: ["cites"],
+            edge_weight: { max: 0.5 },
+            max_depth: 1,
+            objective: "min_weight_sum",
+          },
+        },
+      },
+    } as QueryRequest;
+    const validPath = {
+      nodes: [{ key: "a" }, { key: "b", table: "entities" }],
+      edges: [
+        {
+          from: { key: "a" },
+          to: { key: "b", table: "entities" },
+          direction: "in",
+          type: "cites",
+          weight: 0.5,
+        },
+      ],
+      length: 1,
+      objective: "min_weight_sum",
+      weight_sum: 0.5,
+      objective_value: 0.5,
+    };
+    const result = (path: unknown) => ({
+      kind: "paths",
+      paths: [{ path }],
+      stats: { returned_items: 1, truncated: false },
+    });
+
+    expect(() =>
+      validateGraphQueryResponses(responses(result(validPath)), [constrained], "docs")
+    ).not.toThrow();
+    expect(() =>
+      validateGraphQueryResponses(
+        responses(
+          result({
+            ...validPath,
+            nodes: [{ key: "a" }, { key: "wrong" }],
+            edges: [{ ...validPath.edges[0], to: { key: "wrong" } }],
+          })
+        ),
+        [constrained],
+        "docs"
+      )
+    ).toThrow("terminal endpoint");
+    expect(() =>
+      validateGraphQueryResponses(
+        responses(
+          result({
+            ...validPath,
+            edges: [{ ...validPath.edges[0], type: "links" }],
+          })
+        ),
+        [constrained],
+        "docs"
+      )
+    ).toThrow("was not requested");
+    const unfiltered = {
+      graph_queries: {
+        path: {
+          ...constrained.graph_queries.path,
+          shortest_path: {
+            ...constrained.graph_queries.path.shortest_path,
+            edge_types: [],
+          },
+        },
+      },
+    } as QueryRequest;
+    expect(() =>
+      validateGraphQueryResponses(
+        responses(
+          result({
+            ...validPath,
+            edges: [{ ...validPath.edges[0], type: "links" }],
+          })
+        ),
+        [unfiltered],
+        "docs"
+      )
+    ).not.toThrow();
+
+    const traversal = {
+      graph_queries: {
+        walk: {
+          index: "graph_idx",
+          traverse: { start: { keys: ["a"] }, max_depth: 1 },
+        },
+      },
+    } as QueryRequest;
+    expect(() =>
+      validateGraphQueryResponses(
+        responses(
+          {
+            kind: "nodes",
+            nodes: [{ key: "wrong", depth: 0 }],
+            stats: { returned_items: 1, truncated: false },
+          },
+          "walk"
+        ),
+        [traversal]
+      )
+    ).toThrow("requested traversal identity");
+
+    const direct = {
+      nodes: [{ key: "a" }, { key: "b" }],
+      edges: [
+        {
+          from: { key: "a" },
+          to: { key: "b" },
+          direction: "out",
+          type: "links",
+          weight: 1,
+        },
+      ],
+      length: 1,
+      objective: "min_hops",
+      weight_sum: 1,
+      objective_value: 1,
+    };
+    const kRequest = {
+      graph_queries: {
+        path: {
+          index: "graph_idx",
+          k_shortest_paths: { from: { key: "a" }, to: { key: "b" }, k: 2 },
+        },
+      },
+    } as QueryRequest;
+    expect(() =>
+      validateGraphQueryResponses(
+        responses({
+          kind: "paths",
+          paths: [{ path: direct }, { path: direct }],
+          stats: { returned_items: 2, truncated: false },
+        }),
+        [kRequest]
+      )
+    ).toThrow("duplicates an earlier path");
   });
 });

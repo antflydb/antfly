@@ -13473,6 +13473,7 @@ pub const GraphAggregateValue = struct {
 pub const GraphAggregatesResult = struct {
     /// Stable discriminator for the graph result shape.
     kind: []const u8,
+    /// Keys are the GraphIdentifiers selected by the corresponding aggregate return projection.
     aggregates: std.json.ArrayHashMap(GraphAggregateValue),
     stats: GraphQueryStats,
 };
@@ -14975,7 +14976,7 @@ pub const GraphIndexStats = struct {
     }
 };
 
-/// Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction.
+/// Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction. Results are unique by ordered table-qualified node identities plus stored-edge direction and type, and are ordered best-first by the selected objective.
 pub const GraphKShortestPaths = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
@@ -15754,7 +15755,7 @@ pub const GraphQueryParams = struct {
     }
 };
 
-/// Canonical graph results keyed by graph_queries operation name.
+/// Non-empty canonical graph results keyed exactly by graph_queries operation name. Keys use the versioned GraphIdentifier policy.
 pub const GraphQueryResults = std.json.ArrayHashMap(GraphResult);
 
 pub const GraphQueryStats = struct {

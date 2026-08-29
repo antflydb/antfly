@@ -18,7 +18,8 @@ class GraphKShortestPathsQuery:
     Attributes:
         index (str):
         k_shortest_paths (GraphKShortestPaths): Find up to `k` loopless paths from `from` to `to` in the requested
-            stored-edge direction.
+            stored-edge direction. Results are unique by ordered table-qualified node identities plus stored-edge direction
+            and type, and are ordered best-first by the selected objective.
     """
 
     index: str

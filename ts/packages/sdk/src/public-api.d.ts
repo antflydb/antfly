@@ -12261,7 +12261,7 @@ export interface components {
             index: string;
             shortest_path: components["schemas"]["GraphShortestPath"];
         };
-        /** @description Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction. */
+        /** @description Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction. Results are unique by ordered table-qualified node identities plus stored-edge direction and type, and are ordered best-first by the selected objective. */
         GraphKShortestPaths: {
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
@@ -12502,6 +12502,7 @@ export interface components {
              * @enum {string}
              */
             kind: "aggregates";
+            /** @description Keys are the GraphIdentifiers selected by the corresponding aggregate return projection. */
             aggregates: {
                 [key: string]: components["schemas"]["GraphAggregateValue"];
             };
@@ -12600,7 +12601,7 @@ export interface components {
         };
         /** @description A canonical result produced by graph_queries. Bindings, exact aggregates, and node/path results use required stable discriminators. */
         GraphResult: components["schemas"]["GraphBindingsResult"] | components["schemas"]["GraphAggregatesResult"] | components["schemas"]["GraphNodesResult"] | components["schemas"]["GraphPathsResult"];
-        /** @description Canonical graph results keyed by graph_queries operation name. */
+        /** @description Non-empty canonical graph results keyed exactly by graph_queries operation name. Keys use the versioned GraphIdentifier policy. */
         GraphQueryResults: {
             [key: string]: components["schemas"]["GraphResult"];
         };

@@ -974,6 +974,132 @@ func TestDecodeGraphResultForQueryEnforcesOperationCardinalityAndPathOwnership(t
 	}
 }
 
+func TestDecodeGraphResultForQueryEnforcesObservableQuerySemantics(t *testing.T) {
+	decodeQuery := func(encoded string) GraphQuery {
+		t.Helper()
+		var query GraphQuery
+		if err := json.Unmarshal([]byte(encoded), &query); err != nil {
+			t.Fatal(err)
+		}
+		return query
+	}
+	decodeResult := func(encoded string) GraphResult {
+		t.Helper()
+		var result GraphResult
+		if err := json.Unmarshal([]byte(encoded), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	path := func(nodes, edges, objective string, objectiveValue float64) string {
+		t.Helper()
+		return fmt.Sprintf(
+			`{"kind":"paths","paths":[{"path":{"nodes":%s,"edges":%s,"length":%d,"objective":%q,"weight_sum":%g,"objective_value":%g}}],"stats":{"returned_items":1,"truncated":false}}`,
+			nodes,
+			edges,
+			strings.Count(edges, `"from"`),
+			objective,
+			float64(strings.Count(edges, `"from"`)),
+			objectiveValue,
+		)
+	}
+	const abNodes = `[{"key":"a"},{"key":"b"}]`
+	const abEdge = `[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}]`
+	tests := []struct {
+		name     string
+		query    string
+		result   string
+		contains string
+	}{
+		{
+			name:     "terminal endpoint",
+			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"b"}}}`,
+			result:   path(`[{"key":"a"}]`, `[]`, "min_hops", 0),
+			contains: "terminal endpoint",
+		},
+		{
+			name:     "objective",
+			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"b"},"objective":"min_weight_sum"}}`,
+			result:   path(abNodes, abEdge, "min_hops", 1),
+			contains: "requested objective",
+		},
+		{
+			name:     "edge direction",
+			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"b"},"direction":"in"}}`,
+			result:   path(abNodes, abEdge, "min_hops", 1),
+			contains: "requested direction",
+		},
+		{
+			name:     "edge type",
+			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"b"},"edge_types":["cites"]}}`,
+			result:   path(abNodes, abEdge, "min_hops", 1),
+			contains: "was not requested",
+		},
+		{
+			name:     "edge weight",
+			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"b"},"edge_weight":{"max":0.5}}}`,
+			result:   path(abNodes, abEdge, "min_hops", 1),
+			contains: "requested maximum",
+		},
+		{
+			name:     "path max depth",
+			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"b"},"max_depth":1}}`,
+			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"x"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"x"},"direction":"out","type":"links","weight":1},{"from":{"key":"x"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":2,"objective":"min_hops","weight_sum":2,"objective_value":2}}],"stats":{"returned_items":1,"truncated":false}}`,
+			contains: "requested max_depth",
+		},
+		{
+			name:     "traversal max depth",
+			query:    `{"index":"graph","traverse":{"start":{"keys":["a"]},"max_depth":1}}`,
+			result:   `{"kind":"nodes","nodes":[{"key":"c","depth":2}],"stats":{"returned_items":1,"truncated":false}}`,
+			contains: "requested max_depth",
+		},
+		{
+			name:     "traversal root",
+			query:    `{"index":"graph","traverse":{"start":{"keys":["a"]}}}`,
+			result:   `{"kind":"nodes","nodes":[{"key":"wrong","depth":0}],"stats":{"returned_items":1,"truncated":false}}`,
+			contains: "requested traversal identity",
+		},
+		{
+			name:     "k path loop",
+			query:    `{"index":"graph","k_shortest_paths":{"from":{"key":"a"},"to":{"key":"b"},"k":2}}`,
+			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"x"},{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"x"},"direction":"out","type":"links","weight":1},{"from":{"key":"x"},"to":{"key":"a"},"direction":"out","type":"links","weight":1},{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":3,"objective":"min_hops","weight_sum":3,"objective_value":3}}],"stats":{"returned_items":1,"truncated":false}}`,
+			contains: "loopless",
+		},
+		{
+			name:     "duplicate k path",
+			query:    `{"index":"graph","k_shortest_paths":{"from":{"key":"a"},"to":{"key":"b"},"k":2}}`,
+			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}},{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":2,"truncated":false}}`,
+			contains: "duplicate paths",
+		},
+		{
+			name:     "unordered k paths",
+			query:    `{"index":"graph","k_shortest_paths":{"from":{"key":"a"},"to":{"key":"b"},"k":2}}`,
+			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"x"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"x"},"direction":"out","type":"links","weight":1},{"from":{"key":"x"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":2,"objective":"min_hops","weight_sum":2,"objective_value":2}},{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":2,"truncated":false}}`,
+			contains: "not ordered",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			query := decodeQuery(test.query)
+			result := decodeResult(test.result)
+			if _, err := DecodeGraphResultForQuery(query, result); err == nil || !strings.Contains(err.Error(), test.contains) {
+				t.Fatalf("expected error containing %q, got %v", test.contains, err)
+			}
+			requests := []QueryRequest{{GraphQueries: map[string]GraphQuery{"result": query}}}
+			responses := QueryResponses{Responses: []QueryResult{{GraphResults: map[string]GraphResult{"result": result}}}}
+			if err := validateQueryGraphResponses(requests, &responses); err == nil || !strings.Contains(err.Error(), test.contains) {
+				t.Fatalf("automatic validation: expected error containing %q, got %v", test.contains, err)
+			}
+		})
+	}
+
+	qualified := decodeQuery(`{"index":"graph","shortest_path":{"from":{"key":"a","table":"docs"},"to":{"key":"b","table":"entities"}}}`)
+	qualifiedResult := decodeResult(path(`[{"key":"a"},{"key":"b","table":"entities"}]`, `[{"from":{"key":"a"},"to":{"key":"b","table":"entities"},"direction":"out","type":"links","weight":1}]`, "min_hops", 1))
+	if _, err := DecodeGraphResultForQueryInTable("docs", qualified, qualifiedResult); err != nil {
+		t.Fatalf("query-table endpoint normalization: %v", err)
+	}
+}
+
 func TestCanonicalGraphResultPreservesOpaqueHydratedJSON(t *testing.T) {
 	var canonical GraphResult
 	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":{"title":"alpha","nested":{"values":[1,true,null]}},"evidence":{"source":"edge"}}],"stats":{"returned_items":1,"truncated":false}}`), &canonical); err != nil {

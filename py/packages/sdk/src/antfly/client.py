@@ -909,6 +909,7 @@ class AntflyClient:
             graph_dialect=graph_dialect,
             expected_graph_operations=expected_graph_operations,
             expected_graph_queries=expected_graph_queries,
+            query_table=table,
         )
 
     def get(self, table: str, key: str) -> dict[str, Any]:

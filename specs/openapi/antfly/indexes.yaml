@@ -3191,7 +3191,11 @@ components:
       type: object
       additionalProperties: false
       required: [from, to, k]
-      description: Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction.
+      description: >-
+        Find up to `k` loopless paths from `from` to `to` in the requested
+        stored-edge direction. Results are unique by ordered table-qualified
+        node identities plus stored-edge direction and type, and are ordered
+        best-first by the selected objective.
       properties:
         from: { $ref: '#/components/schemas/GraphPathEndpoint' }
         to: { $ref: '#/components/schemas/GraphPathEndpoint' }
@@ -3757,6 +3761,9 @@ components:
           maxProperties: 64
           additionalProperties:
             $ref: '#/components/schemas/GraphAggregateValue'
+          x-antfly-property-name-schema:
+            $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier'
+          description: Keys are the GraphIdentifiers selected by the corresponding aggregate return projection.
         stats: { $ref: '#/components/schemas/GraphQueryStats' }
     GraphNodesResult:
       x-go-type-skip-optional-pointer: true
@@ -3805,7 +3812,7 @@ components:
           description: Stable discriminator for the graph result shape.
         paths:
           type: array
-          maxItems: 10000
+          maxItems: 100
           items: { $ref: '#/components/schemas/GraphPathResult' }
         stats: { $ref: '#/components/schemas/GraphQueryStats' }
     LegacyGraphSearchResult:
@@ -3881,11 +3888,19 @@ components:
         - $ref: '#/components/schemas/LegacyGraphSearchResult'
     GraphQueryResults:
       type: object
+      minProperties: 1
+      maxProperties: 64
       additionalProperties:
         $ref: '#/components/schemas/GraphResult'
-      description: Canonical graph results keyed by graph_queries operation name.
+      x-antfly-property-name-schema:
+        $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier'
+      description: >-
+        Non-empty canonical graph results keyed exactly by graph_queries
+        operation name. Keys use the versioned GraphIdentifier policy.
     StatefulGraphQueryResults:
       type: object
+      minProperties: 1
+      maxProperties: 64
       additionalProperties:
         $ref: '#/components/schemas/StatefulGraphResult'
       description: >-

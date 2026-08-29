@@ -34,39 +34,41 @@ T = TypeVar("T", bound="GraphKShortestPaths")
 
 @_attrs_define
 class GraphKShortestPaths:
-    """Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction.
+    """Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction. Results are unique by
+    ordered table-qualified node identities plus stored-edge direction and type, and are ordered best-first by the
+    selected objective.
 
-    Attributes:
-        from_ (GraphPathEndpoint):
-        to (GraphPathEndpoint):
-        k (int):
-        direction (EdgeDirection | Unset): Direction of edges to query:
-            - out: Outgoing edges from the node
-            - in: Incoming edges to the node
-            - both: Both outgoing and incoming edges
-        edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
-        max_depth (int | Unset):  Default: 10.
-        edge_weight (GraphEdgeWeightRange | Unset): Inclusive per-edge weight filter. At least one bound is required.
-            Bounds must be finite and non-negative; when both are present, min must not exceed max. This filters individual
-            stored edges and does not constrain the aggregate path objective.
-        objective (GraphPathObjective | Unset): Objective used to rank graph paths:
-            - min_hops: Minimize the number of edges.
-            - min_weight_sum: Minimize the sum of finite non-negative edge weights.
-            - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to be in [0,1].
-        filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
-            GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |
-            GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |
-            GraphDocumentNumericRangeFilter | GraphDocumentPrefixFilter | GraphDocumentRegexpFilter |
-            GraphDocumentTermFilter | GraphDocumentTermRangeFilter | GraphDocumentWildcardFilter | Unset): A non-scoring
-            stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and
-            deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string.
-            Fuzzy predicates require an explicit fuzziness. Range predicates use numeric_range, term_range, or date_range
-            wrappers, and every stored value is addressed by an RFC 6901 JSON Pointer in `path`. Alias-to-alias predicates
-            belong in GraphMatch.where.
-        include_documents (bool | Unset): Attach each terminal stored document as paths[].document when it exists at the
-            pinned snapshot. A dangling terminal identity omits document. When false, document is always omitted. Default:
-            False.
-        fields (list[str] | Unset): Requires include_documents=true. Omit to include all document fields.
+        Attributes:
+            from_ (GraphPathEndpoint):
+            to (GraphPathEndpoint):
+            k (int):
+            direction (EdgeDirection | Unset): Direction of edges to query:
+                - out: Outgoing edges from the node
+                - in: Incoming edges to the node
+                - both: Both outgoing and incoming edges
+            edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
+            max_depth (int | Unset):  Default: 10.
+            edge_weight (GraphEdgeWeightRange | Unset): Inclusive per-edge weight filter. At least one bound is required.
+                Bounds must be finite and non-negative; when both are present, min must not exceed max. This filters individual
+                stored edges and does not constrain the aggregate path objective.
+            objective (GraphPathObjective | Unset): Objective used to rank graph paths:
+                - min_hops: Minimize the number of edges.
+                - min_weight_sum: Minimize the sum of finite non-negative edge weights.
+                - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to be in [0,1].
+            filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
+                GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |
+                GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |
+                GraphDocumentNumericRangeFilter | GraphDocumentPrefixFilter | GraphDocumentRegexpFilter |
+                GraphDocumentTermFilter | GraphDocumentTermRangeFilter | GraphDocumentWildcardFilter | Unset): A non-scoring
+                stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and
+                deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string.
+                Fuzzy predicates require an explicit fuzziness. Range predicates use numeric_range, term_range, or date_range
+                wrappers, and every stored value is addressed by an RFC 6901 JSON Pointer in `path`. Alias-to-alias predicates
+                belong in GraphMatch.where.
+            include_documents (bool | Unset): Attach each terminal stored document as paths[].document when it exists at the
+                pinned snapshot. A dangling terminal identity omits document. When false, document is always omitted. Default:
+                False.
+            fields (list[str] | Unset): Requires include_documents=true. Omit to include all document fields.
     """
 
     from_: GraphPathEndpoint

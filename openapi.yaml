@@ -23533,6 +23533,8 @@ components:
         - to
         - k
       description: Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction.
+        Results are unique by ordered table-qualified node identities plus stored-edge direction and type,
+        and are ordered best-first by the selected objective.
       properties:
         from:
           $ref: '#/components/schemas/GraphPathEndpoint'
@@ -24012,6 +24014,9 @@ components:
           maxProperties: 64
           additionalProperties:
             $ref: '#/components/schemas/GraphAggregateValue'
+          x-antfly-property-name-schema:
+            $ref: '#/components/schemas/GraphIdentifier'
+          description: Keys are the GraphIdentifiers selected by the corresponding aggregate return projection.
         stats:
           $ref: '#/components/schemas/GraphQueryStats'
     GraphPathEdgeDirection:
@@ -24216,7 +24221,7 @@ components:
           description: Stable discriminator for the graph result shape.
         paths:
           type: array
-          maxItems: 10000
+          maxItems: 100
           items:
             $ref: '#/components/schemas/GraphPathResult'
         stats:
@@ -24238,9 +24243,14 @@ components:
           paths: '#/components/schemas/GraphPathsResult'
     GraphQueryResults:
       type: object
+      minProperties: 1
+      maxProperties: 64
       additionalProperties:
         $ref: '#/components/schemas/GraphResult'
-      description: Canonical graph results keyed by graph_queries operation name.
+      x-antfly-property-name-schema:
+        $ref: '#/components/schemas/GraphIdentifier'
+      description: Non-empty canonical graph results keyed exactly by graph_queries operation name. Keys
+        use the versioned GraphIdentifier policy.
     LegacyGraphResultNode:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -24377,6 +24387,8 @@ components:
         - $ref: '#/components/schemas/LegacyGraphSearchResult'
     StatefulGraphQueryResults:
       type: object
+      minProperties: 1
+      maxProperties: 64
       additionalProperties:
         $ref: '#/components/schemas/StatefulGraphResult'
       description: Stateful graph results keyed by operation name. Legacy values are possible only when

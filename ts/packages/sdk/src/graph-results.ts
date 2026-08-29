@@ -4,10 +4,14 @@ import type { QueryRequest, QueryResponses } from "./types.js";
 const MAX_ALIASES = 64;
 const MAX_EDGES = 64;
 const MAX_ITEMS = 10_000;
+const MAX_PATHS = 100;
 const MAX_EDGE_TYPE_BYTES = 64 * 1024;
+const DEFAULT_TRAVERSAL_DEPTH = 1;
+const DEFAULT_PATH_DEPTH = 10;
 const utf8 = new TextEncoder();
 
 type JsonObject = Record<string, unknown>;
+type CanonicalEndpoint = { key: string; table?: string };
 type GraphDialect = "canonical" | "none";
 type CanonicalResultContract = {
   kind: "bindings" | "aggregates" | "nodes" | "paths";
@@ -16,6 +20,16 @@ type CanonicalResultContract = {
   nodeMode?: "traversal" | "shortest_path" | "k_shortest_paths";
   includePaths?: boolean;
   includeDocuments?: boolean;
+  maxDepth?: number;
+  queryTable?: string;
+  from?: CanonicalEndpoint;
+  to?: CanonicalEndpoint;
+  objective?: "min_hops" | "min_weight_sum" | "max_weight_product";
+  direction?: "out" | "in" | "both";
+  edgeTypes?: Set<string>;
+  edgeWeightMin?: number;
+  edgeWeightMax?: number;
+  starts?: CanonicalEndpoint[];
 };
 type RequestGraphContract = {
   dialect: GraphDialect;
@@ -103,6 +117,80 @@ function sameEndpoint(left: JsonObject, right: JsonObject): boolean {
   return left.key === right.key && left.table === right.table;
 }
 
+function contractEndpoint(value: unknown, path: string, queryTable?: string): CanonicalEndpoint {
+  const result = endpoint(value, path);
+  const key = result.key as string;
+  const table = result.table as string | undefined;
+  return table === undefined || table === queryTable ? { key } : { key, table };
+}
+
+function endpointMatchesContract(
+  actual: JsonObject,
+  expected: CanonicalEndpoint,
+  queryTable?: string
+): boolean {
+  if (actual.key !== expected.key) return false;
+  if (actual.table === expected.table) return true;
+  // Standalone validation cannot distinguish an explicit table from the
+  // implicit query table. High-level clients always provide the table.
+  return queryTable === undefined && actual.table === undefined && expected.table !== undefined;
+}
+
+function edgeContract(
+  operation: JsonObject,
+  path: string
+): Pick<CanonicalResultContract, "direction" | "edgeTypes" | "edgeWeightMin" | "edgeWeightMax"> {
+  const direction = operation.direction ?? "out";
+  if (direction !== "out" && direction !== "in" && direction !== "both") {
+    invalid(`${path}.direction`, "must be out, in, or both");
+  }
+  let edgeTypes: Set<string> | undefined;
+  if (operation.edge_types !== undefined) {
+    edgeTypes = new Set(
+      array(operation.edge_types, `${path}.edge_types`).map((value, index) =>
+        nonemptyString(value, `${path}.edge_types[${index}]`, MAX_EDGE_TYPE_BYTES)
+      )
+    );
+  }
+  let edgeWeightMin: number | undefined;
+  let edgeWeightMax: number | undefined;
+  if (operation.edge_weight !== undefined) {
+    const weight = object(operation.edge_weight, `${path}.edge_weight`);
+    if (weight.min !== undefined)
+      edgeWeightMin = finiteNonnegative(weight.min, `${path}.edge_weight.min`);
+    if (weight.max !== undefined)
+      edgeWeightMax = finiteNonnegative(weight.max, `${path}.edge_weight.max`);
+    if (
+      edgeWeightMin !== undefined &&
+      edgeWeightMax !== undefined &&
+      edgeWeightMin > edgeWeightMax
+    ) {
+      invalid(`${path}.edge_weight`, "minimum must not exceed maximum");
+    }
+  }
+  return { direction, edgeTypes, edgeWeightMin, edgeWeightMax };
+}
+
+function validateEdgeContract(
+  edge: JsonObject,
+  path: string,
+  contract: CanonicalResultContract
+): void {
+  if (contract.direction !== "both" && edge.direction !== contract.direction)
+    invalid(`${path}.direction`, "does not match the requested direction");
+  if (
+    contract.edgeTypes &&
+    contract.edgeTypes.size > 0 &&
+    !contract.edgeTypes.has(edge.type as string)
+  )
+    invalid(`${path}.type`, "was not requested");
+  const weight = edge.weight as number;
+  if (contract.edgeWeightMin !== undefined && weight < contract.edgeWeightMin)
+    invalid(`${path}.weight`, "is below the requested minimum");
+  if (contract.edgeWeightMax !== undefined && weight > contract.edgeWeightMax)
+    invalid(`${path}.weight`, "exceeds the requested maximum");
+}
+
 function pathEdge(
   value: unknown,
   path: string,
@@ -186,6 +274,80 @@ function graphPath(value: unknown, path: string): JsonObject {
   return result;
 }
 
+function validateGraphPathContract(
+  value: JsonObject,
+  path: string,
+  contract: CanonicalResultContract
+): void {
+  const length = value.length as number;
+  if (contract.maxDepth !== undefined && length > contract.maxDepth)
+    invalid(`${path}.length`, "exceeds the requested max_depth");
+  if (value.objective !== contract.objective)
+    invalid(`${path}.objective`, "does not match the requested objective");
+  const nodes = array(value.nodes, `${path}.nodes`).map((node, index) =>
+    object(node, `${path}.nodes[${index}]`)
+  );
+  const first = item(nodes, 0, `${path}.nodes[0]`);
+  const last = item(nodes, nodes.length - 1, `${path}.nodes[${nodes.length - 1}]`);
+  if (contract.from && !endpointMatchesContract(first, contract.from, contract.queryTable))
+    invalid(`${path}.nodes[0]`, "does not match the requested start endpoint");
+  if (contract.to && !endpointMatchesContract(last, contract.to, contract.queryTable))
+    invalid(`${path}.nodes[${nodes.length - 1}]`, "does not match the requested terminal endpoint");
+  array(value.edges, `${path}.edges`).forEach((rawEdge, index) => {
+    validateEdgeContract(
+      object(rawEdge, `${path}.edges[${index}]`),
+      `${path}.edges[${index}]`,
+      contract
+    );
+  });
+}
+
+function endpointSignature(value: JsonObject): string {
+  return JSON.stringify([value.table ?? null, value.key]);
+}
+
+function pathSignature(value: JsonObject): string {
+  const nodes = array(value.nodes, "path.nodes").map((node) =>
+    endpointSignature(object(node, "path.nodes"))
+  );
+  const edges = array(value.edges, "path.edges").map((edge) => {
+    const result = object(edge, "path.edges");
+    return [result.direction, result.type];
+  });
+  return JSON.stringify([nodes, edges]);
+}
+
+function validatePathCollection(
+  paths: readonly JsonObject[],
+  path: string,
+  contract: CanonicalResultContract
+): void {
+  if (contract.nodeMode !== "k_shortest_paths") return;
+  const seenPaths = new Set<string>();
+  let previous: number | undefined;
+  paths.forEach((graphPath, index) => {
+    const nodeSignatures = array(graphPath.nodes, `${path}[${index}].path.nodes`).map((node) =>
+      endpointSignature(object(node, `${path}[${index}].path.nodes`))
+    );
+    if (new Set(nodeSignatures).size !== nodeSignatures.length)
+      invalid(`${path}[${index}].path`, "must be loopless for k_shortest_paths");
+    const signature = pathSignature(graphPath);
+    if (seenPaths.has(signature)) invalid(`${path}[${index}].path`, "duplicates an earlier path");
+    seenPaths.add(signature);
+    const score = graphPath.objective_value as number;
+    if (previous !== undefined) {
+      const descending = contract.objective === "max_weight_product";
+      if (
+        (descending && score > previous && !floatEqual(score, previous)) ||
+        (!descending && score < previous && !floatEqual(score, previous))
+      ) {
+        invalid(`${path}[${index}].path.objective_value`, "is out of objective order");
+      }
+    }
+    previous = score;
+  });
+}
+
 function resultNode(value: unknown, path: string): JsonObject {
   const node = object(value, path);
   exactKeys(
@@ -231,6 +393,39 @@ function resultNode(value: unknown, path: string): JsonObject {
     }
   }
   return node;
+}
+
+function validateResultNodeContract(
+  node: JsonObject,
+  path: string,
+  contract: CanonicalResultContract
+): void {
+  if (contract.maxDepth !== undefined && (node.depth as number) > contract.maxDepth)
+    invalid(`${path}.depth`, "exceeds the requested max_depth");
+  if (contract.starts) {
+    let root: JsonObject | undefined;
+    if (node.path !== undefined) {
+      const rawPath = array(node.path, `${path}.path`);
+      root = object(item(rawPath, 0, `${path}.path[0]`), `${path}.path[0]`);
+    } else if (node.depth === 0) {
+      root = node;
+    }
+    if (
+      root &&
+      !contract.starts.some((start) => endpointMatchesContract(root, start, contract.queryTable))
+    ) {
+      invalid(path, "does not originate at a requested traversal identity");
+    }
+  }
+  if (node.path_edges !== undefined) {
+    array(node.path_edges, `${path}.path_edges`).forEach((rawEdge, index) => {
+      validateEdgeContract(
+        object(rawEdge, `${path}.path_edges[${index}]`),
+        `${path}.path_edges[${index}]`,
+        contract
+      );
+    });
+  }
 }
 
 function stats(value: unknown, path: string, expectedItems: number, allowTruncated: boolean): void {
@@ -332,6 +527,7 @@ function canonicalResult(value: unknown, path: string, contract: CanonicalResult
           if (node.path !== undefined || node.path_edges !== undefined)
             invalid(`${path}.nodes[${index}]`, "contains a path that was not requested");
         }
+        validateResultNodeContract(node, `${path}.nodes[${index}]`, contract);
       });
       stats(result.stats, `${path}.stats`, nodes.length, true);
       return;
@@ -343,24 +539,32 @@ function canonicalResult(value: unknown, path: string, contract: CanonicalResult
     if (contract.nodeMode !== "shortest_path" && contract.nodeMode !== "k_shortest_paths")
       invalid(path, "requires a path operation contract");
     const rawPaths = array(result.paths, `${path}.paths`);
-    if (rawPaths.length > (contract.maxItems ?? MAX_ITEMS))
+    if (rawPaths.length > Math.min(contract.maxItems ?? MAX_PATHS, MAX_PATHS))
       invalid(path, "exceeds the requested result limit");
+    const validatedPaths: JsonObject[] = [];
     rawPaths.forEach((rawItem, index) => {
       const pathItem = object(rawItem, `${path}.paths[${index}]`);
       exactKeys(pathItem, `${path}.paths[${index}]`, ["path"], ["document"]);
-      graphPath(pathItem.path, `${path}.paths[${index}].path`);
+      const validatedPath = graphPath(pathItem.path, `${path}.paths[${index}].path`);
+      validateGraphPathContract(validatedPath, `${path}.paths[${index}].path`, contract);
+      validatedPaths.push(validatedPath);
       if (!contract.includeDocuments && pathItem.document !== undefined)
         invalid(`${path}.paths[${index}].document`, "was returned without being requested");
       if (pathItem.document !== undefined)
         object(pathItem.document, `${path}.paths[${index}].document`);
     });
+    validatePathCollection(validatedPaths, `${path}.paths`, contract);
     stats(result.stats, `${path}.stats`, rawPaths.length, false);
     return;
   }
   invalid(`${path}.kind`, "canonical graph results require bindings, aggregates, nodes, or paths");
 }
 
-function canonicalOperationContract(value: unknown, path: string): CanonicalResultContract {
+function canonicalOperationContract(
+  value: unknown,
+  path: string,
+  queryTable?: string
+): CanonicalResultContract {
   const operation = object(value, path);
   if (operation.match !== undefined) {
     const returned = object(operation.return, `${path}.return`);
@@ -399,41 +603,103 @@ function canonicalOperationContract(value: unknown, path: string): CanonicalResu
       rawLimit === undefined
         ? 100
         : boundedInteger(rawLimit, `${path}.traverse.limit`, 1, MAX_ITEMS);
+    const selector = object(traversal.start, `${path}.traverse.start`);
+    let starts: CanonicalEndpoint[] | undefined;
+    if (selector.keys !== undefined) {
+      starts = array(selector.keys, `${path}.traverse.start.keys`).map((key, index) => ({
+        key: nonemptyString(key, `${path}.traverse.start.keys[${index}]`),
+      }));
+    } else if (selector.identities !== undefined) {
+      starts = array(selector.identities, `${path}.traverse.start.identities`).map(
+        (identity, index) =>
+          contractEndpoint(identity, `${path}.traverse.start.identities[${index}]`, queryTable)
+      );
+    }
     return {
       kind: "nodes",
       maxItems,
       nodeMode: "traversal",
       includePaths: traversal.include_paths === true,
       includeDocuments: traversal.include_documents === true,
+      maxDepth:
+        traversal.max_depth === undefined
+          ? DEFAULT_TRAVERSAL_DEPTH
+          : boundedInteger(traversal.max_depth, `${path}.traverse.max_depth`, 0, MAX_EDGES),
+      queryTable,
+      starts,
+      ...edgeContract(traversal, `${path}.traverse`),
     };
   }
   if (operation.shortest_path !== undefined) {
     const shortestPath = object(operation.shortest_path, `${path}.shortest_path`);
+    const objective = shortestPath.objective ?? "min_hops";
+    if (
+      objective !== "min_hops" &&
+      objective !== "min_weight_sum" &&
+      objective !== "max_weight_product"
+    ) {
+      return invalid(`${path}.shortest_path.objective`, "has an unknown value");
+    }
     return {
       kind: "paths",
       maxItems: 1,
       nodeMode: "shortest_path",
       includeDocuments: shortestPath.include_documents === true,
+      maxDepth:
+        shortestPath.max_depth === undefined
+          ? DEFAULT_PATH_DEPTH
+          : boundedInteger(shortestPath.max_depth, `${path}.shortest_path.max_depth`, 1, MAX_EDGES),
+      queryTable,
+      from: contractEndpoint(shortestPath.from, `${path}.shortest_path.from`, queryTable),
+      to: contractEndpoint(shortestPath.to, `${path}.shortest_path.to`, queryTable),
+      objective,
+      ...edgeContract(shortestPath, `${path}.shortest_path`),
     };
   }
   if (operation.k_shortest_paths !== undefined) {
     const kShortestPaths = object(operation.k_shortest_paths, `${path}.k_shortest_paths`);
+    const objective = kShortestPaths.objective ?? "min_hops";
+    if (
+      objective !== "min_hops" &&
+      objective !== "min_weight_sum" &&
+      objective !== "max_weight_product"
+    ) {
+      return invalid(`${path}.k_shortest_paths.objective`, "has an unknown value");
+    }
     return {
       kind: "paths",
       maxItems: boundedInteger(kShortestPaths.k, `${path}.k_shortest_paths.k`, 1, 100),
       nodeMode: "k_shortest_paths",
       includeDocuments: kShortestPaths.include_documents === true,
+      maxDepth:
+        kShortestPaths.max_depth === undefined
+          ? DEFAULT_PATH_DEPTH
+          : boundedInteger(
+              kShortestPaths.max_depth,
+              `${path}.k_shortest_paths.max_depth`,
+              1,
+              MAX_EDGES
+            ),
+      queryTable,
+      from: contractEndpoint(kShortestPaths.from, `${path}.k_shortest_paths.from`, queryTable),
+      to: contractEndpoint(kShortestPaths.to, `${path}.k_shortest_paths.to`, queryTable),
+      objective,
+      ...edgeContract(kShortestPaths, `${path}.k_shortest_paths`),
     };
   }
   return invalid(path, "does not contain a supported graph operation");
 }
 
-function requestDialect(request: QueryRequest): RequestGraphContract {
+function requestDialect(request: QueryRequest, fallbackQueryTable?: string): RequestGraphContract {
   const canonical = request.graph_queries;
   if (canonical !== undefined && canonical !== null) {
+    const queryTable = request.table ?? fallbackQueryTable;
     const operations = new Map<string, CanonicalResultContract>();
     for (const [name, operation] of Object.entries(canonical)) {
-      operations.set(name, canonicalOperationContract(operation, `request.graph_queries.${name}`));
+      operations.set(
+        name,
+        canonicalOperationContract(operation, `request.graph_queries.${name}`, queryTable)
+      );
     }
     return { dialect: "canonical", operations };
   }
@@ -442,9 +708,10 @@ function requestDialect(request: QueryRequest): RequestGraphContract {
 
 export function validateGraphQueryResponses(
   value: QueryResponses | undefined,
-  requests: readonly QueryRequest[]
+  requests: readonly QueryRequest[],
+  queryTable?: string
 ): void {
-  const requestContracts = requests.map(requestDialect);
+  const requestContracts = requests.map((request) => requestDialect(request, queryTable));
   const requiresGraphResults = requestContracts.some(({ dialect }) => dialect !== "none");
   if (!value) {
     if (requiresGraphResults) invalid("response", "is missing a graph query response");

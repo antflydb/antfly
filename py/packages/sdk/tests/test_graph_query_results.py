@@ -593,6 +593,144 @@ def test_public_query_decoder_rejects_invalid_canonical_operation_name() -> None
         )
 
 
+def test_query_decoder_enforces_observable_path_and_traversal_semantics() -> None:
+    constrained_query = {
+        "path": {
+            "index": "graph",
+            "shortest_path": {
+                "from": {"key": "a", "table": "docs"},
+                "to": {"key": "b", "table": "entities"},
+                "direction": "in",
+                "edge_types": ["cites"],
+                "edge_weight": {"max": 0.5},
+                "max_depth": 1,
+                "objective": "min_weight_sum",
+            },
+        }
+    }
+    valid_path = {
+        "nodes": [{"key": "a"}, {"key": "b", "table": "entities"}],
+        "edges": [
+            {
+                "from": {"key": "a"},
+                "to": {"key": "b", "table": "entities"},
+                "direction": "in",
+                "type": "cites",
+                "weight": 0.5,
+            }
+        ],
+        "length": 1,
+        "objective": "min_weight_sum",
+        "weight_sum": 0.5,
+        "objective_value": 0.5,
+    }
+
+    def path_response(graph_path: object) -> dict[str, object]:
+        return _query_response(
+            {
+                "kind": "paths",
+                "paths": [{"path": graph_path}],
+                "stats": {"returned_items": 1, "truncated": False},
+            },
+            operation="path",
+        )
+
+    decode_query_responses(
+        path_response(valid_path),
+        expected_graph_queries=constrained_query,
+        query_table="docs",
+    )
+
+    wrong_terminal = {
+        **valid_path,
+        "nodes": [{"key": "a"}, {"key": "wrong"}],
+        "edges": [{**valid_path["edges"][0], "to": {"key": "wrong"}}],
+    }
+    with pytest.raises(AntflyException, match="terminal endpoint"):
+        decode_query_responses(
+            path_response(wrong_terminal),
+            expected_graph_queries=constrained_query,
+            query_table="docs",
+        )
+
+    wrong_type = {
+        **valid_path,
+        "edges": [{**valid_path["edges"][0], "type": "links"}],
+    }
+    with pytest.raises(AntflyException, match="was not requested"):
+        decode_query_responses(
+            path_response(wrong_type),
+            expected_graph_queries=constrained_query,
+            query_table="docs",
+        )
+    unfiltered_query = {
+        "path": {
+            **constrained_query["path"],
+            "shortest_path": {
+                **constrained_query["path"]["shortest_path"],
+                "edge_types": [],
+            },
+        }
+    }
+    decode_query_responses(
+        path_response(wrong_type),
+        expected_graph_queries=unfiltered_query,
+        query_table="docs",
+    )
+
+    traversal_query = {
+        "walk": {
+            "index": "graph",
+            "traverse": {"start": {"keys": ["a"]}, "max_depth": 1},
+        }
+    }
+    with pytest.raises(AntflyException, match="requested traversal identity"):
+        decode_query_responses(
+            _query_response(
+                {
+                    "kind": "nodes",
+                    "nodes": [{"key": "wrong", "depth": 0}],
+                    "stats": {"returned_items": 1, "truncated": False},
+                },
+                operation="walk",
+            ),
+            expected_graph_queries=traversal_query,
+        )
+
+    k_query = {
+        "path": {
+            "index": "graph",
+            "k_shortest_paths": {"from": {"key": "a"}, "to": {"key": "b"}, "k": 2},
+        }
+    }
+    direct = {
+        "nodes": [{"key": "a"}, {"key": "b"}],
+        "edges": [
+            {
+                "from": {"key": "a"},
+                "to": {"key": "b"},
+                "direction": "out",
+                "type": "links",
+                "weight": 1,
+            }
+        ],
+        "length": 1,
+        "objective": "min_hops",
+        "weight_sum": 1,
+        "objective_value": 1,
+    }
+    duplicate_result = {
+        "kind": "paths",
+        "paths": [{"path": direct}, {"path": direct}],
+        "stats": {"returned_items": 2, "truncated": False},
+    }
+    with pytest.raises(AntflyException, match="duplicates an earlier path"):
+        decode_query_responses(
+            _query_response(duplicate_result, operation="path"),
+            expected_graph_queries=k_query,
+        )
+
+
 def test_antfly_client_query_uses_fail_closed_graph_result_decoder(monkeypatch: pytest.MonkeyPatch) -> None:
     client = AntflyClient("http://test")
     malformed = _query_response(

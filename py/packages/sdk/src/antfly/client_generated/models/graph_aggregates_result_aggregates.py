@@ -15,7 +15,7 @@ T = TypeVar("T", bound="GraphAggregatesResultAggregates")
 
 @_attrs_define
 class GraphAggregatesResultAggregates:
-    """ """
+    """Keys are the GraphIdentifiers selected by the corresponding aggregate return projection."""
 
     additional_properties: dict[str, GraphAggregateValue] = _attrs_field(init=False, factory=dict)
 

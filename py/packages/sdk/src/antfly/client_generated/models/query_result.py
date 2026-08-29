@@ -35,7 +35,8 @@ class QueryResult:
             when the request sets `profile: true`.
         error (str | Unset): Error message if the query failed.
         table (str | Unset): Which table this result came from
-        graph_results (GraphQueryResults | Unset): Canonical graph results keyed by graph_queries operation name.
+        graph_results (GraphQueryResults | Unset): Non-empty canonical graph results keyed exactly by graph_queries
+            operation name. Keys use the versioned GraphIdentifier policy.
     """
 
     took: int

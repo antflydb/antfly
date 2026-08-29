@@ -42,9 +42,12 @@ const (
 	maxGraphEdgeTypes           = 64
 	maxGraphEdgeTypeBytes       = 64 * 1024
 	maxGraphHydratedBindings    = 10_000
+	maxGraphPathResults         = 100
 	maxNamedGraphQueries        = 64
 	maxGraphMatchQueries        = 8
 	defaultGraphBindingsLimit   = 100
+	defaultGraphTraversalDepth  = 1
+	defaultGraphPathDepth       = 10
 	maxAntflyUnixSeconds        = int64(18_446_744_073)
 	maxAntflyUnixNanoseconds    = 709_551_615
 )
@@ -171,7 +174,7 @@ func validateQueryGraphResponses(requests []QueryRequest, result *QueryResponses
 				return fmt.Errorf("antfly: response %d: %w", responseIndex, err)
 			}
 			for name, raw := range response.GraphResults {
-				if err := validateCanonicalGraphResultForQuery(request.GraphQueries[name], raw); err != nil {
+				if err := validateCanonicalGraphResultForQueryInTable(request.GraphQueries[name], request.Table, raw); err != nil {
 					return fmt.Errorf("antfly: response %d graph result %q: %w", responseIndex, name, err)
 				}
 			}
@@ -188,9 +191,19 @@ type canonicalGraphResultContract struct {
 	kind             string
 	names            []string
 	maxItems         int
+	maxDepth         int
 	nodeMode         canonicalGraphNodeMode
 	includePaths     bool
 	includeDocuments bool
+	queryTable       string
+	from             GraphPathEndpoint
+	to               GraphPathEndpoint
+	objective        GraphPathObjective
+	direction        EdgeDirection
+	edgeTypes        []oapi.GraphEdgeType
+	edgeWeight       *GraphEdgeWeightRange
+	starts           []GraphPathEndpoint
+	startsKnown      bool
 }
 
 type canonicalGraphNodeMode uint8
@@ -203,6 +216,10 @@ const (
 )
 
 func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResultContract, error) {
+	return canonicalGraphResultContractForQueryInTable(query, "")
+}
+
+func canonicalGraphResultContractForQueryInTable(query GraphQuery, queryTable string) (canonicalGraphResultContract, error) {
 	decoded, err := query.DecodeStrictVariant()
 	if err != nil {
 		return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph query: %w", err)
@@ -242,31 +259,109 @@ func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResul
 		if limit == 0 {
 			limit = defaultGraphBindingsLimit
 		}
+		maxDepth := value.Traverse.MaxDepth
+		if maxDepth == 0 {
+			maxDepth = defaultGraphTraversalDepth
+		}
+		starts, startsKnown, err := canonicalDirectSelectorEndpoints(value.Traverse.Start, queryTable)
+		if err != nil {
+			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph traversal start: %w", err)
+		}
 		return canonicalGraphResultContract{
 			kind:             string(GraphNodesResultKindNodes),
 			maxItems:         limit,
+			maxDepth:         maxDepth,
 			nodeMode:         canonicalGraphNodeModeTraversal,
 			includePaths:     value.Traverse.IncludePaths,
 			includeDocuments: value.Traverse.IncludeDocuments,
+			queryTable:       queryTable,
+			direction:        effectiveGraphDirection(value.Traverse.Direction),
+			edgeTypes:        value.Traverse.EdgeTypes,
+			edgeWeight:       value.Traverse.EdgeWeight,
+			starts:           starts,
+			startsKnown:      startsKnown,
 		}, nil
 	case oapi.GraphQueryVariantShortestPath:
 		value := decoded.ShortestPath
+		maxDepth := value.ShortestPath.MaxDepth
+		if maxDepth == 0 {
+			maxDepth = defaultGraphPathDepth
+		}
 		return canonicalGraphResultContract{
 			kind:             string(GraphPathsResultKindPaths),
 			maxItems:         1,
+			maxDepth:         maxDepth,
 			nodeMode:         canonicalGraphNodeModeShortestPath,
 			includeDocuments: value.ShortestPath.IncludeDocuments,
+			queryTable:       queryTable,
+			from:             value.ShortestPath.From,
+			to:               value.ShortestPath.To,
+			objective:        effectiveGraphObjective(value.ShortestPath.Objective),
+			direction:        effectiveGraphDirection(value.ShortestPath.Direction),
+			edgeTypes:        value.ShortestPath.EdgeTypes,
+			edgeWeight:       value.ShortestPath.EdgeWeight,
 		}, nil
 	case oapi.GraphQueryVariantKShortestPaths:
 		value := decoded.KShortestPaths
+		maxDepth := value.KShortestPaths.MaxDepth
+		if maxDepth == 0 {
+			maxDepth = defaultGraphPathDepth
+		}
 		return canonicalGraphResultContract{
 			kind:             string(GraphPathsResultKindPaths),
 			maxItems:         value.KShortestPaths.K,
+			maxDepth:         maxDepth,
 			nodeMode:         canonicalGraphNodeModeKShortestPaths,
 			includeDocuments: value.KShortestPaths.IncludeDocuments,
+			queryTable:       queryTable,
+			from:             value.KShortestPaths.From,
+			to:               value.KShortestPaths.To,
+			objective:        effectiveGraphObjective(value.KShortestPaths.Objective),
+			direction:        effectiveGraphDirection(value.KShortestPaths.Direction),
+			edgeTypes:        value.KShortestPaths.EdgeTypes,
+			edgeWeight:       value.KShortestPaths.EdgeWeight,
 		}, nil
 	default:
 		return canonicalGraphResultContract{}, fmt.Errorf("antfly: graph query has no supported operation")
+	}
+}
+
+func effectiveGraphDirection(direction EdgeDirection) EdgeDirection {
+	if direction == "" {
+		return EdgeDirectionOut
+	}
+	return direction
+}
+
+func effectiveGraphObjective(objective GraphPathObjective) GraphPathObjective {
+	if objective == "" {
+		return GraphPathObjectiveMinHops
+	}
+	return objective
+}
+
+func canonicalDirectSelectorEndpoints(selector GraphNodeSelector, queryTable string) ([]GraphPathEndpoint, bool, error) {
+	decoded, err := selector.DecodeStrictVariant()
+	if err != nil {
+		return nil, false, err
+	}
+	switch decoded.Kind {
+	case oapi.GraphNodeSelectorVariantKeys:
+		endpoints := make([]GraphPathEndpoint, len(decoded.Keys.Keys))
+		for i, key := range decoded.Keys.Keys {
+			endpoints[i] = GraphPathEndpoint{Key: key}
+		}
+		return endpoints, true, nil
+	case oapi.GraphNodeSelectorVariantIdentities:
+		endpoints := make([]GraphPathEndpoint, len(decoded.Identities.Identities))
+		for i, endpoint := range decoded.Identities.Identities {
+			endpoints[i] = canonicalExpectedEndpoint(endpoint, queryTable)
+		}
+		return endpoints, true, nil
+	case oapi.GraphNodeSelectorVariantResultRef:
+		return nil, false, nil
+	default:
+		return nil, false, fmt.Errorf("unsupported graph selector")
 	}
 }
 
@@ -293,7 +388,11 @@ func canonicalGraphResultEnvelope(result graphResultEnvelopeDecoder) (graphQuery
 }
 
 func validateCanonicalGraphResultForQuery(query GraphQuery, result GraphResult) error {
-	contract, err := canonicalGraphResultContractForQuery(query)
+	return validateCanonicalGraphResultForQueryInTable(query, "", result)
+}
+
+func validateCanonicalGraphResultForQueryInTable(query GraphQuery, queryTable string, result GraphResult) error {
+	contract, err := canonicalGraphResultContractForQueryInTable(query, queryTable)
 	if err != nil {
 		return err
 	}
@@ -541,6 +640,15 @@ func validateNodesResultPayload(contract canonicalGraphResultContract, result st
 		if !contract.includeDocuments && value.Nodes[i].Document.present {
 			return fmt.Errorf("antfly: nodes graph result node %d contains a document that was not requested", i)
 		}
+		if err := validateTraversalNodeForContract(
+			contract,
+			GraphPathEndpoint{Key: value.Nodes[i].Key, Table: value.Nodes[i].Table.pointer()},
+			value.Nodes[i].Depth.value,
+			value.Nodes[i].Path,
+			value.Nodes[i].PathEdges,
+		); err != nil {
+			return fmt.Errorf("antfly: nodes graph result node %d: %w", i, err)
+		}
 	}
 	for i := range value.Nodes {
 		if contract.includePaths {
@@ -575,8 +683,111 @@ func validatePathsResultPayload(contract canonicalGraphResultContract, result st
 		if !contract.includeDocuments && value.Paths[i].Document.present {
 			return fmt.Errorf("antfly: paths graph result path %d contains a document that was not requested", i)
 		}
+		if err := validateGraphPathForContract(contract, &value.Paths[i].Path); err != nil {
+			return fmt.Errorf("antfly: paths graph result path %d: %w", i, err)
+		}
+	}
+	if err := validateGraphPathCollectionForContract(contract, value.Paths); err != nil {
+		return fmt.Errorf("antfly: paths graph result: %w", err)
 	}
 	return validateDecodedGraphStats(envelope, len(value.Paths), false)
+}
+
+func validateTraversalNodeForContract(
+	contract canonicalGraphResultContract,
+	node GraphPathEndpoint,
+	depth int,
+	path []GraphPathEndpoint,
+	edges []graphPathEdgeValidation,
+) error {
+	if depth > contract.maxDepth {
+		return fmt.Errorf("graph node depth %d exceeds the requested max_depth of %d", depth, contract.maxDepth)
+	}
+	if path != nil {
+		if contract.startsKnown && !endpointInContractSet(path[0], contract.starts) {
+			return fmt.Errorf("graph node path does not start at a requested traversal identity")
+		}
+		for i := range edges {
+			if err := validateGraphEdgeForContract(contract, edges[i].Direction.value, edges[i].Type, edges[i].Weight.value); err != nil {
+				return err
+			}
+		}
+	} else if depth == 0 && contract.startsKnown && !endpointInContractSet(node, contract.starts) {
+		return fmt.Errorf("depth-zero graph node is not a requested traversal identity")
+	}
+	return nil
+}
+
+func validateGraphPathForContract(contract canonicalGraphResultContract, path *graphPathValidation) error {
+	if path.Length.value > contract.maxDepth {
+		return fmt.Errorf("length %d exceeds the requested max_depth of %d", path.Length.value, contract.maxDepth)
+	}
+	if path.Objective.value != contract.objective {
+		return fmt.Errorf("objective %q does not match the requested objective %q", path.Objective.value, contract.objective)
+	}
+	if !endpointMatchesContract(path.Nodes[0], contract.from, contract.queryTable) {
+		return fmt.Errorf("start endpoint does not match the requested from identity")
+	}
+	if !endpointMatchesContract(path.Nodes[len(path.Nodes)-1], contract.to, contract.queryTable) {
+		return fmt.Errorf("terminal endpoint does not match the requested to identity")
+	}
+	for i := range path.Edges {
+		if err := validateGraphEdgeForContract(contract, path.Edges[i].Direction.value, path.Edges[i].Type, path.Edges[i].Weight.value); err != nil {
+			return err
+		}
+	}
+	if contract.nodeMode == canonicalGraphNodeModeKShortestPaths && !graphValidationPathIsLoopless(path.Nodes) {
+		return fmt.Errorf("k_shortest_paths result must be loopless")
+	}
+	return nil
+}
+
+func validateGraphEdgeForContract(contract canonicalGraphResultContract, direction GraphPathEdgeDirection, edgeType string, weight float64) error {
+	if contract.direction != EdgeDirectionBoth && string(direction) != string(contract.direction) {
+		return fmt.Errorf("edge direction %q does not match the requested direction %q", direction, contract.direction)
+	}
+	if len(contract.edgeTypes) > 0 {
+		matched := false
+		for _, allowed := range contract.edgeTypes {
+			if edgeType == string(allowed) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return fmt.Errorf("edge type %q was not requested", edgeType)
+		}
+	}
+	if contract.edgeWeight != nil {
+		if contract.edgeWeight.Min != nil && weight < *contract.edgeWeight.Min {
+			return fmt.Errorf("edge weight is below the requested minimum")
+		}
+		if contract.edgeWeight.Max != nil && weight > *contract.edgeWeight.Max {
+			return fmt.Errorf("edge weight is above the requested maximum")
+		}
+	}
+	return nil
+}
+
+func validateGraphPathCollectionForContract(contract canonicalGraphResultContract, paths []graphPathResultValidation) error {
+	if contract.nodeMode != canonicalGraphNodeModeKShortestPaths {
+		return nil
+	}
+	for i := range paths {
+		for prior := 0; prior < i; prior++ {
+			if sameValidationGraphPath(&paths[prior].Path, &paths[i].Path) {
+				return fmt.Errorf("contains duplicate paths at indexes %d and %d", prior, i)
+			}
+		}
+		if i > 0 && graphObjectiveOutOfOrder(
+			contract.objective,
+			paths[i-1].Path.ObjectiveValue.value,
+			paths[i].Path.ObjectiveValue.value,
+		) {
+			return fmt.Errorf("paths are not ordered by requested objective %q", contract.objective)
+		}
+	}
+	return nil
 }
 
 func validateGraphResultNodePayload(node *graphResultNodeValidation) error {
@@ -711,7 +922,14 @@ func DecodeCanonicalGraphResult(result GraphResult) (any, error) {
 // requested it. This is the preferred decoder for values returned by a known
 // graph_queries entry.
 func DecodeGraphResultForQuery(query GraphQuery, result GraphResult) (any, error) {
-	contract, err := canonicalGraphResultContractForQuery(query)
+	return DecodeGraphResultForQueryInTable("", query, result)
+}
+
+// DecodeGraphResultForQueryInTable additionally knows the queried table, so it
+// can enforce canonical omission of that table qualifier and distinguish it
+// from a cross-table endpoint. Prefer this form for table-scoped transports.
+func DecodeGraphResultForQueryInTable(queryTable string, query GraphQuery, result GraphResult) (any, error) {
+	contract, err := canonicalGraphResultContractForQueryInTable(query, queryTable)
 	if err != nil {
 		return nil, err
 	}
@@ -793,6 +1011,9 @@ func validateDecodedGraphResultContract(contract canonicalGraphResultContract, d
 					return fmt.Errorf("antfly: traversal graph result node %d contains a path that was not requested", i)
 				}
 			}
+			if err := validateDecodedTraversalNodeForContract(contract, value.Nodes[i]); err != nil {
+				return fmt.Errorf("antfly: nodes graph result node %d: %w", i, err)
+			}
 		}
 		return nil
 	case GraphPathsResult:
@@ -808,6 +1029,14 @@ func validateDecodedGraphResultContract(contract canonicalGraphResultContract, d
 					return fmt.Errorf("antfly: paths graph result path %d contains a document that was not requested", i)
 				}
 			}
+		}
+		for i := range value.Paths {
+			if err := validateDecodedGraphPathForContract(contract, value.Paths[i].Path); err != nil {
+				return fmt.Errorf("antfly: paths graph result path %d: %w", i, err)
+			}
+		}
+		if err := validateDecodedGraphPathCollectionForContract(contract, value.Paths); err != nil {
+			return fmt.Errorf("antfly: paths graph result: %w", err)
 		}
 		return nil
 	default:
@@ -925,8 +1154,8 @@ func decodeCanonicalGraphResult(
 		if wire.Kind != GraphPathsResultKindPaths || wire.Paths == nil {
 			return nil, fmt.Errorf("antfly: paths graph result requires kind and paths")
 		}
-		if len(wire.Paths) > maxGraphHydratedBindings {
-			return nil, fmt.Errorf("antfly: paths graph result exceeds %d items", maxGraphHydratedBindings)
+		if len(wire.Paths) > maxGraphPathResults {
+			return nil, fmt.Errorf("antfly: paths graph result exceeds %d items", maxGraphPathResults)
 		}
 		for i := range wire.Paths {
 			if err := validateGraphPathPayload(&wire.Paths[i].Path); err != nil {
@@ -940,8 +1169,8 @@ func decodeCanonicalGraphResult(
 		if value.Kind != GraphPathsResultKindPaths || value.Paths == nil {
 			return nil, fmt.Errorf("antfly: paths graph result requires kind and paths")
 		}
-		if len(value.Paths) > maxGraphHydratedBindings {
-			return nil, fmt.Errorf("antfly: paths graph result exceeds %d items", maxGraphHydratedBindings)
+		if len(value.Paths) > maxGraphPathResults {
+			return nil, fmt.Errorf("antfly: paths graph result exceeds %d items", maxGraphPathResults)
 		}
 		if err := validateDecodedGraphStats(envelope, len(value.Paths), false); err != nil {
 			return nil, err
@@ -1091,6 +1320,153 @@ func sameDecodedGraphEndpoint(left, right GraphPathEndpoint) bool {
 		return false
 	}
 	return left.Table == nil || *left.Table == *right.Table
+}
+
+func canonicalExpectedEndpoint(endpoint GraphPathEndpoint, queryTable string) GraphPathEndpoint {
+	if endpoint.Table != nil && queryTable != "" && *endpoint.Table == queryTable {
+		return GraphPathEndpoint{Key: endpoint.Key}
+	}
+	return endpoint
+}
+
+func endpointMatchesContract(actual, requested GraphPathEndpoint, queryTable string) bool {
+	expected := canonicalExpectedEndpoint(requested, queryTable)
+	if sameDecodedGraphEndpoint(actual, expected) {
+		return true
+	}
+	// The standalone decoder does not know the table selected by its transport.
+	// In that form an omitted result qualifier may represent an explicitly named
+	// query table. Automatic client validation and DecodeGraphResultForQueryInTable
+	// always carry the table and take the strict branch above.
+	return queryTable == "" && requested.Table != nil && actual.Table == nil && actual.Key == requested.Key
+}
+
+func endpointInContractSet(endpoint GraphPathEndpoint, expected []GraphPathEndpoint) bool {
+	for _, candidate := range expected {
+		if sameDecodedGraphEndpoint(endpoint, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func graphValidationPathIsLoopless(nodes []GraphPathEndpoint) bool {
+	for i := range nodes {
+		for prior := 0; prior < i; prior++ {
+			if sameDecodedGraphEndpoint(nodes[prior], nodes[i]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sameValidationGraphPath(left, right *graphPathValidation) bool {
+	if len(left.Nodes) != len(right.Nodes) || len(left.Edges) != len(right.Edges) {
+		return false
+	}
+	for i := range left.Nodes {
+		if !sameDecodedGraphEndpoint(left.Nodes[i], right.Nodes[i]) {
+			return false
+		}
+	}
+	for i := range left.Edges {
+		if left.Edges[i].Direction.value != right.Edges[i].Direction.value ||
+			left.Edges[i].Type != right.Edges[i].Type {
+			return false
+		}
+	}
+	return true
+}
+
+func graphObjectiveOutOfOrder(objective GraphPathObjective, previous, current float64) bool {
+	if graphFloatEqual(previous, current) {
+		return false
+	}
+	if objective == GraphPathObjectiveMaxWeightProduct {
+		return current > previous
+	}
+	return current < previous
+}
+
+func validateDecodedTraversalNodeForContract(contract canonicalGraphResultContract, node GraphResultNode) error {
+	if node.Depth > contract.maxDepth {
+		return fmt.Errorf("graph node depth %d exceeds the requested max_depth of %d", node.Depth, contract.maxDepth)
+	}
+	if node.Path != nil {
+		if contract.startsKnown && !endpointInContractSet(node.Path[0], contract.starts) {
+			return fmt.Errorf("graph node path does not start at a requested traversal identity")
+		}
+		for _, edge := range node.PathEdges {
+			if err := validateGraphEdgeForContract(contract, edge.Direction, string(edge.Type), edge.Weight); err != nil {
+				return err
+			}
+		}
+	} else if node.Depth == 0 && contract.startsKnown && !endpointInContractSet(
+		GraphPathEndpoint{Key: node.Key, Table: node.Table},
+		contract.starts,
+	) {
+		return fmt.Errorf("depth-zero graph node is not a requested traversal identity")
+	}
+	return nil
+}
+
+func validateDecodedGraphPathForContract(contract canonicalGraphResultContract, path GraphPath) error {
+	if path.Length > contract.maxDepth {
+		return fmt.Errorf("length %d exceeds the requested max_depth of %d", path.Length, contract.maxDepth)
+	}
+	if path.Objective != contract.objective {
+		return fmt.Errorf("objective %q does not match the requested objective %q", path.Objective, contract.objective)
+	}
+	if !endpointMatchesContract(path.Nodes[0], contract.from, contract.queryTable) {
+		return fmt.Errorf("start endpoint does not match the requested from identity")
+	}
+	if !endpointMatchesContract(path.Nodes[len(path.Nodes)-1], contract.to, contract.queryTable) {
+		return fmt.Errorf("terminal endpoint does not match the requested to identity")
+	}
+	for _, edge := range path.Edges {
+		if err := validateGraphEdgeForContract(contract, edge.Direction, string(edge.Type), edge.Weight); err != nil {
+			return err
+		}
+	}
+	if contract.nodeMode == canonicalGraphNodeModeKShortestPaths && !graphValidationPathIsLoopless(path.Nodes) {
+		return fmt.Errorf("k_shortest_paths result must be loopless")
+	}
+	return nil
+}
+
+func sameDecodedGraphPath(left, right GraphPath) bool {
+	if len(left.Nodes) != len(right.Nodes) || len(left.Edges) != len(right.Edges) {
+		return false
+	}
+	for i := range left.Nodes {
+		if !sameDecodedGraphEndpoint(left.Nodes[i], right.Nodes[i]) {
+			return false
+		}
+	}
+	for i := range left.Edges {
+		if left.Edges[i].Direction != right.Edges[i].Direction || left.Edges[i].Type != right.Edges[i].Type {
+			return false
+		}
+	}
+	return true
+}
+
+func validateDecodedGraphPathCollectionForContract(contract canonicalGraphResultContract, paths []GraphPathResult) error {
+	if contract.nodeMode != canonicalGraphNodeModeKShortestPaths {
+		return nil
+	}
+	for i := range paths {
+		for prior := 0; prior < i; prior++ {
+			if sameDecodedGraphPath(paths[prior].Path, paths[i].Path) {
+				return fmt.Errorf("contains duplicate paths at indexes %d and %d", prior, i)
+			}
+		}
+		if i > 0 && graphObjectiveOutOfOrder(contract.objective, paths[i-1].Path.ObjectiveValue, paths[i].Path.ObjectiveValue) {
+			return fmt.Errorf("paths are not ordered by requested objective %q", contract.objective)
+		}
+	}
+	return nil
 }
 
 func finiteNonNegative(value float64) bool {
