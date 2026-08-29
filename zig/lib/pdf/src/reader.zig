@@ -9282,6 +9282,7 @@ fn reduceJbig2CoverageAlloc(
     const out = try alloc.alloc(u8, target_len);
     errdefer alloc.free(out);
     @memset(out, 0);
+    var samples_since_cancellation_check: usize = 0;
     for (0..target_height) |target_y| {
         try cancellation.check();
         const source_y_start = (@as(u64, target_y) * source_height) / target_height;
@@ -9295,11 +9296,15 @@ fn reduceJbig2CoverageAlloc(
             while (source_y < @min(source_y_end, source_height)) : (source_y += 1) {
                 var source_x = source_x_start;
                 while (source_x < @min(source_x_end, source_width)) : (source_x += 1) {
-                    if ((source_x - source_x_start) & 4095 == 0) try cancellation.check();
                     const byte = encoded[source_y * source_stride + source_x / 8];
                     const shift: u3 = @intCast(7 - (source_x & 7));
                     black_count += (byte >> shift) & 1;
                     sample_count += 1;
+                    samples_since_cancellation_check += 1;
+                    if (samples_since_cancellation_check >= 4096) {
+                        try cancellation.check();
+                        samples_since_cancellation_check = 0;
+                    }
                 }
             }
             if (sample_count == 0) return error.UnsupportedPdfRendering;
@@ -9849,9 +9854,15 @@ fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Obj
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
 
+    try cancellation.check();
+    var work_since_cancellation_check: usize = 0;
     while (true) {
-        try cancellation.check();
         const code = readLzwCode(input, &bit_pos, code_size) orelse break;
+        work_since_cancellation_check += 1;
+        if (work_since_cancellation_check >= 1024) {
+            try cancellation.check();
+            work_since_cancellation_check = 0;
+        }
         switch (code) {
             256 => {
                 for (dict.items[258..]) |entry| alloc.free(entry);
@@ -9909,9 +9920,10 @@ fn runLengthDecodeAlloc(alloc: Allocator, input: []const u8, max_bytes: usize, c
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
 
+    try cancellation.check();
+    var work_since_cancellation_check: usize = 0;
     var i: usize = 0;
     while (i < input.len) {
-        try cancellation.check();
         const length = input[i];
         i += 1;
         if (length == 128) break;
@@ -9921,6 +9933,11 @@ fn runLengthDecodeAlloc(alloc: Allocator, input: []const u8, max_bytes: usize, c
             if (out.items.len > max_bytes or literal_len > max_bytes - out.items.len) return error.DecodedStreamTooLarge;
             try out.appendSlice(alloc, input[i .. i + literal_len]);
             i += literal_len;
+            work_since_cancellation_check += literal_len;
+            if (work_since_cancellation_check >= 4096) {
+                try cancellation.check();
+                work_since_cancellation_check = 0;
+            }
             continue;
         }
 
@@ -9930,9 +9947,42 @@ fn runLengthDecodeAlloc(alloc: Allocator, input: []const u8, max_bytes: usize, c
         const repeat_len = 257 - @as(usize, length);
         if (out.items.len > max_bytes or repeat_len > max_bytes - out.items.len) return error.DecodedStreamTooLarge;
         try out.appendNTimes(alloc, repeat, repeat_len);
+        work_since_cancellation_check += repeat_len;
+        if (work_since_cancellation_check >= 4096) {
+            try cancellation.check();
+            work_since_cancellation_check = 0;
+        }
     }
 
     return try out.toOwnedSlice(alloc);
+}
+
+test "run length cancellation polling is amortized by decoded work" {
+    const ProbeState = struct {
+        checks: usize = 0,
+
+        fn isCancelled(context: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(context.?)));
+            self.checks += 1;
+            return false;
+        }
+    };
+
+    var encoded = std.ArrayList(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    for (0..3000) |_| try encoded.appendSlice(std.testing.allocator, &.{ 0, 'x' });
+    try encoded.append(std.testing.allocator, 128);
+
+    var probe_state = ProbeState{};
+    const decoded = try runLengthDecodeAlloc(
+        std.testing.allocator,
+        encoded.items,
+        3000,
+        .{ .context = &probe_state, .is_cancelled_fn = ProbeState.isCancelled },
+    );
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqual(@as(usize, 3000), decoded.len);
+    try std.testing.expectEqual(@as(usize, 1), probe_state.checks);
 }
 
 fn dictionaryEntryAlloc(alloc: Allocator, dict: *const std.ArrayList([]u8), code: u16) ![]u8 {
@@ -15487,6 +15537,32 @@ test "reader can decode lzw stream object" {
     try std.testing.expectEqualStrings("-----A---B", decoded);
 }
 
+test "lzw cancellation polling is amortized across short code sequences" {
+    const ProbeState = struct {
+        checks: usize = 0,
+
+        fn isCancelled(context: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(context.?)));
+            self.checks += 1;
+            return false;
+        }
+    };
+
+    var probe_state = ProbeState{};
+    const decoded = try lzwDecodeAlloc(
+        std.testing.allocator,
+        &.{ 0x80, 0x0b, 0x60, 0x50, 0x22, 0x0c, 0x0c, 0x85, 0x01 },
+        null,
+        64,
+        .{ .context = &probe_state, .is_cancelled_fn = ProbeState.isCancelled },
+    );
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("-----A---B", decoded);
+    // One check in LZW and one at the predictor boundary; neither scales with
+    // the number of codes in this short stream.
+    try std.testing.expectEqual(@as(usize, 2), probe_state.checks);
+}
+
 test "reader can decode run length stream object" {
     const alloc = std.testing.allocator;
     const encoded = &.{ 2, 'A', 'B', 'C', 254, 'Z', 128 };
@@ -19460,6 +19536,33 @@ test "image decode targets retain useful resolution and black JBIG2 coverage" {
         0, 0, 0, 128,
         0, 0, 0, 255,
     }, &rgba);
+}
+
+test "JBIG2 coverage reduction polling scales with total sampled work" {
+    const ProbeState = struct {
+        checks: usize = 0,
+
+        fn isCancelled(context: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(context.?)));
+            self.checks += 1;
+            return false;
+        }
+    };
+
+    const encoded = [_]u8{0} ** (64 * 64 / 8);
+    var probe_state = ProbeState{};
+    const reduced = try reduceJbig2CoverageAlloc(
+        std.testing.allocator,
+        &encoded,
+        64,
+        64,
+        64,
+        64,
+        .{ .context = &probe_state, .is_cancelled_fn = ProbeState.isCancelled },
+    );
+    defer std.testing.allocator.free(reduced);
+    try std.testing.expectEqual(@as(usize, 64 * 64), reduced.len);
+    try std.testing.expect(probe_state.checks <= 67);
 }
 
 test "image decode rejects invalid transparency mask object types" {

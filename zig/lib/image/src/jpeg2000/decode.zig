@@ -387,11 +387,11 @@ fn decodeU8BytesFromState(
         const pixels = if (state.header.components[0].bits_per_component == 8) blk: {
             var component_planes = try decodeSingleTileComponentPlanesU8AtResolution(allocator, codestream_bytes, state, 0, cancellation);
             defer component_planes.deinit(allocator);
-            break :blk try reconstruct.interleaveComponentSamplesU8(allocator, &component_planes, state);
+            break :blk try reconstruct.interleaveComponentSamplesU8WithCancellation(allocator, &component_planes, state, cancellation);
         } else blk: {
             var component_planes = try decodeSingleTileComponentPlanesU16AtResolution(allocator, codestream_bytes, state, 0, cancellation);
             defer component_planes.deinit(allocator);
-            break :blk try reconstruct.interleaveNativeComponentSamplesU8(allocator, &component_planes, state);
+            break :blk try reconstruct.interleaveNativeComponentSamplesU8WithCancellation(allocator, &component_planes, state, cancellation);
         };
         errdefer allocator.free(pixels);
         try cancellation.check();
@@ -440,7 +440,7 @@ fn decodeU8BytesFromState(
             for (planes) |plane| allocator.free(plane);
             allocator.free(planes);
         }
-        break :blk try reconstruct.interleaveComponentPlanesU8(allocator, &decode_state, planes);
+        break :blk try reconstruct.interleaveComponentPlanesU8WithCancellation(allocator, &decode_state, planes, cancellation);
     } else blk: {
         var execution = try packet.executeTier1SegmentsForStateWithCancellation(
             allocator,
@@ -455,12 +455,13 @@ fn decodeU8BytesFromState(
             cancellation,
         );
         defer execution.deinit(allocator);
-        const reconstruction = try reconstruct.reconstructTier1ExecutionReportWithOptions(
+        const reconstruction = try reconstruct.reconstructTier1ExecutionReportWithOptionsAndCancellation(
             allocator,
             &decode_state,
             &execution,
             false,
             false,
+            cancellation,
         );
         errdefer allocator.free(reconstruction.pixels);
         try cancellation.check();
@@ -749,17 +750,20 @@ pub fn decodeU16BytesWithCancellation(allocator: std.mem.Allocator, bytes: []con
     );
     defer execution.deinit(allocator);
 
-    var component_planes = try reconstruct.reconstructTier1ComponentPlanesU16(
+    var component_planes = try reconstruct.reconstructTier1ComponentPlanesU16AtResolutionWithCancellation(
         allocator,
         &decode_state,
         &execution,
+        0,
+        cancellation,
     );
     defer component_planes.deinit(allocator);
     try cancellation.check();
-    const pixels = try reconstruct.interleaveComponentPlanesU16(
+    const pixels = try reconstruct.interleaveComponentPlanesU16WithCancellation(
         allocator,
         &component_planes,
         &state,
+        cancellation,
     );
     errdefer allocator.free(pixels);
     try cancellation.check();
@@ -901,10 +905,16 @@ fn decodeStreamingRawPlanes(
     try cancellation.check();
     var assembler = try reconstruct.StreamingPlaneAssembler.initAtResolution(allocator, state, discard_levels);
     defer assembler.deinit();
+    const Context = struct {
+        assembler: *reconstruct.StreamingPlaneAssembler,
+        cancellation: decode_control.CancellationProbe,
+    };
+    var decode_context = Context{ .assembler = &assembler, .cancellation = cancellation };
     const Visitor = struct {
         fn visit(context: *anyopaque, codeblock_state: *const packet.Tier1CodeblockState) !void {
-            const plane_assembler: *reconstruct.StreamingPlaneAssembler = @ptrCast(@alignCast(context));
-            try plane_assembler.appendCodeblock(codeblock_state);
+            const visitor_context: *Context = @ptrCast(@alignCast(context));
+            try visitor_context.cancellation.check();
+            try visitor_context.assembler.appendCodeblock(codeblock_state);
         }
     };
     try packet.visitTier1CodeblocksForStateWithCancellation(
@@ -917,10 +927,10 @@ fn decodeStreamingRawPlanes(
         policy.magnitude,
         0,
         .standard,
-        .{ .context = &assembler, .visit = Visitor.visit },
+        .{ .context = &decode_context, .visit = Visitor.visit },
         cancellation,
     );
-    return assembler.finish(discard_levels);
+    return assembler.finishWithCancellation(discard_levels, cancellation);
 }
 
 fn decodeSingleTileComponentPlanesU8(
@@ -984,11 +994,12 @@ fn decodeSingleTileComponentPlanesU8AtResolution(
             for (raw_planes) |plane| allocator.free(plane);
             allocator.free(raw_planes);
         }
-        return reconstruct.componentPlanesU8FromRawAtResolution(
+        return reconstruct.componentPlanesU8FromRawAtResolutionWithCancellation(
             allocator,
             &decode_state,
             raw_planes,
             discard_levels,
+            cancellation,
         );
     }
 
@@ -1006,7 +1017,7 @@ fn decodeSingleTileComponentPlanesU8AtResolution(
     );
     defer execution.deinit(allocator);
 
-    return reconstruct.reconstructTier1ComponentPlanesU8AtResolution(allocator, &decode_state, &execution, discard_levels);
+    return reconstruct.reconstructTier1ComponentPlanesU8AtResolutionWithCancellation(allocator, &decode_state, &execution, discard_levels, cancellation);
 }
 
 fn decodeSingleTileComponentPlanesU16(
@@ -1070,11 +1081,12 @@ fn decodeSingleTileComponentPlanesU16AtResolution(
             for (raw_planes) |plane| allocator.free(plane);
             allocator.free(raw_planes);
         }
-        return reconstruct.componentPlanesU16FromRawAtResolution(
+        return reconstruct.componentPlanesU16FromRawAtResolutionWithCancellation(
             allocator,
             &decode_state,
             raw_planes,
             discard_levels,
+            cancellation,
         );
     }
 
@@ -1092,7 +1104,7 @@ fn decodeSingleTileComponentPlanesU16AtResolution(
     );
     defer execution.deinit(allocator);
 
-    return reconstruct.reconstructTier1ComponentPlanesU16AtResolution(allocator, &decode_state, &execution, discard_levels);
+    return reconstruct.reconstructTier1ComponentPlanesU16AtResolutionWithCancellation(allocator, &decode_state, &execution, discard_levels, cancellation);
 }
 
 fn decodeMultiTileComponentPlanesU8(
@@ -1353,7 +1365,7 @@ fn decodeMultiTileComponentPlanesU16(
         );
         defer execution.deinit(allocator);
 
-        var component_planes = try reconstruct.reconstructTier1ComponentPlanesU16(allocator, &tile_state, &execution);
+        var component_planes = try reconstruct.reconstructTier1ComponentPlanesU16AtResolutionWithCancellation(allocator, &tile_state, &execution, 0, cancellation);
         defer component_planes.deinit(allocator);
 
         for (component_planes.planes, 0..) |plane, c| {
@@ -1396,7 +1408,7 @@ fn decodeMultiTile(
             state,
         );
         defer component_planes.deinit(allocator);
-        return reconstruct.interleaveComponentSamplesU8(allocator, &component_planes, state);
+        return reconstruct.interleaveComponentSamplesU8WithCancellation(allocator, &component_planes, state, cancellation);
     }
 
     var component_planes = try reconstructComponentPlanesU16FromPlanes(
@@ -1405,7 +1417,7 @@ fn decodeMultiTile(
         state,
     );
     defer component_planes.deinit(allocator);
-    return reconstruct.interleaveNativeComponentSamplesU8(allocator, &component_planes, state);
+    return reconstruct.interleaveNativeComponentSamplesU8WithCancellation(allocator, &component_planes, state, cancellation);
 }
 
 fn decodeMultiTileU16(
@@ -1420,7 +1432,7 @@ fn decodeMultiTileU16(
         state,
     );
     defer component_planes.deinit(allocator);
-    return reconstruct.interleaveComponentPlanesU16(allocator, &component_planes, state);
+    return reconstruct.interleaveComponentPlanesU16WithCancellation(allocator, &component_planes, state, cancellation);
 }
 
 const TilePayload = struct {

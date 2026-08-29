@@ -22,4 +22,14 @@ pub const CancellationProbe = struct {
     pub fn check(self: CancellationProbe) !void {
         if (self.is_cancelled_fn) |is_cancelled| if (is_cancelled(self.context)) return error.Canceled;
     }
+
+    /// Poll after a bounded amount of decoded work instead of from a hot inner
+    /// loop. Saturation keeps attacker-controlled dimensions from wrapping the
+    /// accounting counter.
+    pub fn checkAfterWork(self: CancellationProbe, work_since_check: *usize, completed_work: usize) !void {
+        work_since_check.* +|= completed_work;
+        if (work_since_check.* < 4096) return;
+        try self.check();
+        work_since_check.* = 0;
+    }
 };
