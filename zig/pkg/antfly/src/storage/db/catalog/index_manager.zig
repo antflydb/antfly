@@ -3980,13 +3980,120 @@ pub const IndexManager = struct {
         return (self.index_load_states.get(name) orelse .complete) == .complete;
     }
 
-    fn appendStatusOnlyConfig(self: *IndexManager, cfg: types.IndexConfig) !void {
-        const old = self.status_only_index_configs;
-        const replacement = try self.alloc.alloc(types.IndexConfig, old.len + 1);
-        @memcpy(replacement[0..old.len], old);
-        replacement[old.len] = cfg;
-        if (old.len > 0) self.alloc.free(old);
-        self.status_only_index_configs = replacement;
+    /// Fully allocated quarantine mutation. Preparing under catalog ownership
+    /// makes the later status/runtime/pointer publication infallible: a repair
+    /// rollback can therefore restore its predecessor without ever losing the
+    /// index config or exposing a live runtime with no resident failure
+    /// identity.
+    const PreparedFailedIndexLoad = struct {
+        name_key: ?[]u8,
+        status_config: ?types.IndexConfig,
+        failure_config: ?types.IndexConfig,
+        status_replacement: ?[]types.IndexConfig,
+        incarnation_id: u64,
+        action: IndexLoadRecoveryAction,
+        err_name: []const u8,
+        repair_claim_owner_id: u128,
+
+        fn deinit(self: *@This(), manager: *IndexManager) void {
+            if (self.name_key) |name| manager.alloc.free(name);
+            if (self.status_config) |*cfg| cfg.deinit(manager.alloc);
+            if (self.failure_config) |*cfg| cfg.deinit(manager.alloc);
+            if (self.status_replacement) |replacement| manager.alloc.free(replacement);
+            self.* = undefined;
+        }
+    };
+
+    /// Requires catalog-exclusive ownership. All fallible work happens here;
+    /// commitPreparedFailedIndexLoad is allocation-free and cannot fail.
+    fn prepareFailedIndexLoad(
+        self: *IndexManager,
+        cfg: types.IndexConfig,
+        err_name: []const u8,
+        repair_claim_owner_id: u128,
+    ) !PreparedFailedIndexLoad {
+        if (self.failed_index_loads.contains(cfg.name)) return error.FailedIndexLoadAlreadyRecorded;
+        const action = loadFailureRecoveryActionForConfig(cfg, err_name);
+        var status_config = try types.IndexConfig.clone(self.alloc, cfg);
+        var status_config_owned = true;
+        errdefer if (status_config_owned) status_config.deinit(self.alloc);
+        var failure_config = try types.IndexConfig.clone(self.alloc, cfg);
+        var failure_config_owned = true;
+        errdefer if (failure_config_owned) failure_config.deinit(self.alloc);
+        const name_key = try self.alloc.dupe(u8, cfg.name);
+        var name_key_owned = true;
+        errdefer if (name_key_owned) self.alloc.free(name_key);
+        const status_replacement = try self.alloc.alloc(
+            types.IndexConfig,
+            self.status_only_index_configs.len + 1,
+        );
+        errdefer self.alloc.free(status_replacement);
+        @memcpy(
+            status_replacement[0..self.status_only_index_configs.len],
+            self.status_only_index_configs,
+        );
+        try self.failed_index_loads.ensureUnusedCapacity(self.alloc, 1);
+        try self.failed_index_load_order.ensureUnusedCapacity(self.alloc, 1);
+        const next_failure_count = self.failed_index_loads.count() + 1;
+        // Reserve one slot per quarantined entry in every policy queue. Error
+        // reclassification then migrates membership without allocation after
+        // an open attempt has already observed a different failure class.
+        for (&self.failed_index_load_action_queues) |*queue| {
+            try queue.order.ensureTotalCapacity(self.alloc, next_failure_count);
+        }
+        const incarnation_id = try self.allocateFailedIndexLoadIncarnationId();
+        status_config_owned = false;
+        failure_config_owned = false;
+        name_key_owned = false;
+        return .{
+            .name_key = name_key,
+            .status_config = status_config,
+            .failure_config = failure_config,
+            .status_replacement = status_replacement,
+            .incarnation_id = incarnation_id,
+            .action = action,
+            .err_name = err_name,
+            .repair_claim_owner_id = repair_claim_owner_id,
+        };
+    }
+
+    /// Requires catalog-exclusive ownership and a preparation made against the
+    /// current status-only slice. Returns the exact resident identity now owned
+    /// by the durable repair, if any.
+    fn commitPreparedFailedIndexLoad(
+        self: *IndexManager,
+        prepared: *PreparedFailedIndexLoad,
+    ) FailedIndexLoadSnapshot {
+        const name_key = prepared.name_key.?;
+        const status_config = prepared.status_config.?;
+        const failure_config = prepared.failure_config.?;
+        const status_replacement = prepared.status_replacement.?;
+        status_replacement[self.status_only_index_configs.len] = status_config;
+        if (self.status_only_index_configs.len > 0) self.alloc.free(self.status_only_index_configs);
+        self.status_only_index_configs = status_replacement;
+        prepared.status_config = null;
+        prepared.status_replacement = null;
+
+        const action_queue = self.failedIndexLoadActionQueue(prepared.action);
+        const retry_position = self.failed_index_load_order.items.len;
+        const action_position = action_queue.order.items.len;
+        const failure = FailedIndexLoad{
+            .incarnation_id = prepared.incarnation_id,
+            .err_name = prepared.err_name,
+            .config = failure_config,
+            .config_hash = types.indexConfigHash(failure_config),
+            .action = prepared.action,
+            .retry_queue_position = retry_position,
+            .action_queue_position = action_position,
+            .repair_claim_owner_id = prepared.repair_claim_owner_id,
+        };
+        self.failed_index_loads.putAssumeCapacity(name_key, failure);
+        self.failed_index_load_order.appendAssumeCapacity(name_key);
+        action_queue.order.appendAssumeCapacity(name_key);
+        action_queue.invalidateDiscovery();
+        prepared.name_key = null;
+        prepared.failure_config = null;
+        return failedIndexLoadSnapshotNoLock(failure);
     }
 
     /// Quarantine an index whose persisted artifacts could not be opened:
@@ -4015,44 +4122,9 @@ pub const IndexManager = struct {
 
     fn recordFailedIndexLoad(self: *IndexManager, cfg: types.IndexConfig, err: anyerror) !void {
         if (self.failed_index_loads.contains(cfg.name)) return;
-        const action = loadFailureRecoveryActionForConfig(cfg, @errorName(err));
-        var status_config = try types.IndexConfig.clone(self.alloc, cfg);
-        var status_config_owned = true;
-        errdefer if (status_config_owned) status_config.deinit(self.alloc);
-        var failure_config = try types.IndexConfig.clone(self.alloc, cfg);
-        errdefer failure_config.deinit(self.alloc);
-        const name_key = try self.alloc.dupe(u8, cfg.name);
-        errdefer self.alloc.free(name_key);
-        try self.failed_index_loads.ensureUnusedCapacity(self.alloc, 1);
-        try self.failed_index_load_order.ensureUnusedCapacity(self.alloc, 1);
-        const next_failure_count = self.failed_index_loads.count() + 1;
-        // Reserve one slot per quarantined entry in every policy queue. Error
-        // reclassification then migrates membership without allocation after
-        // an open attempt has already observed a different failure class.
-        for (&self.failed_index_load_action_queues) |*queue| {
-            try queue.order.ensureTotalCapacity(self.alloc, next_failure_count);
-        }
-        const action_queue = self.failedIndexLoadActionQueue(action);
-        const incarnation_id = try self.allocateFailedIndexLoadIncarnationId();
-        // All resident queue/map capacity is reserved before the status-only
-        // catalog publication. The remainder is infallible, so quarantine is
-        // committed atomically across the status, map, retry, and action views.
-        try self.appendStatusOnlyConfig(status_config);
-        status_config_owned = false;
-        const retry_position = self.failed_index_load_order.items.len;
-        const action_position = action_queue.order.items.len;
-        self.failed_index_loads.putAssumeCapacity(name_key, .{
-            .incarnation_id = incarnation_id,
-            .err_name = @errorName(err),
-            .config = failure_config,
-            .config_hash = types.indexConfigHash(cfg),
-            .action = action,
-            .retry_queue_position = retry_position,
-            .action_queue_position = action_position,
-        });
-        self.failed_index_load_order.appendAssumeCapacity(name_key);
-        action_queue.order.appendAssumeCapacity(name_key);
-        action_queue.invalidateDiscovery();
+        var prepared = try self.prepareFailedIndexLoad(cfg, @errorName(err), 0);
+        defer prepared.deinit(self);
+        _ = self.commitPreparedFailedIndexLoad(&prepared);
     }
 
     fn allocateFailedIndexLoadIncarnationId(self: *IndexManager) !u64 {
@@ -6881,6 +6953,53 @@ pub const IndexManager = struct {
         } else {
             try self.clearActiveIndexRootPointer(target_path);
         }
+    }
+
+    /// Converts a loaded but uncertified active repair candidate into the same
+    /// incarnation-scoped quarantine used by open failures while restoring the
+    /// exact predecessor pointer. The caller owns the DB structural/apply
+    /// fence and has already checkpointed `rolling_back`. Every allocation is
+    /// completed before the pointer mutation; after that durable write,
+    /// runtime detachment, status publication, quarantine identity, and repair
+    /// claim commit without another failure point.
+    pub fn rollbackUncertifiedActiveIndexRoot(
+        self: *IndexManager,
+        name: []const u8,
+        expected_candidate_relative_path: []const u8,
+        previous_pointer: ?[]const u8,
+        expected_config_hash: u64,
+        failure_reason: []const u8,
+        repair_id: u128,
+    ) !FailedIndexLoadRepairClaim {
+        if (repair_id == 0 or failure_reason.len == 0) return error.InvalidArgument;
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        if (self.failed_index_loads.contains(name)) return error.RepairOwnershipLost;
+        const cfg = self.get(name) orelse return error.IndexNotFound;
+        if (types.indexConfigHash(cfg.*) != expected_config_hash) {
+            return error.IndexRepairConfigurationChanged;
+        }
+        const target_path = try self.indexPath(name);
+        defer self.alloc.free(target_path);
+        const current_pointer = try self.readActiveIndexRootPointer(target_path, name);
+        defer if (current_pointer) |value| self.alloc.free(value);
+        if (!optionalBytesEqual(current_pointer, expected_candidate_relative_path)) {
+            return error.IndexRootPointerChanged;
+        }
+
+        var prepared = try self.prepareFailedIndexLoad(cfg.*, failure_reason, repair_id);
+        defer prepared.deinit(self);
+        if (previous_pointer) |value| {
+            try self.writeActiveIndexRootPointer(target_path, value);
+        } else {
+            try self.clearActiveIndexRootPointer(target_path);
+        }
+        self.removeInMemory(name);
+        const snapshot = self.commitPreparedFailedIndexLoad(&prepared);
+        return .{
+            .token = snapshot.token,
+            .owner_repair_id = repair_id,
+        };
     }
 
     /// Returns whether the durable active-root pointer for `name` selects the

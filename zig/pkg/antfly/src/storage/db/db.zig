@@ -13371,14 +13371,44 @@ pub const DB = struct {
         if (entry.intent.kind == .algebraic) self.scheduleInactiveRepairShadowCleanup();
     }
 
-    /// Completes the idempotent half of activation recovery. Returns false
-    /// when the recorded candidate is not the active loaded generation, which
-    /// means the caller may safely discard/rebuild only that candidate.
+    const ActivatedIndexRepairCertificationFailure = enum {
+        manifest_missing,
+        manifest_invalid,
+        manifest_identity_mismatch,
+        manifest_sequence_mismatch,
+
+        fn reason(self: @This()) []const u8 {
+            return switch (self) {
+                .manifest_missing => "activation_manifest_missing",
+                .manifest_invalid => "activation_manifest_invalid",
+                .manifest_identity_mismatch => "activation_manifest_identity_mismatch",
+                .manifest_sequence_mismatch => "activation_manifest_sequence_mismatch",
+            };
+        }
+
+        fn fromReason(raw: []const u8) ?@This() {
+            inline for (std.meta.tags(@This())) |failure| {
+                if (std.mem.eql(u8, raw, failure.reason())) return failure;
+            }
+            return null;
+        }
+    };
+
+    const ActivatedIndexRepairReconciliation = union(enum) {
+        committed,
+        not_active,
+        certification_failed: ActivatedIndexRepairCertificationFailure,
+    };
+
+    /// Completes the idempotent half of activation recovery. Certification
+    /// failures are data outcomes rather than raw scheduler errors: the caller
+    /// must durably roll the untrusted incarnation back or expose an exact
+    /// action-required terminal state.
     fn reconcileActivatedIndexRepair(
         self: *DB,
         alloc: Allocator,
         repair_id: u128,
-    ) !bool {
+    ) !ActivatedIndexRepairReconciliation {
         // Restart reconciliation is the second half of the same catalog
         // transaction as ordinary activation. Serialize it with every live
         // index publication and foreground apply, then reload the durable
@@ -13398,39 +13428,45 @@ pub const DB = struct {
         defer entry.deinit(alloc);
         switch (entry.intent.phase) {
             .activating, .validating, .cleanup, .rolling_back => {},
-            else => return false,
+            else => return .not_active,
         }
         if (entry.intent.root_generation != self.core.root_generation or
             entry.intent.group_id != self.localRepairGroupId())
         {
             return error.RepairOwnershipLost;
         }
-        const candidate = entry.intent.candidate_relative_path orelse return false;
+        const candidate = entry.intent.candidate_relative_path orelse return .not_active;
         try index_repair_state.validateCandidateRelativePath(entry.intent.index_name, candidate);
         const active_pointer = try self.core.index_manager.captureActiveIndexRootPointer(entry.intent.index_name);
         defer if (active_pointer) |value| alloc.free(value);
-        if (active_pointer == null or !std.mem.eql(u8, active_pointer.?, candidate)) return false;
-        const cfg = self.core.index_manager.get(entry.intent.index_name) orelse return false;
+        if (active_pointer == null or !std.mem.eql(u8, active_pointer.?, candidate)) return .not_active;
+        const cfg = self.core.index_manager.get(entry.intent.index_name) orelse return .not_active;
         if (cfg.kind != entry.intent.kind or types.indexConfigHash(cfg.*) != entry.intent.config_hash) {
             return error.IndexRepairConfigurationChanged;
         }
         if (!self.core.index_manager.has(entry.intent.index_name) or
             self.core.index_manager.loadFailure(entry.intent.index_name) != null)
         {
-            return false;
+            return .not_active;
         }
 
         const candidate_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate });
         defer alloc.free(candidate_path);
-        const manifest_sequence = try index_generation_manifest.validateReady(
+        const certification = try index_generation_manifest.certifyReady(
             alloc,
             candidate_path,
             repair_id,
             entry.intent.index_name,
             entry.intent.config_hash,
         );
+        const manifest_sequence = switch (certification) {
+            .ready => |sequence| sequence,
+            .missing => return .{ .certification_failed = .manifest_missing },
+            .invalid => return .{ .certification_failed = .manifest_invalid },
+            .identity_mismatch => return .{ .certification_failed = .manifest_identity_mismatch },
+        };
         if (manifest_sequence != entry.intent.candidate_applied_sequence) {
-            return error.IndexGenerationManifestMismatch;
+            return .{ .certification_failed = .manifest_sequence_mismatch };
         }
         if (comptime builtin.is_test) {
             if (test_index_repair_reconcile_fence_hook) |hook| {
@@ -13473,7 +13509,7 @@ pub const DB = struct {
         }
         try self.removeIndexRepairIntentAndPin(alloc, repair_id);
         self.scheduleInactiveRepairShadowCleanup();
-        return true;
+        return .committed;
     }
 
     const ActivatedIndexRepairRollback = enum {
@@ -13506,11 +13542,18 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         repair_id: u128,
+        certification_failure: ?ActivatedIndexRepairCertificationFailure,
     ) !ActivatedIndexRepairRollback {
         var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
         defer entry.deinit(alloc);
         if (!entry.intent.previous_pointer_captured) return .not_active;
         const candidate = entry.intent.candidate_relative_path orelse return .not_active;
+        const rollback_certification_failure = certification_failure orelse blk: {
+            if (entry.intent.phase != .rolling_back) break :blk null;
+            break :blk ActivatedIndexRepairCertificationFailure.fromReason(
+                entry.intent.last_error orelse break :blk null,
+            );
+        };
         var claim: ?index_manager_mod.IndexManager.FailedIndexLoadRepairClaim = null;
         var predecessor_loaded = false;
         {
@@ -13542,13 +13585,15 @@ pub const DB = struct {
                     .claimed, .already_claimed => |value| value,
                     .absent, .mismatch, .claimed_by_other => return error.RepairOwnershipLost,
                 };
-            } else if (predecessor_active) {
+            } else if (predecessor_active and self.core.index_manager.has(entry.intent.index_name)) {
                 // A restart may have already opened the restored predecessor
                 // before the durable rollback owner resumes.
                 predecessor_loaded = true;
-            } else {
+            } else if (!candidate_active or rollback_certification_failure == null) {
                 // A loaded active candidate is reconciled by the caller before
-                // entering rollback. Absence here has no safe retry identity.
+                // entering rollback. Absence here has no safe retry identity;
+                // an inactive pointer with no loaded predecessor is likewise
+                // not evidence that rollback completed.
                 return error.RepairOwnershipLost;
             }
 
@@ -13561,16 +13606,28 @@ pub const DB = struct {
                 try self.updateIndexRepairIntent(alloc, repair_id, .{
                     .phase = .rolling_back,
                     .next_retry_at_ms = 0,
+                    .last_error = if (rollback_certification_failure) |failure| failure.reason() else null,
                     .replace_last_error = true,
                 });
                 checkpointed = true;
             }
             if (candidate_active) {
-                try self.core.index_manager.restoreActiveIndexRootPointer(
-                    entry.intent.index_name,
-                    candidate,
-                    entry.intent.previous_active_relative_path,
-                );
+                if (rollback_certification_failure) |failure| {
+                    claim = try self.core.index_manager.rollbackUncertifiedActiveIndexRoot(
+                        entry.intent.index_name,
+                        candidate,
+                        entry.intent.previous_active_relative_path,
+                        entry.intent.config_hash,
+                        failure.reason(),
+                        repair_id,
+                    );
+                } else {
+                    try self.core.index_manager.restoreActiveIndexRootPointer(
+                        entry.intent.index_name,
+                        candidate,
+                        entry.intent.previous_active_relative_path,
+                    );
+                }
             }
         }
 
@@ -13603,7 +13660,10 @@ pub const DB = struct {
                     try self.recordIndexRepairAttemptFailure(
                         alloc,
                         repair_id,
-                        "rollback_predecessor_retry_open",
+                        if (rollback_certification_failure) |failure|
+                            failure.reason()
+                        else
+                            "rollback_predecessor_retry_open",
                         false,
                     );
                     return .retry_deferred;
@@ -13612,7 +13672,10 @@ pub const DB = struct {
                     try self.discardInactiveIndexRepairCandidateWithTerminal(
                         alloc,
                         repair_id,
-                        "rollback_predecessor_manual_intervention",
+                        if (rollback_certification_failure) |failure|
+                            failure.reason()
+                        else
+                            "rollback_predecessor_manual_intervention",
                     );
                     return .action_required;
                 },
@@ -14287,15 +14350,25 @@ pub const DB = struct {
                 result.terminal = true;
                 return result;
             }
-            if (try self.reconcileActivatedIndexRepair(alloc, repair_id)) {
-                result.attempted = true;
-                var repair = types.ArtifactRepairResult{ .indexes_rebuilt = 1 };
-                try self.finalizeCommittedIndexRepairOutcome(alloc, entry.intent.index_name, 0, &repair);
-                applyCommittedRepairOutcomeToAdvance(&result, repair);
-                result.repaired = repair.indexes_degraded_after == 0 and !repair.debt_remaining;
-                return result;
+            const reconciliation = try self.reconcileActivatedIndexRepair(alloc, repair_id);
+            var certification_failure: ?ActivatedIndexRepairCertificationFailure = null;
+            switch (reconciliation) {
+                .committed => {
+                    result.attempted = true;
+                    var repair = types.ArtifactRepairResult{ .indexes_rebuilt = 1 };
+                    try self.finalizeCommittedIndexRepairOutcome(alloc, entry.intent.index_name, 0, &repair);
+                    applyCommittedRepairOutcomeToAdvance(&result, repair);
+                    result.repaired = repair.indexes_degraded_after == 0 and !repair.debt_remaining;
+                    return result;
+                },
+                .not_active => {},
+                .certification_failed => |failure| certification_failure = failure,
             }
-            const rolled_back = try self.rollbackUnavailableActivatedIndexRepair(alloc, repair_id);
+            const rolled_back = try self.rollbackUnavailableActivatedIndexRepair(
+                alloc,
+                repair_id,
+                certification_failure,
+            );
             switch (rolled_back) {
                 .not_active => {
                     // `activating` is durable before pointer publication. If
@@ -80003,6 +80076,199 @@ test "db restart clears stale dense generation intent after clean checkpoint" {
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 }
 
+const InterruptedActivatedDenseRepair = struct {
+    repair_id: u128,
+    candidate_relative_path: []u8,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.candidate_relative_path);
+        self.* = undefined;
+    }
+};
+
+fn interruptDenseRepairAfterActivation(
+    alloc: Allocator,
+    db: *DB,
+) !InterruptedActivatedDenseRepair {
+    const CrashHook = struct {
+        fn afterSnapshot(_: *anyopaque, _: *DB, _: []const u8, _: u64) !void {}
+
+        fn afterActivation(_: *anyopaque, _: *DB, _: []const u8) !void {
+            return error.TestCrashBeforeActivationCertification;
+        }
+    };
+    var hook_ctx: u8 = 0;
+    db.shadow_index_repair_hook = .{
+        .ptr = &hook_ctx,
+        .after_snapshot_build = CrashHook.afterSnapshot,
+        .after_pointer_activation = CrashHook.afterActivation,
+    };
+    defer db.shadow_index_repair_hook = null;
+    try std.testing.expectError(error.TestCrashBeforeActivationCertification, db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .embedding,
+        .index_name = "dense_idx",
+        .limit = 1,
+        .force = true,
+    }));
+
+    const repair_id = (try db.indexRepairIdForIndex(alloc, "dense_idx")) orelse
+        return error.TestUnexpectedResult;
+    var entry = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Phase.activating, entry.intent.phase);
+    try std.testing.expect(entry.intent.previous_pointer_captured);
+    try std.testing.expect(try db.core.index_manager.isRepairCandidateActive(
+        "dense_idx",
+        entry.intent.candidate_relative_path.?,
+    ));
+    return .{
+        .repair_id = repair_id,
+        .candidate_relative_path = try alloc.dupe(u8, entry.intent.candidate_relative_path.?),
+    };
+}
+
+test "db missing activation certification rolls back to serviceable dense predecessor" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
+        .sync_level = .full_index,
+    });
+
+    var interrupted = try interruptDenseRepairAfterActivation(alloc, &db);
+    defer interrupted.deinit(alloc);
+    const manifest_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/{s}/.antfly-index-generation",
+        .{ std.mem.span(path), interrupted.candidate_relative_path },
+    );
+    defer alloc.free(manifest_path);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, manifest_path);
+
+    const resumed = try db.advanceIndexRepairIntent(alloc, interrupted.repair_id, .{});
+    try std.testing.expect(resumed.attempted);
+    try std.testing.expect(resumed.deferred);
+    try std.testing.expect(!resumed.terminal);
+    try std.testing.expect(db.core.index_manager.failedIndexLoadSnapshot("dense_idx") == null);
+
+    var reset = try db.loadIndexRepairEntryById(alloc, interrupted.repair_id);
+    defer reset.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Phase.preflight, reset.intent.phase);
+    try std.testing.expect(reset.intent.candidate_relative_path == null);
+
+    var result = try db.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 1 } },
+        .limit = 1,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db missing activation certification exposes predecessor action required" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
+        .sync_level = .full_index,
+    });
+
+    var interrupted = try interruptDenseRepairAfterActivation(alloc, &db);
+    defer interrupted.deinit(alloc);
+    const manifest_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/{s}/.antfly-index-generation",
+        .{ std.mem.span(path), interrupted.candidate_relative_path },
+    );
+    defer alloc.free(manifest_path);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, manifest_path);
+
+    const CrashAfterRollback = struct {
+        fn beforeRetry(_: *anyopaque, _: *DB, _: u128) !void {
+            return error.TestCrashAfterUncertifiedRollback;
+        }
+    };
+    var rollback_hook_ctx: u8 = 0;
+    DB.test_index_repair_rollback_retry_hook = .{
+        .ptr = &rollback_hook_ctx,
+        .before_retry = CrashAfterRollback.beforeRetry,
+    };
+    defer DB.test_index_repair_rollback_retry_hook = null;
+    try std.testing.expectError(
+        error.TestCrashAfterUncertifiedRollback,
+        db.advanceIndexRepairIntent(alloc, interrupted.repair_id, .{}),
+    );
+    DB.test_index_repair_rollback_retry_hook = null;
+    var rolling_back = try db.loadIndexRepairEntryById(alloc, interrupted.repair_id);
+    defer rolling_back.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Phase.rolling_back, rolling_back.intent.phase);
+    try std.testing.expectEqualStrings("activation_manifest_missing", rolling_back.intent.last_error.?);
+    try std.testing.expect(!try db.core.index_manager.isRepairCandidateActive(
+        "dense_idx",
+        interrupted.candidate_relative_path,
+    ));
+    try std.testing.expectEqual(
+        interrupted.repair_id,
+        db.core.index_manager.failedIndexLoadSnapshot("dense_idx").?.claim_owner_repair_id.?,
+    );
+
+    index_manager_mod.test_inject_index_open_error = error.InvalidIndexConfig;
+    defer index_manager_mod.test_inject_index_open_error = null;
+    const resumed = try db.advanceIndexRepairIntent(alloc, interrupted.repair_id, .{});
+    index_manager_mod.test_inject_index_open_error = null;
+    try std.testing.expect(resumed.attempted);
+    try std.testing.expect(resumed.terminal);
+
+    var terminal = try db.loadIndexRepairEntryById(alloc, interrupted.repair_id);
+    defer terminal.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Phase.terminal, terminal.intent.phase);
+    try std.testing.expectEqualStrings("activation_manifest_missing", terminal.intent.last_error.?);
+    try std.testing.expect(terminal.intent.candidate_relative_path == null);
+    try std.testing.expect(DB.indexRepairActionRequired(terminal.intent));
+
+    const failure = db.core.index_manager.failedIndexLoadSnapshot("dense_idx") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("InvalidIndexConfig", failure.err_name);
+    try std.testing.expectEqual(
+        index_manager_mod.IndexManager.IndexLoadRecoveryAction.manual_intervention,
+        failure.token.action,
+    );
+    try std.testing.expect(failure.claim_owner_repair_id == null);
+    try std.testing.expectError(error.IndexUnavailable, db.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 1 } },
+        .limit = 1,
+    }));
+}
+
 test "db failed activated dense generation rolls back to retained predecessor" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -80114,7 +80380,7 @@ test "db failed activated dense generation rolls back to retained predecessor" {
     };
     try std.testing.expectError(
         error.TestCrashBeforeRollbackPointerRestore,
-        reopened.rollbackUnavailableActivatedIndexRepair(alloc, repair_id),
+        reopened.rollbackUnavailableActivatedIndexRepair(alloc, repair_id, null),
     );
     reopened.shadow_index_repair_hook = null;
     {
@@ -80161,7 +80427,7 @@ test "db failed activated dense generation rolls back to retained predecessor" {
     defer DB.test_index_repair_rollback_retry_hook = null;
     try std.testing.expectError(
         error.TestCrashAfterRollbackPointerRestore,
-        reopened.rollbackUnavailableActivatedIndexRepair(alloc, repair_id),
+        reopened.rollbackUnavailableActivatedIndexRepair(alloc, repair_id, null),
     );
     try std.testing.expect(rollback_discovery.observed);
     {
@@ -80176,7 +80442,7 @@ test "db failed activated dense generation rolls back to retained predecessor" {
     DB.test_index_repair_rollback_retry_hook = null;
     try std.testing.expectEqual(
         DB.ActivatedIndexRepairRollback.prior_generation_restored,
-        try reopened.rollbackUnavailableActivatedIndexRepair(alloc, repair_id),
+        try reopened.rollbackUnavailableActivatedIndexRepair(alloc, repair_id, null),
     );
     try std.testing.expect(reopened.core.index_manager.loadFailure("dense_idx") == null);
 
