@@ -11132,6 +11132,45 @@ pub const ProvisionedTableWriteSource = struct {
 
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
+
+        // Promotion retires the standby-era writer cache before publishing the
+        // new primary mirror. A lease that drains after that transition queues
+        // its DB for close, and a cold seed capture must participate in that
+        // lifecycle before opening the same persistent root. Opening an
+        // unmanaged DB here can otherwise race the queued owner forever: the
+        // LSM single-writer guard correctly rejects every operator retry, but
+        // no cache operation remains to perform the close.
+        //
+        // Reopen through the serving cache after synchronously draining both
+        // serving and startup retirement queues. This preserves one writer,
+        // installs the current HA gate/mirror on the captured DB, and leaves a
+        // normal resident primary writer behind for subsequent traffic.
+        if (self.write_cache) |cache| {
+            self.drainWriteCachePendingClosesForGroups(table_name, &.{group_id});
+            var cached = self.getOrOpenCachedDbMode(
+                alloc,
+                cache,
+                path,
+                group_id,
+                table_name,
+                .default_async,
+                null,
+                null,
+            ) catch |err| {
+                if (isTransientWriterOpenConflict(err))
+                    return error.HASeedSnapshotRuntimeBusy;
+                return err;
+            };
+            defer cached.deinit(cache.alloc);
+            return try captureHASeedDbSnapshot(
+                alloc,
+                cached.db,
+                cached.db.core.path,
+                snapshot_token,
+                destination_root,
+            );
+        }
+
         var io_impl = Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         _ = Io.Dir.cwd().statFile(io_impl.io(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
@@ -45905,6 +45944,164 @@ test "write cache adopts active just-created db across generation bump" {
     try std.testing.expect(write_cache.entries.items[0].allow_generation_adoption);
     try std.testing.expectEqual(@as(usize, 2), write_cache.entries.items[0].active_leases);
     try std.testing.expectEqual(misses_before, write_cache.miss_count.load(.monotonic));
+}
+
+test "HA seed capture drains writer released after promotion cache clear" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/ha-seed-promoted-writer-root",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(path);
+    const startup_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7002);
+    defer alloc.free(startup_path);
+    const destination_root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/ha-seed-promoted-writer-capture",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(destination_root);
+    const startup_destination_root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/ha-seed-promoted-startup-writer-capture",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(startup_destination_root);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = tables_api.default_indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{
+                        .group_id = 7001,
+                        .table_id = 7,
+                        .start_key = "",
+                        .end_key = "m",
+                    },
+                    .{
+                        .group_id = 7002,
+                        .table_id = 7,
+                        .start_key = "m",
+                        .end_key = null,
+                    },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var startup_write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.bindWriteCaches(&write_cache, &startup_write_cache);
+
+    var standby_writer = try source.getOrOpenCachedDbModeAtGeneration(
+        alloc,
+        &write_cache,
+        path,
+        7001,
+        0,
+        "docs",
+        .default_async,
+        null,
+        null,
+        null,
+        .{},
+    );
+    try standby_writer.db.batch(.{
+        .writes = &.{.{ .key = "doc:active", .value = "{\"title\":\"active cache\"}" }},
+        .timestamp_ns = 1,
+    });
+    var startup_standby_writer = try source.getOrOpenCachedDbModeAtGeneration(
+        alloc,
+        &startup_write_cache,
+        startup_path,
+        7002,
+        0,
+        "docs",
+        .startup_catch_up,
+        null,
+        null,
+        null,
+        .{},
+    );
+    try startup_standby_writer.db.batch(.{
+        .writes = &.{.{ .key = "doc:standby", .value = "{\"title\":\"startup cache\"}" }},
+        .timestamp_ns = 1,
+    });
+
+    // Model the promotion ordering: cache authority is retired while a
+    // request still owns its lease, and that lease reaches zero only after the
+    // transition's synchronous drain has returned.
+    try source.clearWriteCache();
+    try std.testing.expectEqual(@as(usize, 1), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), startup_write_cache.retired_entries.items.len);
+    standby_writer.deinit(alloc);
+    startup_standby_writer.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.closing_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), startup_write_cache.closing_entries.items.len);
+
+    try source.captureHASeedReplicaSnapshot(
+        alloc,
+        "docs",
+        7001,
+        "promoted-generation",
+        destination_root,
+    );
+    try source.captureHASeedReplicaSnapshot(
+        alloc,
+        "docs",
+        7002,
+        "promoted-startup-generation",
+        startup_destination_root,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), startup_write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), startup_write_cache.closing_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), startup_write_cache.entries.items.len);
+    var io_impl = Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const store_path = try std.fs.path.join(alloc, &.{ destination_root, "store.bin" });
+    defer alloc.free(store_path);
+    _ = try Io.Dir.cwd().statFile(io_impl.io(), store_path, .{ .follow_symlinks = false });
+    const startup_store_path = try std.fs.path.join(alloc, &.{ startup_destination_root, "store.bin" });
+    defer alloc.free(startup_store_path);
+    _ = try Io.Dir.cwd().statFile(io_impl.io(), startup_store_path, .{ .follow_symlinks = false });
 }
 
 test "runtime status collection leaves active stale write lease live" {
