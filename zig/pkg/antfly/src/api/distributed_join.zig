@@ -68,6 +68,12 @@ pub fn normalizeDistributedJoinOperationalError(err: anyerror) anyerror {
         error.RecvFailed,
         error.SendFailed,
         error.FinalizerAcknowledgementUnavailable,
+        error.ResourceBudgetExceeded,
+        error.PersistentDescriptorAdmissionExhausted,
+        error.StorageReadTemporarilyUnavailable,
+        error.ResidentDbRetryRequired,
+        error.WriterLocked,
+        error.LsmRootWriterAlreadyOpen,
         => error.DistributedQueryUnavailable,
         else => err,
     };
@@ -78,6 +84,7 @@ test "distributed join ownership and transport failures remain retryable and fai
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.NotLeader));
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.ConnectionResetByPeer));
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.SendFailed));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.ResourceBudgetExceeded));
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.FinalizerAcknowledgementUnavailable));
     try std.testing.expectEqual(error.InternalFailure, normalizeDistributedJoinOperationalError(error.InternalFailure));
 }

@@ -185,6 +185,15 @@ pub const Fixture = struct {
         activate: *const fn (ptr: *anyopaque, node_index: usize) anyerror!void,
     };
 
+    pub const JoinRetryExhaustionFaultObserver = struct {
+        ptr: *anyopaque,
+        activate: *const fn (
+            ptr: *anyopaque,
+            coordinator_index: usize,
+            retry_target_index: usize,
+        ) anyerror!void,
+    };
+
     const node_count = metadata_sim.VoprPublicClusterFixture.node_count;
     const initial_groups = [_]u64{
         metadata_sim.VoprPublicClusterFixture.data_group_id,
@@ -357,6 +366,28 @@ pub const Fixture = struct {
     join_owner_restart_post_reconstruction_read: bool = false,
     join_owner_restart_sound: bool = false,
     join_owner_restart_failure: ?anyerror = null,
+    join_retry_exhaustion_job_id: u64 = 0,
+    join_retry_exhaustion_partition_index: usize = 0,
+    join_retry_exhaustion_first_group_id: u64 = 0,
+    join_retry_exhaustion_retry_group_id: u64 = 0,
+    join_retry_exhaustion_coordinator_index: usize = 0,
+    join_retry_exhaustion_retry_target_index: usize = 0,
+    join_retry_exhaustion_campaign_configured: bool = false,
+    join_retry_exhaustion_fault_observer: ?JoinRetryExhaustionFaultObserver = null,
+    join_retry_exhaustion_faults_injected: bool = false,
+    join_retry_exhaustion_resource_observed: bool = false,
+    join_retry_exhaustion_network_observed: bool = false,
+    join_retry_exhaustion_overlap_observed: bool = false,
+    join_retry_exhaustion_network_matches_before: u64 = 0,
+    join_retry_exhaustion_initial_worker_starts: u64 = 0,
+    join_retry_exhaustion_initial_worker_completions: u64 = 0,
+    join_retry_exhaustion_initial_status: u16 = 0,
+    join_retry_exhaustion_initial_rejected_without_partial: bool = false,
+    join_retry_exhaustion_network_healed: bool = false,
+    join_retry_exhaustion_resource_healed: bool = false,
+    join_retry_exhaustion_recovery_query_active: bool = false,
+    join_retry_exhaustion_recovery_join: bool = false,
+    join_retry_exhaustion_sound: bool = false,
     join_restart_requested: std.Io.Semaphore = .{},
     join_restart_down: std.Io.Semaphore = .{},
     join_restart_recover: std.Io.Semaphore = .{},
@@ -476,6 +507,7 @@ pub const Fixture = struct {
     join_cancellation_enabled: bool = false,
     join_worker_retry_enabled: bool = false,
     join_owner_restart_enabled: bool = false,
+    join_retry_exhaustion_enabled: bool = false,
     fault_mode: FaultMode = .clean,
     work_cost_ports: ?WorkCostPorts = null,
 
@@ -546,6 +578,11 @@ pub const Fixture = struct {
         self.join_owner_restart_enabled = enabled;
     }
 
+    pub fn setJoinRetryExhaustionEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.join_retry_exhaustion_enabled = enabled;
+    }
+
     pub fn setJoinOwnerRestartFaultObserver(
         self: *Fixture,
         observer: JoinOwnerRestartFaultObserver,
@@ -553,6 +590,15 @@ pub const Fixture = struct {
         std.debug.assert(self.phase == .leaders_ready);
         std.debug.assert(self.join_owner_restart_enabled);
         self.join_owner_restart_fault_observer = observer;
+    }
+
+    pub fn setJoinRetryExhaustionFaultObserver(
+        self: *Fixture,
+        observer: JoinRetryExhaustionFaultObserver,
+    ) void {
+        std.debug.assert(self.phase == .leaders_ready);
+        std.debug.assert(self.join_retry_exhaustion_enabled);
+        self.join_retry_exhaustion_fault_observer = observer;
     }
 
     pub fn setFaultMode(self: *Fixture, mode: FaultMode) void {
@@ -592,6 +638,29 @@ pub const Fixture = struct {
         self.join_owner_restart_coordinator_index = coordinator_index;
         self.join_owner_restart_failed_group_id = group_id;
         self.join_owner_restart_campaign_configured = true;
+    }
+
+    /// Select a public coordinator that is the live local leader for the
+    /// shuffle's first worker group and a distinct live leader for its retry
+    /// group. The first attempt can therefore enter the real local worker
+    /// boundary under resource exhaustion, while the second attempt must
+    /// traverse one exact directional production HTTP link.
+    fn prepareJoinRetryExhaustionCampaign(self: *Fixture) !void {
+        if (self.phase != .reads_complete or !self.join_retry_exhaustion_enabled)
+            return error.InvalidProductionJoinRetryExhaustionTarget;
+        const first_group_id = metadata_sim.VoprPublicClusterFixture.data_group_id;
+        const retry_group_id = metadata_sim.VoprPublicClusterFixture.graph_data_group_id;
+        const coordinator_index = self.currentDataLeaderIndex(first_group_id) orelse
+            return error.ProductionDataJoinFirstLeaderMissing;
+        const retry_target_index = self.currentDataLeaderIndex(retry_group_id) orelse
+            return error.ProductionDataJoinRetryLeaderMissing;
+        if (coordinator_index == retry_target_index)
+            return error.ProductionDataJoinRetryRemoteOwnerMissing;
+        self.join_retry_exhaustion_first_group_id = first_group_id;
+        self.join_retry_exhaustion_retry_group_id = retry_group_id;
+        self.join_retry_exhaustion_coordinator_index = coordinator_index;
+        self.join_retry_exhaustion_retry_target_index = retry_target_index;
+        self.join_retry_exhaustion_campaign_configured = true;
     }
 
     /// Freeze the advertised link selected by the deployment manifest before
@@ -663,6 +732,11 @@ pub const Fixture = struct {
                 self.join_worker_retry_enabled or self.active_split_enabled or
                 self.fault_mode != .clean))
             return error.InvalidProductionClusterJoinOwnerRestartMode;
+        if (self.join_retry_exhaustion_enabled and
+            (!self.join_enabled or self.join_cancellation_enabled or
+                self.join_worker_retry_enabled or self.join_owner_restart_enabled or
+                self.active_split_enabled or self.fault_mode != .clean))
+            return error.InvalidProductionClusterJoinRetryExhaustionMode;
         switch (self.fault_mode) {
             .clean => {},
             .graph_hydration_transport_failure => if (!self.graph_enabled or
@@ -1179,6 +1253,69 @@ pub const Fixture = struct {
         switch (event.phase) {
             .partition_worker_started => {
                 self.join_partition_worker_started_count +|= 1;
+                if (self.join_retry_exhaustion_enabled and
+                    self.join_retry_exhaustion_recovery_query_active == false)
+                {
+                    if (self.join_retry_exhaustion_faults_injected) {
+                        // A retry can reach another worker before the scoped
+                        // stream matcher cuts a later exact-group attempt.
+                        // Keep the genuinely saturated resource domain causal
+                        // for every worker that does enter; the final oracle
+                        // separately requires a matched network attempt.
+                        return error.ResourceBudgetExceeded;
+                    }
+                    if (!self.join_retry_exhaustion_campaign_configured)
+                        return error.ProductionJoinRetryExhaustionTargetMissing;
+                    if (event.job_id == 0 or
+                        event.owner_group_id != self.join_retry_exhaustion_first_group_id or
+                        observer.node_index != self.join_retry_exhaustion_coordinator_index)
+                    {
+                        self.failure = error.ProductionJoinRetryExhaustionIdentityMismatch;
+                        return error.ProductionJoinRetryExhaustionIdentityMismatch;
+                    }
+                    const fault_observer = self.join_retry_exhaustion_fault_observer orelse {
+                        self.failure = error.ProductionJoinRetryExhaustionFaultObserverMissing;
+                        return error.ProductionJoinRetryExhaustionFaultObserverMissing;
+                    };
+                    fault_observer.activate(
+                        fault_observer.ptr,
+                        self.join_retry_exhaustion_coordinator_index,
+                        self.join_retry_exhaustion_retry_target_index,
+                    ) catch |err| {
+                        self.failure = err;
+                        return err;
+                    };
+                    self.join_retry_exhaustion_network_matches_before =
+                        self.sim.outboundEndpointPayloadOutageCount();
+                    const retry_endpoint = try parseHttpBaseUriAddress(
+                        self.data_api_uris[self.join_retry_exhaustion_retry_target_index],
+                    );
+                    self.sim.setOutboundEndpointPayloadOutage(
+                        retry_endpoint,
+                        "/join-partition",
+                    ) catch |err| {
+                        self.failure = err;
+                        return err;
+                    };
+                    self.saturateNodeMemory() catch |err| {
+                        self.sim.setOutboundEndpointOutage(null);
+                        self.failure = err;
+                        return err;
+                    };
+                    self.join_retry_exhaustion_job_id = event.job_id;
+                    self.join_retry_exhaustion_partition_index = event.partition_index;
+                    self.join_retry_exhaustion_resource_observed = self.allNodeMemorySaturated();
+                    self.join_retry_exhaustion_faults_injected = true;
+                    if (!self.join_retry_exhaustion_resource_observed) {
+                        self.failure = error.ProductionDataResourceEnvelopeNotSaturated;
+                        return error.ProductionDataResourceEnvelopeNotSaturated;
+                    }
+                    // Fail the first production worker at its operation
+                    // boundary while the resource domain is genuinely full.
+                    // The next exact-group attempt must cross the scoped HTTP
+                    // stream above and exhaust the complete public operation.
+                    return error.ResourceBudgetExceeded;
+                }
                 if (self.join_owner_restart_enabled) {
                     if (!self.join_owner_restart_requested) {
                         if (!self.join_owner_restart_campaign_configured)
@@ -1208,7 +1345,7 @@ pub const Fixture = struct {
                         self.join_restart_requested.post(self.sim.io());
                         // Return immediately so the serving handler can unwind
                         // while the restart owner tears down this exact process.
-                        return error.InjectedJoinPartitionOwnerCrash;
+                        return error.GroupLeaderUnavailable;
                     }
                     if (self.join_owner_restart_recovered_group_id == 0 and
                         event.partition_index == self.join_owner_restart_partition_index and
@@ -1249,7 +1386,7 @@ pub const Fixture = struct {
                     // Fail before any right-row collection or result
                     // publication. The production shuffle engine must record
                     // this attempt and retry the same partition elsewhere.
-                    return error.InjectedJoinPartitionWorkerFailure;
+                    return error.GroupLeaderUnavailable;
                 }
                 if (!self.join_cancellation_enabled or
                     self.join_partition_worker_started_count != 1)
@@ -2047,6 +2184,9 @@ pub const Fixture = struct {
             if (self.join_cancellation_enabled) {
                 self.join_cancellation_sound = try self.runJoinCancellationQuery();
                 self.join_sound = self.join_cancellation_sound;
+            } else if (self.join_retry_exhaustion_enabled) {
+                self.join_retry_exhaustion_sound = try self.runJoinRetryExhaustionQuery();
+                self.join_sound = self.join_retry_exhaustion_sound;
             } else if (self.join_owner_restart_enabled) {
                 self.join_restart_future = self.sim.io().async(driveJoinOwnerRestart, .{self});
                 self.join_owner_restart_sound = try self.runJoinOwnerRestartQuery();
@@ -2241,7 +2381,8 @@ pub const Fixture = struct {
         return self.fault_mode == .join_finalizer_ack_failure or
             self.join_cancellation_enabled or
             self.join_worker_retry_enabled or
-            self.join_owner_restart_enabled;
+            self.join_owner_restart_enabled or
+            self.join_retry_exhaustion_enabled;
     }
 
     fn durableJoinTenantBatchAlloc(self: *Fixture) ![]u8 {
@@ -2355,6 +2496,76 @@ pub const Fixture = struct {
             self.join_partition_worker_started_count > started_before + 1 and
             self.join_partition_worker_completed_count > completed_before;
         return self.join_cancellation_recovered;
+    }
+
+    fn runJoinRetryExhaustionQuery(self: *Fixture) !bool {
+        try self.prepareJoinRetryExhaustionCampaign();
+        const started_before = self.join_partition_worker_started_count;
+        const completed_before = self.join_partition_worker_completed_count;
+        defer {
+            if (self.join_retry_exhaustion_faults_injected and
+                !self.join_retry_exhaustion_network_healed)
+            {
+                self.sim.setOutboundEndpointOutage(null);
+                self.join_retry_exhaustion_network_healed = true;
+            }
+            if (self.join_retry_exhaustion_faults_injected and
+                !self.join_retry_exhaustion_resource_healed)
+            {
+                self.releaseNodeMemory();
+                self.join_retry_exhaustion_resource_healed = self.nodeMemoryBelowHardLimit();
+            }
+        }
+
+        var response = self.client.fetchQueryRaw(
+            self.data_api_uris[self.join_retry_exhaustion_coordinator_index],
+            "tenant_b_docs",
+            durable_join_query_body,
+        ) catch return false;
+        defer response.deinit(self.alloc);
+        self.join_retry_exhaustion_initial_status = response.status;
+        self.join_retry_exhaustion_initial_worker_starts =
+            self.join_partition_worker_started_count -| started_before;
+        self.join_retry_exhaustion_initial_worker_completions =
+            self.join_partition_worker_completed_count -| completed_before;
+        self.join_retry_exhaustion_network_observed =
+            self.sim.outboundEndpointPayloadOutageCount() >
+            self.join_retry_exhaustion_network_matches_before;
+        self.join_retry_exhaustion_overlap_observed =
+            self.join_retry_exhaustion_resource_observed and
+            self.join_retry_exhaustion_network_observed and
+            self.allNodeMemorySaturated();
+        self.join_retry_exhaustion_initial_rejected_without_partial =
+            response.status == 503 and
+            std.mem.indexOf(u8, response.body, "\"code\":\"distributed_query_unavailable\"") != null and
+            std.mem.indexOf(u8, response.body, "\"retryable\":true") != null and
+            std.mem.indexOf(u8, response.body, "\"hits\"") == null and
+            std.mem.indexOf(u8, response.body, "production-tenant") == null and
+            std.mem.indexOf(u8, response.body, "production-left") == null and
+            std.mem.indexOf(u8, response.body, "production-right") == null;
+        if (!self.join_retry_exhaustion_faults_injected or
+            !self.join_retry_exhaustion_initial_rejected_without_partial or
+            !self.join_retry_exhaustion_overlap_observed or
+            self.join_retry_exhaustion_job_id == 0 or
+            self.join_retry_exhaustion_first_group_id == 0 or
+            self.join_retry_exhaustion_retry_group_id == 0 or
+            self.join_retry_exhaustion_first_group_id == self.join_retry_exhaustion_retry_group_id or
+            self.join_retry_exhaustion_coordinator_index ==
+                self.join_retry_exhaustion_retry_target_index or
+            self.join_retry_exhaustion_initial_worker_starts == 0 or
+            self.join_retry_exhaustion_initial_worker_completions != 0)
+            return false;
+
+        self.sim.setOutboundEndpointOutage(null);
+        self.join_retry_exhaustion_network_healed = true;
+        self.releaseNodeMemory();
+        self.join_retry_exhaustion_resource_healed = self.nodeMemoryBelowHardLimit();
+        if (!self.join_retry_exhaustion_resource_healed) return false;
+
+        self.join_retry_exhaustion_recovery_query_active = true;
+        defer self.join_retry_exhaustion_recovery_query_active = false;
+        self.join_retry_exhaustion_recovery_join = try self.runJoinQuery();
+        return self.join_retry_exhaustion_recovery_join;
     }
 
     fn runJoinOwnerRestartQuery(self: *Fixture) !bool {
@@ -2499,7 +2710,9 @@ pub const Fixture = struct {
             worker_retries != .integer or finalizer_retries != .integer or
             attempts != .array)
             return false;
-        if (self.join_owner_restart_enabled and self.join_owner_restart_recovery_query_active) {
+        if ((self.join_owner_restart_enabled and self.join_owner_restart_recovery_query_active) or
+            (self.join_retry_exhaustion_enabled and self.join_retry_exhaustion_recovery_query_active))
+        {
             if (worker_retries.integer != 0 or worker_attempts != .array or
                 worker_attempts.array.items.len == 0 or finalizer_retries.integer != 0 or
                 attempts.array.items.len != 1)
@@ -3188,6 +3401,17 @@ pub const Fixture = struct {
             if (!self.data_server_live[index]) return false;
             const memory = server.provisioned_storage.resource_manager.snapshot().memory;
             if (memory.hard_limit_bytes == 0 or memory.used_bytes != memory.hard_limit_bytes)
+                return false;
+        }
+        return true;
+    }
+
+    fn nodeMemoryBelowHardLimit(self: *Fixture) bool {
+        if (self.data_server_count != node_count) return false;
+        for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+            if (!self.data_server_live[index]) return false;
+            const memory = server.provisioned_storage.resource_manager.snapshot().memory;
+            if (memory.hard_limit_bytes == 0 or memory.used_bytes >= memory.hard_limit_bytes)
                 return false;
         }
         return true;
@@ -3947,6 +4171,24 @@ pub const Fixture = struct {
         join_owner_restart_recovery_join: bool,
         join_owner_restart_post_reconstruction_read: bool,
         join_owner_restart_ok: bool,
+        join_retry_exhaustion_job_id: u64,
+        join_retry_exhaustion_partition_index: usize,
+        join_retry_exhaustion_first_group_id: u64,
+        join_retry_exhaustion_retry_group_id: u64,
+        join_retry_exhaustion_coordinator_index: usize,
+        join_retry_exhaustion_retry_target_index: usize,
+        join_retry_exhaustion_faults_injected: bool,
+        join_retry_exhaustion_resource_observed: bool,
+        join_retry_exhaustion_network_observed: bool,
+        join_retry_exhaustion_overlap_observed: bool,
+        join_retry_exhaustion_initial_worker_starts: u64,
+        join_retry_exhaustion_initial_worker_completions: u64,
+        join_retry_exhaustion_initial_status: u16,
+        join_retry_exhaustion_initial_rejected_without_partial: bool,
+        join_retry_exhaustion_network_healed: bool,
+        join_retry_exhaustion_resource_healed: bool,
+        join_retry_exhaustion_recovery_join: bool,
+        join_retry_exhaustion_ok: bool,
         join_cancellation_boundary_observed: bool,
         join_cancellation_job_id: u64,
         join_cancellation_owner_group_id: u64,
@@ -4029,6 +4271,7 @@ pub const Fixture = struct {
                 (!self.join_cancellation_enabled or self.join_cancellation_sound) and
                 (!self.join_worker_retry_enabled or self.join_worker_retry_sound) and
                 (!self.join_owner_restart_enabled or self.join_owner_restart_sound) and
+                (!self.join_retry_exhaustion_enabled or self.join_retry_exhaustion_sound) and
                 (!self.graph_enabled or self.graph_sound) and
                 (!self.graph_hydration_enabled or self.graph_hydration_sound) and
                 (!self.graph_cancellation_enabled or self.graph_cancellation_sound) and
@@ -4065,6 +4308,24 @@ pub const Fixture = struct {
             .join_owner_restart_recovery_join = self.join_owner_restart_recovery_join,
             .join_owner_restart_post_reconstruction_read = self.join_owner_restart_post_reconstruction_read,
             .join_owner_restart_ok = self.join_owner_restart_sound,
+            .join_retry_exhaustion_job_id = self.join_retry_exhaustion_job_id,
+            .join_retry_exhaustion_partition_index = self.join_retry_exhaustion_partition_index,
+            .join_retry_exhaustion_first_group_id = self.join_retry_exhaustion_first_group_id,
+            .join_retry_exhaustion_retry_group_id = self.join_retry_exhaustion_retry_group_id,
+            .join_retry_exhaustion_coordinator_index = self.join_retry_exhaustion_coordinator_index,
+            .join_retry_exhaustion_retry_target_index = self.join_retry_exhaustion_retry_target_index,
+            .join_retry_exhaustion_faults_injected = self.join_retry_exhaustion_faults_injected,
+            .join_retry_exhaustion_resource_observed = self.join_retry_exhaustion_resource_observed,
+            .join_retry_exhaustion_network_observed = self.join_retry_exhaustion_network_observed,
+            .join_retry_exhaustion_overlap_observed = self.join_retry_exhaustion_overlap_observed,
+            .join_retry_exhaustion_initial_worker_starts = self.join_retry_exhaustion_initial_worker_starts,
+            .join_retry_exhaustion_initial_worker_completions = self.join_retry_exhaustion_initial_worker_completions,
+            .join_retry_exhaustion_initial_status = self.join_retry_exhaustion_initial_status,
+            .join_retry_exhaustion_initial_rejected_without_partial = self.join_retry_exhaustion_initial_rejected_without_partial,
+            .join_retry_exhaustion_network_healed = self.join_retry_exhaustion_network_healed,
+            .join_retry_exhaustion_resource_healed = self.join_retry_exhaustion_resource_healed,
+            .join_retry_exhaustion_recovery_join = self.join_retry_exhaustion_recovery_join,
+            .join_retry_exhaustion_ok = self.join_retry_exhaustion_sound,
             .join_cancellation_boundary_observed = self.join_cancellation_boundary_observed,
             .join_cancellation_job_id = self.join_cancellation_job_id,
             .join_cancellation_owner_group_id = self.join_cancellation_owner_group_id,

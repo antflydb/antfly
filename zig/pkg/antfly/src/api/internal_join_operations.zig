@@ -33,16 +33,21 @@ pub const Operations = struct {
     reads: ?table_reads.TableReadSource = null,
 
     fn mapExecutionError(err: anyerror) Error {
+        if (distributed_join.normalizeDistributedJoinOperationalError(err) == error.DistributedQueryUnavailable)
+            return error.Unavailable;
         return switch (err) {
             error.Canceled, error.Cancelled => error.Canceled,
             error.DeadlineExceeded => error.DeadlineExceeded,
             error.InvalidQueryRequest => error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => error.UnsupportedQueryRequest,
-            error.TableNotFound, error.UnknownGroup => error.NotFound,
+            error.TableNotFound => error.NotFound,
             error.Timeout => error.Timeout,
             error.TopologyChanged => error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
-            else => error.Internal,
+            else => {
+                std.log.err("internal distributed join execution failed err={}", .{err});
+                return error.Internal;
+            },
         };
     }
 
@@ -175,6 +180,16 @@ pub const Operations = struct {
         ) catch |err| return mapExecutionError(err);
     }
 };
+
+test "internal join maps resource and ownership failures to unavailable" {
+    try std.testing.expectEqual(error.Unavailable, Operations.mapExecutionError(error.DistributedQueryUnavailable));
+    try std.testing.expectEqual(error.Unavailable, Operations.mapExecutionError(error.ResourceBudgetExceeded));
+    try std.testing.expectEqual(error.Unavailable, Operations.mapExecutionError(error.PersistentDescriptorAdmissionExhausted));
+    try std.testing.expectEqual(error.Unavailable, Operations.mapExecutionError(error.UnknownGroup));
+    try std.testing.expectEqual(error.Unavailable, Operations.mapExecutionError(error.NotLeader));
+    try std.testing.expectEqual(error.Unavailable, Operations.mapExecutionError(error.SendFailed));
+    try std.testing.expectEqual(error.NotFound, Operations.mapExecutionError(error.TableNotFound));
+}
 
 test "internal join job state is callable without an HTTP request" {
     const alloc = std.testing.allocator;

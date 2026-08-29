@@ -1076,8 +1076,10 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            404 => return error.UnknownGroup,
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.DistributedQueryUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1122,8 +1124,10 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            404 => return error.UnknownGroup,
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.DistributedQueryUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1168,8 +1172,10 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            404 => return error.UnknownGroup,
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.DistributedQueryUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1317,8 +1323,10 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            404 => return error.UnknownGroup,
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.DistributedQueryUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1351,7 +1359,9 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.DistributedQueryUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -3715,6 +3725,42 @@ test "api http client forwards internal query controls and maps remote timeout" 
     try std.testing.expectError(error.Timeout, client.fetchGroupGraphHydrateWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
     try std.testing.expectError(error.Timeout, client.fetchGroupGraphEdgesWithControl(base_uri, 7, "docs", "{}", 37, &cancellation));
     try std.testing.expectEqual(@as(usize, 14), executor.calls);
+}
+
+test "api http client preserves exact-group join unavailability and absence" {
+    const StatusExecutor = struct {
+        status: u16,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.indexOf(u8, req.uri, "/join-") != null);
+            return .{
+                .status = self.status,
+                .body = try alloc.dupe(u8, if (self.status == 503) "join unavailable" else "not found"),
+            };
+        }
+    };
+
+    const base_uri = "http://127.0.0.1:1";
+    var executor = StatusExecutor{ .status = 503 };
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(error.DistributedQueryUnavailable, client.fetchGroupJoinPartitionWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.DistributedQueryUnavailable, client.fetchGroupJoinRowsWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.DistributedQueryUnavailable, client.fetchGroupJoinUnmatchedWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.DistributedQueryUnavailable, client.fetchGroupJoinFinalizeWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.DistributedQueryUnavailable, client.fetchGroupJoinJobState(base_uri, 7, "docs", "{}"));
+
+    executor.status = 404;
+    try std.testing.expectError(error.UnknownGroup, client.fetchGroupJoinPartitionWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.UnknownGroup, client.fetchGroupJoinRowsWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.UnknownGroup, client.fetchGroupJoinUnmatchedWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.UnknownGroup, client.fetchGroupJoinFinalizeWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.NotFound, client.fetchGroupJoinJobState(base_uri, 7, "docs", "{}"));
 }
 
 test "api http client encodes table name for repair cancel callback" {

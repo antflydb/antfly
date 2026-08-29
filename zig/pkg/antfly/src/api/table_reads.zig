@@ -3923,10 +3923,7 @@ pub const ProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
         return switch (route) {
             .local => error.JoinWorkerOwnedLocally,
-            .remote => |remote| joinPartitionRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
-                error.UnexpectedHttpStatus => null,
-                else => err,
-            },
+            .remote => |remote| try joinPartitionRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms),
         };
     }
 
@@ -3944,10 +3941,7 @@ pub const ProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
         return switch (route) {
             .local => error.JoinWorkerOwnedLocally,
-            .remote => |remote| joinRowsRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
-                error.UnexpectedHttpStatus => null,
-                else => err,
-            },
+            .remote => |remote| try joinRowsRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms),
         };
     }
 
@@ -3965,10 +3959,7 @@ pub const ProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
         return switch (route) {
             .local => error.JoinWorkerOwnedLocally,
-            .remote => |remote| joinUnmatchedRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
-                error.UnexpectedHttpStatus => null,
-                else => err,
-            },
+            .remote => |remote| try joinUnmatchedRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms),
         };
     }
 
@@ -3986,10 +3977,7 @@ pub const ProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
         return switch (route) {
             .local => error.JoinWorkerOwnedLocally,
-            .remote => |remote| joinFinalizeRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
-                error.UnexpectedHttpStatus => null,
-                else => err,
-            },
+            .remote => |remote| try joinFinalizeRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms),
         };
     }
 
@@ -4009,7 +3997,7 @@ pub const ProvisionedTableReadSource = struct {
             // requesting a handoff import.
             .local => null,
             .remote => |remote| joinJobStateRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
-                error.UnexpectedHttpStatus => null,
+                error.NotFound => null,
                 else => err,
             },
         };
@@ -5025,10 +5013,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 try local.joinPartitionGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms)
             else
                 null,
-            .remote => |remote| joinPartitionRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
-                error.UnexpectedHttpStatus => null,
-                else => err,
-            },
+            .remote => |remote| try joinPartitionRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms),
         };
     }
 
@@ -5049,10 +5034,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 try local.joinRowsGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms)
             else
                 null,
-            .remote => |remote| joinRowsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
-                error.UnexpectedHttpStatus => null,
-                else => err,
-            },
+            .remote => |remote| try joinRowsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms),
         };
     }
 
@@ -5073,10 +5055,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 try local.joinUnmatchedGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms)
             else
                 null,
-            .remote => |remote| joinUnmatchedRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
-                error.UnexpectedHttpStatus => null,
-                else => err,
-            },
+            .remote => |remote| try joinUnmatchedRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms),
         };
     }
 
@@ -5097,10 +5076,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 try local.joinFinalizeGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms)
             else
                 null,
-            .remote => |remote| joinFinalizeRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
-                error.UnexpectedHttpStatus => null,
-                else => err,
-            },
+            .remote => |remote| try joinFinalizeRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms),
         };
     }
 
@@ -5121,7 +5097,7 @@ pub const HostedProvisionedTableReadSource = struct {
             else
                 null,
             .remote => |remote| joinJobStateRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
-                error.UnexpectedHttpStatus => null,
+                error.NotFound => null,
                 else => err,
             },
         };

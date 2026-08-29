@@ -3582,6 +3582,7 @@ pub fn build(b: *std.Build) void {
         "restore filesystem scope containment handles filesystem roots and component boundaries",
         ".test_0",
         "module compiles",
+        "internal join maps resource and ownership failures to unavailable",
         "postgres libpq global permits are atomic and bounded",
         "postgres libpq permit saturation preserves zero-connection pools",
         "postgres libpq async reader services input while flushing and between results",
@@ -3910,6 +3911,7 @@ pub fn build(b: *std.Build) void {
         "local inference response validation contains malformed ownership",
         "inference connection invocation requires inference write permission",
         "httpx inference connection preserves upstream retry guidance",
+        "api http client preserves exact-group join unavailability and absence",
         "typed internal HTTP errors preserve conflict semantics",
         "internal transaction HTTP responses prove not-proposed only before decision",
         "internal transaction ingress establishes and validates pre-decision deadline",
@@ -7400,6 +7402,12 @@ pub fn build(b: *std.Build) void {
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
     });
     const run_production_cluster_durable_join_owner_restart_vopr_tests = b.addRunArtifact(production_cluster_durable_join_owner_restart_vopr_tests);
+    const production_cluster_durable_join_retry_exhaustion_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production durable shuffle overlapping fault retry exhaustion exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_production_cluster_durable_join_retry_exhaustion_vopr_tests = b.addRunArtifact(production_cluster_durable_join_retry_exhaustion_vopr_tests);
     const production_cluster_graph_split_overlapping_faults_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane graph active split overlapping link resource faults exact replay"},
@@ -7434,6 +7442,7 @@ pub fn build(b: *std.Build) void {
         run_production_cluster_durable_join_cancellation_vopr_tests,
         run_production_cluster_durable_join_worker_retry_vopr_tests,
         run_production_cluster_durable_join_owner_restart_vopr_tests,
+        run_production_cluster_durable_join_retry_exhaustion_vopr_tests,
         run_production_cluster_graph_split_overlapping_faults_vopr_tests,
         run_production_cluster_graph_split_socket_pressure_vopr_tests,
         run_production_cluster_service_rate_vopr_tests,
@@ -7514,6 +7523,11 @@ pub fn build(b: *std.Build) void {
         "Exact-replay durable partition-owner process destruction, reconstruction, and failover",
     );
     production_cluster_durable_join_owner_restart_vopr_test_step.dependOn(&run_production_cluster_durable_join_owner_restart_vopr_tests.step);
+    const production_cluster_durable_join_retry_exhaustion_vopr_test_step = b.step(
+        "production-cluster-durable-join-retry-exhaustion-vopr-test",
+        "Exact-replay durable join retry exhaustion under overlapping resource and network faults",
+    );
+    production_cluster_durable_join_retry_exhaustion_vopr_test_step.dependOn(&run_production_cluster_durable_join_retry_exhaustion_vopr_tests.step);
     const production_cluster_graph_split_overlapping_faults_vopr_test_step = b.step(
         "production-cluster-graph-split-overlapping-faults-vopr-test",
         "Exact-replay overlapping graph transport and all-owner memory faults during an active split",
@@ -7526,7 +7540,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_graph_split_socket_pressure_vopr_test_step.dependOn(&run_production_cluster_graph_split_socket_pressure_vopr_tests.step);
     const production_cluster_vopr_test_step = b.step(
         "production-cluster-vopr-test",
-        "Run every focused production DataServer cluster history through v32",
+        "Run every focused production DataServer cluster history through v33",
     );
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_deep_test_step);
@@ -7541,6 +7555,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_vopr_test_step.dependOn(production_cluster_durable_join_cancellation_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_durable_join_worker_retry_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_durable_join_owner_restart_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_durable_join_retry_exhaustion_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_overlapping_faults_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_socket_pressure_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_service_rate_vopr_test_step);
