@@ -194,6 +194,15 @@ pub const Fixture = struct {
         ) anyerror!void,
     };
 
+    pub const JoinCancellationOverlapFaultObserver = struct {
+        ptr: *anyopaque,
+        activate: *const fn (
+            ptr: *anyopaque,
+            coordinator_index: usize,
+            network_target_index: usize,
+        ) anyerror!void,
+    };
+
     const node_count = metadata_sim.VoprPublicClusterFixture.node_count;
     const initial_groups = [_]u64{
         metadata_sim.VoprPublicClusterFixture.data_group_id,
@@ -400,6 +409,20 @@ pub const Fixture = struct {
     join_cancellation_observed: bool = false,
     join_cancellation_recovered: bool = false,
     join_cancellation_sound: bool = false,
+    join_cancellation_overlap_first_group_id: u64 = 0,
+    join_cancellation_overlap_worker_group_id: u64 = 0,
+    join_cancellation_overlap_coordinator_index: usize = 0,
+    join_cancellation_overlap_network_target_index: usize = 0,
+    join_cancellation_overlap_campaign_configured: bool = false,
+    join_cancellation_overlap_fault_observer: ?JoinCancellationOverlapFaultObserver = null,
+    join_cancellation_overlap_network_armed: bool = false,
+    join_cancellation_overlap_faults_injected: bool = false,
+    join_cancellation_overlap_network_matches_before: u64 = 0,
+    join_cancellation_overlap_network_observed: bool = false,
+    join_cancellation_overlap_resource_observed: bool = false,
+    join_cancellation_overlap_observed: bool = false,
+    join_cancellation_overlap_network_healed: bool = false,
+    join_cancellation_overlap_resource_healed: bool = false,
     graph_sound: bool = false,
     graph_hydration_sound: bool = false,
     graph_hydration_started_count: u64 = 0,
@@ -505,6 +528,7 @@ pub const Fixture = struct {
     graph_stale_snapshot_retry_exhaustion_enabled: bool = false,
     join_enabled: bool = false,
     join_cancellation_enabled: bool = false,
+    join_cancellation_overlap_enabled: bool = false,
     join_worker_retry_enabled: bool = false,
     join_owner_restart_enabled: bool = false,
     join_retry_exhaustion_enabled: bool = false,
@@ -568,6 +592,11 @@ pub const Fixture = struct {
         self.join_cancellation_enabled = enabled;
     }
 
+    pub fn setJoinCancellationOverlapEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.join_cancellation_overlap_enabled = enabled;
+    }
+
     pub fn setJoinWorkerRetryEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.join_worker_retry_enabled = enabled;
@@ -599,6 +628,16 @@ pub const Fixture = struct {
         std.debug.assert(self.phase == .leaders_ready);
         std.debug.assert(self.join_retry_exhaustion_enabled);
         self.join_retry_exhaustion_fault_observer = observer;
+    }
+
+    pub fn setJoinCancellationOverlapFaultObserver(
+        self: *Fixture,
+        observer: JoinCancellationOverlapFaultObserver,
+    ) void {
+        std.debug.assert(self.phase == .leaders_ready);
+        std.debug.assert(self.join_cancellation_enabled);
+        std.debug.assert(self.join_cancellation_overlap_enabled);
+        self.join_cancellation_overlap_fault_observer = observer;
     }
 
     pub fn setFaultMode(self: *Fixture, mode: FaultMode) void {
@@ -663,6 +702,30 @@ pub const Fixture = struct {
         self.join_retry_exhaustion_campaign_configured = true;
     }
 
+    /// Route the first durable partition attempt across one exact production
+    /// link and make the second worker local to the public coordinator. The
+    /// first attempt can then be rejected by the registered network fault,
+    /// while cancellation is held at a real alternate-worker boundary under
+    /// all-owner memory saturation.
+    fn prepareJoinCancellationOverlapCampaign(self: *Fixture) !void {
+        if (self.phase != .reads_complete or !self.join_cancellation_enabled or
+            !self.join_cancellation_overlap_enabled)
+            return error.InvalidProductionJoinCancellationOverlapTarget;
+        const first_group_id = metadata_sim.VoprPublicClusterFixture.data_group_id;
+        const worker_group_id = metadata_sim.VoprPublicClusterFixture.graph_data_group_id;
+        const network_target_index = self.currentDataLeaderIndex(first_group_id) orelse
+            return error.ProductionDataJoinFirstLeaderMissing;
+        const coordinator_index = self.currentDataLeaderIndex(worker_group_id) orelse
+            return error.ProductionDataJoinRetryLeaderMissing;
+        if (coordinator_index == network_target_index)
+            return error.ProductionDataJoinCancellationOverlapRemoteOwnerMissing;
+        self.join_cancellation_overlap_first_group_id = first_group_id;
+        self.join_cancellation_overlap_worker_group_id = worker_group_id;
+        self.join_cancellation_overlap_coordinator_index = coordinator_index;
+        self.join_cancellation_overlap_network_target_index = network_target_index;
+        self.join_cancellation_overlap_campaign_configured = true;
+    }
+
     /// Freeze the advertised link selected by the deployment manifest before
     /// workload start. The active history later fails closed if leadership
     /// changes would make that registered fault scope inaccurate.
@@ -723,6 +786,8 @@ pub const Fixture = struct {
         if (self.join_cancellation_enabled and
             (!self.join_enabled or self.active_split_enabled or self.fault_mode != .clean))
             return error.InvalidProductionClusterJoinCancellationMode;
+        if (self.join_cancellation_overlap_enabled and !self.join_cancellation_enabled)
+            return error.InvalidProductionClusterJoinCancellationOverlapMode;
         if (self.join_worker_retry_enabled and
             (!self.join_enabled or self.join_cancellation_enabled or
                 self.active_split_enabled or self.fault_mode != .clean))
@@ -1387,6 +1452,38 @@ pub const Fixture = struct {
                     // publication. The production shuffle engine must record
                     // this attempt and retry the same partition elsewhere.
                     return error.GroupLeaderUnavailable;
+                }
+                if (self.join_cancellation_overlap_enabled and
+                    !self.join_cancellation_overlap_faults_injected and
+                    self.join_partition_worker_started_count == 1)
+                {
+                    if (!self.join_cancellation_overlap_campaign_configured or
+                        !self.join_cancellation_overlap_network_armed)
+                        return error.ProductionJoinCancellationOverlapTargetMissing;
+                    if (event.job_id == 0 or
+                        event.owner_group_id != self.join_cancellation_overlap_worker_group_id or
+                        observer.node_index != self.join_cancellation_overlap_coordinator_index)
+                    {
+                        self.failure = error.ProductionJoinCancellationOverlapIdentityMismatch;
+                        return error.ProductionJoinCancellationOverlapIdentityMismatch;
+                    }
+                    self.join_cancellation_overlap_network_observed =
+                        self.sim.outboundEndpointPayloadOutageCount() >
+                        self.join_cancellation_overlap_network_matches_before;
+                    self.saturateNodeMemory() catch |err| {
+                        self.failure = err;
+                        return err;
+                    };
+                    self.join_cancellation_overlap_resource_observed =
+                        self.allNodeMemorySaturated();
+                    self.join_cancellation_overlap_observed =
+                        self.join_cancellation_overlap_network_observed and
+                        self.join_cancellation_overlap_resource_observed;
+                    self.join_cancellation_overlap_faults_injected = true;
+                    if (!self.join_cancellation_overlap_observed) {
+                        self.failure = error.ProductionJoinCancellationOverlapNotObserved;
+                        return error.ProductionJoinCancellationOverlapNotObserved;
+                    }
                 }
                 if (!self.join_cancellation_enabled or
                     self.join_partition_worker_started_count != 1)
@@ -2452,11 +2549,50 @@ pub const Fixture = struct {
     }
 
     fn runJoinCancellationQuery(self: *Fixture) !bool {
+        if (self.join_cancellation_overlap_enabled) {
+            try self.prepareJoinCancellationOverlapCampaign();
+            const fault_observer = self.join_cancellation_overlap_fault_observer orelse
+                return error.ProductionJoinCancellationOverlapFaultObserverMissing;
+            try fault_observer.activate(
+                fault_observer.ptr,
+                self.join_cancellation_overlap_coordinator_index,
+                self.join_cancellation_overlap_network_target_index,
+            );
+            self.join_cancellation_overlap_network_matches_before =
+                self.sim.outboundEndpointPayloadOutageCount();
+            const network_target = try parseHttpBaseUriAddress(
+                self.data_api_uris[self.join_cancellation_overlap_network_target_index],
+            );
+            try self.sim.setOutboundEndpointPayloadOutage(
+                network_target,
+                "/join-partition",
+            );
+            self.join_cancellation_overlap_network_armed = true;
+        }
+        defer {
+            if (self.join_cancellation_overlap_network_armed and
+                !self.join_cancellation_overlap_network_healed)
+            {
+                self.sim.setOutboundEndpointOutage(null);
+                self.join_cancellation_overlap_network_healed = true;
+            }
+            if (self.join_cancellation_overlap_faults_injected and
+                !self.join_cancellation_overlap_resource_healed)
+            {
+                self.releaseNodeMemory();
+                self.join_cancellation_overlap_resource_healed =
+                    self.nodeMemoryBelowHardLimit();
+            }
+        }
         const started_before = self.join_partition_worker_started_count;
         const completed_before = self.join_partition_worker_completed_count;
+        const coordinator_index = if (self.join_cancellation_overlap_enabled)
+            self.join_cancellation_overlap_coordinator_index
+        else
+            1;
         var in_flight = self.sim.io().async(fetchJoinQuery, .{
             self,
-            self.data_api_uris[1],
+            self.data_api_uris[coordinator_index],
             durable_join_query_body,
         });
         defer if (in_flight.any_future != null) {
@@ -2475,7 +2611,18 @@ pub const Fixture = struct {
             self.join_cancellation_job_id == 0 or
             self.join_cancellation_owner_group_id == 0 or
             self.join_partition_worker_started_count != started_before + 1 or
-            self.join_partition_worker_completed_count != completed_before)
+            self.join_partition_worker_completed_count != completed_before or
+            (self.join_cancellation_overlap_enabled and
+                (!self.join_cancellation_overlap_faults_injected or
+                    !self.join_cancellation_overlap_network_observed or
+                    !self.join_cancellation_overlap_resource_observed or
+                    !self.join_cancellation_overlap_observed or
+                    self.join_cancellation_overlap_first_group_id == 0 or
+                    self.join_cancellation_overlap_worker_group_id == 0 or
+                    self.join_cancellation_overlap_first_group_id ==
+                        self.join_cancellation_overlap_worker_group_id or
+                    self.join_cancellation_overlap_coordinator_index ==
+                        self.join_cancellation_overlap_network_target_index)))
             return false;
 
         self.join_cancellation_requested = true;
@@ -2491,10 +2638,22 @@ pub const Fixture = struct {
             self.join_partition_worker_completed_count == completed_before;
         if (!self.join_cancellation_observed) return false;
 
+        if (self.join_cancellation_overlap_enabled) {
+            self.sim.setOutboundEndpointOutage(null);
+            self.join_cancellation_overlap_network_healed = true;
+            self.releaseNodeMemory();
+            self.join_cancellation_overlap_resource_healed =
+                self.nodeMemoryBelowHardLimit();
+            if (!self.join_cancellation_overlap_resource_healed) return false;
+        }
+
         self.join_sound = try self.runJoinQuery();
         self.join_cancellation_recovered = self.join_sound and
             self.join_partition_worker_started_count > started_before + 1 and
-            self.join_partition_worker_completed_count > completed_before;
+            self.join_partition_worker_completed_count > completed_before and
+            (!self.join_cancellation_overlap_enabled or
+                (self.join_cancellation_overlap_network_healed and
+                    self.join_cancellation_overlap_resource_healed));
         return self.join_cancellation_recovered;
     }
 
@@ -4196,6 +4355,16 @@ pub const Fixture = struct {
         join_cancellation_observed: bool,
         join_cancellation_recovered: bool,
         join_cancellation_ok: bool,
+        join_cancellation_overlap_first_group_id: u64,
+        join_cancellation_overlap_worker_group_id: u64,
+        join_cancellation_overlap_coordinator_index: usize,
+        join_cancellation_overlap_network_target_index: usize,
+        join_cancellation_overlap_faults_injected: bool,
+        join_cancellation_overlap_network_observed: bool,
+        join_cancellation_overlap_resource_observed: bool,
+        join_cancellation_overlap_observed: bool,
+        join_cancellation_overlap_network_healed: bool,
+        join_cancellation_overlap_resource_healed: bool,
         graph_query_ok: bool,
         graph_hydration_ok: bool,
         graph_hydration_started_count: u64,
@@ -4333,6 +4502,16 @@ pub const Fixture = struct {
             .join_cancellation_observed = self.join_cancellation_observed,
             .join_cancellation_recovered = self.join_cancellation_recovered,
             .join_cancellation_ok = self.join_cancellation_sound,
+            .join_cancellation_overlap_first_group_id = self.join_cancellation_overlap_first_group_id,
+            .join_cancellation_overlap_worker_group_id = self.join_cancellation_overlap_worker_group_id,
+            .join_cancellation_overlap_coordinator_index = self.join_cancellation_overlap_coordinator_index,
+            .join_cancellation_overlap_network_target_index = self.join_cancellation_overlap_network_target_index,
+            .join_cancellation_overlap_faults_injected = self.join_cancellation_overlap_faults_injected,
+            .join_cancellation_overlap_network_observed = self.join_cancellation_overlap_network_observed,
+            .join_cancellation_overlap_resource_observed = self.join_cancellation_overlap_resource_observed,
+            .join_cancellation_overlap_observed = self.join_cancellation_overlap_observed,
+            .join_cancellation_overlap_network_healed = self.join_cancellation_overlap_network_healed,
+            .join_cancellation_overlap_resource_healed = self.join_cancellation_overlap_resource_healed,
             .graph_query_ok = self.graph_sound,
             .graph_hydration_ok = self.graph_hydration_sound,
             .graph_hydration_started_count = self.graph_hydration_started_count,
