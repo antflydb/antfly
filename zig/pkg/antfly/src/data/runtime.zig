@@ -1288,6 +1288,7 @@ const RaftTableApplyStateMachine = struct {
         storage.write_cache.secret_store = self.write_source.secret_store;
         storage.write_cache.remote_content = self.write_source.remote_content;
         self.write_source.read_cache = &storage.read_cache;
+        storage.read_cache.group_admission = self.write_source.groupAdmissionSource();
         self.write_source.bindWriteCachesWithStateMutex(
             &storage.write_cache,
             &storage.startup_write_cache,
@@ -1522,21 +1523,30 @@ const RaftTableApplyStateMachine = struct {
 
     fn retireGroup(ptr: *anyopaque, group_id: raft_engine.core.types.GroupId) void {
         const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(ptr));
-        lockAtomic(&self.applied_mutex);
-        defer self.applied_mutex.unlock();
+        {
+            lockAtomic(&self.applied_mutex);
+            defer self.applied_mutex.unlock();
 
-        _ = self.applied_indexes.remove(group_id);
-        _ = self.retry_apply_checkpoints.remove(group_id);
-        var outcomes = self.apply_outcomes.iterator();
-        while (outcomes.next()) |entry| {
-            if (entry.key_ptr.group_id == group_id) self.apply_outcomes.removeByPtr(entry.key_ptr);
+            _ = self.applied_indexes.remove(group_id);
+            _ = self.retry_apply_checkpoints.remove(group_id);
+            var outcomes = self.apply_outcomes.iterator();
+            while (outcomes.next()) |entry| {
+                if (entry.key_ptr.group_id == group_id) self.apply_outcomes.removeByPtr(entry.key_ptr);
+            }
         }
+        self.write_source.retireGroup(group_id);
+    }
+
+    fn activateGroup(ptr: *anyopaque, group_id: raft_engine.core.types.GroupId) !void {
+        const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(ptr));
+        try self.write_source.activateGroup(group_id);
     }
 
     fn stateMachine(self: *RaftTableApplyStateMachine) raft_engine.runtime.storage_iface.StateMachine {
         return .{
             .ptr = self,
             .vtable = &.{
+                .activate_group = activateGroup,
                 .apply_ready = applyReady,
                 .retire_group = retireGroup,
             },
@@ -19554,6 +19564,11 @@ test "data raft replica retirement removes only retired group apply state" {
     const retired_group_id: u64 = 781;
     const active_group_id: u64 = 782;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-raft-retire-group", .{tmp.sub_path});
+    defer alloc.free(replica_root);
+
     const Catalog = struct {
         fn iface() antfly.public_api.table_catalog.CatalogSource {
             return .{
@@ -19568,8 +19583,25 @@ test "data raft replica retirement removes only retired group apply state" {
         fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
             return .{
                 .status = .{ .metadata_group_id = 1, .metadata_epoch = 1, .metrics = .{} },
-                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
-                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 78,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{
+                    .{
+                        .group_id = retired_group_id,
+                        .table_id = 78,
+                        .start_key = "",
+                        .end_key = "doc:m",
+                    },
+                    .{
+                        .group_id = active_group_id,
+                        .table_id = 78,
+                        .start_key = "doc:m",
+                        .end_key = null,
+                    },
+                })[0..]),
                 .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
@@ -19580,8 +19612,11 @@ test "data raft replica retirement removes only retired group apply state" {
         fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
     };
 
-    var apply_sm = RaftTableApplyStateMachine.init(alloc, "/tmp/unused-antfly-retire-group", Catalog.iface(), null);
+    var storage = antfly.public_api.ProvisionedGroupStorage.init(alloc);
+    defer storage.deinit();
+    var apply_sm = RaftTableApplyStateMachine.init(alloc, replica_root, Catalog.iface(), null);
     defer apply_sm.deinit();
+    apply_sm.attachProvisionedStorage(&storage);
     var data_sm = antfly.raft.state_machine.DataStateMachine{
         .alloc = alloc,
         .applied_sink = antfly.raft.state_machine.noopAppliedIndexSink(),
@@ -19636,7 +19671,36 @@ test "data raft replica retirement removes only retired group apply state" {
     try apply_sm.registerApplyOutcomeWaiter(retired_group_id, 9, 2);
     try apply_sm.registerApplyOutcomeWaiter(active_group_id, 12, 3);
 
+    _ = try apply_sm.write_source.applyReplicatedBatchGroupLocal(alloc, retired_group_id, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"group\":\"retired\"}" }},
+    });
+    _ = try apply_sm.write_source.applyReplicatedBatchGroupLocal(alloc, active_group_id, "docs", .{
+        .writes = &.{.{ .key = "doc:z", .value = "{\"group\":\"active\"}" }},
+    });
+    const retired_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root, retired_group_id);
+    defer alloc.free(retired_db_path);
+    const active_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root, active_group_id);
+    defer alloc.free(active_db_path);
+    var retired_read = try storage.read_cache.getOrOpen(retired_db_path, Catalog.iface(), retired_group_id, 0, "docs");
+    retired_read.release();
+    var active_read = try storage.read_cache.getOrOpen(active_db_path, Catalog.iface(), active_group_id, 0, "docs");
+    active_read.release();
+    var retired_writer = (try apply_sm.write_source.leaseCachedGroupWriter(alloc, retired_group_id, "docs")) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectError(error.GenerationTransitionActive, antfly.db.generation_lifecycle.beginProcessExclusive(retired_db_path));
+    try std.testing.expectError(error.GenerationTransitionActive, antfly.db.generation_lifecycle.beginProcessExclusive(active_db_path));
+
     try host.removeReplica(retired_group_id);
+
+    try std.testing.expectError(error.GenerationTransitionActive, antfly.db.generation_lifecycle.beginProcessExclusive(retired_db_path));
+    retired_writer.deinit(alloc);
+    var retired_transition = try antfly.db.generation_lifecycle.beginProcessExclusive(retired_db_path);
+    retired_transition.deinit();
+    try std.testing.expectError(
+        error.UnknownGroup,
+        storage.read_cache.getOrOpen(retired_db_path, Catalog.iface(), retired_group_id, 0, "docs"),
+    );
+    try std.testing.expectError(error.GenerationTransitionActive, antfly.db.generation_lifecycle.beginProcessExclusive(active_db_path));
 
     try std.testing.expect(host.group(retired_group_id) == null);
     try std.testing.expect(host.group(active_group_id) != null);
@@ -19648,6 +19712,22 @@ test "data raft replica retirement removes only retired group apply state" {
     try std.testing.expect(!apply_sm.apply_outcomes.contains(.{ .group_id = retired_group_id, .index = 9 }));
     try std.testing.expectEqual(@as(usize, 1), apply_sm.apply_outcomes.count());
     try std.testing.expectEqual(.pending, apply_sm.apply_outcomes.get(.{ .group_id = active_group_id, .index = 12 }).?.outcome);
+
+    try host.addGroup(.{
+        .group_id = retired_group_id,
+        .local_node_id = 1,
+        .raft_config = .{
+            .id = 1,
+            .group_id = retired_group_id,
+            .peers = peers[0..],
+            .election_tick = 5,
+            .heartbeat_tick = 1,
+            .pre_vote = false,
+        },
+        .storage = retired_storage.storage(),
+    });
+    var reactivated_read = try storage.read_cache.getOrOpen(retired_db_path, Catalog.iface(), retired_group_id, 0, "docs");
+    reactivated_read.release();
 }
 
 test "data raft apply records transaction conflicts without stopping replica progress" {

@@ -276,6 +276,27 @@ pub const TableRuntimeSnapshotCache = struct {
         if (state.epoch.root_generation == 0) state.epoch.root_generation = 1;
     }
 
+    pub fn invalidateGroup(self: *@This(), group_id: u64) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        var invalidated = false;
+        var states = self.tables.valueIterator();
+        while (states.next()) |state| {
+            const removed = state.groups.fetchRemove(group_id) orelse continue;
+            var status = removed.value;
+            status.deinit(self.alloc);
+            if (!invalidated) {
+                self.advanceInvalidationEpochLocked();
+                self.advanceTopologyRevisionLocked();
+                invalidated = true;
+            }
+            state.epoch.invalidation_epoch = self.next_invalidation_epoch;
+            state.epoch.root_generation +%= 1;
+            if (state.epoch.root_generation == 0) state.epoch.root_generation = 1;
+        }
+    }
+
     /// Captures the table lifecycle before a DB is opened or inspected.
     pub fn capturePublicationToken(self: *@This(), table_name: []const u8) !PublicationToken {
         lockAtomic(&self.mutex);
@@ -2385,6 +2406,32 @@ test "table runtime snapshot cache invalidation fences a stale observed publishe
     defer docs.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 12), docs.items[0].stats.doc_count);
     try std.testing.expectEqual(current_token.observation_generation, docs.items[0].cache_observation_generation);
+}
+
+test "table runtime snapshot cache group invalidation is scoped and fences stale publishers" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const stale_token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroups(stale_token, "docs", &.{
+            .{ .group_id = 7, .stats = .{ .doc_count = 10 } },
+            .{ .group_id = 8, .stats = .{ .doc_count = 20 } },
+        }),
+    );
+
+    cache.invalidateGroup(7);
+
+    var docs = (try cache.snapshot(alloc, "docs")).?;
+    defer docs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), docs.items.len);
+    try std.testing.expectEqual(@as(u64, 8), docs.items[0].group_id);
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.stale_table,
+        try cache.publishGroup(stale_token, "docs", .{ .group_id = 7, .stats = .{ .doc_count = 30 } }),
+    );
 }
 
 test "table runtime snapshot cache batch publication is table epoch atomic" {

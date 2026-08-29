@@ -1044,6 +1044,7 @@ pub const ProvisionedTableWriteCache = struct {
     table_eviction_hook: ?TableEvictionHook = null,
     state_mutex: ?*std.atomic.Mutex = null,
     open_mutex: std.atomic.Mutex = .unlocked,
+    open_mutex_owner: std.atomic.Value(std.Thread.Id) = .init(0),
     entry_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     hit_count: std.atomic.Value(u64) = .init(0),
     miss_count: std.atomic.Value(u64) = .init(0),
@@ -1526,32 +1527,32 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     pub fn setResolutionCandidateSource(self: *ProvisionedTableWriteCache, source: ?db_mod.CandidateSource) void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         if (candidateSourcesEqual(self.resolution_candidate_source, source)) return;
         self.resolution_candidate_source = source;
         self.refreshRuntimeHooksLocked();
     }
 
     pub fn setEntitySink(self: *ProvisionedTableWriteCache, sink: ?db_mod.EntitySink) void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         if (entitySinksEqual(self.entity_sink, sink)) return;
         self.entity_sink = sink;
         self.refreshRuntimeHooksLocked();
     }
 
     pub fn setPromotionLeadershipSource(self: *ProvisionedTableWriteCache, source: ?PromotionLeadershipSource) void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         if (promotionLeadershipSourcesEqual(self.promotion_leadership_source, source)) return;
         self.promotion_leadership_source = source;
         self.refreshRuntimeHooksLocked();
     }
 
     fn setHAWriteGate(self: *ProvisionedTableWriteCache, gate: ?db_mod.HAWriteGate) !void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         if (haWriteGatesEqual(self.ha_write_gate, gate)) return;
         lockAtomic(&self.entry_lifecycle_mutex);
         self.reserveClearCapacityAssumeLifecycleLocked() catch |err| {
@@ -1565,8 +1566,8 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     fn setHAMirror(self: *ProvisionedTableWriteCache, mirror: ?db_mod.HAAsyncEffectMirror) !void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         if (haAsyncMirrorsEqual(self.ha_async_mirror, mirror)) return;
         lockAtomic(&self.entry_lifecycle_mutex);
         self.reserveClearCapacityAssumeLifecycleLocked() catch |err| {
@@ -1736,6 +1737,21 @@ pub const ProvisionedTableWriteCache = struct {
 
     pub fn init(alloc: std.mem.Allocator) ProvisionedTableWriteCache {
         return .{ .alloc = alloc };
+    }
+
+    fn lockOpenMutex(self: *ProvisionedTableWriteCache) void {
+        lockAtomic(&self.open_mutex);
+        self.open_mutex_owner.store(std.Thread.getCurrentId(), .release);
+    }
+
+    fn unlockOpenMutex(self: *ProvisionedTableWriteCache) void {
+        std.debug.assert(self.openMutexHeldByCurrentThread());
+        self.open_mutex_owner.store(0, .release);
+        self.open_mutex.unlock();
+    }
+
+    fn openMutexHeldByCurrentThread(self: *const ProvisionedTableWriteCache) bool {
+        return self.open_mutex_owner.load(.acquire) == std.Thread.getCurrentId();
     }
 
     pub fn deinit(self: *ProvisionedTableWriteCache) void {
@@ -2608,6 +2624,19 @@ pub const ProvisionedTableWriteCache = struct {
         while (i < self.entries.items.len) {
             const entry = self.entries.items[i];
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) {
+                i += 1;
+                continue;
+            }
+            _ = self.entries.orderedRemove(i);
+            self.retireEntryLocked(entry);
+        }
+    }
+
+    fn invalidateGroup(self: *ProvisionedTableWriteCache, group_id: u64) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i];
+            if (entry.group_id != group_id) {
                 i += 1;
                 continue;
             }
@@ -3494,8 +3523,20 @@ pub const ProvisionedTableWriteCache = struct {
 
     fn releaseEntry(self: *ProvisionedTableWriteCache, entry: *Entry) void {
         lockAtomic(&self.entry_lifecycle_mutex);
-        defer self.entry_lifecycle_mutex.unlock();
         self.releaseEntryAssumeLifecycleLocked(entry);
+        const drain_group_id: ?u64 = if (entry.active_leases == 0 and entry.retired)
+            entry.group_id
+        else
+            null;
+        self.entry_lifecycle_mutex.unlock();
+
+        if (drain_group_id) |group_id| {
+            if (self.openMutexHeldByCurrentThread()) {
+                self.drainPendingClosesForGroupAssumeOpenMutexHeld(group_id);
+            } else {
+                self.drainPendingClosesForGroup(group_id);
+            }
+        }
     }
 
     fn retireEntryLocked(self: *ProvisionedTableWriteCache, entry: *Entry) void {
@@ -3581,9 +3622,48 @@ pub const ProvisionedTableWriteCache = struct {
         group_id: u64,
         table_name: []const u8,
     ) void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         self.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
+    }
+
+    fn drainPendingClosesForGroupAssumeOpenMutexHeld(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+    ) void {
+        while (true) {
+            var entry_to_close: ?*Entry = null;
+            lockAtomic(&self.entry_lifecycle_mutex);
+            var i: usize = 0;
+            while (i < self.retired_entries.items.len) : (i += 1) {
+                const entry = self.retired_entries.items[i];
+                if (entry.group_id != group_id or entry.active_leases != 0) continue;
+                entry_to_close = self.retired_entries.orderedRemove(i);
+                break;
+            }
+            if (entry_to_close == null) {
+                i = 0;
+                while (i < self.closing_entries.items.len) : (i += 1) {
+                    const entry = self.closing_entries.items[i];
+                    if (entry.group_id != group_id) continue;
+                    entry_to_close = self.closing_entries.orderedRemove(i);
+                    break;
+                }
+            }
+            self.entry_lifecycle_mutex.unlock();
+
+            const entry = entry_to_close orelse return;
+            self.closeEntryNow(entry);
+        }
+    }
+
+    fn drainPendingClosesForGroup(
+        self: *ProvisionedTableWriteCache,
+        group_id: u64,
+    ) void {
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
+        self.drainPendingClosesForGroupAssumeOpenMutexHeld(group_id);
     }
 
     fn drainPendingClosesAssumeOpenMutexHeld(self: *ProvisionedTableWriteCache) void {
@@ -3608,8 +3688,8 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     fn drainPendingCloses(self: *ProvisionedTableWriteCache) void {
-        lockAtomic(&self.open_mutex);
-        defer self.open_mutex.unlock();
+        self.lockOpenMutex();
+        defer self.unlockOpenMutex();
         self.drainPendingClosesAssumeOpenMutexHeld();
     }
 };
@@ -5880,6 +5960,9 @@ pub const ProvisionedTableWriteSource = struct {
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     local_db_mutex: SourceStateMutex = .{},
+    group_lifecycle_mutex: std.atomic.Mutex = .unlocked,
+    group_lifecycle_enabled: bool = false,
+    active_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
     table_activity_threaded: Io.Threaded,
     table_activity_mutex: Io.Mutex = .init,
     table_activity_ready: Io.Condition = .init,
@@ -6074,8 +6157,8 @@ pub const ProvisionedTableWriteSource = struct {
                 second = swap;
             }
 
-            if (first) |cache| lockAtomic(&cache.open_mutex);
-            if (second) |cache| lockAtomic(&cache.open_mutex);
+            if (first) |cache| cache.lockOpenMutex();
+            if (second) |cache| cache.lockOpenMutex();
             lockAtomic(&owner.local_db_mutex);
             if (first) |cache| lockAtomic(&cache.entry_lifecycle_mutex);
             if (second) |cache| lockAtomic(&cache.entry_lifecycle_mutex);
@@ -6126,8 +6209,8 @@ pub const ProvisionedTableWriteSource = struct {
 
         fn releaseOpenLocks(self: *WriteCacheTransitionLocks) void {
             if (!self.open_locked) return;
-            if (self.second) |cache| cache.open_mutex.unlock();
-            if (self.first) |cache| cache.open_mutex.unlock();
+            if (self.second) |cache| cache.unlockOpenMutex();
+            if (self.first) |cache| cache.unlockOpenMutex();
             self.open_locked = false;
         }
 
@@ -6447,8 +6530,8 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         cache: *ProvisionedTableWriteCache,
     ) void {
-        lockAtomic(&cache.open_mutex);
-        defer cache.open_mutex.unlock();
+        cache.lockOpenMutex();
+        defer cache.unlockOpenMutex();
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
         cache.setRuntimeHooksLocked(
@@ -6627,6 +6710,10 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn deinit(self: *ProvisionedTableWriteSource) void {
         self.quiesce();
+        lockAtomic(&self.group_lifecycle_mutex);
+        self.active_groups.deinit(std.heap.page_allocator);
+        self.active_groups = .empty;
+        self.group_lifecycle_mutex.unlock();
         lockAtomic(&self.dirty_write_tables_mutex);
         self.clearAllDirtyWriteTablesLocked();
         self.dirty_write_tables.deinit(std.heap.page_allocator);
@@ -8442,6 +8529,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !ProvisionedTableWriteCache.CachedDb {
         const deadline_ns = platform_time.monotonicNs() +| replicated_apply_writer_open_timeout_ns;
         while (true) {
+            if (!self.isGroupActive(group_id)) return error.UnknownGroup;
             const open_result: anyerror!ProvisionedTableWriteCache.CachedDb = if (consumeTestWriterOpenPersistentDescriptorFailure())
                 error.PersistentDescriptorAdmissionExhausted
             else
@@ -8513,6 +8601,7 @@ pub const ProvisionedTableWriteSource = struct {
                 lockAtomic(&self.local_db_mutex);
             }
         }
+        if (!self.isGroupActive(group_id)) return error.UnknownGroup;
         if (try self.leaseLiveEntryForLocalMutationLocked(cache, group_id, table_name, allow_bulk_session)) |cached| {
             return cached;
         }
@@ -8607,8 +8696,13 @@ pub const ProvisionedTableWriteSource = struct {
         const deadline_ns = start_ns +| replicated_apply_writer_open_timeout_ns;
         var logged_wait = false;
         while (true) {
+            if (!self.isGroupActive(group_id)) return error.UnknownGroup;
             self.preemptStartupWriteCacheForLocalMutation(group_id, table_name);
             lockAtomic(&self.local_db_mutex);
+            if (!self.isGroupActive(group_id)) {
+                self.local_db_mutex.unlock();
+                return error.UnknownGroup;
+            }
             const maybe_cached = self.leaseLiveEntryForLocalMutationLocked(cache, group_id, table_name, allow_bulk_session) catch |err| {
                 self.local_db_mutex.unlock();
                 return err;
@@ -8711,6 +8805,7 @@ pub const ProvisionedTableWriteSource = struct {
         managed_open_options: ManagedDbOpenOptions,
     ) !ProvisionedTableWriteCache.CachedDb {
         _ = alloc;
+        if (!self.isGroupActive(group_id)) return error.UnknownGroup;
         const local_persisted_metadata = if (preloaded_metadata) |metadata|
             metadata.metadata_source == .local_persisted
         else
@@ -8743,6 +8838,10 @@ pub const ProvisionedTableWriteSource = struct {
         if (mode == .status_only) {
             while (true) {
                 lockAtomic(&self.local_db_mutex);
+                if (!self.isGroupActive(group_id)) {
+                    self.local_db_mutex.unlock();
+                    return error.UnknownGroup;
+                }
                 if (finish_expired_auto_bulk_now_ns) |now_ns| {
                     _ = cache.finishExpiredAutoBulkIngestLocked(now_ns) catch |err| {
                         self.local_db_mutex.unlock();
@@ -8769,6 +8868,10 @@ pub const ProvisionedTableWriteSource = struct {
 
         while (true) {
             lockAtomic(&self.local_db_mutex);
+            if (!self.isGroupActive(group_id)) {
+                self.local_db_mutex.unlock();
+                return error.UnknownGroup;
+            }
             if (finish_expired_auto_bulk_now_ns) |now_ns| {
                 _ = cache.finishExpiredAutoBulkIngestLocked(now_ns) catch |err| {
                     self.local_db_mutex.unlock();
@@ -8826,13 +8929,17 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
 
-        lockAtomic(&cache.open_mutex);
+        cache.lockOpenMutex();
         var cache_open_locked = true;
-        defer if (cache_open_locked) cache.open_mutex.unlock();
+        defer if (cache_open_locked) cache.unlockOpenMutex();
 
         prepared_open_retry: while (true) {
             while (true) {
                 lockAtomic(&self.local_db_mutex);
+                if (!self.isGroupActive(group_id)) {
+                    self.local_db_mutex.unlock();
+                    return error.UnknownGroup;
+                }
                 const open_state = cache.getOrPrepareOpenLocked(
                     group_id,
                     lsm_root_generation,
@@ -8978,18 +9085,18 @@ pub const ProvisionedTableWriteSource = struct {
                             // coordinated slow path acquires both caches in address
                             // order, then revalidate this prepared open after the
                             // victim has synchronously released its lifetime FDs.
-                            cache.open_mutex.unlock();
+                            cache.unlockOpenMutex();
                             cache_open_locked = false;
                             const cross_cache_evicted = self.reclaimInactiveEntryAcrossWriteCachesForDescriptorPressure(
                                 cache,
                                 group_id,
                                 table_name,
                             ) catch |reclaim_err| {
-                                lockAtomic(&cache.open_mutex);
+                                cache.lockOpenMutex();
                                 cache_open_locked = true;
                                 return reclaim_err;
                             };
-                            lockAtomic(&cache.open_mutex);
+                            cache.lockOpenMutex();
                             cache_open_locked = true;
                             if (!cross_cache_evicted) return err;
                             retry_prepared_open = true;
@@ -9021,6 +9128,7 @@ pub const ProvisionedTableWriteSource = struct {
             var cached = blk: {
                 lockAtomic(&self.local_db_mutex);
                 defer self.local_db_mutex.unlock();
+                if (!self.isGroupActive(group_id)) return error.UnknownGroup;
                 try cache.reserveRetiredEntriesCapacityLocked(1);
                 const adopted = try cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
                 if (mode == .default or mode == .default_async) {
@@ -9110,6 +9218,44 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn setLocalIndexRepairDebtHook(self: *ProvisionedTableWriteSource, hook: ?LocalIndexRepairDebtHook) void {
         self.local_index_repair_debt_hook = hook;
+    }
+
+    pub fn activateGroup(self: *ProvisionedTableWriteSource, group_id: u64) !void {
+        lockAtomic(&self.group_lifecycle_mutex);
+        defer self.group_lifecycle_mutex.unlock();
+        try self.active_groups.put(std.heap.page_allocator, group_id, {});
+        self.group_lifecycle_enabled = true;
+    }
+
+    fn isGroupActive(self: *ProvisionedTableWriteSource, group_id: u64) bool {
+        lockAtomic(&self.group_lifecycle_mutex);
+        defer self.group_lifecycle_mutex.unlock();
+        return !self.group_lifecycle_enabled or self.active_groups.contains(group_id);
+    }
+
+    fn groupIsActive(ptr: *anyopaque, group_id: u64) bool {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return self.isGroupActive(group_id);
+    }
+
+    pub fn groupAdmissionSource(self: *ProvisionedTableWriteSource) table_reads.GroupAdmissionSource {
+        return .{ .ptr = self, .is_active = groupIsActive };
+    }
+
+    pub fn retireGroup(self: *ProvisionedTableWriteSource, group_id: u64) void {
+        lockAtomic(&self.group_lifecycle_mutex);
+        if (self.group_lifecycle_enabled) _ = self.active_groups.remove(group_id);
+        self.group_lifecycle_mutex.unlock();
+
+        lockAtomic(&self.local_db_mutex);
+        if (self.write_cache) |cache| cache.invalidateGroup(group_id);
+        if (self.startup_write_cache) |cache| cache.invalidateGroup(group_id);
+        self.local_db_mutex.unlock();
+
+        if (self.read_cache) |cache| cache.invalidateGroup(group_id);
+        if (self.runtime_status_cache) |cache| cache.invalidateGroup(group_id);
+        if (self.write_cache) |cache| cache.drainPendingClosesForGroup(group_id);
+        if (self.startup_write_cache) |cache| cache.drainPendingClosesForGroup(group_id);
     }
 
     fn invalidateReadCache(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -10094,6 +10240,11 @@ pub const ProvisionedTableWriteSource = struct {
             self.endGroupOperation(table_name, group_id);
             return busy_result;
         }
+        if (!self.isGroupActive(group_id)) {
+            self.local_db_mutex.unlock();
+            self.endGroupOperation(table_name, group_id);
+            return busy_result;
+        }
         var live_repair_guard: ?ProvisionedTableWriteCache.CachedDb = if (metadata.advance_index_repairs) repair_cache: {
             const cache = self.write_cache orelse break :repair_cache null;
             break :repair_cache cache.leaseLiveEntryForLocalMutationLocked(group_id, table_name, false);
@@ -10112,6 +10263,11 @@ pub const ProvisionedTableWriteSource = struct {
             self.endGroupOperation(table_name, group_id);
             if (!self.tryBeginGroupOperation(table_name, group_id)) return busy_result;
             if (!self.local_db_mutex.tryLock()) {
+                self.endGroupOperation(table_name, group_id);
+                return busy_result;
+            }
+            if (!self.isGroupActive(group_id)) {
+                self.local_db_mutex.unlock();
                 self.endGroupOperation(table_name, group_id);
                 return busy_result;
             }
@@ -12137,7 +12293,12 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: []const u8,
     ) ResidentWriterRepairState {
+        if (!self.isGroupActive(group_id)) return .absent;
         if (!self.local_db_mutex.tryLock()) return .busy;
+        if (!self.isGroupActive(group_id)) {
+            self.local_db_mutex.unlock();
+            return .absent;
+        }
         var resident: ?ProvisionedTableWriteCache.CachedDb = null;
         var foreground_blocked = false;
         if (self.write_cache) |cache| {
@@ -12242,11 +12403,16 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.local_write_owner) |owner| {
             return try leaseResidentDb(owner, alloc, table_name, group_id, lsm_root_generation, options);
         }
+        if (!self.isGroupActive(group_id)) return error.UnknownGroup;
         var read_request_active = !options.read_activity_held;
         if (read_request_active) self.beginReadRequest(table_name);
         errdefer if (read_request_active) self.endReadRequest(table_name);
 
         lockAtomic(&self.local_db_mutex);
+        if (!self.isGroupActive(group_id)) {
+            self.local_db_mutex.unlock();
+            return error.UnknownGroup;
+        }
         const resident = self.snapshotResidentDbLocked(table_name, group_id, lsm_root_generation);
         self.local_db_mutex.unlock();
 
@@ -12318,11 +12484,16 @@ pub const ProvisionedTableWriteSource = struct {
                 lsm_root_generation,
             );
         }
+        if (!self.isGroupActive(group_id)) return error.UnknownGroup;
 
         // This method is deliberately admission-free. Waiting on cache open
         // barriers is safe here because no read lease can participate in the
         // apply -> admission -> open-barrier cycle.
         lockAtomic(&self.local_db_mutex);
+        if (!self.isGroupActive(group_id)) {
+            self.local_db_mutex.unlock();
+            return error.UnknownGroup;
+        }
         var resident = self.snapshotResidentDbLocked(table_name, group_id, lsm_root_generation);
         self.local_db_mutex.unlock();
         if (resident.cached) |*cached| {
@@ -12397,11 +12568,11 @@ pub const ProvisionedTableWriteSource = struct {
         for (caches, 0..) |maybe_cache, index| {
             const cache = maybe_cache orelse continue;
             if (index != 0 and caches[0] != null and cache == caches[0].?) continue;
-            lockAtomic(&cache.open_mutex);
+            cache.lockOpenMutex();
             lockAtomic(&self.local_db_mutex);
             const observed = self.snapshotResidentDbLocked(table_name, group_id, lsm_root_generation);
             self.local_db_mutex.unlock();
-            cache.open_mutex.unlock();
+            cache.unlockOpenMutex();
             if (observed.cached != null) return observed;
         }
         return .{};
@@ -18033,8 +18204,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             }
         }
 
-        lockAtomic(&cache.write_cache.open_mutex);
-        defer cache.write_cache.open_mutex.unlock();
+        cache.write_cache.lockOpenMutex();
+        defer cache.write_cache.unlockOpenMutex();
 
         while (true) {
             lockAtomic(&cache.mutex);
@@ -32918,6 +33089,86 @@ test "provisioned transition writer fences exact supplied table metadata" {
     );
 }
 
+test "retired group rejects writer cache resurrection until reactivated" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/retired-writer-admission",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const metadata: StartupCatchUpMetadata = .{
+        .indexes_json = "{}",
+        .schema_json = "",
+        .identity_namespace = .{
+            .table_id = 7,
+            .shard_id = 7001,
+            .range_id = 7001,
+        },
+    };
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    try source.activateGroup(7001);
+    var initial = (try source.leaseCachedGroupWriterWithMetadata(
+        alloc,
+        7001,
+        "docs",
+        metadata,
+    )) orelse return error.TestUnexpectedResult;
+    initial.deinit(alloc);
+
+    source.retireGroup(7001);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
+    try std.testing.expectError(
+        error.UnknownGroup,
+        source.leaseCachedGroupWriterWithMetadata(
+            alloc,
+            7001,
+            "docs",
+            metadata,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+
+    try source.activateGroup(7001);
+    var reactivated = (try source.leaseCachedGroupWriterWithMetadata(
+        alloc,
+        7001,
+        "docs",
+        metadata,
+    )) orelse return error.TestUnexpectedResult;
+    defer reactivated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+}
+
 test "provisioned transition identity reassignment opens only the same table" {
     const alloc = std.testing.allocator;
 
@@ -42151,8 +42402,25 @@ test "write cache invalidation retires leased entry until release" {
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), write_cache.retired_entries.items.len);
 
+    const OpenLockHolder = struct {
+        cache: *ProvisionedTableWriteCache,
+        locked: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.cache.lockOpenMutex();
+            self.locked.store(true, .release);
+            sleepNs(20 * std.time.ns_per_ms);
+            self.cache.unlockOpenMutex();
+        }
+    };
+
+    var holder = OpenLockHolder{ .cache = &write_cache };
+    const holder_thread = try std.Thread.spawn(.{}, OpenLockHolder.run, .{&holder});
+    while (!holder.locked.load(.acquire)) sleepNs(std.time.ns_per_ms);
     cached.deinit(alloc);
+    holder_thread.join();
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
 }
 
 test "write cache blocks same-root generation replacement while stale lease stays live" {
@@ -46027,9 +46295,9 @@ test "resident DB retry preparation waits outside admission for writer publicati
         }
     };
 
-    lockAtomic(&startup_cache.open_mutex);
+    startup_cache.lockOpenMutex();
     var open_locked = true;
-    defer if (open_locked) startup_cache.open_mutex.unlock();
+    defer if (open_locked) startup_cache.unlockOpenMutex();
 
     var context = Context{ .source = &source };
     const thread = try std.Thread.spawn(.{}, Context.run, .{&context});
@@ -46053,7 +46321,7 @@ test "resident DB retry preparation waits outside admission for writer publicati
         return err;
     };
     source.local_db_mutex.unlock();
-    startup_cache.open_mutex.unlock();
+    startup_cache.unlockOpenMutex();
     open_locked = false;
 
     thread.join();
@@ -46087,8 +46355,8 @@ test "admitted resident DB lease never waits for an in-flight writer publication
     defer read_activity.deinit();
     try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
 
-    lockAtomic(&startup_cache.open_mutex);
-    defer startup_cache.open_mutex.unlock();
+    startup_cache.lockOpenMutex();
+    defer startup_cache.unlockOpenMutex();
     try std.testing.expectError(
         error.ResidentDbRetryRequired,
         source.residentDbSource().leaseGroup(

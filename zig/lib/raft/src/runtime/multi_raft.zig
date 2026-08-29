@@ -465,6 +465,12 @@ pub const MultiRaft = struct {
         };
         try self.scheduler.registerGroup(cfg.group_id);
         errdefer _ = self.scheduler.unregisterGroup(cfg.group_id);
+        var activated_state_machine: ?storage_iface.StateMachine = null;
+        errdefer if (activated_state_machine) |state_machine| state_machine.retireGroup(cfg.group_id);
+        if (self.hooks.state_machine) |state_machine| {
+            try state_machine.activateGroup(cfg.group_id);
+            activated_state_machine = state_machine;
+        }
         if (self.hooks.transport) |transport| {
             try transport.serveGroup(cfg.group_id, self.transportReceiver());
             self.metrics.transport_group_serves += 1;

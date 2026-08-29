@@ -266,6 +266,10 @@ pub const StateMachine = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        activate_group: ?*const fn (
+            ptr: *anyopaque,
+            group_id: core.types.GroupId,
+        ) anyerror!void = null,
         prepare_snapshot: ?*const fn (
             ptr: *anyopaque,
             group_id: core.types.GroupId,
@@ -288,6 +292,11 @@ pub const StateMachine = struct {
             group_id: core.types.GroupId,
         ) void = null,
     };
+
+    pub fn activateGroup(self: StateMachine, group_id: core.types.GroupId) !void {
+        const activate = self.vtable.activate_group orelse return;
+        try activate(self.ptr, group_id);
+    }
 
     pub fn prepareSnapshot(
         self: StateMachine,

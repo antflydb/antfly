@@ -27,12 +27,18 @@ pub const DataStateMachine = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .activate_group = activateGroup,
                 .prepare_snapshot = prepareSnapshot,
                 .build_snapshot = buildSnapshot,
                 .apply_ready = applyReady,
                 .retire_group = retireGroup,
             },
         };
+    }
+
+    fn activateGroup(ptr: *anyopaque, group_id: raft_engine.core.types.GroupId) !void {
+        const self: *DataStateMachine = @ptrCast(@alignCast(ptr));
+        if (self.delegate) |delegate| try delegate.activateGroup(group_id);
     }
 
     fn prepareSnapshot(

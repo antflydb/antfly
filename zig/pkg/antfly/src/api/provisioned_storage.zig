@@ -323,6 +323,7 @@ pub const ProvisionedGroupStorage = struct {
     /// alive. Call this after attached write sources are quiescent and before
     /// either the sources or this storage are destroyed.
     pub fn detachWriteSourceRuntimeHooks(self: *ProvisionedGroupStorage) void {
+        self.read_cache.group_admission = null;
         self.startup_write_cache.detachRuntimeHooks();
         self.write_cache.detachRuntimeHooks();
         self.startup_write_cache.table_eviction_hook = null;
@@ -385,6 +386,7 @@ pub const ProvisionedGroupStorage = struct {
         _ = read_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
         read_source.resident_db = write_source.residentDbSource();
         write_source.read_cache = &self.read_cache;
+        self.read_cache.group_admission = write_source.groupAdmissionSource();
         write_source.bindWriteCachesWithStateMutex(
             &self.write_cache,
             &self.startup_write_cache,
