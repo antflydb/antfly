@@ -4099,6 +4099,8 @@ pub fn build(b: *std.Build) void {
             "host records backup restore bootstrap failure when no handler is available",
             "file replica catalog persists backup restore bootstrap records across reopen",
             "replica catalog rejects invalid backup restore authority and integrity bindings",
+            "restore binding pins the authenticated native generation manifest",
+            "prepared native restore repair reuses target backend admission",
             "backup restore bootstrap deduplicates exact content across source aliases while a reader is resident",
         },
         .test_runner = .{
@@ -6328,6 +6330,9 @@ pub fn build(b: *std.Build) void {
             "provisioned writer cache starts DB workers after stable entry installation",
             "table write source restore acquires lifecycle unless caller reserves it",
             "provisioned native backup restore repeats through shared read and write owners",
+            "native backup reclaims crash-left snapshot attempts from durable markers",
+            "native backup reclaims a crash marker before snapshot root creation",
+            "native backup never reclaims an old attempt with a live lease",
             "provisioned create succeeds when post-commit runtime status is fenced",
             "provisioned create reuses a generation opened by startup reconciliation",
             "provisioned owner clone snapshot preserves retired runtime counters",
@@ -6460,6 +6465,7 @@ pub fn build(b: *std.Build) void {
             "prepared first generation reconciliation removes an unvalidated candidate",
             "committed generation reconciliation preserves the validated candidate",
             "generation publication marker parsing preserves allocator exhaustion",
+            "manual generation runtime uses an explicit filesystem io authority",
         },
     });
     const run_api_table_writes_production_regression_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
@@ -6471,8 +6477,24 @@ pub fn build(b: *std.Build) void {
     run_api_table_writes_production_regression_unit_tests.step.dependOn(&run_public_api_parity_aggregate_tests.step);
     const api_table_writes_production_regression_step = b.step("api-table-writes-production-regression-test", "Run focused restore and writer-cache lifecycle regressions");
     api_table_writes_production_regression_step.dependOn(&run_api_table_writes_production_regression_tests.step);
-    const api_table_writes_restore_repeat_step = b.step("api-table-writes-restore-repeat-test", "Run the focused shared-owner native restore regression");
-    api_table_writes_restore_repeat_step.dependOn(&run_api_table_writes_production_regression_tests.step);
+    const api_table_writes_restore_repeat_tests = b.addTest(.{
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{
+            "provisioned native backup restore repeats through shared read and write owners",
+            "provisioned table restore retry repairs exact incomplete restore state through active writer",
+            "managed native restore repair retains target backend admission for staged open",
+            "native backup reclaims crash-left snapshot attempts from durable markers",
+            "native backup reclaims a crash marker before snapshot root creation",
+            "native backup never reclaims an old attempt with a live lease",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_api_table_writes_restore_repeat_tests = addFilteredTestRunArtifact(b, api_table_writes_restore_repeat_tests);
+    const api_table_writes_restore_repeat_step = b.step("api-table-writes-restore-repeat-test", "Run focused native restore identity and shared-owner regressions");
+    api_table_writes_restore_repeat_step.dependOn(&run_api_table_writes_restore_repeat_tests.step);
     const api_table_writes_cache_lifecycle_step = b.step("api-table-writes-cache-lifecycle-test", "Run focused writer-cache dirty ownership regressions");
     api_table_writes_cache_lifecycle_step.dependOn(&run_api_table_writes_production_regression_tests.step);
     const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read tests");
@@ -6576,6 +6598,8 @@ pub fn build(b: *std.Build) void {
             "cluster backup manifest rejects incomplete coverage",
             "restore source identities are bounded and canonical",
             "portable backup integrity rejects changed staged bytes",
+            "native artifact copy observes cancellation between io chunks",
+            "native backup directory copy preserves nested files",
             "db explicit restore runtime repair repairs managed chunked dense embeddings once for restored shard",
             "db incomplete deferred restore import recovers before runtime repair",
             "db restore state uses strict structured content identity markers",
@@ -7779,10 +7803,14 @@ pub fn build(b: *std.Build) void {
 
     const db_restore_managed_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{"db restore snapshot replays managed chunked dense embeddings"},
+        .filters = &.{
+            "db restore snapshot replays managed chunked dense embeddings",
+            "native restore backend configuration is resolved exactly once",
+            "native restore filesystem publication rejects non-publishable storage capabilities",
+        },
     });
     const run_db_restore_managed_tests = addFilteredTestRunArtifact(b, db_restore_managed_tests);
-    const db_restore_managed_step = b.step("db-restore-managed-test", "Run the focused managed chunked dense restore DB test");
+    const db_restore_managed_step = b.step("db-restore-managed-test", "Run focused managed native restore DB tests");
     db_restore_managed_step.dependOn(&run_db_restore_managed_tests.step);
 
     const provisioned_write_cache_failed_close_tests = b.addTest(.{
@@ -7925,6 +7953,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.graph_state_name.",
             "storage.db.lease.",
             "storage.db.mod.",
+            "storage.db.native_backup.",
             "storage.db.ownership.",
             "storage.db.planning_stats.",
             "storage.db.promotion_runtime.",
@@ -7933,6 +7962,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.resolution_handoff.",
             "storage.db.resolution_runtime.",
             "storage.db.root_identity.",
+            "storage.db.snapshot_admission.",
             "storage.db.template_remote_stub.",
             "storage.db.template_stub.",
             "storage.db.transform.",

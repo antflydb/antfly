@@ -2596,17 +2596,25 @@ def stateful_api(request: pytest.FixtureRequest):
             return self.post(f"/tables/{table_name}/merge", payload)
 
         def backup_table(
-            self, table_name: str, *, backup_id: str, location: str
+            self,
+            table_name: str,
+            *,
+            backup_id: str,
+            location: str,
+            backup_format: str | None = None,
         ) -> dict:
             try:
+                payload: dict[str, object] = {
+                    "backup_id": backup_id,
+                    "location": location,
+                    "connection": E2E_BACKUP_CONNECTION,
+                }
+                if backup_format is not None:
+                    payload["format"] = backup_format
                 with self._request_lock:
                     response = self.s.post(
                         f"{self.url}/tables/{table_name}/backup",
-                        json={
-                            "backup_id": backup_id,
-                            "location": location,
-                            "connection": E2E_BACKUP_CONNECTION,
-                        },
+                        json=payload,
                         timeout=120,
                     )
                 return self._check(response)
@@ -3213,17 +3221,25 @@ def backup_api(request: pytest.FixtureRequest):
             return self.delete(f"/tables/{table_name}/indexes/{index_name}")
 
         def backup_table(
-            self, table_name: str, *, backup_id: str, location: str
+            self,
+            table_name: str,
+            *,
+            backup_id: str,
+            location: str,
+            backup_format: str | None = None,
         ) -> dict:
             try:
+                payload: dict[str, object] = {
+                    "backup_id": backup_id,
+                    "location": location,
+                    "connection": E2E_BACKUP_CONNECTION,
+                }
+                if backup_format is not None:
+                    payload["format"] = backup_format
                 with self._request_lock:
                     response = self.s.post(
                         f"{self.url}/tables/{table_name}/backup",
-                        json={
-                            "backup_id": backup_id,
-                            "location": location,
-                            "connection": E2E_BACKUP_CONNECTION,
-                        },
+                        json=payload,
                         timeout=120,
                     )
                 return self._check(response)

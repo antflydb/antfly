@@ -107,6 +107,8 @@ const RestoreIntentSource = struct {
     connection: []const u8 = "",
     artifact_size_bytes: u64 = 0,
     artifact_sha256: []const u8 = "",
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
 };
 
 pub fn groupDbPathFromReplicaRoot(alloc: std.mem.Allocator, replica_root_dir: []const u8, group_id: u64) ![]u8 {
@@ -172,6 +174,8 @@ pub fn provisioningFingerprint(
         hashBytes(&hasher, range.restore_connection);
         hasher.update(std.mem.asBytes(&range.restore_artifact_size_bytes));
         hashBytes(&hasher, range.restore_artifact_sha256);
+        hasher.update(std.mem.asBytes(&range.restore_native_manifest_size_bytes));
+        hashBytes(&hasher, range.restore_native_manifest_sha256);
         hasher.update(&range.completed_restore_fingerprint);
         hasher.update(std.mem.asBytes(&table.table_id));
         hashBytes(&hasher, table.name);
@@ -220,16 +224,23 @@ pub fn reconcileReplicaRootWithOptions(
         const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(path);
 
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        try fs_paths.createDirPathPortable(io_impl.io(), path);
-        try applyRestoreIntentIfNeededWithOptions(
+        var io_impl: ?std.Io.Threaded = null;
+        defer if (io_impl) |*owned| owned.deinit();
+        const io = if (options.backend_runtime) |runtime|
+            runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable
+        else blk: {
+            io_impl = std.Io.Threaded.init(alloc, .{});
+            break :blk io_impl.?.io();
+        };
+        try fs_paths.createDirPathPortable(io, path);
+        try applyRestoreIntentIfNeededWithRuntime(
             alloc,
             path,
             group_id,
             table,
             range,
             options.restore_open_options,
+            options.backend_runtime,
         );
 
         const runtime_schema = try runtimeTableSchemaFromJson(alloc, table.schema_json);
@@ -801,6 +812,8 @@ fn collectLocalRestoreProgressWithIo(
         if (!std.mem.eql(u8, state.backup_id, restore.backup_id)) continue;
         if (!std.mem.eql(u8, state.location, restore.location)) continue;
         if (!std.mem.eql(u8, state.artifact_sha256, restore.artifact_sha256)) continue;
+        if (state.native_manifest_size_bytes != restore.native_manifest_size_bytes) continue;
+        if (!std.mem.eql(u8, state.native_manifest_sha256, restore.native_manifest_sha256)) continue;
         if (restore.snapshot_path.len > 0 and !std.mem.eql(u8, state.snapshot_path, restore.snapshot_path)) continue;
         if (state.group_id != group_id) continue;
 
@@ -820,6 +833,8 @@ fn collectLocalRestoreProgressWithIo(
                 .location = progress_location,
                 .snapshot_path = &.{},
                 .artifact_sha256 = &.{},
+                .native_manifest_size_bytes = state.native_manifest_size_bytes,
+                .native_manifest_sha256 = &.{},
                 .primary_restored = state.primary_restored,
                 .runtime_repair_complete = state.runtime_repair_complete,
                 .phase = &.{},
@@ -831,6 +846,7 @@ fn collectLocalRestoreProgressWithIo(
         errdefer if (!appended) table_manager.freeRestoreProgress(alloc, record);
         record.snapshot_path = try alloc.dupe(u8, state.snapshot_path);
         record.artifact_sha256 = try alloc.dupe(u8, state.artifact_sha256);
+        record.native_manifest_sha256 = try alloc.dupe(u8, state.native_manifest_sha256);
         record.phase = try alloc.dupe(u8, state.phase);
         record.last_error = try alloc.dupe(u8, state.last_error);
         try out.append(alloc, record);
@@ -865,6 +881,26 @@ pub fn applyRestoreIntentIfNeededWithOptions(
     range: table_manager.RangeRecord,
     open_options: backups_api.OpenOptions,
 ) !void {
+    return try applyRestoreIntentIfNeededWithRuntime(
+        alloc,
+        path,
+        group_id,
+        table,
+        range,
+        open_options,
+        null,
+    );
+}
+
+pub fn applyRestoreIntentIfNeededWithRuntime(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    table: table_manager.TableRecord,
+    range: table_manager.RangeRecord,
+    open_options: backups_api.OpenOptions,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+) !void {
     const restore = resolveRestoreIntent(range, table) orelse return;
     try backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, .{
         .backup_id = restore.backup_id,
@@ -874,7 +910,10 @@ pub fn applyRestoreIntentIfNeededWithOptions(
         .authority = .{ .external = restore.connection },
         .expected_artifact_size_bytes = restore.artifact_size_bytes,
         .expected_artifact_sha256 = restore.artifact_sha256,
+        .expected_native_manifest_size_bytes = restore.native_manifest_size_bytes,
+        .expected_native_manifest_sha256 = restore.native_manifest_sha256,
         .open_options = open_options,
+        .backend_runtime = backend_runtime,
     }, .{
         .expected_table_name = table.name,
         .expected_identity_namespace = doc_identity.Namespace{
@@ -904,6 +943,8 @@ fn resolveRestoreIntent(
             .connection = range.restore_connection,
             .artifact_size_bytes = range.restore_artifact_size_bytes,
             .artifact_sha256 = range.restore_artifact_sha256,
+            .native_manifest_size_bytes = range.restore_native_manifest_size_bytes,
+            .native_manifest_sha256 = range.restore_native_manifest_sha256,
         };
     }
     _ = table;

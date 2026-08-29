@@ -25,6 +25,7 @@ const Io = std.Io;
 const AtomicU64 = platform.atomic.Value(u64);
 const fs_paths = @import("../../common/fs_paths.zig");
 const common_secrets = @import("../../common/secrets.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const backend_types = @import("../backend_types.zig");
 const docstore_mod = @import("../docstore.zig");
 const segment_mod = @import("../../segment.zig");
@@ -34,7 +35,9 @@ const generation_lifecycle = @import("generation_lifecycle.zig");
 const graph_asset_state = @import("graph_asset_state.zig");
 const graph_edge_contender = @import("graph_edge_contender.zig");
 const graph_state_name = @import("graph_state_name.zig");
+const native_backup = @import("native_backup.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
+const snapshot_admission_mod = @import("snapshot_admission.zig");
 const db_core = @import("core.zig");
 const internal_keys = @import("../internal_keys.zig");
 const hierarchy_navigation = @import("../hierarchy_navigation.zig");
@@ -69,6 +72,7 @@ const json_helpers = @import("../../api/json_helpers.zig");
 test {
     _ = index_repair_state;
     _ = index_generation_manifest;
+    _ = native_backup;
     _ = root_identity;
 }
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -368,6 +372,14 @@ test "document extraction templated inline source size is rejected before persis
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, doc_key));
 }
 
+const BackendConfigurationResolution = struct {
+    path_fingerprint: u64,
+};
+
+fn backendConfigurationPathFingerprint(path: []const u8) u64 {
+    return std.hash.Wyhash.hash(0x9e3779b97f4a7c15, path);
+}
+
 pub const OpenOptions = struct {
     pub const PhysicalRootMode = enum {
         /// The DB path names a directory-backed physical root. DB owns its
@@ -428,6 +440,10 @@ pub const OpenOptions = struct {
     prefer_existing_identity_namespace: bool = false,
     executor: derived_executor_mod.Config = .{},
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
+    /// Private proof installed only by a validated `NativeRestoreOpenPlan`.
+    /// A path-bound proof prevents a copied option set from silently skipping
+    /// configuration for a different DB namespace.
+    _backend_configuration_resolution: ?BackendConfigurationResolution = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     start_index_workers: bool = true,
@@ -488,6 +504,57 @@ pub const OpenOptions = struct {
     /// client-write guard. A standby gate also suppresses mutating background
     /// runtimes at open, even if the generic runtime defaults are enabled.
     ha_write_gate: ?HAWriteGate = null,
+};
+
+/// Immutable backend decision shared by every phase of one native restore.
+/// The runtime configurator is evaluated once against the final logical DB
+/// identity; candidate opens receive an explicit path-bound proof and never
+/// invoke it again.
+pub const NativeRestoreOpenPlan = struct {
+    _options: OpenOptions,
+    _target_path_fingerprint: u64,
+
+    fn resolvedOptionsForPath(self: @This(), path: []const u8) OpenOptions {
+        var opts = self._options;
+        opts._backend_configuration_resolution = .{
+            .path_fingerprint = backendConfigurationPathFingerprint(path),
+        };
+        return opts;
+    }
+
+    pub fn optionsForTarget(self: @This(), target_path: []const u8) !OpenOptions {
+        if (backendConfigurationPathFingerprint(target_path) != self._target_path_fingerprint)
+            return error.NativeRestoreTargetPathMismatch;
+        var opts = self.resolvedOptionsForPath(target_path);
+        // A configurator is not allowed to retain or manufacture lifecycle
+        // authority. Target opens always acquire the published-generation read
+        // lease for themselves.
+        opts.staged_generation = null;
+        return opts;
+    }
+
+    /// Reuses the target's path-independent backend policy only for the
+    /// lifecycle-owned candidate attached to that exact target. Callers cannot
+    /// mint configuration proofs for unrelated paths.
+    pub fn optionsForStagedGeneration(
+        self: @This(),
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+    ) !OpenOptions {
+        const live_path = staged_generation.livePath();
+        if (backendConfigurationPathFingerprint(live_path) != self._target_path_fingerprint)
+            return error.NativeRestoreTargetPathMismatch;
+        try staged_generation.validateLivePath(live_path);
+        var opts = self.resolvedOptionsForPath(staged_generation.path());
+        // Keep the lifecycle capability attached until DB.open. Validation at
+        // option construction alone is racy: the stage may be closed or
+        // superseded before the candidate is actually opened.
+        opts.staged_generation = staged_generation;
+        return opts;
+    }
+
+    pub fn physicalRootMode(self: @This()) OpenOptions.PhysicalRootMode {
+        return self._options.physical_root_mode;
+    }
 };
 
 pub const OpenMode = OpenOptions.OpenMode;
@@ -1175,6 +1242,7 @@ const AsyncContext = struct {
     index_repair_checkpoint: ?index_repair_state.Location = null,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
     repair_replay_mutex: ?*std.atomic.Mutex = null,
     repair_sequence: u64 = 0,
     repair_issue_counter: ?*AtomicU64 = null,
@@ -1742,6 +1810,8 @@ const EnrichmentAppendContext = struct {
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
+    snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
     repair_replay_mutex: ?*std.atomic.Mutex = null,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
@@ -1767,6 +1837,8 @@ const EnrichmentAppendContext = struct {
             .replay_source = self.replay_source,
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
+            .snapshot_admission = self.snapshot_admission,
+            .snapshot_replay_admission = self.snapshot_replay_admission,
             .repair_replay_mutex = self.repair_replay_mutex,
             .log_mutex = self.log_mutex,
             .identity_namespace = doc_identity.default_namespace,
@@ -1808,6 +1880,8 @@ const BatchExecutionContext = struct {
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
+    snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
     repair_replay_mutex: ?*std.atomic.Mutex = null,
     log_mutex: *std.atomic.Mutex,
     identity_namespace: doc_identity.Namespace,
@@ -2780,11 +2854,12 @@ fn loadOrCreateDurableRootIdentity(
     path: []const u8,
 ) !root_identity.State {
     if (backend_runtime) |runtime| {
-        if (runtime.io()) |io| return try root_identity.loadOrCreate(alloc, io, path);
+        const io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        return try root_identity.loadOrCreate(alloc, io, path);
     }
-    // Manual executors intentionally have no shared I/O lane. Keep the
-    // fallback at this operation boundary so every identity helper still uses
-    // one caller-owned Io rather than constructing its own executor.
+    // Legacy callers may omit a runtime entirely. Keep their fallback at this
+    // operation boundary; a supplied runtime must carry its own filesystem
+    // authority so storage work never creates a hidden executor.
     var io_impl = threadedIo();
     defer io_impl.deinit();
     return try root_identity.loadOrCreate(alloc, io_impl.io(), path);
@@ -2821,6 +2896,8 @@ pub const RestoreState = struct {
     backup_id: []u8,
     location: []u8,
     artifact_sha256: []u8,
+    native_manifest_size_bytes: u64,
+    native_manifest_sha256: []u8,
     snapshot_path: []u8,
     group_id: u64,
     phase: []u8,
@@ -2833,6 +2910,7 @@ pub const RestoreState = struct {
         alloc.free(self.backup_id);
         alloc.free(self.location);
         alloc.free(self.artifact_sha256);
+        alloc.free(self.native_manifest_sha256);
         alloc.free(self.snapshot_path);
         alloc.free(self.phase);
         alloc.free(self.graph_ownership_cursor);
@@ -2845,6 +2923,8 @@ pub const RestoreIdentity = struct {
     backup_id: []const u8,
     location: []const u8,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
     snapshot_path: []const u8,
     group_id: u64,
 };
@@ -2857,6 +2937,8 @@ const RestoreStateDisk = struct {
     backup_id: []const u8,
     location: []const u8,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
     snapshot_path: []const u8,
     group_id: u64,
     phase: []const u8,
@@ -2872,6 +2954,8 @@ const RestoreImportDisk = struct {
     backup_id: []const u8,
     location: []const u8,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
     snapshot_path: []const u8,
     group_id: u64,
 };
@@ -2881,6 +2965,8 @@ fn restoreStateAlloc(
     backup_id: []const u8,
     location: []const u8,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64,
+    native_manifest_sha256: []const u8,
     snapshot_path: []const u8,
     group_id: u64,
     phase: []const u8,
@@ -2895,6 +2981,8 @@ fn restoreStateAlloc(
     errdefer alloc.free(location_owned);
     const artifact_sha256_owned = try alloc.dupe(u8, artifact_sha256);
     errdefer alloc.free(artifact_sha256_owned);
+    const native_manifest_sha256_owned = try alloc.dupe(u8, native_manifest_sha256);
+    errdefer alloc.free(native_manifest_sha256_owned);
     const snapshot_path_owned = try alloc.dupe(u8, snapshot_path);
     errdefer alloc.free(snapshot_path_owned);
     const phase_owned = try alloc.dupe(u8, phase);
@@ -2908,6 +2996,8 @@ fn restoreStateAlloc(
         .backup_id = backup_id_owned,
         .location = location_owned,
         .artifact_sha256 = artifact_sha256_owned,
+        .native_manifest_size_bytes = native_manifest_size_bytes,
+        .native_manifest_sha256 = native_manifest_sha256_owned,
         .snapshot_path = snapshot_path_owned,
         .group_id = group_id,
         .phase = phase_owned,
@@ -2949,6 +3039,8 @@ fn validRestoreIdentity(identity: RestoreIdentity) bool {
     return identity.backup_id.len > 0 and
         identity.location.len > 0 and
         validRestoreArtifactSha256(identity.artifact_sha256) and
+        ((identity.native_manifest_size_bytes == 0 and identity.native_manifest_sha256.len == 0) or
+            (identity.native_manifest_size_bytes > 0 and validRestoreArtifactSha256(identity.native_manifest_sha256))) and
         identity.snapshot_path.len > 0 and
         identity.group_id != 0;
 }
@@ -3010,6 +3102,8 @@ fn readRestoreStateForPathAllocWithIo(alloc: Allocator, io: Io, path: []const u8
         disk.backup_id.len == 0 or
         disk.location.len == 0 or
         !validRestoreArtifactSha256(disk.artifact_sha256) or
+        ((disk.native_manifest_size_bytes == 0) != (disk.native_manifest_sha256.len == 0)) or
+        (disk.native_manifest_sha256.len > 0 and !validRestoreArtifactSha256(disk.native_manifest_sha256)) or
         disk.snapshot_path.len == 0 or
         disk.group_id == 0 or
         disk.phase.len == 0 or
@@ -3022,6 +3116,8 @@ fn readRestoreStateForPathAllocWithIo(alloc: Allocator, io: Io, path: []const u8
         disk.backup_id,
         disk.location,
         disk.artifact_sha256,
+        disk.native_manifest_size_bytes,
+        disk.native_manifest_sha256,
         disk.snapshot_path,
         disk.group_id,
         disk.phase,
@@ -3043,6 +3139,8 @@ fn writeRestoreStateForPathWithIo(alloc: Allocator, io: Io, path: []const u8, st
         .backup_id = state.backup_id,
         .location = state.location,
         .artifact_sha256 = state.artifact_sha256,
+        .native_manifest_size_bytes = state.native_manifest_size_bytes,
+        .native_manifest_sha256 = state.native_manifest_sha256,
         .snapshot_path = state.snapshot_path,
         .group_id = state.group_id,
     }) or state.phase.len == 0) return error.InvalidRestoreState;
@@ -3053,6 +3151,8 @@ fn writeRestoreStateForPathWithIo(alloc: Allocator, io: Io, path: []const u8, st
         .backup_id = state.backup_id,
         .location = state.location,
         .artifact_sha256 = state.artifact_sha256,
+        .native_manifest_size_bytes = state.native_manifest_size_bytes,
+        .native_manifest_sha256 = state.native_manifest_sha256,
         .snapshot_path = state.snapshot_path,
         .group_id = state.group_id,
         .phase = state.phase,
@@ -3089,6 +3189,8 @@ fn readRestoreImportStateAllocWithIo(alloc: Allocator, io: Io, path: []const u8)
         disk.backup_id.len == 0 or
         disk.location.len == 0 or
         !validRestoreArtifactSha256(disk.artifact_sha256) or
+        ((disk.native_manifest_size_bytes == 0) != (disk.native_manifest_sha256.len == 0)) or
+        (disk.native_manifest_sha256.len > 0 and !validRestoreArtifactSha256(disk.native_manifest_sha256)) or
         disk.snapshot_path.len == 0 or
         disk.group_id == 0)
     {
@@ -3101,6 +3203,8 @@ fn readRestoreImportStateAllocWithIo(alloc: Allocator, io: Io, path: []const u8)
         disk.backup_id,
         disk.location,
         disk.artifact_sha256,
+        disk.native_manifest_size_bytes,
+        disk.native_manifest_sha256,
         disk.snapshot_path,
         disk.group_id,
         "runtime_repair",
@@ -3193,6 +3297,27 @@ fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
         const sleep_ns = @min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000));
         sleepNs(sleep_ns);
     }
+}
+
+fn ensureSnapshotActive(cancellation: types.CancellationToken) !void {
+    if (cancellation.isCancelled()) return error.Canceled;
+}
+
+fn lockAtomicWithCancellation(mutex: *std.atomic.Mutex, cancellation: types.CancellationToken) !void {
+    var attempts: usize = 0;
+    while (!mutex.tryLock()) : (attempts += 1) {
+        try ensureSnapshotActive(cancellation);
+        if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
+            std.atomic.spinLoopHint();
+        } else if (attempts < 128) {
+            std.Thread.yield() catch {};
+        } else {
+            const backoff_step = @min(attempts - 128, 5);
+            sleepNs(@min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000)));
+        }
+    }
+    errdefer mutex.unlock();
+    try ensureSnapshotActive(cancellation);
 }
 
 fn splitBootstrapMarkersEqual(a: range_state_mod.SplitBootstrapMarker, b: range_state_mod.SplitBootstrapMarker) bool {
@@ -3668,6 +3793,7 @@ pub const DB = struct {
     open_mode: OpenOptions.OpenMode,
     primary_backend: PrimaryBackend,
     primary_lsm_storage: ?lsm_backend_mod.Storage,
+    physical_root_mode: OpenOptions.PhysicalRootMode,
     index_backends: db_config.IndexBackendOptions,
     core: db_core.DBCore,
     /// Durable identity of the physical DB root. Unlike `core.root_generation`,
@@ -3748,6 +3874,7 @@ pub const DB = struct {
     managed_admission_materialization_completed: std.atomic.Value(u64) = .init(0),
     managed_admission_materialization_mutex: std.atomic.Mutex = .unlocked,
     index_structural_mutation_mutex: std.atomic.Mutex = .unlocked,
+    snapshot_publication_mutex: std.atomic.Mutex = .unlocked,
     index_repair_mutex: std.atomic.Mutex = .unlocked,
     generation_replace_mutex: std.atomic.Mutex = .unlocked,
     active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
@@ -3816,6 +3943,8 @@ pub const DB = struct {
             .replay_source = resources.replay_source,
             .index_manager = resources.index_manager,
             .apply_mutex = resources.apply_mutex,
+            .snapshot_admission = resources.snapshot_admission,
+            .snapshot_replay_admission = resources.snapshot_replay_admission,
             .repair_replay_mutex = resources.repair_replay_mutex,
             .log_mutex = resources.log_mutex,
             .identity_namespace = resources.identity_namespace,
@@ -3861,6 +3990,16 @@ pub const DB = struct {
     fn acquireHAMutationShared(self: *const DB) ?HAMutationBarrier.SharedLease {
         const barrier = self.haMutationBarrier() orelse return null;
         return barrier.acquireShared();
+    }
+
+    fn acquireSnapshotReplayMutation(self: *DB) !snapshot_admission_mod.SnapshotAdmission.MutationLease {
+        if (self.backend_runtime.filesystemIo()) |io| {
+            return try self.core.snapshot_replay_admission.acquireMutationIo(
+                io,
+                @as(?types.CancellationToken, null),
+            );
+        }
+        return self.core.snapshot_replay_admission.acquireMutation();
     }
 
     fn mirrorHAReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
@@ -3981,23 +4120,42 @@ pub const DB = struct {
             // options until a runtime has adopted them so partial opens have
             // exactly one cleanup owner.
             errdefer if (opts.enrichment) |*cfg| deinitOwnedEnrichmentConfig(alloc, cfg);
-            if (opts.backend_runtime) |runtime| {
-                if (runtime.db_open_configurator) |configurator| {
-                    try configurator.configure(path, &opts);
+            if (opts._backend_configuration_resolution) |resolution| {
+                if (resolution.path_fingerprint != backendConfigurationPathFingerprint(path))
+                    return error.BackendConfigurationPathMismatch;
+            } else {
+                if (opts.backend_runtime) |runtime| {
+                    if (runtime.db_open_configurator) |configurator| {
+                        try configurator.configure(path, &opts);
+                    }
                 }
             }
+            const runtime_alloc = backgroundRuntimeAllocator(alloc);
+            var owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;
+            errdefer if (owned_backend_runtime) |*handle| handle.deinit();
+            const backend_runtime = opts.backend_runtime orelse blk_runtime: {
+                if (opts.executor.backend == .manual and
+                    opts.physical_root_mode == .filesystem_managed)
+                {
+                    owned_backend_runtime = try background_runtime_mod.BackendRuntimeHandle.initManualWithOwnedFilesystemIo(runtime_alloc);
+                } else {
+                    owned_backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(runtime_alloc, .{
+                        .backend = opts.executor.backend,
+                    });
+                }
+                break :blk_runtime owned_backend_runtime.?.runtime;
+            };
             var generation_read_lease = if (opts.staged_generation) |staged_generation| staged_blk: {
                 try staged_generation.validatePath(path);
                 break :staged_blk null;
             } else if (opts.physical_root_mode == .external_backend)
                 null
             else
-                try generation_lifecycle.acquirePublishedGenerationReadWithRuntime(alloc, path, opts.backend_runtime);
+                try generation_lifecycle.acquirePublishedGenerationReadWithRuntime(alloc, path, backend_runtime);
             errdefer if (generation_read_lease) |*lease| lease.deinit();
             const open_started_ns = monotonicTimeNs();
             const ha_write_gate = if (opts.ha_write_gate) |gate| gate.pinned() else null;
             var profile = OpenProfile{};
-            const runtime_alloc = backgroundRuntimeAllocator(alloc);
             var owned_resource_manager: ?*resource_manager_mod.ResourceManager = null;
             const bind_cache_resource_manager = opts.resource_manager != null;
             if (opts.resource_manager == null) {
@@ -4011,19 +4169,11 @@ pub const DB = struct {
                 alloc.destroy(manager);
             };
             var owned_async_context: ?*AsyncContext = null;
-            var owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;
             var owned_executor: ?*derived_executor_mod.Executor = null;
             errdefer {
                 if (owned_executor) |ptr| runtime_alloc.destroy(ptr);
-                if (owned_backend_runtime) |*handle| handle.deinit();
                 if (owned_async_context) |ptr| runtime_alloc.destroy(ptr);
             }
-            const backend_runtime = opts.backend_runtime orelse blk_runtime: {
-                owned_backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(runtime_alloc, .{
-                    .backend = opts.executor.backend,
-                });
-                break :blk_runtime owned_backend_runtime.?.runtime;
-            };
             var effective_executor = opts.executor;
             if (backend_runtime.io_impl == null and effective_executor.backend == .io_threaded) {
                 effective_executor.backend = .manual;
@@ -4130,6 +4280,7 @@ pub const DB = struct {
                 .open_mode = opts.open_mode,
                 .primary_backend = stored_primary_backend,
                 .primary_lsm_storage = resolved_config.primary_lsm_storage,
+                .physical_root_mode = opts.physical_root_mode,
                 .index_backends = resolved_config.index_backends,
                 .core = db_core.DBCore.fromOpened(alloc, core),
                 .async_context = async_context,
@@ -4330,6 +4481,66 @@ pub const DB = struct {
         };
     }
 
+    /// Resolves the exact storage configuration used by native restore before
+    /// any corpus bytes are fetched. The returned options are safe to pass to
+    /// DB.open without invoking a path-sensitive configurator a second time.
+    pub fn resolveNativeRestoreOpenPlan(
+        target_path: []const u8,
+        requested_options: OpenOptions,
+    ) !NativeRestoreOpenPlan {
+        var opts = requested_options;
+        if (opts.backend_runtime) |runtime| {
+            if (runtime.db_open_configurator) |configurator| {
+                try configurator.configure(target_path, &opts);
+            }
+        }
+        // A restore plan is intentionally copyable across candidate,
+        // recovery, and published opens. Storage configurators may install
+        // borrowed backend capabilities, but may not smuggle move-only
+        // enrichment ownership into it.
+        if (opts.enrichment != null) return error.NativeRestoreConfiguratorOwnedStateUnsupported;
+        // Host-directory publication may reuse only path-independent policy
+        // and storage capabilities which explicitly operate on the host paths
+        // supplied by each open. A target-bound store or derived namespace
+        // would make candidate validation touch storage outside the
+        // lifecycle-owned sibling. Such providers must implement backend-owned
+        // stage/promote and advertise `external_backend` instead.
+        if (opts.physical_root_mode == .filesystem_managed and
+            (opts.primary_runtime_store != null or
+                !nativeRestorePrimaryStoragePublicationCompatible(opts.primary_backend) or
+                !nativeRestoreStoragePublicationCompatible(opts.storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.change_journal_storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.text_lsm_storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.dense_lsm_storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.sparse_lsm_storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.graph_lsm_storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.text_main_lsm_options.storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.text_wal_lsm_options.storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.dense_lsm_options.storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.sparse_lsm_options.storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.graph_reverse_lsm_options.storage) or
+                opts.index_base_path != null or
+                !nativeRestoreStoragePublicationCompatible(opts.index_repair_checkpoint_storage)))
+        {
+            return error.NativeBackupStorageBackendUnsupported;
+        }
+        return .{
+            ._options = opts,
+            ._target_path_fingerprint = backendConfigurationPathFingerprint(target_path),
+        };
+    }
+
+    fn nativeRestoreStoragePublicationCompatible(storage: ?lsm_backend_mod.Storage) bool {
+        return storage == null or storage.?.supportsHostPathGenerationPublication();
+    }
+
+    fn nativeRestorePrimaryStoragePublicationCompatible(primary_backend: PrimaryBackend) bool {
+        return switch (primary_backend) {
+            .lsm, .lsm_memory => |options| nativeRestoreStoragePublicationCompatible(options.storage),
+            .lmdb, .mem => true,
+        };
+    }
+
     pub fn close(self: *DB) void {
         if (self.closed) return;
         self.closed = true;
@@ -4405,6 +4616,7 @@ pub const DB = struct {
             .index_repair_checkpoint = async_resources.index_repair_checkpoint,
             .index_manager = async_resources.index_manager,
             .apply_mutex = async_resources.apply_mutex,
+            .snapshot_replay_admission = async_resources.snapshot_replay_admission,
             .repair_replay_mutex = async_resources.repair_replay_mutex,
             .io = self.backend_runtime.io(),
             .require_graph_resolution_contract = true,
@@ -4614,6 +4826,8 @@ pub const DB = struct {
             .shard_manager = resources.shard_manager,
             .index_manager = resources.index_manager,
             .apply_mutex = resources.apply_mutex,
+            .snapshot_admission = resources.snapshot_admission,
+            .snapshot_replay_admission = resources.snapshot_replay_admission,
             .repair_replay_mutex = resources.repair_replay_mutex,
             .change_journal = resources.change_journal,
             .replay_source = resources.replay_source,
@@ -4785,6 +4999,8 @@ pub const DB = struct {
             .shard_manager = resources.shard_manager,
             .index_manager = resources.index_manager,
             .apply_mutex = resources.apply_mutex,
+            .snapshot_admission = resources.snapshot_admission,
+            .snapshot_replay_admission = resources.snapshot_replay_admission,
             .repair_replay_mutex = resources.repair_replay_mutex,
             .change_journal = resources.change_journal,
             .replay_source = resources.replay_source,
@@ -4862,6 +5078,8 @@ pub const DB = struct {
                 .replay_source = batch_resources.replay_source,
                 .index_manager = batch_resources.index_manager,
                 .apply_mutex = batch_resources.apply_mutex,
+                .snapshot_admission = batch_resources.snapshot_admission,
+                .snapshot_replay_admission = batch_resources.snapshot_replay_admission,
                 .log_mutex = batch_resources.log_mutex,
                 .identity_namespace = batch_resources.identity_namespace,
                 .executor = self.executor,
@@ -5149,6 +5367,12 @@ pub const DB = struct {
             self.runtime_alloc.destroy(runtime);
         }
         self.core.deinit();
+        // Publication locks are opened and closed through the DB runtime's
+        // `std.Io`. Release the read generation before destroying an owned
+        // runtime, while still retaining the lease until all physical DB
+        // state has closed.
+        if (self.generation_read_lease) |*lease| lease.deinit();
+        self.generation_read_lease = null;
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         self.async_context.deinit(self.runtime_alloc);
         self.runtime_alloc.destroy(self.async_context);
@@ -5156,8 +5380,6 @@ pub const DB = struct {
             manager.deinit(self.alloc);
             self.alloc.destroy(manager);
         }
-        if (self.generation_read_lease) |*lease| lease.deinit();
-        self.generation_read_lease = null;
         self.* = undefined;
         self.closed = true;
     }
@@ -5755,6 +5977,8 @@ pub const DB = struct {
     }
 
     fn runLsmMaintenanceStepWithHAMutationHeld(self: *DB) !bool {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         if (try self.core.index_manager.runLsmObsoleteReclaimDue()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -5777,6 +6001,8 @@ pub const DB = struct {
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -5797,6 +6023,8 @@ pub const DB = struct {
     pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
         const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
@@ -5809,6 +6037,8 @@ pub const DB = struct {
     pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
         const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
@@ -5833,6 +6063,8 @@ pub const DB = struct {
     pub fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) !usize {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         var steps: usize = 0;
         while (steps < max_steps) : (steps += 1) {
             var progressed = false;
@@ -6424,6 +6656,8 @@ pub const DB = struct {
 
         try self.executor.failIfUnhealthy();
 
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
         lockApply(self);
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
@@ -6537,6 +6771,7 @@ pub const DB = struct {
         self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
         self.core.unlockApply();
         apply_mutex_held = false;
+        snapshot_mutation.release();
 
         var pressure_ctx = self.batchContext();
         try self.markPrecomputedEnrichmentAppliedForSync(child_batch.sync_level, sequence);
@@ -6584,6 +6819,8 @@ pub const DB = struct {
             try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
         }
 
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
         lockApply(self);
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
@@ -7458,6 +7695,7 @@ pub const DB = struct {
         }
         self.core.unlockApply();
         apply_mutex_held = false;
+        snapshot_mutation.release();
         if (opts.document_child_range_dispatcher) |dispatcher| {
             _ = try self.drainDocumentArtifactChildRangeOutbox(dispatcher, 0);
         }
@@ -8143,6 +8381,7 @@ pub const DB = struct {
 
     const IndexStructuralMutationGuard = struct {
         db: *DB,
+        snapshot_mutation: snapshot_admission_mod.SnapshotAdmission.MutationLease,
         operation: []const u8,
         index_name: []const u8,
         restart_text_merge: bool,
@@ -8178,6 +8417,7 @@ pub const DB = struct {
                 self.db.restartTextMergeAfterStructuralMutation(self.operation, self.index_name);
             }
             self.db.index_structural_mutation_mutex.unlock();
+            self.snapshot_mutation.release();
             self.active = false;
         }
 
@@ -8262,9 +8502,11 @@ pub const DB = struct {
         operation: []const u8,
         index_name: []const u8,
     ) IndexStructuralMutationGuard {
+        const snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         lockAtomicWithBackoff(&self.index_structural_mutation_mutex);
         return .{
             .db = self,
+            .snapshot_mutation = snapshot_mutation,
             .operation = operation,
             .index_name = index_name,
             .restart_text_merge = self.quiesceTextMergeForStructuralMutation(),
@@ -9413,6 +9655,8 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.executor.failIfUnhealthy();
 
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
         lockApply(self);
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
@@ -9479,6 +9723,7 @@ pub const DB = struct {
         self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
         self.core.unlockApply();
         apply_mutex_held = false;
+        snapshot_mutation.release();
 
         if (self.executor.hasWorkers()) {
             self.executor.forceSequence(sequence);
@@ -15038,6 +15283,27 @@ pub const DB = struct {
         automatic_discovery_pending: bool = false,
     };
 
+    /// Advances one durable projection-repair intent created while validating
+    /// a native restore. `true` means the staged generation has no remaining
+    /// repair debt and is eligible for sealing/publication. Existing healthy
+    /// projections are never reset or replayed by this path.
+    pub fn repairNativeRestoreProjectionIntentsStep(
+        self: *DB,
+        alloc: Allocator,
+        options: types.ArtifactRepairRunOptions,
+    ) !bool {
+        const before = try self.indexRepairIntentSummary(alloc);
+        if (before.terminal != 0) return error.NativeBackupProjectionRepairFailed;
+        if (before.paused != 0) return error.NativeBackupProjectionRepairPaused;
+        if (before.runnable == 0) return true;
+
+        const result = try self.repairRecoverableStartupIndexFailures(alloc, 1, options);
+        const after = try self.indexRepairIntentSummary(alloc);
+        if (after.terminal != 0) return error.NativeBackupProjectionRepairFailed;
+        if (after.paused != 0) return error.NativeBackupProjectionRepairPaused;
+        return result.remaining == 0 and after.runnable == 0;
+    }
+
     const index_repair_inspections_per_execution_slot: usize = 8;
 
     const IndexRepairInspectionWindow = struct {
@@ -17516,6 +17782,8 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
         _ = dest_dir1;
         while (true) {
             const target_sequence = self.core.nextDerivedSequence();
@@ -17552,25 +17820,319 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
         lockApply(self);
         defer self.core.unlockApply();
         try finalizeSplitLocked(self, new_range);
     }
 
     pub fn snapshot(self: *DB, id: []const u8) !u64 {
-        try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
+        return try self.snapshotInternal(id, false, .none);
+    }
 
-        lockApply(self);
-        defer self.core.unlockApply();
+    /// Captures the primary store and its validated generated projections as
+    /// one self-contained generation for the native table-backup format.
+    pub fn snapshotNative(self: *DB, id: []const u8) !u64 {
+        return try self.snapshotNativeWithCancellation(id, .none);
+    }
+
+    pub fn snapshotNativeWithCancellation(self: *DB, id: []const u8, cancellation: types.CancellationToken) !u64 {
+        return try self.snapshotInternal(id, true, cancellation);
+    }
+
+    const SnapshotFenceTestHook = struct {
+        ptr: *anyopaque,
+        after_capture_admission: *const fn (*anyopaque) void,
+        after_apply_release: ?*const fn (*anyopaque) void = null,
+        before_artifact_materialize: ?*const fn (*anyopaque) void = null,
+    };
+    var test_snapshot_fence_hook: ?SnapshotFenceTestHook = null;
+
+    fn snapshotInternal(self: *DB, id: []const u8, include_generated: bool, cancellation: types.CancellationToken) !u64 {
+        // Serialize only snapshot construction/publication. Normal writes can
+        // resume before native manifest hashing, while same-ID captures cannot
+        // race the fresh-directory check or atomic rename.
+        try lockAtomicWithCancellation(&self.snapshot_publication_mutex, cancellation);
+        defer self.snapshot_publication_mutex.unlock();
+        try ensureSnapshotActive(cancellation);
+        try validateSnapshotId(id);
+        if (include_generated) {
+            // Host-path exchange is the only native publication adapter
+            // currently implemented. External stores need a backend-owned
+            // staged namespace and atomic generation pointer; until that
+            // capability exists, fail before creating or syncing artifacts.
+            if (self.physical_root_mode != .filesystem_managed)
+                return error.NativeBackupStorageBackendUnsupported;
+            if (self.primary_lsm_storage) |storage| {
+                if (!storage.supportsHostPathGenerationPublication()) {
+                    std.log.err(
+                        "native backup requires atomic host-path generation publication for primary storage",
+                        .{},
+                    );
+                    return error.NativeBackupStorageBackendUnsupported;
+                }
+            }
+        }
+        const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        const snapshot_parent = try std.fmt.allocPrint(self.alloc, "{s}.snapshots", .{self.core.path});
+        defer self.alloc.free(snapshot_parent);
+        const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ snapshot_parent, id });
+        defer self.alloc.free(snapshot_root);
+        try fs_paths.createDirPathPortable(io, snapshot_parent);
+        if (try snapshotPathExists(io, snapshot_root)) return error.SnapshotAlreadyExists;
+        const staging_root = try createSnapshotStagingRoot(self.alloc, io, snapshot_parent, id);
+        defer self.alloc.free(staging_root);
+        var published = false;
+        defer if (!published) std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
+
+        if (!include_generated) {
+            // Portable snapshots omit generated files, but their replay log and
+            // durable watermarks must still describe a converged generation so
+            // restore can deterministically rebuild every managed projection.
+            try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
+            lockApply(self);
+            var apply_held = true;
+            defer if (apply_held) self.core.unlockApply();
+            try self.core.syncStore(true);
+            try self.core.index_manager.syncAll(true);
+            var primary_snapshot = try self.core.pinPortableSnapshot();
+            defer primary_snapshot.deinit();
+            self.core.unlockApply();
+            apply_held = false;
+            var total = try primary_snapshot.materialize(
+                self.alloc,
+                io,
+                staging_root,
+                cancellation,
+            );
+            total = std.math.add(
+                u64,
+                total,
+                try db_core.writeLogicalSnapshotManifest(self.alloc, io, staging_root),
+            ) catch return error.SnapshotTooLarge;
+            try publishSnapshotStaging(io, snapshot_parent, staging_root, snapshot_root);
+            published = true;
+            return total;
+        }
+
+        // Close primary/catalog admission before selecting the target. The
+        // barrier is writer preferring, so continuous client traffic cannot
+        // starve capture. Internal enrichment and resolution callbacks remain
+        // admitted while maintenance drains already-committed work.
+        var capture = self.core.snapshot_admission.acquireCaptureIo(io, @as(?types.CancellationToken, cancellation)) catch |err| switch (err) {
+            error.Cancelled => return error.Canceled,
+            else => return err,
+        };
+        defer capture.release();
+        if (builtin.is_test) {
+            if (test_snapshot_fence_hook) |hook| hook.after_capture_admission(hook.ptr);
+        }
+
+        var structural: ?IndexStructuralMutationGuard = null;
+        defer if (structural) |*guard| guard.release();
+        var replay_capture: ?snapshot_admission_mod.SnapshotAdmission.CaptureLease = null;
+        defer if (replay_capture) |*lease| lease.release();
+        var apply_held = false;
+        defer if (apply_held) self.core.unlockApply();
+        var capture_target_sequence: u64 = undefined;
+
+        // An internal callback can append a finite follow-up replay record
+        // during the drain. Recheck under the final apply fence; unlike the old
+        // optimistic loop, primary writes and catalog churn are already barred,
+        // so an external write stream cannot keep this loop alive forever.
+        while (true) {
+            const target_sequence = self.currentMaintenanceTargetSequence();
+            self.runMaintenanceUntilWithCancellation(
+                target_sequence,
+                .{},
+                cancellation,
+                std.math.maxInt(u64),
+            ) catch |err| switch (err) {
+                error.Cancelled => return error.Canceled,
+                else => return err,
+            };
+            try ensureSnapshotActive(cancellation);
+            try self.flushAppliedSequencesForIdle();
+
+            structural = self.beginIndexStructuralMutation("native snapshot", "*");
+            replay_capture = self.core.snapshot_replay_admission.acquireCaptureIo(
+                io,
+                @as(?types.CancellationToken, cancellation),
+            ) catch |err| switch (err) {
+                error.Cancelled => return error.Canceled,
+                else => return err,
+            };
+            lockApply(self);
+            apply_held = true;
+            if (self.currentMaintenanceTargetSequence() == target_sequence) {
+                capture_target_sequence = self.core.nextDerivedSequence();
+                break;
+            }
+            self.core.unlockApply();
+            apply_held = false;
+            replay_capture.?.release();
+            replay_capture = null;
+            structural.?.release();
+            structural = null;
+        }
 
         try self.core.syncStore(true);
         try self.core.index_manager.syncAll(true);
+        if (self.loadIndexRepairState(self.alloc)) |repair_state_value| {
+            var repair_state = repair_state_value;
+            defer repair_state.deinit(self.alloc);
+            if (repair_state.entries.items.len != 0)
+                return error.NativeBackupRepairStateNotQuiescent;
+        } else |err| switch (err) {
+            error.FileNotFound, error.DurableIndexRepairStateUnavailable => {},
+            else => return err,
+        }
 
-        const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}.snapshots/{s}", .{ self.core.path, id });
-        defer self.alloc.free(snapshot_root);
-        try ensureDirPath(snapshot_root);
+        // Pin the primary MVCC/read-snapshot while the selected revision is
+        // fenced. Its corpus-sized serialization happens only after writers
+        // resume and therefore does not extend write unavailability.
+        var primary_snapshot = try self.core.pinNativeSnapshot();
+        defer primary_snapshot.deinit();
+        if (comptime builtin.os.tag == .freestanding) {
+            self.core.unlockApply();
+            apply_held = false;
+            replay_capture.?.release();
+            replay_capture = null;
+            structural.?.release();
+            structural = null;
+            capture.release();
+            const total = try primary_snapshot.materialize(
+                self.alloc,
+                io,
+                staging_root,
+                cancellation,
+            );
+            try publishSnapshotStaging(io, snapshot_parent, staging_root, snapshot_root);
+            published = true;
+            return total;
+        }
 
-        return try self.core.writeSnapshot(snapshot_root);
+        const configs = try self.core.listIndexes(self.alloc);
+        defer types.freeIndexConfigs(self.alloc, configs);
+        const projections = try self.alloc.alloc(native_backup.Projection, configs.len);
+        defer self.alloc.free(projections);
+        for (configs, 0..) |cfg, i| {
+            const checkpoint = try self.core.loadProjectionCheckpoint(self.alloc, cfg.name);
+            if (checkpoint.status != .clean or
+                checkpoint.config_hash != types.indexConfigHash(cfg) or
+                checkpoint.applied_sequence != capture_target_sequence)
+            {
+                return error.NativeBackupProjectionNotQuiescent;
+            }
+            const backend_id = self.core.index_manager.nativeBackupBackendId(cfg.kind);
+            const has_immutable_checkpoint = self.core.index_manager.nativeBackupSupportsImmutableCheckpoint(cfg.kind);
+            if (!has_immutable_checkpoint) {
+                std.log.err(
+                    "native backup requires an immutable projection checkpoint index={s} kind={s} backend={s}",
+                    .{ cfg.name, @tagName(cfg.kind), backend_id },
+                );
+                return error.NativeBackupProjectionBackendUnsupported;
+            }
+            projections[i] = .{
+                .name = cfg.name,
+                .kind = @tagName(cfg.kind),
+                .config_hash = types.indexConfigHash(cfg),
+                .coverage_generation = cfg.coverage_generation,
+                .checkpoint_generation = checkpoint.generation,
+                .applied_sequence = checkpoint.applied_sequence,
+                .target_sequence = capture_target_sequence,
+                .artifact_format = "antfly-managed-index-tree",
+                .artifact_version = 1,
+                .backend_id = backend_id,
+                .codec_version = 1,
+                .artifact_state = .complete,
+                .repair_reason = "",
+            };
+        }
+        std.mem.sort(native_backup.Projection, projections, {}, struct {
+            fn lessThan(_: void, lhs: native_backup.Projection, rhs: native_backup.Projection) bool {
+                return std.mem.order(u8, lhs.name, rhs.name) == .lt;
+            }
+        }.lessThan);
+
+        // Ask each backend to retain its exact manifested generation. Pinning
+        // is bounded by backend/run metadata and does not walk or hardlink the
+        // corpus while revision and mutation fences remain held.
+        var generated_checkpoints = try self.core.index_manager.pinNativeBackupCheckpoints();
+        defer generated_checkpoints.deinit();
+        const generated_metadata_pin_root = try std.fmt.allocPrint(self.alloc, "{s}/.generated-metadata-pin", .{staging_root});
+        defer self.alloc.free(generated_metadata_pin_root);
+        var generated_metadata = try native_backup.pinGeneratedCheckpointMetadata(
+            self.alloc,
+            io,
+            self.core.path,
+            generated_metadata_pin_root,
+            cancellation,
+        );
+        defer generated_metadata.deinit();
+
+        // The primary store and hardlink-pinned generated files now form one
+        // stable generation. Release the latency-sensitive apply lock first,
+        // then all mutation admission before reading corpus bytes.
+        self.core.unlockApply();
+        apply_held = false;
+        if (builtin.is_test) {
+            if (test_snapshot_fence_hook) |hook| {
+                if (hook.after_apply_release) |run| run(hook.ptr);
+            }
+        }
+
+        replay_capture.?.release();
+        replay_capture = null;
+        structural.?.release();
+        structural = null;
+        capture.release();
+
+        // Both primary and generated artifacts remain pinned. Expensive file
+        // copies, primary serialization, hashing, and manifest encoding stay
+        // off both the apply lock and mutation-admission paths.
+        if (builtin.is_test) {
+            if (test_snapshot_fence_hook) |hook| {
+                if (hook.before_artifact_materialize) |run| run(hook.ptr);
+            }
+        }
+        var artifact_receipts = native_backup.ArtifactReceiptCollector.init(
+            self.alloc,
+            staging_root,
+            projections,
+        );
+        defer artifact_receipts.deinit();
+        const receipt_sink = artifact_receipts.sink();
+        var total = try generated_checkpoints.materializeWithSink(io, staging_root, cancellation, receipt_sink);
+        total = std.math.add(
+            u64,
+            total,
+            try generated_metadata.materializeWithSink(staging_root, cancellation, receipt_sink),
+        ) catch return error.FileTooBig;
+        total = std.math.add(u64, total, try primary_snapshot.materializeWithSink(
+            self.alloc,
+            io,
+            staging_root,
+            cancellation,
+            receipt_sink,
+        )) catch return error.FileTooBig;
+        total = std.math.add(u64, total, try native_backup.finalizeCaptureGenerationFromReceiptsWithCancellation(
+            self.alloc,
+            io,
+            &artifact_receipts,
+            capture_target_sequence,
+            .{
+                .artifact_format = primary_snapshot.artifactFormat(),
+                .artifact_version = primary_snapshot.artifactVersion(),
+                .source_backend = @tagName(self.primary_backend),
+            },
+            cancellation,
+        )) catch return error.FileTooBig;
+        try ensureSnapshotActive(cancellation);
+        try publishSnapshotStaging(io, snapshot_parent, staging_root, snapshot_root);
+        published = true;
+        return total;
     }
 
     pub fn sync(self: *DB, full: bool) !void {
@@ -17592,14 +18154,27 @@ pub const DB = struct {
         opts: OpenOptions,
         restore_identity: ?RestoreIdentity,
         restore_io: ?Io,
+        cancellation: types.CancellationToken,
+        native_manifest: ?*const native_backup.Manifest,
     ) !void {
-        const shared_io = restore_io orelse if (opts.backend_runtime) |runtime| runtime.io() else null;
+        try cancellation.check();
+        const shared_io = restore_io orelse if (opts.backend_runtime) |runtime| runtime.filesystemIo() else null;
+        const identity_io = if (restore_identity != null)
+            shared_io orelse return error.BackendRuntimeIoUnavailable
+        else
+            null;
         if (restore_identity) |identity| {
-            if (shared_io) |io|
-                try beginRestoreImportWithIo(alloc, io, path, snapshot_root, identity)
-            else
-                try beginRestoreImport(alloc, path, snapshot_root, identity);
+            try beginRestoreImportWithIo(alloc, identity_io.?, path, snapshot_root, identity);
         }
+        const physical_primary = if (native_manifest) |manifest|
+            std.mem.eql(u8, manifest.primary.artifact_format, "antfly-lsm-checkpoint")
+        else
+            false;
+        if (physical_primary) switch (opts.primary_backend) {
+            .lsm => {},
+            else => return error.UnsupportedBackupFormat,
+        };
+
         var opened_primary = try openPrimaryStore(alloc, path, .{
             .map_size = opts.map_size,
             .no_sync = opts.no_sync,
@@ -17613,11 +18188,22 @@ pub const DB = struct {
             opened_primary.owner.close(alloc);
         }
 
-        try db_core.clearAllKeysFromStore(alloc, &opened_primary.store);
-        try db_core.importStoreSnapshot(alloc, &opened_primary.store, snapshot_root);
+        const streaming_store = if (physical_primary)
+            true
+        else blk: {
+            try db_core.clearAllKeysFromStore(alloc, &opened_primary.store);
+            break :blk if (shared_io) |io|
+                try db_core.importStoreSnapshotWithIo(alloc, io, &opened_primary.store, snapshot_root, cancellation)
+            else fallback: {
+                try db_core.importStoreSnapshot(alloc, &opened_primary.store, snapshot_root);
+                break :fallback false;
+            };
+        };
+        try cancellation.check();
         try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
         try validateRestoredIdentityNamespace(&opened_primary.store, opts);
-        try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
+        if (!streaming_store)
+            try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
         // The candidate root owns its identity. Creating it while the staged
         // capability is still held makes identity part of the durable tree
         // that is sealed and atomically published, rather than an open-time
@@ -17629,27 +18215,7 @@ pub const DB = struct {
                 try loadOrCreateDurableRootIdentity(alloc, opts.backend_runtime, path);
         }
         if (restore_identity) |identity| {
-            if (shared_io) |io|
-                try markRestorePrimaryRestoredForPathWithArtifactWithIo(
-                    alloc,
-                    io,
-                    path,
-                    identity.backup_id,
-                    identity.location,
-                    identity.artifact_sha256,
-                    identity.snapshot_path,
-                    identity.group_id,
-                )
-            else
-                try markRestorePrimaryRestoredForPathWithArtifact(
-                    alloc,
-                    path,
-                    identity.backup_id,
-                    identity.location,
-                    identity.artifact_sha256,
-                    identity.snapshot_path,
-                    identity.group_id,
-                );
+            try markRestorePrimaryRestoredForPathWithIdentityWithIo(alloc, identity_io.?, path, identity);
         }
     }
 
@@ -17660,7 +18226,7 @@ pub const DB = struct {
     }
 
     fn restoreSnapshotTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions) !void {
-        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, null, null);
+        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, null, null, .none, null);
         // Graph reverse indexes are derived from stored outgoing edge keys, so
         // restore them after the logical store and derived log are rehydrated.
         var restored = try DB.open(alloc, path, opts);
@@ -17692,8 +18258,17 @@ pub const DB = struct {
         opts: OpenOptions,
         identity: RestoreIdentity,
     ) !void {
-        try staged_generation.validatePath(path);
-        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, null);
+        const runtime = opts.backend_runtime orelse return error.BackendRuntimeIoUnavailable;
+        const io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        return try restoreSnapshotToDeferredRuntimeRepairWithIo(
+            staged_generation,
+            alloc,
+            io,
+            snapshot_root,
+            path,
+            opts,
+            identity,
+        );
     }
 
     pub fn restoreSnapshotToDeferredRuntimeRepairWithIo(
@@ -17705,8 +18280,465 @@ pub const DB = struct {
         opts: OpenOptions,
         identity: RestoreIdentity,
     ) !void {
+        return try restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation(
+            staged_generation,
+            alloc,
+            io,
+            snapshot_root,
+            path,
+            opts,
+            identity,
+            .none,
+        );
+    }
+
+    pub fn restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: Io,
+        snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+        identity: RestoreIdentity,
+        cancellation: types.CancellationToken,
+    ) !void {
         try staged_generation.validatePath(path);
-        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, io);
+        var native_generation = try native_backup.validateAndMaterializeWithCancellation(
+            alloc,
+            io,
+            snapshot_root,
+            path,
+            cancellation,
+        );
+        defer if (native_generation) |*generation| generation.deinit();
+        if (native_generation) |*generation| return try restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation(
+            staged_generation,
+            alloc,
+            io,
+            snapshot_root,
+            path,
+            opts,
+            identity,
+            generation,
+            cancellation,
+        );
+        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, io, cancellation, null);
+    }
+
+    /// Installs a generation whose declared files were already authenticated
+    /// and copied directly into the unpublished destination. This is the
+    /// manifest-first remote restore path; it deliberately performs no source
+    /// tree enumeration or second corpus-sized validation pass.
+    pub fn restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: Io,
+        primary_snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+        identity: RestoreIdentity,
+        native_generation: *native_backup.LoadedManifest,
+        cancellation: types.CancellationToken,
+    ) !void {
+        // Tree-materialized callers may already contain every projection.
+        // Remove statically incompatible physical codecs before opening the
+        // staged catalog; the manifest-first remote planner calls the primary
+        // phase directly and has not downloaded these groups yet.
+        try classifyIncompatibleNativeProjections(native_generation, opts);
+        try native_generation.discardInvalidProjectionArtifacts(io, path);
+        try restoreMaterializedNativePrimaryAndPlanProjectionsWithIoAndCancellation(
+            staged_generation,
+            alloc,
+            io,
+            primary_snapshot_root,
+            path,
+            opts,
+            identity,
+            native_generation,
+            cancellation,
+        );
+        try finishMaterializedNativeGenerationWithIo(
+            staged_generation,
+            alloc,
+            io,
+            path,
+            opts,
+            native_generation,
+            true,
+        );
+    }
+
+    /// Restores only the primary and small generation metadata, then uses the
+    /// restored catalog to decide which projection artifact groups are worth
+    /// transferring. No physical projection corpus is required by this phase.
+    pub fn restoreMaterializedNativePrimaryAndPlanProjectionsWithIoAndCancellation(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: Io,
+        primary_snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+        identity: RestoreIdentity,
+        native_generation: *native_backup.LoadedManifest,
+        cancellation: types.CancellationToken,
+    ) !void {
+        try staged_generation.validatePath(path);
+        try classifyIncompatibleNativeProjections(native_generation, opts);
+        try restoreSnapshotStoreTo(
+            alloc,
+            primary_snapshot_root,
+            path,
+            opts,
+            identity,
+            io,
+            cancellation,
+            native_generation.value(),
+        );
+        var validation_opts = opts;
+        validation_opts.open_mode = .query_readonly;
+        validation_opts.staged_generation = staged_generation;
+        validation_opts.start_index_workers = false;
+        validation_opts.start_optional_runtimes = false;
+        validation_opts.start_optional_runtime_workers = false;
+        var validation = try DB.open(alloc, path, validation_opts);
+        defer validation.close();
+        try validation.classifyNativeProjectionCatalogCompatibility(alloc, native_generation);
+    }
+
+    pub fn finishMaterializedNativeGenerationWithIo(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: Io,
+        path: []const u8,
+        opts: OpenOptions,
+        native_generation: *native_backup.LoadedManifest,
+        complete_runtime_repair: bool,
+    ) !void {
+        try validateInstalledNativeBackupGeneration(
+            staged_generation,
+            alloc,
+            io,
+            path,
+            opts,
+            native_generation,
+            complete_runtime_repair,
+        );
+    }
+
+    /// Local bound databases do not have a non-zero Raft group identity. Return
+    /// whether a complete native generation was installed so the caller can
+    /// run the legacy logical fallback without manufacturing replica provenance.
+    pub fn restoreSnapshotToLocalDeferredRuntimeRepairWithIo(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: Io,
+        snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+    ) !bool {
+        return try restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation(
+            staged_generation,
+            alloc,
+            io,
+            snapshot_root,
+            path,
+            opts,
+            .none,
+        );
+    }
+
+    pub fn restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: Io,
+        snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+        cancellation: types.CancellationToken,
+    ) !bool {
+        try staged_generation.validatePath(path);
+        var native_generation = try native_backup.validateAndMaterializeWithCancellation(
+            alloc,
+            io,
+            snapshot_root,
+            path,
+            cancellation,
+        );
+        defer if (native_generation) |*generation| generation.deinit();
+        if (native_generation) |*generation| {
+            try classifyIncompatibleNativeProjections(generation, opts);
+            try generation.discardInvalidProjectionArtifacts(io, path);
+        }
+        try restoreSnapshotStoreTo(
+            alloc,
+            snapshot_root,
+            path,
+            opts,
+            null,
+            io,
+            cancellation,
+            if (native_generation) |*generation| generation.value() else null,
+        );
+        if (native_generation) |*generation| {
+            try validateInstalledNativeBackupGeneration(staged_generation, alloc, io, path, opts, generation, false);
+            return true;
+        }
+        return false;
+    }
+
+    fn validateInstalledNativeBackupGeneration(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: Io,
+        path: []const u8,
+        opts: OpenOptions,
+        native_generation: *native_backup.LoadedManifest,
+        complete_runtime_repair: bool,
+    ) !void {
+        // Repair identities are replica-local capabilities. The checkpoint is
+        // part of the checksummed generation so pending debt cannot disappear,
+        // but a quiesced fast-path snapshot is required to carry no entries.
+        // Rebind that empty state before any staged open so two restored roots
+        // never share repair authority.
+        const repair_path = try index_repair_state.checkpointPathAlloc(alloc, path);
+        defer alloc.free(repair_path);
+        if (index_repair_state.load(alloc, repair_path)) |repair_state_value| {
+            var repair_state = repair_state_value;
+            defer repair_state.deinit(alloc);
+            if (repair_state.entries.items.len != 0)
+                return error.NativeBackupRepairStateNotQuiescent;
+            var rebound = try index_repair_state.resetForRootGeneration(
+                alloc,
+                repair_path,
+                repair_state.identity,
+                opts.lsm_root_generation,
+            );
+            rebound.deinit(alloc);
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+
+        var validation_opts = opts;
+        validation_opts.open_mode = if (native_generation.invalid_projections.items.len == 0)
+            .query_readonly
+        else
+            .writer_no_replay;
+        validation_opts.staged_generation = staged_generation;
+        validation_opts.start_index_workers = false;
+        validation_opts.start_optional_runtimes = false;
+        validation_opts.start_optional_runtime_workers = false;
+        {
+            var validation = try DB.open(alloc, path, validation_opts);
+            defer validation.close();
+            try validation.validateNativeBackupGeneration(alloc, native_generation);
+        }
+        if (native_generation.invalid_projections.items.len != 0) {
+            try native_generation.discardInvalidProjectionArtifacts(io, path);
+            validation_opts.open_mode = .writer_no_replay;
+            var restored = try DB.open(alloc, path, validation_opts);
+            defer restored.close();
+            for (native_generation.invalid_projections.items) |invalid| {
+                // A projection present only in the native manifest is stale
+                // relative to the restored catalog. Its files were discarded,
+                // but there is no configured runtime generation to repair.
+                const cfg = restored.core.index_manager.get(invalid.name) orelse continue;
+                const previous = try restored.core.loadProjectionCheckpoint(alloc, invalid.name);
+                try restored.core.saveProjectionCheckpoint(invalid.name, .{
+                    .applied_sequence = 0,
+                    .status = .repair_required,
+                    .generation = previous.generation +| 1,
+                    .config_hash = types.indexConfigHash(cfg.*),
+                });
+                _ = try restored.createGenerationRepairIntentAtTarget(
+                    alloc,
+                    cfg.*,
+                    .projection_generation_invalid,
+                    0,
+                    0,
+                    @tagName(invalid.reason),
+                    native_generation.value().capture_target_sequence,
+                );
+            }
+            try restored.core.index_manager.syncAll(true);
+            if (complete_runtime_repair) {
+                try restored.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "repair_indexes", false);
+            }
+        } else if (complete_runtime_repair) {
+            try markRestoreRuntimeRepairCompleteWithIo(alloc, io, path);
+        }
+    }
+
+    fn classifyNativeProjectionCatalogCompatibility(
+        self: *DB,
+        alloc: Allocator,
+        native_generation: *native_backup.LoadedManifest,
+    ) !void {
+        const manifest = native_generation.value();
+        const primary_sequence = self.core.nextDerivedSequence();
+        if (primary_sequence != manifest.capture_target_sequence) {
+            std.log.err(
+                "native backup primary checkpoint mismatch primary_sequence={d} manifest_target={d}",
+                .{ primary_sequence, manifest.capture_target_sequence },
+            );
+            return error.NativeBackupPrimaryCheckpointMismatch;
+        }
+        const configs = try self.core.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, configs);
+        var configs_by_name = std.StringHashMapUnmanaged(*const types.IndexConfig).empty;
+        defer configs_by_name.deinit(alloc);
+        try configs_by_name.ensureTotalCapacity(alloc, @intCast(configs.len));
+        for (configs) |*cfg| {
+            const entry = configs_by_name.getOrPutAssumeCapacity(cfg.name);
+            if (entry.found_existing) return error.InvalidIndexCatalog;
+            entry.value_ptr.* = cfg;
+        }
+        var manifest_projection_names = std.StringHashMapUnmanaged(void).empty;
+        defer manifest_projection_names.deinit(alloc);
+        try manifest_projection_names.ensureTotalCapacity(alloc, @intCast(manifest.projections.len));
+        for (manifest.projections) |projection| {
+            const entry = manifest_projection_names.getOrPutAssumeCapacity(projection.name);
+            if (entry.found_existing) return error.InvalidNativeBackupManifest;
+        }
+
+        // A catalog projection omitted from the physical generation is local
+        // repair debt, not permission to reject an otherwise valid primary
+        // snapshot. It will receive a durable repair intent below.
+        for (configs) |cfg| {
+            if (!manifest_projection_names.contains(cfg.name))
+                try native_generation.invalidateProjection(cfg.name, .missing_artifact);
+        }
+
+        for (manifest.projections) |projection| {
+            if (native_generation.projectionInvalid(projection.name)) continue;
+            const cfg = configs_by_name.get(projection.name) orelse {
+                try native_generation.invalidateProjection(projection.name, .config_mismatch);
+                continue;
+            };
+            if (!std.mem.eql(u8, projection.kind, @tagName(cfg.kind)) or
+                projection.config_hash != types.indexConfigHash(cfg.*))
+            {
+                try native_generation.invalidateProjection(projection.name, .config_mismatch);
+                continue;
+            }
+            if (projection.coverage_generation != cfg.coverage_generation) {
+                try native_generation.invalidateProjection(projection.name, .coverage_mismatch);
+                continue;
+            }
+            if (projection.target_sequence != manifest.capture_target_sequence or
+                projection.applied_sequence != projection.target_sequence)
+            {
+                try native_generation.invalidateProjection(projection.name, .checkpoint_mismatch);
+                continue;
+            }
+            const checkpoint = try self.core.loadProjectionCheckpoint(alloc, projection.name);
+            if (checkpoint.status != .clean or
+                checkpoint.config_hash != projection.config_hash or
+                checkpoint.generation != projection.checkpoint_generation or
+                checkpoint.applied_sequence != projection.applied_sequence or
+                checkpoint.applied_sequence != projection.target_sequence)
+            {
+                std.log.err("native backup projection checkpoint mismatch index={s} status={s} checkpoint_hash={d} manifest_hash={d} checkpoint_generation={d} manifest_generation={d} checkpoint_applied={d} manifest_applied={d} manifest_target={d}", .{
+                    projection.name,
+                    @tagName(checkpoint.status),
+                    checkpoint.config_hash,
+                    projection.config_hash,
+                    checkpoint.generation,
+                    projection.checkpoint_generation,
+                    checkpoint.applied_sequence,
+                    projection.applied_sequence,
+                    projection.target_sequence,
+                });
+                try native_generation.invalidateProjection(projection.name, .checkpoint_mismatch);
+                continue;
+            }
+        }
+    }
+
+    fn validateNativeBackupGeneration(self: *DB, alloc: Allocator, native_generation: *native_backup.LoadedManifest) !void {
+        try self.classifyNativeProjectionCatalogCompatibility(alloc, native_generation);
+        const configs = try self.core.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, configs);
+        var configs_by_name = std.StringHashMapUnmanaged(*const types.IndexConfig).empty;
+        defer configs_by_name.deinit(alloc);
+        try configs_by_name.ensureTotalCapacity(alloc, @intCast(configs.len));
+        for (configs) |*cfg| {
+            const entry = configs_by_name.getOrPutAssumeCapacity(cfg.name);
+            if (entry.found_existing) return error.InvalidIndexCatalog;
+            entry.value_ptr.* = cfg;
+        }
+        for (native_generation.value().projections) |projection| {
+            if (native_generation.projectionInvalid(projection.name)) continue;
+            const cfg = configs_by_name.get(projection.name) orelse continue;
+            if (self.core.index_manager.loadFailure(projection.name)) |err_name| {
+                if (nativeBackupProjectionLoadFailureIsRepairable(err_name)) {
+                    try native_generation.invalidateProjection(projection.name, .unreadable);
+                    continue;
+                }
+                // Unknown, resource, and transient I/O failures are not proof
+                // that a checksummed generation is corrupt. Leave the staged
+                // tree intact so the asynchronous restore job can retry.
+                std.log.warn("native backup projection validation deferred index={s} err={s}", .{ projection.name, err_name });
+                return error.NativeBackupProjectionValidationIndeterminate;
+            }
+            if (cfg.kind == .dense_vector) {
+                const dense = self.core.index_manager.denseIndex(projection.name) orelse {
+                    try native_generation.invalidateProjection(projection.name, .unreadable);
+                    continue;
+                };
+                if (@hasDecl(@TypeOf(dense.index), "validateStoredStructure")) {
+                    dense.index.validateStoredStructure(alloc) catch |err| switch (err) {
+                        error.NotFound, error.FileNotFound, error.Corrupted => {
+                            try native_generation.invalidateProjection(projection.name, .unreadable);
+                        },
+                        else => {
+                            // A transient resource or I/O failure is not
+                            // evidence that the checksummed artifact is bad.
+                            // Preserve the staged generation and let the
+                            // durable restore job retry validation.
+                            std.log.warn("native backup dense projection validation deferred index={s} err={s}", .{ projection.name, @errorName(err) });
+                            return error.NativeBackupProjectionValidationIndeterminate;
+                        },
+                    };
+                }
+            }
+        }
+    }
+
+    fn nativeBackupProjectionLoadFailureIsRepairable(err_name: []const u8) bool {
+        const repairable = [_][]const u8{
+            "Corrupted",
+            "FileNotFound",
+            "NotFound",
+            "UnsupportedVersion",
+            "IncompleteBulkPublish",
+        };
+        for (repairable) |candidate| {
+            if (std.mem.eql(u8, err_name, candidate)) return true;
+        }
+        return false;
+    }
+
+    fn classifyIncompatibleNativeProjections(
+        generation: *native_backup.LoadedManifest,
+        opts: OpenOptions,
+    ) !void {
+        for (generation.value().projections) |projection| {
+            const kind = std.meta.stringToEnum(types.IndexKind, projection.kind) orelse
+                return error.InvalidNativeBackupManifest;
+            const target_backend = switch (kind) {
+                .full_text => @tagName(opts.index_backends.text_main_backend),
+                .dense_vector => @tagName(opts.index_backends.dense_storage_backend),
+                .sparse_vector => @tagName(opts.index_backends.sparse_backend),
+                .graph => @tagName(opts.index_backends.graph_reverse_backend),
+                .algebraic => "primary",
+            };
+            if (!std.mem.eql(u8, projection.backend_id, target_backend) or
+                projection.codec_version != 1)
+            {
+                try generation.invalidateProjection(projection.name, .backend_mismatch);
+            }
+        }
     }
 
     fn beginRestoreImport(alloc: Allocator, path: []const u8, snapshot_root: []const u8, identity: RestoreIdentity) !void {
@@ -17733,6 +18765,8 @@ pub const DB = struct {
             .backup_id = identity.backup_id,
             .location = identity.location,
             .artifact_sha256 = identity.artifact_sha256,
+            .native_manifest_size_bytes = identity.native_manifest_size_bytes,
+            .native_manifest_sha256 = identity.native_manifest_sha256,
             .snapshot_path = identity.snapshot_path,
             .group_id = identity.group_id,
         }, .{});
@@ -17765,11 +18799,13 @@ pub const DB = struct {
             .backup_id = identity_state.backup_id,
             .location = identity_state.location,
             .artifact_sha256 = identity_state.artifact_sha256,
+            .native_manifest_size_bytes = identity_state.native_manifest_size_bytes,
+            .native_manifest_sha256 = identity_state.native_manifest_sha256,
             .snapshot_path = identity_state.snapshot_path,
             .group_id = identity_state.group_id,
         };
         std.log.warn("recovering incomplete restore import phase=startup", .{});
-        try restoreSnapshotStoreTo(alloc, import_state.snapshot_root, path, opts, identity, io);
+        try restoreSnapshotStoreTo(alloc, import_state.snapshot_root, path, opts, identity, io, .none, null);
         return true;
     }
 
@@ -17814,7 +18850,36 @@ pub const DB = struct {
         snapshot_path: []const u8,
         group_id: u64,
     ) !void {
-        var state = try restoreStateAlloc(alloc, backup_id, location, artifact_sha256, snapshot_path, group_id, "runtime_repair", true, false, "", "");
+        return try markRestorePrimaryRestoredForPathWithIdentityWithIo(alloc, io, path, .{
+            .backup_id = backup_id,
+            .location = location,
+            .artifact_sha256 = artifact_sha256,
+            .snapshot_path = snapshot_path,
+            .group_id = group_id,
+        });
+    }
+
+    pub fn markRestorePrimaryRestoredForPathWithIdentityWithIo(
+        alloc: Allocator,
+        io: Io,
+        path: []const u8,
+        identity: RestoreIdentity,
+    ) !void {
+        var state = try restoreStateAlloc(
+            alloc,
+            identity.backup_id,
+            identity.location,
+            identity.artifact_sha256,
+            identity.native_manifest_size_bytes,
+            identity.native_manifest_sha256,
+            identity.snapshot_path,
+            identity.group_id,
+            "runtime_repair",
+            true,
+            false,
+            "",
+            "",
+        );
         defer state.deinit(alloc);
         try writeRestoreStateForPathWithIo(alloc, io, path, state);
         const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
@@ -17873,7 +18938,7 @@ pub const DB = struct {
     }
 
     pub fn restoreRuntimeRepairNeeded(self: *DB) !bool {
-        if (self.backend_runtime.io()) |io| {
+        if (self.backend_runtime.filesystemIo()) |io| {
             return try restoreRuntimeRepairNeededForPathWithIo(self.alloc, io, self.core.path);
         }
         return try restoreRuntimeRepairNeededForPath(self.alloc, self.core.path);
@@ -17920,7 +18985,7 @@ pub const DB = struct {
     }
 
     pub fn repairRestoreRuntimeStateStepIfNeeded(self: *DB, alloc: Allocator) !bool {
-        if (self.backend_runtime.io()) |io| {
+        if (self.backend_runtime.filesystemIo()) |io| {
             return try self.repairRestoreRuntimeStateStepIfNeededWithIo(alloc, io);
         }
         var io_impl = threadedIo();
@@ -17929,10 +18994,27 @@ pub const DB = struct {
     }
 
     pub fn repairRestoreRuntimeStateStepIfNeededWithIo(self: *DB, alloc: Allocator, io: Io) !bool {
+        return try self.repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(alloc, io, .{});
+    }
+
+    pub fn repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
+        self: *DB,
+        alloc: Allocator,
+        io: Io,
+        repair_options: types.ArtifactRepairRunOptions,
+    ) !bool {
         var state = (try readRestoreStateForPathAllocWithIo(alloc, io, self.core.path)) orelse return false;
         defer state.deinit(alloc);
         if (!state.primary_restored or state.runtime_repair_complete) return false;
         const phase = state.phase;
+
+        if (std.mem.eql(u8, phase, "repair_indexes")) {
+            std.log.info("restore runtime repair phase=repair_indexes", .{});
+            if (!try self.repairNativeRestoreProjectionIntentsStep(alloc, repair_options))
+                return error.RestoreRuntimeRepairIncomplete;
+            try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "complete", true);
+            return true;
+        }
 
         if (std.mem.eql(u8, phase, "runtime_repair") or std.mem.eql(u8, phase, "reset_watermarks")) {
             std.log.info("restore runtime repair phase=reset_index_watermarks", .{});
@@ -18064,7 +19146,7 @@ pub const DB = struct {
     }
 
     fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
-        if (self.backend_runtime.io()) |io| {
+        if (self.backend_runtime.filesystemIo()) |io| {
             return try self.repairRestoreRuntimeStateIfNeededWithIo(alloc, io);
         }
         var io_impl = threadedIo();
@@ -19995,6 +21077,8 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.executor.failIfUnhealthy();
 
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
         lockApply(self);
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
@@ -20044,6 +21128,7 @@ pub const DB = struct {
         self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
         self.core.unlockApply();
         apply_mutex_held = false;
+        snapshot_mutation.release();
 
         if (self.executor.hasWorkers()) {
             self.executor.forceSequence(sequence);
@@ -20190,6 +21275,8 @@ pub const DB = struct {
     }
 
     pub fn evaluateAlgebraicAdaptiveCandidates(self: *DB) !u64 {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.evaluateAlgebraicAdaptiveCandidatesLocked();
@@ -20206,6 +21293,8 @@ pub const DB = struct {
     }
 
     pub fn runAlgebraicAdaptiveWork(self: *DB) !u64 {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         lockApply(self);
         defer self.core.unlockApply();
         const target_sequence = self.core.nextDerivedSequence();
@@ -20373,6 +21462,8 @@ pub const DB = struct {
 
     pub fn compactTextIndexes(self: *DB) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.compactTextIndexes();
@@ -20380,6 +21471,8 @@ pub const DB = struct {
 
     pub fn drainScheduledTextMerges(self: *DB) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.drainScheduledTextMerges();
@@ -20406,6 +21499,8 @@ pub const DB = struct {
                     merge_permit = try runtime.acquireProducerPermit(index_name, planned.estimate.segment_count, planned.estimate.byte_count);
                 }
                 defer if (merge_permit) |*permit| permit.release();
+                var snapshot_replay = try self.acquireSnapshotReplayMutation();
+                defer snapshot_replay.release();
                 lockApply(self);
                 const published = self.core.index_manager.indexTextKernelDocuments(index_name, chunk) catch |err| {
                     self.core.unlockApply();
@@ -20423,6 +21518,8 @@ pub const DB = struct {
 
     pub fn forceCompactTextIndexes(self: *DB) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.forceCompactTextIndexes();
@@ -21726,6 +22823,8 @@ pub const DB = struct {
     }
 
     pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         var names = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (names.items) |name| alloc.free(name);
@@ -21744,6 +22843,8 @@ pub const DB = struct {
     }
 
     pub fn rebuildSparseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         var names = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (names.items) |name| alloc.free(name);
@@ -21762,6 +22863,8 @@ pub const DB = struct {
     }
 
     pub fn rebuildGraphIndexesForTargetCoverage(self: *DB, alloc: Allocator) !void {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         try applySplitGraphArtifactsInRange(
             alloc,
             "",
@@ -21772,6 +22875,8 @@ pub const DB = struct {
     }
 
     pub fn runDensePostingMaintenanceForIdle(self: *DB) !usize {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.index_manager.runDensePostingMaintenance(.{
@@ -23416,6 +24521,8 @@ pub const DB = struct {
         progress_ctx: ?*anyopaque,
         progress_hook: ?ReplayProgressHook,
     ) !DenseArtifactRebuildOutcome {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         var dense_visibility_attempted = false;
         errdefer if (dense_visibility_attempted) self.clearDenseHbcCaches();
         var plan = try self.collectDenseArtifactRebuildPlan(alloc);
@@ -38317,6 +39424,8 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     var ha_mutation = acquireHAMutationSharedContext(ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    var snapshot_mutation = acquireSnapshotMutationContext(ctx);
+    defer if (snapshot_mutation) |*lease| lease.release();
     ctx.apply_mutex.lockExclusive();
     var apply_mutex_held = true;
     errdefer if (apply_mutex_held) ctx.apply_mutex.unlockExclusive();
@@ -38458,6 +39567,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     }
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
+    if (snapshot_mutation) |*lease| lease.release();
     try mirrorHAReplayPayloadCommitContext(ctx, replay_payload);
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
     defer sync_targets.deinit(ctx.alloc);
@@ -38519,6 +39629,8 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     var ha_mutation = acquireHAMutationSharedContext(ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    var snapshot_replay = try acquireSnapshotReplayContext(ctx);
+    defer if (snapshot_replay) |*lease| lease.release();
     ctx.apply_mutex.lockExclusive();
     defer ctx.apply_mutex.unlockExclusive();
     const sequence = ctx.store.reserveNextReplaySequence(1);
@@ -38531,6 +39643,10 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
 }
 
 fn appendReplicatedHADerivedEffectContext(ctx: *const BatchExecutionContext, record: ha_replication_record_mod.RecordView) !u64 {
+    var snapshot_mutation = acquireSnapshotMutationContext(ctx);
+    defer if (snapshot_mutation) |*lease| lease.release();
+    var snapshot_replay = try acquireSnapshotReplayContext(ctx);
+    defer if (snapshot_replay) |*lease| lease.release();
     var decoded = try ha_effects_mod.decodeDerivedChangeRecord(ctx.alloc, record);
     defer decoded.deinit();
 
@@ -38620,6 +39736,27 @@ fn haMutationBarrierFromContext(ctx: *const BatchExecutionContext) ?*HAMutationB
 fn acquireHAMutationSharedContext(ctx: *const BatchExecutionContext) ?HAMutationBarrier.SharedLease {
     const barrier = haMutationBarrierFromContext(ctx) orelse return null;
     return barrier.acquireShared();
+}
+
+fn acquireSnapshotMutationContext(ctx: *const BatchExecutionContext) ?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+    const admission = ctx.snapshot_admission orelse return null;
+    return admission.acquireMutation();
+}
+
+fn acquireSnapshotReplayContext(ctx: *const BatchExecutionContext) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+    const admission = ctx.snapshot_replay_admission orelse return null;
+    if (ctx.io) |io| {
+        return try admission.acquireMutationIo(io, @as(?types.CancellationToken, null));
+    }
+    return admission.acquireMutation();
+}
+
+fn acquireSnapshotReplayAsyncContext(ctx: *const AsyncContext) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+    const admission = ctx.snapshot_replay_admission orelse return null;
+    if (ctx.io) |io| {
+        return try admission.acquireMutationIo(io, @as(?types.CancellationToken, null));
+    }
+    return admission.acquireMutation();
 }
 
 fn haTransitionMutexFromContext(ctx: *const BatchExecutionContext) ?*std.atomic.Mutex {
@@ -40107,6 +41244,8 @@ fn appendResolutionRecordWithHook(
     var ha_mutation = acquireHAMutationSharedContext(&batch_ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(batch_ctx.ha_write_gate);
+    var snapshot_replay = try acquireSnapshotReplayContext(&batch_ctx);
+    defer if (snapshot_replay) |*lease| lease.release();
 
     const store_writes = try batch_ctx.alloc.alloc(docstore_mod.KVPair, write.artifact_writes.len);
     defer batch_ctx.alloc.free(store_writes);
@@ -40134,6 +41273,8 @@ fn appendResolutionRecordWithHook(
     }
     batch_ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
+    snapshot_replay.?.release();
+    snapshot_replay = null;
 
     try mirrorHAReplayPayloadCommitContext(&batch_ctx, payload);
     before_handoff_publish.run();
@@ -40812,6 +41953,8 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
     var ha_mutation = acquireHAMutationSharedContext(&batch_ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(batch_ctx.ha_write_gate);
+    var snapshot_replay = try acquireSnapshotReplayContext(&batch_ctx);
+    defer if (snapshot_replay) |*lease| lease.release();
     const replay_deleted_keys = try concatKeyViews(batch_ctx.alloc, batch.deleted_keys, artifact_delete_keys);
     defer batch_ctx.alloc.free(replay_deleted_keys);
     var replay_batch = batch;
@@ -40855,6 +41998,8 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
         batch_ctx.executor.trackBacklogBytes(reserved_sequence, @intCast(payload.len)) catch {};
         break :blk reserved_sequence;
     };
+    snapshot_replay.?.release();
+    snapshot_replay = null;
 
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
     if (ctx.executor.hasWorkers()) {
@@ -40955,6 +42100,7 @@ fn canAdvanceDerivedReplayTargetContext(
         .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
         .index_manager = ctx.index_manager,
         .apply_mutex = ctx.apply_mutex,
+        .snapshot_replay_admission = ctx.snapshot_replay_admission,
         .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
         .resolution_runtime = ctx.resolution_runtime,
         .promotion_runtime = ctx.promotion_runtime,
@@ -40974,10 +42120,12 @@ fn applyDerivedBatchToIndexReplayContext(
 
     const async_ctx = AsyncContext{
         .alloc = ctx.alloc,
+        .io = ctx.io,
         .store = ctx.store,
         .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
         .index_manager = ctx.index_manager,
         .apply_mutex = ctx.apply_mutex,
+        .snapshot_replay_admission = ctx.snapshot_replay_admission,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .require_graph_resolution_contract = true,
         .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
@@ -41050,10 +42198,12 @@ fn applyDerivedBatchTargetsContextProfiled(ctx: *const BatchExecutionContext, ba
         if (try batchAdvancesManagedIndexApplyState(ctx.index_manager, batch, index_ref)) {
             const async_ctx = AsyncContext{
                 .alloc = ctx.alloc,
+                .io = ctx.io,
                 .store = ctx.store,
                 .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
                 .index_manager = ctx.index_manager,
                 .apply_mutex = ctx.apply_mutex,
+                .snapshot_replay_admission = ctx.snapshot_replay_admission,
                 .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
                 .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
             };
@@ -41423,10 +42573,12 @@ fn applyDerivedBatchToIndex(self: *DB, batch: derived_types.DerivedBatch, index_
     const resources = self.core.asyncResources();
     const ctx = AsyncContext{
         .alloc = self.alloc,
+        .io = self.backend_runtime.io(),
         .store = resources.store,
         .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
+        .snapshot_replay_admission = resources.snapshot_replay_admission,
         .text_merge_runtime = self.text_merge_runtime,
     };
     try applyDerivedBatchToIndexContext(&ctx, batch, index_ref);
@@ -42804,6 +43956,11 @@ fn filterAndRecordSparseEmbeddingArtifactRepairIssuesForReplay(
 }
 
 fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, profile: ?*BatchProfile) !void {
+    // Generated files and their publication metadata are one physical
+    // generation. Native capture takes the exclusive side of this admission
+    // while copying, so no async worker may rewrite an artifact mid-copy.
+    var snapshot_replay = try acquireSnapshotReplayAsyncContext(ctx);
+    defer if (snapshot_replay) |*lease| lease.release();
     if (index_ref.kind == .full_text) {
         const apply_start_ns = monotonicTimeNs();
         const text_replay_options: index_manager_mod.IndexBatchOptions = .{
@@ -46686,10 +47843,12 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
     if (!try batchAdvancesManagedIndexApplyStateForReplay(resources.index_manager, batch, index_ref)) return false;
     const ctx = AsyncContext{
         .alloc = self.alloc,
+        .io = self.backend_runtime.io(),
         .store = resources.store,
         .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
+        .snapshot_replay_admission = resources.snapshot_replay_admission,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .require_graph_resolution_contract = true,
     };
@@ -46908,10 +48067,12 @@ fn applyDerivedBatchToShadowIfNeeded(self: *DB, batch: derived_types.DerivedBatc
     const async_resources = self.core.asyncResources();
     const ctx = AsyncContext{
         .alloc = self.alloc,
+        .io = self.backend_runtime.io(),
         .store = async_resources.store,
         .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
         .index_manager = shadow.manager,
         .apply_mutex = async_resources.apply_mutex,
+        .snapshot_replay_admission = async_resources.snapshot_replay_admission,
         .allow_graph_materialization = false,
     };
 
@@ -48229,6 +49390,62 @@ fn ensureDirPath(path: []const u8) !void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), path);
+}
+
+fn validateSnapshotId(id: []const u8) !void {
+    if (id.len == 0 or id.len > 255 or
+        std.mem.eql(u8, id, ".") or
+        std.mem.eql(u8, id, "..") or
+        std.mem.indexOfScalar(u8, id, '/') != null or
+        std.mem.indexOfScalar(u8, id, '\\') != null)
+    {
+        return error.InvalidSnapshotId;
+    }
+}
+
+fn snapshotPathExists(io: Io, path: []const u8) !bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.Io.Dir.accessAbsolute(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+    } else {
+        std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+    }
+    return true;
+}
+
+fn createSnapshotStagingRoot(alloc: Allocator, io: Io, parent: []const u8, id: []const u8) ![]u8 {
+    for (0..64) |_| {
+        var entropy: [8]u8 = undefined;
+        try io.randomSecure(&entropy);
+        const nonce = std.fmt.bytesToHex(entropy, .lower);
+        const candidate = try std.fmt.allocPrint(alloc, "{s}/.{s}.staging-{s}", .{ parent, id, &nonce });
+        errdefer alloc.free(candidate);
+        std.Io.Dir.cwd().createDir(io, candidate, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                alloc.free(candidate);
+                continue;
+            },
+            else => return err,
+        };
+        errdefer std.Io.Dir.cwd().deleteTree(io, candidate) catch {};
+        try fs_paths.syncDirPortable(io, parent);
+        return candidate;
+    }
+    return error.SnapshotStagingCollision;
+}
+
+fn publishSnapshotStaging(io: Io, parent: []const u8, staging: []const u8, destination: []const u8) !void {
+    if (try snapshotPathExists(io, destination)) return error.SnapshotAlreadyExists;
+    if (std.fs.path.isAbsolute(destination))
+        try std.Io.Dir.renameAbsolute(staging, destination, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), staging, std.Io.Dir.cwd(), destination, io);
+    try fs_paths.syncDirPortable(io, parent);
 }
 
 fn directoryUsageBytes(alloc: Allocator, path: []const u8) !u64 {
@@ -51694,7 +52911,10 @@ test "db batch projected admission includes payload and internal record overhead
 test "db open borrows shared backend runtime" {
     const alloc = std.testing.allocator;
 
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer runtime.deinit();
 
     var first_path_buf: [256]u8 = undefined;
@@ -51735,7 +52955,10 @@ test "db open borrows shared backend runtime" {
 
 test "db close retires runtime owners for memory primary backend" {
     const alloc = std.testing.allocator;
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
@@ -51822,7 +53045,10 @@ test "db repair capacity treats unsupported observation as accounting only" {
 test "db open downgrades borrowed manual backend runtime to manual executor" {
     const alloc = std.testing.allocator;
 
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
@@ -51838,10 +53064,55 @@ test "db open downgrades borrowed manual backend runtime to manual executor" {
     try std.testing.expect(db.owned_backend_runtime == null);
 }
 
+test "db open owns filesystem io for its manual backend runtime" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .executor = .{ .backend = .manual },
+    });
+    try std.testing.expect(db.owned_backend_runtime != null);
+    try std.testing.expect(db.owned_backend_runtime.?.ownsFilesystemIo());
+    try std.testing.expect(db.backend_runtime.io() == null);
+    try std.testing.expect(db.backend_runtime.filesystemIo() != null);
+    db.close();
+
+    // Closing must release the publication lease before destroying the
+    // runtime and its filesystem authority so the same root can reopen.
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .executor = .{ .backend = .manual },
+    });
+    reopened.close();
+}
+
+test "db open rejects borrowed manual runtime without filesystem authority" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+    });
+    defer runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    try std.testing.expectError(error.BackendRuntimeIoUnavailable, DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+    }));
+}
+
 test "db text merge enabled requires backend runtime io" {
     const alloc = std.testing.allocator;
 
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
@@ -51858,7 +53129,10 @@ test "db text merge enabled requires backend runtime io" {
 test "db enrichment enabled requires backend runtime io" {
     const alloc = std.testing.allocator;
 
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer runtime.deinit();
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -52062,7 +53336,10 @@ test "db runtime-only status overlay preserves a resident enrichment worker" {
 test "db ttl cleanup enabled requires backend runtime io" {
     const alloc = std.testing.allocator;
 
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
@@ -52083,7 +53360,10 @@ const TestTransactionRecoveryResolver = struct {
 test "db transaction recovery enabled requires backend runtime io" {
     const alloc = std.testing.allocator;
 
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
@@ -98798,24 +100078,50 @@ test "db hbc posting lazy versus eager profile benchmark" {
     }
 }
 
-test "db snapshot exports logical store only" {
+test "native restore deletes projections only for explicit physical corruption" {
+    try std.testing.expect(DB.nativeBackupProjectionLoadFailureIsRepairable("Corrupted"));
+    try std.testing.expect(DB.nativeBackupProjectionLoadFailureIsRepairable("FileNotFound"));
+    try std.testing.expect(DB.nativeBackupProjectionLoadFailureIsRepairable("UnsupportedVersion"));
+    try std.testing.expect(!DB.nativeBackupProjectionLoadFailureIsRepairable("OutOfMemory"));
+    try std.testing.expect(!DB.nativeBackupProjectionLoadFailureIsRepairable("InputOutput"));
+    try std.testing.expect(!DB.nativeBackupProjectionLoadFailureIsRepairable("TableReadChurn"));
+    try std.testing.expect(!DB.nativeBackupProjectionLoadFailureIsRepairable("UnknownBackendFailure"));
+}
+
+test "db native snapshot exports self-contained generation" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
+    defer runtime.deinit();
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+    });
     defer db.close();
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:snap", .value = "{\"title\":\"snap\"}" }},
     });
 
-    const snapshot_size = try db.snapshot("snap1");
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Canceled,
+        db.snapshotNativeWithCancellation("cancelled", types.CancellationToken.fromAtomic(&canceled)),
+    );
+    const snapshot_size = try db.snapshotNative("snap1");
     try std.testing.expect(snapshot_size > 0);
+    try std.testing.expectError(error.SnapshotAlreadyExists, db.snapshotNative("snap1"));
 
-    const store_snapshot_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1/store.bin", .{std.mem.span(path)});
+    const store_snapshot_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1/{s}/manifest.bin", .{
+        std.mem.span(path),
+        db_core.primary_lsm_checkpoint_directory_name,
+    });
     defer alloc.free(store_snapshot_path);
     defer {
         var snapshots_buf: [512]u8 = undefined;
@@ -98828,6 +100134,403 @@ test "db snapshot exports logical store only" {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     try std.Io.Dir.accessAbsolute(io_impl.io(), store_snapshot_path, .{});
+    const generation_manifest_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1/{s}", .{ std.mem.span(path), native_backup.manifest_file_name });
+    defer alloc.free(generation_manifest_path);
+    try std.Io.Dir.accessAbsolute(io_impl.io(), generation_manifest_path, .{});
+    const manifest_raw = try std.Io.Dir.cwd().readFileAlloc(
+        io_impl.io(),
+        generation_manifest_path,
+        alloc,
+        .limited(1024 * 1024),
+    );
+    defer alloc.free(manifest_raw);
+    var parsed_manifest = try std.json.parseFromSlice(native_backup.Manifest, alloc, manifest_raw, .{});
+    defer parsed_manifest.deinit();
+    try std.testing.expectEqual(native_backup.format_version, parsed_manifest.value.format_version);
+    try std.testing.expectEqualStrings("antfly-lsm-checkpoint", parsed_manifest.value.primary.artifact_format);
+    try std.testing.expectEqual(@as(u32, 1), parsed_manifest.value.primary.artifact_version);
+}
+
+test "db native snapshot rejects projections without immutable checkpoints" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(path)})) |snapshots| {
+            std.Io.Dir.cwd().deleteTree(std.testing.io, snapshots) catch {};
+        } else |_| {}
+    }
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    // Install the physical backend before materializing the projection. DB
+    // config resolution deliberately couples backend overrides to their
+    // storage override, while this test needs a local LMDB generation.
+    db.core.index_manager.setDenseStorageBackend(.lmdb);
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:one", .value = "{\"embedding\":[1,0,0]}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectError(
+        error.NativeBackupProjectionBackendUnsupported,
+        db.snapshotNative("unsupported-projection-backend"),
+    );
+}
+
+test "db native snapshot rejects storage without atomic host generation publication" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var memory_storage = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory_storage.deinit();
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .storage = memory_storage.storage(),
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:one", .value = "{\"title\":\"one\"}" }} });
+    try std.testing.expectError(
+        error.NativeBackupStorageBackendUnsupported,
+        db.snapshotNative("unsupported-storage-publication"),
+    );
+}
+
+test "db native snapshot rejects an external physical root before creating artifacts" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = std.mem.span(tempPath(&path_buf));
+    defer cleanupTempDir(path);
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "native-capture-external" });
+    defer runtime_store.deinit();
+    var db = try DB.open(alloc, path, .{
+        .primary_backend = .{ .mem = .{} },
+        .primary_runtime_store = &runtime_store,
+        .physical_root_mode = .external_backend,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:one", .value = "{\"title\":\"one\"}" }} });
+
+    try std.testing.expectError(
+        error.NativeBackupStorageBackendUnsupported,
+        db.snapshotNative("unsupported-external-root"),
+    );
+    const snapshot_parent = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{path});
+    defer alloc.free(snapshot_parent);
+    try std.testing.expect(!try snapshotPathExists(std.testing.io, snapshot_parent));
+}
+
+test "native restore backend configuration is resolved exactly once" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = std.mem.span(tempPath(&path_buf));
+    defer cleanupTempDir(path);
+    var candidate_path_buf: [256]u8 = undefined;
+    const candidate_path = std.mem.span(tempPath(&candidate_path_buf));
+    defer cleanupTempDir(candidate_path);
+
+    const ConfiguratorContext = struct {
+        expected_path: []const u8,
+        calls: usize = 0,
+
+        fn configure(ptr: *anyopaque, configured_path: []const u8, opaque_options: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const opts: *OpenOptions = @ptrCast(@alignCast(opaque_options));
+            if (!std.mem.eql(u8, configured_path, self.expected_path)) return error.UnexpectedConfiguredPath;
+            self.calls += 1;
+            opts.start_index_workers = false;
+            opts.start_optional_runtimes = false;
+            opts.ttl_cleanup = .{ .enabled = false };
+        }
+    };
+    var context = ConfiguratorContext{ .expected_path = path };
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    runtime.ptr().db_open_configurator = .{
+        .ptr = &context,
+        .configure_fn = ConfiguratorContext.configure,
+    };
+
+    const resolved = try DB.resolveNativeRestoreOpenPlan(path, .{ .backend_runtime = runtime.ptr() });
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+
+    var transition = try generation_lifecycle.beginProcessExclusiveWithRuntime(path, runtime.ptr());
+    var staged = try transition.beginStaging();
+    const staged_path = try alloc.dupe(u8, staged.path());
+    defer alloc.free(staged_path);
+    const staged_options = try resolved.optionsForStagedGeneration(&staged);
+    try std.testing.expectEqual(&staged, staged_options.staged_generation.?);
+    var candidate = try DB.open(alloc, staged.path(), staged_options);
+    candidate.close();
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    staged.deinit();
+    transition.deinit();
+    try std.testing.expectError(
+        error.InvalidGenerationTransition,
+        DB.open(alloc, staged_path, staged_options),
+    );
+
+    const target_options = try resolved.optionsForTarget(path);
+    try std.testing.expectEqual(@as(?*const generation_lifecycle.StagedGeneration, null), target_options.staged_generation);
+    var db = try DB.open(alloc, path, target_options);
+    defer db.close();
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expectError(
+        error.NativeRestoreTargetPathMismatch,
+        resolved.optionsForTarget(candidate_path),
+    );
+
+    var unrelated_transition = try generation_lifecycle.beginProcessExclusiveWithRuntime(candidate_path, runtime.ptr());
+    defer unrelated_transition.deinit();
+    var unrelated_staged = try unrelated_transition.beginStaging();
+    defer unrelated_staged.deinit();
+    try std.testing.expectError(
+        error.NativeRestoreTargetPathMismatch,
+        resolved.optionsForStagedGeneration(&unrelated_staged),
+    );
+}
+
+test "native restore filesystem publication rejects non-publishable storage capabilities" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = std.mem.span(tempPath(&path_buf));
+    defer cleanupTempDir(path);
+
+    var memory_storage = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory_storage.deinit();
+    try std.testing.expectError(
+        error.NativeBackupStorageBackendUnsupported,
+        DB.resolveNativeRestoreOpenPlan(path, .{
+            .storage = memory_storage.storage(),
+        }),
+    );
+    try std.testing.expectError(
+        error.NativeBackupStorageBackendUnsupported,
+        DB.resolveNativeRestoreOpenPlan(path, .{
+            .primary_backend = .{ .lsm = .{ .storage = memory_storage.storage() } },
+        }),
+    );
+    try std.testing.expectError(
+        error.NativeBackupStorageBackendUnsupported,
+        DB.resolveNativeRestoreOpenPlan(path, .{
+            .index_backends = .{
+                .dense_lsm_storage = memory_storage.storage(),
+            },
+        }),
+    );
+    try std.testing.expectError(
+        error.NativeBackupStorageBackendUnsupported,
+        DB.resolveNativeRestoreOpenPlan(path, .{
+            .index_backends = .{
+                .dense_lsm_options = .{ .storage = memory_storage.storage() },
+            },
+        }),
+    );
+}
+
+test "db native snapshot admission bounds capture under concurrent writes" {
+    const alloc = std.heap.page_allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(path)})) |snapshots| {
+            var cleanup_io = threadedIo();
+            defer cleanup_io.deinit();
+            std.Io.Dir.cwd().deleteTree(cleanup_io.io(), snapshots) catch {};
+        } else |_| {}
+    }
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:before", .value = "{\"embedding\":[1,0,0]}" }},
+        .sync_level = .full_index,
+    });
+
+    const Fence = struct {
+        db: *DB,
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        apply_released: std.atomic.Value(bool) = .init(false),
+        copy_entered: std.atomic.Value(bool) = .init(false),
+        release_copy: std.atomic.Value(bool) = .init(false),
+        materialize_entered: std.atomic.Value(bool) = .init(false),
+        release_materialize: std.atomic.Value(bool) = .init(false),
+
+        fn afterCaptureAdmission(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        }
+
+        fn afterApplyRelease(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.db.core.apply_mutex.tryLockExclusive()) {
+                self.db.core.apply_mutex.unlockExclusive();
+                self.apply_released.store(true, .release);
+            }
+            self.copy_entered.store(true, .release);
+            while (!self.release_copy.load(.acquire)) std.atomic.spinLoopHint();
+        }
+
+        fn beforeArtifactMaterialize(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.materialize_entered.store(true, .release);
+            while (!self.release_materialize.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+    const SnapshotWorker = struct {
+        db: *DB,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            _ = self.db.snapshotNative("fenced-native") catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    const Writer = struct {
+        db: *DB,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.db.batch(.{
+                .writes = &.{.{ .key = "doc:during", .value = "{\"embedding\":[0,1,0]}" }},
+                // Exercise the post-fence generated-index write path. Native
+                // capture must never pin an appendable LSM WAL payload inode.
+                .sync_level = .full_index,
+            }) catch |err| {
+                self.err = err;
+            };
+            self.done.store(true, .release);
+        }
+    };
+    const Maintenance = struct {
+        db: *DB,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            _ = self.db.runLsmMaintenanceStepBestEffort() catch |err| {
+                self.err = err;
+                self.done.store(true, .release);
+                return;
+            };
+            self.done.store(true, .release);
+        }
+    };
+
+    var fence = Fence{ .db = &db };
+    DB.test_snapshot_fence_hook = .{
+        .ptr = &fence,
+        .after_capture_admission = Fence.afterCaptureAdmission,
+        .after_apply_release = Fence.afterApplyRelease,
+        .before_artifact_materialize = Fence.beforeArtifactMaterialize,
+    };
+    defer DB.test_snapshot_fence_hook = null;
+    var worker = SnapshotWorker{ .db = &db };
+    const snapshot_thread = try std.Thread.spawn(.{}, SnapshotWorker.run, .{&worker});
+    while (!fence.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    // Maintenance-owned replay production is not a client mutation and must
+    // remain able to finish after primary admission closes. The capture drain
+    // includes this advance before selecting its final checkpoint.
+    const internal_sequence = try appendDerivedBatchRecord(&db, .{});
+    try std.testing.expect(internal_sequence > 0);
+
+    // A writer arriving after capture intent is published cannot advance the
+    // selected revision. It resumes immediately after staging, before manifest
+    // hashing and publication complete.
+    var writer = Writer{ .db = &db };
+    const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    while (!writer.started.load(.acquire)) std.atomic.spinLoopHint();
+    for (0..1024) |_| std.Thread.yield() catch {};
+    try std.testing.expect(!writer.done.load(.acquire));
+    fence.release.store(true, .release);
+    while (!fence.copy_entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    // Apply release alone is not the publication boundary: the short metadata
+    // pin still excludes physical index maintenance.
+    var maintenance = Maintenance{ .db = &db };
+    const maintenance_thread = try std.Thread.spawn(.{}, Maintenance.run, .{&maintenance});
+    while (!maintenance.started.load(.acquire)) std.atomic.spinLoopHint();
+    for (0..1024) |_| std.Thread.yield() catch {};
+    try std.testing.expect(!maintenance.done.load(.acquire));
+    fence.release_copy.store(true, .release);
+    while (!fence.materialize_entered.load(.acquire)) std.atomic.spinLoopHint();
+    // Every corpus-sized generated and primary read is outside both mutation
+    // fences. Foreground writes and index maintenance must finish even while
+    // artifact materialization is deliberately held.
+    const outside_fence_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
+    while (monotonicTimeNs() < outside_fence_deadline) {
+        if (writer.done.load(.acquire) and maintenance.done.load(.acquire)) break;
+        std.Thread.yield() catch {};
+    }
+    const writer_finished_outside_fence = writer.done.load(.acquire);
+    const maintenance_finished_outside_fence = maintenance.done.load(.acquire);
+    fence.release_materialize.store(true, .release);
+    snapshot_thread.join();
+    maintenance_thread.join();
+    writer_thread.join();
+    if (worker.err) |err| return err;
+    if (maintenance.err) |err| return err;
+    if (writer.err) |err| return err;
+    try std.testing.expect(writer_finished_outside_fence);
+    try std.testing.expect(maintenance_finished_outside_fence);
+    try std.testing.expect(writer.done.load(.acquire));
+    try std.testing.expect(fence.apply_released.load(.acquire));
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/fenced-native", .{std.mem.span(path)});
+    defer alloc.free(snapshot_root);
+    var destination_tmp = std.testing.tmpDir(.{});
+    defer destination_tmp.cleanup();
+    const destination = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{destination_tmp.sub_path});
+    defer alloc.free(destination);
+    var loaded = (try native_backup.validateAndMaterialize(
+        alloc,
+        std.testing.io,
+        snapshot_root,
+        destination,
+    )).?;
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.value().projections.len);
+    try std.testing.expectEqual(
+        loaded.value().capture_target_sequence,
+        loaded.value().projections[0].applied_sequence,
+    );
+    try std.testing.expectEqual(
+        loaded.value().projections[0].applied_sequence,
+        loaded.value().projections[0].target_sequence,
+    );
 }
 
 test "db snapshot exports logical store only for durable lsm primary backend" {
@@ -98851,6 +100554,12 @@ test "db snapshot exports logical store only for durable lsm primary backend" {
 
     const store_snapshot_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1/store.bin", .{std.mem.span(path)});
     defer alloc.free(store_snapshot_path);
+    const snapshot_manifest_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}.snapshots/snap1/{s}",
+        .{ std.mem.span(path), db_core.logical_snapshot_manifest_file_name },
+    );
+    defer alloc.free(snapshot_manifest_path);
     defer {
         var snapshots_buf: [512]u8 = undefined;
         if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(path)})) |snapshots| {
@@ -98862,6 +100571,342 @@ test "db snapshot exports logical store only for durable lsm primary backend" {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     try std.Io.Dir.accessAbsolute(io_impl.io(), store_snapshot_path, .{});
+    try std.Io.Dir.accessAbsolute(io_impl.io(), snapshot_manifest_path, .{});
+}
+
+test "db native deferred restore preserves generated dense generation without embedder" {
+    const alloc = std.testing.allocator;
+    var source_buf: [256]u8 = undefined;
+    const source_path = tempPath(&source_buf);
+    defer cleanupTempDir(source_path);
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+
+    var source_applied: u64 = 0;
+    var source_generation: u64 = 0;
+    var source_count: u64 = 0;
+    {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var source = try DB.open(alloc, std.mem.span(source_path), .{
+            .primary_backend = primary_backend,
+            .enrichment = .{
+                .owner_id = "native-backup-source",
+                .dense_embedder = deterministic.interface(),
+            },
+        });
+        defer source.close();
+        try source.addIndex(.{
+            .name = "semantic_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+        });
+        try source.addIndex(.{
+            .name = "text_idx",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        });
+        try source.batch(.{
+            .writes = &.{.{
+                .key = "doc:native",
+                .value = "{\"body\":\"abcdefghijklmno\",\"title\":\"portable native generation\"}",
+            }},
+            .sync_level = .full_index,
+        });
+        try source.runUntilIdle();
+        const cfg = source.core.index_manager.get("semantic_idx") orelse return error.TestUnexpectedResult;
+        const checkpoint = try source.core.loadProjectionCheckpoint(alloc, cfg.name);
+        source_applied = checkpoint.applied_sequence;
+        source_generation = checkpoint.generation;
+        source_count = source.core.index_manager.denseIndex("semantic_idx").?.index.stats().active_count;
+        try std.testing.expect(source_count > 0);
+        _ = try source.snapshotNative("native-fast");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/native-fast", .{std.mem.span(source_path)});
+    defer alloc.free(snapshot_root);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(source_path)})) |snapshots| {
+            var cleanup_io = threadedIo();
+            defer cleanup_io.deinit();
+            std.Io.Dir.cwd().deleteTree(cleanup_io.io(), snapshots) catch {};
+        } else |_| {}
+    }
+
+    var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(restore_path));
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    var restore_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
+    defer restore_runtime.deinit();
+    try DB.restoreSnapshotToDeferredRuntimeRepair(
+        &staged,
+        alloc,
+        snapshot_root,
+        staged.path(),
+        .{
+            .primary_backend = primary_backend,
+            .backend_runtime = restore_runtime.ptr(),
+        },
+        .{
+            .backup_id = "native-fast",
+            .location = "local",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            .snapshot_path = "native-fast",
+            .group_id = 7001,
+        },
+    );
+    try std.testing.expect(!(try DB.restoreRuntimeRepairNeededForPathWithIo(alloc, std.testing.io, staged.path())));
+    _ = try staged.publish();
+    staged.deinit();
+    transition.deinit();
+
+    var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+        .primary_backend = primary_backend,
+        .open_mode = .query_readonly,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer restored.close();
+    const cfg = restored.core.index_manager.get("semantic_idx") orelse return error.TestUnexpectedResult;
+    const checkpoint = try restored.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try std.testing.expectEqual(source_applied, checkpoint.applied_sequence);
+    try std.testing.expectEqual(source_generation, checkpoint.generation);
+    try std.testing.expectEqual(source_count, restored.core.index_manager.denseIndex("semantic_idx").?.index.stats().active_count);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    const vector = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
+    defer alloc.free(vector);
+    var result = try restored.search(alloc, .{
+        .index_name = "semantic_idx",
+        .dense = .{ .vector = vector, .k = 3 },
+        .return_mode = .parent,
+    });
+    defer result.deinit();
+    try std.testing.expect(result.hits.len > 0);
+    try std.testing.expectEqualStrings("doc:native", result.hits[0].id);
+
+    var text_result = try restored.search(alloc, .{
+        .index_name = "text_idx",
+        .full_text = .{ .match = .{ .field = "title", .text = "generation" } },
+    });
+    defer text_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), text_result.total_hits);
+    try std.testing.expectEqualStrings("doc:native", text_result.hits[0].id);
+}
+
+test "db native restore rejects a primary revision outside the manifest generation" {
+    const alloc = std.testing.allocator;
+    var source_buf: [256]u8 = undefined;
+    const source_path = tempPath(&source_buf);
+    defer cleanupTempDir(source_path);
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+
+    {
+        var source = try DB.open(alloc, std.mem.span(source_path), .{ .primary_backend = primary_backend });
+        defer source.close();
+        try source.batch(.{
+            .writes = &.{.{ .key = "doc:native", .value = "{\"title\":\"revision proof\"}" }},
+            .sync_level = .full_index,
+        });
+        _ = try source.snapshotNative("revision-mismatch");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/revision-mismatch", .{std.mem.span(source_path)});
+    defer alloc.free(snapshot_root);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(source_path)})) |snapshots| {
+            std.Io.Dir.cwd().deleteTree(std.testing.io, snapshots) catch {};
+        } else |_| {}
+    }
+    const manifest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, native_backup.manifest_file_name });
+    defer alloc.free(manifest_path);
+    const manifest_raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, manifest_path, alloc, .limited(8 * 1024 * 1024));
+    defer alloc.free(manifest_raw);
+    var parsed = try std.json.parseFromSlice(native_backup.Manifest, alloc, manifest_raw, .{});
+    defer parsed.deinit();
+    parsed.value.capture_target_sequence += 1;
+    const mismatched_manifest = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    defer alloc.free(mismatched_manifest);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = manifest_path,
+        .data = mismatched_manifest,
+    });
+
+    var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(restore_path));
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    try std.testing.expectError(
+        error.NativeBackupPrimaryCheckpointMismatch,
+        DB.restoreSnapshotToDeferredRuntimeRepairWithIo(
+            &staged,
+            alloc,
+            std.testing.io,
+            snapshot_root,
+            staged.path(),
+            .{ .primary_backend = primary_backend },
+            .{
+                .backup_id = "revision-mismatch",
+                .location = "local",
+                .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                .snapshot_path = "revision-mismatch",
+                .group_id = 7003,
+            },
+        ),
+    );
+}
+
+test "db native restore preserves primary generation and repairs only a missing projection" {
+    const alloc = std.testing.allocator;
+    var source_buf: [256]u8 = undefined;
+    const source_path = tempPath(&source_buf);
+    defer cleanupTempDir(source_path);
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+
+    {
+        var source = try DB.open(alloc, std.mem.span(source_path), .{ .primary_backend = primary_backend });
+        defer source.close();
+        try source.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+        });
+        try source.addIndex(.{
+            .name = "text_idx",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        });
+        try source.batch(.{
+            .writes = &.{.{ .key = "doc:native", .value = "{\"embedding\":[1,0,0],\"title\":\"healthy projection\"}" }},
+            .sync_level = .full_index,
+        });
+        _ = try source.snapshotNative("missing-projection");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/missing-projection", .{std.mem.span(source_path)});
+    defer alloc.free(snapshot_root);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(source_path)})) |snapshots| {
+            std.Io.Dir.cwd().deleteTree(std.testing.io, snapshots) catch {};
+        } else |_| {}
+    }
+    const manifest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, native_backup.manifest_file_name });
+    defer alloc.free(manifest_path);
+    const manifest_raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, manifest_path, alloc, .limited(8 * 1024 * 1024));
+    defer alloc.free(manifest_raw);
+    var parsed = try std.json.parseFromSlice(native_backup.Manifest, alloc, manifest_raw, .{});
+    defer parsed.deinit();
+    var compatibility_tmp = std.testing.tmpDir(.{});
+    defer compatibility_tmp.cleanup();
+    const compatibility_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{compatibility_tmp.sub_path});
+    defer alloc.free(compatibility_path);
+    var compatibility = (try native_backup.validateAndMaterialize(
+        alloc,
+        std.testing.io,
+        snapshot_root,
+        compatibility_path,
+    )).?;
+    defer compatibility.deinit();
+    var mismatch_options = OpenOptions{ .primary_backend = primary_backend };
+    mismatch_options.index_backends.dense_storage_backend = .lmdb;
+    try DB.classifyIncompatibleNativeProjections(
+        &compatibility,
+        mismatch_options,
+    );
+    try std.testing.expect(compatibility.projectionInvalid("dense_idx"));
+    try std.testing.expect(!compatibility.projectionInvalid("text_idx"));
+
+    const damaged = for (parsed.value.artifacts) |artifact| {
+        if (artifact.role == .projection and std.mem.eql(u8, artifact.projection_name, "dense_idx"))
+            break artifact.path;
+    } else return error.TestUnexpectedResult;
+    const damaged_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, damaged });
+    defer alloc.free(damaged_path);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, damaged_path);
+
+    var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(restore_path));
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    try DB.restoreSnapshotToDeferredRuntimeRepairWithIo(
+        &staged,
+        alloc,
+        std.testing.io,
+        snapshot_root,
+        staged.path(),
+        .{ .primary_backend = primary_backend },
+        .{
+            .backup_id = "missing-projection",
+            .location = "local",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            .snapshot_path = "missing-projection",
+            .group_id = 7002,
+        },
+    );
+    try std.testing.expect(try DB.restoreRuntimeRepairNeededForPathWithIo(alloc, std.testing.io, staged.path()));
+    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, staged.path())).?;
+    defer restore_state.deinit(alloc);
+    try std.testing.expectEqualStrings("repair_indexes", restore_state.phase);
+    const repair_path = try index_repair_state.checkpointPathAlloc(alloc, staged.path());
+    defer alloc.free(repair_path);
+    var repair_state = try index_repair_state.load(alloc, repair_path);
+    defer repair_state.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), repair_state.entries.items.len);
+    try std.testing.expectEqualStrings("dense_idx", repair_state.entries.items[0].intent.index_name);
+    try std.testing.expectEqual(
+        index_repair_state.Trigger.projection_generation_invalid,
+        repair_state.entries.items[0].intent.trigger,
+    );
+
+    // Restore cancellation must reach the corpus-scale generation repair, not
+    // merely the loop surrounding it. A pre-cancelled quantum leaves the
+    // durable intent pending and the staged generation unpublished.
+    var repair_db = try DB.open(alloc, staged.path(), .{
+        .primary_backend = primary_backend,
+        .open_mode = .writer_no_replay,
+        .staged_generation = &staged,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+    });
+    defer repair_db.close();
+    const CancellationProbe = struct {
+        requests: usize = 0,
+
+        fn requested(ptr: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.requests += 1;
+            return true;
+        }
+    };
+    var cancellation_probe = CancellationProbe{};
+    try std.testing.expectError(
+        error.RestoreRuntimeRepairIncomplete,
+        repair_db.repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
+            alloc,
+            std.testing.io,
+            .{ .cancel_check = .{
+                .ptr = &cancellation_probe,
+                .is_requested = CancellationProbe.requested,
+            } },
+        ),
+    );
+    try std.testing.expect(cancellation_probe.requests > 0);
+    try std.testing.expect(try repair_db.restoreRuntimeRepairNeeded());
 }
 
 test "db restore snapshot recreates logical store for durable lsm primary backend" {
@@ -98926,6 +100971,64 @@ test "db restore snapshot recreates logical store for durable lsm primary backen
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
 }
 
+test "logical snapshot descriptor is strict while descriptorless compatibility remains readable" {
+    const alloc = std.testing.allocator;
+    var src_buf: [256]u8 = undefined;
+    const src_path = tempPath(&src_buf);
+    defer cleanupTempDir(src_path);
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(src_path), .{
+            .primary_backend = primary_backend,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "doc:legacy", .value = "{\"title\":\"legacy\"}" }} });
+        _ = try db.snapshot("compat");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/compat", .{std.mem.span(src_path)});
+    defer alloc.free(snapshot_root);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
+            var cleanup_io = threadedIo();
+            defer cleanup_io.deinit();
+            std.Io.Dir.cwd().deleteTree(cleanup_io.io(), snapshots) catch {};
+        } else |_| {}
+    }
+    const descriptor_path = try std.fs.path.join(alloc, &.{ snapshot_root, db_core.logical_snapshot_manifest_file_name });
+    defer alloc.free(descriptor_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = descriptor_path,
+        .data = "{\"format_version\":2,\"primary_artifact_format\":\"antfly-kv-stream\",\"primary_artifact_version\":2,\"replay_embedded\":true}",
+    });
+    try std.testing.expectError(
+        error.UnsupportedBackupFormat,
+        DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+        }),
+    );
+
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, descriptor_path);
+    try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
+        .primary_backend = primary_backend,
+        .start_index_workers = false,
+    });
+    var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+        .primary_backend = primary_backend,
+        .start_index_workers = false,
+    });
+    defer restored.close();
+    const doc = (try restored.get(alloc, "doc:legacy")) orelse return error.TestExpectedEqual;
+    defer alloc.free(doc);
+    try std.testing.expectEqualStrings("{\"title\":\"legacy\"}", doc);
+}
+
 test "db restore snapshot repeatedly validates run-backed doc identity metadata" {
     // Exercise the allocator used by the server process. Darwin's malloc
     // diagnostics only poison and guard allocations that cross this boundary.
@@ -98983,9 +101086,10 @@ test "db restore snapshot repeatedly validates run-backed doc identity metadata"
         defer transition.deinit();
         var staged_generation = try transition.beginStaging();
         defer staged_generation.deinit();
-        try DB.restoreSnapshotToDeferredRuntimeRepair(
+        try DB.restoreSnapshotToDeferredRuntimeRepairWithIo(
             &staged_generation,
             alloc,
+            std.testing.io,
             snapshot_root,
             staged_generation.path(),
             .{
@@ -99121,9 +101225,10 @@ test "db deferred restore rejects strict doc identity namespace mismatch" {
     defer transition.deinit();
     var staged_generation = try transition.beginStaging();
     defer staged_generation.deinit();
-    try std.testing.expectError(error.IdentityNamespaceMismatch, DB.restoreSnapshotToDeferredRuntimeRepair(
+    try std.testing.expectError(error.IdentityNamespaceMismatch, DB.restoreSnapshotToDeferredRuntimeRepairWithIo(
         &staged_generation,
         alloc,
+        std.testing.io,
         snapshot_root,
         staged_generation.path(),
         .{

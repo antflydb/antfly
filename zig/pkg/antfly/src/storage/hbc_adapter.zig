@@ -2609,6 +2609,13 @@ pub const HBCIndex = struct {
         }
     }
 
+    pub fn pinNativeCheckpoint(self: *HBCIndex) !lsm_backend.Backend.NativeCheckpoint {
+        return switch (self.env_owner) {
+            .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
+            .lmdb => error.Unsupported,
+        };
+    }
+
     pub fn snapshotLsmNativeStorageStats(self: *const HBCIndex) ?lsm_backend.NativeStorageStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),
