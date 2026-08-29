@@ -47,18 +47,19 @@ pub const SnapshotStore = struct {
         get_snapshot: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8) anyerror![]u8,
         release_snapshot: ?*const fn (ptr: *anyopaque, snapshot_id: []const u8) anyerror!void = null,
         begin_chunked_snapshot: ?*const fn (ptr: *anyopaque, manifest: snapshot_transfer.Manifest, snapshot_id: []const u8) anyerror!void = null,
-        put_snapshot_chunk: ?*const fn (ptr: *anyopaque, snapshot_id: []const u8, offset: u64, body: []const u8) anyerror!void = null,
+        put_snapshot_chunk: ?*const fn (ptr: *anyopaque, snapshot_id: []const u8, generation: snapshot_transfer.Generation, offset: u64, body: []const u8) anyerror!void = null,
         commit_chunked_snapshot: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             snapshot_id: []const u8,
+            generation: snapshot_transfer.Generation,
             materialize: bool,
         ) anyerror!?raft_engine.core.types.Snapshot = null,
         get_snapshot_upload_manifest: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8) anyerror!snapshot_transfer.Manifest = null,
         get_snapshot_manifest: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8) anyerror!snapshot_transfer.Manifest = null,
-        get_snapshot_chunk: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8, offset: u64, max_len: usize) anyerror![]u8 = null,
-        abort_chunked_snapshot: ?*const fn (ptr: *anyopaque, snapshot_id: []const u8) anyerror!void = null,
-        release_chunked_snapshot: ?*const fn (ptr: *anyopaque, snapshot_id: []const u8) anyerror!void = null,
+        get_snapshot_chunk: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8, generation: snapshot_transfer.Generation, offset: u64, max_len: usize) anyerror![]u8 = null,
+        abort_chunked_snapshot: ?*const fn (ptr: *anyopaque, snapshot_id: []const u8, generation: snapshot_transfer.Generation) anyerror!void = null,
+        release_chunked_snapshot: ?*const fn (ptr: *anyopaque, snapshot_id: []const u8, generation: snapshot_transfer.Generation) anyerror!void = null,
         max_chunk_bytes: ?*const fn (ptr: *anyopaque) usize = null,
     };
 
@@ -141,6 +142,7 @@ pub const HttpServer = struct {
     const snapshot_operation_header = "x-antfly-raft-snapshot-operation";
     const snapshot_offset_header = "x-antfly-raft-snapshot-offset";
     const snapshot_chunk_length_header = "x-antfly-raft-snapshot-chunk-length";
+    const snapshot_generation_header = "x-antfly-raft-snapshot-generation";
 
     alloc: std.mem.Allocator,
     cfg: HttpServerConfig,
@@ -327,22 +329,31 @@ pub const HttpServer = struct {
                 var manifest = try snapshot_transfer.decode(self.alloc, req.body);
                 defer manifest.deinit(self.alloc);
                 try validateManifestRequest(req, manifest);
+                const generation = try parseRequiredGenerationHeader(req);
+                const body_generation = try snapshot_transfer.generationFromEncodedManifest(req.body);
+                if (!std.mem.eql(
+                    u8,
+                    &generation,
+                    &body_generation,
+                )) return error.SnapshotGenerationMismatch;
                 try store.vtable.begin_chunked_snapshot.?(store.ptr, manifest, snapshot_id);
                 return try self.textResponse(201, "snapshot upload initialized");
             }
             if (std.mem.eql(u8, operation, "chunk") and req.method == .PUT) {
                 if (req.body.len > self.cfg.max_request_bytes) return error.RequestTooLarge;
                 const offset = try parseRequiredU64Header(req, snapshot_offset_header);
+                const generation = try parseRequiredGenerationHeader(req);
                 var manifest = store.vtable.get_snapshot_upload_manifest.?(store.ptr, self.alloc, snapshot_id) catch |err| switch (err) {
                     error.FileNotFound => return try self.textResponse(409, "snapshot upload not initialized"),
                     else => return err,
                 };
                 defer manifest.deinit(self.alloc);
                 try validateManifestRequest(req, manifest);
-                try store.vtable.put_snapshot_chunk.?(store.ptr, snapshot_id, offset, req.body);
+                try store.vtable.put_snapshot_chunk.?(store.ptr, snapshot_id, generation, offset, req.body);
                 return try self.textResponse(202, "snapshot chunk accepted");
             }
             if (std.mem.eql(u8, operation, "commit") and req.method == .POST) {
+                const generation = try parseRequiredGenerationHeader(req);
                 var manifest = store.vtable.get_snapshot_upload_manifest.?(store.ptr, self.alloc, snapshot_id) catch |err| switch (err) {
                     error.FileNotFound => return try self.textResponse(409, "snapshot upload not initialized"),
                     else => return err,
@@ -368,6 +379,7 @@ pub const HttpServer = struct {
                     store.ptr,
                     self.alloc,
                     snapshot_id,
+                    generation,
                     handler != null,
                 );
                 errdefer if (snapshot) |*owned| owned.deinit(self.alloc);
@@ -383,7 +395,7 @@ pub const HttpServer = struct {
                     snapshot = null;
                     admitted = false;
                     try live_handler.handleSnapshotUpload(upload);
-                    store.vtable.release_chunked_snapshot.?(store.ptr, snapshot_id) catch |err| {
+                    store.vtable.release_chunked_snapshot.?(store.ptr, snapshot_id, generation) catch |err| {
                         std.log.warn("committed live snapshot cleanup deferred snapshot_id={s} err={s}", .{
                             snapshot_id,
                             @errorName(err),
@@ -398,13 +410,14 @@ pub const HttpServer = struct {
                 return try self.textResponse(201, "snapshot committed");
             }
             if (std.mem.eql(u8, operation, "abort") and req.method == .DELETE) {
+                const generation = try parseRequiredGenerationHeader(req);
                 var manifest = store.vtable.get_snapshot_upload_manifest.?(store.ptr, self.alloc, snapshot_id) catch |err| switch (err) {
                     error.FileNotFound => return try self.textResponse(204, ""),
                     else => return err,
                 };
                 defer manifest.deinit(self.alloc);
                 try validateManifestRequest(req, manifest);
-                if (store.vtable.abort_chunked_snapshot) |abort| try abort(store.ptr, snapshot_id);
+                if (store.vtable.abort_chunked_snapshot) |abort| try abort(store.ptr, snapshot_id, generation);
                 return try self.textResponse(204, "");
             }
             return error.InvalidSnapshotTransferOperation;
@@ -419,19 +432,32 @@ pub const HttpServer = struct {
                 defer manifest.deinit(self.alloc);
                 const body = try snapshot_transfer.encode(self.alloc, manifest);
                 errdefer self.alloc.free(body);
+                const generation = try snapshot_transfer.generationFromEncodedManifest(body);
+                const encoded_generation = snapshot_transfer.encodeGeneration(generation);
+                const headers = try self.alloc.alloc(common.Header, 1);
+                errdefer self.alloc.free(headers);
+                headers[0] = .{
+                    .name = try self.alloc.dupe(u8, snapshot_generation_header),
+                    .value = undefined,
+                };
+                errdefer self.alloc.free(headers[0].name);
+                headers[0].value = try self.alloc.dupe(u8, &encoded_generation);
+                errdefer self.alloc.free(headers[0].value);
                 return .{
                     .status = 200,
                     .content_type = try self.alloc.dupe(u8, "application/x-antflydb-raft-snapshot-manifest-v2"),
+                    .headers = headers,
                     .body = body,
                 };
             }
             if (std.mem.eql(u8, operation, "chunk") and req.method == .GET) {
                 const offset = try parseRequiredU64Header(req, snapshot_offset_header);
                 const requested_len = try parseRequiredU64Header(req, snapshot_chunk_length_header);
+                const generation = try parseRequiredGenerationHeader(req);
                 const max_len = std.math.cast(usize, requested_len) orelse return error.InvalidSnapshotChunkLength;
                 if (max_len == 0 or max_len > snapshot_transfer.max_chunk_bytes)
                     return error.InvalidSnapshotChunkLength;
-                const body = store.vtable.get_snapshot_chunk.?(store.ptr, self.alloc, snapshot_id, offset, max_len) catch |err| switch (err) {
+                const body = store.vtable.get_snapshot_chunk.?(store.ptr, self.alloc, snapshot_id, generation, offset, max_len) catch |err| switch (err) {
                     error.FileNotFound => return try self.textResponse(404, "snapshot artifact not found"),
                     else => return err,
                 };
@@ -443,7 +469,8 @@ pub const HttpServer = struct {
                 };
             }
             if (std.mem.eql(u8, operation, "release") and req.method == .DELETE) {
-                store.vtable.release_chunked_snapshot.?(store.ptr, snapshot_id) catch |err| switch (err) {
+                const generation = try parseRequiredGenerationHeader(req);
+                store.vtable.release_chunked_snapshot.?(store.ptr, snapshot_id, generation) catch |err| switch (err) {
                     error.FileNotFound => {},
                     else => return err,
                 };
@@ -479,6 +506,12 @@ pub const HttpServer = struct {
         return std.fmt.parseInt(u64, encoded, 10) catch return error.InvalidSnapshotTransferHeader;
     }
 
+    fn parseRequiredGenerationHeader(req: common.HttpRequest) !snapshot_transfer.Generation {
+        const encoded = req.header(snapshot_generation_header) orelse
+            return error.MissingSnapshotTransferHeader;
+        return snapshot_transfer.decodeGeneration(encoded);
+    }
+
     fn validateManifestRequest(req: common.HttpRequest, manifest: snapshot_transfer.Manifest) !void {
         if (try parseRequiredU64Header(req, "x-antfly-raft-group-id") != manifest.group_id or
             try parseRequiredU64Header(req, "x-antfly-raft-from-node-id") != manifest.from or
@@ -494,6 +527,7 @@ pub const HttpServer = struct {
         var response = self.handle(req) catch |err| switch (err) {
             error.SnapshotAdmissionBackpressure => try self.textResponse(503, "snapshot admission temporarily unavailable"),
             error.SnapshotArtifactQuotaExceeded => try self.textResponse(507, "snapshot artifact quota exceeded"),
+            error.SnapshotGenerationMismatch => try self.textResponse(409, "snapshot artifact generation changed"),
             error.RequestTooLarge, error.SnapshotTooLarge => try self.textResponse(413, "snapshot request too large"),
             else => return err,
         };
@@ -617,17 +651,17 @@ test "http server advertises isolated snapshot routes only for complete stores" 
             return try alloc.alloc(u8, 0);
         }
         fn begin(_: *anyopaque, _: snapshot_transfer.Manifest, _: []const u8) !void {}
-        fn putChunk(_: *anyopaque, _: []const u8, _: u64, _: []const u8) !void {}
-        fn commit(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: bool) !?raft_engine.core.types.Snapshot {
+        fn putChunk(_: *anyopaque, _: []const u8, _: snapshot_transfer.Generation, _: u64, _: []const u8) !void {}
+        fn commit(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: snapshot_transfer.Generation, _: bool) !?raft_engine.core.types.Snapshot {
             return null;
         }
         fn getManifest(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !snapshot_transfer.Manifest {
             return error.NotUsed;
         }
-        fn getChunk(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
+        fn getChunk(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: snapshot_transfer.Generation, _: u64, _: usize) ![]u8 {
             return try alloc.alloc(u8, 0);
         }
-        fn discard(_: *anyopaque, _: []const u8) !void {}
+        fn discard(_: *anyopaque, _: []const u8, _: snapshot_transfer.Generation) !void {}
     };
 
     var handler_context: u8 = 0;

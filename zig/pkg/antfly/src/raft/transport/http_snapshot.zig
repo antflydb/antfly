@@ -169,11 +169,9 @@ pub const HttpSnapshotTransport = struct {
                 defer target.deinit(self.alloc);
                 const capabilities = self.peerSnapshotV2Capabilities(target.capabilities_uri, req.from);
                 if (requested_format == .chunked_manifest_v2) {
-                    const peer_max = if (capabilities) |value|
-                        value.max_chunk_bytes
-                    else
-                        snapshot_transfer.min_chunk_bytes;
-                    return try self.sendChunkedSnapshot(req, target.upload_uri, &live_headers, peer_max);
+                    const value = capabilities orelse
+                        return error.SnapshotTransferProtocolUpgradeRequired;
+                    return try self.sendChunkedSnapshot(req, target.upload_uri, &live_headers, value.max_chunk_bytes);
                 }
                 if (capabilities) |value|
                     return try self.sendChunkedSnapshot(req, target.upload_uri, &live_headers, value.max_chunk_bytes);
@@ -353,9 +351,11 @@ pub const HttpSnapshotTransport = struct {
         };
         const encoded_manifest = try snapshot_transfer.encode(self.alloc, manifest);
         defer self.alloc.free(encoded_manifest);
+        const generation = try snapshot_transfer.generationFromEncodedManifest(encoded_manifest);
+        const encoded_generation = snapshot_transfer.encodeGeneration(generation);
 
-        var begin_headers: [6]common.RequestHeader = undefined;
-        const begin_count = appendTransferHeaders(&begin_headers, identity_headers, "begin", null, null);
+        var begin_headers: [7]common.RequestHeader = undefined;
+        const begin_count = appendTransferHeaders(&begin_headers, identity_headers, &encoded_generation, "begin", null, null);
         try self.executeExpectedSuccess(.{
             .method = .POST,
             .uri = uri,
@@ -365,8 +365,8 @@ pub const HttpSnapshotTransport = struct {
             .body = encoded_manifest,
         });
         errdefer {
-            var abort_headers: [6]common.RequestHeader = undefined;
-            const abort_count = appendTransferHeaders(&abort_headers, identity_headers, "abort", null, null);
+            var abort_headers: [7]common.RequestHeader = undefined;
+            const abort_count = appendTransferHeaders(&abort_headers, identity_headers, &encoded_generation, "abort", null, null);
             self.executeExpectedSuccess(.{
                 .method = .DELETE,
                 .uri = uri,
@@ -383,8 +383,8 @@ pub const HttpSnapshotTransport = struct {
             const end = @min(req.snapshot.data.len, offset + transfer_chunk_size);
             var offset_buf: [32]u8 = undefined;
             const encoded_offset = try std.fmt.bufPrint(&offset_buf, "{d}", .{offset});
-            var chunk_headers: [7]common.RequestHeader = undefined;
-            const chunk_count = appendTransferHeaders(&chunk_headers, identity_headers, "chunk", encoded_offset, null);
+            var chunk_headers: [8]common.RequestHeader = undefined;
+            const chunk_count = appendTransferHeaders(&chunk_headers, identity_headers, &encoded_generation, "chunk", encoded_offset, null);
             try self.executeExpectedSuccess(.{
                 .method = .PUT,
                 .uri = uri,
@@ -396,8 +396,8 @@ pub const HttpSnapshotTransport = struct {
             offset = end;
         }
 
-        var commit_headers: [6]common.RequestHeader = undefined;
-        const commit_count = appendTransferHeaders(&commit_headers, identity_headers, "commit", null, null);
+        var commit_headers: [7]common.RequestHeader = undefined;
+        const commit_count = appendTransferHeaders(&commit_headers, identity_headers, &encoded_generation, "commit", null, null);
         try self.executeExpectedSuccess(.{
             .method = .POST,
             .uri = uri,
@@ -409,6 +409,7 @@ pub const HttpSnapshotTransport = struct {
     fn executeExpectedSuccess(self: *HttpSnapshotTransport, req: common.HttpRequest) !void {
         var resp = try self.executor.execute(self.alloc, req);
         defer resp.deinit(self.alloc);
+        if (resp.status == 409) return error.SnapshotArtifactGenerationConflict;
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
     }
 
@@ -483,12 +484,11 @@ pub const HttpSnapshotTransport = struct {
             return error.SnapshotTransferProtocolUpgradeRequired;
         defer target.deinit(self.alloc);
         const capabilities = self.peerSnapshotV2Capabilities(target.capabilities_uri, 0);
-        if (require_capability and capabilities == null) return error.SnapshotArtifactNotFound;
-        const peer_max = if (capabilities) |value|
-            value.max_chunk_bytes
+        const value = capabilities orelse return if (require_capability)
+            error.SnapshotArtifactNotFound
         else
-            snapshot_transfer.min_chunk_bytes;
-        return try self.fetchSnapshotV2(req, receiver, target.fetch_uri, peer_max);
+            error.SnapshotTransferProtocolUpgradeRequired;
+        return try self.fetchSnapshotV2(req, receiver, target.fetch_uri, value.max_chunk_bytes);
     }
 
     fn mapSnapshotFetchStatus(status: u16) !void {
@@ -496,7 +496,7 @@ pub const HttpSnapshotTransport = struct {
             200...299 => {},
             404 => error.SnapshotArtifactNotFound,
             410 => error.SnapshotArtifactExpired,
-            409 => error.SnapshotArtifactNotCommitted,
+            409 => error.SnapshotArtifactGenerationConflict,
             503 => error.SnapshotAdmissionBackpressure,
             else => error.UnexpectedHttpStatus,
         };
@@ -587,6 +587,8 @@ pub const HttpSnapshotTransport = struct {
 
         var manifest = try snapshot_transfer.decode(self.alloc, resp.body);
         defer manifest.deinit(self.alloc);
+        const generation = try snapshot_transfer.generationFromEncodedManifest(resp.body);
+        const encoded_generation = snapshot_transfer.encodeGeneration(generation);
         if (manifest.group_id != req.group_id)
             return error.SnapshotTransferIdentityMismatch;
         switch (manifest.purpose()) {
@@ -609,6 +611,7 @@ pub const HttpSnapshotTransport = struct {
             const chunk_headers = [_]common.RequestHeader{
                 .{ .name = "x-antfly-raft-snapshot-protocol", .value = "2" },
                 .{ .name = "x-antfly-raft-snapshot-operation", .value = "chunk" },
+                .{ .name = "x-antfly-raft-snapshot-generation", .value = &encoded_generation },
                 .{ .name = "x-antfly-raft-snapshot-offset", .value = encoded_offset },
                 .{ .name = "x-antfly-raft-snapshot-chunk-length", .value = encoded_length },
             };
@@ -641,6 +644,7 @@ pub const HttpSnapshotTransport = struct {
         const release_headers = [_]common.RequestHeader{
             .{ .name = "x-antfly-raft-snapshot-protocol", .value = "2" },
             .{ .name = "x-antfly-raft-snapshot-operation", .value = "release" },
+            .{ .name = "x-antfly-raft-snapshot-generation", .value = &encoded_generation },
         };
         self.executeExpectedSuccess(.{
             .method = .DELETE,
@@ -655,16 +659,19 @@ pub const HttpSnapshotTransport = struct {
     fn appendTransferHeaders(
         out: []common.RequestHeader,
         identity: []const common.RequestHeader,
+        generation: []const u8,
         operation: []const u8,
         offset: ?[]const u8,
         chunk_length: ?[]const u8,
     ) usize {
-        std.debug.assert(out.len >= identity.len + 2 + @intFromBool(offset != null) + @intFromBool(chunk_length != null));
+        std.debug.assert(out.len >= identity.len + 3 + @intFromBool(offset != null) + @intFromBool(chunk_length != null));
         @memcpy(out[0..identity.len], identity);
         var count = identity.len;
         out[count] = .{ .name = "x-antfly-raft-snapshot-protocol", .value = "2" };
         count += 1;
         out[count] = .{ .name = "x-antfly-raft-snapshot-operation", .value = operation };
+        count += 1;
+        out[count] = .{ .name = "x-antfly-raft-snapshot-generation", .value = generation };
         count += 1;
         if (offset) |value| {
             out[count] = .{ .name = "x-antfly-raft-snapshot-offset", .value = value };
@@ -936,7 +943,7 @@ test "unknown locator fetches legacy first while v2 locator is deterministic" {
             if (std.mem.eql(u8, req.uri, routes.Routes.capabilities)) {
                 return .{
                     .status = 200,
-                    .body = try alloc.dupe(u8, "{\"snapshot_transfer_protocol_version\":2,\"snapshot_transfer_route_version\":1}"),
+                    .body = try alloc.dupe(u8, "{\"snapshot_transfer_protocol_version\":2,\"snapshot_transfer_route_version\":2}"),
                 };
             }
             self.v2_requests += 1;
@@ -989,6 +996,10 @@ test "v2 bootstrap artifact validates its owner instead of a Raft sender" {
 
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, req.uri, routes.Routes.capabilities)) return .{
+                .status = 200,
+                .body = try alloc.dupe(u8, "{\"snapshot_transfer_protocol_version\":2,\"snapshot_transfer_route_version\":2,\"snapshot_max_chunk_bytes\":65536}"),
+            };
             if (std.mem.eql(u8, req.header("x-antfly-raft-snapshot-operation") orelse "", "manifest")) {
                 return .{
                     .status = 200,
@@ -1048,6 +1059,10 @@ test "v2 fetch transfers snapshot ownership before receiver errors" {
 
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, req.uri, routes.Routes.capabilities)) return .{
+                .status = 200,
+                .body = try alloc.dupe(u8, "{\"snapshot_transfer_protocol_version\":2,\"snapshot_transfer_route_version\":2,\"snapshot_max_chunk_bytes\":65536}"),
+            };
             const operation = req.header("x-antfly-raft-snapshot-operation") orelse "";
             if (std.mem.eql(u8, operation, "manifest")) return .{
                 .status = 200,
@@ -1444,7 +1459,7 @@ test "versioned v2 store-only upload uses its locator and artifact purpose" {
                     .status = 200,
                     .body = try std.fmt.allocPrint(
                         alloc,
-                        "{{\"snapshot_transfer_protocol_version\":2,\"snapshot_transfer_route_version\":1,\"snapshot_max_chunk_bytes\":{d}}}",
+                        "{{\"snapshot_transfer_protocol_version\":2,\"snapshot_transfer_route_version\":2,\"snapshot_max_chunk_bytes\":{d}}}",
                         .{snapshot_transfer.min_chunk_bytes},
                     ),
                 };

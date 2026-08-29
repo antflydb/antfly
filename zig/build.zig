@@ -3869,6 +3869,7 @@ pub fn build(b: *std.Build) void {
         "api http server rejects oversized table definitions before parsing across public and MCP",
         "api http server reports exhausted table mutation authority consistently",
         "ambiguous mutation response is explicitly non-retryable",
+        "routed table mutation preserves hop budget for provably unsent request",
         "api http server create index installs exact visible config and defers lagging projection",
         "status source reports an absent linearizable read capability without failing",
         "table read source distinguishes unavailable physical capability observation",

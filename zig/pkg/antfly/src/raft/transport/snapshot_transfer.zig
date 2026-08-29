@@ -9,8 +9,10 @@ const raft_engine = @import("raft_engine");
 pub const protocol_version: u32 = 2;
 /// Generation of the isolated `/raft/v2/snapshot/*` HTTP routing contract.
 /// This is deliberately separate from the snapshot wire format version.
-pub const http_route_version: u32 = 1;
+pub const http_route_version: u32 = 2;
 pub const digest_len = std.crypto.hash.sha2.Sha256.digest_length;
+pub const Generation = [digest_len]u8;
+pub const generation_hex_len = digest_len * 2;
 pub const max_manifest_bytes: usize = 256 * 1024;
 /// Every v2 implementation must accept at least this chunk size. It is the
 /// rolling-compatible fallback when talking to an early v2 peer that does not
@@ -81,6 +83,29 @@ pub fn digest(bytes: []const u8) [digest_len]u8 {
     var value: [digest_len]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &value, .{});
     return value;
+}
+
+/// Immutable identity for one artifact incarnation. The manifest checksum is
+/// already a digest of every identity, metadata, size, and payload-digest
+/// field, so it is also the cheapest complete generation fence to carry on
+/// each chunk request.
+pub fn generationFromEncodedManifest(encoded: []const u8) !Generation {
+    if (encoded.len < digest_len) return error.InvalidSnapshotManifest;
+    var generation: Generation = undefined;
+    @memcpy(&generation, encoded[encoded.len - digest_len ..]);
+    return generation;
+}
+
+pub fn encodeGeneration(generation: Generation) [generation_hex_len]u8 {
+    return std.fmt.bytesToHex(generation, .lower);
+}
+
+pub fn decodeGeneration(encoded: []const u8) !Generation {
+    if (encoded.len != generation_hex_len) return error.InvalidSnapshotGeneration;
+    var generation: Generation = undefined;
+    _ = std.fmt.hexToBytes(&generation, encoded) catch
+        return error.InvalidSnapshotGeneration;
+    return generation;
 }
 
 pub fn encode(alloc: std.mem.Allocator, manifest: Manifest) ![]u8 {
@@ -201,6 +226,14 @@ test "snapshot transfer manifest round trips with integrity metadata" {
     try std.testing.expectEqual(original.data_len, decoded.data_len);
     try std.testing.expectEqualSlices(u64, &voters, decoded.metadata.conf_state.voters);
     try std.testing.expectEqualSlices(u8, &original.digest, &decoded.digest);
+    const generation = try generationFromEncodedManifest(encoded);
+    const encoded_generation = encodeGeneration(generation);
+    const decoded_generation = try decodeGeneration(&encoded_generation);
+    try std.testing.expectEqualSlices(
+        u8,
+        &generation,
+        &decoded_generation,
+    );
 
     const corrupt = try std.testing.allocator.dupe(u8, encoded);
     defer std.testing.allocator.free(corrupt);

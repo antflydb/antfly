@@ -513,10 +513,10 @@ pub const MetadataHttpClient = struct {
 
     /// Forwards a public create to the current metadata leader's internal
     /// table route with at-most-once semantics. `error.NotLeader` proves the
-    /// receiving node rejected the mutation before admission, so the caller
-    /// may re-resolve the leader and forward once more. Ambiguous transport
-    /// or authority outcomes surface as `error.MetadataMutationOutcomeUnknown`
-    /// and must not be replayed without an exact state probe.
+    /// receiving node rejected the mutation before admission, while
+    /// `error.RaftMutationRequestNotSent` proves the request never crossed the
+    /// transport boundary. Ambiguous outcomes must not be replayed without an
+    /// exact state probe.
     pub fn createTableForwarded(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -629,7 +629,7 @@ pub const MetadataHttpClient = struct {
             if (delivery == .not_sent or
                 (delivery == .unknown and err == error.ConnectionRefused))
             {
-                return error.NotLeader;
+                return error.RaftMutationRequestNotSent;
             }
             return error.MetadataMutationOutcomeUnknown;
         };
@@ -1775,6 +1775,26 @@ test "metadata http client preserves transport ambiguity for forwarded table mut
     try std.testing.expectEqual(@as(usize, 1), dropping.attempts);
 }
 
+test "metadata http client classifies a provably unsent table mutation" {
+    const UnsentExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            req.delivery_tracker.?.markNotSent();
+            return error.ConnectionResetByPeer;
+        }
+    };
+
+    var executor = UnsentExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(
+        error.RaftMutationRequestNotSent,
+        client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+    );
+}
+
 test "metadata http client preserves extension ownership across forwarding" {
     const ExtensionOwnedExecutor = struct {
         fn ownedHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !http_common.Header {
@@ -1858,11 +1878,12 @@ test "metadata http client preserves unrecognized server outcomes for forwarded 
     try std.testing.expectEqual(@as(usize, 1), server_error.attempts);
 
     // An old metadata leader does not stamp the mutation protocol marker. Its
-    // headerless 404 must not be mistaken for a definitive table absence.
+    // headerless 404 is a definitive route-version gate, not table absence or
+    // an ambiguous admitted mutation outcome.
     var old_leader = StatusExecutor{ .status = 404 };
     var drop_client = MetadataHttpClient.init(std.testing.allocator, old_leader.executor());
     try std.testing.expectError(
-        error.MetadataMutationOutcomeUnknown,
+        error.TableTopologyProtocolUpgradeRequired,
         drop_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
     );
     try std.testing.expectEqual(@as(usize, 1), old_leader.attempts);

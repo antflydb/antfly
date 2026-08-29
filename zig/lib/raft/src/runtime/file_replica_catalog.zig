@@ -255,27 +255,49 @@ fn decodeRecord(alloc: std.mem.Allocator, reader: *std.Io.Reader) !replica.Repli
     record.bootstrap = switch (bootstrap_kind) {
         bootstrap_empty => .empty,
         bootstrap_persisted => .persisted,
-        bootstrap_fetch_snapshot, bootstrap_fetch_snapshot_versioned => .{ .fetch_snapshot = .{
-            .from = try reader.takeInt(u64, .little),
-            .term = try reader.takeInt(u64, .little),
-            .fetch_immediately = (try reader.takeByte()) != 0,
-            .locator = .{
-                .snapshot_id = try readBytes(alloc, reader),
-                .uri = try readBytes(alloc, reader),
-                .format = if (bootstrap_kind == bootstrap_fetch_snapshot_versioned) blk: {
-                    const format = std.enums.fromInt(
-                        snapshot_transport_iface.SnapshotArtifactFormat,
-                        try reader.takeByte(),
-                    ) orelse return error.InvalidReplicaCatalogBootstrap;
-                    if (format == .unknown) return error.InvalidReplicaCatalogBootstrap;
-                    break :blk format;
-                } else .unknown,
-            },
-        } },
+        bootstrap_fetch_snapshot, bootstrap_fetch_snapshot_versioned => .{
+            .fetch_snapshot = try decodeSnapshotBootstrap(
+                alloc,
+                reader,
+                bootstrap_kind == bootstrap_fetch_snapshot_versioned,
+            ),
+        },
         else => return error.InvalidReplicaCatalogBootstrap,
     };
 
     return record;
+}
+
+fn decodeSnapshotBootstrap(
+    alloc: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    versioned: bool,
+) !replica.SnapshotBootstrap {
+    const from = try reader.takeInt(u64, .little);
+    const term = try reader.takeInt(u64, .little);
+    const fetch_immediately = (try reader.takeByte()) != 0;
+    const snapshot_id = try readBytes(alloc, reader);
+    errdefer alloc.free(snapshot_id);
+    const uri = try readBytes(alloc, reader);
+    errdefer alloc.free(uri);
+    const format: snapshot_transport_iface.SnapshotArtifactFormat = if (versioned) blk: {
+        const decoded = std.enums.fromInt(
+            snapshot_transport_iface.SnapshotArtifactFormat,
+            try reader.takeByte(),
+        ) orelse return error.InvalidReplicaCatalogBootstrap;
+        if (decoded == .unknown) return error.InvalidReplicaCatalogBootstrap;
+        break :blk decoded;
+    } else .unknown;
+    return .{
+        .from = from,
+        .term = term,
+        .fetch_immediately = fetch_immediately,
+        .locator = .{
+            .snapshot_id = snapshot_id,
+            .uri = uri,
+            .format = format,
+        },
+    };
 }
 
 fn writeBytes(alloc: std.mem.Allocator, buffer: *std.ArrayList(u8), bytes: []const u8) !void {
@@ -314,6 +336,22 @@ fn decodeReadOnlyOption(raw: u8) !core.types.ReadOnlyOption {
         @intFromEnum(core.types.ReadOnlyOption.lease_based) => .lease_based,
         else => error.InvalidReplicaCatalogReadOnlyOption,
     };
+}
+
+test "versioned snapshot bootstrap frees partial locator on invalid format" {
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendInt(std.testing.allocator, &encoded, u64, 1);
+    try appendInt(std.testing.allocator, &encoded, u64, 9);
+    try encoded.append(std.testing.allocator, 1);
+    try writeBytes(std.testing.allocator, &encoded, "snapshot-id");
+    try writeBytes(std.testing.allocator, &encoded, "https://snapshot");
+    try encoded.append(std.testing.allocator, 0xff);
+    var reader: std.Io.Reader = .fixed(encoded.items);
+    try std.testing.expectError(
+        error.InvalidReplicaCatalogBootstrap,
+        decodeSnapshotBootstrap(std.testing.allocator, &reader, true),
+    );
 }
 
 test "file replica catalog persists and reloads replica records" {

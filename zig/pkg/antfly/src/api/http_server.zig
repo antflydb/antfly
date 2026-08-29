@@ -1616,10 +1616,11 @@ const max_table_mutation_route_attempts: usize = 3;
 /// Drives one public table create/drop through the current metadata
 /// authority. `ops.local()` runs the existing local workflow when this node
 /// is the leader; `ops.forward(peer)` sends the mutation to the resolved
-/// leader otherwise. Only a typed, provably pre-admission `error.NotLeader`
-/// from either path triggers bounded leader rediscovery. Ambiguous
-/// transport or server failures surface unchanged and are never replayed;
-/// callers converge through an exact state probe.
+/// leader otherwise. A typed `error.NotLeader` consumes a delivered hop;
+/// `error.RaftMutationRequestNotSent` retries without consuming one because
+/// the executor proved the request never crossed the process boundary.
+/// Ambiguous transport or server failures surface unchanged and are never
+/// replayed; callers converge through an exact state probe.
 fn runRoutedTableMutation(router: anytype, ops: anytype) !void {
     var attempts: usize = 0;
     var forwarding = raft_mutation_forwarding.Context{
@@ -1655,6 +1656,7 @@ fn runRoutedTableMutation(router: anytype, ops: anytype) !void {
                 return;
             },
             .forward => |peer| {
+                const parent_attempt_started_ns = attempt_started_ns;
                 const elapsed_ns = platform_time.monotonicNs() -| attempt_started_ns;
                 const elapsed_ms: u32 = @intCast(@min(
                     elapsed_ns / std.time.ns_per_ms,
@@ -1663,11 +1665,24 @@ fn runRoutedTableMutation(router: anytype, ops: anytype) !void {
                 // Consume the hop before it crosses the process boundary, as
                 // the shared data-Raft path does. The receiver must observe
                 // the remaining allowance, never the sender's parent budget.
-                forwarding = forwarding.child(elapsed_ms, 50) catch
+                const child_forwarding = forwarding.child(elapsed_ms, 50) catch
                     return error.NotLeader;
                 attempt_started_ns = platform_time.monotonicNs();
-                ops.forward(peer, forwarding) catch |err| switch (err) {
+                ops.forward(peer, child_forwarding) catch |err| switch (err) {
+                    error.RaftMutationRequestNotSent => {
+                        if (attempts >= max_table_mutation_route_attempts) return error.NotLeader;
+                        const total_elapsed_ns = platform_time.monotonicNs() -| parent_attempt_started_ns;
+                        const total_elapsed_ms: u32 = @intCast(@min(
+                            total_elapsed_ns / std.time.ns_per_ms,
+                            std.math.maxInt(u32),
+                        ));
+                        if (total_elapsed_ms >= forwarding.remaining_ms) return error.NotLeader;
+                        forwarding.remaining_ms -= total_elapsed_ms;
+                        attempt_started_ns = platform_time.monotonicNs();
+                        continue;
+                    },
                     error.NotLeader => {
+                        forwarding = child_forwarding;
                         if (attempts >= max_table_mutation_route_attempts) return error.NotLeader;
                         continue;
                     },
@@ -1707,6 +1722,19 @@ test "routed table mutation rediscovers the leader after a typed pre-admission r
     try std.testing.expectEqual(@as(usize, 2), script.forward_calls);
     try std.testing.expectEqual(@as(u8, 0), script.last_forwarding.?.forwards_remaining);
     try std.testing.expectEqual(@as(usize, 2), script.route_resolutions);
+}
+
+test "routed table mutation preserves hop budget for provably unsent request" {
+    var script = RoutedTableMutationScript{
+        .routes = &.{
+            .{ .forward = .{ .node_id = 2, .orchestration_url = "http://offline" } },
+            .{ .forward = .{ .node_id = 3, .orchestration_url = "http://leader" } },
+        },
+        .forward_errors = &.{error.RaftMutationRequestNotSent},
+    };
+    try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
+    try std.testing.expectEqual(@as(usize, 2), script.forward_calls);
+    try std.testing.expectEqual(@as(u8, 1), script.last_forwarding.?.forwards_remaining);
 }
 
 test "routed table mutation rediscovery converges on a leader that becomes local" {

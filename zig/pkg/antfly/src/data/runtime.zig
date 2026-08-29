@@ -15873,8 +15873,6 @@ const RemoteMetadataSource = struct {
                 forwarding_hops_remaining,
                 !mutation_attempted,
             ) orelse return error.RaftMutationDeadlineExceeded;
-            forwarding_hops_remaining = forwarding.forwards_remaining;
-            mutation_attempted = true;
             const result = callFn(
                 self,
                 &metadata_client,
@@ -15882,10 +15880,21 @@ const RemoteMetadataSource = struct {
                 forwarding,
                 ctx,
             ) catch |err| {
+                if (err == error.RaftMutationRequestNotSent) {
+                    // The executor proved that no peer observed the child
+                    // context. Preserve both its hop and the single campaign
+                    // privilege for the next configured endpoint.
+                    last_pre_admission_err = error.NotLeader;
+                    continue;
+                }
+                forwarding_hops_remaining = forwarding.forwards_remaining;
+                mutation_attempted = true;
                 if (!remoteMetadataMutationRetryable(err)) return err;
                 last_pre_admission_err = err;
                 continue;
             };
+            forwarding_hops_remaining = forwarding.forwards_remaining;
+            mutation_attempted = true;
             self.noteMetadataAuthoritySuccess(index);
             return result;
         }
@@ -15897,7 +15906,7 @@ const RemoteMetadataSource = struct {
         // explicit not-proposed outcome. Transport ambiguity, deterministic
         // catalog results, and local allocation failures must never be hidden
         // by endpoint failover.
-        return err == error.NotLeader;
+        return err == error.NotLeader or err == error.RaftMutationRequestNotSent;
     }
 
     fn remoteHead(ptr: *anyopaque) !antfly.metadata_api.MetadataHead {
@@ -30877,6 +30886,7 @@ test "remote metadata status source advertises exact table drop cleanup" {
 
 test "remote metadata mutation failover preserves ambiguous and deterministic outcomes" {
     try std.testing.expect(RemoteMetadataSource.remoteMetadataMutationRetryable(error.NotLeader));
+    try std.testing.expect(RemoteMetadataSource.remoteMetadataMutationRetryable(error.RaftMutationRequestNotSent));
     try std.testing.expect(!RemoteMetadataSource.remoteMetadataMutationRetryable(error.MetadataMutationOutcomeUnknown));
     try std.testing.expect(!RemoteMetadataSource.remoteMetadataMutationRetryable(error.TableNotFound));
     try std.testing.expect(!RemoteMetadataSource.remoteMetadataMutationRetryable(error.TableAlreadyExists));

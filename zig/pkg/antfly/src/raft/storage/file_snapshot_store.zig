@@ -39,6 +39,10 @@ pub const FileSnapshotStoreConfig = struct {
 
 pub const FileSnapshotStore = struct {
     const artifact_maintenance_interval_ns: u64 = std.time.ns_per_min;
+    const FetchLease = struct {
+        generation: snapshot_transfer.Generation,
+        deadline_ns: i128,
+    };
 
     alloc: std.mem.Allocator,
     cfg: FileSnapshotStoreConfig,
@@ -48,7 +52,7 @@ pub const FileSnapshotStore = struct {
     artifact_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     next_artifact_maintenance_ns: std.atomic.Value(u64) = .init(0),
     fetch_lease_mutex: std.atomic.Mutex = .unlocked,
-    fetch_leases: std.StringHashMapUnmanaged(i128) = .empty,
+    fetch_leases: std.StringHashMapUnmanaged(FetchLease) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, cfg: FileSnapshotStoreConfig) !FileSnapshotStore {
         if (cfg.max_snapshot_bytes == 0 or cfg.max_chunk_bytes < snapshot_transfer.min_chunk_bytes or
@@ -195,14 +199,17 @@ pub const FileSnapshotStore = struct {
         defer lock.unlock();
         const path = try self.transferPath(snapshot_id, ".v2.part");
         defer self.alloc.free(path);
+        const committed_path = try self.transferPath(snapshot_id, ".v2");
+        defer self.alloc.free(committed_path);
         try fs_paths.createDirPathPortable(io(self), self.root_dir);
         const total_len = std.math.add(u64, @sizeOf(u32) + encoded.len, manifest.data_len) catch
             return error.SnapshotTooLarge;
-        try self.admitArtifact(path, total_len);
 
-        // A repeated begin for the same manifest resumes the sparse staging
-        // file. A different manifest with the same deterministic id starts a
-        // clean incarnation and cannot inherit old chunks.
+        // Snapshot IDs are immutable artifact identities. An exact begin
+        // resumes a sparse staging file; replacement requires the owner to
+        // conditionally abort/release the old generation first. This prevents
+        // a delayed begin from rolling a newer upload back to an older
+        // manifest after all later chunk requests have been fenced.
         if (self.readEncodedManifest(self.alloc, path)) |existing| {
             defer self.alloc.free(existing);
             if (std.mem.eql(u8, existing, encoded)) {
@@ -211,11 +218,23 @@ pub const FileSnapshotStore = struct {
                 // A crash can publish the header before setLength completes.
                 // Only a fully shaped sparse artifact is resumable.
                 if (try existing_file.length(io(self)) == total_len) return;
-            }
+            } else return error.SnapshotGenerationMismatch;
         } else |err| switch (err) {
             error.FileNotFound, error.InvalidSnapshotManifest => {},
             else => return err,
         }
+        if (self.readEncodedManifest(self.alloc, committed_path)) |existing| {
+            defer self.alloc.free(existing);
+            if (!std.mem.eql(u8, existing, encoded))
+                return error.SnapshotGenerationMismatch;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            // A corrupt committed artifact must not be silently replaced by a
+            // request that only proved ownership of a different generation.
+            error.InvalidSnapshotManifest => return err,
+            else => return err,
+        }
+        try self.admitArtifact(path, total_len);
 
         var file = try fs_paths.createFilePortable(io(self), path, .{ .truncate = true });
         defer file.close(io(self));
@@ -231,6 +250,7 @@ pub const FileSnapshotStore = struct {
     fn putSnapshotChunk(
         ptr: *anyopaque,
         snapshot_id: []const u8,
+        generation: snapshot_transfer.Generation,
         offset: u64,
         body: []const u8,
     ) !void {
@@ -242,8 +262,10 @@ pub const FileSnapshotStore = struct {
         defer lock.unlock();
         const path = try self.transferPath(snapshot_id, ".v2.part");
         defer self.alloc.free(path);
-        var manifest = try self.readManifest(self.alloc, path);
-        defer manifest.deinit(self.alloc);
+        var identified = try self.readManifestWithGeneration(self.alloc, path);
+        defer identified.manifest.deinit(self.alloc);
+        try requireGeneration(generation, identified.generation);
+        const manifest = identified.manifest;
         if (offset > manifest.data_len or body.len > manifest.data_len - offset)
             return error.InvalidSnapshotChunkRange;
         const data_offset = try self.dataOffset(path);
@@ -256,6 +278,7 @@ pub const FileSnapshotStore = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         snapshot_id: []const u8,
+        generation: snapshot_transfer.Generation,
         materialize: bool,
     ) !?@import("raft_engine").core.types.Snapshot {
         const self: *FileSnapshotStore = @ptrCast(@alignCast(ptr));
@@ -268,13 +291,15 @@ pub const FileSnapshotStore = struct {
         const committed_path = try self.transferPath(snapshot_id, ".v2");
         defer self.alloc.free(committed_path);
         var publish = true;
-        var manifest = self.readManifest(alloc, staging_path) catch |err| switch (err) {
+        const identified = self.readManifestWithGeneration(alloc, staging_path) catch |err| switch (err) {
             error.FileNotFound => blk: {
                 publish = false;
-                break :blk try self.readManifest(alloc, committed_path);
+                break :blk try self.readManifestWithGeneration(alloc, committed_path);
             },
             else => return err,
         };
+        try requireGeneration(generation, identified.generation);
+        var manifest = identified.manifest;
         errdefer manifest.deinit(alloc);
         const artifact_path = if (publish) staging_path else committed_path;
         const data_offset = try self.dataOffset(artifact_path);
@@ -338,9 +363,10 @@ pub const FileSnapshotStore = struct {
         defer lock.unlock();
         const committed_path = try self.transferPath(snapshot_id, ".v2");
         defer self.alloc.free(committed_path);
-        var manifest = try self.readManifest(alloc, committed_path);
+        const identified = try self.readManifestWithGeneration(alloc, committed_path);
+        var manifest = identified.manifest;
         errdefer manifest.deinit(alloc);
-        try self.renewFetchLease(snapshot_id);
+        try self.renewFetchLease(snapshot_id, identified.generation);
         return manifest;
     }
 
@@ -371,6 +397,7 @@ pub const FileSnapshotStore = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         snapshot_id: []const u8,
+        generation: snapshot_transfer.Generation,
         offset: u64,
         max_len: usize,
     ) ![]u8 {
@@ -383,9 +410,11 @@ pub const FileSnapshotStore = struct {
         defer lock.unlock();
         const path = try self.transferPath(snapshot_id, ".v2");
         defer self.alloc.free(path);
-        var manifest = try self.readManifest(alloc, path);
-        defer manifest.deinit(alloc);
-        try self.renewFetchLease(snapshot_id);
+        var identified = try self.readManifestWithGeneration(alloc, path);
+        defer identified.manifest.deinit(alloc);
+        try requireGeneration(generation, identified.generation);
+        const manifest = identified.manifest;
+        try self.renewFetchLease(snapshot_id, generation);
         if (offset >= manifest.data_len) return try alloc.dupe(u8, &.{});
         const len: usize = @intCast(@min(max_len, manifest.data_len - offset));
         const chunk = try alloc.alloc(u8, len);
@@ -397,7 +426,11 @@ pub const FileSnapshotStore = struct {
         return chunk;
     }
 
-    fn abortChunkedSnapshot(ptr: *anyopaque, snapshot_id: []const u8) !void {
+    fn abortChunkedSnapshot(
+        ptr: *anyopaque,
+        snapshot_id: []const u8,
+        generation: snapshot_transfer.Generation,
+    ) !void {
         const self: *FileSnapshotStore = @ptrCast(@alignCast(ptr));
         try validateSnapshotId(snapshot_id);
         const lock = self.uploadLock(snapshot_id);
@@ -405,6 +438,8 @@ pub const FileSnapshotStore = struct {
         defer lock.unlock();
         const path = try self.transferPath(snapshot_id, ".v2.part");
         defer self.alloc.free(path);
+        const current_generation = try self.readGeneration(self.alloc, path);
+        try requireGeneration(generation, current_generation);
         const deleted = if (std.Io.Dir.cwd().deleteFile(io(self), path))
             true
         else |err| switch (err) {
@@ -414,7 +449,11 @@ pub const FileSnapshotStore = struct {
         if (deleted) try fs_paths.syncDirPortable(io(self), self.root_dir);
     }
 
-    fn releaseChunkedSnapshot(ptr: *anyopaque, snapshot_id: []const u8) !void {
+    fn releaseChunkedSnapshot(
+        ptr: *anyopaque,
+        snapshot_id: []const u8,
+        generation: snapshot_transfer.Generation,
+    ) !void {
         const self: *FileSnapshotStore = @ptrCast(@alignCast(ptr));
         try validateSnapshotId(snapshot_id);
         const lock = self.uploadLock(snapshot_id);
@@ -422,7 +461,9 @@ pub const FileSnapshotStore = struct {
         defer lock.unlock();
         const path = try self.transferPath(snapshot_id, ".v2");
         defer self.alloc.free(path);
-        self.clearFetchLease(snapshot_id);
+        const current_generation = try self.readGeneration(self.alloc, path);
+        try requireGeneration(generation, current_generation);
+        self.clearFetchLease(snapshot_id, generation);
         const deleted = if (std.Io.Dir.cwd().deleteFile(io(self), path))
             true
         else |err| switch (err) {
@@ -503,8 +544,18 @@ pub const FileSnapshotStore = struct {
             if (!lock.tryLock()) continue;
             const removed = removed: {
                 defer lock.unlock();
-                if (!artifact.staging and self.fetchLeaseActive(artifact.snapshot_id, now_ns))
-                    break :removed false;
+                if (!artifact.staging) {
+                    const artifact_path = try self.transferPath(artifact.snapshot_id, ".v2");
+                    defer self.alloc.free(artifact_path);
+                    const generation = self.readGeneration(self.alloc, artifact_path) catch |err| switch (err) {
+                        error.FileNotFound, error.InvalidSnapshotManifest => null,
+                        else => return err,
+                    };
+                    if (generation) |value| {
+                        if (self.fetchLeaseActive(artifact.snapshot_id, value, now_ns))
+                            break :removed false;
+                    }
+                }
                 const current = dir.statFile(io(self), entry.name, .{}) catch |err| switch (err) {
                     error.FileNotFound => break :removed false,
                     else => return err,
@@ -521,31 +572,50 @@ pub const FileSnapshotStore = struct {
         if (deleted) try fs_paths.syncDirPortable(io(self), self.root_dir);
     }
 
-    fn renewFetchLease(self: *FileSnapshotStore, snapshot_id: []const u8) !void {
+    fn renewFetchLease(
+        self: *FileSnapshotStore,
+        snapshot_id: []const u8,
+        generation: snapshot_transfer.Generation,
+    ) !void {
         const deadline = std.Io.Timestamp.now(io(self), .real).toNanoseconds() +|
             self.cfg.artifact_policy.active_fetch_lease_ns;
         platform_sync.lockYielding(&self.fetch_lease_mutex);
         defer self.fetch_lease_mutex.unlock();
         if (self.fetch_leases.getPtr(snapshot_id)) |existing| {
-            existing.* = deadline;
+            existing.* = .{ .generation = generation, .deadline_ns = deadline };
             return;
         }
         const owned_id = try self.alloc.dupe(u8, snapshot_id);
         errdefer self.alloc.free(owned_id);
-        try self.fetch_leases.putNoClobber(self.alloc, owned_id, deadline);
+        try self.fetch_leases.putNoClobber(self.alloc, owned_id, .{
+            .generation = generation,
+            .deadline_ns = deadline,
+        });
     }
 
-    fn clearFetchLease(self: *FileSnapshotStore, snapshot_id: []const u8) void {
+    fn clearFetchLease(
+        self: *FileSnapshotStore,
+        snapshot_id: []const u8,
+        generation: snapshot_transfer.Generation,
+    ) void {
         platform_sync.lockYielding(&self.fetch_lease_mutex);
         defer self.fetch_lease_mutex.unlock();
+        const lease = self.fetch_leases.get(snapshot_id) orelse return;
+        if (!std.mem.eql(u8, &lease.generation, &generation)) return;
         if (self.fetch_leases.fetchRemove(snapshot_id)) |removed| self.alloc.free(removed.key);
     }
 
-    fn fetchLeaseActive(self: *FileSnapshotStore, snapshot_id: []const u8, now_ns: i128) bool {
+    fn fetchLeaseActive(
+        self: *FileSnapshotStore,
+        snapshot_id: []const u8,
+        generation: snapshot_transfer.Generation,
+        now_ns: i128,
+    ) bool {
         platform_sync.lockYielding(&self.fetch_lease_mutex);
         defer self.fetch_lease_mutex.unlock();
-        const deadline = self.fetch_leases.get(snapshot_id) orelse return false;
-        if (deadline > now_ns) return true;
+        const lease = self.fetch_leases.get(snapshot_id) orelse return false;
+        if (!std.mem.eql(u8, &lease.generation, &generation)) return false;
+        if (lease.deadline_ns > now_ns) return true;
         if (self.fetch_leases.fetchRemove(snapshot_id)) |removed| self.alloc.free(removed.key);
         return false;
     }
@@ -605,6 +675,46 @@ pub const FileSnapshotStore = struct {
         return try snapshot_transfer.decode(alloc, encoded);
     }
 
+    const ManifestWithGeneration = struct {
+        manifest: snapshot_transfer.Manifest,
+        generation: snapshot_transfer.Generation,
+    };
+
+    fn readManifestWithGeneration(
+        self: *FileSnapshotStore,
+        alloc: std.mem.Allocator,
+        path: []const u8,
+    ) !ManifestWithGeneration {
+        const encoded = try self.readEncodedManifest(alloc, path);
+        defer alloc.free(encoded);
+        const generation = try snapshot_transfer.generationFromEncodedManifest(encoded);
+        return .{
+            .manifest = try snapshot_transfer.decode(alloc, encoded),
+            .generation = generation,
+        };
+    }
+
+    fn readGeneration(
+        self: *FileSnapshotStore,
+        alloc: std.mem.Allocator,
+        path: []const u8,
+    ) !snapshot_transfer.Generation {
+        const encoded = try self.readEncodedManifest(alloc, path);
+        defer alloc.free(encoded);
+        // Decode before trusting the checksum bytes as an artifact identity.
+        var manifest = try snapshot_transfer.decode(alloc, encoded);
+        defer manifest.deinit(alloc);
+        return try snapshot_transfer.generationFromEncodedManifest(encoded);
+    }
+
+    fn requireGeneration(
+        expected: snapshot_transfer.Generation,
+        actual: snapshot_transfer.Generation,
+    ) !void {
+        if (!std.mem.eql(u8, &expected, &actual))
+            return error.SnapshotGenerationMismatch;
+    }
+
     fn readEncodedManifest(self: *FileSnapshotStore, alloc: std.mem.Allocator, path: []const u8) ![]u8 {
         var file = try std.Io.Dir.cwd().openFile(io(self), path, .{});
         defer file.close(io(self));
@@ -655,6 +765,12 @@ pub const FileSnapshotStore = struct {
         }
     }
 };
+
+fn testManifestGeneration(manifest: snapshot_transfer.Manifest) !snapshot_transfer.Generation {
+    const encoded = try snapshot_transfer.encode(std.testing.allocator, manifest);
+    defer std.testing.allocator.free(encoded);
+    return try snapshot_transfer.generationFromEncodedManifest(encoded);
+}
 
 test "file snapshot store persists snapshot bodies" {
     var tmp = std.testing.tmpDir(.{});
@@ -760,17 +876,19 @@ test "file snapshot store resumes chunks and atomically verifies commit" {
         .digest = snapshot_transfer.digest(body),
     };
     const iface = store.store();
+    const generation = try testManifestGeneration(manifest);
     try iface.vtable.begin_chunked_snapshot.?(iface.ptr, manifest, "snap-v2");
-    try iface.vtable.put_snapshot_chunk.?(iface.ptr, "snap-v2", 0, body[0..4]);
+    try iface.vtable.put_snapshot_chunk.?(iface.ptr, "snap-v2", generation, 0, body[0..4]);
     // Idempotent begin retains already-published chunks for retry/resume.
     try iface.vtable.begin_chunked_snapshot.?(iface.ptr, manifest, "snap-v2");
-    try iface.vtable.put_snapshot_chunk.?(iface.ptr, "snap-v2", 4, body[4..8]);
-    try iface.vtable.put_snapshot_chunk.?(iface.ptr, "snap-v2", 8, body[8..12]);
-    try iface.vtable.put_snapshot_chunk.?(iface.ptr, "snap-v2", 12, body[12..]);
+    try iface.vtable.put_snapshot_chunk.?(iface.ptr, "snap-v2", generation, 4, body[4..8]);
+    try iface.vtable.put_snapshot_chunk.?(iface.ptr, "snap-v2", generation, 8, body[8..12]);
+    try iface.vtable.put_snapshot_chunk.?(iface.ptr, "snap-v2", generation, 12, body[12..]);
     var snapshot = (try iface.vtable.commit_chunked_snapshot.?(
         iface.ptr,
         std.testing.allocator,
         "snap-v2",
+        generation,
         true,
     )).?;
     defer snapshot.deinit(std.testing.allocator);
@@ -781,6 +899,12 @@ test "file snapshot store resumes chunks and atomically verifies commit" {
     // make the committed chunks available to a later fetch.
     var replacement = manifest;
     replacement.metadata.index = 13;
+    const replacement_generation = try testManifestGeneration(replacement);
+    try std.testing.expectError(
+        error.SnapshotGenerationMismatch,
+        iface.vtable.begin_chunked_snapshot.?(iface.ptr, replacement, "snap-v2"),
+    );
+    try iface.vtable.release_chunked_snapshot.?(iface.ptr, "snap-v2", generation);
     try iface.vtable.begin_chunked_snapshot.?(iface.ptr, replacement, "snap-v2");
     var upload_manifest = try iface.vtable.get_snapshot_upload_manifest.?(
         iface.ptr,
@@ -789,41 +913,138 @@ test "file snapshot store resumes chunks and atomically verifies commit" {
     );
     defer upload_manifest.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 13), upload_manifest.metadata.index);
-    var committed_manifest = try iface.vtable.get_snapshot_manifest.?(
-        iface.ptr,
-        std.testing.allocator,
-        "snap-v2",
-    );
-    defer committed_manifest.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 12), committed_manifest.metadata.index);
     var offset: usize = 0;
     while (offset < body.len) {
         const end = @min(body.len, offset + 4);
-        try iface.vtable.put_snapshot_chunk.?(iface.ptr, "snap-v2", offset, body[offset..end]);
+        try iface.vtable.put_snapshot_chunk.?(iface.ptr, "snap-v2", replacement_generation, offset, body[offset..end]);
         offset = end;
     }
     try std.testing.expect((try iface.vtable.commit_chunked_snapshot.?(
         iface.ptr,
         std.testing.allocator,
         "snap-v2",
+        replacement_generation,
         false,
     )) == null);
-    const tail = try iface.vtable.get_snapshot_chunk.?(iface.ptr, std.testing.allocator, "snap-v2", 5, 4);
+    const tail = try iface.vtable.get_snapshot_chunk.?(iface.ptr, std.testing.allocator, "snap-v2", replacement_generation, 5, 4);
     defer std.testing.allocator.free(tail);
     try std.testing.expectEqualStrings(body[5..9], tail);
     var retried = (try iface.vtable.commit_chunked_snapshot.?(
         iface.ptr,
         std.testing.allocator,
         "snap-v2",
+        replacement_generation,
         true,
     )).?;
     defer retried.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 13), retried.metadata.index);
-    try iface.vtable.release_chunked_snapshot.?(iface.ptr, "snap-v2");
+    try iface.vtable.release_chunked_snapshot.?(iface.ptr, "snap-v2", replacement_generation);
     try std.testing.expectError(
         error.FileNotFound,
         iface.vtable.get_snapshot_manifest.?(iface.ptr, std.testing.allocator, "snap-v2"),
     );
+}
+
+test "chunked snapshot generations fence stale upload and release requests" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/raft-snaps-generation-fence",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root_dir);
+    var store = try FileSnapshotStore.init(std.testing.allocator, .{ .root_dir = root_dir });
+    defer store.deinit();
+
+    const body = "current-generation";
+    const first: snapshot_transfer.Manifest = .{
+        .group_id = 94,
+        .from = 0,
+        .to = 2,
+        .request_term = 0,
+        .metadata = .{ .index = 14, .term = 4 },
+        .data_len = body.len,
+        .digest = snapshot_transfer.digest(body),
+    };
+    var replacement = first;
+    replacement.metadata.index = 15;
+    const first_generation = try testManifestGeneration(first);
+    const replacement_generation = try testManifestGeneration(replacement);
+    const iface = store.store();
+
+    try iface.vtable.begin_chunked_snapshot.?(iface.ptr, first, "reused-id");
+    try std.testing.expectError(
+        error.SnapshotGenerationMismatch,
+        iface.vtable.begin_chunked_snapshot.?(iface.ptr, replacement, "reused-id"),
+    );
+    try iface.vtable.abort_chunked_snapshot.?(
+        iface.ptr,
+        "reused-id",
+        first_generation,
+    );
+    try iface.vtable.begin_chunked_snapshot.?(iface.ptr, replacement, "reused-id");
+    try std.testing.expectError(
+        error.SnapshotGenerationMismatch,
+        iface.vtable.put_snapshot_chunk.?(
+            iface.ptr,
+            "reused-id",
+            first_generation,
+            0,
+            body,
+        ),
+    );
+    try std.testing.expectError(
+        error.SnapshotGenerationMismatch,
+        iface.vtable.abort_chunked_snapshot.?(
+            iface.ptr,
+            "reused-id",
+            first_generation,
+        ),
+    );
+    try std.testing.expectError(
+        error.SnapshotGenerationMismatch,
+        iface.vtable.commit_chunked_snapshot.?(
+            iface.ptr,
+            std.testing.allocator,
+            "reused-id",
+            first_generation,
+            false,
+        ),
+    );
+
+    try iface.vtable.put_snapshot_chunk.?(
+        iface.ptr,
+        "reused-id",
+        replacement_generation,
+        0,
+        body,
+    );
+    try std.testing.expect((try iface.vtable.commit_chunked_snapshot.?(
+        iface.ptr,
+        std.testing.allocator,
+        "reused-id",
+        replacement_generation,
+        false,
+    )) == null);
+    try std.testing.expectError(
+        error.SnapshotGenerationMismatch,
+        iface.vtable.release_chunked_snapshot.?(
+            iface.ptr,
+            "reused-id",
+            first_generation,
+        ),
+    );
+    const fetched = try iface.vtable.get_snapshot_chunk.?(
+        iface.ptr,
+        std.testing.allocator,
+        "reused-id",
+        replacement_generation,
+        0,
+        body.len,
+    );
+    defer std.testing.allocator.free(fetched);
+    try std.testing.expectEqualStrings(body, fetched);
 }
 
 test "active chunked fetch lease fences committed artifact expiry" {
@@ -850,12 +1071,14 @@ test "active chunked fetch lease fences committed artifact expiry" {
         .digest = snapshot_transfer.digest(body),
     };
     const iface = store.store();
+    const generation = try testManifestGeneration(manifest);
     try iface.vtable.begin_chunked_snapshot.?(iface.ptr, manifest, "leased");
-    try iface.vtable.put_snapshot_chunk.?(iface.ptr, "leased", 0, body);
+    try iface.vtable.put_snapshot_chunk.?(iface.ptr, "leased", generation, 0, body);
     try std.testing.expect((try iface.vtable.commit_chunked_snapshot.?(
         iface.ptr,
         std.testing.allocator,
         "leased",
+        generation,
         false,
     )) == null);
 
@@ -871,6 +1094,7 @@ test "active chunked fetch lease fences committed artifact expiry" {
         iface.ptr,
         std.testing.allocator,
         "leased",
+        generation,
         0,
         body.len,
     );
