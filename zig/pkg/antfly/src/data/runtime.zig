@@ -3856,6 +3856,8 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         // control-plane backoff preserves that exclusion without terminating
         // the data process and permanently removing a destination voter.
         error.TransitionDestinationProvisioningBusy,
+        // Restore holds the local generation lock while status collection runs.
+        error.GenerationTransitionActive,
         // Placement projection is multi-row. A store can observe its local
         // row before every row needed to prove the incumbent voter set is
         // visible. Refusing to bootstrap from that partial set is required,
@@ -3906,6 +3908,7 @@ test "data runtime treats metadata leadership churn as retryable bootstrap failu
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataIncarnationUnavailable));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MissingAuthoritativeBootstrapVoters));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.TransitionDestinationProvisioningBusy));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.GenerationTransitionActive));
     try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidArguments));
     try std.testing.expect(!isRetryableMetadataBootstrapError(error.MetadataIncarnationMismatch));
 }
@@ -25612,6 +25615,72 @@ test "data runtime runRound backs off retryable provision metadata failures" {
     try std.testing.expectEqual(next_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
     try std.testing.expectEqual(last_head_check_at_ms, server.last_provision_head_check_at_ms);
     try std.testing.expectEqual(@as(usize, 3), server.provision_ticks);
+}
+
+test "data runtime keeps serving when store status metadata request is retryable" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-status-retry", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    const remote_metadata = try alloc.create(RemoteMetadataSource);
+    const metadata_api_urls = [_][]const u8{"http://metadata.test"};
+    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls, backend_runtime.ptr().apiIoImpl().?);
+    remote_metadata.test_faults.fetch_head_error = error.NotLeader;
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .remote_metadata = remote_metadata,
+        .store_registration = .{
+            .node_id = 9,
+            .store_id = 19,
+            .role = "data",
+            .failure_domain = "test",
+        },
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .backend_runtime = backend_runtime.ptr(),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    server.store_registration_confirmed = true;
+    server.store_status_dirty.store(true, .release);
+    server.last_store_status_report_at_ms = 1;
+    server.runtime_status_dirty.store(false, .release);
+    server.provisioned_startup_catch_up_dirty.store(false, .release);
+    server.provisioned_root_refresh_dirty.store(false, .release);
+
+    try server.runControlRoundOnly();
+
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expect(server.nextMetadataBootstrapRetryAtMsForTest() != 0);
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
+
+    remote_metadata.test_faults.fetch_head_error = error.GenerationTransitionActive;
+    server.clearMetadataBootstrapRetry();
+
+    try server.runControlRoundOnly();
+
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expect(server.nextMetadataBootstrapRetryAtMsForTest() != 0);
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
 }
 
 test "data runtime provisioned root refresh worker backs off retryable metadata failures" {
