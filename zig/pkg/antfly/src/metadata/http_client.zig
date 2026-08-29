@@ -15,6 +15,7 @@
 const std = @import("std");
 const ant_json = @import("antfly-json");
 const platform_time = @import("antfly_platform").time;
+const tables_api = @import("../api/tables.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
@@ -43,6 +44,9 @@ const RetryPolicy = enum {
     replay_safe,
     /// Retry only failures that prove the server did not admit the mutation.
     at_most_once,
+    /// Require the table-mutation protocol marker in addition to
+    /// non-admission proof before replaying a table mutation.
+    marked_table_mutation,
 };
 
 /// One monotonic budget shared by every transport and not-leader retry in a
@@ -342,6 +346,31 @@ pub const MetadataHttpClient = struct {
         try self.requestWithBody(base_uri, .POST, routes.Routes.internal_schema_progress, body, error.InvalidSchemaProgressRequest, null, null);
     }
 
+    pub fn upsertRestoreProgress(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        body: []const u8,
+    ) !void {
+        try self.requestWithBody(base_uri, .POST, routes.Routes.internal_restore_progress, body, error.InvalidRestoreProgressRequest, null, null);
+    }
+
+    pub fn removeRestoreProgress(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_id: u64,
+        node_id: u64,
+        group_id: u64,
+    ) !void {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/{d}/{d}/{d}", .{
+            routes.Routes.internal_restore_progress,
+            table_id,
+            node_id,
+            group_id,
+        });
+        defer self.alloc.free(path);
+        try self.requestNoBody(base_uri, .DELETE, path, null, error.InvalidRestoreProgressRequest, null);
+    }
+
     pub fn restoreExtensions(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -439,6 +468,88 @@ pub const MetadataHttpClient = struct {
         });
         defer self.alloc.free(path);
         try self.requestNoBody(base_uri, .DELETE, path, error.TableNotFound, null, error.TableTransitionActive);
+    }
+
+    /// Forwards a public create to the current metadata leader's internal
+    /// table route with at-most-once semantics. `error.NotLeader` proves the
+    /// receiving node rejected the mutation before admission, so the caller
+    /// may re-resolve the leader and forward once more. Ambiguous transport
+    /// or authority outcomes surface as `error.MetadataMutationOutcomeUnknown`
+    /// and must not be replayed without an exact state probe.
+    pub fn createTableForwarded(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        definition_json: []const u8,
+    ) !void {
+        try tables_api.validateTableMutationName(table_name);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, routes.ForwardedCreateTableMutation{
+            .table_name = table_name,
+            .definition_json = definition_json,
+        }, .{});
+        defer self.alloc.free(body);
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_forwarded_table_create);
+        defer self.alloc.free(uri);
+        var resp = self.executeWithRetryPolicy(.{
+            .method = .POST,
+            .uri = uri,
+            .body = body,
+            .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
+        }, null, .marked_table_mutation) catch |err| switch (err) {
+            error.ReallocationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+        defer resp.deinit(self.alloc);
+        if (!responseHasHeaderValueAnyStatus(
+            resp,
+            routes.Routes.table_mutation_protocol_header,
+            routes.Routes.table_mutation_protocol_value,
+        )) return error.MetadataMutationOutcomeUnknown;
+        if (resp.status == 201) return;
+        return switch (resp.status) {
+            400 => error.InvalidCreateTableRequest,
+            405 => error.UnsupportedOperation,
+            409 => error.TableAlreadyExists,
+            else => error.MetadataMutationOutcomeUnknown,
+        };
+    }
+
+    pub fn dropTableForwarded(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+    ) !void {
+        try tables_api.validateTableMutationName(table_name);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, routes.ForwardedDropTableMutation{
+            .table_name = table_name,
+        }, .{});
+        defer self.alloc.free(body);
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_forwarded_table_drop);
+        defer self.alloc.free(uri);
+        var resp = self.executeWithRetryPolicy(.{
+            .method = .POST,
+            .uri = uri,
+            .body = body,
+            .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
+        }, null, .marked_table_mutation) catch |err| switch (err) {
+            error.ReallocationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+        defer resp.deinit(self.alloc);
+        if (!responseHasHeaderValueAnyStatus(
+            resp,
+            routes.Routes.table_mutation_protocol_header,
+            routes.Routes.table_mutation_protocol_value,
+        )) return error.MetadataMutationOutcomeUnknown;
+        if (resp.status == 204) return;
+        return switch (resp.status) {
+            404 => error.TableNotFound,
+            405 => error.UnsupportedOperation,
+            409 => error.TableTransitionActive,
+            else => error.MetadataMutationOutcomeUnknown,
+        };
     }
 
     pub fn updateSchema(
@@ -755,7 +866,7 @@ pub const MetadataHttpClient = struct {
                     // POST. Although active requests coalesce, a replay can
                     // arrive after the first generation clears and create a
                     // second pass. Preserve ambiguity for observation instead.
-                    if (retry_policy == .at_most_once) return error.ReallocationOutcomeUnknown;
+                    if (retry_policy != .replay_safe) return error.ReallocationOutcomeUnknown;
                     if (transport_attempt >= max_transport_retries) return err;
                     transport_attempt += 1;
                     continue;
@@ -763,7 +874,7 @@ pub const MetadataHttpClient = struct {
                 // Preserve the established behavior for other metadata calls,
                 // while treating this response-less failure as ambiguous for
                 // the at-most-once reallocation mutation.
-                error.ConnectionTimedOut => if (retry_policy == .at_most_once)
+                error.ConnectionTimedOut => if (retry_policy != .replay_safe)
                     return error.ReallocationOutcomeUnknown
                 else
                     return err,
@@ -772,6 +883,7 @@ pub const MetadataHttpClient = struct {
             const retryable_authority_response = switch (retry_policy) {
                 .replay_safe => isMetadataNotLeaderResponse(resp),
                 .at_most_once => isMetadataMutationNotAdmittedResponse(resp),
+                .marked_table_mutation => isMarkedTableMutationNotAdmittedResponse(resp),
             };
             if (!retryable_authority_response) return resp;
             if (not_leader_attempt >= max_metadata_not_leader_retries) {
@@ -779,7 +891,7 @@ pub const MetadataHttpClient = struct {
                 return error.NotLeader;
             }
             not_leader_attempt += 1;
-            const retry_delay_ns = if (retry_policy == .at_most_once)
+            const retry_delay_ns = if (retry_policy != .replay_safe)
                 metadataAuthorityRetryDelayNs(resp)
             else
                 0;
@@ -808,8 +920,20 @@ pub const MetadataHttpClient = struct {
         );
     }
 
+    fn isMarkedTableMutationNotAdmittedResponse(resp: http_common.HttpResponse) bool {
+        return isMetadataMutationNotAdmittedResponse(resp) and responseHasHeaderValueAnyStatus(
+            resp,
+            routes.Routes.table_mutation_protocol_header,
+            routes.Routes.table_mutation_protocol_value,
+        );
+    }
+
     fn responseHasHeaderValue(resp: http_common.HttpResponse, name: []const u8, value: []const u8) bool {
         if (resp.status != 503) return false;
+        return responseHasHeaderValueAnyStatus(resp, name, value);
+    }
+
+    fn responseHasHeaderValueAnyStatus(resp: http_common.HttpResponse, name: []const u8, value: []const u8) bool {
         for (resp.headers) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, name) and
                 std.ascii.eqlIgnoreCase(std.mem.trim(u8, header.value, " \t\r\n"), value))
@@ -1238,6 +1362,290 @@ test "metadata http client treats missing linearizable snapshot route as unsuppo
     );
 }
 
+test "metadata http client forwards table create and drop to the internal route" {
+    const RecordingExecutor = struct {
+        expected_method: http_common.Method,
+        expected_uri_suffix: []const u8,
+        expected_body: ?[]const u8,
+        success_status: u16,
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            try std.testing.expectEqual(self.expected_method, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, self.expected_uri_suffix));
+            if (self.expected_body) |body| {
+                try std.testing.expectEqualStrings(body, req.body);
+            } else {
+                try std.testing.expectEqual(@as(usize, 0), req.body.len);
+            }
+            const headers = try alloc.alloc(http_common.Header, 1);
+            errdefer alloc.free(headers);
+            headers[0] = .{
+                .name = try alloc.dupe(u8, routes.Routes.table_mutation_protocol_header),
+                .value = &.{},
+            };
+            errdefer headers[0].deinit(alloc);
+            headers[0].value = try alloc.dupe(u8, routes.Routes.table_mutation_protocol_value);
+            return .{ .status = self.success_status, .headers = headers };
+        }
+    };
+
+    var create_exec = RecordingExecutor{
+        .expected_method = .POST,
+        .expected_uri_suffix = routes.Routes.internal_forwarded_table_create,
+        .expected_body = "{\"table_name\":\"sales/archive\",\"definition_json\":\"{\\\"num_shards\\\":1}\"}",
+        .success_status = 201,
+    };
+    var create_client = MetadataHttpClient.init(std.testing.allocator, create_exec.executor());
+    try create_client.createTableForwarded("http://127.0.0.1:9000", "sales/archive", "{\"num_shards\":1}");
+    try std.testing.expectEqual(@as(usize, 1), create_exec.attempts);
+
+    var drop_exec = RecordingExecutor{
+        .expected_method = .POST,
+        .expected_uri_suffix = routes.Routes.internal_forwarded_table_drop,
+        .expected_body = "{\"table_name\":\"sales%2Farchive\"}",
+        .success_status = 204,
+    };
+    var drop_client = MetadataHttpClient.init(std.testing.allocator, drop_exec.executor());
+    try drop_client.dropTableForwarded("http://127.0.0.1:9000", "sales%2Farchive");
+    try std.testing.expectEqual(@as(usize, 1), drop_exec.attempts);
+}
+
+test "metadata http client rejects invalid forwarded table names before I/O" {
+    const CountingExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var counting = CountingExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, counting.executor());
+    const too_long: [tables_api.max_table_name_bytes + 1]u8 = @splat('a');
+    try std.testing.expectError(
+        error.InvalidTableName,
+        client.createTableForwarded("http://127.0.0.1:9000", &too_long, "{}"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), counting.attempts);
+}
+
+test "metadata http client surfaces typed rejection for forwarded table mutations only with non-admission proof" {
+    const RejectingExecutor = struct {
+        header_name: []const u8,
+        header_value: []const u8,
+        attempts: usize = 0,
+
+        fn ownedHeader(
+            alloc: std.mem.Allocator,
+            name: []const u8,
+            value: []const u8,
+        ) !http_common.Header {
+            const owned_name = try alloc.dupe(u8, name);
+            errdefer alloc.free(owned_name);
+            const owned_value = try alloc.dupe(u8, value);
+            return .{ .name = owned_name, .value = owned_value };
+        }
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            const headers = try alloc.alloc(http_common.Header, 3);
+            var initialized: usize = 0;
+            errdefer {
+                for (headers[0..initialized]) |*header| header.deinit(alloc);
+                alloc.free(headers);
+            }
+            headers[initialized] = try ownedHeader(alloc, self.header_name, self.header_value);
+            initialized += 1;
+            headers[initialized] = try ownedHeader(alloc, "Retry-After", "0");
+            initialized += 1;
+            headers[initialized] = try ownedHeader(
+                alloc,
+                routes.Routes.table_mutation_protocol_header,
+                routes.Routes.table_mutation_protocol_value,
+            );
+            initialized += 1;
+            const body = try alloc.dupe(u8, "metadata authority unavailable");
+            return .{ .status = 503, .headers = headers, .body = body };
+        }
+    };
+
+    var not_admitted = RejectingExecutor{
+        .header_name = http_common.metadata_mutation_not_admitted_header,
+        .header_value = http_common.metadata_mutation_not_admitted_value,
+    };
+    var not_admitted_client = MetadataHttpClient.init(std.testing.allocator, not_admitted.executor());
+    try std.testing.expectError(
+        error.NotLeader,
+        not_admitted_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1 + max_metadata_not_leader_retries), not_admitted.attempts);
+
+    var broad_hint = RejectingExecutor{
+        .header_name = http_common.metadata_not_leader_header,
+        .header_value = http_common.metadata_not_leader_value,
+    };
+    var broad_hint_client = MetadataHttpClient.init(std.testing.allocator, broad_hint.executor());
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        broad_hint_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), broad_hint.attempts);
+}
+
+test "metadata http client preserves transport ambiguity for forwarded table mutations" {
+    const DroppingExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            return error.ConnectionResetByPeer;
+        }
+    };
+
+    var dropping = DroppingExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, dropping.executor());
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), dropping.attempts);
+}
+
+test "metadata http client preserves unrecognized server outcomes for forwarded table mutations" {
+    const StatusExecutor = struct {
+        status: u16,
+        protocol_marker: bool = false,
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            if (self.protocol_marker) {
+                const headers = try alloc.alloc(http_common.Header, 1);
+                errdefer alloc.free(headers);
+                headers[0] = .{
+                    .name = try alloc.dupe(u8, routes.Routes.table_mutation_protocol_header),
+                    .value = &.{},
+                };
+                errdefer headers[0].deinit(alloc);
+                headers[0].value = try alloc.dupe(u8, routes.Routes.table_mutation_protocol_value);
+                return .{ .status = self.status, .headers = headers };
+            }
+            return .{ .status = self.status };
+        }
+    };
+
+    var server_error = StatusExecutor{ .status = 500, .protocol_marker = true };
+    var create_client = MetadataHttpClient.init(std.testing.allocator, server_error.executor());
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        create_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), server_error.attempts);
+
+    // An old metadata leader does not stamp the mutation protocol marker. Its
+    // headerless 404 must not be mistaken for a definitive table absence.
+    var old_leader = StatusExecutor{ .status = 404 };
+    var drop_client = MetadataHttpClient.init(std.testing.allocator, old_leader.executor());
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        drop_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), old_leader.attempts);
+
+    var headerless_create_success = StatusExecutor{ .status = 201 };
+    var headerless_create_client = MetadataHttpClient.init(
+        std.testing.allocator,
+        headerless_create_success.executor(),
+    );
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        headerless_create_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), headerless_create_success.attempts);
+
+    var headerless_drop_success = StatusExecutor{ .status = 204 };
+    var headerless_drop_client = MetadataHttpClient.init(
+        std.testing.allocator,
+        headerless_drop_success.executor(),
+    );
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        headerless_drop_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), headerless_drop_success.attempts);
+
+    var wrong_marked_success = StatusExecutor{ .status = 200, .protocol_marker = true };
+    var wrong_marked_client = MetadataHttpClient.init(
+        std.testing.allocator,
+        wrong_marked_success.executor(),
+    );
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        wrong_marked_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), wrong_marked_success.attempts);
+}
+
+test "metadata http client does not replay unmarked table mutation rejection proof" {
+    const UnmarkedRejectingExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            const headers = try alloc.alloc(http_common.Header, 1);
+            errdefer alloc.free(headers);
+            headers[0] = .{
+                .name = try alloc.dupe(u8, http_common.metadata_mutation_not_admitted_header),
+                .value = &.{},
+            };
+            errdefer headers[0].deinit(alloc);
+            headers[0].value = try alloc.dupe(u8, http_common.metadata_mutation_not_admitted_value);
+            return .{ .status = 503, .headers = headers };
+        }
+    };
+
+    var unmarked = UnmarkedRejectingExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, unmarked.executor());
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), unmarked.attempts);
+}
+
 test "metadata http client retries transient connection close on fetch status" {
     const FlakyExecutor = struct {
         attempts: usize = 0,
@@ -1527,6 +1935,8 @@ test "metadata http client round-trips server endpoints" {
         upsert_node_count: usize = 0,
         upsert_store_count: usize = 0,
         report_store_status_count: usize = 0,
+        upsert_restore_progress_count: usize = 0,
+        remove_restore_progress_count: usize = 0,
 
         const tables = [_]metadata_table_manager.TableRecord{
             .{ .table_id = 1, .name = "docs", .placement_role = "data" },
@@ -1608,6 +2018,8 @@ test "metadata http client round-trips server endpoints" {
                     .upsert_node = upsertNode,
                     .upsert_store = upsertStore,
                     .report_store_status = reportStoreStatus,
+                    .upsert_restore_progress = upsertRestoreProgress,
+                    .remove_restore_progress = removeRestoreProgress,
                     .trigger_reallocate = triggerReallocate,
                     .request_split = requestSplit,
                     .request_merge = requestMerge,
@@ -1731,6 +2143,30 @@ test "metadata http client round-trips server endpoints" {
             self.report_store_status_count += 1;
         }
 
+        fn upsertRestoreProgress(ptr: *anyopaque, _: std.mem.Allocator, record: metadata_table_manager.RestoreProgressRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 1), record.table_id);
+            try std.testing.expectEqual(@as(u64, 7), record.node_id);
+            try std.testing.expectEqual(@as(u64, 10), record.group_id);
+            try std.testing.expectEqualStrings("backup-1", record.backup_id);
+            try std.testing.expectEqualStrings("artifact-1", record.artifact_backup_id);
+            try std.testing.expectEqualStrings("s3://archive/backups", record.location);
+            try std.testing.expectEqualStrings("artifact-1.afb", record.snapshot_path);
+            try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", record.artifact_sha256);
+            try std.testing.expect(record.primary_restored);
+            try std.testing.expect(record.runtime_repair_complete);
+            try std.testing.expectEqualStrings("complete", record.phase);
+            self.upsert_restore_progress_count += 1;
+        }
+
+        fn removeRestoreProgress(ptr: *anyopaque, table_id: u64, node_id: u64, group_id: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 1), table_id);
+            try std.testing.expectEqual(@as(u64, 7), node_id);
+            try std.testing.expectEqual(@as(u64, 10), group_id);
+            self.remove_restore_progress_count += 1;
+        }
+
         fn requestSplit(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.SplitRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
@@ -1812,6 +2248,11 @@ test "metadata http client round-trips server endpoints" {
     try client.dropTable(base_uri, "docs");
     try client.upsertNode(base_uri, "{\"store_id\":7,\"node_id\":7}");
     try client.reportNodeStatus(base_uri, "{\"store_id\":7,\"health_class\":\"healthy\"}");
+    try client.upsertRestoreProgress(
+        base_uri,
+        "{\"table_id\":1,\"node_id\":7,\"group_id\":10,\"backup_id\":\"backup-1\",\"artifact_backup_id\":\"artifact-1\",\"location\":\"s3://archive/backups\",\"snapshot_path\":\"artifact-1.afb\",\"artifact_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"primary_restored\":true,\"runtime_repair_complete\":true,\"phase\":\"complete\"}",
+    );
+    try client.removeRestoreProgress(base_uri, 1, 7, 10);
     try client.requestTableSplit(base_uri, "docs", "{\"split_key\":\"doc:m\"}");
     try client.requestTableMerge(base_uri, "docs", "{\"donor_group_id\":11,\"receiver_group_id\":10}");
     try std.testing.expectEqual(@as(usize, 1), source.create_count);
@@ -1824,6 +2265,8 @@ test "metadata http client round-trips server endpoints" {
     try std.testing.expectEqual(@as(usize, 1), source.upsert_node_count);
     try std.testing.expectEqual(@as(usize, 1), source.upsert_store_count);
     try std.testing.expectEqual(@as(usize, 1), source.report_store_status_count);
+    try std.testing.expectEqual(@as(usize, 1), source.upsert_restore_progress_count);
+    try std.testing.expectEqual(@as(usize, 1), source.remove_restore_progress_count);
     try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
     try std.testing.expectEqual(@as(usize, 1), source.split_count);
     try std.testing.expectEqual(@as(usize, 1), source.merge_count);

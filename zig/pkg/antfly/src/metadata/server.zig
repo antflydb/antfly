@@ -1459,6 +1459,386 @@ test "metadata admin maps retryable authority loss to service unavailable" {
     try std.testing.expect(std.mem.indexOf(u8, response.body, "metadata authority unavailable") != null);
 }
 
+test "metadata admin distinguishes non-admission from ambiguous authority loss on table mutations" {
+    const raft_transport_common = @import("../raft/transport/http_common.zig");
+    const tables_api = @import("../api/tables.zig");
+    const FakeSource = struct {
+        fn iface(self: *@This()) metadata_http_server.AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .create_table = createTable,
+                    .drop_table = dropTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_mod.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_mod.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_mod.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn createTable(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !void {
+            return error.NotLeader;
+        }
+
+        fn dropTable(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !void {
+            return error.MetadataMutationOutcomeUnknown;
+        }
+    };
+
+    const hasHeader = struct {
+        fn check(response: anytype, name: []const u8) bool {
+            for (response.headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, name)) return true;
+            }
+            return false;
+        }
+    }.check;
+
+    var source = FakeSource{};
+    var admin = metadata_http_server.MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var server_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer server_io.deinit();
+    var http_server = httpx.Server.initWithConfig(std.testing.allocator, server_io.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
+    defer http_server.deinit();
+    try admin.registerRoutes(&http_server);
+    var listener_task = httpx.ListenerTask.init(&http_server);
+    try listener_task.start();
+    defer {
+        listener_task.shutdown(30_000);
+        listener_task.join() catch unreachable;
+    }
+
+    const address = http_server.boundAddress() orelse return error.MissingAdminListener;
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/internal/v1/tables/docs", .{address.ip4.port});
+    defer std.testing.allocator.free(uri);
+    var executor = raft_transport.StdHttpExecutor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+
+    var create_response = try executor.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = uri,
+        .body = "{}",
+        .content_type = "application/json",
+    });
+    defer create_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), create_response.status);
+    try std.testing.expect(hasHeader(create_response, raft_transport_common.metadata_not_leader_header));
+    try std.testing.expect(hasHeader(create_response, raft_transport_common.metadata_mutation_not_admitted_header));
+
+    var drop_response = try executor.executor().execute(std.testing.allocator, .{
+        .method = .DELETE,
+        .uri = uri,
+    });
+    defer drop_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), drop_response.status);
+    try std.testing.expect(hasHeader(drop_response, raft_transport_common.metadata_not_leader_header));
+    try std.testing.expect(!hasHeader(drop_response, raft_transport_common.metadata_mutation_not_admitted_header));
+}
+
+test "metadata public status source routes table mutations through local and follower paths" {
+    const raft_engine = @import("raft_engine");
+    const internal_service_secret = "metadata-table-forwarding-service-secret-v1";
+    const internal_service_issuer = "metadata-table-forwarding-test";
+
+    const Factory = struct {
+        alloc: std.mem.Allocator,
+        store: *raft_engine.core.MemoryStorage,
+        peers: []const raft_engine.core.types.NodeId,
+
+        fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
+            return .{ .ptr = self, .vtable = &.{ .build_descriptor = buildDescriptor, .free_descriptor = freeDescriptor } };
+        }
+
+        fn buildDescriptor(ptr: *anyopaque, record: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const peers = try self.alloc.dupe(raft_engine.core.types.NodeId, self.peers);
+            return .{
+                .group = .{
+                    .group_id = record.group_id,
+                    .local_node_id = record.local_node_id,
+                    .raft_config = .{
+                        .id = record.local_node_id,
+                        .group_id = record.group_id,
+                        .peers = peers,
+                        .election_tick = 5,
+                        .heartbeat_tick = 1,
+                        .pre_vote = false,
+                        .check_quorum = true,
+                    },
+                    .storage = self.store.storage(),
+                },
+                .bootstrap = switch (record.bootstrap_mode) {
+                    .empty => .empty,
+                    .persisted => .persisted,
+                    .fetch_snapshot => .persisted,
+                },
+            };
+        }
+
+        fn freeDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = alloc;
+            self.alloc.free(desc.group.raft_config.peers);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/routed-table-mutation-root", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/routed-table-mutation-catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/routed-table-mutation-snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+
+    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = Factory{ .alloc = std.testing.allocator, .store = &store, .peers = &.{1} };
+
+    var svc = try service.MetadataHttpService.init(std.testing.allocator, .{
+        .http = .{
+            .host = .{
+                .local_node_id = 1,
+                .metadata_group_id = 2912,
+                .replica_root_dir = replica_root,
+                .replica_catalog_path = replica_catalog_path,
+            },
+            .transport = .{
+                .snapshot = .{ .root_dir = snapshot_root },
+            },
+        },
+    }, .{
+        .http = .{
+            .http = .{
+                .host = .{
+                    .descriptor_factory = factory.iface(),
+                },
+            },
+        },
+    }, .{
+        .observe_local_replica_root = false,
+    });
+    defer svc.deinit();
+
+    _ = try svc.ensureMetadataReplica(.{
+        .group_id = 2912,
+        .replica_id = 1,
+        .local_node_id = 1,
+        .bootstrap_mode = .empty,
+    });
+    try svc.campaignMetadataGroup();
+    try svc.runRound();
+
+    try std.testing.expect(switch (try svc.resolveTableMutationRoute()) {
+        .local => true,
+        .forward => false,
+    });
+
+    var source = public_api_http_server.StatusSource.fromMetadataHttpService(&svc);
+    try source.createTable(std.testing.allocator, "docs", .{});
+
+    var rounds: usize = 0;
+    var present = false;
+    while (rounds < 32) : (rounds += 1) {
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        present = false;
+        for (snapshot.tables) |table| {
+            if (std.mem.eql(u8, table.name, "docs")) present = true;
+        }
+        if (present) break;
+        try svc.runRound();
+    }
+    try std.testing.expect(present);
+
+    try source.dropTable(std.testing.allocator, "docs");
+
+    rounds = 0;
+    var absent_confirmations: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        var still_present = false;
+        for (snapshot.tables) |table| {
+            if (std.mem.eql(u8, table.name, "docs")) still_present = true;
+        }
+        if (still_present) {
+            absent_confirmations = 0;
+        } else {
+            absent_confirmations += 1;
+            if (absent_confirmations >= 3) break;
+        }
+        try svc.runRound();
+    }
+    try std.testing.expect(absent_confirmations >= 3);
+
+    try std.testing.expectError(error.TableNotFound, source.dropTable(std.testing.allocator, "docs"));
+
+    var leader_admin = metadata_http_server.MetadataHttpServer.init(
+        std.testing.allocator,
+        .{},
+        metadata_http_server.AdminSource.fromMetadataHttpService(&svc),
+    );
+    defer leader_admin.deinit();
+    var leader_server_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer leader_server_io.deinit();
+    var leader_http_server = httpx.Server.initWithConfig(std.testing.allocator, leader_server_io.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+    });
+    defer leader_http_server.deinit();
+    try leader_admin.registerRoutes(&leader_http_server);
+    var leader_listener_task = httpx.ListenerTask.init(&leader_http_server);
+    try leader_listener_task.start();
+    defer {
+        leader_listener_task.shutdown(30_000);
+        leader_listener_task.join() catch unreachable;
+    }
+
+    const leader_address = leader_http_server.boundAddress() orelse return error.MissingAdminListener;
+    const leader_base_uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{leader_address.ip4.port});
+    defer std.testing.allocator.free(leader_base_uri);
+    const protocol_peers = [_]service.ReallocationProtocolPeer{
+        .{ .node_id = 1, .orchestration_url = leader_base_uri },
+    };
+
+    const follower_replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/routed-table-mutation-follower-root", .{tmp.sub_path});
+    defer std.testing.allocator.free(follower_replica_root);
+    const follower_replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/routed-table-mutation-follower-catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(follower_replica_catalog_path);
+    const follower_snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/routed-table-mutation-follower-snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(follower_snapshot_root);
+
+    var follower_store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer follower_store.deinit();
+    var follower_factory = Factory{ .alloc = std.testing.allocator, .store = &follower_store, .peers = &.{ 1, 2 } };
+    var follower = try service.MetadataHttpService.init(std.testing.allocator, .{
+        .http = .{
+            .host = .{
+                .local_node_id = 2,
+                .metadata_group_id = 2912,
+                .replica_root_dir = follower_replica_root,
+                .replica_catalog_path = follower_replica_catalog_path,
+            },
+            .transport = .{
+                .snapshot = .{ .root_dir = follower_snapshot_root },
+            },
+        },
+    }, .{
+        .http = .{
+            .http = .{
+                .host = .{
+                    .descriptor_factory = follower_factory.iface(),
+                },
+            },
+        },
+    }, .{
+        .observe_local_replica_root = false,
+        .internal_service_secret = internal_service_secret,
+        .internal_service_issuer = internal_service_issuer,
+        .reallocation_protocol_peers = &protocol_peers,
+    });
+    defer follower.deinit();
+
+    _ = try follower.ensureMetadataReplica(.{
+        .group_id = 2912,
+        .replica_id = 2,
+        .local_node_id = 2,
+        .bootstrap_mode = .empty,
+    });
+    const leader_status = svc.raft.raftStatus(2912) orelse return error.MissingRaftStatus;
+    try follower.raft.host.http_host.host.step(2912, .{
+        .msg_type = .heartbeat,
+        .from = 1,
+        .to = 2,
+        .term = leader_status.hard.current_term,
+    });
+
+    const follower_status = follower.raft.raftStatus(2912) orelse return error.MissingRaftStatus;
+    try std.testing.expectEqual(raft_engine.core.types.StateRole.follower, follower_status.soft.role);
+    try std.testing.expectEqual(@as(?u64, 1), follower_status.soft.leader_id);
+    switch (try follower.resolveTableMutationRoute()) {
+        .local => return error.TestExpectedEqual,
+        .forward => |peer| {
+            try std.testing.expectEqual(@as(u64, 1), peer.node_id);
+            try std.testing.expectEqualStrings(leader_base_uri, peer.orchestration_url.?);
+        },
+    }
+
+    const forward_client = follower.tableMutationForwardClient();
+    const forward_auth = forward_client.internal_service orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(internal_service_secret, forward_auth.secret);
+    try std.testing.expectEqualStrings(internal_service_issuer, forward_auth.issuer);
+
+    var follower_source = public_api_http_server.StatusSource.fromMetadataHttpService(&follower);
+    const follower_table_name = "sales_archive";
+    try follower_source.createTable(std.testing.allocator, follower_table_name, .{});
+
+    rounds = 0;
+    present = false;
+    while (rounds < 32) : (rounds += 1) {
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        present = false;
+        for (snapshot.tables) |table| {
+            if (std.mem.eql(u8, table.name, follower_table_name)) present = true;
+        }
+        if (present) break;
+        try svc.runRound();
+    }
+    try std.testing.expect(present);
+
+    var follower_snapshot = try follower.adminSnapshot();
+    defer follower.freeAdminSnapshot(&follower_snapshot);
+    for (follower_snapshot.tables) |table| {
+        try std.testing.expect(!std.mem.eql(u8, table.name, follower_table_name));
+    }
+
+    try follower_source.dropTable(std.testing.allocator, follower_table_name);
+    rounds = 0;
+    absent_confirmations = 0;
+    while (rounds < 32) : (rounds += 1) {
+        var snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&snapshot);
+        var still_present = false;
+        for (snapshot.tables) |table| {
+            if (std.mem.eql(u8, table.name, follower_table_name)) still_present = true;
+        }
+        if (still_present) {
+            absent_confirmations = 0;
+        } else {
+            absent_confirmations += 1;
+            if (absent_confirmations >= 3) break;
+        }
+        try svc.runRound();
+    }
+    try std.testing.expect(absent_confirmations >= 3);
+    try std.testing.expectError(error.TableNotFound, follower_source.dropTable(std.testing.allocator, follower_table_name));
+}
+
 test "metadata public api server carries auth and restore configuration" {
     const raft_engine = @import("raft_engine");
 

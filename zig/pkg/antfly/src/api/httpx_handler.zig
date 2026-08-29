@@ -4159,9 +4159,13 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(409);
                     return ctx.text("table already exists");
                 },
-                error.InvalidCreateTableRequest => {
+                error.InvalidCreateTableRequest, error.InvalidTableName => {
                     _ = ctx.status(400);
                     return ctx.text("invalid table configuration");
+                },
+                error.CreateTableRequestTooLarge => {
+                    _ = ctx.status(413);
+                    return ctx.text("create table request too large");
                 },
                 error.UnsupportedOperation => {
                     _ = ctx.status(405);
@@ -4275,6 +4279,10 @@ pub const AntflyApiHandler = struct {
             }
         }
         self.api_server.source.dropTable(alloc, decoded_table_name) catch |err| switch (err) {
+            error.InvalidTableName => {
+                _ = ctx.status(400);
+                return ctx.text("invalid table name");
+            },
             error.TableNotFound => {
                 _ = ctx.status(404);
                 return ctx.text("not found");
