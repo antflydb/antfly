@@ -6339,6 +6339,8 @@ pub fn build(b: *std.Build) void {
             "index repair inspection window is bounded and rotates fairly",
             "resident index repair scheduler skips deferred prefixes with bounded fair quanta",
             "resident index repair scheduler maintains exact aggregate wake precedence",
+            "resident index repair progress waits are revision scoped and event driven",
+            "quarantine binding reconciliation serializes with terminal transition",
             "repair admission revisions stay fail closed and reject delayed publishers",
             "db progressive managed admission serves a checkpointed partial generation",
             "db removing one repair pin preserves pressure gate for another index",

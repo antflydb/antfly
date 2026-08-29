@@ -9627,9 +9627,17 @@ pub const ProvisionedTableWriteSource = struct {
             .status, .publish, .publish_consistent, .publish_blocking => if (self.captureRepairHandoffPublicationTokenBestEffort(table_name, group_id, true)) |token| {
                 _ = self.settleRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token);
             },
+            .index_repair_progress => {},
             else => {},
         };
         switch (event.change) {
+            .index_repair_progress => {
+                // The DB scheduler already matched this edge to an exact
+                // revision-scoped progress wait. Wake the group owner without
+                // invalidating readers or borrowing structural status scope.
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue_runnable);
+                return;
+            },
             .index_repair_pending => {
                 if (repairVisibilityEdgeRequiresReaderRetirement(event)) {
                     self.invalidateReadCache(table_name);
@@ -38210,6 +38218,25 @@ test "managed repair visibility edges retire cached readers and runtime status" 
     try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
     try std.testing.expectEqual(ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue, hooks.debt.?);
     try std.testing.expectEqual(@as(usize, 2), hooks.changes);
+
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", .{ .group_id = 7001, .stats = .{ .repair_degraded = true } });
+    const epoch_before_progress = read_cache.table_epochs.get("docs").?;
+    const changes_before_progress = hooks.changes;
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
+        &source,
+        "docs",
+        7001,
+        null,
+        .index_repair_progress,
+    );
+    try std.testing.expectEqual(epoch_before_progress, read_cache.table_epochs.get("docs").?);
+    var preserved = (try snapshot_cache.snapshot(alloc, "docs")) orelse return error.TestUnexpectedResult;
+    preserved.deinit(alloc);
+    try std.testing.expectEqual(
+        ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue_runnable,
+        hooks.debt.?,
+    );
+    try std.testing.expectEqual(changes_before_progress, hooks.changes);
 
     source.retireReadersAfterIndexRepairCompletion("docs", .{ .cleared_debt = true });
     try std.testing.expectEqual(@as(u64, 10), read_cache.table_epochs.get("docs").?);

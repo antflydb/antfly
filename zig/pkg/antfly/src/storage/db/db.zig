@@ -739,6 +739,10 @@ pub const QueryVisibilityChange = enum {
     publish_blocking,
     index_repair_pending,
     index_repair_cleared,
+    /// An exact derived watermark advanced far enough to wake a resident
+    /// progress wait. This is scheduling-only: it neither invalidates readers
+    /// nor changes durable repair admission.
+    index_repair_progress,
 };
 
 pub const IndexRepairAdmission = enum {
@@ -834,7 +838,12 @@ const IndexRepairScheduleRecord = struct {
     index_name: []u8,
     class: IndexRepairScheduleClass,
     phase_terminal: bool,
+    /// Durable retry deadline from the checkpoint. Progress waits are a
+    /// process-local acceleration layer and may temporarily replace the
+    /// effective deadline without changing durable repair authority.
+    durable_next_retry_at_ms: u64,
     next_retry_at_ms: u64,
+    progress_wait_until_sequence: ?u64 = null,
     heap_position: ?usize = null,
 };
 
@@ -863,6 +872,7 @@ const IndexRepairSchedulerDirectory = struct {
     runnable: usize = 0,
     paused: usize = 0,
     terminal: usize = 0,
+    progress_waiters: usize = 0,
 
     fn classifyControlMutation(
         self: *const @This(),
@@ -955,6 +965,42 @@ const IndexRepairSchedulerDirectory = struct {
         self.siftHeapDown(new_position);
     }
 
+    /// Arm an event-driven wait for an exact durable repair revision. The
+    /// fallback deadline recovers missed callbacks and non-replay maintenance
+    /// completion without turning a queryable partial generation into a hot
+    /// owner loop.
+    fn deferForProgress(
+        self: *@This(),
+        repair_id: u128,
+        expected_revision: u64,
+        wake_at_sequence: u64,
+        fallback_at_ms: u64,
+    ) bool {
+        const record_index = self.by_id.get(repair_id) orelse return false;
+        const record = &self.records.items[record_index];
+        if (record.revision != expected_revision or record.class != .runnable) return false;
+        if (record.progress_wait_until_sequence == null) self.progress_waiters += 1;
+        record.progress_wait_until_sequence = wake_at_sequence;
+        record.next_retry_at_ms = @max(fallback_at_ms, record.durable_next_retry_at_ms);
+        self.rescheduleRunnable(repair_id);
+        return true;
+    }
+
+    /// Wake only the waiting repair for the exact index whose durable applied
+    /// watermark advanced. Returns true when the outer group owner must be
+    /// nudged; repeated notifications at the same sequence are coalesced.
+    fn wakeForIndexProgress(self: *@This(), index_name: []const u8, applied_sequence: u64) bool {
+        const record_index = self.by_name.get(index_name) orelse return false;
+        const record = &self.records.items[record_index];
+        const wake_at = record.progress_wait_until_sequence orelse return false;
+        if (applied_sequence < wake_at) return false;
+        record.progress_wait_until_sequence = null;
+        self.progress_waiters -= 1;
+        record.next_retry_at_ms = record.durable_next_retry_at_ms;
+        self.rescheduleRunnable(record.repair_id);
+        return true;
+    }
+
     fn earliestRetryDeadline(self: *const @This()) u64 {
         const repair_id = if (self.runnable_heap.items.len == 0)
             return 0
@@ -1011,13 +1057,15 @@ const IndexRepairSchedulerDirectory = struct {
             if (persisted_revision == record.revision) {
                 if (record.class != class or
                     record.phase_terminal != (intent.phase == .terminal) or
-                    record.next_retry_at_ms != intent.next_retry_at_ms)
+                    record.durable_next_retry_at_ms != intent.next_retry_at_ms)
                 {
                     return error.InvalidIndexRepairState;
                 }
                 return;
             }
-            const schedule_changed = record.class != class or record.next_retry_at_ms != intent.next_retry_at_ms;
+            const schedule_changed = record.class != class or
+                record.next_retry_at_ms != intent.next_retry_at_ms or
+                record.progress_wait_until_sequence != null;
             if (schedule_changed and record.class != .runnable and class == .runnable)
                 try self.runnable_heap.ensureUnusedCapacity(alloc, 1);
             if (schedule_changed and record.class == .runnable and class != .runnable)
@@ -1028,6 +1076,9 @@ const IndexRepairSchedulerDirectory = struct {
                 record.class = class;
             }
             record.next_retry_at_ms = intent.next_retry_at_ms;
+            record.durable_next_retry_at_ms = intent.next_retry_at_ms;
+            if (record.progress_wait_until_sequence != null) self.progress_waiters -= 1;
+            record.progress_wait_until_sequence = null;
             record.phase_terminal = intent.phase == .terminal;
             record.revision = persisted_revision;
             if (schedule_changed and class == .runnable) {
@@ -1052,6 +1103,7 @@ const IndexRepairSchedulerDirectory = struct {
             .index_name = owned_name,
             .class = class,
             .phase_terminal = intent.phase == .terminal,
+            .durable_next_retry_at_ms = intent.next_retry_at_ms,
             .next_retry_at_ms = intent.next_retry_at_ms,
         });
         self.by_id.putAssumeCapacity(intent.repair_id, record_index);
@@ -1063,6 +1115,7 @@ const IndexRepairSchedulerDirectory = struct {
     fn remove(self: *@This(), alloc: Allocator, repair_id: u128) void {
         const record_index = self.by_id.get(repair_id) orelse return;
         const removed = self.records.items[record_index];
+        if (removed.progress_wait_until_sequence != null) self.progress_waiters -= 1;
         if (removed.class == .runnable) self.removeRunnable(removed.repair_id);
         self.decrementClass(removed.class);
         _ = self.by_id.remove(removed.repair_id);
@@ -1127,7 +1180,14 @@ const AsyncContext = struct {
     query_visibility_hook: ?QueryVisibilityHook = null,
     query_visibility_hook_in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     index_repair_notification_pending: bool = false,
+    /// Serializes durable repair-control transitions with their process-local
+    /// quarantine binding effects. The scheduler directory remains a fallible
+    /// projection and is never allowed to race claim ownership decisions.
+    index_repair_control_mutex: std.atomic.Mutex = .unlocked,
     index_repair_scheduler_mutex: std.atomic.Mutex = .unlocked,
+    /// Avoid taking the scheduler mutex on the common derived-watermark path
+    /// when no repair is waiting for index progress.
+    index_repair_progress_wait_pending: std.atomic.Value(bool) = .init(false),
     index_repair_scheduler_revision: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     index_repair_scheduler: IndexRepairSchedulerDirectory = .{},
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -3546,6 +3606,12 @@ pub const DB = struct {
     active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
     shadow_index_repair_hook: ?@This().ShadowIndexRepairHook = null,
 
+    const IndexRepairDiscoveryObservationTestHook = struct {
+        ptr: *anyopaque,
+        after_observation: *const fn (ptr: *anyopaque, db: *DB, repair_id: u128) anyerror!void,
+    };
+    var test_index_repair_discovery_observation_hook: ?IndexRepairDiscoveryObservationTestHook = null;
+
     const engine_vtable = db_core.Engine.VTable{
         .batch = engineBatch,
         .lookup = engineLookup,
@@ -4252,7 +4318,7 @@ pub const DB = struct {
         notifyQueryVisibilityHook(ctx, .status);
     }
 
-    fn notifyDerivedAppliedSequenceAdvanced(ptr: *anyopaque, index_name: []const u8, _: u64) void {
+    fn notifyDerivedAppliedSequenceAdvanced(ptr: *anyopaque, index_name: []const u8, applied_sequence: u64) void {
         const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
         // The executor invokes this only after persistence, publishing its live
         // applied watermark, and releasing its mutex. Dense lifecycle status
@@ -4270,6 +4336,9 @@ pub const DB = struct {
             else
                 .status,
         );
+        if (wakeIndexRepairForProgressContext(ctx, index_name, applied_sequence)) {
+            notifyQueryVisibilityHook(ctx, .index_repair_progress);
+        }
     }
 
     fn hasQueryVisibilityHook(ctx: *AsyncContext) bool {
@@ -4316,6 +4385,7 @@ pub const DB = struct {
         const hook = ctx.query_visibility_hook orelse {
             switch (event.change) {
                 .index_repair_pending => ctx.index_repair_notification_pending = true,
+                .index_repair_progress => {},
                 else => {},
             }
             ctx.query_visibility_hook_mutex.unlock();
@@ -10946,11 +11016,21 @@ pub const DB = struct {
         wake: IndexRepairWake = .empty,
     };
 
+    /// Requires index_repair_scheduler_mutex.
+    fn publishIndexRepairProgressWaitHint(ctx: *AsyncContext) void {
+        ctx.index_repair_progress_wait_pending.store(
+            ctx.index_repair_scheduler.initialized and
+                ctx.index_repair_scheduler.progress_waiters != 0,
+            .release,
+        );
+    }
+
     fn invalidateIndexRepairSchedulerDirectory(ctx: *AsyncContext) void {
         _ = ctx.index_repair_scheduler_revision.fetchAdd(1, .acq_rel);
         lockAtomic(&ctx.index_repair_scheduler_mutex);
         defer ctx.index_repair_scheduler_mutex.unlock();
         ctx.index_repair_scheduler.deinit(ctx.alloc);
+        publishIndexRepairProgressWaitHint(ctx);
     }
 
     fn noteIndexRepairSchedulerUpsert(
@@ -10962,11 +11042,15 @@ pub const DB = struct {
         _ = ctx.index_repair_scheduler_revision.fetchAdd(1, .acq_rel);
         lockAtomic(&ctx.index_repair_scheduler_mutex);
         defer ctx.index_repair_scheduler_mutex.unlock();
-        if (!ctx.index_repair_scheduler.initialized) return;
+        if (!ctx.index_repair_scheduler.initialized) {
+            publishIndexRepairProgressWaitHint(ctx);
+            return;
+        }
         switch (ctx.index_repair_scheduler.classifyControlMutation(intent.identity(), control_revision)) {
             .stale => return,
             .gap => {
                 ctx.index_repair_scheduler.deinit(ctx.alloc);
+                publishIndexRepairProgressWaitHint(ctx);
                 return;
             },
             .next => {},
@@ -10976,9 +11060,11 @@ pub const DB = struct {
             // consistency mismatch invalidates only the acceleration layer;
             // the next owner rebuilds it from the committed checkpoint.
             ctx.index_repair_scheduler.deinit(ctx.alloc);
+            publishIndexRepairProgressWaitHint(ctx);
             return;
         };
         ctx.index_repair_scheduler.control_revision = control_revision;
+        publishIndexRepairProgressWaitHint(ctx);
     }
 
     fn noteIndexRepairSchedulerRemove(
@@ -10990,17 +11076,64 @@ pub const DB = struct {
         _ = ctx.index_repair_scheduler_revision.fetchAdd(1, .acq_rel);
         lockAtomic(&ctx.index_repair_scheduler_mutex);
         defer ctx.index_repair_scheduler_mutex.unlock();
-        if (!ctx.index_repair_scheduler.initialized) return;
+        if (!ctx.index_repair_scheduler.initialized) {
+            publishIndexRepairProgressWaitHint(ctx);
+            return;
+        }
         switch (ctx.index_repair_scheduler.classifyControlMutation(identity, control_revision)) {
             .stale => return,
             .gap => {
                 ctx.index_repair_scheduler.deinit(ctx.alloc);
+                publishIndexRepairProgressWaitHint(ctx);
                 return;
             },
             .next => {},
         }
         ctx.index_repair_scheduler.remove(ctx.alloc, repair_id);
         ctx.index_repair_scheduler.control_revision = control_revision;
+        publishIndexRepairProgressWaitHint(ctx);
+    }
+
+    const progressive_index_repair_audit_interval_ms: u64 = 5 * std.time.ms_per_s;
+
+    fn deferIndexRepairForProgress(
+        self: *DB,
+        repair_id: u128,
+        expected_revision: u64,
+        wake_at_sequence: u64,
+    ) bool {
+        const fallback_at_ms = currentTimeNs() / std.time.ns_per_ms +|
+            progressive_index_repair_audit_interval_ms;
+        lockAtomic(&self.async_context.index_repair_scheduler_mutex);
+        defer self.async_context.index_repair_scheduler_mutex.unlock();
+        if (!self.async_context.index_repair_scheduler.initialized) return false;
+        const armed = self.async_context.index_repair_scheduler.deferForProgress(
+            repair_id,
+            expected_revision,
+            wake_at_sequence,
+            fallback_at_ms,
+        );
+        if (armed) self.async_context.index_repair_progress_wait_pending.store(true, .release);
+        return armed;
+    }
+
+    fn wakeIndexRepairForProgressContext(
+        ctx: *AsyncContext,
+        index_name: []const u8,
+        applied_sequence: u64,
+    ) bool {
+        if (!ctx.index_repair_progress_wait_pending.load(.acquire)) return false;
+        lockAtomic(&ctx.index_repair_scheduler_mutex);
+        defer ctx.index_repair_scheduler_mutex.unlock();
+        if (!ctx.index_repair_scheduler.initialized) {
+            ctx.index_repair_progress_wait_pending.store(false, .release);
+            return false;
+        }
+        const woke = ctx.index_repair_scheduler.wakeForIndexProgress(index_name, applied_sequence);
+        if (ctx.index_repair_scheduler.progress_waiters == 0) {
+            ctx.index_repair_progress_wait_pending.store(false, .release);
+        }
+        return woke;
     }
 
     fn ensureIndexRepairSchedulerDirectory(self: *DB, alloc: Allocator) !void {
@@ -11013,6 +11146,7 @@ pub const DB = struct {
                 false;
             if (initialized and !current_root) {
                 self.async_context.index_repair_scheduler.deinit(self.async_context.alloc);
+                publishIndexRepairProgressWaitHint(self.async_context);
                 _ = self.async_context.index_repair_scheduler_revision.fetchAdd(1, .acq_rel);
             }
             self.async_context.index_repair_scheduler_mutex.unlock();
@@ -11032,6 +11166,7 @@ pub const DB = struct {
             if (self.async_context.index_repair_scheduler_revision.load(.acquire) != observed_revision) continue;
             self.async_context.index_repair_scheduler = replacement;
             replacement_owned = false;
+            publishIndexRepairProgressWaitHint(self.async_context);
             return;
         }
     }
@@ -11568,6 +11703,7 @@ pub const DB = struct {
             self.async_context.index_repair_scheduler = scheduler;
             scheduler_owned = false;
         }
+        publishIndexRepairProgressWaitHint(self.async_context);
         self.async_context.index_repair_scheduler_mutex.unlock();
         return replacement;
     }
@@ -11682,6 +11818,11 @@ pub const DB = struct {
     }
 
     const IndexRepairIntentUpdate = struct {
+        const AttemptFailure = struct {
+            err_name: []const u8,
+            terminal: bool,
+        };
+
         trigger: ?index_repair_state.Trigger = null,
         operator_job_id: ?u64 = null,
         operator_job_created_at_ms: ?u64 = null,
@@ -11705,6 +11846,10 @@ pub const DB = struct {
         owner_epoch: ?u64 = null,
         last_error: ?[]const u8 = null,
         replace_last_error: bool = false,
+        /// Relative retry accounting must be derived from the authoritative
+        /// entry while repair-control ownership is held. Supplying absolute
+        /// counters from an earlier snapshot can lose a concurrent failure.
+        attempt_failure: ?AttemptFailure = null,
     };
 
     fn indexRepairRetryDelayMs(repair_id: u128, attempt_count: u32) u64 {
@@ -11767,6 +11912,26 @@ pub const DB = struct {
         repair_id: u128,
         update: IndexRepairIntentUpdate,
     ) !void {
+        return try self.updateIndexRepairIntentWithBindingEffect(
+            alloc,
+            repair_id,
+            update,
+            .retain,
+        );
+    }
+
+    const IndexRepairBindingEffect = enum { retain, release };
+
+    fn updateIndexRepairIntentWithBindingEffect(
+        self: *DB,
+        alloc: Allocator,
+        repair_id: u128,
+        update: IndexRepairIntentUpdate,
+        binding_effect: IndexRepairBindingEffect,
+    ) !void {
+        lockAtomic(&self.async_context.index_repair_control_mutex);
+        var control_locked = true;
+        defer if (control_locked) self.async_context.index_repair_control_mutex.unlock();
         const location = try self.indexRepairStateLocation();
         var state = try index_repair_state.loadAt(alloc, location);
         defer state.deinit(alloc);
@@ -11790,6 +11955,18 @@ pub const DB = struct {
             .root_generation = entry.intent.root_generation,
             .owner_epoch = entry.intent.owner_epoch,
         };
+        const now_ms = currentTimeNs() / std.time.ns_per_ms;
+        if (update.attempt_failure) |failure| {
+            entry.intent.phase = if (failure.terminal) .terminal else entry.intent.phase;
+            entry.intent.attempt_count = @max(entry.intent.attempt_count, 1);
+            entry.intent.failure_streak +|= 1;
+            entry.intent.next_retry_at_ms = if (failure.terminal)
+                0
+            else
+                now_ms +| indexRepairRetryDelayMs(repair_id, entry.intent.failure_streak);
+            if (entry.intent.last_error) |value| alloc.free(value);
+            entry.intent.last_error = try alloc.dupe(u8, failure.err_name);
+        }
         if (update.trigger) |value| entry.intent.trigger = value;
         if (update.operator_job_id) |value| entry.intent.operator_job_id = value;
         if (update.operator_job_created_at_ms) |value| entry.intent.operator_job_created_at_ms = value;
@@ -11821,7 +11998,7 @@ pub const DB = struct {
             if (entry.intent.last_error) |value| alloc.free(value);
             entry.intent.last_error = if (update.last_error) |value| try alloc.dupe(u8, value) else null;
         }
-        entry.intent.updated_at_ms = currentTimeNs() / std.time.ns_per_ms;
+        entry.intent.updated_at_ms = now_ms;
         const blocks_service = indexRepairIntentBlocksService(entry.intent);
         const preserve_serviceability = blocks_service and
             previous_admission == .blocked and
@@ -11854,6 +12031,17 @@ pub const DB = struct {
             );
         }
         noteIndexRepairSchedulerUpsert(self.async_context, entry.intent, persisted_revision, control_revision);
+        if (binding_effect == .release) {
+            self.core.index_manager.releaseFailedIndexLoadRepairClaim(
+                entry.intent.index_name,
+                entry.intent.repair_id,
+            );
+        }
+        // Hooks may enqueue work or inspect the DB. Publish them only after the
+        // durable transition, scheduler projection, and binding effect are one
+        // completed control transaction.
+        self.async_context.index_repair_control_mutex.unlock();
+        control_locked = false;
         const admission = indexRepairAdmission(entry.intent);
         const action_required = indexRepairActionRequired(entry.intent);
         if (previous_admission != admission or
@@ -11868,7 +12056,9 @@ pub const DB = struct {
                 previous_action_required,
             );
         }
-        if (update.phase) |phase| {
+        const persisted_phase = update.phase orelse
+            if (update.attempt_failure != null) entry.intent.phase else null;
+        if (persisted_phase) |phase| {
             if (self.shadow_index_repair_hook) |hook| {
                 if (hook.after_phase_persisted) |after_phase| {
                     try after_phase(hook.ptr, self, repair_id, phase);
@@ -12153,6 +12343,9 @@ pub const DB = struct {
         last_error: ?[]const u8,
         minimum_target_sequence: ?u64,
     ) !u128 {
+        lockAtomic(&self.async_context.index_repair_control_mutex);
+        var control_locked = true;
+        defer if (control_locked) self.async_context.index_repair_control_mutex.unlock();
         var state = try self.loadOrCreateCurrentIndexRepairState(alloc);
         defer state.deinit(alloc);
         if (state.findIndex(cfg.name)) |i| return state.entries.items[i].intent.repair_id;
@@ -12216,6 +12409,8 @@ pub const DB = struct {
             );
         }
         noteIndexRepairSchedulerUpsert(self.async_context, intent, persisted_revision, control_revision);
+        self.async_context.index_repair_control_mutex.unlock();
+        control_locked = false;
         notifyIndexRepairVisibilityHook(
             self.async_context,
             .index_repair_pending,
@@ -12776,22 +12971,16 @@ pub const DB = struct {
         err_name: []const u8,
         terminal: bool,
     ) !void {
-        var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
-        defer entry.deinit(alloc);
-        const now_ms = currentTimeNs() / std.time.ns_per_ms;
-        const attempt_count = @max(entry.intent.attempt_count, 1);
-        const failure_streak = entry.intent.failure_streak +| 1;
-        try self.updateIndexRepairIntent(alloc, repair_id, .{
-            .phase = if (terminal) .terminal else entry.intent.phase,
-            .attempt_count = attempt_count,
-            .failure_streak = failure_streak,
-            .next_retry_at_ms = if (terminal) 0 else now_ms +| indexRepairRetryDelayMs(repair_id, failure_streak),
-            .last_error = err_name,
-            .replace_last_error = true,
-        });
-        if (terminal) self.core.index_manager.releaseFailedIndexLoadRepairClaim(
-            entry.intent.index_name,
-            entry.intent.repair_id,
+        try self.updateIndexRepairIntentWithBindingEffect(
+            alloc,
+            repair_id,
+            .{
+                .attempt_failure = .{
+                    .err_name = err_name,
+                    .terminal = terminal,
+                },
+            },
+            if (terminal) .release else .retain,
         );
     }
 
@@ -12835,6 +13024,9 @@ pub const DB = struct {
     }
 
     fn removeIndexRepairIntentAndPinContext(ctx: *AsyncContext, alloc: Allocator, repair_id: u128) !void {
+        lockAtomic(&ctx.index_repair_control_mutex);
+        var control_locked = true;
+        defer if (control_locked) ctx.index_repair_control_mutex.unlock();
         // Pin creation, pin removal, the in-memory pressure gate, and replay
         // truncation must observe one serialization order. Per-index repair
         // leases are insufficient because two different indexes may complete
@@ -12890,6 +13082,8 @@ pub const DB = struct {
             entry.intent.index_name,
             entry.intent.repair_id,
         );
+        ctx.index_repair_control_mutex.unlock();
+        control_locked = false;
         notifyIndexRepairVisibilityHook(
             ctx,
             .index_repair_cleared,
@@ -13089,6 +13283,11 @@ pub const DB = struct {
                 result.automatic_sweep_complete = false;
                 continue;
             }
+            // Directory observation and its resident binding effect share the
+            // same control transaction as durable phase transitions. The
+            // directory remains a cache, but its revision cannot change from
+            // pending to terminal (or back) between classification and claim.
+            lockAtomic(&self.async_context.index_repair_control_mutex);
             lockAtomic(&self.async_context.index_repair_scheduler_mutex);
             const existing = if (self.async_context.index_repair_scheduler.by_name.get(cfg.name)) |record_index|
                 self.async_context.index_repair_scheduler.records.items[record_index]
@@ -13096,6 +13295,11 @@ pub const DB = struct {
                 null;
             self.async_context.index_repair_scheduler_mutex.unlock();
             if (existing) |record| {
+                if (comptime builtin.is_test) {
+                    if (test_index_repair_discovery_observation_hook) |hook| {
+                        try hook.after_observation(hook.ptr, self, record.repair_id);
+                    }
+                }
                 if (record.phase_terminal) {
                     self.core.index_manager.releaseFailedIndexLoadRecoveryCandidate(
                         cfg.name,
@@ -13111,6 +13315,7 @@ pub const DB = struct {
                     )) {
                         .claimed, .already_claimed => {},
                         .absent, .stale, .claimed_by_other => {
+                            self.async_context.index_repair_control_mutex.unlock();
                             result.automatic_deferred += 1;
                             result.automatic_sweep_complete = false;
                             continue;
@@ -13118,9 +13323,11 @@ pub const DB = struct {
                     }
                     result.already_pending += 1;
                 }
+                self.async_context.index_repair_control_mutex.unlock();
                 candidate.classified = true;
                 continue;
             }
+            self.async_context.index_repair_control_mutex.unlock();
             switch (action) {
                 .retry_open => continue,
                 .manual_intervention => {
@@ -13166,6 +13373,9 @@ pub const DB = struct {
             defer intent.deinit(alloc);
             var catalog_incarnation = self.beginIndexCatalogIncarnationGuard();
             defer catalog_incarnation.deinit();
+            lockAtomic(&self.async_context.index_repair_control_mutex);
+            var repair_control_locked = true;
+            defer if (repair_control_locked) self.async_context.index_repair_control_mutex.unlock();
             // Detached config cloning and checkpoint inspection run without the
             // catalog lock. Revalidate under the same short lifecycle boundary
             // used by drop/recreate and quarantine publication so the durable
@@ -13191,7 +13401,23 @@ pub const DB = struct {
             );
             var admission_fence = try self.core.index_manager.beginRepairAdmissionFence(intent.index_name);
             defer self.core.index_manager.cancelRepairAdmissionFence(&admission_fence, intent.index_name);
-            const control_revision = try index_repair_state.putEntryAt(alloc, location, state_identity, null, .{ .intent = intent });
+            const control_revision = index_repair_state.putEntryAt(
+                alloc,
+                location,
+                state_identity,
+                null,
+                .{ .intent = intent },
+            ) catch |err| switch (err) {
+                // Another authorized creator won after the initial directory
+                // observation. The exact candidate claim unwinds below and a
+                // later bounded pass adopts the committed durable intent.
+                error.RepairTransitionConflict => {
+                    result.automatic_deferred += 1;
+                    result.automatic_sweep_complete = false;
+                    continue;
+                },
+                else => return err,
+            };
             // The durable intent now owns this exact quarantine incarnation.
             // Keep the claim until terminal classification or successful
             // replacement removes the failed-load entry.
@@ -13214,6 +13440,8 @@ pub const DB = struct {
                 .generation = checkpoint.generation,
                 .config_hash = types.indexConfigHash(cfg),
             });
+            self.async_context.index_repair_control_mutex.unlock();
+            repair_control_locked = false;
             catalog_incarnation.release();
             notifyIndexRepairVisibilityHook(
                 self.async_context,
@@ -13500,6 +13728,7 @@ pub const DB = struct {
                     .replace_last_error = true,
                 });
                 entry.intent.phase = retry_phase;
+                entry.intent.revision +|= 1;
             } else {
                 result.terminal = true;
                 return result;
@@ -13580,6 +13809,7 @@ pub const DB = struct {
         if (options.owner_epoch != 0 and entry.intent.owner_epoch != options.owner_epoch) {
             try self.updateIndexRepairIntent(alloc, repair_id, .{ .owner_epoch = options.owner_epoch });
             entry.intent.owner_epoch = options.owner_epoch;
+            entry.intent.revision +|= 1;
         }
 
         const cfg_ptr = self.core.index_manager.get(entry.intent.index_name) orelse {
@@ -13612,6 +13842,32 @@ pub const DB = struct {
         // durable intent remains pending and the stronger proof above retires
         // it once coverage and replay converge.
         if (try self.managedAdmissionGenerationIsQueryable(alloc, entry.intent)) {
+            const observed_sequence = try self.managedIndexAppliedSequence(alloc, entry.intent.index_name);
+            const wake_at_sequence = @max(
+                observed_sequence +| 1,
+                try self.projectionStatsTargetSequence(alloc, cfg_ptr.*, observed_sequence),
+            );
+            if (!self.deferIndexRepairForProgress(
+                repair_id,
+                entry.intent.revision,
+                wake_at_sequence,
+            )) {
+                // A concurrent durable transition invalidated this observation.
+                // Consume one bounded slot and let its newer schedule decide
+                // the next wake instead of publishing a stale progress wait.
+                result.busy = true;
+                return result;
+            }
+            // Arm-then-recheck closes the lost-wakeup window between proving
+            // partial serviceability and installing the resident wait.
+            const current_sequence = try self.managedIndexAppliedSequence(alloc, entry.intent.index_name);
+            if (current_sequence >= wake_at_sequence) {
+                _ = wakeIndexRepairForProgressContext(
+                    self.async_context,
+                    entry.intent.index_name,
+                    current_sequence,
+                );
+            }
             result.deferred = true;
             return result;
         }
@@ -14064,6 +14320,19 @@ pub const DB = struct {
                     selection.next_retry_at_ms = record.next_retry_at_ms;
                 }
                 continue;
+            }
+            if (record.progress_wait_until_sequence != null) {
+                // The slow audit deadline fired without a matching progress
+                // callback. Clear the process-local wait before execution so
+                // the new observation can arm a fresh token and deadline.
+                const mutable = &directory.records.items[record_index];
+                mutable.progress_wait_until_sequence = null;
+                directory.progress_waiters -= 1;
+                mutable.next_retry_at_ms = mutable.durable_next_retry_at_ms;
+                directory.rescheduleRunnable(mutable.repair_id);
+                if (directory.progress_waiters == 0) {
+                    self.async_context.index_repair_progress_wait_pending.store(false, .release);
+                }
             }
             selection.repair_ids.appendAssumeCapacity(record.repair_id);
         }
@@ -75021,6 +75290,118 @@ test "db index repair rebuilds dense index quarantined by incomplete bulk publis
     try std.testing.expectEqualStrings("doc:c", after_adoption.hits[0].id);
 }
 
+test "quarantine binding reconciliation serializes with terminal transition" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
+            .sync_level = .full_index,
+        });
+    }
+
+    const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_path);
+    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    defer alloc.free(dense_path_z);
+    {
+        var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
+            .dims = 2,
+            .storage_backend = .lsm,
+        }, .{});
+        try hbc.beginBulkIngestSession();
+        hbc.close();
+    }
+
+    var repair_id: u128 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        _ = try db.discoverRecoverableStartupIndexFailures(alloc, 1);
+        repair_id = (try db.indexRepairIdForIndex(alloc, "dense_idx")) orelse
+            return error.TestUnexpectedResult;
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const Context = struct {
+        db: *DB,
+        repair_id: u128,
+        observed: std.atomic.Value(bool) = .init(false),
+        terminal_attempted: std.atomic.Value(bool) = .init(false),
+        terminal_error: ?anyerror = null,
+
+        fn terminal(ptr: *@This()) void {
+            while (!ptr.observed.load(.acquire)) std.Thread.yield() catch {};
+            ptr.terminal_attempted.store(true, .release);
+            ptr.db.recordIndexRepairAttemptFailure(
+                ptr.db.alloc,
+                ptr.repair_id,
+                "test_terminal",
+                true,
+            ) catch |err| {
+                ptr.terminal_error = err;
+            };
+        }
+
+        fn afterObservation(raw: *anyopaque, _: *DB, observed_repair_id: u128) !void {
+            const ptr: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(ptr.repair_id, observed_repair_id);
+            ptr.observed.store(true, .release);
+            while (!ptr.terminal_attempted.load(.acquire)) std.Thread.yield() catch {};
+            // The terminal thread is now waiting on repair-control ownership.
+            // Returning lets discovery finish its pending binding transaction;
+            // terminalization must then release that exact binding.
+        }
+    };
+    var context = Context{ .db = &reopened, .repair_id = repair_id };
+    var terminal_thread = try std.Thread.spawn(.{}, Context.terminal, .{&context});
+    var terminal_thread_joined = false;
+    defer if (!terminal_thread_joined) {
+        context.observed.store(true, .release);
+        terminal_thread.join();
+    };
+    DB.test_index_repair_discovery_observation_hook = .{
+        .ptr = &context,
+        .after_observation = Context.afterObservation,
+    };
+    defer DB.test_index_repair_discovery_observation_hook = null;
+    const discovery = try reopened.discoverRecoverableStartupIndexFailures(alloc, 1);
+    terminal_thread.join();
+    terminal_thread_joined = true;
+    try std.testing.expect(context.terminal_error == null);
+    try std.testing.expectEqual(@as(usize, 1), discovery.already_pending);
+
+    var terminal = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+    defer terminal.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Phase.terminal, terminal.intent.phase);
+    try std.testing.expect(
+        reopened.core.index_manager.failedIndexLoadSnapshot("dense_idx").?.claim_owner_repair_id == null,
+    );
+}
+
 test "db restart reconciles activated dense repair without rebuilding" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -76026,6 +76407,56 @@ test "resident index repair scheduler maintains exact aggregate wake precedence"
         IndexRepairSchedulerDirectory.ControlMutationDisposition.gap,
         directory.classifyControlMutation(identity, 44),
     );
+}
+
+test "resident index repair progress waits are revision scoped and event driven" {
+    const alloc = std.testing.allocator;
+    var directory = IndexRepairSchedulerDirectory{
+        .initialized = true,
+        .identity = .{ .db_identity = 1, .replica_id = 1, .root_generation = 1 },
+    };
+    defer directory.deinit(alloc);
+
+    var intent = index_repair_state.IndexRepairIntent{
+        .repair_id = 17,
+        .revision = 1,
+        .db_identity = 1,
+        .group_id = 1,
+        .replica_id = 1,
+        .root_generation = 1,
+        .index_name = try alloc.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .config_hash = 9,
+        .detected_sequence = 1,
+        .target_sequence = 20,
+        .started_at_ms = 1,
+        .updated_at_ms = 1,
+        .owner_epoch = 0,
+    };
+    defer intent.deinit(alloc);
+    try directory.upsert(alloc, intent, intent.revision);
+
+    try std.testing.expect(directory.deferForProgress(17, 1, 20, 500));
+    try std.testing.expectEqual(@as(usize, 1), directory.progress_waiters);
+    try std.testing.expectEqual(@as(u64, 500), directory.wake().at_realtime_ms);
+    // An idempotent durable projection must not erase a resident wait.
+    try directory.upsert(alloc, intent, intent.revision);
+    try std.testing.expectEqual(@as(u64, 500), directory.wake().at_realtime_ms);
+    try std.testing.expect(!directory.wakeForIndexProgress("semantic_idx", 10));
+    try std.testing.expect(!directory.wakeForIndexProgress("semantic_idx", 19));
+    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", 20));
+    try std.testing.expectEqual(@as(usize, 0), directory.progress_waiters);
+    try std.testing.expectEqual(DB.IndexRepairWake.immediate, directory.wake());
+    try std.testing.expect(!directory.wakeForIndexProgress("unrelated", 99));
+
+    try std.testing.expect(directory.deferForProgress(17, 1, 30, 600));
+    intent.revision += 1;
+    intent.next_retry_at_ms = 700;
+    try directory.upsert(alloc, intent, intent.revision);
+    try std.testing.expectEqual(@as(usize, 0), directory.progress_waiters);
+    try std.testing.expectEqual(@as(u64, 700), directory.wake().at_realtime_ms);
+    // A delayed event from the prior revision cannot wake the new schedule.
+    try std.testing.expect(!directory.wakeForIndexProgress("semantic_idx", 12));
 }
 
 test "repair admission revisions stay fail closed and reject delayed publishers" {
