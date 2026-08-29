@@ -293,7 +293,6 @@ pub const Host = struct {
     const PendingInboundMessage = struct {
         group_id: u64,
         message: raft_engine.core.Message,
-        snapshot_bytes: usize = 0,
 
         fn deinit(self: *PendingInboundMessage, alloc: std.mem.Allocator) void {
             self.message.deinit(alloc);
@@ -326,23 +325,29 @@ pub const Host = struct {
     bootstrap_statuses: std.AutoHashMapUnmanaged(u64, OwnedBootstrapStatus) = .empty,
     inbound_mutex: std.atomic.Mutex = .unlocked,
     pending_inbound: std.ArrayListUnmanaged(PendingInboundMessage) = .empty,
-    pending_inbound_snapshot_bytes: usize = 0,
 
     pub fn init(alloc: std.mem.Allocator, cfg: HostConfig, deps: HostDeps) Host {
+        var runtime_cfg = cfg.runtime;
+        runtime_cfg.max_pending_snapshot_bytes = @min(
+            runtime_cfg.max_pending_snapshot_bytes,
+            cfg.max_pending_inbound_snapshot_bytes,
+        );
         return .{
             .alloc = alloc,
             .cfg = cfg,
             .deps = deps,
-            .runtime_host = raft_engine.runtime.MultiRaft.init(alloc, cfg.runtime, deps.runtime_hooks),
+            .runtime_host = raft_engine.runtime.MultiRaft.init(alloc, runtime_cfg, deps.runtime_hooks),
         };
     }
 
     pub fn deinit(self: *Host) void {
         self.lockInbound();
-        for (self.pending_inbound.items) |*pending| pending.deinit(self.alloc);
-        self.pending_inbound.deinit(self.alloc);
-        self.pending_inbound_snapshot_bytes = 0;
+        var pending = self.pending_inbound;
+        self.pending_inbound = .empty;
+        self.metrics.pending_inbound_messages = 0;
         self.inbound_mutex.unlock();
+        for (pending.items) |*item| item.deinit(self.alloc);
+        pending.deinit(self.alloc);
         var bootstrap_it = self.bootstrap_statuses.valueIterator();
         while (bootstrap_it.next()) |bootstrap_status| bootstrap_status.deinit(self.alloc);
         self.bootstrap_statuses.deinit(self.alloc);
@@ -652,6 +657,8 @@ pub const Host = struct {
         snapshot.runtime_pending_outbound_bytes = runtime_metrics.pending_outbound_bytes;
         snapshot.runtime_pending_apply_tasks = runtime_metrics.pending_apply_tasks;
         snapshot.runtime_pending_apply_bytes = runtime_metrics.pending_apply_bytes;
+        snapshot.pending_inbound_snapshot_bytes = runtime_metrics.pending_snapshot_bytes;
+        snapshot.inbound_snapshot_admission_denials = runtime_metrics.snapshot_admission_denials;
         snapshot.runtime_transport_queue_denials = runtime_metrics.transport_queue_denials;
         snapshot.runtime_apply_queue_denials = runtime_metrics.apply_queue_denials;
         snapshot.runtime_oversized_outbound_ready_rejections = runtime_metrics.oversized_outbound_ready_rejections;
@@ -737,11 +744,9 @@ pub const Host = struct {
     fn drainInboundMessages(self: *Host, max_messages: usize) !usize {
         if (max_messages == 0) return 0;
         var pending = std.ArrayListUnmanaged(PendingInboundMessage).empty;
-        var owned_snapshot_bytes: usize = 0;
         defer {
             for (pending.items) |*item| item.deinit(self.alloc);
             pending.deinit(self.alloc);
-            self.releaseInboundSnapshotBytes(owned_snapshot_bytes);
         }
 
         self.lockInbound();
@@ -763,7 +768,6 @@ pub const Host = struct {
             } else {
                 self.pending_inbound.clearRetainingCapacity();
             }
-            for (pending.items) |item| owned_snapshot_bytes += item.snapshot_bytes;
         }
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
         self.inbound_mutex.unlock();
@@ -784,15 +788,6 @@ pub const Host = struct {
         while (!self.inbound_mutex.tryLock()) {
             std.Thread.yield() catch {};
         }
-    }
-
-    fn releaseInboundSnapshotBytes(self: *Host, snapshot_bytes: usize) void {
-        if (snapshot_bytes == 0) return;
-        self.lockInbound();
-        defer self.inbound_mutex.unlock();
-        std.debug.assert(self.pending_inbound_snapshot_bytes >= snapshot_bytes);
-        self.pending_inbound_snapshot_bytes -= snapshot_bytes;
-        self.metrics.pending_inbound_snapshot_bytes = self.pending_inbound_snapshot_bytes;
     }
 
     pub fn campaignGroup(self: *Host, group_id: u64) !void {
@@ -862,6 +857,10 @@ pub const Host = struct {
         });
         const grp = self.runtime_host.group(upload.group_id) orelse return error.UnknownGroup;
         if (upload.to != grp.localNodeId()) return error.SnapshotUploadTargetMismatch;
+        try self.runtime_host.attachSnapshotAdmission(&owned.snapshot);
+        // The shared payload now owns the reservation and returns it only after
+        // Raft persistence and state-machine apply release their final clone.
+        admission_reserved = false;
         var msg: raft_engine.core.Message = .{
             .msg_type = .snapshot,
             .from = upload.from,
@@ -877,36 +876,19 @@ pub const Host = struct {
         try self.pending_inbound.append(self.alloc, .{
             .group_id = upload.group_id,
             .message = msg,
-            .snapshot_bytes = snapshot_bytes,
         });
-        admission_reserved = false;
         self.metrics.inbound_message_enqueues += 1;
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
     }
 
     pub fn admitSnapshotUpload(self: *Host, admission: transport.http_server.SnapshotUploadAdmission) !void {
         const data_len = std.math.cast(usize, admission.data_len) orelse return error.SnapshotTooLarge;
-        self.lockInbound();
-        defer self.inbound_mutex.unlock();
-        const grp = self.runtime_host.group(admission.group_id) orelse return error.UnknownGroup;
-        if (admission.to != grp.localNodeId()) return error.SnapshotUploadTargetMismatch;
-        if (data_len > self.cfg.max_pending_inbound_snapshot_bytes or
-            self.pending_inbound_snapshot_bytes > self.cfg.max_pending_inbound_snapshot_bytes - data_len)
-        {
-            self.metrics.inbound_snapshot_admission_denials += 1;
-            return error.SnapshotAdmissionBackpressure;
-        }
-        self.pending_inbound_snapshot_bytes += data_len;
-        self.metrics.pending_inbound_snapshot_bytes = self.pending_inbound_snapshot_bytes;
+        try self.runtime_host.admitInboundSnapshot(admission.group_id, admission.to, data_len);
     }
 
     pub fn cancelSnapshotUpload(self: *Host, admission: transport.http_server.SnapshotUploadAdmission) void {
         const data_len = std.math.cast(usize, admission.data_len) orelse return;
-        self.lockInbound();
-        defer self.inbound_mutex.unlock();
-        std.debug.assert(self.pending_inbound_snapshot_bytes >= data_len);
-        self.pending_inbound_snapshot_bytes -|= data_len;
-        self.metrics.pending_inbound_snapshot_bytes = self.pending_inbound_snapshot_bytes;
+        self.runtime_host.cancelSnapshotAdmission(data_len);
     }
 
     pub fn forgetLeader(self: *Host, group_id: u64) !void {
@@ -1656,19 +1638,19 @@ test "host queues live snapshot uploads for runtime round" {
 
     try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_enqueues);
     try std.testing.expectEqual(@as(usize, 1), host.metrics.pending_inbound_messages);
-    try std.testing.expectEqual(@as(usize, "queued-snapshot".len), host.metrics.pending_inbound_snapshot_bytes);
+    try std.testing.expectEqual(@as(usize, "queued-snapshot".len), host.metricsSnapshot().pending_inbound_snapshot_bytes);
     try std.testing.expectEqual(@as(usize, 0), host.metrics.inbound_message_drains);
     try std.testing.expectError(error.SnapshotAdmissionBackpressure, host.admitSnapshotUpload(.{
         .group_id = 41,
         .to = 1,
         .data_len = 1,
     }));
-    try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_snapshot_admission_denials);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().inbound_snapshot_admission_denials);
 
     _ = try host.runRoundBounded(1, 1, 1);
     try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_drains);
     try std.testing.expectEqual(@as(usize, 0), host.metrics.pending_inbound_messages);
-    try std.testing.expectEqual(@as(usize, 0), host.metrics.pending_inbound_snapshot_bytes);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_inbound_snapshot_bytes);
 }
 
 test "host drops stale inbound peer batch groups without leaking pending storage" {

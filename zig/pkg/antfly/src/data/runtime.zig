@@ -377,6 +377,7 @@ fn dataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     // accidental unbounded clone can exhaust the process.
     cfg.max_single_outbound_ready_bytes = data_raft_max_single_ready_bytes;
     cfg.max_single_apply_ready_bytes = data_raft_max_single_ready_bytes;
+    cfg.max_pending_snapshot_bytes = data_raft_max_snapshot_transfer_bytes;
     // Chunked snapshot transport is bounded and durable, but mixed-version
     // groups cannot safely compact until every member advertises protocol v2.
     // Keep the fail-closed rollout gate here; capability-aware activation can

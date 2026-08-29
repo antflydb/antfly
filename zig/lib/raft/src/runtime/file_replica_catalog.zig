@@ -193,20 +193,15 @@ fn encodeRecord(alloc: std.mem.Allocator, buffer: *std.ArrayList(u8), record: re
         .empty => try buffer.append(alloc, bootstrap_empty),
         .persisted => try buffer.append(alloc, bootstrap_persisted),
         .fetch_snapshot => |snapshot| {
-            try buffer.append(
-                alloc,
-                if (snapshot.locator.format == .unknown)
-                    bootstrap_fetch_snapshot
-                else
-                    bootstrap_fetch_snapshot_versioned,
-            );
+            // Keep writing the predecessor shape until a durable catalog
+            // migration has been activated separately from decoder rollout.
+            // A rolling rollback must be able to reopen every local record.
+            try buffer.append(alloc, bootstrap_fetch_snapshot);
             try appendInt(alloc, buffer, u64, snapshot.from);
             try appendInt(alloc, buffer, u64, snapshot.term);
             try buffer.append(alloc, if (snapshot.fetch_immediately) 1 else 0);
             try writeBytes(alloc, buffer, snapshot.locator.snapshot_id);
             try writeBytes(alloc, buffer, snapshot.locator.uri);
-            if (snapshot.locator.format != .unknown)
-                try buffer.append(alloc, @intFromEnum(snapshot.locator.format));
         },
     }
 }
@@ -356,32 +351,57 @@ test "versioned snapshot bootstrap frees partial locator on invalid format" {
 
 test "file replica catalog persists and reloads replica records" {
     const path = "/tmp/antflydb-raft-file-replica-catalog.bin";
+    var peers = [_]core.types.NodeId{ 1, 2, 3 };
+    const record: replica.ReplicaRecord = .{
+        .group_id = 201,
+        .local_node_id = 2,
+        .raft = .{
+            .peers = peers[0..],
+            .pre_vote = false,
+            .check_quorum = true,
+            .read_only_option = .lease_based,
+        },
+        .bootstrap = .{
+            .fetch_snapshot = .{
+                .from = 1,
+                .term = 9,
+                .locator = .{
+                    .snapshot_id = "file-catalog",
+                    .uri = "file:///tmp/snapshot",
+                    .format = .chunked_manifest_v2,
+                },
+            },
+        },
+    };
+
+    // The writer remains predecessor-readable even when the in-memory locator
+    // has an explicit decoder format.
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(std.testing.allocator);
+    try encodeRecord(std.testing.allocator, &encoded, record);
+    var reader: std.Io.Reader = .fixed(encoded.items);
+    _ = try reader.takeInt(u64, .little);
+    _ = try reader.takeInt(u64, .little);
+    const peer_count = try reader.takeInt(u32, .little);
+    for (0..peer_count) |_| _ = try reader.takeInt(u64, .little);
+    _ = try reader.takeInt(u32, .little);
+    _ = try reader.takeInt(u32, .little);
+    const has_seed = try reader.takeByte();
+    if (has_seed != 0) _ = try reader.takeInt(u64, .little);
+    _ = try reader.takeInt(u64, .little);
+    _ = try reader.takeInt(u64, .little);
+    _ = try reader.takeInt(u64, .little);
+    _ = try reader.takeInt(u32, .little);
+    _ = try reader.takeInt(u64, .little);
+    _ = try reader.takeInt(u64, .little);
+    _ = try reader.takeByte();
+    _ = try reader.takeByte();
+    try std.testing.expectEqual(bootstrap_fetch_snapshot, try reader.takeByte());
+
     {
         var catalog = try FileReplicaCatalog.init(std.testing.allocator, path);
         defer catalog.deinit();
-
-        var peers = [_]core.types.NodeId{ 1, 2, 3 };
-        try catalog.catalog().upsertReplica(.{
-            .group_id = 201,
-            .local_node_id = 2,
-            .raft = .{
-                .peers = peers[0..],
-                .pre_vote = false,
-                .check_quorum = true,
-                .read_only_option = .lease_based,
-            },
-            .bootstrap = .{
-                .fetch_snapshot = .{
-                    .from = 1,
-                    .term = 9,
-                    .locator = .{
-                        .snapshot_id = "file-catalog",
-                        .uri = "file:///tmp/snapshot",
-                        .format = .chunked_manifest_v2,
-                    },
-                },
-            },
-        });
+        try catalog.catalog().upsertReplica(record);
     }
 
     var catalog = try FileReplicaCatalog.init(std.testing.allocator, path);
@@ -389,7 +409,7 @@ test "file replica catalog persists and reloads replica records" {
 
     const records = try catalog.catalog().listReplicas(std.testing.allocator);
     defer {
-        for (records) |*record| record.deinit(std.testing.allocator);
+        for (records) |*stored_record| stored_record.deinit(std.testing.allocator);
         std.testing.allocator.free(records);
     }
 
@@ -399,7 +419,7 @@ test "file replica catalog persists and reloads replica records" {
     try std.testing.expectEqual(core.types.ReadOnlyOption.lease_based, records[0].raft.read_only_option);
     try std.testing.expectEqualStrings("file-catalog", records[0].bootstrap.fetch_snapshot.locator.snapshot_id);
     try std.testing.expectEqual(
-        snapshot_transport_iface.SnapshotArtifactFormat.chunked_manifest_v2,
+        snapshot_transport_iface.SnapshotArtifactFormat.unknown,
         records[0].bootstrap.fetch_snapshot.locator.format,
     );
 }

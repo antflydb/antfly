@@ -1846,8 +1846,62 @@ test "multi raft ensureReplica can fetch snapshot bootstrap" {
     try std.testing.expect(result.created);
     try std.testing.expect(result.fetched_snapshot);
     try std.testing.expect(host.group(132).?.hasReady());
+    try std.testing.expectEqual(
+        @as(usize, "ensure-snapshot".len),
+        host.metricsSnapshot().pending_snapshot_bytes,
+    );
     try std.testing.expectEqual(true, try host.processReady(132));
     try std.testing.expectEqual(@as(core.types.Index, 15), store.snapshot_state.metadata.index);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_snapshot_bytes);
+}
+
+test "multi raft rejects snapshot bootstrap above aggregate ownership budget" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    const root_dir = "/tmp/antflydb-raft-runtime-reject-fetch-snapshot";
+    var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
+    defer snapshot_transport.deinit();
+    var voters = [_]core.types.NodeId{ 1, 2 };
+    const payload = try std.testing.allocator.dupe(u8, "over-budget-snapshot");
+    defer std.testing.allocator.free(payload);
+    try snapshot_transport.transport().sendSnapshot(.{
+        .group_id = 133,
+        .to = 2,
+        .term = 6,
+        .snapshot = .{
+            .metadata = .{ .index = 15, .term = 6, .conf_state = .{ .voters = voters[0..] } },
+            .data = payload,
+        },
+        .locator = .{ .snapshot_id = "over-budget" },
+    });
+
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .max_pending_snapshot_bytes = payload.len - 1,
+    }, .{ .snapshot_transport = snapshot_transport.transport() });
+    defer host.deinit();
+    try std.testing.expectError(error.SnapshotAdmissionBackpressure, host.ensureReplica(.{
+        .group = .{
+            .group_id = 133,
+            .local_node_id = 2,
+            .raft_config = .{
+                .id = 2,
+                .group_id = 133,
+                .peers = voters[0..],
+                .election_tick = 10,
+                .heartbeat_tick = 1,
+                .pre_vote = false,
+            },
+            .storage = store.storage(),
+        },
+        .bootstrap = .{ .fetch_snapshot = .{
+            .from = 1,
+            .term = 6,
+            .locator = .{ .snapshot_id = "over-budget" },
+        } },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_snapshot_bytes);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().snapshot_admission_denials);
 }
 
 test "multi raft backpressure can defer ready processing" {

@@ -448,10 +448,20 @@ pub const HttpSnapshotTransport = struct {
         try mapSnapshotFetchStatus(legacy.status);
         if (legacy.body.len > self.cfg.legacy_fallback_max_request_bytes)
             return error.SnapshotTooLarge;
-        const snapshot = try decodeSnapshotEnvelopeWithLimits(self.alloc, legacy.body, .{
+        var snapshot = try decodeSnapshotEnvelopeWithLimits(self.alloc, legacy.body, .{
             .max_snapshot_bytes = self.cfg.max_snapshot_bytes,
         });
-        try receiver.receiveSnapshot(req, snapshot);
+        var snapshot_owned = true;
+        defer if (snapshot_owned) snapshot.deinit(self.alloc);
+        const data_len = snapshot.data.len;
+        var admission_owned = try receiver.admitSnapshot(req, data_len);
+        errdefer if (admission_owned) receiver.cancelSnapshotAdmission(data_len);
+        var admitted_req = req;
+        admitted_req.admission_reserved = admission_owned;
+        admitted_req.admitted_snapshot_bytes = if (admission_owned) data_len else 0;
+        admission_owned = false;
+        snapshot_owned = false;
+        try receiver.receiveSnapshot(admitted_req, snapshot);
         var release = self.executor.execute(self.alloc, .{
             .method = .DELETE,
             .uri = req.locator.uri,
@@ -598,6 +608,8 @@ pub const HttpSnapshotTransport = struct {
         }
         if (manifest.data_len > self.cfg.max_snapshot_bytes) return error.SnapshotTooLarge;
         const data_len = std.math.cast(usize, manifest.data_len) orelse return error.SnapshotTooLarge;
+        var admission_owned = try receiver.admitSnapshot(req, data_len);
+        errdefer if (admission_owned) receiver.cancelSnapshotAdmission(data_len);
         const data = try self.alloc.alloc(u8, data_len);
         var data_owned = true;
         defer if (data_owned) self.alloc.free(data);
@@ -639,7 +651,11 @@ pub const HttpSnapshotTransport = struct {
         // admission returns an error. Relinquish locally before the call so an
         // error cannot double-free the receiver's message.
         data_owned = false;
-        try receiver.receiveSnapshot(req, .{ .metadata = metadata, .data = data });
+        var admitted_req = req;
+        admitted_req.admission_reserved = admission_owned;
+        admitted_req.admitted_snapshot_bytes = if (admission_owned) data_len else 0;
+        admission_owned = false;
+        try receiver.receiveSnapshot(admitted_req, .{ .metadata = metadata, .data = data });
 
         const release_headers = [_]common.RequestHeader{
             .{ .name = "x-antfly-raft-snapshot-protocol", .value = "2" },
@@ -1118,6 +1134,87 @@ test "v2 fetch transfers snapshot ownership before receiver errors" {
             },
         }, Receiver.iface()),
     );
+}
+
+test "v2 fetch applies receiver admission before allocating or requesting chunks" {
+    const Executor = struct {
+        manifest: []const u8,
+        chunk_requests: usize = 0,
+
+        fn iface(self: *@This()) common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, req.uri, routes.Routes.capabilities)) return .{
+                .status = 200,
+                .body = try alloc.dupe(u8, "{\"snapshot_transfer_protocol_version\":2,\"snapshot_transfer_route_version\":2,\"snapshot_max_chunk_bytes\":65536}"),
+            };
+            const operation = req.header("x-antfly-raft-snapshot-operation") orelse "";
+            if (std.mem.eql(u8, operation, "manifest")) return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/x-antflydb-raft-snapshot-manifest-v2"),
+                .body = try alloc.dupe(u8, self.manifest),
+            };
+            if (std.mem.eql(u8, operation, "chunk")) self.chunk_requests += 1;
+            return error.TestUnexpectedRequest;
+        }
+    };
+    const Receiver = struct {
+        fn admit(
+            _: *anyopaque,
+            _: raft_engine.runtime.snapshot_transport_iface.SnapshotFetchRequest,
+            _: usize,
+        ) !void {
+            return error.SnapshotAdmissionBackpressure;
+        }
+
+        fn receive(
+            _: *anyopaque,
+            _: raft_engine.runtime.snapshot_transport_iface.SnapshotFetchRequest,
+            _: raft_engine.core.types.Snapshot,
+        ) !void {
+            return error.TestUnexpectedReceive;
+        }
+
+        fn cancel(_: *anyopaque, _: usize) void {}
+
+        fn iface() raft_engine.runtime.snapshot_transport_iface.SnapshotReceiver {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admit_snapshot = admit,
+                    .cancel_snapshot_admission = cancel,
+                    .receive_snapshot = receive,
+                },
+            };
+        }
+    };
+
+    const manifest: snapshot_transfer.Manifest = .{
+        .group_id = 93,
+        .from = 0,
+        .to = 8,
+        .request_term = 0,
+        .metadata = .{ .index = 13, .term = 5 },
+        .data_len = snapshot_transfer.min_chunk_bytes,
+        .digest = snapshot_transfer.digest("not-used"),
+    };
+    const encoded = try snapshot_transfer.encode(std.testing.allocator, manifest);
+    defer std.testing.allocator.free(encoded);
+    var executor = Executor{ .manifest = encoded };
+    var transport = HttpSnapshotTransport.init(std.testing.allocator, .{ .root_dir = "/tmp" }, executor.iface(), null);
+    try std.testing.expectError(error.SnapshotAdmissionBackpressure, transport.transport().fetchSnapshot(.{
+        .group_id = 93,
+        .from = 8,
+        .locator = .{
+            .snapshot_id = "admission",
+            .uri = "/raft/v2/snapshot/fetch/admission",
+            .format = .chunked_manifest_v2,
+        },
+    }, Receiver.iface()));
+    try std.testing.expectEqual(@as(usize, 0), executor.chunk_requests);
 }
 
 test "http snapshot transport posts and fetches serialized snapshots" {

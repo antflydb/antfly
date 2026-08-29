@@ -42,6 +42,10 @@ pub const RuntimeConfig = struct {
     /// is empty. Operators should size this above the largest accepted entry
     /// or snapshot representation while keeping it below an OOM-scale value.
     max_single_apply_ready_bytes: usize = std.math.maxInt(usize),
+    /// Aggregate snapshot payload ownership retained by fetch, Raft Ready,
+    /// persistence, and apply. This is intentionally separate from apply queue
+    /// pressure because an accepted snapshot may still be pending in Raft.
+    max_pending_snapshot_bytes: usize = 1 << 30,
     max_apply_tasks_per_round: usize = std.math.maxInt(usize),
     applied_log_retained_entries: u64 = 4096,
     applied_log_compaction_min_interval_entries: u64 = 4096,
@@ -158,6 +162,8 @@ pub const HostMetrics = struct {
     pending_outbound_bytes: usize = 0,
     pending_apply_tasks: usize = 0,
     pending_apply_bytes: usize = 0,
+    pending_snapshot_bytes: usize = 0,
+    snapshot_admission_denials: usize = 0,
     transport_queue_denials: usize = 0,
     apply_queue_denials: usize = 0,
     oversized_outbound_ready_rejections: usize = 0,
@@ -414,6 +420,8 @@ pub const MultiRaft = struct {
     next_group_incarnation: u64 = 1,
     pending_outbox: TransportOutbox = .{},
     pending_apply: std.ArrayListUnmanaged(PendingApplyTask) = .empty,
+    pending_snapshot_bytes: std.atomic.Value(usize) = .init(0),
+    snapshot_admission_denials: std.atomic.Value(usize) = .init(0),
     // Reused by every bounded Ready drain. Capacity is reserved when groups
     // are admitted so the consensus hot path never allocates merely to record
     // hard-limit quarantines.
@@ -456,6 +464,7 @@ pub const MultiRaft = struct {
         while (snapshot_candidates.next()) |candidate| candidate.deinit(self.alloc);
         self.snapshot_candidates.deinit(self.alloc);
         self.scheduler.deinit();
+        std.debug.assert(self.pending_snapshot_bytes.load(.acquire) == 0);
         self.* = undefined;
     }
 
@@ -745,7 +754,10 @@ pub const MultiRaft = struct {
     }
 
     pub fn metricsSnapshot(self: *const MultiRaft) HostMetrics {
-        return self.metrics;
+        var snapshot = self.metrics;
+        snapshot.pending_snapshot_bytes = self.pending_snapshot_bytes.load(.acquire);
+        snapshot.snapshot_admission_denials = self.snapshot_admission_denials.load(.acquire);
+        return snapshot;
     }
 
     pub fn step(self: *MultiRaft, group_id: core.types.GroupId, msg: core.Message) !void {
@@ -862,6 +874,30 @@ pub const MultiRaft = struct {
         try self.resumeOnActivity(req.group_id);
         const snapshot_transport = self.hooks.snapshot_transport orelse return error.MissingSnapshotTransport;
         try snapshot_transport.fetchSnapshot(req, self.snapshotReceiver());
+    }
+
+    /// Reserves the process-wide snapshot ownership budget before an external
+    /// ingress path materializes a live payload.
+    pub fn admitInboundSnapshot(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        to: core.types.NodeId,
+        data_len: usize,
+    ) !void {
+        const grp = self.group(group_id) orelse return error.UnknownGroup;
+        if (to != grp.localNodeId()) return error.SnapshotUploadTargetMismatch;
+        try self.reserveSnapshotBytes(data_len);
+    }
+
+    pub fn cancelSnapshotAdmission(self: *MultiRaft, data_len: usize) void {
+        self.releaseSnapshotBytes(data_len);
+    }
+
+    pub fn attachSnapshotAdmission(self: *MultiRaft, snapshot: *core.types.Snapshot) !void {
+        try snapshot.shareOwnedData(self.alloc, .{
+            .ptr = self,
+            .release = releaseSnapshotBytesCallback,
+        });
     }
 
     pub fn proposeConfChange(self: *MultiRaft, group_id: core.types.GroupId, conf_change: core.ConfChange) !void {
@@ -1888,9 +1924,26 @@ pub const MultiRaft = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .admit_snapshot = snapshotAdmitReceive,
+                .cancel_snapshot_admission = snapshotCancelAdmission,
                 .receive_snapshot = snapshotHandleReceive,
             },
         };
+    }
+
+    fn snapshotAdmitReceive(
+        ptr: *anyopaque,
+        req: snapshot_transport_iface.SnapshotFetchRequest,
+        data_len: usize,
+    ) !void {
+        const self: *MultiRaft = @ptrCast(@alignCast(ptr));
+        _ = self.group(req.group_id) orelse return error.UnknownGroup;
+        try self.reserveSnapshotBytes(data_len);
+    }
+
+    fn snapshotCancelAdmission(ptr: *anyopaque, data_len: usize) void {
+        const self: *MultiRaft = @ptrCast(@alignCast(ptr));
+        self.releaseSnapshotBytes(data_len);
     }
 
     fn snapshotHandleReceive(
@@ -1901,7 +1954,22 @@ pub const MultiRaft = struct {
         const self: *MultiRaft = @ptrCast(@alignCast(ptr));
         var owned_snapshot = snapshot;
         defer owned_snapshot.deinit(self.alloc);
+        var admission_reserved = req.admission_reserved;
+        var admission_bytes = if (admission_reserved) req.admitted_snapshot_bytes else 0;
+        errdefer if (admission_reserved) self.releaseSnapshotBytes(admission_bytes);
         const grp = self.group(req.group_id) orelse return error.UnknownGroup;
+        if (admission_reserved and admission_bytes != owned_snapshot.data.len)
+            return error.SnapshotAdmissionSizeMismatch;
+        if (!admission_reserved) {
+            try self.reserveSnapshotBytes(owned_snapshot.data.len);
+            admission_reserved = true;
+            admission_bytes = owned_snapshot.data.len;
+        }
+        try owned_snapshot.shareOwnedData(self.alloc, .{
+            .ptr = self,
+            .release = releaseSnapshotBytesCallback,
+        });
+        admission_reserved = false;
         var msg: core.Message = .{
             .msg_type = .snapshot,
             .from = req.from,
@@ -1912,6 +1980,41 @@ pub const MultiRaft = struct {
         owned_snapshot = .{};
         defer msg.deinit(self.alloc);
         try self.step(req.group_id, msg);
+    }
+
+    fn reserveSnapshotBytes(self: *MultiRaft, data_len: usize) !void {
+        if (data_len > self.cfg.max_pending_snapshot_bytes) {
+            _ = self.snapshot_admission_denials.fetchAdd(1, .monotonic);
+            return error.SnapshotAdmissionBackpressure;
+        }
+        var current = self.pending_snapshot_bytes.load(.acquire);
+        while (true) {
+            if (current > self.cfg.max_pending_snapshot_bytes - data_len) {
+                _ = self.snapshot_admission_denials.fetchAdd(1, .monotonic);
+                return error.SnapshotAdmissionBackpressure;
+            }
+            if (self.pending_snapshot_bytes.cmpxchgWeak(
+                current,
+                current + data_len,
+                .acq_rel,
+                .acquire,
+            )) |observed| {
+                current = observed;
+                continue;
+            }
+            return;
+        }
+    }
+
+    fn releaseSnapshotBytes(self: *MultiRaft, data_len: usize) void {
+        if (data_len == 0) return;
+        const previous = self.pending_snapshot_bytes.fetchSub(data_len, .acq_rel);
+        std.debug.assert(previous >= data_len);
+    }
+
+    fn releaseSnapshotBytesCallback(ptr: *anyopaque, data_len: usize) void {
+        const self: *MultiRaft = @ptrCast(@alignCast(ptr));
+        self.releaseSnapshotBytes(data_len);
     }
 
     fn handleLocalStorageAppend(

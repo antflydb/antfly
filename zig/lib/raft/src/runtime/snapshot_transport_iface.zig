@@ -45,6 +45,11 @@ pub const SnapshotFetchRequest = struct {
     from: core.types.NodeId,
     term: core.types.Term = 0,
     locator: SnapshotLocator,
+    /// Set only on the receiver callback after its byte admission hook has
+    /// accepted this payload. Transports must relinquish the reservation with
+    /// the same ownership semantics as the snapshot itself.
+    admission_reserved: bool = false,
+    admitted_snapshot_bytes: usize = 0,
 };
 
 pub const SnapshotReceiver = struct {
@@ -52,6 +57,15 @@ pub const SnapshotReceiver = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        admit_snapshot: ?*const fn (
+            ptr: *anyopaque,
+            req: SnapshotFetchRequest,
+            data_len: usize,
+        ) anyerror!void = null,
+        cancel_snapshot_admission: ?*const fn (
+            ptr: *anyopaque,
+            data_len: usize,
+        ) void = null,
         /// Takes ownership of `snapshot` when invoked, whether the callback
         /// succeeds or fails. This keeps transport error paths from guessing
         /// whether a partially admitted Raft message still owns its buffers.
@@ -62,6 +76,18 @@ pub const SnapshotReceiver = struct {
         ) anyerror!void,
         receive_locator: ?*const fn (ptr: *anyopaque, req: SnapshotFetchRequest) anyerror!void = null,
     };
+
+    pub fn admitSnapshot(self: SnapshotReceiver, req: SnapshotFetchRequest, data_len: usize) !bool {
+        const admit = self.vtable.admit_snapshot orelse return false;
+        if (self.vtable.cancel_snapshot_admission == null) return error.InvalidSnapshotReceiver;
+        try admit(self.ptr, req, data_len);
+        return true;
+    }
+
+    pub fn cancelSnapshotAdmission(self: SnapshotReceiver, data_len: usize) void {
+        const cancel = self.vtable.cancel_snapshot_admission orelse return;
+        cancel(self.ptr, data_len);
+    }
 
     pub fn receiveSnapshot(self: SnapshotReceiver, req: SnapshotFetchRequest, snapshot: core.types.Snapshot) !void {
         return try self.vtable.receive_snapshot(self.ptr, req, snapshot);

@@ -60,6 +60,7 @@ fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
         .max_pending_apply_tasks = 1024,
         .max_pending_apply_bytes = 16 * 1024 * 1024,
         .max_single_apply_ready_bytes = metadata_raft_max_single_ready_bytes,
+        .max_pending_snapshot_bytes = metadata_raft_max_snapshot_transfer_bytes,
         .max_apply_tasks_per_round = 16,
         .applied_log_retained_entries = metadata_raft_retained_entries,
         .applied_log_compaction_min_interval_entries = metadata_raft_compaction_min_interval_entries,

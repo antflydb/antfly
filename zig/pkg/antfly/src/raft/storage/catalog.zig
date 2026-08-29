@@ -89,6 +89,25 @@ pub const SnapshotBootstrapRecord = struct {
     uri: []const u8 = "",
     format: raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat = .unknown,
 
+    /// Keep the durable catalog predecessor-readable during the decoder-first
+    /// rollout. The isolated v2 URI is already a lossless discriminator for
+    /// Antfly snapshot artifacts, so emitting `format` here would only make a
+    /// node rollback reject an otherwise valid local catalog as an unknown JSON
+    /// field. The default parser still accepts catalogs written by development
+    /// builds that included the explicit field.
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        try writer.objectField("from_node_id");
+        try writer.write(self.from_node_id);
+        try writer.objectField("term");
+        try writer.write(self.term);
+        try writer.objectField("snapshot_id");
+        try writer.write(self.snapshot_id);
+        try writer.objectField("uri");
+        try writer.write(self.uri);
+        try writer.endObject();
+    }
+
     pub fn inferFormat(snapshot_id: []const u8, uri: []const u8) raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat {
         const v2_routes = [_][]const u8{
             "/raft/v2/snapshot/upload",
@@ -1138,6 +1157,14 @@ test "file replica catalog persists records across reopen" {
     {
         var reopened = try FileReplicaCatalog.init(std.testing.allocator, path);
         defer reopened.deinit();
+        const raw = try std.Io.Dir.cwd().readFileAlloc(
+            reopened.io(),
+            path,
+            std.testing.allocator,
+            .limited(max_replica_catalog_bytes),
+        );
+        defer std.testing.allocator.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"format\"") == null);
         const records = try reopened.catalog().listReplicas(std.testing.allocator);
         defer freeReplicaRecords(std.testing.allocator, records);
         try std.testing.expectEqual(@as(usize, 1), records.len);
