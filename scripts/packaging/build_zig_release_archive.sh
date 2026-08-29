@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+# Copyright 2026 Antfly, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 set -euo pipefail
 
 usage() {
@@ -14,6 +28,7 @@ contains:
   include/
   README.md
   LICENSE
+  THIRD_PARTY_NOTICES.md
 EOF
 }
 
@@ -265,6 +280,7 @@ if [ -d "$prefix/include" ]; then
 fi
 cp "$repo_root/README.md" "$stage/README.md"
 cp "$repo_root/LICENSE" "$stage/LICENSE"
+cp "$repo_root/THIRD_PARTY_NOTICES.md" "$stage/THIRD_PARTY_NOTICES.md"
 "$repo_root/scripts/completions.sh" "$stage/completions"
 
 python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
@@ -273,6 +289,7 @@ python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
   --mtime "$source_date_epoch"
 tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
 grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null
+grep -Fx "./THIRD_PARTY_NOTICES.md" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "./completions/antfly.bash" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "./completions/antfly.zsh" "$work_root/archive-contents.txt" >/dev/null

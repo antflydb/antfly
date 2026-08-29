@@ -75,6 +75,7 @@ const kernel_owner_client = if (control_only_storage_sources)
 else
     struct {};
 const aggregation_contract = @import("../storage/db/aggregations_contract.zig");
+const http_route_helpers = @import("http_route_helpers.zig");
 
 fn publishRuntimeStatusGroupForTest(
     cache: *runtime_status.TableRuntimeSnapshotCache,
@@ -2281,7 +2282,7 @@ pub const BoundTableReadSource = struct {
 
         for (result.hashes, 0..) |entry, i| {
             const json = if (opts.include_documents) result.documents[i].json else null;
-            try appendScanLine(alloc, &out, entry.id, json);
+            try appendScanLine(alloc, &out, entry.id, json, entry.content_hash);
         }
 
         return .{
@@ -8947,7 +8948,7 @@ fn scanLocal(
     defer out.deinit(alloc);
     for (result.hashes, 0..) |entry, i| {
         const json = if (opts.include_documents) result.documents[i].json else null;
-        try appendScanLine(alloc, &out, entry.id, json);
+        try appendScanLine(alloc, &out, entry.id, json, entry.content_hash);
     }
     return .{ .ndjson = try out.toOwnedSlice(alloc) };
 }
@@ -8979,7 +8980,7 @@ fn scanProvisionedLocal(
     defer out.deinit(alloc);
     for (result.hashes, 0..) |entry, i| {
         const json = if (opts.include_documents) result.documents[i].json else null;
-        try appendScanLine(alloc, &out, entry.id, json);
+        try appendScanLine(alloc, &out, entry.id, json, entry.content_hash);
     }
     return .{ .ndjson = try out.toOwnedSlice(alloc) };
 }
@@ -17053,8 +17054,29 @@ fn encodeScanRequest(
         try appendJsonFieldName(alloc, &out, &first, "filter_query");
         try out.appendSlice(alloc, opts.filter_query_json);
     }
+    if (opts.include_content_hashes) {
+        try appendJsonFieldBool(alloc, &out, &first, "_include_content_hashes", true);
+    }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+test "internal scan content hash mode round trips without public document fields" {
+    const body = try encodeScanRequest(std.testing.allocator, "doc:a", "doc:z", .{
+        .include_content_hashes = true,
+    });
+    defer std.testing.allocator.free(body);
+
+    var parsed = try http_route_helpers.parseInternalScanKeysRequest(std.testing.allocator, body);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expect(parsed.opts.include_content_hashes);
+    try std.testing.expect(!parsed.opts.include_documents);
+    try std.testing.expectEqualStrings("doc:a", parsed.from);
+    try std.testing.expectEqualStrings("doc:z", parsed.to);
+
+    var public_parsed = try http_route_helpers.parseScanKeysRequest(std.testing.allocator, body);
+    defer public_parsed.deinit(std.testing.allocator);
+    try std.testing.expect(!public_parsed.opts.include_content_hashes);
 }
 
 fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
@@ -17301,7 +17323,7 @@ pub fn encodeStorageKernelScanNdjson(
     defer out.deinit(alloc);
     for (result.hashes, 0..) |entry, i| {
         const json = if (include_documents) result.documents[i].json else null;
-        try appendScanLine(alloc, &out, entry.id, json);
+        try appendScanLine(alloc, &out, entry.id, json, entry.content_hash);
     }
     return try out.toOwnedSlice(alloc);
 }
@@ -19058,12 +19080,19 @@ fn appendScanLine(
     out: *std.ArrayListUnmanaged(u8),
     key: []const u8,
     projected_json: ?[]const u8,
+    content_hash: ?db_mod.types.DocumentContentHash,
 ) !void {
     const escaped_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(key, .{})});
     defer alloc.free(escaped_key);
 
     try out.appendSlice(alloc, "{\"_id\":");
     try out.appendSlice(alloc, escaped_key);
+    if (content_hash) |digest| {
+        const encoded = std.fmt.bytesToHex(digest, .lower);
+        try out.appendSlice(alloc, ",\"_content_hash\":\"");
+        try out.appendSlice(alloc, &encoded);
+        try out.append(alloc, '\"');
+    }
     if (projected_json) |json| {
         try appendScanProjectedFields(alloc, out, json);
     } else {
@@ -19115,7 +19144,7 @@ test "scan ndjson keeps _id reserved for server document identity" {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
 
-    try appendScanLine(alloc, &out, "doc:server", "{\"_id\":\"doc:stored\",\"title\":\"alpha\"}");
+    try appendScanLine(alloc, &out, "doc:server", "{\"_id\":\"doc:stored\",\"title\":\"alpha\"}", null);
     try std.testing.expectEqualStrings("{\"_id\":\"doc:server\",\"title\":\"alpha\"}\n", out.items);
 }
 

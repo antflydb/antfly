@@ -502,6 +502,7 @@ comptime {
             exportInternal(&storage_kernel_exports.storageOwnerBulkAbort, "antfly_storage_owner_bulk_abort");
             exportInternal(&storage_kernel_exports.storageOwnerBatchJson, "antfly_storage_owner_batch_json");
             exportInternal(&storage_kernel_exports.storageOwnerReplicatedBatchJson, "antfly_storage_owner_replicated_batch_json");
+            exportInternal(&storage_kernel_exports.storageOwnerReplicatedBatchAtRaftEntryJson, "antfly_storage_owner_replicated_batch_at_raft_entry_json");
             exportInternal(&storage_kernel_exports.storageOwnerTransactionStatus, "antfly_storage_owner_transaction_status");
             exportInternal(&storage_kernel_exports.storageOwnerWaitForSync, "antfly_storage_owner_wait_for_sync");
             exportInternal(&storage_kernel_exports.storageOwnerApplyHAReplicationRecord, "antfly_storage_owner_apply_ha_replication_record");

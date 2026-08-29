@@ -4252,6 +4252,32 @@ pub fn storageOwnerReplicatedBatchJson(
     return .ok;
 }
 
+pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (request.raft_term == 0 or request.raft_index == 0) return .invalid_argument;
+    var response: capi.Buffer = .{};
+    const status = replicatedBatchStorageKernelJsonAtRaftEntry(handle, .{
+        .ptr = request.request_json.ptr,
+        .len = @intCast(request.request_json.len),
+    }, .{
+        .term = request.raft_term,
+        .index = request.raft_index,
+    }, &response);
+    if (status != .ok) return status;
+    out_response.* = .{
+        .ptr = response.ptr,
+        .len = @intCast(response.len),
+    };
+    return .ok;
+}
+
 pub fn storageOwnerTransactionStatus(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.TransactionStatusRequest,
@@ -4517,7 +4543,7 @@ fn prepareStorageRestore(
     snapshot.* = .{
         .alloc = alloc,
         .preparation = preparation,
-        .staged = staged,
+        .staged = staged.takeStagedGeneration(),
         .restore_live_path = restore_live_path,
     };
     preparation_owned = false;
@@ -4819,6 +4845,33 @@ fn replicatedBatchStorageKernelJson(
         handle.storage_owner_table_name orelse return .invalid_argument,
         handle.storage_owner_group_id,
         owned.req,
+    ) catch |err| return storageOwnerStatusFromError(err);
+    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_buf.* = .{
+        .ptr = response.ptr,
+        .len = response.len,
+    };
+    return .ok;
+}
+
+fn replicatedBatchStorageKernelJsonAtRaftEntry(
+    handle: *Handle,
+    request_json: capi.Slice,
+    raft_entry: db_mod.RaftAppliedEntryIdentity,
+    out_buf: *capi.Buffer,
+) kernel_owner_abi.Status {
+    var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer owned.deinit(handle.alloc);
+
+    antfly.public_api.table_writes.applyStorageKernelReplicatedBatchAtRaftEntry(
+        handle.alloc,
+        &handle.db,
+        handle.storage_owner_table_name orelse return .invalid_argument,
+        handle.storage_owner_group_id,
+        owned.req,
+        raft_entry,
     ) catch |err| return storageOwnerStatusFromError(err);
     const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err|
         return storageOwnerStatusFromError(err);
@@ -5520,6 +5573,8 @@ pub fn storageOwnerRestoreStateJson(
         .backup_id = state.backup_id,
         .location = state.location,
         .artifact_sha256 = state.artifact_sha256,
+        .native_manifest_size_bytes = state.native_manifest_size_bytes,
+        .native_manifest_sha256 = state.native_manifest_sha256,
         .snapshot_path = state.snapshot_path,
         .group_id = state.group_id,
         .phase = state.phase,

@@ -415,6 +415,28 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn replicatedBatchAtRaftEntryJson(
+        self: *Owner,
+        table_name: []const u8,
+        request_json: []const u8,
+        raft_term: u64,
+        raft_index: u64,
+    ) !Response {
+        if (raft_term == 0 or raft_index == 0) return error.InvalidArgument;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_replicated_batch_at_raft_entry_json(
+            self.handle,
+            &.{
+                .table_name = .fromSlice(table_name),
+                .request_json = .fromSlice(request_json),
+                .raft_term = raft_term,
+                .raft_index = raft_index,
+            },
+            &response.buffer,
+        ));
+        return response;
+    }
+
     pub fn transactionStatus(
         self: *Owner,
         table_name: []const u8,

@@ -322,6 +322,12 @@ pub const Context = struct {
     /// Optional transport-neutral cancellation source installed by adapters
     /// that cannot expose their concrete listener state to the handler.
     cancellation_probe: ?CancellationProbe = null,
+    /// Optional application-owned absolute monotonic deadline established by
+    /// ingress middleware. The HTTP library carries but does not interpret it.
+    application_deadline_ns: ?u64 = null,
+    /// Records malformed application deadline metadata so authentication can
+    /// run before an application-specific validation response is disclosed.
+    application_deadline_invalid: bool = false,
 
     /// Optional transport-neutral streaming sink. Linked runtime adapters use
     /// this to preserve incremental response delivery without sharing socket

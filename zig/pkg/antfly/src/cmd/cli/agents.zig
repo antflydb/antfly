@@ -45,6 +45,8 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     var full_text_search: ?[]const u8 = null;
     var indexes_str: ?[]const u8 = null;
     var fields_str: ?[]const u8 = null;
+    var reranker_json: ?[]const u8 = null;
+    var pruner_json: ?[]const u8 = null;
     var limit: i64 = 5;
     var prompt: ?[]const u8 = null;
     var system_prompt: ?[]const u8 = null;
@@ -76,6 +78,10 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
             takeUniqueValue(args, &indexes_str, arg);
         } else if (std.mem.eql(u8, arg, "--fields")) {
             takeUniqueValue(args, &fields_str, arg);
+        } else if (std.mem.eql(u8, arg, "--reranker")) {
+            takeUniqueValue(args, &reranker_json, arg);
+        } else if (std.mem.eql(u8, arg, "--pruner")) {
+            takeUniqueValue(args, &pruner_json, arg);
         } else if (std.mem.eql(u8, arg, "--limit")) {
             takeUniqueSwitch(&limit_set, arg);
             const raw = args.next() orelse cli.fatal("--limit requires a value", .{});
@@ -138,6 +144,14 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     defer if (indexes) |slice| allocator.free(slice);
     if (indexes_str) |raw| indexes = try cli.splitCommaListAlloc(allocator, raw);
 
+    var reranker_value: ?std.json.Parsed(antfly_client.types.RerankerConfig) = null;
+    defer if (reranker_value) |*parsed| parsed.deinit();
+    if (reranker_json) |raw| reranker_value = parseJsonArg(antfly_client.types.RerankerConfig, allocator, "--reranker", raw);
+
+    var pruner_value: ?std.json.Parsed(antfly_client.types.Pruner) = null;
+    defer if (pruner_value) |*parsed| parsed.deinit();
+    if (pruner_json) |raw| pruner_value = parseJsonArg(antfly_client.types.Pruner, allocator, "--pruner", raw);
+
     const retrieval_query = antfly_client.types.RetrievalQueryRequest{
         .table = table,
         .full_text_search = if (full_text_value) |*parsed| parsed.value else null,
@@ -145,6 +159,8 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
         .indexes = indexes,
         .fields = fields,
         .limit = limit,
+        .reranker = if (reranker_value) |*parsed| parsed.value else null,
+        .pruner = if (pruner_value) |*parsed| parsed.value else null,
     };
     const queries = [_]antfly_client.types.RetrievalQueryRequest{retrieval_query};
 

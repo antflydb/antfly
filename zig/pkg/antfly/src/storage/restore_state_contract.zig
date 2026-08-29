@@ -20,6 +20,8 @@ pub const State = struct {
     backup_id: []const u8,
     location: []const u8,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
     snapshot_path: []const u8,
     group_id: u64,
     phase: []const u8,
@@ -34,6 +36,11 @@ pub const State = struct {
         errdefer alloc.free(location);
         const artifact_sha256 = try alloc.dupe(u8, self.artifact_sha256);
         errdefer alloc.free(artifact_sha256);
+        const native_manifest_sha256 = if (self.native_manifest_sha256.len > 0)
+            try alloc.dupe(u8, self.native_manifest_sha256)
+        else
+            "";
+        errdefer if (native_manifest_sha256.len > 0) alloc.free(@constCast(native_manifest_sha256));
         const snapshot_path = try alloc.dupe(u8, self.snapshot_path);
         errdefer alloc.free(snapshot_path);
         const phase = try alloc.dupe(u8, self.phase);
@@ -43,6 +50,8 @@ pub const State = struct {
             .backup_id = backup_id,
             .location = location,
             .artifact_sha256 = artifact_sha256,
+            .native_manifest_size_bytes = self.native_manifest_size_bytes,
+            .native_manifest_sha256 = native_manifest_sha256,
             .snapshot_path = snapshot_path,
             .group_id = self.group_id,
             .phase = phase,
@@ -56,6 +65,7 @@ pub const State = struct {
         alloc.free(@constCast(self.backup_id));
         alloc.free(@constCast(self.location));
         alloc.free(@constCast(self.artifact_sha256));
+        if (self.native_manifest_sha256.len > 0) alloc.free(@constCast(self.native_manifest_sha256));
         alloc.free(@constCast(self.snapshot_path));
         alloc.free(@constCast(self.phase));
         alloc.free(@constCast(self.last_error));

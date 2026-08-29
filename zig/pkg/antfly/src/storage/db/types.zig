@@ -27,8 +27,10 @@ const reranking_mod = @import("antfly_reranking");
 const doc_identity_mod = @import("doc_identity.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const index_repair_status = @import("../../common/index_repair_status.zig");
+const document_content_hash = @import("document_content_hash.zig");
 pub const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
+pub const DocumentContentHash = document_content_hash.Digest;
 
 pub const GeoPoint = struct {
     lon: f64,
@@ -1139,6 +1141,9 @@ pub const ScanOptions = struct {
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     filter_query_json: []const u8 = "",
+    /// Internal-only response mode used by linear merge. Public scans leave
+    /// this false and retain their existing NDJSON shape.
+    include_content_hashes: bool = false,
 };
 
 pub const ScanDocument = struct {
@@ -1155,6 +1160,7 @@ pub const ScanDocument = struct {
 pub const ScanHash = struct {
     id: []u8,
     hash: u64,
+    content_hash: ?DocumentContentHash = null,
 
     pub fn deinit(self: *ScanHash, alloc: Allocator) void {
         alloc.free(self.id);
@@ -2610,6 +2616,22 @@ pub const RepairCancelCheck = struct {
     }
 };
 
+/// Stable adapter from restore/request cancellation to the repair subsystem's
+/// cooperative callback. The adapter must remain alive while the returned
+/// check is borrowed by a repair quantum.
+pub const RepairCancellation = struct {
+    token: CancellationToken,
+
+    fn requested(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.token.isCancelled();
+    }
+
+    pub fn check(self: *@This()) RepairCancelCheck {
+        return .{ .ptr = self, .is_requested = requested };
+    }
+};
+
 /// Cooperative scheduler preemption checked only at durable reconstruction
 /// boundaries. Unlike cancellation, yielding is a successful partial pass: the
 /// candidate remains reopenable and its scan cursor is persisted before the
@@ -2695,9 +2717,6 @@ pub const ArtifactRepairRunOptions = struct {
     /// Installed by the durable owner after admission. Shadow construction
     /// invokes it only at bounded publication/window boundaries.
     capacity_check: ?RepairCapacityCheck = null,
-    /// Internal recursion fence: the durable owner has already admitted and
-    /// claimed this intent and is invoking the lower-level rebuild engine.
-    executing_durable_index_repair: bool = false,
     /// Managed operator requests persist/enqueue intent work and return
     /// immediately. Standalone callers leave this false and advance through
     /// the same state machine synchronously.
@@ -2707,6 +2726,29 @@ pub const ArtifactRepairRunOptions = struct {
         if (self.cancel_check) |check| return check.requested();
         return false;
     }
+};
+
+/// Authoritative owner wake decision. A tagged state prevents `0` from
+/// ambiguously meaning both "run now" and "nothing runnable" at scheduler
+/// boundaries while remaining available to the control-only compiler unit.
+pub const IndexRepairWake = union(enum) {
+    immediate,
+    at_realtime_ms: u64,
+    parked,
+    empty,
+
+    pub fn retryAtMs(self: @This()) u64 {
+        return switch (self) {
+            .at_realtime_ms => |deadline| deadline,
+            .immediate, .parked, .empty => 0,
+        };
+    }
+};
+
+/// Exact data-Raft entry persisted atomically with one document mutation.
+pub const RaftAppliedEntryIdentity = struct {
+    term: u64,
+    index: u64,
 };
 
 pub const ArtifactRepairResult = struct {
@@ -2860,6 +2902,20 @@ pub const AlgebraicProgressStatus = struct {
 pub const DBIndexStats = struct {
     name: []const u8,
     kind: IndexKind,
+    // Status-plane overlay used to fence one catalog target while retaining
+    // authoritative observations for unaffected sibling indexes. This is an
+    // internal observation fact and is not serialized in the public API.
+    runtime_observation_stale: bool = false,
+    // A cache merge may retain serviceability for one exact derived-index
+    // incarnation while its already-open runtime publishes catch-up status.
+    // This proof never originates in persisted DB stats and is cleared by a
+    // fresh observation, a root change, or an incarnation change.
+    runtime_observation_serviceable: bool = false,
+    // The status cache proved that this index is an untouched sibling of one
+    // exact in-place catalog target. Unlike generic derived-incarnation
+    // continuity, this proof can retain authority across table-level opening
+    // metadata and applies to every index kind. It is never persisted.
+    runtime_observation_targeted_sibling: bool = false,
     // Error name recorded when the index's persisted artifacts failed to
     // load (e.g. "UnsupportedVersion"); null for healthy indexes.
     load_error: ?[]const u8 = null,
@@ -2902,6 +2958,9 @@ pub const DBIndexStats = struct {
     // Compact lifecycle used when DBIndexStats crosses process boundaries.
     // The full local durable diagnostics remain authoritative when present.
     index_repair_status: ?IndexRepairStatus = null,
+    // Separate from lifecycle because a terminal scheduler checkpoint can be
+    // retryable while paused/irrecoverable states require operator action.
+    index_repair_action_required: bool = false,
     // Internal proof that the active managed-admission generation is safe to
     // query. Under progressive publication it may still have incomplete source
     // coverage; repair intent remains authoritative until full convergence.

@@ -62,6 +62,7 @@ const table_writes = @import("table_writes.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const transactions_api = @import("transactions.zig");
 const distributed_txn = @import("distributed_txn.zig");
+const distributed_txn_contract = @import("distributed_txn_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
 const generating_runtime = @import("../generating/mod.zig");
@@ -260,7 +261,25 @@ pub const AntflyApiHandler = struct {
 
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         self.api_server.recordHandledRequest();
+        establishInternalTxnPreDecisionDeadline(ctx);
         return next.call(ctx) catch |err| mapIngressError(ctx, err);
+    }
+
+    fn establishInternalTxnPreDecisionDeadline(ctx: *httpx.Context) void {
+        if (ctx.application_deadline_ns != null or ctx.application_deadline_invalid) return;
+        const path = ctx.request.uri.path;
+        if (routes.matchGroupTxnBegin(path) == null and routes.matchGroupTxnPrepare(path) == null) return;
+        const raw = ctx.header(distributed_txn_contract.pre_decision_remaining_ms_header) orelse return;
+        const budget_ms = std.fmt.parseUnsigned(u32, raw, 10) catch {
+            ctx.application_deadline_invalid = true;
+            return;
+        };
+        if (budget_ms == 0 or budget_ms > distributed_txn_contract.max_pre_decision_server_budget_ms) {
+            ctx.application_deadline_invalid = true;
+            return;
+        }
+        ctx.application_deadline_ns = platform_time.monotonicNs() +|
+            @as(u64, budget_ms) *| std.time.ns_per_ms;
     }
 
     /// Continuous-HA mutation safety belongs to ingress policy, not to a
@@ -277,6 +296,8 @@ pub const AntflyApiHandler = struct {
     /// The HA namespace retains its independent replication credential.
     fn enforceInternalServiceAuth(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         if (try self.internalServiceAuthRejection(ctx)) |response| return response;
+        if (ctx.application_deadline_invalid)
+            return textResponse(ctx, 400, "invalid transaction deadline");
         return next.call(ctx);
     }
 
@@ -315,8 +336,11 @@ pub const AntflyApiHandler = struct {
     /// application configuration or error classification.
     pub fn dispatchLinkedRoute(self: *AntflyApiHandler, ctx: *httpx.Context, route_handler: httpx.Handler) !httpx.Response {
         self.api_server.recordHandledRequest();
+        establishInternalTxnPreDecisionDeadline(ctx);
         if (try self.haMutationRejection(ctx)) |response| return response;
         if (try self.internalServiceAuthRejection(ctx)) |response| return response;
+        if (ctx.application_deadline_invalid)
+            return textResponse(ctx, 400, "invalid transaction deadline");
         return route_handler.invoke(ctx) catch |err| mapIngressError(ctx, err);
     }
 
@@ -941,6 +965,7 @@ pub const AntflyApiHandler = struct {
                     }
                 }.call,
             } else .none,
+            .deadline_ns = ctx.application_deadline_ns,
             .request_id = ctx.header("x-request-id") orelse "",
             .principal = if (identity) |authenticated| .{
                 .kind = .user,
@@ -1949,7 +1974,7 @@ pub const AntflyApiHandler = struct {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse "";
-        var input = http_route_helpers.parseScanKeysRequest(ctx.allocator, body) catch |err| return switch (err) {
+        var input = http_route_helpers.parseInternalScanKeysRequest(ctx.allocator, body) catch |err| return switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => textResponse(ctx, 400, "invalid scan request"),
             else => err,
         };
@@ -2090,7 +2115,25 @@ pub const AntflyApiHandler = struct {
         return ctx.json(.{ .inserted = result.inserted, .deleted = result.deleted, .transformed = result.transformed });
     }
 
-    fn internalTxnErrorResponse(ctx: *httpx.Context, err: internal_group_operations.Error) !httpx.Response {
+    const InternalTxnPhase = enum {
+        begin,
+        prepare,
+        resolve,
+        status,
+        acknowledge,
+
+        fn isPreDecision(self: InternalTxnPhase) bool {
+            return self == .begin or self == .prepare;
+        }
+    };
+
+    fn internalTxnErrorResponse(
+        ctx: *httpx.Context,
+        err: internal_group_operations.Error,
+        phase: InternalTxnPhase,
+    ) !httpx.Response {
+        if (txnErrorProvesNotProposed(err, phase))
+            try ctx.setHeader(distributed_txn_contract.pre_decision_outcome_header, distributed_txn_contract.pre_decision_not_proposed_v1);
         return switch (err) {
             error.InvalidArgument => textResponse(ctx, 400, "invalid transaction request"),
             error.DecisionConflict => textResponse(ctx, 409, "decision conflict"),
@@ -2101,14 +2144,24 @@ pub const AntflyApiHandler = struct {
             error.NotFound => textResponse(ctx, 404, "not found"),
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            error.PreDecisionDeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            error.TransactionPreDecisionOutcomeUnknown => textResponse(ctx, 504, "transaction outcome unknown"),
             error.EnrichmentWaitCanceled,
             error.EnrichmentWaitTimeout,
             error.EnrichmentRetryInProgress,
             => textResponse(ctx, 202, "committed_visibility_pending"),
             error.EnrichmentWorkerFailed => textResponse(ctx, 202, "committed_repair_required"),
+            error.GroupLeaderUnavailable => textResponse(ctx, 503, "group leader unavailable"),
             error.Unavailable => textResponse(ctx, 503, "transaction unavailable"),
             else => textResponse(ctx, 500, "internal server error"),
         };
+    }
+
+    fn txnErrorProvesNotProposed(err: internal_group_operations.Error, phase: InternalTxnPhase) bool {
+        if (!phase.isPreDecision()) return false;
+        return err == error.GroupLeaderUnavailable or
+            err == error.PreDecisionDeadlineExceeded or
+            err == error.NotFound;
     }
 
     fn internalTxnBegin(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -2118,7 +2171,7 @@ pub const AntflyApiHandler = struct {
         var input = distributed_txn.parseTxnBeginRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         defer distributed_txn.freeTxnBeginRequest(ctx.allocator, &input);
         self.internalGroupOperations().txnBegin(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
-            return internalTxnErrorResponse(ctx, err);
+            return internalTxnErrorResponse(ctx, err, .begin);
         return ctx.json(struct {}{});
     }
 
@@ -2129,7 +2182,7 @@ pub const AntflyApiHandler = struct {
         var input = distributed_txn.parseTxnPrepareRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         defer distributed_txn.freeTxnPrepareRequest(ctx.allocator, &input);
         self.internalGroupOperations().txnPrepare(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
-            return internalTxnErrorResponse(ctx, err);
+            return internalTxnErrorResponse(ctx, err, .prepare);
         return ctx.json(struct {}{});
     }
 
@@ -2139,7 +2192,7 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         const input = distributed_txn.parseTxnResolveRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         self.internalGroupOperations().txnResolve(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
-            return internalTxnErrorResponse(ctx, err);
+            return internalTxnErrorResponse(ctx, err, .resolve);
         return ctx.json(struct {}{});
     }
 
@@ -2149,7 +2202,7 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         const txn_id = distributed_txn.parseTxnStatusRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         const status = self.internalGroupOperations().txnStatus(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, txn_id) catch |err|
-            return internalTxnErrorResponse(ctx, err);
+            return internalTxnErrorResponse(ctx, err, .status);
         return ctx.json(distributed_txn.TxnStatusResponse{ .status = status });
     }
 
@@ -2160,7 +2213,7 @@ pub const AntflyApiHandler = struct {
         var input = distributed_txn.parseTxnAcknowledgeRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         defer distributed_txn.freeTxnAcknowledgeRequest(ctx.allocator, &input);
         self.internalGroupOperations().txnAcknowledge(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
-            return internalTxnErrorResponse(ctx, err);
+            return internalTxnErrorResponse(ctx, err, .acknowledge);
         return ctx.json(struct {}{});
     }
 
@@ -5967,6 +6020,179 @@ test "typed internal HTTP errors preserve conflict semantics" {
     try std.testing.expectEqual(@as(u16, 409), stale_cursor.status);
     try std.testing.expectEqualStrings("HierarchyCursorStale", stale_cursor.message);
     try std.testing.expect(AntflyApiHandler.sharedInternalHttpErrorSpec(error.NotFound) == null);
+}
+
+test "internal transaction HTTP responses prove not-proposed only before decision" {
+    const LeaderUnavailableWrites = struct {
+        fn source() table_writes.TableWriteSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .batch = batch,
+                .txn_begin_group_local = begin,
+                .txn_prepare_group_local = prepare,
+            } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return null;
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) anyerror!?void {
+            return error.LeaderUnavailable;
+        }
+
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest) anyerror!?void {
+            return error.LeaderUnavailable;
+        }
+    };
+
+    var status_source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(std.testing.allocator, .{}, status_source.iface(), null, LeaderUnavailableWrites.source());
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    const params = [_]httpx.RouteParam{
+        .{ .name = "group_id", .value = "7" },
+        .{ .name = "table_name", .value = "docs" },
+    };
+    const txn_id = [_]u8{0x42} ** 16;
+
+    const begin_body = try distributed_txn.encodeTxnBeginRequest(std.testing.allocator, .{
+        .txn_id = txn_id,
+        .begin_timestamp = 1,
+        .participants = &.{"table2:docs:group:7"},
+    });
+    defer std.testing.allocator.free(begin_body);
+    var begin_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn/begin");
+    defer begin_request.deinit();
+    begin_request.body = begin_body;
+    var begin_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &begin_request);
+    defer begin_ctx.deinit();
+    begin_ctx.params = &params;
+    var begin_response = try handler.internalTxnBegin(&begin_ctx);
+    defer begin_response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), begin_response.status.code);
+    try std.testing.expectEqualStrings(
+        distributed_txn_contract.pre_decision_not_proposed_v1,
+        begin_response.headers.get(distributed_txn_contract.pre_decision_outcome_header).?,
+    );
+
+    const prepare_body = try distributed_txn.encodeTxnPrepareRequest(std.testing.allocator, .{
+        .txn_id = txn_id,
+        .req = .{},
+    });
+    defer std.testing.allocator.free(prepare_body);
+    var prepare_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn/prepare");
+    defer prepare_request.deinit();
+    prepare_request.body = prepare_body;
+    var prepare_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &prepare_request);
+    defer prepare_ctx.deinit();
+    prepare_ctx.params = &params;
+    var prepare_response = try handler.internalTxnPrepare(&prepare_ctx);
+    defer prepare_response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), prepare_response.status.code);
+    try std.testing.expectEqualStrings(
+        distributed_txn_contract.pre_decision_not_proposed_v1,
+        prepare_response.headers.get(distributed_txn_contract.pre_decision_outcome_header).?,
+    );
+
+    inline for (.{
+        AntflyApiHandler.InternalTxnPhase.resolve,
+        AntflyApiHandler.InternalTxnPhase.status,
+        AntflyApiHandler.InternalTxnPhase.acknowledge,
+    }) |phase| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn");
+        defer request.deinit();
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try AntflyApiHandler.internalTxnErrorResponse(&ctx, error.GroupLeaderUnavailable, phase);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expect(response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
+    }
+
+    var unavailable_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn");
+    defer unavailable_request.deinit();
+    var unavailable_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &unavailable_request);
+    defer unavailable_ctx.deinit();
+    var unavailable_response = try AntflyApiHandler.internalTxnErrorResponse(&unavailable_ctx, error.Unavailable, .begin);
+    defer unavailable_response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), unavailable_response.status.code);
+    try std.testing.expect(unavailable_response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
+
+    var ambiguous_deadline_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn");
+    defer ambiguous_deadline_request.deinit();
+    var ambiguous_deadline_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &ambiguous_deadline_request);
+    defer ambiguous_deadline_ctx.deinit();
+    var ambiguous_deadline_response = try AntflyApiHandler.internalTxnErrorResponse(
+        &ambiguous_deadline_ctx,
+        error.TransactionPreDecisionOutcomeUnknown,
+        .begin,
+    );
+    defer ambiguous_deadline_response.deinit();
+    try std.testing.expectEqual(@as(u16, 504), ambiguous_deadline_response.status.code);
+    try std.testing.expect(ambiguous_deadline_response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
+
+    var generic_deadline_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn");
+    defer generic_deadline_request.deinit();
+    var generic_deadline_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &generic_deadline_request);
+    defer generic_deadline_ctx.deinit();
+    var generic_deadline_response = try AntflyApiHandler.internalTxnErrorResponse(
+        &generic_deadline_ctx,
+        error.DeadlineExceeded,
+        .begin,
+    );
+    defer generic_deadline_response.deinit();
+    try std.testing.expectEqual(@as(u16, 504), generic_deadline_response.status.code);
+    try std.testing.expect(generic_deadline_response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
+
+    inline for (.{
+        .{ error.PreDecisionDeadlineExceeded, @as(u16, 504) },
+        .{ error.NotFound, @as(u16, 404) },
+    }) |case| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn");
+        defer request.deinit();
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try AntflyApiHandler.internalTxnErrorResponse(&ctx, case[0], .begin);
+        defer response.deinit();
+        try std.testing.expectEqual(case[1], response.status.code);
+        try std.testing.expectEqualStrings(
+            distributed_txn_contract.pre_decision_not_proposed_v1,
+            response.headers.get(distributed_txn_contract.pre_decision_outcome_header).?,
+        );
+    }
+}
+
+test "internal transaction ingress establishes and validates pre-decision deadline" {
+    const budget_ms: u32 = 250;
+    var request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        "http://127.0.0.1/internal/v1/groups/7/tables/docs/txn-begin",
+    );
+    defer request.deinit();
+    try request.setHeader(distributed_txn_contract.pre_decision_remaining_ms_header, "250");
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    const before_ns = platform_time.monotonicNs();
+    AntflyApiHandler.establishInternalTxnPreDecisionDeadline(&ctx);
+    const after_ns = platform_time.monotonicNs();
+    const deadline_ns = ctx.application_deadline_ns.?;
+    try std.testing.expect(deadline_ns >= before_ns + budget_ms * std.time.ns_per_ms);
+    try std.testing.expect(deadline_ns <= after_ns + budget_ms * std.time.ns_per_ms);
+    try std.testing.expectEqual(deadline_ns, AntflyApiHandler.operationContext(&ctx, null).deadline_ns.?);
+
+    var invalid_request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        "http://127.0.0.1/internal/v1/groups/7/tables/docs/txn-prepare",
+    );
+    defer invalid_request.deinit();
+    try invalid_request.setHeader(distributed_txn_contract.pre_decision_remaining_ms_header, "5001");
+    var invalid_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &invalid_request);
+    defer invalid_ctx.deinit();
+    AntflyApiHandler.establishInternalTxnPreDecisionDeadline(&invalid_ctx);
+    try std.testing.expect(invalid_ctx.application_deadline_ns == null);
+    try std.testing.expect(invalid_ctx.application_deadline_invalid);
 }
 
 test "HA mutation middleware fails closed for unregistered HTTP methods" {

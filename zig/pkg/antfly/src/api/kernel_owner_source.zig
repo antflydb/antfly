@@ -700,6 +700,37 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer response.deinit();
     }
 
+    /// Apply one exact committed Raft entry. The provider persists the log
+    /// identity in the same physical batch as the mutation, making retries
+    /// after an apply-watermark crash safe across the compiled boundary.
+    pub fn applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        req: db_types.BatchRequest,
+        raft_term: u64,
+        raft_index: u64,
+    ) !void {
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{
+            self.replica_root_dir,
+            group_id,
+        });
+        defer alloc.free(path);
+        const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
+        defer alloc.free(request_json);
+        var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor);
+        defer lease.deinit();
+        var response = try lease.owner().replicatedBatchAtRaftEntryJson(
+            table_name,
+            request_json,
+            raft_term,
+            raft_index,
+        );
+        defer response.deinit();
+    }
+
     pub fn waitForCurrentSyncGroupLocal(
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
@@ -1919,8 +1950,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             options.estimated_candidate_bytes != defaults.estimated_candidate_bytes or
             options.planned_disk_bytes != defaults.planned_disk_bytes or
             options.capacity_domain_id != defaults.capacity_domain_id or
-            !std.meta.eql(options.capacity_observation, defaults.capacity_observation) or
-            options.executing_durable_index_repair != defaults.executing_durable_index_repair)
+            !std.meta.eql(options.capacity_observation, defaults.capacity_observation))
         {
             return error.UnsupportedStorageKernelRepairControls;
         }

@@ -19,6 +19,7 @@ const validation = @import("validation.zig");
 
 pub const topology_format_version: u16 = 3;
 pub const topology_name = "TOPOLOGY.json";
+pub const logical_snapshot_manifest_name = "SNAPSHOT.json";
 pub const max_topology_bytes: usize = 64 * 1024 * 1024;
 pub const max_files: usize = 1_000_000;
 pub const max_file_bytes: u64 = 64 * 1024 * 1024 * 1024;
@@ -54,6 +55,9 @@ pub const ReplicaSnapshot = struct {
     table_name: []const u8,
     snapshot_path: []const u8,
     logical_sha256: []const u8,
+    /// Present for the versioned logical snapshot layout. Absence preserves
+    /// the released v0.2.0 store.bin/change-journal.bin seed contract.
+    snapshot_manifest_sha256: ?[]const u8 = null,
     identity_table_id: u64,
     identity_shard_id: u64,
     identity_range_id: u64,
@@ -154,6 +158,16 @@ pub fn validate(
         const store_path = try std.fs.path.join(alloc, &.{ raw_root, replica.snapshot_path, "store.bin" });
         defer alloc.free(store_path);
         try expectFileSha256(io, alloc, store_path, replica.logical_sha256);
+        if (replica.snapshot_manifest_sha256) |expected_sha256| {
+            if (!isCanonicalSha256(expected_sha256)) return error.SeedReplicaIdentityMismatch;
+            const manifest_path = try std.fs.path.join(alloc, &.{
+                raw_root,
+                replica.snapshot_path,
+                logical_snapshot_manifest_name,
+            });
+            defer alloc.free(manifest_path);
+            try expectFileSha256(io, alloc, manifest_path, expected_sha256);
+        }
     }
 
     for (topology.extension_artifacts, 0..) |artifact, index| {

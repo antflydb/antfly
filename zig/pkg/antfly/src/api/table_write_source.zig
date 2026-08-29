@@ -465,6 +465,28 @@ pub const TableWriteSource = struct {
             sync_level: db_mod.types.SyncLevel,
             cancellation: db_mod.types.CancellationToken,
         ) anyerror!?distributed_txn.CommitOutcome = null,
+        txn_begin_group_local_with_pre_decision_context: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            begin_timestamp: u64,
+            topology_epoch: u64,
+            retain_terminal: bool,
+            participants: []const []const u8,
+            context: distributed_txn.PreDecisionContext,
+        ) anyerror!?void = null,
+        txn_prepare_group_local_with_pre_decision_context: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            topology_epoch: u64,
+            req: db_mod.types.TransactionIntentRequest,
+            context: distributed_txn.PreDecisionContext,
+        ) anyerror!?void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -796,6 +818,38 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.txn_prepare_group_local orelse return null;
         return try BoundaryAbi.call("txn_prepare_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, topology_epoch, req });
+    }
+
+    pub fn txnBeginGroupLocalWithPreDecisionContext(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        topology_epoch: u64,
+        retain_terminal: bool,
+        participants: []const []const u8,
+        context: distributed_txn.PreDecisionContext,
+    ) !?void {
+        const fn_ptr = self.vtable.txn_begin_group_local_with_pre_decision_context orelse
+            return try self.txnBeginGroupLocal(alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants);
+        return try BoundaryAbi.call("txn_begin_group_local_with_pre_decision_context", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants, context });
+    }
+
+    pub fn txnPrepareGroupLocalWithPreDecisionContext(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        topology_epoch: u64,
+        req: db_mod.types.TransactionIntentRequest,
+        context: distributed_txn.PreDecisionContext,
+    ) !?void {
+        const fn_ptr = self.vtable.txn_prepare_group_local_with_pre_decision_context orelse
+            return try self.txnPrepareGroupLocal(alloc, group_id, table_name, txn_id, topology_epoch, req);
+        return try BoundaryAbi.call("txn_prepare_group_local_with_pre_decision_context", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, topology_epoch, req, context });
     }
 
     pub fn txnResolveGroupLocal(
@@ -1143,6 +1197,7 @@ test "compiled table write boundary transports cancellation and committed failur
         calls: usize = 0,
         transaction_calls: usize = 0,
         stateless_transaction_calls: usize = 0,
+        pre_decision_calls: usize = 0,
         failure: ?anyerror = null,
 
         fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
@@ -1179,6 +1234,15 @@ test "compiled table write boundary transports cancellation and committed failur
             return .{ .committed = .{ .participant_count = 1 } };
         }
 
+        fn txnBeginWithPreDecisionContext(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8, context: distributed_txn.PreDecisionContext) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.pre_decision_calls += 1;
+            try std.testing.expectEqual(@as(?u64, 123), context.deadline_ns);
+            try context.cancellation.check();
+            if (self.failure) |err| return err;
+            return {};
+        }
+
         fn foreignDispatch(
             contract: *const runtime_native_abi.CallContract,
             callback: *const anyopaque,
@@ -1199,6 +1263,7 @@ test "compiled table write boundary transports cancellation and committed failur
             .commit_transaction_with_id = Fake.commitTransactionWithId,
             .commit_transaction_with_id_with_cancellation = Fake.commitTransactionWithIdAndCancellation,
             .commit_transaction_with_cancellation = Fake.commitTransactionWithCancellation,
+            .txn_begin_group_local_with_pre_decision_context = Fake.txnBeginWithPreDecisionContext,
         },
         .boundary_dispatch = Fake.foreignDispatch,
     };
@@ -1238,4 +1303,34 @@ test "compiled table write boundary transports cancellation and committed failur
         ),
     );
     try std.testing.expectEqual(@as(usize, 1), fake.stateless_transaction_calls);
+    canceled.store(false, .release);
+    fake.failure = null;
+    try std.testing.expect((try source.txnBeginGroupLocalWithPreDecisionContext(
+        std.testing.allocator,
+        7,
+        "docs",
+        std.mem.zeroes(db_mod.types.TxnId),
+        1,
+        2,
+        false,
+        &.{},
+        .{
+            .deadline_ns = 123,
+            .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled),
+        },
+    )) != null);
+    try std.testing.expectEqual(@as(usize, 1), fake.pre_decision_calls);
+    fake.failure = error.PreDecisionDeadlineExceeded;
+    try std.testing.expectError(error.PreDecisionDeadlineExceeded, source.txnBeginGroupLocalWithPreDecisionContext(
+        std.testing.allocator,
+        7,
+        "docs",
+        std.mem.zeroes(db_mod.types.TxnId),
+        1,
+        2,
+        false,
+        &.{},
+        .{ .deadline_ns = 123 },
+    ));
+    try std.testing.expectEqual(@as(usize, 2), fake.pre_decision_calls);
 }

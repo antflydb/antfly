@@ -26,6 +26,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const fs_paths = @import("../../common/fs_paths.zig");
+const db_core = @import("../db/core.zig");
 const backup_manifest = @import("backup_manifest.zig");
 const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
 const local_generation_gc = @import("local_generation_gc.zig");
@@ -1386,20 +1387,24 @@ fn prepareMaterializedTestStaging(
     const store_target = try std.fs.path.join(alloc, &.{ source_snapshot_root, "store.bin" });
     defer alloc.free(store_target);
     try copyFileDurably(io, store_source, store_target, source_snapshot_root);
-    const journal_source = try std.fs.path.join(alloc, &.{ captured_snapshot_root, "change-journal.bin" });
-    defer alloc.free(journal_source);
-    const journal_target = try std.fs.path.join(alloc, &.{ source_snapshot_root, "change-journal.bin" });
-    defer alloc.free(journal_target);
-    try copyFileDurably(io, journal_source, journal_target, source_snapshot_root);
+    const snapshot_manifest_source = try std.fs.path.join(alloc, &.{ captured_snapshot_root, db_core.logical_snapshot_manifest_file_name });
+    defer alloc.free(snapshot_manifest_source);
+    const snapshot_manifest_target = try std.fs.path.join(alloc, &.{ source_snapshot_root, db_core.logical_snapshot_manifest_file_name });
+    defer alloc.free(snapshot_manifest_target);
+    try copyFileDurably(io, snapshot_manifest_source, snapshot_manifest_target, source_snapshot_root);
 
     const store_bytes = try readFileAlloc(io, alloc, store_target, 16 * 1024 * 1024);
     defer alloc.free(store_bytes);
-    const journal_bytes = try readFileAlloc(io, alloc, journal_target, 16 * 1024 * 1024);
-    defer alloc.free(journal_bytes);
+    const snapshot_manifest_bytes = try readFileAlloc(io, alloc, snapshot_manifest_target, 4096);
+    defer alloc.free(snapshot_manifest_bytes);
     var store_digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(store_bytes, &store_digest, .{});
     var store_sha256: [Sha256.digest_length * 2]u8 = undefined;
     encodeHex(&store_sha256, &store_digest);
+    var snapshot_manifest_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(snapshot_manifest_bytes, &snapshot_manifest_digest, .{});
+    var snapshot_manifest_sha256: [Sha256.digest_length * 2]u8 = undefined;
+    encodeHex(&snapshot_manifest_sha256, &snapshot_manifest_digest);
     const topology_json = try std.json.Stringify.valueAlloc(alloc, seed_materialization.Topology{
         .generation = generation,
         .catalog = .{
@@ -1424,6 +1429,7 @@ fn prepareMaterializedTestStaging(
             .table_name = "docs",
             .snapshot_path = "replicas/group-1",
             .logical_sha256 = &store_sha256,
+            .snapshot_manifest_sha256 = &snapshot_manifest_sha256,
             .identity_table_id = identity.table_id,
             .identity_shard_id = identity.shard_id,
             .identity_range_id = 1,
@@ -1443,7 +1449,7 @@ fn prepareMaterializedTestStaging(
     const files = [_]backup_manifest.FileEntry{
         .{ .path = seed_materialization.topology_name, .kind = .manifest, .size_bytes = topology_json.len, .crc32 = backup_manifest.crc32(topology_json) },
         .{ .path = "replicas/group-1/store.bin", .kind = .artifact, .size_bytes = store_bytes.len, .crc32 = backup_manifest.crc32(store_bytes) },
-        .{ .path = "replicas/group-1/change-journal.bin", .kind = .artifact, .size_bytes = journal_bytes.len, .crc32 = backup_manifest.crc32(journal_bytes) },
+        .{ .path = "replicas/group-1/SNAPSHOT.json", .kind = .manifest, .size_bytes = snapshot_manifest_bytes.len, .crc32 = backup_manifest.crc32(snapshot_manifest_bytes) },
     };
     const manifest = try backup_manifest.encodeAlloc(alloc, .{
         .identity = identity,
@@ -1473,7 +1479,7 @@ fn prepareMaterializedTestStaging(
         .end_record_lsn = 12,
         .manifest_sha256 = &manifest_sha256,
         .file_count = files.len,
-        .total_bytes = topology_json.len + store_bytes.len + journal_bytes.len,
+        .total_bytes = topology_json.len + store_bytes.len + snapshot_manifest_bytes.len,
         .topology_id = binding.topology_id,
         .topology_generation = binding.topology_generation,
         .node_id = binding.node_id,

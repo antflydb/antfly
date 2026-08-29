@@ -23,6 +23,7 @@ const storage_source_options = @import("storage_source_options");
 const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
+const index_repair_status = @import("../common/index_repair_status.zig");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const api_operation = @import("operation.zig");
 const search_pattern_filter = @import("../search/pattern_filter.zig");
@@ -723,6 +724,21 @@ pub const RestoreExecutionGuard = struct {
     ptr: *anyopaque,
     is_current: *const fn (ptr: *anyopaque, leadership_term: u64) bool,
 };
+
+fn restoreWorkerAuthorityMatches(
+    current_owner_id: u64,
+    current_leadership_term: u64,
+    expected_owner_id: u64,
+    expected_leadership_term: u64,
+    guard: ?RestoreExecutionGuard,
+) bool {
+    if (current_owner_id != expected_owner_id or
+        current_leadership_term != expected_leadership_term)
+        return false;
+    const active_guard = guard orelse return true;
+    return expected_leadership_term != 0 and
+        active_guard.is_current(active_guard.ptr, expected_leadership_term);
+}
 
 /// Process-local admission shared by every protocol adapter that invokes the
 /// public application operations below.
@@ -1938,6 +1954,8 @@ pub const ApiHttpServer = struct {
     restore_retry_wakeup_in_flight: std.atomic.Value(bool) = .init(false),
     restore_retry_wakeup_generation: std.atomic.Value(u64) = .init(0),
     restore_retry_wakeup_event: std.Io.Event = .unset,
+    restore_backoff_waiters: [max_concurrent_restore_jobs]?*std.Io.Event =
+        .{null} ** max_concurrent_restore_jobs,
     restore_jobs_resumed: std.atomic.Value(bool) = .init(false),
     restore_jobs_closing: std.atomic.Value(bool) = .init(false),
     restore_leadership_term: std.atomic.Value(u64) = .init(0),
@@ -2417,6 +2435,7 @@ pub const ApiHttpServer = struct {
     pub fn deinit(self: *ApiHttpServer) void {
         self.restore_jobs_closing.store(true, .release);
         self.signalRestoreRetryWakeup();
+        self.signalRestoreBackoffWaiters();
         self.backup_maintenance_closing.store(true, .release);
         self.index_installation_closing.store(true, .release);
         if (self.cfg.backend_runtime) |runtime| {
@@ -2486,12 +2505,19 @@ pub const ApiHttpServer = struct {
     fn prepareRestoreLeadershipLocked(self: *ApiHttpServer, runtime: *db_mod.background_runtime.BackendRuntime, leadership_term: u64) !void {
         self.restore_leadership_term.store(0, .release);
         const previous_owner_id = self.restore_job_owner_id.swap(0, .acq_rel);
+        // Wake both classes of sleepers after publishing the ownership change.
+        // The earlier admission-pause signal keeps dispatch responsive; this
+        // second signal closes the race where a worker starts another wait just
+        // before the swap. Post-wakeup checks can now retire immediately, so
+        // closeOwner never inherits a multi-second retry deadline.
+        self.signalRestoreRetryWakeup();
+        self.signalRestoreBackoffWaiters();
         if (previous_owner_id != 0) runtime.durable_jobs.closeOwner(previous_owner_id);
         platform_sync.lockYielding(&self.restore_schedule_mutex);
         self.scheduled_restore_jobs.clearRetainingCapacity();
         self.restore_schedule_mutex.unlock();
         self.restore_jobs_resumed.store(false, .release);
-        try self.restore_job_store.prepareReplicatedLeadership(self.alloc);
+        try self.restore_job_store.prepareReplicatedLeadership(self.alloc, leadership_term);
         self.restore_job_owner_id.store(try runtime.allocOwnerId(), .release);
         self.restore_leadership_term.store(leadership_term, .release);
         self.restore_dispatch_paused.store(false, .release);
@@ -7494,7 +7520,9 @@ pub const ApiHttpServer = struct {
         verification_cache: ?*backups_api.ArtifactVerificationCache,
         destination_authorization_fingerprint: []const u8,
         destination_authorization_principal: []const u8,
+        cancellation: api_operation.CancellationToken,
     ) !OwnedRestoreOutcome {
+        try cancellation.check();
         var manifest = backups_api.readManifestFromLocationWithArtifactBackupId(
             self.alloc,
             backup_location,
@@ -7664,6 +7692,7 @@ pub const ApiHttpServer = struct {
                     .replace_existing = replace_existing,
                     .publication_hook = publication_hook,
                     .io = self.sharedApiIo(),
+                    .cancellation = cancellation,
                 }) catch |err| switch (err) {
                     error.UnsupportedOperation => return error.UnsupportedOperation,
                     error.UnsupportedBackupFormat => return error.UnsupportedBackupFormat,
@@ -7678,6 +7707,7 @@ pub const ApiHttpServer = struct {
                     },
                 }) != null) break;
 
+                try cancellation.check();
                 if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
                 sleepNs(poll_interval_ns);
             }
@@ -7768,7 +7798,9 @@ pub const ApiHttpServer = struct {
                 range.restore_snapshot_path.len > 0 or
                 range.restore_connection.len > 0 or
                 range.restore_artifact_size_bytes > 0 or
-                range.restore_artifact_sha256.len > 0;
+                range.restore_artifact_sha256.len > 0 or
+                range.restore_native_manifest_size_bytes > 0 or
+                range.restore_native_manifest_sha256.len > 0;
             if (!has_active_restore) {
                 if (!std.mem.eql(
                     u8,
@@ -7823,6 +7855,7 @@ pub const ApiHttpServer = struct {
         backup_id: []const u8,
         destination_authorization_fingerprint: []const u8,
         destination_authorization_principal: []const u8,
+        cancellation: api_operation.CancellationToken,
     ) !OwnedRestoreOutcome {
         return try self.restoreOwnedTableWithRetryAndLifecycle(
             table_name,
@@ -7835,6 +7868,7 @@ pub const ApiHttpServer = struct {
             null,
             destination_authorization_fingerprint,
             destination_authorization_principal,
+            cancellation,
         );
     }
 
@@ -7850,10 +7884,12 @@ pub const ApiHttpServer = struct {
         verification_cache: ?*backups_api.ArtifactVerificationCache,
         destination_authorization_fingerprint: []const u8,
         destination_authorization_principal: []const u8,
+        cancellation: api_operation.CancellationToken,
     ) !OwnedRestoreOutcome {
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
-            const outcome = self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, artifact_backup_id, restore_lifecycle_already_active, replace_existing, verification_cache, destination_authorization_fingerprint, destination_authorization_principal) catch |err| switch (err) {
+            try cancellation.check();
+            const outcome = self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, artifact_backup_id, restore_lifecycle_already_active, replace_existing, verification_cache, destination_authorization_fingerprint, destination_authorization_principal, cancellation) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
                     if (attempt + 1 >= 3) return err;
                     if (!replace_existing and (self.tableExists(table_name) catch false)) {
@@ -9237,6 +9273,21 @@ pub const ApiHttpServer = struct {
         unavailable,
     };
 
+    fn runtimeIndexRepairLifecycle(item: db_mod.types.DBIndexStats) index_repair_status.LifecycleProjection {
+        const status = item.index_repair_status orelse index_repair_status.summarize(
+            item.index_repair_id != null,
+            item.index_repair_automation,
+            item.index_repair_phase,
+            item.index_repair_wait_reason,
+            item.index_repair_action_required,
+        );
+        return index_repair_status.projectLifecycle(
+            status,
+            item.index_repair_action_required,
+            item.index_repair_active_generation_serviceable,
+        );
+    }
+
     fn runtimeStatusHasCurrentLifecycleEvidence(metadata: runtime_status.RuntimeStatusMetadata) bool {
         return metadata.freshness == .fresh or metadata.freshness == .catching_up;
     }
@@ -9262,20 +9313,23 @@ pub const ApiHttpServer = struct {
                     if (std.mem.eql(u8, item.name, index_name)) break item;
                 } else continue;
                 observed_group_index = true;
-                if (index.load_error != null) return .unavailable;
-                // Terminal and operator-paused repairs are actionable failures,
-                // not retryable publication windows.
-                if (std.mem.eql(u8, index.index_repair_phase, "terminal") or
-                    std.mem.eql(u8, index.index_repair_automation, "paused")) return .unavailable;
+                const repair_lifecycle = runtimeIndexRepairLifecycle(index);
+                // The storage owner supplies an incarnation/version-scoped
+                // serviceability proof. Candidate failure diagnostics remain
+                // visible, but cannot revoke a generation that admission still
+                // serves. Without that proof, actionable repair fails closed.
+                if (index.load_error != null and !repair_lifecycle.active_generation_serviceable) return .unavailable;
+                if (repair_lifecycle.blocks_queryable and repair_lifecycle.action_required) return .unavailable;
                 if (index.backfill_active or
                     index.replay_catch_up_required or
                     index.catch_up_active or
-                    index.index_repair_id != null or
+                    repair_lifecycle.blocks_queryable or
+                    repair_lifecycle.present or
                     index.replay_applied_sequence < index.replay_target_sequence or
                     index.catch_up_applied_sequence < index.catch_up_target_sequence)
                 {
                     group_active_build = true;
-                } else if (index.repair_degraded) {
+                } else if (index.repair_degraded and !repair_lifecycle.active_generation_serviceable) {
                     return .unavailable;
                 }
             }
@@ -9570,6 +9624,7 @@ pub const ApiHttpServer = struct {
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.NativeBackupStorageBackendUnsupported, error.NativeBackupProjectionBackendUnsupported => return error.UnsupportedBackupFormat,
             error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
             error.UnsupportedMultiRangeTable => return error.UnsupportedMultiRangeTable,
             else => {
@@ -9689,6 +9744,7 @@ pub const ApiHttpServer = struct {
             backup_id,
             request.destination_authorization_fingerprint,
             request.destination_authorization_principal,
+            request.cancellation,
         ) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -9715,6 +9771,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedBackupMigrationState => error.UnsupportedBackupMigrationState,
             error.UnsupportedMultiRangeTable => error.UnsupportedMultiRangeTable,
             error.UnsupportedBackupFormat => error.UnsupportedBackupFormat,
+            error.NativeBackupProjectionValidationIndeterminate => error.RestoreValidationPending,
             error.RestoreDurabilityPending, error.GenerationDurabilityUncertain => error.RestoreDurabilityPending,
             error.RestoreDurabilityConfirmed => error.RestoreDurabilityConfirmed,
             error.BackupManifestTooLarge => error.BackupManifestTooLarge,
@@ -11049,6 +11106,28 @@ pub const ApiHttpServer = struct {
 
     const RestoreCancellation = struct { job_id: u64, attempt_id: u64 };
 
+    const RestoreRepairCancellation = struct {
+        server: *ApiHttpServer,
+        restore: RestoreCancellation,
+
+        fn token(self: *const @This()) api_operation.CancellationToken {
+            return .{
+                .ptr = self,
+                .is_cancelled_fn = isCancelled,
+            };
+        }
+
+        fn isCancelled(ptr: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            if (!self.server.restoreExecutionPermitted()) return true;
+            return (self.server.restore_job_store.attemptState(
+                self.server.alloc,
+                self.restore.job_id,
+                self.restore.attempt_id,
+            ) catch return true) != .active;
+        }
+    };
+
     fn mapClusterRestoreRepositoryError(
         err: anyerror,
     ) cluster_api_http.ClusterApi.ExecuteRestoreError {
@@ -11081,6 +11160,11 @@ pub const ApiHttpServer = struct {
     ) cluster_api_http.ClusterApi.ExecuteRestoreError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const op_alloc = self.alloc;
+        var repair_cancellation_context: RestoreRepairCancellation = undefined;
+        const repair_cancellation = if (cancellation) |restore| blk: {
+            repair_cancellation_context = .{ .server = self, .restore = restore };
+            break :blk repair_cancellation_context.token();
+        } else api_operation.CancellationToken.none;
         const restore_connection = req.connection orelse return error.InvalidRequest;
         if (restore_connection.len == 0 or restore_connection.len > 256) return error.InvalidRequest;
         const restore_io = self.sharedApiIo() orelse return error.InternalFailure;
@@ -11425,8 +11509,11 @@ pub const ApiHttpServer = struct {
                 else
                     "",
                 destination_authorization_principal,
+                repair_cancellation,
             ) catch |err| {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
+                if (err == error.NativeBackupProjectionValidationIndeterminate)
+                    return error.RestoreValidationPending;
                 if (err == error.RestoreDestinationReauthorizationRequired or
                     err == error.StoredDestinationAuthorizationRevoked)
                     return error.RestoreDestinationReauthorizationRequired;
@@ -11542,6 +11629,24 @@ pub const ApiHttpServer = struct {
         const guard = self.cfg.restore_execution_guard orelse return true;
         const term = self.restore_leadership_term.load(.acquire);
         return term != 0 and guard.is_current(guard.ptr, term);
+    }
+
+    /// Worker authority is narrower than general restore admission: delayed
+    /// completion paths must still belong to the exact durable-job owner and
+    /// metadata leadership term captured at submission. This fences a worker
+    /// from an earlier term even if this process later becomes leader again.
+    fn restoreWorkerAuthorityCurrent(self: *ApiHttpServer, owner_id: u64, leadership_term: u64) bool {
+        if (self.restore_jobs_closing.load(.acquire) or
+            self.restore_dispatch_paused.load(.acquire) or
+            self.restore_job_owner_id.load(.acquire) != owner_id)
+            return false;
+        return restoreWorkerAuthorityMatches(
+            self.restore_job_owner_id.load(.acquire),
+            self.restore_leadership_term.load(.acquire),
+            owner_id,
+            leadership_term,
+            self.cfg.restore_execution_guard,
+        );
     }
 
     pub fn executeExtensionHostBatch(
@@ -13141,6 +13246,7 @@ pub const ApiHttpServer = struct {
     fn submitRestoreJob(self: *ApiHttpServer, job_id: u64) !void {
         const runtime = self.cfg.backend_runtime orelse return error.AsyncRestoreUnavailable;
         const owner_id = self.restore_job_owner_id.load(.acquire);
+        const leadership_term = self.restore_leadership_term.load(.acquire);
         if (runtime.threaded_jobs == null or owner_id == 0)
             return error.AsyncRestoreUnavailable;
         platform_sync.lockYielding(&self.restore_schedule_mutex);
@@ -13163,7 +13269,12 @@ pub const ApiHttpServer = struct {
         self.restore_schedule_mutex.unlock();
         errdefer self.unmarkScheduledRestoreJob(job_id);
         const work = try self.alloc.create(RestoreJobWork);
-        work.* = .{ .server = self, .job_id = job_id };
+        work.* = .{
+            .server = self,
+            .job_id = job_id,
+            .owner_id = owner_id,
+            .leadership_term = leadership_term,
+        };
         runtime.durable_jobs.submit(.{
             .owner_id = owner_id,
             .class = .maintenance,
@@ -13225,23 +13336,105 @@ pub const ApiHttpServer = struct {
         if (self.sharedApiIo()) |io| self.restore_retry_wakeup_event.set(io);
     }
 
+    fn signalRestoreBackoffWaiters(self: *ApiHttpServer) void {
+        const io = self.sharedApiIo() orelse return;
+        platform_sync.lockYielding(&self.restore_schedule_mutex);
+        defer self.restore_schedule_mutex.unlock();
+        for (self.restore_backoff_waiters) |waiter| {
+            if (waiter) |event| event.set(io);
+        }
+    }
+
+    /// Register-before-check closes the owner-change wakeup race without a
+    /// polling loop. The fixed slots are bounded by restore admission, require
+    /// no outage-path allocation, and allow one broadcast to release every old
+    /// owner before `closeOwner` drains it.
+    fn waitForRestoreBackoff(
+        self: *ApiHttpServer,
+        event: *std.Io.Event,
+        owner_id: u64,
+        leadership_term: u64,
+        delay_ms: u64,
+    ) bool {
+        const io = self.sharedApiIo() orelse {
+            // Freestanding/manual runtimes do not expose shared I/O. Keep this
+            // compatibility path tightly bounded so ownership drain latency is
+            // never coupled to the five-second production backoff.
+            sleepNs(@min(delay_ms, restore_jobs.restore_retry_min_ms) * @as(u64, std.time.ns_per_ms));
+            return self.restoreWorkerAuthorityCurrent(owner_id, leadership_term);
+        };
+        event.reset();
+
+        platform_sync.lockYielding(&self.restore_schedule_mutex);
+        if (!self.restoreWorkerAuthorityCurrent(owner_id, leadership_term)) {
+            self.restore_schedule_mutex.unlock();
+            return false;
+        }
+        var registered_slot: ?usize = null;
+        for (&self.restore_backoff_waiters, 0..) |*slot, index| {
+            if (slot.* != null) continue;
+            slot.* = event;
+            registered_slot = index;
+            break;
+        }
+        self.restore_schedule_mutex.unlock();
+
+        const slot_index = registered_slot orelse {
+            // Admission guarantees at most one waiter per scheduled restore.
+            // Preserve correctness if that invariant is violated without
+            // spinning or extending leadership drain by the full backoff.
+            io.sleep(std.Io.Duration.fromMilliseconds(@intCast(@min(delay_ms, restore_jobs.restore_retry_min_ms))), .awake) catch return false;
+            return self.restoreWorkerAuthorityCurrent(owner_id, leadership_term);
+        };
+        defer {
+            platform_sync.lockYielding(&self.restore_schedule_mutex);
+            std.debug.assert(self.restore_backoff_waiters[slot_index] == event);
+            self.restore_backoff_waiters[slot_index] = null;
+            self.restore_schedule_mutex.unlock();
+        }
+
+        _ = waitForRestoreBackoffEvent(io, event, delay_ms) catch return false;
+        return self.restoreWorkerAuthorityCurrent(owner_id, leadership_term);
+    }
+
     fn unmarkScheduledRestoreJob(self: *ApiHttpServer, job_id: u64) void {
         platform_sync.lockYielding(&self.restore_schedule_mutex);
         _ = self.scheduled_restore_jobs.remove(job_id);
         self.restore_schedule_mutex.unlock();
     }
 
-    fn runRestoreJob(self: *ApiHttpServer, job_id: u64) !void {
+    fn runRestoreJob(
+        self: *ApiHttpServer,
+        job_id: u64,
+        attempt_id_out: *u64,
+        begin_established_out: *bool,
+    ) !void {
+        begin_established_out.* = false;
         if (!self.restoreExecutionPermitted()) {
             try self.restore_job_store.requeuePending(job_id);
             return;
         }
-        const running_encoded = (try self.restore_job_store.begin(self.alloc, job_id)) orelse return;
-        defer self.alloc.free(running_encoded);
-        var parsed = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, running_encoded, .{ .ignore_unknown_fields = true });
+        const begin = (try self.restore_job_store.beginAttempt(
+            self.alloc,
+            job_id,
+            attempt_id_out,
+        )) orelse return;
+        defer self.alloc.free(begin.encoded);
+        if (begin.attempt_id == 0) return;
+        std.debug.assert(attempt_id_out.* == begin.attempt_id);
+        // From here onward the exact running attempt is durable. Errors before
+        // this boundary still belong to the queued predecessor and must never
+        // be sent through running-only terminalization.
+        begin_established_out.* = true;
+        var parsed = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const state = parsed.value;
-        if (state.phase != .running) return;
+        if (state.phase != .running or state.attempt_id != begin.attempt_id)
+            return error.CorruptRestoreJobStore;
+        var repair_cancellation = RestoreRepairCancellation{
+            .server = self,
+            .restore = .{ .job_id = state.job_id, .attempt_id = state.attempt_id },
+        };
         var location = backups_api.openBackupLocationWithOptions(self.alloc, state.location, .{
             .secret_store = self.cfg.secret_store,
             .node_config = self.cfg.node_config,
@@ -13249,6 +13442,7 @@ pub const ApiHttpServer = struct {
             .required_capability = "restore.read",
             .io = self.sharedApiIo(),
         }) catch |err| {
+            if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
             const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
             self.alloc.free(failed);
             return;
@@ -13262,7 +13456,7 @@ pub const ApiHttpServer = struct {
                 if (!restore_jobs.containsTableIndex(state.published_table_ranges orelse &.{}, 0)) {
                     if (!restore_jobs.tableAttempted(state, 0)) {
                         self.checkpointRestoreTableStarted(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
-                            if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
+                            if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                             const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                             self.alloc.free(failed);
                             return;
@@ -13278,6 +13472,7 @@ pub const ApiHttpServer = struct {
                         state.connection,
                         &location,
                         .{
+                            .cancellation = repair_cancellation.token(),
                             .destination_authorization_fingerprint = state.destination_authorization_fingerprint,
                             .destination_authorization_principal = state.destination_authorization_principal,
                         },
@@ -13290,7 +13485,7 @@ pub const ApiHttpServer = struct {
                         error.RestoreDurabilityConfirmed => restored_via_metadata = false,
                         error.RestoreDurabilityPending => {
                             self.checkpointRestoreTableDurabilityPending(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |checkpoint_err| {
-                                if (checkpoint_err == error.RestoreJobFenced or metadata_authority.isRetryableError(checkpoint_err)) return error.RestoreJobFenced;
+                                if (restoreJobErrorIsFenced(checkpoint_err)) return error.RestoreJobFenced;
                                 const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(checkpoint_err));
                                 self.alloc.free(failed);
                                 return;
@@ -13302,13 +13497,30 @@ pub const ApiHttpServer = struct {
                             return;
                         },
                         else => {
+                            if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
+                            if (restoreJobErrorIsRetryable(err)) {
+                                const retry_delay_ns = restoreRepositoryRetryDelayNs(
+                                    state.job_id,
+                                    state.attempt_id,
+                                );
+                                const retried = try self.restore_job_store.retryRunning(
+                                    self.alloc,
+                                    state,
+                                    @errorName(err),
+                                    retry_delay_ns,
+                                );
+                                self.alloc.free(retried);
+                                self.signalRestoreRetryWakeup();
+                                try self.ensureRestoreRetryWakeup();
+                                return;
+                            }
                             const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                             self.alloc.free(failed);
                             return;
                         },
                     };
                     self.checkpointRestoreTablePublished(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
-                        if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
+                        if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                         self.alloc.free(failed);
                         return;
@@ -13329,14 +13541,14 @@ pub const ApiHttpServer = struct {
                 }
                 if (restored_via_metadata and !self.cfg.deployment_mode.isStandalone()) {
                     self.waitForDistributedRestoreCompletion(table_name, state.location, state.backup_id, state.backup_id, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }) catch |err| {
-                        if (metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
+                        if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                         self.alloc.free(failed);
                         return;
                     };
                 }
                 self.checkpointRestoreTableCompleted(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
-                    if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
+                    if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                     const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                     self.alloc.free(failed);
                     return;
@@ -13351,7 +13563,7 @@ pub const ApiHttpServer = struct {
                 .table_names = state.table_names,
                 .restore_mode = state.restore_mode,
             }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
-                if (err == error.BackupRepositoryBusy) {
+                if (restoreJobErrorIsRetryable(err)) {
                     const retry_delay_ns = restoreRepositoryRetryDelayNs(
                         state.job_id,
                         state.attempt_id,
@@ -13367,7 +13579,7 @@ pub const ApiHttpServer = struct {
                     try self.ensureRestoreRetryWakeup();
                     return;
                 }
-                if (err == error.NotLeader or err == error.RestoreJobFenced) {
+                if (restoreJobErrorIsFenced(err)) {
                     return error.RestoreJobFenced;
                 }
                 const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
@@ -13645,6 +13857,27 @@ fn waitForRestoreRetryDeadline(
     return false;
 }
 
+fn waitForRestoreBackoffEvent(
+    io: std.Io,
+    event: *std.Io.Event,
+    delay_ms: u64,
+) error{Canceled}!bool {
+    const bounded_delay_ms: i64 = @intCast(@min(
+        delay_ms,
+        @as(u64, @intCast(std.math.maxInt(i64))),
+    ));
+    event.waitTimeout(io, .{
+        .duration = .{
+            .raw = std.Io.Duration.fromMilliseconds(bounded_delay_ms),
+            .clock = .awake,
+        },
+    }) catch |err| switch (err) {
+        error.Timeout => return true,
+        error.Canceled => return error.Canceled,
+    };
+    return false;
+}
+
 test "restore retry deadline wakeup is interruptible without polling" {
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -13674,22 +13907,133 @@ test "restore retry deadline wakeup is interruptible without polling" {
     ));
 }
 
+test "restore ownership backoff is interruptible without polling" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var event: std.Io.Event = .unset;
+    const Wake = struct {
+        fn run(wake_io: std.Io, wake_event: *std.Io.Event) void {
+            wake_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+            wake_event.set(wake_io);
+        }
+    };
+    var wake = try io.concurrent(Wake.run, .{ io, &event });
+    defer _ = wake.await(io);
+    try std.testing.expect(!try waitForRestoreBackoffEvent(io, &event, 60 * 1000));
+}
+
 const RestoreJobWork = struct {
     server: *ApiHttpServer,
     job_id: u64,
+    owner_id: u64,
+    leadership_term: u64,
+    attempt_id: u64 = 0,
+    retry_wakeup: std.Io.Event = .unset,
 
     fn run(ptr: *anyopaque) !void {
         const self: *RestoreJobWork = @ptrCast(@alignCast(ptr));
-        self.server.runRestoreJob(self.job_id) catch |err| {
-            // Leadership rebuilds recover running attempts into the durable
-            // FIFO. The old owner must never turn a correctly fenced attempt
-            // into a terminal failure while leadership is moving.
-            if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return;
-            std.log.err("restore job execution failed job_id={d} err={s}", .{ self.job_id, @errorName(err) });
-            self.server.restore_job_store.failRunningById(self.server.alloc, self.job_id, @errorName(err)) catch |persist_err| {
-                std.log.err("failed to persist restore job failure job_id={d} err={s}", .{ self.job_id, @errorName(persist_err) });
+        var retry_delay_ms = restore_jobs.restore_retry_min_ms;
+        while (self.authorityCurrent()) {
+            self.attempt_id = 0;
+            var begin_established = false;
+            self.server.runRestoreJob(
+                self.job_id,
+                &self.attempt_id,
+                &begin_established,
+            ) catch |err| {
+                // Leadership rebuilds recover running attempts into the durable
+                // FIFO. The old owner must never turn a correctly fenced attempt
+                // into a terminal failure while leadership is moving.
+                // Every begin-stage error is recoverable regardless of its
+                // error class: no execution side effect exists yet, and the
+                // dispatcher has already removed the queued entry.
+                if (restoreJobFailureRequiresRecovery(begin_established, err)) {
+                    if (!self.recoverExactAttempt(err, &retry_delay_ms)) return;
+                    if (!self.waitForRetry(&retry_delay_ms)) {
+                        // A same-owner I/O cancellation must not strand the
+                        // queued predecessor. Leadership loss is rebuilt from
+                        // replicated state by the new owner.
+                        if (self.authorityCurrent())
+                            self.server.restore_job_store.requeuePending(self.job_id) catch {};
+                        return;
+                    }
+                    continue;
+                }
+                std.log.err("restore job execution failed job_id={d} attempt_id={d} err={s}", .{
+                    self.job_id,
+                    self.attempt_id,
+                    @errorName(err),
+                });
+                self.failExactAttempt(err, &retry_delay_ms);
+                return;
             };
-        };
+            return;
+        }
+    }
+
+    /// Returns true only when begin did not commit and this same worker should
+    /// retry the queued predecessor after backoff. Every other durable outcome
+    /// releases the worker slot.
+    fn recoverExactAttempt(self: *RestoreJobWork, cause: anyerror, retry_delay_ms: *u64) bool {
+        while (self.authorityCurrent()) {
+            const outcome = self.server.restore_job_store.recoverDispatchedAttempt(
+                self.server.alloc,
+                self.job_id,
+                self.attempt_id,
+                @errorName(cause),
+            ) catch |err| {
+                // A stable owner must not strand a running job merely because
+                // its checkpoint store is temporarily unavailable. Keep one
+                // bounded worker asleep instead of spinning or consuming a
+                // fresh durable-job slot on every retry.
+                std.log.warn("restore attempt requeue deferred job_id={d} attempt_id={d} err={s}", .{
+                    self.job_id,
+                    self.attempt_id,
+                    @errorName(err),
+                });
+                if (!self.waitForRetry(retry_delay_ms)) return false;
+                continue;
+            };
+            return outcome == .retry_queued;
+        }
+        return false;
+    }
+
+    fn failExactAttempt(self: *RestoreJobWork, cause: anyerror, retry_delay_ms: *u64) void {
+        while (self.authorityCurrent()) {
+            _ = self.server.restore_job_store.failRunningAttempt(
+                self.server.alloc,
+                self.job_id,
+                self.attempt_id,
+                @errorName(cause),
+            ) catch |err| {
+                std.log.warn("restore attempt terminalization deferred job_id={d} attempt_id={d} err={s}", .{
+                    self.job_id,
+                    self.attempt_id,
+                    @errorName(err),
+                });
+                if (!self.waitForRetry(retry_delay_ms)) return;
+                continue;
+            };
+            return;
+        }
+    }
+
+    fn waitForRetry(self: *RestoreJobWork, retry_delay_ms: *u64) bool {
+        const delay_ms = retry_delay_ms.*;
+        const elapsed = self.server.waitForRestoreBackoff(
+            &self.retry_wakeup,
+            self.owner_id,
+            self.leadership_term,
+            delay_ms,
+        );
+        retry_delay_ms.* = @min(delay_ms * 2, restore_jobs.restore_retry_max_ms);
+        return elapsed;
+    }
+
+    fn authorityCurrent(self: *const RestoreJobWork) bool {
+        return self.server.restoreWorkerAuthorityCurrent(self.owner_id, self.leadership_term);
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -13698,6 +14042,62 @@ const RestoreJobWork = struct {
         self.server.alloc.destroy(self);
     }
 };
+
+fn restoreJobErrorIsFenced(err: anyerror) bool {
+    return err == error.RestoreJobFenced or
+        err == error.RestoreJobPersistenceUnavailable or
+        metadata_authority.isRetryableError(err);
+}
+
+fn restoreJobErrorIsRetryable(err: anyerror) bool {
+    return err == error.BackupRepositoryBusy or
+        err == error.RestoreValidationPending;
+}
+
+fn restoreJobFailureRequiresRecovery(begin_established: bool, err: anyerror) bool {
+    return !begin_established or restoreJobErrorIsFenced(err);
+}
+
+test "restore job ownership failures remain retryable" {
+    try std.testing.expect(restoreJobErrorIsFenced(error.RestoreJobFenced));
+    try std.testing.expect(restoreJobErrorIsFenced(error.RestoreJobPersistenceUnavailable));
+    try std.testing.expect(restoreJobErrorIsFenced(error.NotLeader));
+    try std.testing.expect(!restoreJobErrorIsFenced(error.InvalidArguments));
+    try std.testing.expect(restoreJobFailureRequiresRecovery(false, error.OutOfMemory));
+    try std.testing.expect(!restoreJobFailureRequiresRecovery(true, error.OutOfMemory));
+}
+
+test "native restore validation uncertainty remains an asynchronous retry" {
+    try std.testing.expectEqual(
+        @as(public_table_http.TableApi.ExecuteRestoreError, error.RestoreValidationPending),
+        ApiHttpServer.mapExecuteRestoreError(error.NativeBackupProjectionValidationIndeterminate),
+    );
+    try std.testing.expect(!restoreJobErrorIsFenced(error.RestoreValidationPending));
+    try std.testing.expect(restoreJobErrorIsRetryable(error.RestoreValidationPending));
+    try std.testing.expect(restoreJobErrorIsRetryable(error.BackupRepositoryBusy));
+    try std.testing.expect(!restoreJobErrorIsRetryable(error.BackupIntegrityFailure));
+}
+
+test "restore worker authority is fenced across leadership reacquisition" {
+    const GuardState = struct {
+        current_term: std.atomic.Value(u64) = .init(7),
+
+        fn isCurrent(ptr: *anyopaque, term: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.current_term.load(.acquire) == term;
+        }
+    };
+    var state: GuardState = .{};
+    const guard: RestoreExecutionGuard = .{ .ptr = &state, .is_current = GuardState.isCurrent };
+
+    try std.testing.expect(restoreWorkerAuthorityMatches(41, 7, 41, 7, guard));
+    state.current_term.store(9, .release);
+    // The process-local durable-job owner may not have rotated yet, but the
+    // captured term is already stale and cannot finalize an attempt.
+    try std.testing.expect(!restoreWorkerAuthorityMatches(41, 7, 41, 7, guard));
+    try std.testing.expect(!restoreWorkerAuthorityMatches(41, 9, 41, 7, guard));
+    try std.testing.expect(restoreWorkerAuthorityMatches(41, 0, 41, 0, null));
+}
 
 fn restoreJobIdFromPath(path: []const u8) ?u64 {
     const prefix = routes.Routes.restore ++ "/jobs/";
@@ -19234,6 +19634,8 @@ test "api http missing index classification requires active rebuild evidence" {
         .repair_degraded = true,
         .index_repair_id = 42,
         .index_repair_phase = "terminal",
+        .index_repair_status = .failed,
+        .index_repair_action_required = true,
     }};
     const terminal_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 10,
@@ -19251,6 +19653,8 @@ test "api http missing index classification requires active rebuild evidence" {
         .index_repair_id = 42,
         .index_repair_phase = "building",
         .index_repair_automation = "paused",
+        .index_repair_status = .paused,
+        .index_repair_action_required = true,
     }};
     const paused_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 10,
@@ -19260,6 +19664,29 @@ test "api http missing index classification requires active rebuild evidence" {
     try std.testing.expectEqual(
         ApiHttpServer.RuntimeIndexLifecycle.unavailable,
         ApiHttpServer.runtimeIndexLifecycle(paused_statuses[0..], &expected_group_ids, "semantic_idx"),
+    );
+
+    const retained_terminal_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .load_error = "CandidateManifestInvalid",
+        .repair_degraded = true,
+        .index_repair_id = 45,
+        .index_repair_phase = "terminal",
+        .index_repair_status = .failed,
+        .index_repair_action_required = true,
+        .index_repair_active_generation_serviceable = true,
+    }};
+    const retained_terminal_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .indexes = @constCast(retained_terminal_indexes[0..]) },
+    }};
+    // Candidate diagnostics remain actionable, but the exact active-generation
+    // proof is authoritative for query admission.
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.rebuilding,
+        ApiHttpServer.runtimeIndexLifecycle(retained_terminal_statuses[0..], &expected_group_ids, "semantic_idx"),
     );
 
     const degraded_indexes = [_]db_mod.types.DBIndexStats{.{
@@ -19296,6 +19723,8 @@ test "api http missing index classification requires active rebuild evidence" {
             .repair_degraded = true,
             .index_repair_id = 44,
             .index_repair_phase = "terminal",
+            .index_repair_status = .failed,
+            .index_repair_action_required = true,
         },
     };
     const mixed_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{

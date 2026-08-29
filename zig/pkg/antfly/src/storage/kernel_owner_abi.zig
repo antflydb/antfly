@@ -186,6 +186,8 @@ pub const EnrichmentExtractRequest = extern struct {
     callback_ctx: ?*anyopaque = null,
     on_begin: ?EnrichmentStreamBeginFn = null,
     on_units_json: ?*const fn (?*anyopaque, BorrowedBytes) callconv(.c) Status = null,
+    max_decoded_stream_bytes: u64 = 64 * 1024 * 1024,
+    max_working_set_bytes: u64 = 96 * 1024 * 1024,
 };
 
 pub const EnrichmentRenderPdfRequest = extern struct {
@@ -860,6 +862,18 @@ pub const JsonOperationRequest = extern struct {
     request_json: BorrowedBytes = .{},
 };
 
+/// One committed data-Raft mutation. The log identity is persisted atomically
+/// with the document mutation so replay after a crash is idempotent even for
+/// non-idempotent transforms and transaction state transitions.
+pub const ReplicatedBatchAtRaftEntryRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    raft_term: u64 = 0,
+    raft_index: u64 = 0,
+};
+
 /// Complete offline HA-seed operations that must remain beside physical DB
 /// restore/validation code. Values are append-only because they are recorded
 /// in `FailureIdentity.operation` for cross-unit diagnostics.
@@ -1521,6 +1535,12 @@ pub extern fn antfly_storage_owner_batch_json(
 pub extern fn antfly_storage_owner_replicated_batch_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_replicated_batch_at_raft_entry_json(
+    owner: ?*anyopaque,
+    request: *const ReplicatedBatchAtRaftEntryRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 

@@ -200,6 +200,28 @@ pub fn extractDownloadedStreamingWithFailure(
     sink: extraction.UnitSink,
     out_failure: *abi.FailureIdentity,
 ) !void {
+    return extractDownloadedStreamingWithLimitsWithFailure(
+        alloc,
+        downloaded,
+        source_url,
+        config_json,
+        raw_document_json,
+        (extraction.Config{}).pdf_decode_limits,
+        sink,
+        out_failure,
+    );
+}
+
+pub fn extractDownloadedStreamingWithLimitsWithFailure(
+    alloc: Allocator,
+    downloaded: anytype,
+    source_url: []const u8,
+    config_json: []const u8,
+    raw_document_json: []const u8,
+    pdf_decode_limits: @TypeOf((extraction.Config{}).pdf_decode_limits),
+    sink: extraction.UnitSink,
+    out_failure: *abi.FailureIdentity,
+) !void {
     out_failure.* = .{};
     var context = Context{ .alloc = alloc, .sink = sink };
     var failure: abi.FailureIdentity = .{};
@@ -212,6 +234,8 @@ pub fn extractDownloadedStreamingWithFailure(
         .callback_ctx = &context,
         .on_begin = Context.onBegin,
         .on_units_json = Context.onUnitsJson,
+        .max_decoded_stream_bytes = @intCast(pdf_decode_limits.max_decoded_stream_bytes),
+        .max_working_set_bytes = @intCast(pdf_decode_limits.max_working_set_bytes),
     }, &failure);
     // Callback failures originate in this consumer. Preserve their exact Zig
     // identity and do not confuse the provider's unwind sentinel with a

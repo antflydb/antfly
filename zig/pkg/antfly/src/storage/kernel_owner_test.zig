@@ -353,6 +353,41 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     );
     defer replicated_response.deinit();
     try std.testing.expect(std.mem.indexOf(u8, replicated_response.bytes(), "\"inserted\":1") != null);
+
+    // Exact Raft-entry apply must preserve the physical idempotence fence
+    // across the opaque storage-owner ABI. In particular, replaying a
+    // non-idempotent transform at the same term/index must be a no-op.
+    var raft_insert_response = try owner.replicatedBatchAtRaftEntryJson(
+        "docs",
+        "{\"inserts\":{\"doc:raft-counter\":{\"count\":0}},\"sync_level\":\"write\"}",
+        3,
+        40,
+    );
+    defer raft_insert_response.deinit();
+    var raft_increment_response = try owner.replicatedBatchAtRaftEntryJson(
+        "docs",
+        "{\"transforms\":[{\"key\":\"doc:raft-counter\",\"operations\":[{\"op\":\"$inc\",\"path\":\"count\",\"value\":1}]}],\"sync_level\":\"write\"}",
+        3,
+        41,
+    );
+    defer raft_increment_response.deinit();
+    var raft_replay_response = try owner.replicatedBatchAtRaftEntryJson(
+        "docs",
+        "{\"transforms\":[{\"key\":\"doc:raft-counter\",\"operations\":[{\"op\":\"$inc\",\"path\":\"count\",\"value\":1}]}],\"sync_level\":\"write\"}",
+        3,
+        41,
+    );
+    defer raft_replay_response.deinit();
+    var raft_counter = try owner.lookupJson(
+        "docs",
+        "{\"key\":\"doc:raft-counter\",\"include_all_fields\":true}",
+    );
+    defer raft_counter.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, raft_counter.bytes(), "\"count\":1") != null);
+    try std.testing.expectError(
+        error.InvalidArgument,
+        owner.replicatedBatchAtRaftEntryJson("docs", "{}", 0, 42),
+    );
     try std.testing.expectError(error.InvalidBatchRequest, owner.batchJson("docs", "{"));
     try std.testing.expectError(error.InvalidBatchRequest, owner.replicatedBatchJson("docs", "{"));
     try owner.waitForSync("docs", .full_index);

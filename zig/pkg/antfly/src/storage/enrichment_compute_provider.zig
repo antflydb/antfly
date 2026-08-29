@@ -160,6 +160,12 @@ pub fn extractStream(
         return fail(err, .extract_stream, out_failure);
     };
     defer config.deinit(alloc);
+    config.pdf_decode_limits = .{
+        .max_decoded_stream_bytes = std.math.cast(usize, request.max_decoded_stream_bytes) orelse
+            return fail(error.InvalidPdfDecodeLimits, .extract_stream, out_failure),
+        .max_working_set_bytes = std.math.cast(usize, request.max_working_set_bytes) orelse
+            return fail(error.InvalidPdfDecodeLimits, .extract_stream, out_failure),
+    };
     extraction.applySourceMetadataFromJson(alloc, &config, request.raw_document_json.slice()) catch |err| {
         return fail(err, .extract_stream, out_failure);
     };
