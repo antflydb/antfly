@@ -1842,7 +1842,7 @@ pub const IndexReadinessReason = enum {
     }
 };
 
-/// Authoritative query-readiness and completeness state for the desired index incarnation.
+/// Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans.
 pub const IndexReadinessState = enum {
     pending,
     queryable_partial,
@@ -1882,6 +1882,10 @@ pub const IndexReadinessStatus = struct {
     complete: bool,
     /// Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
     incarnation: ?[]const u8 = null,
+    /// Highest captured source/replay revision required by this readiness observation.
+    target_revision: ?i64 = null,
+    /// Highest revision published to the query-visible index represented by this observation.
+    published_revision: ?i64 = null,
     /// Stable, machine-readable blockers or failure reasons. Empty when state is ready.
     pending_reasons: []const IndexReadinessReason,
     /// Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order.
@@ -1894,6 +1898,12 @@ pub const IndexRepairStatus = struct {
     state: []const u8,
     /// Whether an operator must resume, retry, reconfigure, or drop the affected index.
     action_required: bool,
+    /// Whether this repair currently prevents the proven serving incarnation from answering queries.
+    blocks_queryable: bool,
+    /// Whether this repair prevents the desired incarnation from satisfying the complete milestone.
+    blocks_complete: bool,
+    /// Diagnostic reason automation stopped. Present only when action_required is true.
+    reason: ?[]const u8 = null,
 };
 
 /// Stable machine-readable reason why an artifact source is pending or failed.

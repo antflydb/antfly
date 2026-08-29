@@ -20,8 +20,9 @@ T = TypeVar("T", bound="IndexReadinessStatus")
 class IndexReadinessStatus:
     """
     Attributes:
-        state (IndexReadinessState): Authoritative query-readiness and completeness state for the desired index
-            incarnation.
+        state (IndexReadinessState): Lifecycle state for the desired index incarnation. A failed desired repair may
+            coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the
+            explicit milestone booleans.
         queryable (bool): Whether the published generation can safely answer queries.
         complete (bool): Whether the desired incarnation has complete coverage and publication according to its
             configured policies.
@@ -29,6 +30,9 @@ class IndexReadinessStatus:
             state is ready.
         incarnation (str | Unset): Opaque identity for the desired index incarnation. Clients may compare it for
             equality but must not interpret its contents.
+        target_revision (int | Unset): Highest captured source/replay revision required by this readiness observation.
+        published_revision (int | Unset): Highest revision published to the query-visible index represented by this
+            observation.
         sources (list[IndexSourceReadinessStatus] | Unset): Operational readiness for each configured artifact stream.
             Present only for artifact-backed indexes, in configuration order.
     """
@@ -38,6 +42,8 @@ class IndexReadinessStatus:
     complete: bool
     pending_reasons: list[IndexReadinessReason]
     incarnation: str | Unset = UNSET
+    target_revision: int | Unset = UNSET
+    published_revision: int | Unset = UNSET
     sources: list[IndexSourceReadinessStatus] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -53,6 +59,10 @@ class IndexReadinessStatus:
             pending_reasons.append(pending_reasons_item)
 
         incarnation = self.incarnation
+
+        target_revision = self.target_revision
+
+        published_revision = self.published_revision
 
         sources: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.sources, Unset):
@@ -73,6 +83,10 @@ class IndexReadinessStatus:
         )
         if incarnation is not UNSET:
             field_dict["incarnation"] = incarnation
+        if target_revision is not UNSET:
+            field_dict["target_revision"] = target_revision
+        if published_revision is not UNSET:
+            field_dict["published_revision"] = published_revision
         if sources is not UNSET:
             field_dict["sources"] = sources
 
@@ -98,6 +112,10 @@ class IndexReadinessStatus:
 
         incarnation = d.pop("incarnation", UNSET)
 
+        target_revision = d.pop("target_revision", UNSET)
+
+        published_revision = d.pop("published_revision", UNSET)
+
         _sources = d.pop("sources", UNSET)
         sources: list[IndexSourceReadinessStatus] | Unset = UNSET
         if _sources is not UNSET:
@@ -113,6 +131,8 @@ class IndexReadinessStatus:
             complete=complete,
             pending_reasons=pending_reasons,
             incarnation=incarnation,
+            target_revision=target_revision,
+            published_revision=published_revision,
             sources=sources,
         )
 

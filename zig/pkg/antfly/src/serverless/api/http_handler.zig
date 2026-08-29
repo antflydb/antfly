@@ -4661,13 +4661,21 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteListIndexesError![]u8 {
-        _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch return error.InternalFailure) orelse return error.NotFound;
+        var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch |err| {
+            std.log.err("serverless public table index list lookup failed table={s} err={}", .{ table_name, err });
+            return error.InternalFailure;
+        }) orelse return error.NotFound;
         defer table.deinit(self.alloc);
-        var status = self.catalog.tableBuildStatus(table_name) catch return error.InternalFailure;
+        var status = self.catalog.tableBuildStatus(table_name) catch |err| {
+            std.log.err("serverless public table index list status failed table={s} err={}", .{ table_name, err });
+            return error.InternalFailure;
+        };
         defer status.deinit(self.alloc);
-        return encodeServerlessIndexListAlloc(self.alloc, table.indexes_json, status) catch return error.InternalFailure;
+        return encodeServerlessIndexListAlloc(alloc, table.indexes_json, status) catch |err| {
+            std.log.err("serverless public table index list encode failed table={s} err={}", .{ table_name, err });
+            return error.InternalFailure;
+        };
     }
 
     fn executePublicTableGetIndex(
@@ -4677,13 +4685,21 @@ pub const HttpHandler = struct {
         index_name: []const u8,
         _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
-        _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch return error.InternalFailure) orelse return error.NotFound;
+        var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch |err| {
+            std.log.err("serverless public table index lookup failed table={s} index={s} err={}", .{ table_name, index_name, err });
+            return error.InternalFailure;
+        }) orelse return error.NotFound;
         defer table.deinit(self.alloc);
-        var status = self.catalog.tableBuildStatus(table_name) catch return error.InternalFailure;
+        var status = self.catalog.tableBuildStatus(table_name) catch |err| {
+            std.log.err("serverless public table index status failed table={s} index={s} err={}", .{ table_name, index_name, err });
+            return error.InternalFailure;
+        };
         defer status.deinit(self.alloc);
-        return (encodeServerlessSingleIndexAlloc(self.alloc, table.indexes_json, index_name, status) catch return error.InternalFailure) orelse error.NotFound;
+        return (encodeServerlessSingleIndexAlloc(alloc, table.indexes_json, index_name, status) catch |err| {
+            std.log.err("serverless public table index encode failed table={s} index={s} err={}", .{ table_name, index_name, err });
+            return error.InternalFailure;
+        }) orelse error.NotFound;
     }
 
     fn executePublicTableCreateIndex(

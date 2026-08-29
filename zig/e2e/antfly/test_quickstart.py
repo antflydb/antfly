@@ -994,10 +994,10 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     coverage = partial_status["coverage"]
     assert readiness["queryable"] is True
     assert readiness["complete"] is False
+    assert readiness["state"] != "failed"
+    assert "coverage" in readiness["pending_reasons"]
     assert readiness["incarnation"].startswith("g-")
-    assert readiness["pending_reasons"]
-    assert "target_revision" not in readiness
-    assert "published_revision" not in readiness
+    assert readiness["published_revision"] <= readiness["target_revision"]
     assert 0 < coverage["covered"] < coverage["source_total"] == 100
     assert coverage["complete"] is False
 

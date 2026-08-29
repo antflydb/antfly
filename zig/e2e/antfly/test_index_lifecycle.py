@@ -1448,6 +1448,10 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
     assert partial["backfill_state"] == "retrying"
     assert partial["backfill_active"] is True
     assert partial["backfill_progress"] < 1.0
+    readiness = partial["readiness"]
+    assert readiness["state"] != "failed"
+    assert readiness["complete"] is False
+    assert "coverage" in readiness["pending_reasons"]
     # Replay and managed enrichment coverage are independent axes. The write
     # log may be fully consumed while retryable provider work still leaves the
     # derived index partially covered.

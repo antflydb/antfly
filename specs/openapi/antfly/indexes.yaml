@@ -680,7 +680,7 @@ components:
         - queryable_partial
         - ready
         - failed
-      description: "Authoritative query-readiness and completeness state for the desired index incarnation."
+      description: "Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans."
     IndexReadinessReason:
       type: string
       enum:
@@ -727,6 +727,14 @@ components:
         incarnation:
           type: string
           description: "Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents."
+        target_revision:
+          type: integer
+          format: uint64
+          description: "Highest captured source/replay revision required by this readiness observation."
+        published_revision:
+          type: integer
+          format: uint64
+          description: "Highest revision published to the query-visible index represented by this observation."
         pending_reasons:
           type: array
           items:
@@ -769,6 +777,8 @@ components:
       required:
         - state
         - action_required
+        - blocks_queryable
+        - blocks_complete
       properties:
         state:
           type: string
@@ -781,6 +791,15 @@ components:
         action_required:
           type: boolean
           description: Whether an operator must resume, retry, reconfigure, or drop the affected index.
+        blocks_queryable:
+          type: boolean
+          description: Whether this repair currently prevents the proven serving incarnation from answering queries.
+        blocks_complete:
+          type: boolean
+          description: Whether this repair prevents the desired incarnation from satisfying the complete milestone.
+        reason:
+          type: string
+          description: Diagnostic reason automation stopped. Present only when action_required is true.
     FullTextIndexStats:
       type: object
       required:

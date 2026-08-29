@@ -10051,7 +10051,7 @@ export interface components {
         /** @description Discriminated normalized configuration returned after an index is created. */
         CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"];
         /**
-         * @description Authoritative query-readiness and completeness state for the desired index incarnation.
+         * @description Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans.
          * @enum {string}
          */
         IndexReadinessState: "pending" | "queryable_partial" | "ready" | "failed";
@@ -10083,6 +10083,16 @@ export interface components {
             complete: boolean;
             /** @description Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents. */
             incarnation?: string;
+            /**
+             * Format: uint64
+             * @description Highest captured source/replay revision required by this readiness observation.
+             */
+            target_revision?: number;
+            /**
+             * Format: uint64
+             * @description Highest revision published to the query-visible index represented by this observation.
+             */
+            published_revision?: number;
             /** @description Stable, machine-readable blockers or failure reasons. Empty when state is ready. */
             pending_reasons: components["schemas"]["IndexReadinessReason"][];
             /** @description Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order. */
@@ -10097,6 +10107,12 @@ export interface components {
             state: "rebuilding" | "waiting" | "paused" | "failed";
             /** @description Whether an operator must resume, retry, reconfigure, or drop the affected index. */
             action_required: boolean;
+            /** @description Whether this repair currently prevents the proven serving incarnation from answering queries. */
+            blocks_queryable: boolean;
+            /** @description Whether this repair prevents the desired incarnation from satisfying the complete milestone. */
+            blocks_complete: boolean;
+            /** @description Diagnostic reason automation stopped. Present only when action_required is true. */
+            reason?: string;
         };
         FullTextIndexStats: {
             /**
