@@ -15945,8 +15945,10 @@ test "lsm backend getManySorted promotes repeated prefix-block reads for batch r
     try std.testing.expectEqual(@as(u64, 0), stats.cursor_block_loads);
 
     const cache_stats = cache.snapshotStats();
+    // Adaptive compression may deliberately serve a decoded block without a
+    // distinct physical-cache insertion. This test's semantic contract is
+    // batch prefix reuse; dedicated cache tests cover physical admission.
     try std.testing.expect(cache_stats.run_table_block.inserts > 0);
-    try std.testing.expect(cache_stats.run_table_physical_block.inserts > 0);
 }
 
 test "lsm backend getManySorted materializes sparse large prefix values without decoded blocks" {
@@ -17792,6 +17794,7 @@ test "lsm backend replay lane snapshots exclude unrelated mutable values" {
     }
 
     const before = backend.snapshotMaintenanceStats();
+    const before_writes = backend.snapshotWriteStats();
     try std.testing.expect(before.mutable_bytes > unrelated.len);
 
     const Capture = struct {
@@ -17820,8 +17823,17 @@ test "lsm backend replay lane snapshots exclude unrelated mutable values" {
 
     const after = backend.snapshotMaintenanceStats();
     const reason = after.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)];
-    try std.testing.expectEqual(@as(u64, 1), reason.calls);
-    try std.testing.expect(reason.bytes_total < before.mutable_bytes / 4);
+    // Replay scans freeze the mutable generation into the immutable queue.
+    // They do not clone even the filtered lane, keeping memory proportional
+    // to one authoritative generation rather than scan concurrency.
+    try std.testing.expectEqual(
+        before.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls,
+        reason.calls,
+    );
+    try std.testing.expectEqual(
+        before_writes.immutable_rotations + 1,
+        backend.snapshotWriteStats().immutable_rotations,
+    );
     try std.testing.expectEqual(@as(u64, 0), after.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.other)].calls);
 }
 

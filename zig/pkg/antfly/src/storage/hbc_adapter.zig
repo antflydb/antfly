@@ -3115,6 +3115,13 @@ const PublishedSearchStateFlight = struct {
     refs: usize = 0,
 };
 
+pub const ExperimentalPostingCaptureOwner = enum {
+    none,
+    source,
+    source_handoff,
+    maintenance,
+};
+
 pub const HBCIndex = struct {
     alloc: Allocator,
     env_owner: EnvOwner,
@@ -3138,6 +3145,13 @@ pub const HBCIndex = struct {
     experimental_posting_wal_authoritative_persisted: bool = false,
     experimental_posting_mutation_base_generation: ?*ExperimentalPostingReadGeneration = null,
     experimental_posting_capture_enabled: bool = false,
+    experimental_posting_capture_owner: ExperimentalPostingCaptureOwner = .none,
+    // A maintenance capture spans both its durable WAL append and any
+    // immediate checkpoint maintenance. Keep the compatibility owner alive
+    // for that whole logical transaction; the append may activate a native
+    // generation, but must not invalidate the Store pointer the caller still
+    // owns for the checkpoint step.
+    experimental_posting_maintenance_capture_active: bool = false,
     experimental_posting_captured_values: ExperimentalPostingCapturedValues = .empty,
     experimental_exact_vector_capture_enabled: bool = false,
     experimental_exact_vector_mutations: ExperimentalExactVectorMutations = .empty,
@@ -3869,6 +3883,17 @@ pub const HBCIndex = struct {
         const finishing_outermost = self.write_session_depth == 1 and self.write_session_kind == .streaming_replay;
         const needs_explicit_sync = finishing_outermost and self.writeSessionFinishNeedsExplicitDurableSync();
         try self.finishWriteSessionWithOptions(.streaming_replay, options);
+        // Source capture publication follows the durable session finish and
+        // precedes the applied watermark. Make that short handoff explicit so
+        // another replay window yields instead of either borrowing the wrong
+        // transaction or treating ordinary publication ordering as a fatal
+        // ownership violation.
+        if (finishing_outermost and
+            self.experimental_posting_capture_enabled and
+            self.experimental_posting_capture_owner == .source)
+        {
+            self.experimental_posting_capture_owner = .source_handoff;
+        }
         if (needs_explicit_sync) try self.sync(true);
     }
 
@@ -6304,8 +6329,11 @@ pub const HBCIndex = struct {
         if (encoded.len != IndexMetadata.encoded_size and encoded.len != IndexMetadata.legacy_encoded_size)
             return error.CorruptedPostingMetadata;
         const metadata = IndexMetadata.decode(encoded);
-        if (metadata.version != self.metadata.version or
-            metadata.dims != self.metadata.dims or
+        // The bootstrap metadata may itself have come from the same native
+        // generation. Comparing two copies only proves self-consistency and
+        // would accept a future or corrupt format version on this build.
+        if (metadata.version != vectorindex_hbc.hbc_index_version) return error.UnsupportedVersion;
+        if (metadata.dims != self.metadata.dims or
             metadata.branching_factor != self.metadata.branching_factor or
             metadata.leaf_size != self.metadata.leaf_size or
             metadata.use_quantization != self.metadata.use_quantization or
@@ -6682,6 +6710,13 @@ pub const HBCIndex = struct {
         self: *HBCIndex,
         posting_store: *posting_segment_store_mod.Store,
     ) !void {
+        // Never compact a generation that failed its structural proof. A
+        // checkpoint would only republish the corruption in a new immutable
+        // file and can race the shadow-generation repair.
+        if (self.generationRepairPending()) {
+            self.discardExperimentalPostingCheckpointBuild();
+            return;
+        }
         // The builder normally finishes well before the durable tail reaches
         // the hard policy bound. If it does not, wait only at that bound so
         // recovery debt cannot grow without limit.
@@ -6854,6 +6889,12 @@ pub const HBCIndex = struct {
         if (options.flatten) {
             _ = try self.requestExperimentalPostingFullCheckpointForReadiness();
             _ = try self.finishExperimentalPostingCheckpointForReadiness();
+        } else {
+            // A stable-tip caller that deliberately keeps the bounded delta
+            // chain still owns a publication fence. Retire any opportunistic
+            // build started before its final validation; publishing that stale
+            // candidate later could overwrite the state just certified here.
+            self.discardExperimentalPostingCheckpointBuild();
         }
         if (self.experimentalPostingDurableAppliedSequence() != applied_sequence) {
             return error.PostingCheckpointSequenceMismatch;
@@ -6937,6 +6978,7 @@ pub const HBCIndex = struct {
         self.discardExperimentalPostingCheckpointBuild();
         self.experimental_posting_overlay_collapsed_wal_bytes = 0;
         self.experimental_posting_capture_enabled = false;
+        self.experimental_posting_capture_owner = .none;
         self.clearExperimentalPostingMutationBase();
         self.clearExperimentalPostingCapturedValues();
         self.clearExperimentalExactVectorMutations();
@@ -6963,6 +7005,7 @@ pub const HBCIndex = struct {
         var posting_store = &self.experimental_posting_write_store.?;
         if (posting_store.checkpoint == null) {
             self.experimental_posting_capture_enabled = false;
+            self.experimental_posting_capture_owner = .none;
             self.clearExperimentalPostingMutationBase();
             self.clearExperimentalPostingCapturedValues();
             self.clearExperimentalExactVectorMutations();
@@ -7014,7 +7057,11 @@ pub const HBCIndex = struct {
         };
     }
 
-    pub fn beginExperimentalPostingMutationCapture(self: *HBCIndex) !void {
+    fn beginExperimentalPostingMutationCaptureOwned(
+        self: *HBCIndex,
+        owner: ExperimentalPostingCaptureOwner,
+    ) !void {
+        std.debug.assert(owner != .none);
         if (self.experimental_posting_capture_enabled) return error.ExperimentalPostingCaptureAlreadyActive;
         // A posting capture is the derived-state transaction boundary, not an
         // LSM snapshot. It is valid (and required) inside a streaming replay
@@ -7042,6 +7089,11 @@ pub const HBCIndex = struct {
         }
         self.experimental_posting_sidecar_managed = true;
         self.experimental_posting_capture_enabled = true;
+        self.experimental_posting_capture_owner = owner;
+    }
+
+    pub fn beginExperimentalPostingMutationCapture(self: *HBCIndex) !void {
+        try self.beginExperimentalPostingMutationCaptureOwned(.source);
     }
 
     /// Reports whether the active source transaction changed any HBC-owned
@@ -7052,11 +7104,16 @@ pub const HBCIndex = struct {
     /// the corresponding artifact mutations itself.
     pub fn experimentalPostingCaptureHasMutations(self: *const HBCIndex) bool {
         return self.experimental_posting_capture_enabled and
-            self.experimental_posting_captured_values.count() != 0;
+            (self.experimental_posting_captured_values.count() != 0 or
+                self.experimental_exact_vector_mutations.count() != 0);
     }
 
     pub fn experimentalPostingMutationCaptureActive(self: *const HBCIndex) bool {
         return self.experimental_posting_capture_enabled;
+    }
+
+    pub fn experimentalPostingMutationCaptureOwner(self: *const HBCIndex) ExperimentalPostingCaptureOwner {
+        return self.experimental_posting_capture_owner;
     }
 
     /// Routes query-facing HBC mutations through the committed posting WAL
@@ -7072,6 +7129,7 @@ pub const HBCIndex = struct {
 
     pub fn cancelExperimentalPostingMutationCapture(self: *HBCIndex) void {
         self.experimental_posting_capture_enabled = false;
+        self.experimental_posting_capture_owner = .none;
         var mutation_base_restored = true;
         if (self.experimental_posting_wal_authoritative.load(.acquire) and
             self.experimental_posting_mutation_base_generation != null)
@@ -7112,12 +7170,15 @@ pub const HBCIndex = struct {
         const capture: ExperimentalPostingMaintenanceCapture = .{
             .covered_source_sequence = posting_store.covered_source_sequence,
         };
-        try self.beginExperimentalPostingMutationCapture();
+        try self.beginExperimentalPostingMutationCaptureOwned(.maintenance);
+        self.experimental_posting_maintenance_capture_active = true;
         return capture;
     }
 
     fn cancelExperimentalPostingMaintenanceCapture(self: *HBCIndex) void {
         self.cancelExperimentalPostingMutationCapture();
+        self.experimental_posting_maintenance_capture_active = false;
+        self.detachLegacyLsmAfterNativeActivationBestEffort();
     }
 
     /// Completes an independently committed maintenance transaction without
@@ -7128,8 +7189,12 @@ pub const HBCIndex = struct {
         self: *HBCIndex,
         capture: ExperimentalPostingMaintenanceCapture,
     ) !void {
-        if (self.experimental_posting_captured_values.count() == 0) {
-            self.cancelExperimentalPostingMaintenanceCapture();
+        defer {
+            self.experimental_posting_maintenance_capture_active = false;
+            self.detachLegacyLsmAfterNativeActivationBestEffort();
+        }
+        if (!self.experimentalPostingCaptureHasMutations()) {
+            self.cancelExperimentalPostingMutationCapture();
             return;
         }
         if (self.experimental_posting_write_store == null) return error.MissingPostingCheckpoint;
@@ -7175,6 +7240,7 @@ pub const HBCIndex = struct {
     ) !PostingWalAppendStats {
         if (!self.experimental_posting_capture_enabled) return error.ExperimentalPostingCaptureNotActive;
         self.experimental_posting_capture_enabled = false;
+        self.experimental_posting_capture_owner = .none;
         defer self.clearExperimentalPostingMutationBase();
         defer self.clearExperimentalPostingCapturedValues();
         defer self.clearExperimentalExactVectorMutations();
@@ -8172,6 +8238,7 @@ pub const HBCIndex = struct {
             !self.experimentalPostingReadGenerationLoaded() or
             self.write_session_depth != 0 or
             self.experimental_posting_capture_enabled or
+            self.experimental_posting_maintenance_capture_active or
             self.experimental_posting_checkpoint_build != null)
         {
             return;
@@ -10869,8 +10936,24 @@ pub const HBCIndex = struct {
         try self.finishWriteTxn(&txn);
     }
 
+    fn beginFormatAgnosticTestMutation(self: *HBCIndex) !bool {
+        if (!self.experimental_posting_sidecar_managed) return false;
+        try self.beginExperimentalPostingMutationCaptureOwned(.source);
+        return true;
+    }
+
+    fn finishFormatAgnosticTestMutation(self: *HBCIndex, capture_started: bool) !void {
+        if (!capture_started) return;
+        const covered_source_sequence = self.experimentalPostingDurableAppliedSequence() orelse
+            return error.MissingPostingCheckpoint;
+        try self.persistExperimentalPostingSidecarAtAppliedSequence(covered_source_sequence, .{});
+    }
+
     pub fn deleteNodeHeaderForTest(self: *HBCIndex, node_id: u64) !void {
         if (!builtin.is_test) return error.Unsupported;
+
+        const capture_started = try self.beginFormatAgnosticTestMutation();
+        errdefer if (capture_started) self.cancelExperimentalPostingMutationCapture();
 
         var txn = try self.beginWriteTxn();
         errdefer txn.abort();
@@ -10878,6 +10961,104 @@ pub const HBCIndex = struct {
         var key_buf: [12]u8 = undefined;
         try self.deleteNamespaced(&txn, .nodes, encodeNodeKey(&key_buf, node_id, .packed_node));
         try self.finishWriteTxn(&txn);
+        try self.finishFormatAgnosticTestMutation(capture_started);
+    }
+
+    /// Injects an index-only vector while preserving the native mutation
+    /// transaction invariant. Repair tests use this to model stale derived
+    /// state that deliberately has no matching primary artifact.
+    pub fn insertVectorForTest(self: *HBCIndex, vector_id: u64, vector_data: []const f32) !void {
+        if (!builtin.is_test) return error.Unsupported;
+
+        const capture_started = try self.beginFormatAgnosticTestMutation();
+        errdefer if (capture_started) self.cancelExperimentalPostingMutationCapture();
+
+        try vectorindex_hbc_index.insert(self, vector_id, vector_data, nowNs, elapsedSince);
+        try self.finishFormatAgnosticTestMutation(capture_started);
+    }
+
+    /// Persists deliberately incompatible metadata through whichever mutation
+    /// format currently owns the index. This keeps quarantine tests valid
+    /// after native authority has released the compatibility LSM.
+    pub fn setMetadataVersionForTest(self: *HBCIndex, version_value: u32) !void {
+        if (!builtin.is_test) return error.Unsupported;
+
+        const capture_started = try self.beginFormatAgnosticTestMutation();
+        errdefer if (capture_started) self.cancelExperimentalPostingMutationCapture();
+
+        var metadata = self.metadata;
+        metadata.version = version_value;
+        var metadata_buf: [IndexMetadata.encoded_size]u8 = undefined;
+        var txn = try self.beginWriteTxn();
+        errdefer txn.abort();
+        try self.putNamespaced(&txn, .meta, meta_key, metadata.encode(&metadata_buf));
+        // Deliberately bypass ordinary finalization: it republishes
+        // self.metadata and would overwrite the incompatible bytes this test
+        // is injecting. PublishedWriteTxn.commit still preserves the query
+        // generation fence, while the format-agnostic capture below makes the
+        // mutation durable in the active native WAL.
+        try txn.commit();
+        try self.finishFormatAgnosticTestMutation(capture_started);
+    }
+
+    /// Marks one posting dirty through the active mutation format so tests can
+    /// exercise idle repair without depending on a retained compatibility LSM.
+    pub fn markNodePostingDirtyForTest(self: *HBCIndex, node_id: u64) !void {
+        if (!builtin.is_test) return error.Unsupported;
+
+        const capture_started = try self.beginFormatAgnosticTestMutation();
+        errdefer if (capture_started) self.cancelExperimentalPostingMutationCapture();
+
+        var txn = try self.beginWriteTxn();
+        errdefer txn.abort();
+        var node = try self.loadNode(&txn, node_id);
+        defer node.deinit(self.alloc);
+        try node.ensureUnbacked(self.alloc);
+        node.posting_state.noteMembersChanged(node.members.len);
+        try self.saveNode(&txn, &node);
+        try self.finishWriteTxn(&txn);
+        self.invalidateNodeCache(node_id);
+        try self.finishFormatAgnosticTestMutation(capture_started);
+    }
+
+    /// Marks every non-empty leaf dirty in one transaction and returns the
+    /// count. Clearing the node cache after commit is cheaper and safer than
+    /// retaining an unbounded list of leaf ids solely for test invalidation.
+    pub fn markAllLeafPostingsDirtyForTest(self: *HBCIndex) !usize {
+        if (!builtin.is_test) return error.Unsupported;
+
+        const capture_started = try self.beginFormatAgnosticTestMutation();
+        errdefer if (capture_started) self.cancelExperimentalPostingMutationCapture();
+
+        var dirtied: usize = 0;
+        var txn = try self.beginWriteTxn();
+        errdefer txn.abort();
+        var node_id: u64 = 1;
+        while (node_id <= self.metadata.node_count) : (node_id += 1) {
+            var node = self.loadNode(&txn, node_id) catch continue;
+            defer node.deinit(self.alloc);
+            if (!node.is_leaf or node.members.len == 0) continue;
+            try node.ensureUnbacked(self.alloc);
+            node.posting_state.noteMembersChanged(node.members.len);
+            try self.saveNode(&txn, &node);
+            dirtied += 1;
+        }
+        try self.finishWriteTxn(&txn);
+        self.clearNodeCache();
+        try self.finishFormatAgnosticTestMutation(capture_started);
+        return dirtied;
+    }
+
+    /// Leaves the currently selected format without a publishable generation.
+    /// Legacy stores retain their interrupted-bulk marker; native stores drop
+    /// only CURRENT, preserving immutable files for diagnosis and replacement.
+    pub fn markPublishedGenerationIncompleteForTest(self: *HBCIndex) !void {
+        if (!builtin.is_test) return error.Unsupported;
+        if (!self.experimentalPostingWalAuthoritative()) {
+            try self.persistBulkPublishState();
+            return;
+        }
+        try self.invalidateExperimentalPostingSidecar();
     }
 
     pub fn getNodeRead(self: *HBCIndex, txn: anytype, node_id: u64) !NodeRead {
@@ -12927,6 +13108,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn batchDelete(self: *HBCIndex, vector_ids: []const u64) !void {
+        try self.captureExactVectorBatch(&.{}, vector_ids);
         try vectorindex_hbc_index.batchDelete(self, vector_ids);
     }
 
@@ -12966,6 +13148,14 @@ pub const HBCIndex = struct {
         const generation = self.publishedGeneration();
         return (generation & 1) == 0 and
             self.generation_repair_pending_generation.load(.acquire) == generation;
+    }
+
+    /// Fences a structurally invalid immutable generation from queries and
+    /// compaction while the database rebuilds it from authoritative artifacts.
+    pub fn quarantineExperimentalPostingGeneration(self: *HBCIndex) void {
+        self.noteIncompletePublishedSnapshot();
+        self.disableExperimentalPostingReads();
+        self.discardExperimentalPostingCheckpointBuild();
     }
 
     pub fn treeLinkRepairPending(self: *const HBCIndex) bool {

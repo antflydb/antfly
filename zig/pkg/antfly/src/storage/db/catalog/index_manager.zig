@@ -1283,6 +1283,11 @@ pub const IndexManager = struct {
     applied_sequence_checkpoint_path: ?[]const u8,
     vector_block_generation_mu: std.atomic.Mutex = .unlocked,
     vector_block_build_mu: std.atomic.Mutex = .unlocked,
+    // A snapshot builder writes its reserved immutable generation without
+    // holding vector_block_build_mu. WAL appends remain online, while this bit
+    // prevents those appenders and idle maintenance from consuming the same
+    // generation number through a delta checkpoint.
+    vector_block_base_staging: std.atomic.Value(bool) = .init(false),
     // Public readiness remains closed from stable-tip vector publication
     // through posting-generation flattening. Queries may still lease the new
     // mmap generation, but readiness cannot hand the compactor to query one.
@@ -2809,10 +2814,12 @@ pub const IndexManager = struct {
         }
 
         var opened = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &current.opened);
-        errdefer opened.deinit();
+        var opened_owned = true;
+        errdefer if (opened_owned) opened.deinit();
         if (opened.store.covered_source_sequence < covered_source_sequence)
             return error.VectorBlockCoverageCommitMissing;
         const generation = try SharedVectorBlockGeneration.create(self.alloc, opened);
+        opened_owned = false;
         self.installVectorBlockGeneration(generation);
         return true;
     }
@@ -2878,8 +2885,9 @@ pub const IndexManager = struct {
         try store.appendBatch(batch_id, records, covered_source_sequence, .{});
 
         var opened = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &current.opened);
-        errdefer opened.deinit();
-        if (try opened.checkpointWalToDelta(false)) {
+        var opened_owned = true;
+        errdefer if (opened_owned) opened.deinit();
+        if (!self.vector_block_base_staging.load(.acquire) and try opened.checkpointWalToDelta(false)) {
             // Publication rotated WAL and CURRENT. Reopen so the installed
             // query lease owns exactly the new sparse generation rather than
             // the pre-checkpoint mmap/WAL view retained by the builder.
@@ -2897,6 +2905,7 @@ pub const IndexManager = struct {
             }
         }
         const generation = try SharedVectorBlockGeneration.create(self.alloc, opened);
+        opened_owned = false;
         self.installVectorBlockGeneration(generation);
         self.vector_block_projection_dirty.store(false, .release);
         return true;
@@ -2912,8 +2921,10 @@ pub const IndexManager = struct {
         covered_source_sequence: u64,
     ) !bool {
         const storage = self.vector_block_storage orelse return false;
+        if (self.vector_block_base_staging.load(.acquire)) return false;
         lockAtomicWithBackoff(&self.vector_block_build_mu);
         defer self.vector_block_build_mu.unlock();
+        if (self.vector_block_base_staging.load(.acquire)) return false;
 
         const current = self.acquireVectorBlockGeneration() orelse return false;
         defer current.release();
@@ -2933,7 +2944,8 @@ pub const IndexManager = struct {
         if (!try opened.compactDeltasToBase()) return false;
 
         var compacted = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &opened);
-        errdefer compacted.deinit();
+        var compacted_owned = true;
+        errdefer if (compacted_owned) compacted.deinit();
         const coverage = compacted.baseOnlyCoverage(denseVectorArtifactScopeHash(entry));
         if (compacted.store.covered_source_sequence != covered_source_sequence or
             coverage == null or coverage.?.vector_count != entry.index.stats().active_count)
@@ -2941,6 +2953,7 @@ pub const IndexManager = struct {
             return error.VectorBlockPublishedGenerationNotReady;
         }
         const generation = try SharedVectorBlockGeneration.create(self.alloc, compacted);
+        compacted_owned = false;
         self.installVectorBlockGeneration(generation);
         self.vector_block_projection_dirty.store(false, .release);
         std.log.info(
@@ -2965,12 +2978,15 @@ pub const IndexManager = struct {
             else => return err,
         };
         var opened = try vector_block_store_mod.Store.openWithBlocks(self.alloc, self.vector_block_storage.?, root);
-        errdefer opened.deinit();
+        var opened_owned = true;
+        errdefer if (opened_owned) opened.deinit();
         if (opened.store.manifest == null) {
             opened.deinit();
+            opened_owned = false;
             return;
         }
         const generation = try SharedVectorBlockGeneration.create(self.alloc, opened);
+        opened_owned = false;
         self.installVectorBlockGeneration(generation);
     }
 
@@ -2995,29 +3011,44 @@ pub const IndexManager = struct {
             }
             return;
         }
-        lockAtomicWithBackoff(&self.vector_block_build_mu);
-        defer self.vector_block_build_mu.unlock();
 
-        var requires_projection_rewrite = false;
+        // Only one snapshot builder may reserve the next immutable generation.
+        // Ordinary WAL appends continue under vector_block_build_mu while the
+        // expensive source scan and shard encoding run outside that mutex.
+        if (self.vector_block_base_staging.swap(true, .acq_rel)) return;
+        defer self.vector_block_base_staging.store(false, .release);
+
+        // Pin the source before reserving the WAL prefix. If a source commit
+        // races this point, its derived exact-vector mutation is necessarily
+        // appended after the prefix and survives as publication's WAL tail.
+        var source_txn = try primary.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer source_txn.abort();
+        const snapshot_sequence = try primary.lastReplaySequenceFromTxn(&source_txn, 0);
+        if (snapshot_sequence != applied_sequence) {
+            std.log.info("shared vector-block build deferred at snapshot boundary applied_sequence={} snapshot_sequence={}", .{ applied_sequence, snapshot_sequence });
+            return;
+        }
+
+        lockAtomicWithBackoff(&self.vector_block_build_mu);
+        var build_mu_locked = true;
+        defer if (build_mu_locked) self.vector_block_build_mu.unlock();
+
         if (self.acquireVectorBlockGeneration()) |current| {
             const current_coverage = current.opened.store.covered_source_sequence;
             const preferred_encoding = current.opened.usesBaseEncoding(denseVectorBlockPreferredEncoding());
             const preferred_layout = current.opened.store.manifest.?.shard_count == (vector_block_store_mod.BaseBuildOptions{}).shard_count;
             const base_only = current.opened.baseOnlyVectorCount() != null;
+            const established_overlay = !base_only and (current.opened.baseVectorCount() orelse 0) != 0;
             const certified_coverage = current.opened.baseOnlyCoverage(denseVectorArtifactScopeHash(entry));
             current.release();
             if (current_coverage == applied_sequence and preferred_encoding and preferred_layout and
-                (!base_only or
-                    (certified_coverage != null and certified_coverage.?.vector_count == entry.index.stats().active_count)))
+                (established_overlay or
+                    (base_only and
+                        (certified_coverage != null and certified_coverage.?.vector_count == entry.index.stats().active_count))))
             {
                 self.vector_block_projection_dirty.store(false, .release);
                 return;
             }
-            requires_projection_rewrite = current_coverage == applied_sequence;
-            // Never let a stale shared projection answer a newer HBC lease.
-            // Existing query leases retain the old mmap generation while new
-            // queries use primary artifacts until publication completes.
-            self.clearVectorBlockGeneration();
         }
 
         // The decoded HBC vector cache is a derivative of the same primary
@@ -3038,22 +3069,10 @@ pub const IndexManager = struct {
             }
         };
 
-        // Pin one source snapshot and derive its watermark from that snapshot.
-        // A current-tip check before a separately-opened scan is insufficient:
-        // a concurrent source commit can otherwise be mislabeled as the older
-        // HBC generation.
         // This is a one-pass projection scan. Retaining primary LSM blocks
         // would immediately duplicate the exact vectors in both the shared
         // cache and the mmap generation (hundreds of MiB at only 50K rows),
         // even though native reranking will not read those artifact blocks.
-        var source_txn = try primary.beginReadTxnWithBlockCacheAdmission(.transient);
-        defer source_txn.abort();
-        const snapshot_sequence = try primary.lastReplaySequenceFromTxn(&source_txn, 0);
-        if (snapshot_sequence != applied_sequence) {
-            std.log.info("shared vector-block build deferred at snapshot boundary applied_sequence={} snapshot_sequence={}", .{ applied_sequence, snapshot_sequence });
-            return;
-        }
-
         const root = try self.vectorBlockRootAlloc();
         defer self.alloc.free(root);
         // Charge actual allocator growth instead of guessing from corpus
@@ -3078,7 +3097,7 @@ pub const IndexManager = struct {
             return err;
         };
         defer store.deinit();
-        if (store.manifest != null and store.covered_source_sequence == applied_sequence and !requires_projection_rewrite) {
+        if (store.manifest != null and store.covered_source_sequence == applied_sequence) {
             try self.loadVectorBlockGenerationIfPresent();
             if (self.vectorBlockReadyAtSequenceAndCount(
                 applied_sequence,
@@ -3092,16 +3111,28 @@ pub const IndexManager = struct {
             // CURRENT may be a readable legacy float32 base. It is safe for
             // fallback queries, but it is not the preferred bounded-residency
             // projection. Replace it through the same atomic generation path.
-            self.clearVectorBlockGeneration();
         }
         const generation = if (store.manifest) |manifest|
             std.math.add(u64, manifest.latest_generation, 1) catch return error.VectorBlockGenerationOverflow
         else
             1;
+        const reserved_latest_generation = if (store.manifest) |manifest| manifest.latest_generation else 0;
+        const prefix_boundary: ?vector_block_store_mod.WalPrefixBoundary = if (store.manifest != null and
+            store.covered_source_sequence == applied_sequence)
+            store.walPrefixBoundary()
+        else
+            null;
+
+        // Release the mutation/WAL mutex for the corpus-sized work. The
+        // staging flag keeps generation publication fixed, but exact-vector
+        // batches continue to append complete commit frames to this WAL.
+        self.vector_block_build_mu.unlock();
+        build_mu_locked = false;
+
         const started = platform_time.monotonicNs();
         const artifact_scope_hashes = try self.vectorBlockArtifactScopeHashesAlloc();
         defer self.alloc.free(artifact_scope_hashes);
-        const stats = store.buildBaseFromArtifactsTxn(primary, &source_txn, generation, applied_sequence, .{
+        var build = store.stageBaseFromArtifactsTxn(primary, &source_txn, generation, applied_sequence, .{
             .encoding = denseVectorBlockPreferredEncoding(),
             .artifact_scope_hashes = artifact_scope_hashes,
         }) catch |err| {
@@ -3109,6 +3140,101 @@ pub const IndexManager = struct {
                 return error.ResourceBudgetExceeded;
             return err;
         };
+        defer build.deinit();
+
+        lockAtomicWithBackoff(&self.vector_block_build_mu);
+        build_mu_locked = true;
+        var publisher = vector_block_store_mod.Store.open(build_alloc, storage, root) catch |err| {
+            if (err == error.OutOfMemory and budgeted_alloc != null and budgeted_alloc.?.denied())
+                return error.ResourceBudgetExceeded;
+            return err;
+        };
+        defer publisher.deinit();
+        const current_latest_generation = if (publisher.manifest) |manifest| manifest.latest_generation else 0;
+        if (current_latest_generation != reserved_latest_generation) {
+            // A future publisher should honor vector_block_base_staging, but
+            // if an older binary or recovery path consumed this reservation,
+            // prefer a harmless orphan over deleting blocks CURRENT may own.
+            if (current_latest_generation >= generation) build.disarmCleanup();
+            return error.VectorBlockGenerationReservationLost;
+        }
+
+        if (prefix_boundary) |prefix| {
+            // Every concurrent source mutation must still have an exact-vector
+            // generation on which capture was enabled. A failed/uncaptured
+            // batch clears that generation and marks the projection dirty;
+            // publishing the snapshot in that state would lose the batch.
+            var can_preserve_snapshot_tail = !self.vector_block_projection_dirty.load(.acquire);
+            const captured_generation = if (can_preserve_snapshot_tail)
+                self.acquireVectorBlockGeneration()
+            else
+                null;
+            defer if (captured_generation) |generation_lease| generation_lease.release();
+            if (captured_generation) |generation_lease| {
+                can_preserve_snapshot_tail =
+                    generation_lease.opened.store.wal_generation == publisher.wal_generation and
+                    generation_lease.opened.store.wal_committed_bytes == publisher.wal_committed_bytes;
+            } else {
+                can_preserve_snapshot_tail = false;
+            }
+            if (can_preserve_snapshot_tail) {
+                try publisher.publishStagedBaseBuild(&build, .{ .flatten_prefix = prefix });
+            } else {
+                // WAL capture was unavailable or fenced, so no suffix can be
+                // trusted. A complete snapshot may still replace it when the
+                // source has remained at the exact pinned tip; flatten the
+                // current WAL only after proving that stronger boundary.
+                if (primary.lastReplaySequence(0) != applied_sequence)
+                    return error.VectorBlockSnapshotAdvancedWithoutWal;
+                if (applied_sequence < publisher.covered_source_sequence) {
+                    try publisher.publishStagedBaseBuild(&build, .reset_source_epoch);
+                } else {
+                    try publisher.publishStagedBaseBuild(&build, .{
+                        .flatten_prefix = publisher.walPrefixBoundary(),
+                    });
+                }
+            }
+        } else if (publisher.manifest != null and primary.lastReplaySequence(0) == applied_sequence) {
+            // The prior projection was behind when the snapshot was pinned.
+            // With the source still at that exact snapshot, every currently
+            // committed WAL record is represented by the new base. Flatten
+            // the whole prefix; there can be no suffix under this mutex.
+            if (applied_sequence < publisher.covered_source_sequence) {
+                // Restore can install a complete source snapshot whose replay
+                // sequence restarts below the imported projection epoch. The
+                // stable-tip proof above makes it safe to atomically replace
+                // that base and discard its incomparable old WAL.
+                try publisher.publishStagedBaseBuild(&build, .reset_source_epoch);
+            } else {
+                try publisher.publishStagedBaseBuild(&build, .{
+                    .flatten_prefix = publisher.walPrefixBoundary(),
+                });
+            }
+        } else {
+            // Without an established WAL authority, concurrent source progress
+            // cannot be reconstructed from a suffix. Publish only if the
+            // pinned snapshot is still the table tip.
+            if (primary.lastReplaySequence(0) != applied_sequence) return error.VectorBlockSnapshotAdvancedWithoutWal;
+            try publisher.publishStagedBaseBuild(&build, .no_tail);
+        }
+        const stats = build.stats;
+
+        // Open and install the new generation before admitting another WAL
+        // mutation. Existing queries retain the old mmap lease; new queries
+        // atomically observe the replacement base plus its preserved suffix.
+        const previous = self.acquireVectorBlockGeneration();
+        defer if (previous) |generation_lease| generation_lease.release();
+        var opened = if (previous) |generation_lease|
+            try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &generation_lease.opened)
+        else
+            try vector_block_store_mod.Store.openWithBlocks(self.alloc, storage, root);
+        var opened_owned = true;
+        errdefer if (opened_owned) opened.deinit();
+        const shared = try SharedVectorBlockGeneration.create(self.alloc, opened);
+        opened_owned = false;
+        self.installVectorBlockGeneration(shared);
+        self.vector_block_projection_dirty.store(false, .release);
+
         std.log.info(
             "shared vector-block base published generation={} sequence={} vectors={} vector_bytes={} artifact_bytes={} block_bytes={} elapsed_ms={}",
             .{
@@ -3121,23 +3247,23 @@ pub const IndexManager = struct {
                 (platform_time.monotonicNs() - started) / std.time.ns_per_ms,
             },
         );
-        try self.loadVectorBlockGenerationIfPresent();
-        if (!self.vectorBlockReadyAtSequenceAndCount(
-            applied_sequence,
-            denseVectorArtifactScopeHash(entry),
-            entry.index.stats().active_count,
-        ))
+        // A concurrent writer may have advanced the preserved WAL beyond this
+        // builder's source boundary. That generation is correct and queryable;
+        // lifecycle checkpoint publication performs its own stable-tip check.
+        if (publisher.covered_source_sequence == applied_sequence and
+            !self.vectorBlockReadyAtSequenceAndCount(
+                applied_sequence,
+                denseVectorArtifactScopeHash(entry),
+                entry.index.stats().active_count,
+            ))
             return error.VectorBlockPublishedGenerationNotReady;
-        self.vector_block_projection_dirty.store(false, .release);
         keep_native_cache_bypass = true;
     }
 
-    /// Publishes every native query artifact required at a stable source tip
-    /// under one readiness fence. The exact-vector base remains independently
-    /// leasable, dirty posting payloads are repaired against that base, and a
-    /// meaningful posting WAL tail is flattened into a full generation. This
-    /// keeps neither posting repair, background checkpointing, nor a large
-    /// exact centroid overlay from becoming the first query's work.
+    /// Publishes every native query artifact required at a stable source tip.
+    /// The corpus-sized exact-vector snapshot is optimistic: online mutations
+    /// append to its WAL suffix while immutable shards are encoded. Only the
+    /// final posting validation owns the per-index mutation mutex.
     pub fn finalizeVectorBlockBaseAtStableTip(
         self: *IndexManager,
         name: []const u8,
@@ -3145,16 +3271,36 @@ pub const IndexManager = struct {
     ) !void {
         if (self.vector_block_storage == null) return;
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        self.vector_block_stable_tip_finalizing.store(true, .release);
+        defer self.vector_block_stable_tip_finalizing.store(false, .release);
+
+        try self.ensureVectorBlockBaseAtAppliedSequence(entry.config.name, applied_sequence);
         lockAtomicWithBackoff(entry.apply_mutex);
         defer entry.apply_mutex.unlock();
-        try self.finalizeVectorBlockBaseAtStableTipLocked(entry, applied_sequence);
+        // A streaming source window durably closes its write session before
+        // the applied-sequence callback publishes the source_handoff capture.
+        // That transaction owns the next native generation; stable-tip
+        // finalization must yield rather than bootstrap across it. Absence of
+        // both a durable generation and an active capture remains the valid
+        // empty/migration bootstrap case below.
+        if (entry.index.experimentalPostingMutationCaptureActive())
+            return error.PostingCheckpointCaptureActive;
+        if (entry.index.experimentalPostingDurableAppliedSequence()) |posting_sequence| {
+            if (posting_sequence != applied_sequence)
+                return error.PostingCheckpointSequenceMismatch;
+        }
+        _ = try self.finalizeNativePostingGenerationAtStableTipLocked(entry, applied_sequence, .{
+            .validate_payloads = true,
+            // Query fan-out is already bounded by the native manifest. Leave
+            // consolidation to the background checkpoint lane instead of
+            // turning public readiness into a corpus rewrite.
+            .flatten = false,
+        });
     }
 
-    /// Caller owns entry.apply_mutex. Keep vector publication, native posting
-    /// repair, and the final flattened generation in one mutation epoch: a
-    /// query may otherwise arrive after vector publication, observe an active
-    /// repair capture, and fall back to the compatibility LSM for the entire
-    /// maintenance transaction.
+    /// Caller owns entry.apply_mutex. This quiescent maintenance path may build
+    /// a missing vector base inline, but it still leaves bounded native delta
+    /// consolidation to the background lane.
     fn finalizeVectorBlockBaseAtStableTipLocked(
         self: *IndexManager,
         entry: *DenseIndex,
@@ -3163,11 +3309,10 @@ pub const IndexManager = struct {
         self.vector_block_stable_tip_finalizing.store(true, .release);
         defer self.vector_block_stable_tip_finalizing.store(false, .release);
 
-        _ = try self.compactVectorBlockGenerationAtStableTip(entry, applied_sequence);
         try self.ensureVectorBlockBaseAtAppliedSequence(entry.config.name, applied_sequence);
         _ = try self.finalizeNativePostingGenerationAtStableTipLocked(entry, applied_sequence, .{
             .validate_payloads = true,
-            .flatten = true,
+            .flatten = false,
         });
     }
 
@@ -3241,6 +3386,12 @@ pub const IndexManager = struct {
     // publish immediately, while background publication additionally requires
     // no mutable rows, immutable memtables, or active bulk batch below.
     const vector_block_quiescence_ns: u64 = 2 * std.time.ns_per_s;
+    // Publishing the first tiny base is cheaper than leaving a newly created
+    // index in a pending state until an otherwise unnecessary maintenance
+    // wake. The pinned source sequence and post-build epoch validation still
+    // reject concurrent advancement. Larger corpora retain the debounce and
+    // settled-LSM requirement so an ingest lull cannot trigger repeated scans.
+    const vector_block_immediate_bootstrap_max_vectors: u64 = 4096;
 
     fn primaryWritePlaneSafeForProjection(stats: lsm_backend_mod.Backend.MaintenanceStats, maintenance_score: u64) bool {
         // An upload lull is not a stable publication boundary. Even a small
@@ -3275,6 +3426,7 @@ pub const IndexManager = struct {
         const primary = self.primary_store orelse return false;
         const posting_sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse return false;
         const source_sequence = primary.lastReplaySequence(0);
+        const active_vector_count = entry.index.stats().active_count;
         const now = platform_time.monotonicNs();
         if (self.vector_block_candidate_sequence.load(.acquire) != source_sequence) {
             self.vector_block_candidate_sequence.store(source_sequence, .release);
@@ -3288,18 +3440,27 @@ pub const IndexManager = struct {
         // though initial-publication readiness deliberately waits for a
         // cardinality-certified base. A base-only generation must already
         // match HBC cardinality or it needs the guarded primary-scan path.
+        var has_native_generation = false;
+        var native_generation_requires_initial_flatten = false;
         const native_generation_self_contained = blk: {
             const generation = self.acquireVectorBlockGeneration() orelse break :blk false;
             defer generation.release();
+            has_native_generation = true;
             if (!vectorBlockGenerationReadyAtSequence(generation, source_sequence)) break :blk false;
             const base_only_count = generation.opened.baseOnlyVectorCount();
-            if (base_only_count == null) break :blk true;
+            if (base_only_count == null) {
+                native_generation_requires_initial_flatten = active_vector_count != 0 and
+                    (generation.opened.baseVectorCount() orelse 0) == 0;
+                break :blk true;
+            }
             const coverage = generation.opened.baseOnlyCoverage(denseVectorArtifactScopeHash(entry)) orelse break :blk false;
-            break :blk coverage.vector_count == entry.index.stats().active_count;
+            break :blk coverage.vector_count == active_vector_count;
         };
+        const immediate_initial_bootstrap = (!has_native_generation or native_generation_requires_initial_flatten) and
+            active_vector_count <= vector_block_immediate_bootstrap_max_vectors;
 
         const since = self.vector_block_candidate_since_ns.load(.acquire);
-        if (since == 0 or now -| since < vector_block_quiescence_ns) return true;
+        if (!immediate_initial_bootstrap and (since == 0 or now -| since < vector_block_quiescence_ns)) return true;
 
         // A sequence-aligned native generation can be finalized entirely from
         // its immutable blocks and WAL. Keep vector consolidation and posting
@@ -3327,13 +3488,13 @@ pub const IndexManager = struct {
         // quiet source sequence can be an LSM backpressure pause rather than
         // an idle workload, so opportunistic source scans require a completely
         // settled write plane. Explicit lifecycle barriers bypass this gate.
-        if (self.primary_lsm_backend) |backend| {
+        if (!immediate_initial_bootstrap) if (self.primary_lsm_backend) |backend| {
             const primary_stats = backend.snapshotMaintenanceStats();
             if (!primaryWritePlaneSafeForProjection(primary_stats, backend.maintenanceScore())) {
                 self.vector_block_candidate_since_ns.store(now, .release);
                 return true;
             }
-        }
+        };
 
         try self.finalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence);
         const topology_rebuilt = self.maybeRebuildRecursiveTopologyFromVectorBlocks(entry) catch |err| blk: {
@@ -3970,7 +4131,9 @@ pub const IndexManager = struct {
     /// automatic-rebuild allowlist deliberately narrow: an unknown load error
     /// must never become permission to delete or replace an index root.
     pub fn loadFailureRecoveryAction(err_name: []const u8) IndexLoadRecoveryAction {
-        if (std.mem.eql(u8, err_name, "IncompleteBulkPublish")) {
+        if (std.mem.eql(u8, err_name, "IncompleteBulkPublish") or
+            std.mem.eql(u8, err_name, "MissingPostingCheckpoint"))
+        {
             return .rebuild_from_artifacts;
         }
         if (std.mem.eql(u8, err_name, "TableReadChurn")) {
@@ -8353,10 +8516,17 @@ pub const IndexManager = struct {
             };
             handoffs[i].index_name = try self.alloc.dupe(u8, dest_entry.config.name);
             const total_members = split_work.totalRightMembers();
+            var posting_capture_started = try self.beginDensePostingSidecarCaptureByName(dest_entry.config.name);
+            if (!posting_capture_started and self.densePostingSidecarCaptureRequiredByName(dest_entry.config.name))
+                return error.PostingWalCaptureOwnershipConflict;
+            errdefer if (posting_capture_started)
+                self.cancelDensePostingSidecarCaptureByName(dest_entry.config.name);
             var dest_txn = try dest_entry.index.beginWriteTxn();
-            errdefer dest_txn.abort();
+            var dest_txn_open = true;
+            errdefer if (dest_txn_open) dest_txn.abort();
             var store_batch = try dest_store.beginWriteBatch();
-            errdefer store_batch.abort();
+            var store_batch_open = true;
+            errdefer if (store_batch_open) store_batch.abort();
             const store_txn = store_batch.asTxn();
             const Context = struct {
                 alloc: Allocator,
@@ -8442,6 +8612,7 @@ pub const IndexManager = struct {
             const before_finalize = dest_entry.index.getWriteProfile();
             const finalize_started = nowNs();
             try dest_entry.index.finishWriteTxn(&dest_txn);
+            dest_txn_open = false;
             handoffs[i].finalize_ns += elapsedSince(finalize_started);
             const after_finalize = dest_entry.index.getWriteProfile();
             handoffs[i].finalize_quantized_ns += after_finalize.refresh_quantized_ns - before_finalize.refresh_quantized_ns;
@@ -8452,6 +8623,11 @@ pub const IndexManager = struct {
                 try self.setDenseNextIdAtLeastTxn(store_txn, dest_entry.config.name, ctx.max_vector_id + 1);
             }
             try store_batch.commit();
+            store_batch_open = false;
+            if (posting_capture_started) {
+                try self.finishDensePostingSidecarCaptureByName(dest_entry.config.name, dest_store.lastReplaySequence(0));
+                posting_capture_started = false;
+            }
         }
 
         return handoffs;
@@ -8820,17 +8996,67 @@ pub const IndexManager = struct {
             var members = try entry.index.collectSplitMembers(split_key);
             defer members.deinit(self.alloc);
 
+            var delete_ids = std.ArrayListUnmanaged(u64).empty;
+            defer delete_ids.deinit(self.alloc);
+            var delete_metadata = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (delete_metadata.items) |metadata| self.alloc.free(metadata);
+                delete_metadata.deinit(self.alloc);
+            }
+
             for ([_][]const u64{ members.right_only_members, members.mixed_right_members }) |member_ids| {
                 for (member_ids) |member_id| {
                     const metadata = (try entry.index.getMetadata(member_id)) orelse continue;
-                    defer self.alloc.free(metadata);
-
-                    entry.index.delete(member_id) catch |err| switch (err) {
-                        error.NotFound => {},
-                        else => return err,
+                    try delete_ids.append(self.alloc, member_id);
+                    delete_metadata.append(self.alloc, metadata) catch |err| {
+                        _ = delete_ids.pop();
+                        self.alloc.free(metadata);
+                        return err;
                     };
-                    try self.clearDenseVectorMapping(store, entry.config.name, metadata, member_id);
                 }
+            }
+            if (delete_ids.items.len == 0) continue;
+
+            // Remove the primary mappings first. If publication below fails or
+            // the process crashes, the still-visible HBC members retain their
+            // metadata and make the prune retryable. Publishing the HBC delete
+            // first would lose that recovery handle and could strand mappings.
+            // Use one primary batch so a large split does not amplify WAL and
+            // fsync overhead per vector.
+            var cleared_ordinals = std.ArrayListUnmanaged(?doc_identity.DocOrdinal).empty;
+            defer cleared_ordinals.deinit(self.alloc);
+            try cleared_ordinals.ensureTotalCapacity(self.alloc, delete_ids.items.len);
+            {
+                var mapping_batch = try store.beginWriteBatch();
+                errdefer mapping_batch.abort();
+                const mapping_txn = mapping_batch.asTxn();
+                for (delete_ids.items, delete_metadata.items) |member_id, metadata| {
+                    const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, mapping_txn, metadata)) orelse
+                        try self.lookupDenseVectorOrdinalTxn(mapping_txn, entry.config.name, member_id);
+                    try self.clearDenseVectorMappingTxnWithOrdinal(
+                        mapping_txn,
+                        entry.config.name,
+                        metadata,
+                        member_id,
+                        ordinal,
+                    );
+                    cleared_ordinals.appendAssumeCapacity(ordinal);
+                }
+                try mapping_batch.commit();
+            }
+            for (delete_ids.items, cleared_ordinals.items) |member_id, ordinal| {
+                if (ordinal) |doc_ordinal| {
+                    _ = entry.ordinal_vector_ids.remove(doc_ordinal);
+                    _ = entry.vector_ordinals.remove(member_id);
+                }
+            }
+
+            {
+                const capture_started = try self.beginDensePostingSidecarCaptureByName(entry.config.name);
+                if (!capture_started) return error.PostingWalCaptureOwnershipConflict;
+                errdefer self.cancelDensePostingSidecarCaptureByName(entry.config.name);
+                try entry.index.batchDelete(delete_ids.items);
+                try self.finishDensePostingSidecarCaptureByName(entry.config.name, store.lastReplaySequence(0));
             }
         }
     }
@@ -8945,7 +9171,23 @@ pub const IndexManager = struct {
             .float32;
     }
 
+    pub const DensePostingCaptureOptions = struct {
+        /// The caller is applying mutations inside the source session that
+        /// already owns this capture. This is an explicit capability: an
+        /// unrelated enrichment or repair writer must never infer ownership
+        /// merely from observing an open HBC session.
+        borrow_active_source: bool = false,
+    };
+
     pub fn beginDensePostingSidecarCaptureByName(self: *IndexManager, name: []const u8) !bool {
+        return try self.beginDensePostingSidecarCaptureByNameWithOptions(name, .{});
+    }
+
+    pub fn beginDensePostingSidecarCaptureByNameWithOptions(
+        self: *IndexManager,
+        name: []const u8,
+        options: DensePostingCaptureOptions,
+    ) !bool {
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
         // The durable authority marker is sticky. Once an index has moved its
         // query-facing state to segment+WAL, every later process must preserve
@@ -8954,14 +9196,28 @@ pub const IndexManager = struct {
         // silently skip capture and then reject the first derived mutation.
         if (!densePostingSidecarEnabled() and !entry.index.experimentalPostingWalAuthoritative()) return false;
         if (entry.index.experimentalPostingMutationCaptureActive()) {
-            // An already-open streaming session identifies the one supported
-            // nesting case: a replay batch joins its catch-up window's source
-            // capture. A capture without that session belongs to independent
-            // maintenance. Never let a new source window silently borrow it;
-            // maintenance may publish and close the capture before the source
-            // mutation begins.
-            if (entry.index.lsmSessionBatchingActive()) return false;
-            return error.PostingWalCaptureOwnershipConflict;
+            switch (entry.index.experimentalPostingMutationCaptureOwner()) {
+                // An already-open streaming session identifies the one
+                // supported nesting case only when the active transaction is
+                // itself source-owned. Session state alone cannot authorize a
+                // replay batch to borrow maintenance or handoff mutations.
+                .source => if (options.borrow_active_source and entry.index.lsmSessionBatchingActive())
+                    return false
+                else
+                    return error.PostingWalCaptureOwnershipConflict,
+                // The preceding source window has durably closed its HBC
+                // session and is publishing the same capture before its
+                // applied watermark. An empty handoff owns no derived changes
+                // and may be canceled atomically; its later watermark callback
+                // records ordinary coverage. A mutated handoff must publish
+                // before another source transaction can begin.
+                .source_handoff => if (entry.index.experimentalPostingCaptureHasMutations())
+                    return error.ReplayDocumentNotVisible
+                else
+                    entry.index.cancelExperimentalPostingMutationCapture(),
+                .maintenance => return error.PostingWalCaptureOwnershipConflict,
+                .none => return error.ExperimentalPostingCaptureOwnershipInvalid,
+            }
         }
         var capture_exact_vectors = false;
         if (self.vector_block_storage != null) {
@@ -8978,15 +9234,90 @@ pub const IndexManager = struct {
         return true;
     }
 
+    /// Whether mutations for this index must own or join a native posting-WAL
+    /// transaction. Keep this separate from beginDensePostingSidecarCaptureByName:
+    /// that function returns false both when capture is disabled and when a
+    /// replay batch legitimately joins its already-open source session.
+    pub fn densePostingSidecarCaptureRequiredByName(self: *IndexManager, name: []const u8) bool {
+        const entry = self.denseIndex(name) orelse return false;
+        return densePostingSidecarEnabled() or entry.index.experimentalPostingWalAuthoritative();
+    }
+
+    pub fn densePostingCoverageIncludesByName(self: *IndexManager, name: []const u8, sequence: u64) bool {
+        const entry = self.denseIndex(name) orelse return false;
+        const covered = entry.index.experimentalPostingDurableAppliedSequence() orelse return false;
+        return covered >= sequence;
+    }
+
     pub fn cancelDensePostingSidecarCaptureByName(self: *IndexManager, name: []const u8) void {
         const entry = self.denseIndex(name) orelse return;
         entry.index.cancelExperimentalPostingMutationCapture();
     }
 
     pub fn persistDensePostingSidecarByName(self: *IndexManager, name: []const u8, applied_sequence: u64) !void {
+        return try self.persistDensePostingSidecarByNameWithOptions(name, applied_sequence, .{});
+    }
+
+    /// Completes a source capture opened by this caller. Unlike the generic
+    /// idempotent coverage publisher, an already-covered no-op transaction is
+    /// consumed rather than left active for a later source window.
+    pub fn finishDensePostingSidecarCaptureByName(self: *IndexManager, name: []const u8, applied_sequence: u64) !void {
+        return try self.persistDensePostingSidecarByNameWithOptions(name, applied_sequence, .{
+            .consume_owned_source_capture = true,
+        });
+    }
+
+    const DensePostingPersistOptions = struct {
+        consume_owned_source_capture: bool = false,
+    };
+
+    fn persistDensePostingSidecarByNameWithOptions(
+        self: *IndexManager,
+        name: []const u8,
+        applied_sequence: u64,
+        options: DensePostingPersistOptions,
+    ) !void {
         const entry = self.denseIndex(name) orelse return;
         if (!densePostingSidecarEnabled() and !entry.index.experimentalPostingWalAuthoritative()) return;
-        const posting_capture_has_mutations = entry.index.experimentalPostingCaptureHasMutations();
+        if (options.consume_owned_source_capture and
+            entry.index.experimentalPostingMutationCaptureActive())
+        {
+            switch (entry.index.experimentalPostingMutationCaptureOwner()) {
+                .source, .source_handoff => {},
+                .maintenance => return error.PostingWalCaptureOwnershipConflict,
+                .none => return error.ExperimentalPostingCaptureOwnershipInvalid,
+            }
+        }
+        // Status/checkpoint callers can race immediately after the source
+        // transaction published its native watermark. If an equal or newer
+        // boundary is already durable, this request is complete and must not
+        // inspect, consume, or publish a subsequently opened capture owned by
+        // another replay window.
+        const capture_active = entry.index.experimentalPostingMutationCaptureActive();
+        const capture_has_mutations = entry.index.experimentalPostingCaptureHasMutations();
+        if (entry.index.experimentalPostingDurableAppliedSequence()) |covered| {
+            if (covered >= applied_sequence) {
+                // A generic status publisher has no capability for whichever
+                // source transaction is currently open. Its request is
+                // already satisfied even when that newer capture is mutated.
+                if (!options.consume_owned_source_capture) return;
+                // The explicit owner still has to publish a mutated capture;
+                // an empty equal-boundary transaction can be retired without
+                // adding a redundant coverage frame.
+                if (!capture_active) return;
+                if (!capture_has_mutations) {
+                    entry.index.cancelExperimentalPostingMutationCapture();
+                    return;
+                }
+            }
+        }
+        // Below an uncovered boundary, generic callers may append a pure
+        // coverage frame only when no source/maintenance transaction is live.
+        // Never infer authority from the capture's current contents: another
+        // mutation can join it until its owner closes the session.
+        if (capture_active and !options.consume_owned_source_capture)
+            return error.PostingWalCaptureOwnershipConflict;
+        const posting_capture_has_mutations = capture_has_mutations;
         const exact_vector_mutations = try entry.index.takeExperimentalExactVectorMutations();
         defer {
             for (exact_vector_mutations) |*mutation| mutation.deinit(self.alloc);
@@ -9012,6 +9343,15 @@ pub const IndexManager = struct {
                 });
                 break :blk false;
             };
+            if (!vector_mutations_published) {
+                // Fence immediately, while still holding the publication
+                // mutex. Authoritative posting publication can also fail and
+                // return below; deferring this fence until after that call
+                // would leave stale exact vectors available on the double-
+                // failure path.
+                self.vector_block_projection_dirty.store(true, .release);
+                self.clearVectorBlockGeneration();
+            }
             self.vector_block_build_mu.unlock();
         }
         entry.index.persistExperimentalPostingSidecarAtAppliedSequence(applied_sequence, .{}) catch |err| {
@@ -12438,46 +12778,57 @@ pub const IndexManager = struct {
                 index.setExternalVectorBatchDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatch);
                 self.attachVectorBlockResidencyPolicy(&index);
                 if (densePostingSidecarEnabled() or index.experimentalPostingWalAuthoritative()) {
-                    const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpoint(
-                        self.alloc,
-                        self.checkpointIo(),
-                        store,
-                        self.applied_sequence_checkpoint_path,
-                        cfg.name,
-                    );
-                    var posting_sequence = applied_sequence;
+                    var posting_sequence: u64 = 0;
                     if (index.experimentalPostingWalAuthoritative()) {
-                        posting_sequence = index.activateExperimentalPostingReadsAtOrAfter(applied_sequence) catch |err| {
-                            std.log.err("dense posting WAL startup validation failed index={s} applied_sequence={} err={s}", .{
+                        // Native coverage is the dense applied watermark. The
+                        // generic checkpoint is only a compatibility/lifecycle
+                        // mirror and may be corrupt or ahead after a crash; it
+                        // must never veto a healthy authoritative generation.
+                        // Any source journal tail above this sequence is replayed
+                        // normally after the index has opened.
+                        posting_sequence = index.activateExperimentalPostingReadsAtOrAfter(0) catch |err| {
+                            std.log.err("dense posting WAL startup validation failed index={s} err={s}", .{
                                 cfg.name,
-                                applied_sequence,
                                 @errorName(err),
                             });
                             return error.PostingWalMutationStoreRequiresRebuild;
                         };
-                        if (posting_sequence > applied_sequence) {
-                            // The generic applied checkpoint is now a
-                            // compatibility/lifecycle mirror. Authoritative
-                            // HBC coverage normally advances ahead of it.
-                            std.log.info("dense posting WAL recovered authoritative coverage ahead of compatibility mirror index={s} mirror_sequence={} posting_sequence={}", .{
+                        const primary_sequence = store.lastReplaySequence(0);
+                        // A split/restore image may have pruned every replay
+                        // row after transferring its already-covered native
+                        // generation. In that case zero is an unknown source
+                        // frontier, not proof that native coverage is ahead.
+                        if (primary_sequence != 0 and posting_sequence > primary_sequence) {
+                            std.log.err("dense posting WAL coverage is ahead of the authoritative source index={s} posting_sequence={} primary_sequence={}", .{
                                 cfg.name,
-                                applied_sequence,
                                 posting_sequence,
+                                primary_sequence,
                             });
+                            return error.PostingWalMutationStoreRequiresRebuild;
                         }
-                    } else index.activateExperimentalPostingReads(applied_sequence) catch |err| switch (err) {
-                        error.MissingPostingCheckpoint, error.PostingCheckpointSequenceMismatch => {
-                            if (!read_only) index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
-                                std.log.warn("dense posting sidecar startup invalidation failed index={s} err={s}", .{ cfg.name, @errorName(invalidate_err) });
-                            };
-                        },
-                        else => {
-                            std.log.warn("dense posting sidecar startup validation failed index={s} err={s}", .{ cfg.name, @errorName(err) });
-                            if (!read_only) index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
-                                std.log.warn("dense posting sidecar startup invalidation failed index={s} err={s}", .{ cfg.name, @errorName(invalidate_err) });
-                            };
-                        },
-                    };
+                    } else {
+                        const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpoint(
+                            self.alloc,
+                            self.checkpointIo(),
+                            store,
+                            self.applied_sequence_checkpoint_path,
+                            cfg.name,
+                        );
+                        posting_sequence = applied_sequence;
+                        index.activateExperimentalPostingReads(applied_sequence) catch |err| switch (err) {
+                            error.MissingPostingCheckpoint, error.PostingCheckpointSequenceMismatch => {
+                                if (!read_only) index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
+                                    std.log.warn("dense posting sidecar startup invalidation failed index={s} err={s}", .{ cfg.name, @errorName(invalidate_err) });
+                                };
+                            },
+                            else => {
+                                std.log.warn("dense posting sidecar startup validation failed index={s} err={s}", .{ cfg.name, @errorName(err) });
+                                if (!read_only) index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
+                                    std.log.warn("dense posting sidecar startup invalidation failed index={s} err={s}", .{ cfg.name, @errorName(invalidate_err) });
+                                };
+                            },
+                        };
+                    }
                     if (index.experimentalPostingReadsEnabled()) {
                         std.log.info("dense posting sidecar activated index={s} sequence={}", .{ cfg.name, posting_sequence });
                     }
@@ -17806,6 +18157,10 @@ pub const IndexManager = struct {
                     remaining_count += 1;
                     continue;
                 }
+                // This key has been satisfied by the immutable vector block
+                // and is removed from the compacted fallback prefix below.
+                // Release it now; the final defer owns only that prefix.
+                manager.alloc.free(artifact_read.key);
                 const slot = artifact_read.position;
                 const matrix_pos = matrix_positions[slot];
                 const matrix_start = std.math.mul(usize, matrix_pos, dims) catch return error.BufferTooSmall;
@@ -18730,31 +19085,6 @@ pub const IndexManager = struct {
             try mutable_txn.put(ordinal_member_key, &buf);
             try mutable_txn.put(vector_ordinal_map_key, &ordinal_buf);
         }
-    }
-
-    fn clearDenseVectorMapping(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, doc_key: []const u8, vector_id: u64) !void {
-        var batch = try store.beginWriteBatch();
-        errdefer batch.abort();
-        const txn = batch.asTxn();
-        const ordinal = if (self.denseIndex(index_name)) |entry|
-            if (entry.chunk_name == null) try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key) else null
-        else
-            null;
-        try self.clearDenseVectorMappingTxn(txn, index_name, doc_key, vector_id);
-        try batch.commit();
-        if (ordinal) |doc_ordinal| {
-            if (self.denseIndex(index_name)) |entry| {
-                _ = entry.ordinal_vector_ids.remove(doc_ordinal);
-                _ = entry.vector_ordinals.remove(vector_id);
-            }
-        }
-    }
-
-    fn clearDenseVectorMappingTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8, vector_id: u64) !void {
-        const mutable_txn = txn;
-        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, mutable_txn, doc_key)) orelse
-            try self.lookupDenseVectorOrdinalTxn(mutable_txn, index_name, vector_id);
-        try self.clearDenseVectorMappingTxnWithOrdinal(mutable_txn, index_name, doc_key, vector_id, ordinal);
     }
 
     fn clearDenseVectorMappingTxnWithOrdinal(
@@ -25870,10 +26200,14 @@ test "configured index loading only parallelizes read-only construction" {
     );
 }
 
-test "index load recovery classification only auto rebuilds incomplete publication" {
+test "index load recovery classification only auto rebuilds missing publication" {
     try std.testing.expectEqual(
         IndexManager.IndexLoadRecoveryAction.rebuild_from_artifacts,
         IndexManager.loadFailureRecoveryAction("IncompleteBulkPublish"),
+    );
+    try std.testing.expectEqual(
+        IndexManager.IndexLoadRecoveryAction.rebuild_from_artifacts,
+        IndexManager.loadFailureRecoveryAction("MissingPostingCheckpoint"),
     );
     try std.testing.expectEqual(
         IndexManager.IndexLoadRecoveryAction.retry_open,
@@ -29904,10 +30238,55 @@ test "authoritative posting capture starts inside an existing replay session" {
 
     try std.testing.expect(try manager.beginDensePostingSidecarCaptureByName("dv_v1"));
     try std.testing.expect(entry.index.experimentalPostingMutationCaptureActive());
-    try std.testing.expect(!try manager.beginDensePostingSidecarCaptureByName("dv_v1"));
-    manager.cancelDensePostingSidecarCaptureByName("dv_v1");
-    manager.abortDenseStreamingReplaySessionByName("dv_v1");
+    // An idempotent catalog/status publication for the already-covered
+    // boundary must not consume or reject the next empty source window.
+    try manager.persistDensePostingSidecarByName("dv_v1", 0);
+    try std.testing.expect(entry.index.experimentalPostingMutationCaptureActive());
+    try std.testing.expectError(
+        error.PostingWalCaptureOwnershipConflict,
+        manager.beginDensePostingSidecarCaptureByName("dv_v1"),
+    );
+    try std.testing.expect(!try manager.beginDensePostingSidecarCaptureByNameWithOptions(
+        "dv_v1",
+        .{ .borrow_active_source = true },
+    ));
+    try manager.finishDenseStreamingReplaySessionByNameWithOptions("dv_v1", .{});
     session_open = false;
+    try std.testing.expectEqual(
+        hbc_mod.ExperimentalPostingCaptureOwner.source_handoff,
+        entry.index.experimentalPostingMutationCaptureOwner(),
+    );
+    // The completed session captured no mutation, so its owner can retire the
+    // coverage-only handoff without adding another WAL generation.
+    try manager.finishDensePostingSidecarCaptureByName("dv_v1", 0);
+    try std.testing.expect(!entry.index.experimentalPostingMutationCaptureActive());
+
+    // Seed a real member outside the transaction under test, then delete it
+    // through that transaction so the capture is observably mutated.
+    var captured_vector = [_]f32{ 1, 0 };
+    try entry.index.insertVectorForTest(42, &captured_vector);
+    try manager.beginDenseStreamingReplaySessionByName("dv_v1");
+    session_open = true;
+    try std.testing.expect(try manager.beginDensePostingSidecarCaptureByName("dv_v1"));
+    try std.testing.expectEqual(
+        hbc_mod.ExperimentalPostingCaptureOwner.source,
+        entry.index.experimentalPostingMutationCaptureOwner(),
+    );
+    // A generic status callback for an already-covered boundary must not
+    // publish a newer mutated source transaction. Only the source owner may
+    // consume this capture after its streaming session becomes durable.
+    try entry.index.batchDelete(&.{42});
+    try std.testing.expect(entry.index.experimentalPostingCaptureHasMutations());
+    try manager.persistDensePostingSidecarByName("dv_v1", 0);
+    try std.testing.expect(entry.index.experimentalPostingMutationCaptureActive());
+    try manager.finishDenseStreamingReplaySessionByNameWithOptions("dv_v1", .{});
+    session_open = false;
+    try std.testing.expectError(
+        error.ReplayDocumentNotVisible,
+        manager.beginDensePostingSidecarCaptureByName("dv_v1"),
+    );
+    try manager.finishDensePostingSidecarCaptureByName("dv_v1", 0);
+    try std.testing.expect(!entry.index.experimentalPostingMutationCaptureActive());
 }
 
 test "stable native finalization certifies an empty dense index" {

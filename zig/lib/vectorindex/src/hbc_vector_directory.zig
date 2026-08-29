@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const checked_region = @import("checked_region.zig");
 
 const magic: [4]u8 = "AFVD".*;
 const version: u16 = 1;
@@ -102,12 +103,18 @@ pub const Reader = struct {
         if (!std.mem.eql(u8, footer[footer_size - 4 ..], &magic)) return error.CorruptedVectorDirectory;
         if (readU16(footer[20..22]) != version or readU16(footer[22..24]) != 0) return error.UnsupportedVectorDirectoryVersion;
         if (readU32(footer[24..28]) != std.hash.Crc32.hash(footer[0..24])) return error.VectorDirectoryChecksumMismatch;
-        const index_offset = std.math.cast(usize, readU64(footer[0..8])) orelse return error.CorruptedVectorDirectory;
-        const count = std.math.cast(usize, readU64(footer[8..16])) orelse return error.CorruptedVectorDirectory;
-        const index_len = std.math.mul(usize, count, index_entry_size) catch return error.CorruptedVectorDirectory;
-        if (index_offset < header_size or index_offset + index_len != data.len - footer_size) return error.CorruptedVectorDirectory;
-        if (readU32(footer[16..20]) != std.hash.Crc32.hash(data[index_offset .. index_offset + index_len])) return error.VectorDirectoryChecksumMismatch;
-        const reader: Reader = .{ .data = data, .index_offset = index_offset, .count = count };
+        const count_raw = readU64(footer[8..16]);
+        const index_region = checked_region.exactTail(
+            data.len,
+            footer_size,
+            header_size,
+            readU64(footer[0..8]),
+            count_raw,
+            index_entry_size,
+        ) catch return error.CorruptedVectorDirectory;
+        const count = std.math.cast(usize, count_raw) orelse return error.CorruptedVectorDirectory;
+        if (readU32(footer[16..20]) != std.hash.Crc32.hash(index_region.slice(data))) return error.VectorDirectoryChecksumMismatch;
+        const reader: Reader = .{ .data = data, .index_offset = index_region.offset, .count = count };
         try reader.validate();
         return reader;
     }
@@ -257,4 +264,19 @@ test "HBC vector directory verifies values lazily" {
     const reader = try Reader.init(bytes);
     try std.testing.expectEqualStrings("doc:7", (try reader.get(.metadata, 7)).?);
     try std.testing.expectError(error.VectorDirectoryChecksumMismatch, reader.get(.leaf, 7));
+}
+
+test "HBC vector directory rejects wrapped index regions before slicing" {
+    const alloc = std.testing.allocator;
+    var writer = try Writer.init(alloc);
+    defer writer.deinit();
+    try writer.append(.leaf, 7, "leaf-7");
+    const bytes = try writer.build();
+    defer alloc.free(bytes);
+
+    const footer = bytes[bytes.len - footer_size ..];
+    std.mem.writeInt(u64, footer[0..8], std.math.maxInt(u64) - 7, .big);
+    std.mem.writeInt(u64, footer[8..16], 1, .big);
+    std.mem.writeInt(u32, footer[24..28], std.hash.Crc32.hash(footer[0..24]), .big);
+    try std.testing.expectError(error.CorruptedVectorDirectory, Reader.init(bytes));
 }

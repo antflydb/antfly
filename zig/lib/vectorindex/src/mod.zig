@@ -23,6 +23,7 @@ pub const search = @import("search.zig");
 pub const search_runtime = @import("search_runtime.zig");
 pub const store = @import("store.zig");
 pub const posting = @import("posting.zig");
+pub const checked_region = @import("checked_region.zig");
 pub const posting_segment = @import("posting_segment.zig");
 pub const centroid_directory = @import("centroid_directory.zig");
 pub const quantized_directory = @import("quantized_directory.zig");

@@ -24,6 +24,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posting = @import("posting.zig");
+const checked_region = @import("checked_region.zig");
 
 pub const PostingId = posting.PostingId;
 
@@ -341,17 +342,20 @@ pub const Reader = struct {
         if (segment_version < min_supported_version or segment_version > version) return error.UnsupportedPostingSegmentVersion;
         if (readU16(footer[22..24]) != 0) return error.UnsupportedPostingSegmentFlags;
         if (readU32(footer[24..28]) != std.hash.Crc32.hash(footer[0..24])) return error.PostingSegmentChecksumMismatch;
-        const index_offset_u64 = readU64(footer[0..8]);
         const entry_count_u64 = readU64(footer[8..16]);
-        const index_offset = std.math.cast(usize, index_offset_u64) orelse return error.CorruptedPostingSegment;
         const entry_count = std.math.cast(usize, entry_count_u64) orelse return error.CorruptedPostingSegment;
-        const index_bytes = std.math.mul(usize, entry_count, index_entry_size) catch return error.CorruptedPostingSegment;
-        const index_end = std.math.add(usize, index_offset, index_bytes) catch return error.CorruptedPostingSegment;
-        if (index_offset > data.len - footer_size or index_end != data.len - footer_size) return error.CorruptedPostingSegment;
-        if (readU32(footer[16..20]) != std.hash.Crc32.hash(data[index_offset..index_end])) return error.PostingSegmentChecksumMismatch;
+        const index_region = checked_region.exactTail(
+            data.len,
+            footer_size,
+            0,
+            readU64(footer[0..8]),
+            entry_count_u64,
+            index_entry_size,
+        ) catch return error.CorruptedPostingSegment;
+        if (readU32(footer[16..20]) != std.hash.Crc32.hash(index_region.slice(data))) return error.PostingSegmentChecksumMismatch;
         const reader: Reader = .{
             .data = data,
-            .index_offset = index_offset,
+            .index_offset = index_region.offset,
             .entry_count = entry_count,
         };
         try reader.validateIndex();

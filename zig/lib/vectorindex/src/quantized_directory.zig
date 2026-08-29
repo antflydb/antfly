@@ -102,12 +102,15 @@ pub const Writer = struct {
         const width = std.math.cast(usize, set.codes.width) orelse return error.InvalidQuantizedDirectoryEntry;
         const encoded_count = std.math.cast(i64, count) orelse return error.InvalidQuantizedDirectoryEntry;
         const code_values = std.math.mul(usize, count, width) catch return error.InvalidQuantizedDirectoryEntry;
+        const scalar_bytes = std.math.mul(usize, count, @sizeOf(f32)) catch return error.InvalidQuantizedDirectoryEntry;
+        const omitted_l2_centroid_dots = self.metric == 0 and set.centroid_dot_products.len == 0;
         if (count == 0 or width == 0 or
             set.codes.count != encoded_count or
             set.codes.data.len != code_values or
+            set.code_counts.len != count or
             set.centroid_distances.len != count or
             set.quantized_dot_products.len != count or
-            set.centroid_dot_products.len != count)
+            (set.centroid_dot_products.len != count and !omitted_l2_centroid_dots))
         {
             return error.InvalidQuantizedDirectoryEntry;
         }
@@ -132,7 +135,10 @@ pub const Writer = struct {
         try self.out.appendSlice(self.alloc, std.mem.sliceAsBytes(set.code_counts));
         try self.out.appendSlice(self.alloc, std.mem.sliceAsBytes(set.centroid_distances));
         try self.out.appendSlice(self.alloc, std.mem.sliceAsBytes(set.quantized_dot_products));
-        try self.out.appendSlice(self.alloc, std.mem.sliceAsBytes(set.centroid_dot_products));
+        if (omitted_l2_centroid_dots)
+            try appendZeros(self.alloc, &self.out, scalar_bytes)
+        else
+            try self.out.appendSlice(self.alloc, std.mem.sliceAsBytes(set.centroid_dot_products));
     }
 
     pub fn build(self: *Writer) ![]u8 {
@@ -386,6 +392,28 @@ test "quantized directory round trips borrowed aligned views" {
     try std.testing.expectEqual(first.centroid_norm, view.centroid_norm);
     const borrowed = view.asProto();
     try std.testing.expectEqualSlices(u64, first.codes.data, borrowed.codes.data);
+}
+
+test "quantized directory canonicalizes omitted l2 centroid dots" {
+    const alloc = std.testing.allocator;
+    var writer = try Writer.init(alloc, 2, 0);
+    defer writer.deinit();
+    const set = proto.RaBitQuantizedVectorSet{
+        .metric = .l2_squared,
+        .centroid = @constCast(&[_]f32{ 1, 2 }),
+        .codes = .{ .count = 2, .width = 1, .data = @constCast(&[_]u64{ 7, 9 }) },
+        .code_counts = @constCast(&[_]u32{ 2, 3 }),
+        .centroid_distances = @constCast(&[_]f32{ 0.25, 0.5 }),
+        .quantized_dot_products = @constCast(&[_]f32{ 1.25, 1.5 }),
+        .centroid_dot_products = @constCast(&[_]f32{}),
+        .centroid_norm = 3.5,
+    };
+    try writer.append(7, &set);
+    const encoded = try writer.build();
+    defer alloc.free(encoded);
+    const reader = try Reader.init(encoded);
+    const view = (try reader.get(7)).?;
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0 }, view.centroid_dot_products);
 }
 
 test "quantized directory rejects truncation" {

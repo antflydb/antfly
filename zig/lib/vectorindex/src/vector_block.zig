@@ -18,6 +18,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const checked_region = @import("checked_region.zig");
 
 const magic: [8]u8 = .{ 'A', 'F', 'V', 'B', 'L', 'K', 0, 0 };
 const legacy_version: u16 = 1;
@@ -457,14 +458,20 @@ pub const Reader = struct {
         if (readU64(footer[24..32]) != generation) return error.CorruptedVectorBlock;
         if (readU32(footer[40..44]) != shard_id or readU32(footer[44..48]) != shard_count) return error.CorruptedVectorBlock;
         if (readU64(footer[16..24]) != covered_source_sequence) return error.CorruptedVectorBlock;
-        const index_offset = std.math.cast(usize, readU64(footer[0..8])) orelse return error.CorruptedVectorBlock;
-        const count = std.math.cast(usize, readU64(footer[8..16])) orelse return error.CorruptedVectorBlock;
-        const index_len = std.math.mul(usize, count, entry_size) catch return error.CorruptedVectorBlock;
-        if (index_offset < header_size or index_offset + index_len != data.len - footer_size) return error.CorruptedVectorBlock;
-        if (readU32(footer[32..36]) != std.hash.Crc32.hash(data[index_offset..][0..index_len])) return error.VectorBlockIndexChecksumMismatch;
+        const count_raw = readU64(footer[8..16]);
+        const index_region = checked_region.exactTail(
+            data.len,
+            footer_size,
+            header_size,
+            readU64(footer[0..8]),
+            count_raw,
+            entry_size,
+        ) catch return error.CorruptedVectorBlock;
+        const count = std.math.cast(usize, count_raw) orelse return error.CorruptedVectorBlock;
+        if (readU32(footer[32..36]) != std.hash.Crc32.hash(index_region.slice(data))) return error.VectorBlockIndexChecksumMismatch;
         const reader: Reader = .{
             .data = data,
-            .index_offset = index_offset,
+            .index_offset = index_region.offset,
             .count = count,
             .generation = generation,
             .shard_id = shard_id,
@@ -725,6 +732,21 @@ test "vector block preserves generation revisions and tombstones" {
     try std.testing.expectEqual(@as(u64, 3), (try reader.get("artifact-a", 30, null)).tombstone.revision);
     try std.testing.expectError(error.VectorBlockRevisionMismatch, reader.get("artifact-a", 25, 1));
     try std.testing.expect((try reader.get("missing", 30, null)) == .missing);
+}
+
+test "vector block rejects wrapped index regions before slicing" {
+    const alloc = std.testing.allocator;
+    var writer = try Writer.init(alloc, 1, 0, 1, 1);
+    defer writer.deinit();
+    try writer.appendVector("artifact", 1, 1, &.{1});
+    const encoded = try writer.build();
+    defer alloc.free(encoded);
+
+    const footer = encoded[encoded.len - footer_size ..];
+    writeU64(footer[0..8], std.math.maxInt(u64) - 31);
+    writeU64(footer[8..16], 1);
+    writeU32(footer[48..52], std.hash.Crc32.hash(footer[0..48]));
+    try std.testing.expectError(error.CorruptedVectorBlock, Reader.init(encoded));
 }
 
 test "vector block float16 projection round trips through explicit encoding" {

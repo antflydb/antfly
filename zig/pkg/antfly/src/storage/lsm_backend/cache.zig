@@ -349,9 +349,17 @@ pub const Cache = struct {
     fn reclaimForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
         const self: *Cache = @ptrCast(@alignCast(context));
         if (target_bytes == 0) return 0;
+        // Reclaim runs on another owner's admission path. It must never wait
+        // behind cache accounting: that owner may already hold a shard lock
+        // while publishing a release, and a blocking inverse acquisition
+        // would turn optional cache retention into process-wide backpressure.
+        // A busy cache simply declines this pass; the requester can use its
+        // bounded transient path or a later background reclaim pass.
+        if (!self.resource_accounting_mutex.tryLock()) return 0;
+        defer self.resource_accounting_mutex.unlock();
         const before = self.currentBytes();
         while (before -| self.currentBytes() < target_bytes) {
-            if (!self.evictOne()) break;
+            if (!self.tryEvictOneAccountingLocked()) break;
         }
         return @intCast(before -| self.currentBytes());
     }
@@ -894,6 +902,13 @@ pub const Cache = struct {
         if (bytes == 0) return;
         const locked = lockAtomic(&self.resource_accounting_mutex);
         defer if (locked) self.resource_accounting_mutex.unlock();
+        self.releaseResourceBytesAccountingLocked(bytes);
+    }
+
+    // Caller owns resource_accounting_mutex. Keeping the ResourceManager
+    // reconciliation in one helper makes both normal eviction and the
+    // strictly non-blocking reclaim path exactly-once accounting owners.
+    fn releaseResourceBytesAccountingLocked(self: *Cache, bytes: usize) void {
         const manager = self.resource_manager orelse return;
         const amount: u64 = @intCast(bytes);
         if (amount > self.resource_accounted_bytes) {

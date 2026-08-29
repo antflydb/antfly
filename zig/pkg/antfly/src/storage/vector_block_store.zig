@@ -143,9 +143,91 @@ pub const BaseBuildStats = struct {
     block_bytes: u64 = 0,
 };
 
+/// Durable but unpublished result of one snapshot-bound base build. Immutable
+/// blocks may be staged without excluding writers; the caller later rotates
+/// the WAL and publishes CURRENT under the short table-level mutation lock.
+pub const StagedBaseBuild = struct {
+    alloc: Allocator,
+    storage: lsm_backend.Storage,
+    root_dir: []u8,
+    generation: u64,
+    covered_source_sequence: u64,
+    staged: []StagedBlock,
+    coverages: []vector_manifest.Coverage,
+    stats: BaseBuildStats,
+    cleanup_staged: bool = true,
+
+    /// Transfers ownership of the durable blocks to CURRENT. This is also
+    /// used after an ambiguous CURRENT result: recovery, not the caller, must
+    /// decide whether those files became authoritative.
+    pub fn disarmCleanup(self: *StagedBaseBuild) void {
+        self.cleanup_staged = false;
+    }
+
+    pub fn deinit(self: *StagedBaseBuild) void {
+        if (self.cleanup_staged) discardStagedBlocksAt(
+            self.storage,
+            self.root_dir,
+            self.staged,
+        );
+        self.alloc.free(self.root_dir);
+        self.alloc.free(self.staged);
+        self.alloc.free(self.coverages);
+        self.* = undefined;
+    }
+};
+
+fn discardStagedBlocksAt(
+    storage: lsm_backend.Storage,
+    root_dir: []const u8,
+    staged: []const StagedBlock,
+) void {
+    for (staged) |receipt| {
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const separator = if (std.mem.endsWith(u8, root_dir, std.fs.path.sep_str)) "" else std.fs.path.sep_str;
+        const path = std.fmt.bufPrint(&path_buffer, "{s}{s}block-{d}-{d}.afvb", .{
+            root_dir,
+            separator,
+            receipt.generation,
+            receipt.shard_id,
+        }) catch continue;
+        storage.deleteFileAbsolute(path) catch {};
+    }
+}
+
 pub const TopologyEpoch = struct {
     base_generation: u64,
     wal_mutation_sequence: u64,
+};
+
+pub const BaseWalDisposition = union(enum) {
+    /// The staged base establishes a generation with no retained WAL prefix.
+    no_tail,
+    /// The staged snapshot contains this exact committed prefix; preserve any
+    /// later complete batches as the new WAL tail.
+    flatten_prefix: WalPrefixBoundary,
+    /// A restore installed a complete authoritative source snapshot whose
+    /// replay sequence belongs to a new epoch. Drop the imported old-epoch WAL
+    /// instead of comparing incomparable sequence numbers.
+    reset_source_epoch,
+};
+
+pub const WalPrefixBoundary = struct {
+    generation: u64,
+    committed_bytes: u64,
+    covered_source_sequence: u64,
+};
+
+const RecoveredWal = struct {
+    alloc: Allocator,
+    bytes: []u8,
+    replay: vector_wal.Replay,
+
+    fn deinit(self: *RecoveredWal) void {
+        self.replay.deinit();
+        self.alloc.free(self.bytes);
+        self.* = undefined;
+    }
 };
 
 pub const Store = struct {
@@ -208,6 +290,14 @@ pub const Store = struct {
 
     pub fn nextBatchId(self: *const Store) !u64 {
         return std.math.add(u64, self.last_committed_batch orelse 0, 1) catch error.VectorWalBatchOverflow;
+    }
+
+    pub fn walPrefixBoundary(self: *const Store) WalPrefixBoundary {
+        return .{
+            .generation = self.wal_generation,
+            .committed_bytes = self.wal_committed_bytes,
+            .covered_source_sequence = self.covered_source_sequence,
+        };
     }
 
     /// Changes only when exact-vector content changes. Coverage-only WAL
@@ -339,6 +429,13 @@ pub const Store = struct {
         };
     }
 
+    /// Removes an unpublished build reservation. Staged block names are never
+    /// referenced by CURRENT until publication, so cleanup is safe even while
+    /// readers retain the preceding generation.
+    pub fn discardStagedBlocks(self: *const Store, staged: []const StagedBlock) void {
+        discardStagedBlocksAt(self.storage, self.root_dir, staged);
+    }
+
     pub fn publishStagedGeneration(
         self: *Store,
         generation: u64,
@@ -352,6 +449,8 @@ pub const Store = struct {
             staged,
             if (replace_base) .replace_base else .append_delta,
             null,
+            null,
+            false,
         );
     }
 
@@ -368,7 +467,61 @@ pub const Store = struct {
             staged,
             .replace_base,
             coverages,
+            null,
+            false,
         );
+    }
+
+    /// Replaces the immutable base built at `covered_source_sequence` while
+    /// carrying every batch committed after `flattened` into the new WAL.
+    /// The boundary is a byte offset after a complete commit frame, so batches
+    /// sharing a source sequence are never filtered or lost.
+    pub fn publishStagedBasePreservingWalTail(
+        self: *Store,
+        generation: u64,
+        covered_source_sequence: u64,
+        staged: []const StagedBlock,
+        coverages: []const vector_manifest.Coverage,
+        flattened: WalPrefixBoundary,
+    ) !void {
+        return try self.publishStagedGenerationMode(
+            generation,
+            covered_source_sequence,
+            staged,
+            .replace_base,
+            coverages,
+            flattened,
+            false,
+        );
+    }
+
+    /// Publishes an owned staged snapshot and transfers its durable blocks to
+    /// CURRENT. Before the CURRENT commit point, errors leave cleanup armed;
+    /// after an ambiguous commit result the poisoned Store disarms cleanup so
+    /// recovery can safely determine which generation won.
+    pub fn publishStagedBaseBuild(
+        self: *Store,
+        build: *StagedBaseBuild,
+        wal_disposition: BaseWalDisposition,
+    ) !void {
+        const poisoned_before = self.poisoned;
+        const flattened_wal: ?WalPrefixBoundary = switch (wal_disposition) {
+            .no_tail, .reset_source_epoch => null,
+            .flatten_prefix => |boundary| boundary,
+        };
+        self.publishStagedGenerationMode(
+            build.generation,
+            build.covered_source_sequence,
+            build.staged,
+            .replace_base,
+            build.coverages,
+            flattened_wal,
+            wal_disposition == .reset_source_epoch,
+        ) catch |err| {
+            if (!poisoned_before and self.poisoned) build.disarmCleanup();
+            return err;
+        };
+        build.disarmCleanup();
     }
 
     const PublicationMode = enum { replace_base, append_delta, replace_deltas };
@@ -389,6 +542,8 @@ pub const Store = struct {
             staged,
             .replace_deltas,
             null,
+            null,
+            false,
         );
     }
 
@@ -399,6 +554,8 @@ pub const Store = struct {
         staged: []const StagedBlock,
         mode: PublicationMode,
         replacement_coverages: ?[]const vector_manifest.Coverage,
+        flattened_wal: ?WalPrefixBoundary,
+        reset_source_epoch: bool,
     ) !void {
         if (self.poisoned) return error.VectorBlockStoreRequiresReopen;
         if (staged.len == 0) return error.EmptyVectorBlockGeneration;
@@ -407,8 +564,22 @@ pub const Store = struct {
         // WAL contains mutations, publication must stay at its exact covered
         // boundary or it could silently drop a committed update.
         const replace_base = mode == .replace_base;
-        const authoritative_replacement = replace_base and !self.wal_has_mutations;
+        if (reset_source_epoch and (!replace_base or flattened_wal != null))
+            return error.InvalidVectorBlockPublicationBoundary;
+        if (flattened_wal != null and !replace_base) return error.InvalidVectorBlockPublicationBoundary;
+        const authoritative_replacement = replace_base and
+            (!self.wal_has_mutations or flattened_wal != null or reset_source_epoch);
         if (!authoritative_replacement and covered_source_sequence != self.covered_source_sequence) return error.InvalidVectorBlockPublicationBoundary;
+        if (flattened_wal) |boundary| {
+            if (boundary.generation != self.wal_generation or
+                boundary.covered_source_sequence > covered_source_sequence or
+                boundary.committed_bytes > self.wal_committed_bytes or
+                (covered_source_sequence > self.covered_source_sequence and
+                    boundary.committed_bytes != self.wal_committed_bytes))
+            {
+                return error.InvalidVectorBlockPublicationBoundary;
+            }
+        }
         const shard_count = staged[0].shard_count;
         if (replace_base and staged.len != shard_count) return error.IncompleteVectorBlockBase;
         if (!replace_base and self.manifest == null) return error.MissingVectorBlockManifest;
@@ -453,13 +624,51 @@ pub const Store = struct {
             self.manifest_coverages;
         const next_coverages = try self.alloc.dupe(vector_manifest.Coverage, coverage_source);
         errdefer self.alloc.free(next_coverages);
+        var recovered_wal: ?RecoveredWal = null;
+        defer if (recovered_wal) |*wal| wal.deinit();
+        var next_wal_bytes: []const u8 = &.{};
+        var next_wal_last_batch: ?u64 = null;
+        var next_wal_has_mutations = false;
+        var next_wal_latest_mutation_sequence: u64 = 0;
+        var next_covered_source_sequence = covered_source_sequence;
+        if (flattened_wal) |boundary| {
+            recovered_wal = try self.recoverWal();
+            const recovered = &recovered_wal.?;
+            if (@as(u64, @intCast(recovered.replay.committed_bytes)) != self.wal_committed_bytes) {
+                return error.InvalidVectorBlockPublicationBoundary;
+            }
+            const prefix_len = std.math.cast(usize, boundary.committed_bytes) orelse return error.InvalidVectorBlockPublicationBoundary;
+            var prefix = try vector_wal.Replay.parse(self.alloc, recovered.bytes[0..prefix_len]);
+            defer prefix.deinit();
+            if (prefix.committed_bytes != prefix_len or
+                (prefix_len != 0 and prefix.covered_source_sequence != boundary.covered_source_sequence))
+            {
+                return error.InvalidVectorBlockPublicationBoundary;
+            }
+            next_wal_bytes = recovered.bytes[prefix_len..recovered.replay.committed_bytes];
+            if (next_wal_bytes.len != 0) {
+                var tail = try vector_wal.Replay.parse(self.alloc, next_wal_bytes);
+                defer tail.deinit();
+                if (tail.committed_bytes != next_wal_bytes.len) return error.InvalidVectorBlockPublicationBoundary;
+                for (tail.records.items) |record| {
+                    if (record.kind != .coverage and record.source_sequence <= covered_source_sequence)
+                        return error.VectorWalOverlapsCheckpoint;
+                    if (record.kind == .upsert or record.kind == .tombstone) {
+                        next_wal_has_mutations = true;
+                        next_wal_latest_mutation_sequence = @max(next_wal_latest_mutation_sequence, record.source_sequence);
+                    }
+                }
+                next_wal_last_batch = tail.last_committed_batch;
+                next_covered_source_sequence = @max(covered_source_sequence, tail.covered_source_sequence);
+            }
+        }
         const next_wal_generation = std.math.add(u64, self.wal_generation, 1) catch return error.VectorWalGenerationOverflow;
         const next_manifest: vector_manifest.Manifest = .{
             .base_generation = if (replace_base) generation else self.manifest.?.base_generation,
             .latest_generation = generation,
             .wal_generation = next_wal_generation,
-            .wal_committed_bytes = 0,
-            .covered_source_sequence = covered_source_sequence,
+            .wal_committed_bytes = @intCast(next_wal_bytes.len),
+            .covered_source_sequence = next_covered_source_sequence,
             .shard_count = shard_count,
             .segments = next_segments,
             .coverages = next_coverages,
@@ -475,7 +684,7 @@ pub const Store = struct {
         // already the crash-recovery authority and invite an unsafe retry.
         const previous_wal_path = try self.walPathAlloc(self.wal_generation);
         defer self.alloc.free(previous_wal_path);
-        try atomicReplace(self.alloc, self.storage, next_wal_path, &.{});
+        try atomicReplace(self.alloc, self.storage, next_wal_path, next_wal_bytes);
         const current_path = try self.currentPathAlloc();
         defer self.alloc.free(current_path);
         generation_publication.publishControlFile(self.alloc, self.storage, current_path, encoded) catch |err| {
@@ -506,11 +715,11 @@ pub const Store = struct {
         self.manifest.?.segments = self.manifest_segments;
         self.manifest.?.coverages = self.manifest_coverages;
         self.wal_generation = next_wal_generation;
-        self.wal_committed_bytes = 0;
-        self.wal_has_mutations = false;
-        self.wal_latest_mutation_sequence = 0;
-        self.last_committed_batch = null;
-        self.covered_source_sequence = covered_source_sequence;
+        self.wal_committed_bytes = @intCast(next_wal_bytes.len);
+        self.wal_has_mutations = next_wal_has_mutations;
+        self.wal_latest_mutation_sequence = next_wal_latest_mutation_sequence;
+        self.last_committed_batch = next_wal_last_batch;
+        self.covered_source_sequence = next_covered_source_sequence;
         self.segment_covered_source_sequence = covered_source_sequence;
         self.storage.deleteFileAbsolute(previous_wal_path) catch {};
     }
@@ -548,6 +757,26 @@ pub const Store = struct {
         covered_source_sequence: u64,
         options: BaseBuildOptions,
     ) !BaseBuildStats {
+        var build = try self.stageBaseFromArtifactsTxn(
+            doc_store,
+            txn,
+            generation,
+            covered_source_sequence,
+            options,
+        );
+        defer build.deinit();
+        try self.publishStagedBaseBuild(&build, .no_tail);
+        return build.stats;
+    }
+
+    pub fn stageBaseFromArtifactsTxn(
+        self: *Store,
+        doc_store: anytype,
+        txn: anytype,
+        generation: u64,
+        covered_source_sequence: u64,
+        options: BaseBuildOptions,
+    ) !StagedBaseBuild {
         if (builtin.target.cpu.arch.endian() != .little) return error.UnsupportedVectorBlockBuildEndian;
         if (options.shard_count == 0 or options.shard_count > vector_manifest.max_shards or
             !std.math.isPowerOfTwo(options.shard_count) or options.spool_buffer_bytes == 0)
@@ -560,7 +789,7 @@ pub const Store = struct {
             previous_scope = scope_hash;
         }
         const coverages = try self.alloc.alloc(vector_manifest.Coverage, options.artifact_scope_hashes.len);
-        defer self.alloc.free(coverages);
+        errdefer self.alloc.free(coverages);
         for (coverages, options.artifact_scope_hashes) |*coverage, scope_hash| coverage.* = .{
             .scope_hash = scope_hash,
             .vector_count = 0,
@@ -703,7 +932,9 @@ pub const Store = struct {
         }
 
         const staged = try self.alloc.alloc(StagedBlock, options.shard_count);
-        defer self.alloc.free(staged);
+        errdefer self.alloc.free(staged);
+        var staged_count: usize = 0;
+        errdefer self.discardStagedBlocks(staged[0..staged_count]);
         for (0..options.shard_count) |shard| {
             const spool = try self.storage.readFileAlloc(self.alloc, spool_paths[shard], boundedReadLimit(max_block_bytes));
             defer self.alloc.free(spool);
@@ -733,9 +964,20 @@ pub const Store = struct {
             defer self.alloc.free(block);
             stats.block_bytes += block.len;
             staged[shard] = try self.stageBlock(generation, covered_source_sequence, @intCast(shard), block);
+            staged_count += 1;
         }
-        try self.publishStagedBaseWithCoverage(generation, covered_source_sequence, staged, coverages);
-        return stats;
+        const build_root = try self.alloc.dupe(u8, self.root_dir);
+        errdefer self.alloc.free(build_root);
+        return .{
+            .alloc = self.alloc,
+            .storage = self.storage,
+            .root_dir = build_root,
+            .generation = generation,
+            .covered_source_sequence = covered_source_sequence,
+            .staged = staged,
+            .coverages = coverages,
+            .stats = stats,
+        };
     }
 
     fn currentPathAlloc(self: *const Store) ![]u8 {
@@ -752,6 +994,17 @@ pub const Store = struct {
         const name = try std.fmt.allocPrint(self.alloc, "block-{d}-{d}.afvb", .{ generation, shard_id });
         defer self.alloc.free(name);
         return try std.fs.path.join(self.alloc, &.{ self.root_dir, name });
+    }
+
+    fn recoverWal(self: *const Store) !RecoveredWal {
+        const path = try self.walPathAlloc(self.wal_generation);
+        defer self.alloc.free(path);
+        const bytes = try self.storage.readFileAlloc(self.alloc, path, max_wal_bytes + 1);
+        errdefer self.alloc.free(bytes);
+        var replay = try vector_wal.Replay.parse(self.alloc, bytes);
+        errdefer replay.deinit();
+        if (replay.committed_bytes != bytes.len) return error.InvalidVectorBlockPublicationBoundary;
+        return .{ .alloc = self.alloc, .bytes = bytes, .replay = replay };
     }
 };
 
@@ -1593,6 +1846,150 @@ test "vector block store publishes base and replays committed WAL" {
     }
 }
 
+test "vector block store publishes snapshot base with committed WAL suffix" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const root = "/vector-block-snapshot-wal-suffix";
+    var store = try Store.open(alloc, memory.storage(), root);
+    defer store.deinit();
+
+    var initial_writer = try vector_block.Writer.init(alloc, 1, 0, 1, 0);
+    defer initial_writer.deinit();
+    try initial_writer.appendVector("artifact-a", 0, 1, &.{1.0});
+    const initial = try initial_writer.build();
+    defer alloc.free(initial);
+    try store.publishGeneration(1, 0, &.{.{ .shard_id = 0, .bytes = initial }}, true);
+
+    // This lease represents a query that began before the replacement. It
+    // must remain on the old immutable generation after CURRENT advances.
+    var old_query = try Store.openWithBlocks(alloc, memory.storage(), root);
+    defer old_query.deinit();
+    const boundary = store.walPrefixBoundary();
+
+    var replacement_writer = try vector_block.Writer.init(alloc, 2, 0, 1, 0);
+    defer replacement_writer.deinit();
+    try replacement_writer.appendVector("artifact-a", 0, 2, &.{2.0});
+    const replacement = try replacement_writer.build();
+    defer alloc.free(replacement);
+    const staged = [_]StagedBlock{try store.stageBlock(2, 0, 0, replacement)};
+
+    // This complete batch raced the snapshot encoder. Publication retains its
+    // exact byte suffix in the next WAL generation instead of replaying or
+    // filtering records by source sequence.
+    try store.appendBatch(try store.nextBatchId(), &.{.{
+        .kind = .upsert,
+        .key = "artifact-a",
+        .source_sequence = 1,
+        .revision = 3,
+        .vector = &.{3.0},
+    }}, 1, .{});
+    try store.publishStagedBasePreservingWalTail(2, 0, &staged, &.{}, boundary);
+
+    try std.testing.expectEqualSlices(f32, &.{1.0}, (try old_query.get("artifact-a", 0, null)).vector.vectorView().?);
+    var current = try Store.openWithBlocks(alloc, memory.storage(), root);
+    defer current.deinit();
+    try std.testing.expectEqual(@as(u64, 2), current.store.manifest.?.base_generation);
+    try std.testing.expectEqual(@as(u64, 1), current.store.covered_source_sequence);
+    try std.testing.expect(current.store.wal_has_mutations);
+    try std.testing.expectEqualSlices(f32, &.{2.0}, (try current.get("artifact-a", 0, 2)).vector.vectorView().?);
+    try std.testing.expectEqualSlices(f32, &.{3.0}, (try current.get("artifact-a", 1, 3)).vector.vectorView().?);
+}
+
+test "vector block store authoritative snapshot flattens older WAL prefix" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const root = "/vector-block-snapshot-flatten-prefix";
+    var store = try Store.open(alloc, memory.storage(), root);
+    defer store.deinit();
+
+    var initial_writer = try vector_block.Writer.init(alloc, 1, 0, 1, 0);
+    defer initial_writer.deinit();
+    try initial_writer.appendVector("artifact-a", 0, 1, &.{1.0});
+    const initial = try initial_writer.build();
+    defer alloc.free(initial);
+    try store.publishGeneration(1, 0, &.{.{ .shard_id = 0, .bytes = initial }}, true);
+    try store.appendBatch(try store.nextBatchId(), &.{.{
+        .kind = .upsert,
+        .key = "artifact-a",
+        .source_sequence = 1,
+        .revision = 2,
+        .vector = &.{2.0},
+    }}, 1, .{});
+
+    // A separately pinned authoritative snapshot at sequence two contains the
+    // complete older WAL prefix. Publishing at that newer watermark may drop
+    // the prefix only when its boundary is the current committed WAL end.
+    const flattened = store.walPrefixBoundary();
+    var replacement_writer = try vector_block.Writer.init(alloc, 2, 0, 1, 2);
+    defer replacement_writer.deinit();
+    try replacement_writer.appendVector("artifact-a", 2, 3, &.{3.0});
+    const replacement = try replacement_writer.build();
+    defer alloc.free(replacement);
+    const staged = [_]StagedBlock{try store.stageBlock(2, 2, 0, replacement)};
+    try store.publishStagedBasePreservingWalTail(2, 2, &staged, &.{}, flattened);
+
+    var current = try Store.openWithBlocks(alloc, memory.storage(), root);
+    defer current.deinit();
+    try std.testing.expectEqual(@as(u64, 2), current.store.covered_source_sequence);
+    try std.testing.expect(!current.store.wal_has_mutations);
+    try std.testing.expectEqual(@as(u64, 0), current.store.wal_committed_bytes);
+    try std.testing.expectEqualSlices(f32, &.{3.0}, (try current.get("artifact-a", 2, 3)).vector.vectorView().?);
+}
+
+test "owned staged base can reset a restored source epoch" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const root = "/vector-block-reset-source-epoch";
+    var store = try Store.open(alloc, memory.storage(), root);
+    defer store.deinit();
+
+    var initial_writer = try vector_block.Writer.init(alloc, 1, 0, 1, 0);
+    defer initial_writer.deinit();
+    try initial_writer.appendVector("artifact-a", 0, 1, &.{0.0});
+    const initial = try initial_writer.build();
+    defer alloc.free(initial);
+    try store.publishGeneration(1, 0, &.{.{ .shard_id = 0, .bytes = initial }}, true);
+    try store.appendBatch(try store.nextBatchId(), &.{.{
+        .kind = .upsert,
+        .key = "artifact-a",
+        .source_sequence = 6,
+        .revision = 6,
+        .vector = &.{6.0},
+    }}, 6, .{});
+
+    // A normal replacement cannot move behind a committed WAL tail. Restore
+    // is different: the complete imported source snapshot establishes a new
+    // sequence epoch and must retire every mutation from the old source.
+    var replacement_writer = try vector_block.Writer.init(alloc, 2, 0, 1, 1);
+    defer replacement_writer.deinit();
+    try replacement_writer.appendVector("artifact-a", 1, 1, &.{1.0});
+    const replacement = try replacement_writer.build();
+    defer alloc.free(replacement);
+    const receipt = try store.stageBlock(2, 1, 0, replacement);
+    var build: StagedBaseBuild = .{
+        .alloc = alloc,
+        .storage = memory.storage(),
+        .root_dir = try alloc.dupe(u8, root),
+        .generation = 2,
+        .covered_source_sequence = 1,
+        .staged = try alloc.dupe(StagedBlock, &.{receipt}),
+        .coverages = try alloc.alloc(vector_manifest.Coverage, 0),
+        .stats = .{},
+    };
+    defer build.deinit();
+    try store.publishStagedBaseBuild(&build, .reset_source_epoch);
+
+    var current = try Store.openWithBlocks(alloc, memory.storage(), root);
+    defer current.deinit();
+    try std.testing.expectEqual(@as(u64, 1), current.store.covered_source_sequence);
+    try std.testing.expect(!current.store.wal_has_mutations);
+    try std.testing.expectEqual(@as(u64, 0), current.store.wal_committed_bytes);
+    try std.testing.expectEqualSlices(f32, &.{1.0}, (try current.get("artifact-a", 1, 1)).vector.vectorView().?);
+}
+
 test "vector block store poisons ambiguous CURRENT publication" {
     const alloc = std.testing.allocator;
     var memory = lsm_backend.MemoryStorage.init(alloc);
@@ -1618,6 +2015,82 @@ test "vector block store poisons ambiguous CURRENT publication" {
     defer store.deinit();
     try std.testing.expectEqual(@as(u64, 1), store.manifest.?.base_generation);
     try std.testing.expectEqual(@as(u64, 0), store.covered_source_sequence);
+}
+
+test "owned staged base removes blocks after pre-CURRENT rejection" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const root = "/vector-block-staged-rejected";
+    var store = try Store.open(alloc, memory.storage(), root);
+    defer store.deinit();
+
+    var writer = try vector_block.Writer.init(alloc, 1, 0, 1, 0);
+    defer writer.deinit();
+    try writer.appendVector("artifact-a", 0, 1, &.{ 1.0, 2.0 });
+    const base = try writer.build();
+    defer alloc.free(base);
+    const receipt = try store.stageBlock(1, 0, 0, base);
+    const block_path = try store.blockPathAlloc(1, 0);
+    defer alloc.free(block_path);
+
+    var build: StagedBaseBuild = .{
+        .alloc = alloc,
+        .storage = memory.storage(),
+        .root_dir = try alloc.dupe(u8, root),
+        .generation = 1,
+        .covered_source_sequence = 0,
+        .staged = try alloc.dupe(StagedBlock, &.{receipt}),
+        .coverages = try alloc.alloc(vector_manifest.Coverage, 0),
+        .stats = .{},
+    };
+    // Receipt validation fails before CURRENT. The owner must remove the
+    // durable reservation instead of accumulating an unreachable generation.
+    build.staged[0].bytes += 1;
+    try std.testing.expectError(error.MissingVectorBlock, store.publishStagedBaseBuild(&build, .no_tail));
+    build.deinit();
+    try std.testing.expectError(error.FileNotFound, memory.storage().fileSize(block_path));
+}
+
+test "owned staged base survives ambiguous CURRENT publication" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const root = "/vector-block-staged-ambiguous";
+    var store = try Store.open(alloc, memory.storage(), root);
+
+    var writer = try vector_block.Writer.init(alloc, 1, 0, 1, 0);
+    defer writer.deinit();
+    try writer.appendVector("artifact-a", 0, 1, &.{ 1.0, 2.0 });
+    const base = try writer.build();
+    defer alloc.free(base);
+    const receipt = try store.stageBlock(1, 0, 0, base);
+    const block_path = try store.blockPathAlloc(1, 0);
+    defer alloc.free(block_path);
+
+    var build: StagedBaseBuild = .{
+        .alloc = alloc,
+        .storage = memory.storage(),
+        .root_dir = try alloc.dupe(u8, root),
+        .generation = 1,
+        .covered_source_sequence = 0,
+        .staged = try alloc.dupe(StagedBlock, &.{receipt}),
+        .coverages = try alloc.alloc(vector_manifest.Coverage, 0),
+        .stats = .{},
+    };
+    generation_publication.injectPostPublishFailuresForTest(2);
+    try std.testing.expectError(
+        error.GenerationPublicationDurabilityUncertain,
+        store.publishStagedBaseBuild(&build, .no_tail),
+    );
+    try std.testing.expect(store.poisoned);
+    build.deinit();
+    try std.testing.expect((try memory.storage().fileSize(block_path)) > 0);
+    store.deinit();
+
+    store = try Store.open(alloc, memory.storage(), root);
+    defer store.deinit();
+    try std.testing.expectEqual(@as(u64, 1), store.manifest.?.base_generation);
 }
 
 test "vector block store checkpoints and consolidates sparse delta generations" {

@@ -216,7 +216,9 @@ pub const BlockIterator = struct {
         const scalar_bytes = std.math.mul(usize, count, @sizeOf(f32)) catch return error.InvalidCentroidDirectory;
         const vector_count = std.math.mul(usize, count, self.reader.dims) catch return error.InvalidCentroidDirectory;
         const vector_bytes = std.math.mul(usize, vector_count, @sizeOf(f32)) catch return error.InvalidCentroidDirectory;
-        const total = ids_bytes + scalar_bytes * 2 + vector_bytes;
+        const scalar_columns_bytes = std.math.mul(usize, scalar_bytes, 2) catch return error.InvalidCentroidDirectory;
+        const total_without_vectors = std.math.add(usize, ids_bytes, scalar_columns_bytes) catch return error.InvalidCentroidDirectory;
+        const total = std.math.add(usize, total_without_vectors, vector_bytes) catch return error.InvalidCentroidDirectory;
         if (cursor > self.reader.data.len or total > self.reader.data.len - cursor) return error.InvalidCentroidDirectory;
 
         const ids_raw: []align(@alignOf(u64)) const u8 = @alignCast(self.reader.data[cursor .. cursor + ids_bytes]);
