@@ -76,12 +76,35 @@ pub const LifecycleHook = struct {
     }
 };
 
+/// Production-neutral logical work boundary for routed graph operations.
+/// Deterministic runtimes can model reversible per-owner service rates without
+/// making the graph coordinator depend on VOPR. Native runtimes leave this
+/// unset and retain their ordinary request behavior.
+pub const WorkKind = enum {
+    expand,
+    hydrate,
+    get_edges,
+};
+
+pub const WorkCostPort = struct {
+    ptr: *anyopaque,
+    charge_fn: *const fn (ptr: *anyopaque, group_id: u64, kind: WorkKind, units: u64) anyerror!void,
+
+    /// Parallel fanout may call this concurrently. Implementations that are
+    /// not scheduler-confined must synchronize their own accounting and
+    /// reversible effect state.
+    pub fn charge(self: WorkCostPort, group_id: u64, kind: WorkKind, units: u64) !void {
+        try self.charge_fn(self.ptr, group_id, kind, units);
+    }
+};
+
 pub const Worker = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
     lifecycle_hook: ?LifecycleHook = null,
+    work_cost_port: ?WorkCostPort = null,
 
     pub const VTable = struct {
         execute_graph_expand: *const fn (
@@ -121,6 +144,8 @@ pub const Worker = struct {
         consistency: raft_mod.ReadConsistency,
     ) !GraphExpandResponse {
         try self.ensureActive();
+        if (self.work_cost_port) |port| try port.charge(group_id, .expand, req.frontier.len);
+        try self.ensureActive();
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
         controlled.cancellation = self.cancellation;
@@ -138,6 +163,8 @@ pub const Worker = struct {
         req: GraphHydrateRequest,
         consistency: raft_mod.ReadConsistency,
     ) !GraphHydrateResponse {
+        try self.ensureActive();
+        if (self.work_cost_port) |port| try port.charge(group_id, .hydrate, req.keys.len);
         try self.ensureActive();
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
@@ -158,6 +185,8 @@ pub const Worker = struct {
     ) !GraphEdgesResponse {
         try self.ensureActive();
         const func = self.vtable.execute_graph_get_edges orelse return error.UnsupportedQueryRequest;
+        if (self.work_cost_port) |port| try port.charge(group_id, .get_edges, 1);
+        try self.ensureActive();
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
         controlled.cancellation = self.cancellation;
@@ -8740,7 +8769,7 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
         },
         .identity_read_generation = 77,
         .execution_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s,
-        .cancellation = &cancellation,
+        .cancellation = CancellationToken.fromAtomic(&cancellation),
     };
     const base_result = db_mod.types.SearchResult{
         .alloc = std.testing.allocator,

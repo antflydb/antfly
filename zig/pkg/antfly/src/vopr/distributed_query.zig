@@ -21,13 +21,14 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "distributed-query";
-    pub const version: u32 = 2;
+    pub const version: u32 = 3;
 
     const result_id = vopr.id.stable(name, "result-sound");
     const retry_id = vopr.id.stable(name, "retry-bounded");
     const cancellation_id = vopr.id.stable(name, "cancellation-propagates");
     const generation_id = vopr.id.stable(name, "stale-generation-rejected");
     const authorization_id = vopr.id.stable(name, "cross-table-authorization");
+    const service_rate_id = vopr.id.stable(name, "service-rate-composes-and-heals");
     const cleanup_id = vopr.id.stable(name, "resources-cleaned");
     const complete_id = vopr.id.stable(name, "history-completes");
 
@@ -37,6 +38,7 @@ pub const Scenario = struct {
         .{ .id = cancellation_id, .name = name ++ ".cancellation-propagates", .kind = .always },
         .{ .id = generation_id, .name = name ++ ".stale-generation-rejected", .kind = .always },
         .{ .id = authorization_id, .name = name ++ ".cross-table-authorization", .kind = .always },
+        .{ .id = service_rate_id, .name = name ++ ".service-rate-composes-and-heals", .kind = .always },
         .{ .id = cleanup_id, .name = name ++ ".resources-cleaned", .kind = .always },
         .{ .id = complete_id, .name = name ++ ".history-completes", .kind = .reachable },
     };
@@ -49,6 +51,7 @@ pub const Scenario = struct {
         cancel_in_flight,
         stale_generation,
         cross_table_authorization,
+        service_rate,
     };
 
     const mode_ids = ids: {
@@ -64,12 +67,53 @@ pub const Scenario = struct {
         break :names values;
     };
     const cancel_id = vopr.id.stable(name, "cancel-outstanding-fanout");
+    const heal_service_rate_id = vopr.id.stable(name, "heal-service-rate");
+    const service_rate_fault_id = vopr.id.stable(name, "fault.group-22-slow");
+    const expand_operation = vopr.service_rate.Operation.named(name ++ ".expand", 10);
+    const hydrate_operation = vopr.service_rate.Operation.named(name ++ ".hydrate", 20);
+    const get_edges_operation = vopr.service_rate.Operation.named(name ++ ".get-edges", 30);
+    const service_nodes = [_]vopr.service_rate.Node{
+        .{ .id = vopr.id.stable(name, "group.11"), .name = name ++ ".group.11" },
+        .{ .id = vopr.id.stable(name, "group.22"), .name = name ++ ".group.22" },
+        .{ .id = vopr.id.stable(name, "group.33"), .name = name ++ ".group.33" },
+    };
+    const service_operations = [_]vopr.service_rate.Operation{
+        expand_operation,
+        hydrate_operation,
+        get_edges_operation,
+    };
+
+    const ServiceRateAdapter = struct {
+        ports: [service_nodes.len]vopr.service_rate.Port,
+
+        fn iface(self: *@This()) distributed_graph.WorkCostPort {
+            return .{ .ptr = self, .charge_fn = charge };
+        }
+
+        fn charge(ptr: *anyopaque, group_id: u64, kind: distributed_graph.WorkKind, units: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const port_index: usize = switch (group_id) {
+                11 => 0,
+                22 => 1,
+                33 => 2,
+                else => return error.UnknownDistributedGraphServiceNode,
+            };
+            const operation_id = switch (kind) {
+                .expand => expand_operation.id,
+                .hydrate => hydrate_operation.id,
+                .get_edges => get_edges_operation.id,
+            };
+            _ = try self.ports[port_index].charge(operation_id, units);
+        }
+    };
 
     const State = struct {
         owner_allocator: std.mem.Allocator,
         fixture_allocator: FixtureAllocator,
         allocator: std.mem.Allocator,
         sim: vopr.vopr_io.VoprIo,
+        service_rate_model: vopr.service_rate.Model = undefined,
+        service_rate_adapter: ServiceRateAdapter = undefined,
         mode: ?Mode = null,
         phase: u32 = 0,
         cancellation: std.atomic.Value(bool) = .init(false),
@@ -82,6 +126,9 @@ pub const Scenario = struct {
         cancellation_sound: bool = true,
         generation_sound: bool = true,
         authorization_sound: bool = true,
+        service_rate_sound: bool = true,
+        slowdown_pass_complete: bool = false,
+        slowdown_healed: bool = false,
         complete: bool = false,
         task_error: ?anyerror = null,
 
@@ -100,10 +147,20 @@ pub const Scenario = struct {
                 .seed = 0x4451_5259,
                 .instrumentation = .{ .enabled = false, .map_digest = 0x4451_5259 },
             });
+            errdefer self.sim.deinit();
+            self.service_rate_model = try vopr.service_rate.Model.init(
+                self.allocator,
+                &service_nodes,
+                &service_operations,
+            );
+            errdefer self.service_rate_model.deinit();
+            for (&self.service_rate_adapter.ports, service_nodes) |*port, node|
+                port.* = try self.service_rate_model.port(self.sim.io(), node.id);
             return self;
         }
 
         fn deinit(self: *State) void {
+            self.service_rate_model.deinit();
             self.sim.deinit();
             const owner_allocator = self.owner_allocator;
             std.debug.assert(self.fixture_allocator.deinit() == .ok);
@@ -138,7 +195,7 @@ pub const Scenario = struct {
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *State = @ptrCast(@alignCast(ptr));
             const ranges: []const metadata_table_manager.RangeRecord = switch (self.mode.?) {
-                .fanout_hydrate, .fanout_nodes_only, .cancel_in_flight => fanout_ranges[0..],
+                .fanout_hydrate, .fanout_nodes_only, .cancel_in_flight, .service_rate => fanout_ranges[0..],
                 else => retry_ranges[@min(self.phase, retry_ranges.len - 1)][0..],
             };
             return .{
@@ -156,11 +213,15 @@ pub const Scenario = struct {
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
         fn worker(self: *State) distributed_graph.Worker {
-            return .{ .ptr = self, .vtable = &.{
-                .execute_graph_expand = executeGraphExpand,
-                .execute_graph_hydrate = executeGraphHydrate,
-                .fanout_io = fanoutIo,
-            } };
+            return .{
+                .ptr = self,
+                .work_cost_port = if (self.mode.? == .service_rate) self.service_rate_adapter.iface() else null,
+                .vtable = &.{
+                    .execute_graph_expand = executeGraphExpand,
+                    .execute_graph_hydrate = executeGraphHydrate,
+                    .fanout_io = fanoutIo,
+                },
+            };
         }
 
         fn fanoutIo(ptr: *anyopaque) ?std.Io {
@@ -257,7 +318,17 @@ pub const Scenario = struct {
                 return;
             }
 
-            const start_nodes = if (self.mode.? == .fanout_hydrate or self.mode.? == .fanout_nodes_only or self.mode.? == .cancel_in_flight)
+            const expand_before = self.expand_calls.load(.monotonic);
+            const hydrate_before = self.hydrate_calls.load(.monotonic);
+            const group_11_usage_before: ?vopr.service_rate.Usage = if (self.mode.? == .service_rate)
+                try self.service_rate_model.nodeUsage(service_nodes[0].id)
+            else
+                null;
+            const group_22_usage_before: ?vopr.service_rate.Usage = if (self.mode.? == .service_rate)
+                try self.service_rate_model.nodeUsage(service_nodes[1].id)
+            else
+                null;
+            const start_nodes = if (self.mode.? == .fanout_hydrate or self.mode.? == .fanout_nodes_only or self.mode.? == .cancel_in_flight or self.mode.? == .service_rate)
                 &[_][]const u8{ "doc:a", "doc:n" }
             else
                 &[_][]const u8{"doc:a"};
@@ -305,7 +376,7 @@ pub const Scenario = struct {
                 for (results) |*result| result.deinit(self.allocator);
                 self.allocator.free(results);
             }
-            self.result_sound = switch (self.mode.?) {
+            const query_sound = switch (self.mode.?) {
                 .fanout_hydrate => self.expand_calls.load(.monotonic) == 2 and
                     self.hydrate_calls.load(.monotonic) == 2 and results.len == 1 and
                     results[0].nodes.len == 2 and results[0].hits.len == 2,
@@ -314,8 +385,25 @@ pub const Scenario = struct {
                     results[0].nodes.len == 2 and results[0].hits.len == 0,
                 .topology_retry => self.expand_calls.load(.monotonic) == 2 and
                     self.hydrate_calls.load(.monotonic) == 1 and results.len == 1,
+                .service_rate => self.expand_calls.load(.monotonic) - expand_before == 2 and
+                    self.hydrate_calls.load(.monotonic) - hydrate_before == 2 and
+                    results.len == 1 and results[0].nodes.len == 2 and results[0].hits.len == 2,
                 else => false,
             };
+            self.result_sound = self.result_sound and query_sound;
+            if (self.mode.? == .service_rate) {
+                const group_11_usage_after = try self.service_rate_model.nodeUsage(service_nodes[0].id);
+                const group_22_usage_after = try self.service_rate_model.nodeUsage(service_nodes[1].id);
+                const group_11_operations = group_11_usage_after.operations - group_11_usage_before.?.operations;
+                const group_22_operations = group_22_usage_after.operations - group_22_usage_before.?.operations;
+                const group_11_charged_ns = group_11_usage_after.charged_ns - group_11_usage_before.?.charged_ns;
+                const group_22_charged_ns = group_22_usage_after.charged_ns - group_22_usage_before.?.charged_ns;
+                const expected_group_22_charged_ns: u64 = if (self.slowdown_healed) 30 else 120;
+                self.service_rate_sound = self.service_rate_sound and
+                    group_11_operations == 2 and group_22_operations == 2 and
+                    group_11_charged_ns == 30 and
+                    group_22_charged_ns == expected_group_22_charged_ns;
+            }
             self.retry_sound = self.mode.? != .topology_retry or self.phase == 1;
         }
 
@@ -323,7 +411,10 @@ pub const Scenario = struct {
             self.run() catch |err| {
                 self.task_error = err;
             };
-            self.complete = true;
+            if (self.mode.? == .service_rate and !self.slowdown_healed)
+                self.slowdown_pass_complete = true
+            else
+                self.complete = true;
         }
     };
 
@@ -348,11 +439,14 @@ pub const Scenario = struct {
                     .fanout_hydrate, .fanout_nodes_only, .topology_retry, .cross_table_authorization => .workload,
                     else => .fault,
                 },
+                .fault_phase = if (mode == .service_rate) .start else null,
             });
             return;
         }
         if (state.mode.? == .cancel_in_flight and !state.cancellation_selected and state.expand_active.load(.monotonic) > 0)
             try list.append(allocator, .{ .id = cancel_id, .name = name ++ ".cancel-outstanding-fanout", .kind = .fault });
+        if (state.mode.? == .service_rate and state.slowdown_pass_complete and !state.slowdown_healed)
+            try list.append(allocator, .{ .id = heal_service_rate_id, .name = name ++ ".heal-service-rate", .kind = .fault, .fault_phase = .end });
         if (!state.sim.scheduler().quiescent()) try state.sim.scheduler().enumerateReady(list, allocator);
     }
 
@@ -362,6 +456,11 @@ pub const Scenario = struct {
             var found = false;
             inline for (std.meta.tags(Mode), mode_ids) |mode, id| if (selected.id == id) {
                 state.mode = mode;
+                if (mode == .service_rate) try state.service_rate_model.activate(.{
+                    .fault_id = service_rate_fault_id,
+                    .node_id = service_nodes[1].id,
+                    .multiplier_ppm = 4 * vopr.service_rate.parts_per_million,
+                });
                 _ = state.sim.io().async(State.runTask, .{state});
                 found = true;
             };
@@ -369,6 +468,10 @@ pub const Scenario = struct {
         } else if (selected.id == cancel_id) {
             state.cancellation_selected = true;
             state.cancellation.store(true, .monotonic);
+        } else if (selected.id == heal_service_rate_id) {
+            try state.service_rate_model.heal(service_rate_fault_id);
+            state.slowdown_healed = true;
+            _ = state.sim.io().async(State.runTask, .{state});
         } else {
             try state.sim.scheduler().executeReady(selected.id, events, allocator);
         }
@@ -381,6 +484,7 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".expand-calls", state.expand_calls.load(.monotonic));
         try builder.addNamed(allocator, name ++ ".hydrate-calls", state.hydrate_calls.load(.monotonic));
         try builder.addNamed(allocator, name ++ ".cancelled", @intFromBool(state.cancellation_selected));
+        try builder.addNamed(allocator, name ++ ".service-rate-healed", @intFromBool(state.slowdown_healed));
         try builder.addNamed(allocator, name ++ ".complete", @intFromBool(state.complete));
     }
 
@@ -391,6 +495,7 @@ pub const Scenario = struct {
         try sink.check(allocator, cancellation_id, state.cancellation_sound);
         try sink.check(allocator, generation_id, state.generation_sound);
         try sink.check(allocator, authorization_id, state.authorization_sound);
+        try sink.check(allocator, service_rate_id, state.service_rate_sound);
         try sink.check(allocator, cleanup_id, !state.complete or state.sim.resourceSnapshot().active_tasks == 0);
         try sink.check(allocator, complete_id, state.complete);
     }
@@ -401,11 +506,11 @@ pub const Scenario = struct {
             .progress_expected = state.mode != null,
             .progress_units = state.expand_calls.load(.monotonic) + state.hydrate_calls.load(.monotonic),
             .recovery_expected = state.mode != null and switch (state.mode.?) {
-                .topology_retry, .retry_exhausted, .cancel_in_flight, .stale_generation => true,
+                .topology_retry, .retry_exhausted, .cancel_in_flight, .stale_generation, .service_rate => true,
                 else => false,
             },
             .recovery_complete = state.complete,
-            .consistency_valid = state.result_sound and state.retry_sound and state.cancellation_sound and state.generation_sound and state.authorization_sound,
+            .consistency_valid = state.result_sound and state.retry_sound and state.cancellation_sound and state.generation_sound and state.authorization_sound and state.service_rate_sound,
             .cleanup_complete = state.complete and state.sim.resourceSnapshot().active_tasks == 0,
         });
     }
@@ -423,7 +528,7 @@ test "distributed query VOPR exact replays fanout topology snapshots cancellatio
             .system = "antfly",
             .transition_budget = 2_000,
             .backend_ids = &backend_ids,
-            .source_revision = "distributed-query-vopr-v2",
+            .source_revision = "distributed-query-vopr-v3",
             .target = "native",
             .optimize = @tagName(@import("builtin").mode),
         });
