@@ -89,6 +89,10 @@ Use product-area names for test files. Do not use migration labels like `*_parit
   - document lookup and full-text query still work after restore
   - cluster `/backup`, `/backups`, and `/restore` round-trip for local `file://` backups
   - backend-gated remote cluster round-trip coverage for `s3://` and `gs://`
+  - three metadata and three data processes with replication factor three
+  - sequential member restarts beginning with the metadata leader
+  - metadata and data voter convergence, preserved node and store identities, and matching documents on every replica
+  - source-group retirement, fresh restored range and group IDs, and post-restore replicated writes
 - `test_extensions.py`
   - full-suite MemoryAF extension package projection from `extensions/memoryaf`
   - standalone and distributed extension lifecycle dry-run coverage
@@ -105,6 +109,10 @@ Use product-area names for test files. Do not use migration labels like `*_parit
   - configured with `ANTFLY_STATEFUL_URL`
   - optional `ANTFLY_STATEFUL_API_ROOT`
   - use `/db/v1` for Go Antfly; local Zig `antfly standalone` serves stateful routes at the root
+- `replicated_backup_cluster`
+  - starts three metadata and three data processes with replication factor three
+  - preserves each process's storage root across leader-first sequential restarts
+  - exercises the distributed `antfly` binary rather than the standalone runtime
 
 ## Shared vs Serverless-Specific
 
@@ -199,5 +207,5 @@ Compared with `../antfly/e2e`, the biggest missing areas are:
 
 1. Expand graph coverage with more Go graph matrix cases.
 2. Expand broader stateful retrieval-generation depth beyond pipeline-only retrieval.
-3. Broaden backup/restore coverage beyond the current local + remote matrix.
+3. Add opt-in object-store execution of the replicated backup/restore scenario.
 4. Decide whether provider/auth/secrets tests belong in this portable suite or a separate integration suite with external dependencies.
