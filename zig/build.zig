@@ -7307,6 +7307,12 @@ pub fn build(b: *std.Build) void {
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_production_cluster_graph_split_overlapping_faults_vopr_tests = b.addRunArtifact(production_cluster_graph_split_overlapping_faults_vopr_tests);
+    const production_cluster_graph_split_socket_pressure_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production data plane graph active split socket pressure exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_production_cluster_graph_split_socket_pressure_vopr_tests = b.addRunArtifact(production_cluster_graph_split_socket_pressure_vopr_tests);
     // Stackful VoprIo fibers do not use Zig's persistent std.zig.Server test
     // protocol: after a successful test body the server runner can report a
     // spurious subprocess failure, while the same binary and seed pass in
@@ -7327,6 +7333,7 @@ pub fn build(b: *std.Build) void {
         run_production_cluster_join_split_vopr_tests,
         run_production_cluster_durable_join_takeover_vopr_tests,
         run_production_cluster_graph_split_overlapping_faults_vopr_tests,
+        run_production_cluster_graph_split_socket_pressure_vopr_tests,
     }) |run_production_cluster_test| {
         // addRunArtifact appends cache-dir, seed, and --listen arguments after
         // the artifact; simple mode needs only the artifact itself.
@@ -7389,6 +7396,11 @@ pub fn build(b: *std.Build) void {
         "Exact-replay overlapping graph transport and all-owner memory faults during an active split",
     );
     production_cluster_graph_split_overlapping_faults_vopr_test_step.dependOn(&run_production_cluster_graph_split_overlapping_faults_vopr_tests.step);
+    const production_cluster_graph_split_socket_pressure_vopr_test_step = b.step(
+        "production-cluster-graph-split-socket-pressure-vopr-test",
+        "Exact-replay a selected production listener socket denial and recovery during an active split",
+    );
+    production_cluster_graph_split_socket_pressure_vopr_test_step.dependOn(&run_production_cluster_graph_split_socket_pressure_vopr_tests.step);
     const production_cluster_vopr_test_step = b.step(
         "production-cluster-vopr-test",
         "Run production DataServer smoke, active-reconfiguration, graph, and graph-during-split histories",
@@ -7404,6 +7416,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_vopr_test_step.dependOn(production_cluster_join_split_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_durable_join_takeover_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_overlapping_faults_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_socket_pressure_vopr_test_step);
 
     const generation_reranking_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,

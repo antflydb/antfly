@@ -89,6 +89,7 @@ pub const Fixture = struct {
         graph_owner_restart,
         graph_partial_write,
         resource_pressure,
+        socket_pressure,
         join_finalizer_ack_failure,
 
         fn hasGraphTransportFailure(self: FaultMode) bool {
@@ -281,6 +282,13 @@ pub const Fixture = struct {
     graph_partial_write_count_before: u64 = 0,
     graph_partial_write_target_index: usize = 0,
     graph_partial_write_target_configured: bool = false,
+    socket_pressure_target_index: usize = 0,
+    socket_pressure_target_configured: bool = false,
+    socket_pressure_injected: bool = false,
+    socket_pressure_denial_observed: bool = false,
+    socket_pressure_error_code: u16 = 0,
+    socket_pressure_no_ingress: bool = false,
+    socket_pressure_recovered: bool = false,
     resource_reservations: [node_count]?resource_manager.BatchReservation = .{null} ** node_count,
     resource_pressure_observed: bool = false,
     resource_denial_sound: bool = false,
@@ -402,6 +410,17 @@ pub const Fixture = struct {
         self.graph_transport_target_configured = true;
         self.graph_probe_route_index = coordinator_index;
         return coordinator_index;
+    }
+
+    /// Freeze the production node whose public listener owns the modeled
+    /// descriptor-pressure domain. The workload later rejects new connections
+    /// at this exact endpoint while established Raft and control streams remain
+    /// available.
+    pub fn configureSocketPressureTarget(self: *Fixture, target_index: usize) !void {
+        if (self.phase != .leaders_ready or target_index >= self.data_server_count or !self.data_server_live[target_index])
+            return error.InvalidProductionSocketPressureTarget;
+        self.socket_pressure_target_index = target_index;
+        self.socket_pressure_target_configured = true;
     }
 
     pub fn bootstrap(self: *Fixture) !void {
@@ -701,6 +720,7 @@ pub const Fixture = struct {
     ) void {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
         if (self.fault_mode == .clean or self.fault_mode == .resource_pressure or
+            self.fault_mode == .socket_pressure or
             self.fault_mode == .join_finalizer_ack_failure) return;
         switch (event.phase) {
             .expand_round_completed => {
@@ -743,7 +763,7 @@ pub const Fixture = struct {
                         self.sim.setOutboundEndpointPayloadPartialWrite(endpoint, "/graph-expand", 1) catch unreachable;
                         self.graph_partial_write_injected = true;
                     },
-                    .resource_pressure, .join_finalizer_ack_failure => unreachable,
+                    .resource_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
                 }
             },
             .attempt_failed => {
@@ -773,7 +793,7 @@ pub const Fixture = struct {
                         self.graph_restart_recovered.wait(self.sim.io()) catch return;
                     },
                     .graph_partial_write => {},
-                    .resource_pressure, .join_finalizer_ack_failure => unreachable,
+                    .resource_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
                 }
             },
             else => {},
@@ -1422,9 +1442,13 @@ pub const Fixture = struct {
             if (!self.join_enabled) try self.waitForSplitInProgress();
             if (self.fault_mode.hasResourcePressure())
                 try self.runResourcePressureDuringSplit();
+            if (self.fault_mode == .socket_pressure)
+                try self.runSocketPressureDuringSplit();
             const ingress_before = self.public_request_ingress_count;
             self.split_graph_inflight_sound = probe: {
-                if (self.fault_mode != .clean and self.fault_mode != .resource_pressure) {
+                if (self.fault_mode != .clean and self.fault_mode != .resource_pressure and
+                    self.fault_mode != .socket_pressure)
+                {
                     const start_leader_index = self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.data_group_id) orelse
                         return error.ProductionDataGraphLeaderMissing;
                     const target_index = self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.graph_data_group_id) orelse
@@ -1454,7 +1478,7 @@ pub const Fixture = struct {
                                     return error.ProductionGraphPartialWriteTargetLeadershipChanged;
                                 break :blk try parseHttpBaseUriAddress(self.data_api_uris[target_index]);
                             },
-                        .resource_pressure, .join_finalizer_ack_failure => unreachable,
+                        .resource_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
                     }
                     self.graph_transport_fault_armed = true;
                 }
@@ -1744,7 +1768,8 @@ pub const Fixture = struct {
                             self.graph_partial_write_count_before + 1;
                     return self.split_graph_inflight_complete and self.graph_partial_write_observed;
                 }
-                if (self.fault_mode != .clean and self.fault_mode != .resource_pressure) return false;
+                if (self.fault_mode != .clean and self.fault_mode != .resource_pressure and
+                    self.fault_mode != .socket_pressure) return false;
                 return self.split_graph_inflight_complete;
             },
             409, 503 => {
@@ -1779,7 +1804,7 @@ pub const Fixture = struct {
                     return self.graph_partial_rejected_sound;
                 }
                 if (self.fault_mode == .graph_partial_write) return false;
-                if (self.fault_mode == .resource_pressure) return false;
+                if (self.fault_mode == .resource_pressure or self.fault_mode == .socket_pressure) return false;
                 return self.split_graph_inflight_rejected;
             },
             else => return error.UnexpectedHttpStatus,
@@ -1866,6 +1891,89 @@ pub const Fixture = struct {
         );
         if (!self.resource_recovery_sound)
             return error.ProductionDataResourceRecoveryFailed;
+    }
+
+    /// Deny every new connection to one registered production listener while
+    /// leaving existing connections and all other node endpoints untouched.
+    /// A fresh non-pooled client makes the denial non-vacuous; a second fresh
+    /// client after healing proves the same public route recovers.
+    fn runSocketPressureDuringSplit(self: *Fixture) !void {
+        if (!self.socket_pressure_target_configured)
+            return error.ProductionSocketPressureTargetMissing;
+        const target_index = self.socket_pressure_target_index;
+        if (target_index >= self.data_api_uri_count or !self.data_api_uri_live[target_index])
+            return error.ProductionSocketPressureTargetUnavailable;
+        const endpoint = try parseHttpBaseUriAddress(self.data_api_uris[target_index]);
+        _ = self.sim.listenerConnectionCount(endpoint);
+
+        try self.sim.setListenerConnectionLimit(endpoint, 0);
+        var quota_active = true;
+        errdefer if (quota_active) self.sim.setListenerConnectionLimit(endpoint, null) catch {};
+        self.socket_pressure_injected = true;
+        const ingress_before = self.public_request_ingress_count;
+
+        {
+            var denied_executor = io_http_executor.IoHttpExecutor.init(self.alloc, self.sim.io(), .{
+                .connect_timeout_ms = 1_000,
+                .read_timeout_ms = 1_000,
+                .write_timeout_ms = 1_000,
+                .keep_alive = false,
+                .pool_max_connections = 1,
+                .pool_max_per_host = 1,
+            });
+            defer {
+                denied_executor.beginShutdown();
+                denied_executor.drainShutdown();
+                denied_executor.deinit();
+            }
+            var denied_client = api_http_client.ApiHttpClient.init(self.alloc, denied_executor.executor());
+            if (denied_client.fetchLookupResponse(
+                self.data_api_uris[target_index],
+                "docs",
+                "doc:k",
+                null,
+            )) |response_value| {
+                var response = response_value;
+                response.deinit(self.alloc);
+                return error.ProductionSocketPressureRequestUnexpectedlyReachedServer;
+            } else |err| {
+                self.socket_pressure_error_code = @intFromError(err);
+                self.socket_pressure_denial_observed = err == error.ProcessFdQuotaExceeded;
+            }
+        }
+        self.socket_pressure_no_ingress = self.public_request_ingress_count == ingress_before;
+        if (!self.socket_pressure_denial_observed or !self.socket_pressure_no_ingress)
+            return error.ProductionSocketPressureDidNotDenyBeforeIngress;
+
+        try self.sim.setListenerConnectionLimit(endpoint, null);
+        quota_active = false;
+        {
+            var recovered_executor = io_http_executor.IoHttpExecutor.init(self.alloc, self.sim.io(), .{
+                .connect_timeout_ms = 1_000,
+                .read_timeout_ms = 1_000,
+                .write_timeout_ms = 1_000,
+                .keep_alive = false,
+                .pool_max_connections = 1,
+                .pool_max_per_host = 1,
+            });
+            defer {
+                recovered_executor.beginShutdown();
+                recovered_executor.drainShutdown();
+                recovered_executor.deinit();
+            }
+            var recovered_client = api_http_client.ApiHttpClient.init(self.alloc, recovered_executor.executor());
+            var response = try recovered_client.fetchLookupResponse(
+                self.data_api_uris[target_index],
+                "docs",
+                "doc:k",
+                null,
+            );
+            defer response.deinit(self.alloc);
+            self.socket_pressure_recovered = response.status == 200 and
+                std.mem.indexOf(u8, response.body, "production-split") != null;
+        }
+        if (!self.socket_pressure_recovered)
+            return error.ProductionSocketPressureDidNotRecover;
     }
 
     fn saturateNodeMemory(self: *Fixture) !void {
@@ -2526,6 +2634,11 @@ pub const Fixture = struct {
         graph_owner_restart_error_code: u16,
         graph_partial_write_injected: bool,
         graph_partial_write_observed: bool,
+        socket_pressure_injected: bool,
+        socket_pressure_denial_observed: bool,
+        socket_pressure_error_code: u16,
+        socket_pressure_no_ingress: bool,
+        socket_pressure_recovered: bool,
         resource_pressure_observed: bool,
         resource_denial_ok: bool,
         resource_denial_status: u16,
@@ -2576,6 +2689,11 @@ pub const Fixture = struct {
             .graph_owner_restart_error_code = self.graph_owner_restart_error_code,
             .graph_partial_write_injected = self.graph_partial_write_injected,
             .graph_partial_write_observed = self.graph_partial_write_observed,
+            .socket_pressure_injected = self.socket_pressure_injected,
+            .socket_pressure_denial_observed = self.socket_pressure_denial_observed,
+            .socket_pressure_error_code = self.socket_pressure_error_code,
+            .socket_pressure_no_ingress = self.socket_pressure_no_ingress,
+            .socket_pressure_recovered = self.socket_pressure_recovered,
             .resource_pressure_observed = self.resource_pressure_observed,
             .resource_denial_ok = self.resource_denial_sound,
             .resource_denial_status = self.resource_denial_status,

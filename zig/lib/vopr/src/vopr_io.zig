@@ -578,6 +578,21 @@ pub const VoprIo = struct {
         return self.network.outboundEndpointPayloadPartialWriteCount();
     }
 
+    /// Apply or clear a reversible connection quota for one logical listener's
+    /// bound address. Zero denies new connections without disturbing
+    /// established streams.
+    pub fn setListenerConnectionLimit(
+        self: *VoprIo,
+        address: std.Io.net.IpAddress,
+        max_connections: ?usize,
+    ) !void {
+        try self.network.setListenerConnectionLimit(address, max_connections);
+    }
+
+    pub fn listenerConnectionCount(self: *const VoprIo, address: std.Io.net.IpAddress) usize {
+        return self.network.listenerConnectionCount(address);
+    }
+
     pub fn setDirectionalPartition(self: *VoprIo, source: ?std.Io.net.Socket.Handle, destination: ?std.Io.net.Socket.Handle) void {
         self.network.faults.partition_source = source;
         self.network.faults.partition_destination = destination;

@@ -108,6 +108,7 @@ const SocketState = struct {
     closed: bool = false,
     next_packet_sequence: u64 = 1,
     connection_endpoint_id: ?ids.StableId = null,
+    connection_listener_endpoint_id: ?ids.StableId = null,
     connection_owner_id: ?ids.StableId = null,
     connection_client: bool = false,
     connection_identity_bound: bool = false,
@@ -143,6 +144,11 @@ const IdentitySequence = struct {
     next_sequence: u64 = 1,
 };
 
+const ListenerConnectionLimit = struct {
+    endpoint_id: ids.StableId,
+    max_connections: usize,
+};
+
 pub const Network = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -152,6 +158,7 @@ pub const Network = struct {
     sockets: std.AutoHashMapUnmanaged(std.Io.net.Socket.Handle, *SocketState) = .empty,
     socket_order: std.ArrayListUnmanaged(*SocketState) = .empty,
     identity_sequences: std.ArrayListUnmanaged(IdentitySequence) = .empty,
+    listener_connection_limits: std.ArrayListUnmanaged(ListenerConnectionLimit) = .empty,
     open_sockets: usize = 0,
     packets: std.ArrayListUnmanaged(Packet) = .empty,
     queued_bytes: usize = 0,
@@ -186,6 +193,7 @@ pub const Network = struct {
         }
         self.socket_order.deinit(self.allocator);
         self.identity_sequences.deinit(self.allocator);
+        self.listener_connection_limits.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -592,6 +600,36 @@ pub const Network = struct {
         return self.open_sockets;
     }
 
+    /// Set or clear the maximum number of live accepted connections for one
+    /// logical IP listener, identified by its bound address. The endpoint
+    /// identity, rather than a transient socket handle, makes the fault stable
+    /// across listener restart. A zero limit is an intentional reversible
+    /// denial of every new connection.
+    pub fn setListenerConnectionLimit(
+        self: *Network,
+        address: std.Io.net.IpAddress,
+        max_connections: ?usize,
+    ) !void {
+        const endpoint_id = ipEndpointIdentity("vopr-io.ip-listener", address);
+        for (self.listener_connection_limits.items, 0..) |*limit, index| {
+            if (limit.endpoint_id != endpoint_id) continue;
+            if (max_connections) |value| {
+                limit.max_connections = value;
+            } else {
+                _ = self.listener_connection_limits.orderedRemove(index);
+            }
+            return;
+        }
+        if (max_connections) |value| try self.listener_connection_limits.append(self.allocator, .{
+            .endpoint_id = endpoint_id,
+            .max_connections = value,
+        });
+    }
+
+    pub fn listenerConnectionCount(self: *const Network, address: std.Io.net.IpAddress) usize {
+        return self.listenerConnectionCountById(ipEndpointIdentity("vopr-io.ip-listener", address));
+    }
+
     pub fn setOutboundEndpointOutage(self: *Network, address: ?std.Io.net.IpAddress) void {
         self.clearOutboundEndpointPayloadFault();
         self.faults.outbound_endpoint_down = if (address) |value|
@@ -650,6 +688,15 @@ pub const Network = struct {
     }
 
     fn connectToListener(self: *Network, listener: *SocketState, address: std.Io.net.IpAddress, owner_id: ids.StableId) !*SocketState {
+        const endpoint_id = ipEndpointIdentity("vopr-io.ip-listener", switch (listener.listener_address.?) {
+            .ip => |value| value,
+            .unix => unreachable,
+        });
+        for (self.listener_connection_limits.items) |limit| {
+            if (limit.endpoint_id == endpoint_id and
+                self.listenerConnectionCountById(endpoint_id) >= limit.max_connections)
+                return error.ProcessFdQuotaExceeded;
+        }
         if (listener.pending_accept.items.len >= listener.backlog) return error.ConnectionRefused;
         const connection_owner = ids.derive("vopr-io.connection-owner", listener.id, owner_id);
         const connection_sequence = try self.allocateIdentitySequence(connection_owner);
@@ -662,9 +709,11 @@ pub const Network = struct {
         client.peer = server.handle;
         server.peer = client.handle;
         client.connection_endpoint_id = listener.id;
+        client.connection_listener_endpoint_id = endpoint_id;
         client.connection_owner_id = connection_owner;
         client.connection_client = true;
         server.connection_endpoint_id = listener.id;
+        server.connection_listener_endpoint_id = endpoint_id;
         server.connection_owner_id = connection_owner;
         listener.pending_accept.append(self.allocator, server.handle) catch |err| {
             self.destroyLastSocket(server);
@@ -673,6 +722,16 @@ pub const Network = struct {
         };
         try self.wait_port.?.wake(listener.acceptResource(), 1);
         return client;
+    }
+
+    fn listenerConnectionCountById(self: *const Network, endpoint_id: ids.StableId) usize {
+        var count: usize = 0;
+        for (self.socket_order.items) |socket_state| {
+            if (socket_state.closed or socket_state.kind != .stream or socket_state.connection_client) continue;
+            const listener_id = socket_state.connection_listener_endpoint_id orelse continue;
+            if (listener_id == endpoint_id) count += 1;
+        }
+        return count;
     }
 
     fn bindConnectionIdentity(
@@ -1105,6 +1164,62 @@ test "closing listener releases unaccepted server sockets" {
     try std.testing.expectEqual(@as(usize, 1), network.openSocketCount());
     try std.testing.expect(network.close(&.{client.handle}));
     try std.testing.expectEqual(@as(usize, 0), network.openSocketCount());
+}
+
+test "listener connection limits are endpoint scoped and reversible" {
+    const NoopWaitPort = struct {
+        fn wait(_: *anyopaque, _: ids.StableId) anyerror!void {
+            return error.UnexpectedWait;
+        }
+
+        fn wake(_: *anyopaque, _: ids.StableId, _: u32) anyerror!void {}
+
+        fn ready(_: *anyopaque, _: ids.StableId) anyerror!void {}
+
+        const vtable = WaitPort.VTable{ .wait = wait, .wake = wake, .ready = ready };
+    };
+
+    var network = try Network.init(std.testing.allocator, .{});
+    defer network.deinit();
+    var context: u8 = 0;
+    network.bindWaitPort(.{ .ptr = &context, .vtable = &NoopWaitPort.vtable });
+    const limited_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(21_007) };
+    const healthy_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(21_008) };
+    const limited_listener = try network.listenIp(&limited_address, .{});
+    _ = try network.listenIp(&healthy_address, .{});
+
+    try network.setListenerConnectionLimit(limited_address, 1);
+    const first_client = try network.connectIp(&limited_address, .{ .mode = .stream }, 1);
+    const first_server = try network.accept(limited_listener.handle);
+    try std.testing.expectEqual(@as(usize, 1), network.listenerConnectionCount(limited_address));
+    try std.testing.expectError(
+        error.ProcessFdQuotaExceeded,
+        network.connectIp(&limited_address, .{ .mode = .stream }, 2),
+    );
+    _ = try network.connectIp(&healthy_address, .{ .mode = .stream }, 3);
+
+    try std.testing.expect(network.close(&.{ first_client.handle, first_server.handle }));
+    try std.testing.expectEqual(@as(usize, 0), network.listenerConnectionCount(limited_address));
+    const recovered_client = try network.connectIp(&limited_address, .{ .mode = .stream }, 4);
+    const recovered_server = try network.accept(limited_listener.handle);
+    try std.testing.expect(network.close(&.{ recovered_client.handle, recovered_server.handle }));
+
+    try network.setListenerConnectionLimit(limited_address, 0);
+    try std.testing.expectError(
+        error.ProcessFdQuotaExceeded,
+        network.connectIp(&limited_address, .{ .mode = .stream }, 5),
+    );
+    try std.testing.expect(network.close(&.{limited_listener.handle}));
+    _ = try network.listenIp(&limited_address, .{});
+    try std.testing.expectError(
+        error.ProcessFdQuotaExceeded,
+        network.connectIp(&limited_address, .{ .mode = .stream }, 6),
+    );
+    const rebound_listener = network.findIpListener(limited_address).?;
+    try std.testing.expect(network.close(&.{rebound_listener.handle}));
+    try network.setListenerConnectionLimit(limited_address, null);
+    _ = try network.listenIp(&limited_address, .{});
+    _ = try network.connectIp(&limited_address, .{ .mode = .stream }, 7);
 }
 
 test "connection identities are scoped to logical clients on one listener" {

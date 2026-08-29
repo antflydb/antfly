@@ -16,7 +16,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 21;
+    pub const version: u32 = 22;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -31,6 +31,7 @@ pub const Scenario = struct {
     const production_join_split_id = vopr.id.stable(name, "public-distributed-join-survives-active-split");
     const production_durable_join_takeover_id = vopr.id.stable(name, "public-durable-shuffle-finalizer-takeover");
     const production_overlapping_faults_id = vopr.id.stable(name, "production-graph-overlapping-link-resource-faults-recover");
+    const production_socket_pressure_id = vopr.id.stable(name, "production-listener-socket-pressure-recovers-during-split");
     const graph_restart_id = vopr.id.stable(name, "public-graph-inflight-restart-sound");
     const graph_topology_id = vopr.id.stable(name, "public-graph-topology-churn-fails-closed");
     const graph_partial_id = vopr.id.stable(name, "public-graph-partial-result-rejected");
@@ -58,6 +59,7 @@ pub const Scenario = struct {
         .{ .id = production_join_split_id, .name = name ++ ".public-distributed-join-survives-active-split", .kind = .always },
         .{ .id = production_durable_join_takeover_id, .name = name ++ ".public-durable-shuffle-finalizer-takeover", .kind = .always },
         .{ .id = production_overlapping_faults_id, .name = name ++ ".production-graph-overlapping-link-resource-faults-recover", .kind = .always },
+        .{ .id = production_socket_pressure_id, .name = name ++ ".production-listener-socket-pressure-recovers-during-split", .kind = .always },
         .{ .id = graph_restart_id, .name = name ++ ".public-graph-inflight-restart-sound", .kind = .always },
         .{ .id = graph_topology_id, .name = name ++ ".public-graph-topology-churn-fails-closed", .kind = .always },
         .{ .id = graph_partial_id, .name = name ++ ".public-graph-partial-result-rejected", .kind = .always },
@@ -94,6 +96,7 @@ pub const Scenario = struct {
         production_data_plane_join_split,
         production_data_plane_durable_join_takeover,
         production_data_plane_graph_split_overlapping_faults,
+        production_data_plane_graph_split_socket_pressure,
 
         fn isProduction(self: Mode) bool {
             return self == .production_data_plane_baseline or
@@ -106,12 +109,13 @@ pub const Scenario = struct {
                 self == .production_data_plane_graph_split_resource_pressure or
                 self == .production_data_plane_join_split or
                 self == .production_data_plane_durable_join_takeover or
-                self == .production_data_plane_graph_split_overlapping_faults;
+                self == .production_data_plane_graph_split_overlapping_faults or
+                self == .production_data_plane_graph_split_socket_pressure;
         }
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_graph_split_overlapping_faults => .clean,
+                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -150,6 +154,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "production-data-plane-join-split"),
         vopr.id.stable(name, "production-data-plane-durable-join-takeover"),
         vopr.id.stable(name, "production-data-plane-graph-split-overlapping-faults"),
+        vopr.id.stable(name, "production-data-plane-graph-split-socket-pressure"),
     };
     const mode_names = [_][]const u8{
         name ++ ".clean",
@@ -172,6 +177,7 @@ pub const Scenario = struct {
         name ++ ".production-data-plane-join-split",
         name ++ ".production-data-plane-durable-join-takeover",
         name ++ ".production-data-plane-graph-split-overlapping-faults",
+        name ++ ".production-data-plane-graph-split-socket-pressure",
     };
 
     const production_baseline_ordinal: usize = @intFromEnum(Mode.production_data_plane_baseline);
@@ -185,6 +191,7 @@ pub const Scenario = struct {
     const production_join_split_ordinal: usize = @intFromEnum(Mode.production_data_plane_join_split);
     const production_durable_join_takeover_ordinal: usize = @intFromEnum(Mode.production_data_plane_durable_join_takeover);
     const production_graph_split_overlapping_faults_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_overlapping_faults);
+    const production_graph_split_socket_pressure_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_socket_pressure);
 
     const metadata_role = vopr.id.stable(name, "role.metadata");
     const public_data_role = vopr.id.stable(name, "role.public-data");
@@ -297,6 +304,11 @@ pub const Scenario = struct {
         graph_owner_restart_error_code: u64 = 0,
         graph_partial_write_injected: bool = false,
         graph_partial_write_observed: bool = false,
+        socket_pressure_injected: bool = false,
+        socket_pressure_denial_observed: bool = false,
+        socket_pressure_error_code: u64 = 0,
+        socket_pressure_no_ingress: bool = false,
+        socket_pressure_recovered: bool = false,
         graph_partial_rejected_sound: bool = false,
     };
 
@@ -432,6 +444,11 @@ pub const Scenario = struct {
                     .graph_owner_restart_error_code = snapshot.graph_owner_restart_error_code,
                     .graph_partial_write_injected = snapshot.graph_partial_write_injected,
                     .graph_partial_write_observed = snapshot.graph_partial_write_observed,
+                    .socket_pressure_injected = snapshot.socket_pressure_injected,
+                    .socket_pressure_denial_observed = snapshot.socket_pressure_denial_observed,
+                    .socket_pressure_error_code = snapshot.socket_pressure_error_code,
+                    .socket_pressure_no_ingress = snapshot.socket_pressure_no_ingress,
+                    .socket_pressure_recovered = snapshot.socket_pressure_recovered,
                     .graph_partial_rejected_sound = snapshot.graph_partial_rejected_sound,
                     .resource_pressure_observed = snapshot.resource_pressure_observed,
                     .resource_denial_ok = snapshot.resource_denial_ok,
@@ -507,6 +524,7 @@ pub const Scenario = struct {
                         mode == .production_data_plane_graph_split_partial_write or
                         mode == .production_data_plane_graph_split_resource_pressure or
                         mode == .production_data_plane_graph_split_overlapping_faults or
+                        mode == .production_data_plane_graph_split_socket_pressure or
                         mode == .production_data_plane_join_split,
                 );
                 self.production_cluster.?.setGraphEnabled(
@@ -516,7 +534,8 @@ pub const Scenario = struct {
                         mode == .production_data_plane_graph_split_owner_restart or
                         mode == .production_data_plane_graph_split_partial_write or
                         mode == .production_data_plane_graph_split_resource_pressure or
-                        mode == .production_data_plane_graph_split_overlapping_faults,
+                        mode == .production_data_plane_graph_split_overlapping_faults or
+                        mode == .production_data_plane_graph_split_socket_pressure,
                 );
                 self.production_cluster.?.setJoinEnabled(
                     mode == .production_data_plane_join_split or
@@ -528,6 +547,7 @@ pub const Scenario = struct {
                     .production_data_plane_graph_split_partial_write => .graph_partial_write,
                     .production_data_plane_graph_split_resource_pressure => .resource_pressure,
                     .production_data_plane_graph_split_overlapping_faults => .graph_transport_resource_pressure,
+                    .production_data_plane_graph_split_socket_pressure => .socket_pressure,
                     .production_data_plane_durable_join_takeover => .join_finalizer_ack_failure,
                     else => .clean,
                 });
@@ -755,6 +775,18 @@ pub const Scenario = struct {
                         domain_id,
                     );
                 },
+                .production_data_plane_graph_split_socket_pressure => {
+                    const production = self.production_cluster orelse
+                        return error.MissingProductionCluster;
+                    const target_index = production.currentGraphOwnerIndex() orelse
+                        return error.ProductionDataGraphLeaderMissing;
+                    try production.configureSocketPressureTarget(target_index);
+                    try deployment.activateFault(
+                        vopr.id.stable(name, "fault.production-graph-split-socket-pressure"),
+                        .resource,
+                        resource_domains[target_index],
+                    );
+                },
                 .production_data_plane_durable_join_takeover => for (process_domains[0..3], 0..) |domain_id, index| try deployment.activateFault(
                     vopr.id.derive("full-cluster.production-durable-join-finalizer-ack-failure", domain_id, index),
                     .custom,
@@ -928,6 +960,11 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".graph-owner-restart-error", if (cluster) |snapshot| @intCast(snapshot.graph_owner_restart_error_code) else 0);
         try builder.addNamed(allocator, name ++ ".graph-partial-write-injected", @intFromBool(if (cluster) |snapshot| snapshot.graph_partial_write_injected else false));
         try builder.addNamed(allocator, name ++ ".graph-partial-write-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_partial_write_observed else false));
+        try builder.addNamed(allocator, name ++ ".socket-pressure-injected", @intFromBool(if (cluster) |snapshot| snapshot.socket_pressure_injected else false));
+        try builder.addNamed(allocator, name ++ ".socket-pressure-denial-observed", @intFromBool(if (cluster) |snapshot| snapshot.socket_pressure_denial_observed else false));
+        try builder.addNamed(allocator, name ++ ".socket-pressure-error", if (cluster) |snapshot| @intCast(snapshot.socket_pressure_error_code) else 0);
+        try builder.addNamed(allocator, name ++ ".socket-pressure-no-ingress", @intFromBool(if (cluster) |snapshot| snapshot.socket_pressure_no_ingress else false));
+        try builder.addNamed(allocator, name ++ ".socket-pressure-recovered", @intFromBool(if (cluster) |snapshot| snapshot.socket_pressure_recovered else false));
         try builder.addNamed(allocator, name ++ ".graph-partial-result-rejected", @intFromBool(if (cluster) |snapshot| snapshot.graph_partial_rejected_sound else false));
         try builder.addNamed(allocator, name ++ ".request-errors", if (production) |value| @intFromBool(value.failure != null) else if (fixture) |public_cluster| @intCast(public_cluster.request_errors) else 0);
         try builder.addNamed(allocator, name ++ ".last-request-error", if (production) |value| if (value.failure) |err| @intFromError(err) else 0 else if (fixture) |public_cluster| @intCast(public_cluster.last_request_error_code) else 0);
@@ -969,13 +1006,15 @@ pub const Scenario = struct {
             state.mode == .production_data_plane_graph_split_owner_restart or
             state.mode == .production_data_plane_graph_split_partial_write or
             state.mode == .production_data_plane_graph_split_resource_pressure or
-            state.mode == .production_data_plane_graph_split_overlapping_faults;
+            state.mode == .production_data_plane_graph_split_overlapping_faults or
+            state.mode == .production_data_plane_graph_split_socket_pressure;
         const production_graph_split_mode = state.mode == .production_data_plane_graph_split or
             state.mode == .production_data_plane_graph_split_transport_failure or
             state.mode == .production_data_plane_graph_split_owner_restart or
             state.mode == .production_data_plane_graph_split_partial_write or
             state.mode == .production_data_plane_graph_split_resource_pressure or
-            state.mode == .production_data_plane_graph_split_overlapping_faults;
+            state.mode == .production_data_plane_graph_split_overlapping_faults or
+            state.mode == .production_data_plane_graph_split_socket_pressure;
         const resources = state.sim.resourceSnapshot();
         try sink.check(allocator, acknowledged_id, !state.complete or (cluster != null and cluster.?.requests_ok));
         try sink.check(allocator, quorum_id, !state.complete or (cluster != null and cluster.?.topology_ok));
@@ -1051,6 +1090,14 @@ pub const Scenario = struct {
                 (!cluster.?.resource_retry_attempted or cluster.?.resource_absent_before_retry) and
                 cluster.?.resource_recovery_ok and
                 cluster.?.resource_post_split_ok and cluster.?.post_split_graph_query_ok));
+        try sink.check(allocator, production_socket_pressure_id, !state.complete or state.mode.? != .production_data_plane_graph_split_socket_pressure or
+            (cluster != null and cluster.?.graph_query_ok and
+                cluster.?.split_graph_inflight_started and cluster.?.split_graph_inflight_complete and
+                !cluster.?.split_graph_inflight_rejected and cluster.?.split_graph_inflight_ok and
+                cluster.?.socket_pressure_injected and cluster.?.socket_pressure_denial_observed and
+                cluster.?.socket_pressure_error_code == @intFromError(error.ProcessFdQuotaExceeded) and
+                cluster.?.socket_pressure_no_ingress and cluster.?.socket_pressure_recovered and
+                cluster.?.post_split_graph_query_ok));
         try sink.check(allocator, graph_restart_id, !state.complete or state.mode.? != .graph_inflight_restart or
             (cluster != null and cluster.?.graph_inflight_restart_observed and cluster.?.graph_inflight_restart_recovered and
                 cluster.?.graph_query_ok));
@@ -1129,12 +1176,13 @@ fn runExactMode(
     const production_join_split_mode = mode_id == Scenario.mode_ids[Scenario.production_join_split_ordinal];
     const production_durable_join_takeover_mode = mode_id == Scenario.mode_ids[Scenario.production_durable_join_takeover_ordinal];
     const production_graph_split_overlapping_faults_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_overlapping_faults_ordinal];
+    const production_graph_split_socket_pressure_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_socket_pressure_ordinal];
     const production_mode = production_baseline_mode or production_graph_mode or
         production_split_mode or production_graph_split_mode or
         production_graph_split_transport_mode or production_graph_split_owner_restart_mode or
         production_graph_split_partial_write_mode or production_graph_split_resource_pressure_mode or
         production_join_split_mode or production_durable_join_takeover_mode or
-        production_graph_split_overlapping_faults_mode;
+        production_graph_split_overlapping_faults_mode or production_graph_split_socket_pressure_mode;
     // Fault extensions of the promoted graph/split history keep its
     // cooperative scheduling seed. The prefixed mode remains distinct replay
     // truth, while comparable scheduling ensures the experiment changes the
@@ -1147,7 +1195,7 @@ fn runExactMode(
     else if (production_graph_split_owner_restart_mode or
         production_graph_split_partial_write_mode or production_graph_split_resource_pressure_mode)
         Scenario.production_graph_split_transport_ordinal
-    else if (production_graph_split_overlapping_faults_mode)
+    else if (production_graph_split_overlapping_faults_mode or production_graph_split_socket_pressure_mode)
         Scenario.production_graph_split_transport_ordinal
     else
         mode_ordinal;
@@ -1163,7 +1211,9 @@ fn runExactMode(
         .resource_budget = if (production_mode) 256 else 96,
         .backend_ids = &backend_ids,
         .source_revision = if (production_mode)
-            (if (production_graph_split_overlapping_faults_mode)
+            (if (production_graph_split_socket_pressure_mode)
+                "full-cluster-vopr-v22-graph-split-socket-pressure"
+            else if (production_graph_split_overlapping_faults_mode)
                 "full-cluster-vopr-v21-graph-split-overlapping-faults"
             else if (production_durable_join_takeover_mode)
                 "full-cluster-vopr-v20-durable-join-takeover"
@@ -1392,6 +1442,19 @@ test "full cluster production data plane graph active split overlapping link res
         Scenario.mode_ids[ordinal],
         ordinal,
         600_000,
+        .complete,
+    );
+}
+
+test "full cluster production data plane graph active split socket pressure exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.production_graph_split_socket_pressure_ordinal;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        500_000,
         .complete,
     );
 }
