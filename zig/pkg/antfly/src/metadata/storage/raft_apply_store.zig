@@ -10992,6 +10992,31 @@ test "metadata raft apply store transition codec preserves native generation res
     );
 }
 
+test "metadata raft apply store transition codec preserves combined store capabilities" {
+    const encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .register_store = .{
+            .store_id = 101,
+            .node_id = 201,
+            .reporter_incarnation = 0x1234,
+            .native_generation_restore_version = metadata_table_manager.native_generation_restore_protocol_version,
+            .artifact_sources_protocol_version = metadata_table_manager.artifact_sources_protocol_version,
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = (try decodeTransitionCommand(std.testing.allocator, encoded)) orelse
+        return error.InvalidMetadataTransitionEncoding;
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        metadata_table_manager.native_generation_restore_protocol_version,
+        decoded.register_store.native_generation_restore_version,
+    );
+    try std.testing.expectEqual(
+        metadata_table_manager.artifact_sources_protocol_version,
+        decoded.register_store.artifact_sources_protocol_version,
+    );
+}
+
 test "metadata raft apply store transition codec rejects generation without incarnation" {
     try std.testing.expectError(
         error.InvalidStoreReporterFence,
@@ -11430,15 +11455,17 @@ test "metadata runtime index status decoder accepts version ten records" {
     try std.testing.expect(!decoded.repair_active_generation_serviceable);
 }
 
-test "metadata runtime index status decoder defaults version fourteen source failures safely" {
+test "metadata runtime index status decoder defaults version fifteen source failures safely" {
     const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(u16, 15), runtime_status_protocol.artifact_source_status_record_version);
+    try std.testing.expectEqual(@as(u16, 16), runtime_status_protocol.artifact_source_failure_status_record_version);
     var encoded = std.ArrayListUnmanaged(u8).empty;
     defer encoded.deinit(alloc);
     const sources = [_]metadata.RuntimeIndexSourceReplayStatusReport{.{
         .artifact_name = "chunk_vectors",
         .published_sequence = 7,
         .target_sequence = 9,
-        // V14 cannot represent this field; the decoder must not consume a byte
+        // V15 cannot represent this field; the decoder must not consume a byte
         // from the following record or manufacture a terminal failure.
         .failed = true,
     }};
