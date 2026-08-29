@@ -15,8 +15,9 @@ T = TypeVar("T", bound="IndexReadinessStatus")
 class IndexReadinessStatus:
     """
     Attributes:
-        state (IndexReadinessState): Authoritative query-readiness and completeness state for the desired index
-            incarnation.
+        state (IndexReadinessState): Lifecycle state for the desired index incarnation. A failed desired repair may
+            coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the
+            explicit milestone booleans.
         queryable (bool): Whether the published generation can safely answer queries.
         complete (bool): Whether the desired incarnation has complete coverage and publication according to its
             configured policies.

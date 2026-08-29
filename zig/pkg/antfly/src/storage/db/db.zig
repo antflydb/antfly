@@ -114,6 +114,48 @@ const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const process_memory_mod = @import("antfly_platform").process_memory;
 
+fn quarantineClaimMismatchReason(
+    mismatch: index_manager_mod.IndexManager.FailedIndexLoadMismatch,
+) []const u8 {
+    // Stable safety/UX precedence: a replacement identity or configuration
+    // change must not be obscured by a simultaneous policy/revision change.
+    if (mismatch.incarnation_changed) return "quarantine_incarnation_changed";
+    if (mismatch.config_changed) return "quarantine_config_changed";
+    if (mismatch.action_changed) return "quarantine_recovery_policy_changed";
+    return "quarantine_claim_stale";
+}
+
+test "quarantine claim mismatch reason uses stable safety precedence" {
+    try std.testing.expectEqualStrings(
+        "quarantine_incarnation_changed",
+        quarantineClaimMismatchReason(.{
+            .incarnation_changed = true,
+            .config_changed = true,
+            .action_changed = true,
+            .revision_changed = true,
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "quarantine_config_changed",
+        quarantineClaimMismatchReason(.{
+            .config_changed = true,
+            .action_changed = true,
+            .revision_changed = true,
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "quarantine_recovery_policy_changed",
+        quarantineClaimMismatchReason(.{
+            .action_changed = true,
+            .revision_changed = true,
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "quarantine_claim_stale",
+        quarantineClaimMismatchReason(.{ .revision_changed = true }),
+    );
+}
+
 fn standaloneResourceManagerOptionsForTotal(alloc: Allocator, total: u64) resource_manager_mod.Options {
     var options = resource_manager_mod.Options{ .identity_allocator = alloc };
     if (total == 0) return options;
@@ -697,6 +739,36 @@ pub const QueryVisibilityChange = enum {
     publish_blocking,
     index_repair_pending,
     index_repair_cleared,
+    /// An exact derived watermark advanced far enough to wake a resident
+    /// progress wait. This is scheduling-only: it neither invalidates readers
+    /// nor changes durable repair admission.
+    index_repair_progress,
+};
+
+pub const IndexRepairAdmission = enum {
+    unknown,
+    serviceable,
+    blocked,
+};
+
+/// Incarnation-scoped identity for a durable repair visibility edge. The
+/// slices are borrowed for the synchronous notification only; consumers that
+/// retain an event must clone them.
+pub const IndexRepairVisibility = struct {
+    index_name: []const u8,
+    repair_id: u128 = 0,
+    revision: u64 = 0,
+    config_hash: u64 = 0,
+    root_generation: u64 = 0,
+    previous_admission: IndexRepairAdmission = .unknown,
+    admission: IndexRepairAdmission = .unknown,
+    previous_action_required: bool = false,
+    action_required: bool = false,
+};
+
+pub const QueryVisibilityEvent = struct {
+    change: QueryVisibilityChange,
+    repair: ?IndexRepairVisibility = null,
 };
 
 pub const QueryVisibilityHook = struct {
@@ -704,10 +776,10 @@ pub const QueryVisibilityHook = struct {
     table_name: []const u8,
     group_id: u64 = 0,
     db: ?*DB = null,
-    on_change: *const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64, db: ?*DB, change: QueryVisibilityChange) void,
+    on_change: *const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64, db: ?*DB, event: QueryVisibilityEvent) void,
 
-    pub fn notify(self: @This(), change: QueryVisibilityChange) void {
-        self.on_change(self.ptr, self.table_name, self.group_id, self.db, change);
+    pub fn notify(self: @This(), event: QueryVisibilityEvent) void {
+        self.on_change(self.ptr, self.table_name, self.group_id, self.db, event);
     }
 };
 
@@ -736,6 +808,359 @@ fn managedIndexReplayHint(kind: types.IndexKind) change_journal_mod.TargetHint {
     };
 }
 
+fn retryableIndexRepairTerminalPhase(
+    last_error: ?[]const u8,
+    trigger: index_repair_state.Trigger,
+) ?index_repair_state.Phase {
+    const reason = last_error orelse return null;
+    if (!std.mem.eql(u8, reason, @errorName(error.RepairSourceCoverageIncomplete))) return null;
+    // Only managed replacement/artifact generations can become complete
+    // after source artifacts are reprocessed. Structural-invalid and
+    // externally supplied generations retain fail-closed classification.
+    if (trigger != .operator_generation_rebuild and
+        trigger != .artifact_coverage_mismatch and
+        trigger != .replay_artifact_unavailable)
+    {
+        return null;
+    }
+    return .detected;
+}
+
+const IndexRepairScheduleClass = enum {
+    runnable,
+    paused,
+    terminal,
+};
+
+const IndexRepairScheduleRecord = struct {
+    repair_id: u128,
+    revision: u64,
+    index_name: []u8,
+    class: IndexRepairScheduleClass,
+    phase_terminal: bool,
+    /// Durable retry deadline from the checkpoint. Progress waits are a
+    /// process-local acceleration layer and may temporarily replace the
+    /// effective deadline without changing durable repair authority.
+    durable_next_retry_at_ms: u64,
+    next_retry_at_ms: u64,
+    progress_wait_until_sequence: ?u64 = null,
+    heap_position: ?usize = null,
+};
+
+/// Process-resident projection of the durable repair checkpoint. Durable
+/// intents remain the authority; this directory is rebuilt once per open and
+/// then revision-reconciled after every committed mutation. It makes the
+/// maintenance owner's steady-state inspection cost depend on its quantum,
+/// not on the total number of paused or future-dated intents.
+const IndexRepairSchedulerDirectory = struct {
+    const ControlMutationDisposition = enum { stale, next, gap };
+
+    initialized: bool = false,
+    identity: ?index_repair_state.ReplicaIdentity = null,
+    /// Exact durable checkpoint revision materialized by this projection.
+    /// Events must arrive consecutively; a gap invalidates the acceleration
+    /// layer and the next owner reconstructs it from the durable authority.
+    control_revision: u64 = 0,
+    records: std.ArrayListUnmanaged(IndexRepairScheduleRecord) = .empty,
+    by_id: std.AutoHashMapUnmanaged(u128, usize) = .empty,
+    by_name: std.StringHashMapUnmanaged(usize) = .empty,
+    /// Exact min-heap of runnable repair IDs. Record-owned positions make
+    /// update/removal O(log N) without tombstones, lazy pruning, or an
+    /// occasionally unbounded compaction pass under the owner mutex.
+    runnable_heap: std.ArrayListUnmanaged(u128) = .empty,
+    cursor: usize = 0,
+    runnable: usize = 0,
+    paused: usize = 0,
+    terminal: usize = 0,
+    progress_waiters: usize = 0,
+
+    fn classifyControlMutation(
+        self: *const @This(),
+        identity: index_repair_state.ReplicaIdentity,
+        control_revision: u64,
+    ) ControlMutationDisposition {
+        const current_identity = self.identity orelse return .gap;
+        if (!current_identity.eql(identity)) return .gap;
+        if (control_revision <= self.control_revision) return .stale;
+        if (control_revision != self.control_revision +| 1) return .gap;
+        return .next;
+    }
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.records.items) |record| alloc.free(record.index_name);
+        self.records.deinit(alloc);
+        self.by_id.deinit(alloc);
+        self.by_name.deinit(alloc);
+        self.runnable_heap.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn heapLess(self: *const @This(), a: u128, b: u128) bool {
+        const a_record = self.records.items[self.by_id.get(a).?];
+        const b_record = self.records.items[self.by_id.get(b).?];
+        if (a_record.next_retry_at_ms != b_record.next_retry_at_ms) {
+            return a_record.next_retry_at_ms < b_record.next_retry_at_ms;
+        }
+        return a < b;
+    }
+
+    fn swapHeap(self: *@This(), a: usize, b: usize) void {
+        if (a == b) return;
+        std.mem.swap(u128, &self.runnable_heap.items[a], &self.runnable_heap.items[b]);
+        self.records.items[self.by_id.get(self.runnable_heap.items[a]).?].heap_position = a;
+        self.records.items[self.by_id.get(self.runnable_heap.items[b]).?].heap_position = b;
+    }
+
+    fn siftHeapUp(self: *@This(), start: usize) usize {
+        var child = start;
+        while (child != 0) {
+            const parent = (child - 1) / 2;
+            if (!self.heapLess(self.runnable_heap.items[child], self.runnable_heap.items[parent])) break;
+            self.swapHeap(child, parent);
+            child = parent;
+        }
+        return child;
+    }
+
+    fn siftHeapDown(self: *@This(), start: usize) void {
+        var parent = start;
+        while (true) {
+            const left = parent * 2 + 1;
+            if (left >= self.runnable_heap.items.len) break;
+            const right = left + 1;
+            const child = if (right < self.runnable_heap.items.len and
+                self.heapLess(self.runnable_heap.items[right], self.runnable_heap.items[left]))
+                right
+            else
+                left;
+            if (!self.heapLess(self.runnable_heap.items[child], self.runnable_heap.items[parent])) break;
+            self.swapHeap(parent, child);
+            parent = child;
+        }
+    }
+
+    fn addRunnableAssumeCapacity(self: *@This(), repair_id: u128) void {
+        const position = self.runnable_heap.items.len;
+        self.runnable_heap.appendAssumeCapacity(repair_id);
+        self.records.items[self.by_id.get(repair_id).?].heap_position = position;
+        _ = self.siftHeapUp(position);
+    }
+
+    fn removeRunnable(self: *@This(), repair_id: u128) void {
+        const record_index = self.by_id.get(repair_id) orelse return;
+        const position = self.records.items[record_index].heap_position orelse return;
+        const last = self.runnable_heap.pop().?;
+        self.records.items[record_index].heap_position = null;
+        if (position == self.runnable_heap.items.len) return;
+        self.runnable_heap.items[position] = last;
+        self.records.items[self.by_id.get(last).?].heap_position = position;
+        const new_position = self.siftHeapUp(position);
+        self.siftHeapDown(new_position);
+    }
+
+    fn rescheduleRunnable(self: *@This(), repair_id: u128) void {
+        const record = self.records.items[self.by_id.get(repair_id).?];
+        const position = record.heap_position orelse unreachable;
+        const new_position = self.siftHeapUp(position);
+        self.siftHeapDown(new_position);
+    }
+
+    /// Arm an event-driven wait for an exact durable repair revision. The
+    /// fallback deadline recovers missed callbacks and non-replay maintenance
+    /// completion without turning a queryable partial generation into a hot
+    /// owner loop.
+    fn deferForProgress(
+        self: *@This(),
+        repair_id: u128,
+        expected_revision: u64,
+        wake_at_sequence: u64,
+        fallback_at_ms: u64,
+    ) bool {
+        const record_index = self.by_id.get(repair_id) orelse return false;
+        const record = &self.records.items[record_index];
+        if (record.revision != expected_revision or record.class != .runnable) return false;
+        if (record.progress_wait_until_sequence == null) self.progress_waiters += 1;
+        record.progress_wait_until_sequence = wake_at_sequence;
+        record.next_retry_at_ms = @max(fallback_at_ms, record.durable_next_retry_at_ms);
+        self.rescheduleRunnable(repair_id);
+        return true;
+    }
+
+    /// Wake only the waiting repair for the exact index whose durable applied
+    /// watermark advanced. Returns true when the outer group owner must be
+    /// nudged; repeated notifications at the same sequence are coalesced.
+    fn wakeForIndexProgress(self: *@This(), index_name: []const u8, applied_sequence: u64) bool {
+        const record_index = self.by_name.get(index_name) orelse return false;
+        const record = &self.records.items[record_index];
+        const wake_at = record.progress_wait_until_sequence orelse return false;
+        if (applied_sequence < wake_at) return false;
+        record.progress_wait_until_sequence = null;
+        self.progress_waiters -= 1;
+        record.next_retry_at_ms = record.durable_next_retry_at_ms;
+        self.rescheduleRunnable(record.repair_id);
+        return true;
+    }
+
+    fn earliestRetryDeadline(self: *const @This()) u64 {
+        const repair_id = if (self.runnable_heap.items.len == 0)
+            return 0
+        else
+            self.runnable_heap.items[0];
+        return self.records.items[self.by_id.get(repair_id).?].next_retry_at_ms;
+    }
+
+    fn wake(self: *const @This()) DB.IndexRepairWake {
+        if (self.runnable != 0) {
+            const deadline = self.earliestRetryDeadline();
+            return if (deadline == 0) .immediate else .{ .at_realtime_ms = deadline };
+        }
+        if (self.paused != 0 or self.terminal != 0) return .parked;
+        return .empty;
+    }
+
+    fn incrementClass(self: *@This(), class: IndexRepairScheduleClass) void {
+        switch (class) {
+            .runnable => self.runnable += 1,
+            .paused => self.paused += 1,
+            .terminal => self.terminal += 1,
+        }
+    }
+
+    fn decrementClass(self: *@This(), class: IndexRepairScheduleClass) void {
+        switch (class) {
+            .runnable => self.runnable -= 1,
+            .paused => self.paused -= 1,
+            .terminal => self.terminal -= 1,
+        }
+    }
+
+    fn classForIntent(intent: index_repair_state.IndexRepairIntent) IndexRepairScheduleClass {
+        if (intent.phase == .terminal and retryableIndexRepairTerminalPhase(
+            intent.last_error,
+            intent.trigger,
+        ) == null) return .terminal;
+        if (intent.automation == .paused) return .paused;
+        return .runnable;
+    }
+
+    fn upsert(
+        self: *@This(),
+        alloc: Allocator,
+        intent: index_repair_state.IndexRepairIntent,
+        persisted_revision: u64,
+    ) !void {
+        const class = classForIntent(intent);
+        if (self.by_id.get(intent.repair_id)) |record_index| {
+            const record = &self.records.items[record_index];
+            if (!std.mem.eql(u8, record.index_name, intent.index_name)) return error.InvalidIndexRepairState;
+            if (persisted_revision < record.revision) return;
+            if (persisted_revision == record.revision) {
+                if (record.class != class or
+                    record.phase_terminal != (intent.phase == .terminal) or
+                    record.durable_next_retry_at_ms != intent.next_retry_at_ms)
+                {
+                    return error.InvalidIndexRepairState;
+                }
+                return;
+            }
+            const schedule_changed = record.class != class or
+                record.next_retry_at_ms != intent.next_retry_at_ms or
+                record.progress_wait_until_sequence != null;
+            if (schedule_changed and record.class != .runnable and class == .runnable)
+                try self.runnable_heap.ensureUnusedCapacity(alloc, 1);
+            if (schedule_changed and record.class == .runnable and class != .runnable)
+                self.removeRunnable(intent.repair_id);
+            if (record.class != class) {
+                self.decrementClass(record.class);
+                self.incrementClass(class);
+                record.class = class;
+            }
+            record.next_retry_at_ms = intent.next_retry_at_ms;
+            record.durable_next_retry_at_ms = intent.next_retry_at_ms;
+            if (record.progress_wait_until_sequence != null) self.progress_waiters -= 1;
+            record.progress_wait_until_sequence = null;
+            record.phase_terminal = intent.phase == .terminal;
+            record.revision = persisted_revision;
+            if (schedule_changed and class == .runnable) {
+                if (record.heap_position == null)
+                    self.addRunnableAssumeCapacity(intent.repair_id)
+                else
+                    self.rescheduleRunnable(intent.repair_id);
+            }
+            return;
+        }
+        if (self.by_name.contains(intent.index_name)) return error.InvalidIndexRepairState;
+        const owned_name = try alloc.dupe(u8, intent.index_name);
+        errdefer alloc.free(owned_name);
+        try self.records.ensureUnusedCapacity(alloc, 1);
+        try self.by_id.ensureUnusedCapacity(alloc, 1);
+        try self.by_name.ensureUnusedCapacity(alloc, 1);
+        if (class == .runnable) try self.runnable_heap.ensureUnusedCapacity(alloc, 1);
+        const record_index = self.records.items.len;
+        self.records.appendAssumeCapacity(.{
+            .repair_id = intent.repair_id,
+            .revision = persisted_revision,
+            .index_name = owned_name,
+            .class = class,
+            .phase_terminal = intent.phase == .terminal,
+            .durable_next_retry_at_ms = intent.next_retry_at_ms,
+            .next_retry_at_ms = intent.next_retry_at_ms,
+        });
+        self.by_id.putAssumeCapacity(intent.repair_id, record_index);
+        self.by_name.putAssumeCapacity(owned_name, record_index);
+        self.incrementClass(class);
+        if (class == .runnable) self.addRunnableAssumeCapacity(intent.repair_id);
+    }
+
+    fn remove(self: *@This(), alloc: Allocator, repair_id: u128) void {
+        const record_index = self.by_id.get(repair_id) orelse return;
+        const removed = self.records.items[record_index];
+        if (removed.progress_wait_until_sequence != null) self.progress_waiters -= 1;
+        if (removed.class == .runnable) self.removeRunnable(removed.repair_id);
+        self.decrementClass(removed.class);
+        _ = self.by_id.remove(removed.repair_id);
+        _ = self.by_name.remove(removed.index_name);
+        alloc.free(removed.index_name);
+        _ = self.records.swapRemove(record_index);
+        if (record_index < self.records.items.len) {
+            const moved = self.records.items[record_index];
+            self.by_id.getPtr(moved.repair_id).?.* = record_index;
+            self.by_name.getPtr(moved.index_name).?.* = record_index;
+        }
+        if (self.records.items.len == 0) {
+            self.cursor = 0;
+        } else if (self.cursor >= self.records.items.len) {
+            self.cursor %= self.records.items.len;
+        }
+    }
+
+    fn buildFromState(alloc: Allocator, state: index_repair_state.State) !@This() {
+        var directory: @This() = .{
+            .initialized = true,
+            .identity = state.identity,
+            .control_revision = state.control_revision,
+        };
+        errdefer directory.deinit(alloc);
+        try directory.records.ensureTotalCapacity(alloc, state.entries.items.len);
+        const map_capacity: u32 = @intCast(state.entries.items.len);
+        try directory.by_id.ensureTotalCapacity(alloc, map_capacity);
+        try directory.by_name.ensureTotalCapacity(alloc, map_capacity);
+        try directory.runnable_heap.ensureTotalCapacity(alloc, state.entries.items.len);
+        for (state.entries.items) |entry| try directory.upsert(alloc, entry.intent, entry.intent.revision);
+        return directory;
+    }
+
+    fn summary(self: *@This()) DB.IndexRepairIntentSummary {
+        return .{
+            .runnable = self.runnable,
+            .paused = self.paused,
+            .terminal = self.terminal,
+            .earliest_retry_at_ms = self.earliestRetryDeadline(),
+            .wake = self.wake(),
+        };
+    }
+};
+
 const AsyncContext = struct {
     alloc: Allocator,
     io: ?std.Io = null,
@@ -755,6 +1180,16 @@ const AsyncContext = struct {
     query_visibility_hook: ?QueryVisibilityHook = null,
     query_visibility_hook_in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     index_repair_notification_pending: bool = false,
+    /// Serializes durable repair-control transitions with their process-local
+    /// quarantine binding effects. The scheduler directory remains a fallible
+    /// projection and is never allowed to race claim ownership decisions.
+    index_repair_control_mutex: std.atomic.Mutex = .unlocked,
+    index_repair_scheduler_mutex: std.atomic.Mutex = .unlocked,
+    /// Avoid taking the scheduler mutex on the common derived-watermark path
+    /// when no repair is waiting for index progress.
+    index_repair_progress_wait_pending: std.atomic.Value(bool) = .init(false),
+    index_repair_scheduler_revision: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    index_repair_scheduler: IndexRepairSchedulerDirectory = .{},
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
     dense_finish_mutex: std.atomic.Mutex = .unlocked,
@@ -792,6 +1227,7 @@ const AsyncContext = struct {
     stats: AsyncContentionStats = .{},
 
     fn deinit(self: *@This(), alloc: Allocator) void {
+        self.index_repair_scheduler.deinit(alloc);
         self.applied_sequence_coalescer.deinit(alloc);
         var pending_finalization_it = self.pending_dense_projection_finalizations.keyIterator();
         while (pending_finalization_it.next()) |key| alloc.free(@constCast(key.*));
@@ -3170,6 +3606,32 @@ pub const DB = struct {
     active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
     shadow_index_repair_hook: ?@This().ShadowIndexRepairHook = null,
 
+    const IndexRepairDiscoveryObservationTestHook = struct {
+        ptr: *anyopaque,
+        after_observation: *const fn (ptr: *anyopaque, db: *DB, repair_id: u128) anyerror!void,
+    };
+    var test_index_repair_discovery_observation_hook: ?IndexRepairDiscoveryObservationTestHook = null;
+
+    const IndexRepairRollbackRetryTestHook = struct {
+        ptr: *anyopaque,
+        before_retry: *const fn (ptr: *anyopaque, db: *DB, repair_id: u128) anyerror!void,
+    };
+    var test_index_repair_rollback_retry_hook: ?IndexRepairRollbackRetryTestHook = null;
+
+    const IndexRepairAdvanceLeaseTestHook = struct {
+        ptr: *anyopaque,
+        after_acquire: *const fn (ptr: *anyopaque, db: *DB, repair_id: u128) anyerror!void,
+    };
+    var test_index_repair_advance_lease_hook: ?IndexRepairAdvanceLeaseTestHook = null;
+
+    const IndexRepairReconcileFenceTestHook = struct {
+        ptr: *anyopaque,
+        before_fence: ?*const fn (ptr: *anyopaque, db: *DB, repair_id: u128) anyerror!void = null,
+        after_validation: ?*const fn (ptr: *anyopaque, db: *DB, repair_id: u128) anyerror!void = null,
+        before_retirement: ?*const fn (ptr: *anyopaque, db: *DB, repair_id: u128) anyerror!void = null,
+    };
+    var test_index_repair_reconcile_fence_hook: ?IndexRepairReconcileFenceTestHook = null;
+
     const engine_vtable = db_core.Engine.VTable{
         .batch = engineBatch,
         .lookup = engineLookup,
@@ -3831,7 +4293,10 @@ pub const DB = struct {
         }
         self.async_context.query_visibility_hook_mutex.unlock();
         if (pending_hook) |attached| {
-            attached.notify(.index_repair_pending);
+            // A repair edge raised before hook attachment cannot safely retain
+            // a borrowed index identity. Deliver it as unknown scope so the
+            // owner conservatively invalidates group-wide visibility.
+            attached.notify(.{ .change = .index_repair_pending });
             _ = self.async_context.query_visibility_hook_in_flight.fetchSub(1, .release);
         }
         if (hook == null) {
@@ -3873,7 +4338,7 @@ pub const DB = struct {
         notifyQueryVisibilityHook(ctx, .status);
     }
 
-    fn notifyDerivedAppliedSequenceAdvanced(ptr: *anyopaque, index_name: []const u8, _: u64) void {
+    fn notifyDerivedAppliedSequenceAdvanced(ptr: *anyopaque, index_name: []const u8, applied_sequence: u64) void {
         const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
         // The executor invokes this only after persistence, publishing its live
         // applied watermark, and releasing its mutex. Dense lifecycle status
@@ -3891,6 +4356,9 @@ pub const DB = struct {
             else
                 .status,
         );
+        if (wakeIndexRepairForProgressContext(ctx, index_name, applied_sequence)) {
+            notifyQueryVisibilityHook(ctx, .index_repair_progress);
+        }
     }
 
     fn hasQueryVisibilityHook(ctx: *AsyncContext) bool {
@@ -3900,22 +4368,56 @@ pub const DB = struct {
     }
 
     fn notifyQueryVisibilityHook(ctx: *AsyncContext, change: QueryVisibilityChange) void {
+        notifyQueryVisibilityEvent(ctx, .{ .change = change });
+    }
+
+    fn notifyIndexRepairVisibilityHook(
+        ctx: *AsyncContext,
+        change: QueryVisibilityChange,
+        intent: index_repair_state.IndexRepairIntent,
+        persisted_revision: u64,
+        previous_admission: IndexRepairAdmission,
+        previous_action_required: bool,
+    ) void {
+        std.debug.assert(change == .index_repair_pending or change == .index_repair_cleared);
+        const admission: IndexRepairAdmission = if (change == .index_repair_cleared)
+            .serviceable
+        else
+            indexRepairAdmission(intent);
+        notifyQueryVisibilityEvent(ctx, .{
+            .change = change,
+            .repair = .{
+                .index_name = intent.index_name,
+                .repair_id = intent.repair_id,
+                .revision = persisted_revision,
+                .config_hash = intent.config_hash,
+                .root_generation = intent.root_generation,
+                .previous_admission = previous_admission,
+                .admission = admission,
+                .previous_action_required = previous_action_required,
+                .action_required = change != .index_repair_cleared and indexRepairActionRequired(intent),
+            },
+        });
+    }
+
+    fn notifyQueryVisibilityEvent(ctx: *AsyncContext, event: QueryVisibilityEvent) void {
         lockAtomic(&ctx.query_visibility_hook_mutex);
         const hook = ctx.query_visibility_hook orelse {
-            switch (change) {
+            switch (event.change) {
                 .index_repair_pending => ctx.index_repair_notification_pending = true,
+                .index_repair_progress => {},
                 else => {},
             }
             ctx.query_visibility_hook_mutex.unlock();
             return;
         };
-        if (change == .index_repair_pending or change == .index_repair_cleared) {
+        if (event.change == .index_repair_pending or event.change == .index_repair_cleared) {
             ctx.index_repair_notification_pending = false;
         }
         _ = ctx.query_visibility_hook_in_flight.fetchAdd(1, .acquire);
         ctx.query_visibility_hook_mutex.unlock();
         defer _ = ctx.query_visibility_hook_in_flight.fetchSub(1, .release);
-        hook.notify(change);
+        hook.notify(event);
     }
 
     const DetachedEnrichmentRuntime = struct {
@@ -7463,7 +7965,7 @@ pub const DB = struct {
             // Index catalog durability is already decided at this point.
             // Queries and foreground indexing remain available; surface the
             // maintenance degradation without misreporting the mutation.
-            std.log.err("failed to restart text merge runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
+            std.log.warn("failed to restart text merge runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
             scheduleMaintenanceRestartContext(
                 self.async_context,
                 self.backend_runtime.durable_jobs,
@@ -7476,7 +7978,7 @@ pub const DB = struct {
     fn restartSparseCompactionAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) void {
         const runtime = self.sparse_compaction_runtime orelse return;
         runtime.resumeAfterPause() catch |err| {
-            std.log.err("failed to restart sparse compaction runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
+            std.log.warn("failed to restart sparse compaction runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
             scheduleMaintenanceRestartContext(
                 self.async_context,
                 self.backend_runtime.durable_jobs,
@@ -7530,6 +8032,31 @@ pub const DB = struct {
             self.release();
         }
     };
+
+    /// Lightweight serialization for repair-control commits which bind to the
+    /// current catalog incarnation but do not publish or retire runtime index
+    /// pointers. Full structural mutations take the same mutex and additionally
+    /// drain background pointer borrowers; discovery needs only the shared
+    /// incarnation boundary and therefore does not stop merge/compaction work.
+    const IndexCatalogIncarnationGuard = struct {
+        db: *DB,
+        active: bool = true,
+
+        fn release(self: *@This()) void {
+            if (!self.active) return;
+            self.db.index_structural_mutation_mutex.unlock();
+            self.active = false;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.release();
+        }
+    };
+
+    fn beginIndexCatalogIncarnationGuard(self: *DB) IndexCatalogIncarnationGuard {
+        lockAtomicWithBackoff(&self.index_structural_mutation_mutex);
+        return .{ .db = self };
+    }
 
     const QuarantineIndexPublicationFence = struct {
         db: *DB,
@@ -10441,6 +10968,14 @@ pub const DB = struct {
         already_pending: usize = 0,
         terminal: usize = 0,
         existing_terminal: usize = 0,
+        automatic_remaining: usize = 0,
+        automatic_deferred: usize = 0,
+        automatic_sweep_complete: bool = true,
+
+        pub fn automaticDiscoveryPending(self: @This()) bool {
+            return self.automatic_remaining != 0 and
+                (!self.automatic_sweep_complete or self.automatic_deferred != 0);
+        }
     };
 
     fn indexRepairStateLocation(self: *const DB) !index_repair_state.Location {
@@ -10476,39 +11011,192 @@ pub const DB = struct {
         return admissions.len != 0;
     }
 
+    /// Authoritative owner wake decision. A tagged state prevents `0` from
+    /// ambiguously meaning both "run now" and "nothing runnable" at scheduler
+    /// boundaries.
+    pub const IndexRepairWake = union(enum) {
+        immediate,
+        at_realtime_ms: u64,
+        parked,
+        empty,
+
+        pub fn retryAtMs(self: @This()) u64 {
+            return switch (self) {
+                .at_realtime_ms => |deadline| deadline,
+                .immediate, .parked, .empty => 0,
+            };
+        }
+    };
+
     pub const IndexRepairIntentSummary = struct {
         runnable: usize = 0,
         paused: usize = 0,
         terminal: usize = 0,
         earliest_retry_at_ms: u64 = 0,
+        wake: IndexRepairWake = .empty,
     };
+
+    /// Requires index_repair_scheduler_mutex.
+    fn publishIndexRepairProgressWaitHint(ctx: *AsyncContext) void {
+        ctx.index_repair_progress_wait_pending.store(
+            ctx.index_repair_scheduler.initialized and
+                ctx.index_repair_scheduler.progress_waiters != 0,
+            .release,
+        );
+    }
+
+    fn invalidateIndexRepairSchedulerDirectory(ctx: *AsyncContext) void {
+        _ = ctx.index_repair_scheduler_revision.fetchAdd(1, .acq_rel);
+        lockAtomic(&ctx.index_repair_scheduler_mutex);
+        defer ctx.index_repair_scheduler_mutex.unlock();
+        ctx.index_repair_scheduler.deinit(ctx.alloc);
+        publishIndexRepairProgressWaitHint(ctx);
+    }
+
+    fn noteIndexRepairSchedulerUpsert(
+        ctx: *AsyncContext,
+        intent: index_repair_state.IndexRepairIntent,
+        persisted_revision: u64,
+        control_revision: u64,
+    ) void {
+        _ = ctx.index_repair_scheduler_revision.fetchAdd(1, .acq_rel);
+        lockAtomic(&ctx.index_repair_scheduler_mutex);
+        defer ctx.index_repair_scheduler_mutex.unlock();
+        if (!ctx.index_repair_scheduler.initialized) {
+            publishIndexRepairProgressWaitHint(ctx);
+            return;
+        }
+        switch (ctx.index_repair_scheduler.classifyControlMutation(intent.identity(), control_revision)) {
+            .stale => return,
+            .gap => {
+                ctx.index_repair_scheduler.deinit(ctx.alloc);
+                publishIndexRepairProgressWaitHint(ctx);
+                return;
+            },
+            .next => {},
+        }
+        ctx.index_repair_scheduler.upsert(ctx.alloc, intent, persisted_revision) catch {
+            // The durable checkpoint remains authoritative. Allocation or a
+            // consistency mismatch invalidates only the acceleration layer;
+            // the next owner rebuilds it from the committed checkpoint.
+            ctx.index_repair_scheduler.deinit(ctx.alloc);
+            publishIndexRepairProgressWaitHint(ctx);
+            return;
+        };
+        ctx.index_repair_scheduler.control_revision = control_revision;
+        publishIndexRepairProgressWaitHint(ctx);
+    }
+
+    fn noteIndexRepairSchedulerRemove(
+        ctx: *AsyncContext,
+        identity: index_repair_state.ReplicaIdentity,
+        repair_id: u128,
+        control_revision: u64,
+    ) void {
+        _ = ctx.index_repair_scheduler_revision.fetchAdd(1, .acq_rel);
+        lockAtomic(&ctx.index_repair_scheduler_mutex);
+        defer ctx.index_repair_scheduler_mutex.unlock();
+        if (!ctx.index_repair_scheduler.initialized) {
+            publishIndexRepairProgressWaitHint(ctx);
+            return;
+        }
+        switch (ctx.index_repair_scheduler.classifyControlMutation(identity, control_revision)) {
+            .stale => return,
+            .gap => {
+                ctx.index_repair_scheduler.deinit(ctx.alloc);
+                publishIndexRepairProgressWaitHint(ctx);
+                return;
+            },
+            .next => {},
+        }
+        ctx.index_repair_scheduler.remove(ctx.alloc, repair_id);
+        ctx.index_repair_scheduler.control_revision = control_revision;
+        publishIndexRepairProgressWaitHint(ctx);
+    }
+
+    const progressive_index_repair_audit_interval_ms: u64 = 5 * std.time.ms_per_s;
+
+    fn deferIndexRepairForProgress(
+        self: *DB,
+        repair_id: u128,
+        expected_revision: u64,
+        wake_at_sequence: u64,
+    ) bool {
+        const fallback_at_ms = currentTimeNs() / std.time.ns_per_ms +|
+            progressive_index_repair_audit_interval_ms;
+        lockAtomic(&self.async_context.index_repair_scheduler_mutex);
+        defer self.async_context.index_repair_scheduler_mutex.unlock();
+        if (!self.async_context.index_repair_scheduler.initialized) return false;
+        const armed = self.async_context.index_repair_scheduler.deferForProgress(
+            repair_id,
+            expected_revision,
+            wake_at_sequence,
+            fallback_at_ms,
+        );
+        if (armed) self.async_context.index_repair_progress_wait_pending.store(true, .release);
+        return armed;
+    }
+
+    fn wakeIndexRepairForProgressContext(
+        ctx: *AsyncContext,
+        index_name: []const u8,
+        applied_sequence: u64,
+    ) bool {
+        if (!ctx.index_repair_progress_wait_pending.load(.acquire)) return false;
+        lockAtomic(&ctx.index_repair_scheduler_mutex);
+        defer ctx.index_repair_scheduler_mutex.unlock();
+        if (!ctx.index_repair_scheduler.initialized) {
+            ctx.index_repair_progress_wait_pending.store(false, .release);
+            return false;
+        }
+        const woke = ctx.index_repair_scheduler.wakeForIndexProgress(index_name, applied_sequence);
+        if (ctx.index_repair_scheduler.progress_waiters == 0) {
+            ctx.index_repair_progress_wait_pending.store(false, .release);
+        }
+        return woke;
+    }
+
+    fn ensureIndexRepairSchedulerDirectory(self: *DB, alloc: Allocator) !void {
+        while (true) {
+            lockAtomic(&self.async_context.index_repair_scheduler_mutex);
+            const initialized = self.async_context.index_repair_scheduler.initialized;
+            const current_root = if (self.async_context.index_repair_scheduler.identity) |identity|
+                identity.root_generation == self.core.root_generation
+            else
+                false;
+            if (initialized and !current_root) {
+                self.async_context.index_repair_scheduler.deinit(self.async_context.alloc);
+                publishIndexRepairProgressWaitHint(self.async_context);
+                _ = self.async_context.index_repair_scheduler_revision.fetchAdd(1, .acq_rel);
+            }
+            self.async_context.index_repair_scheduler_mutex.unlock();
+            if (initialized and current_root) return;
+            if (initialized) continue;
+
+            const observed_revision = self.async_context.index_repair_scheduler_revision.load(.acquire);
+            var state = try self.loadOrCreateCurrentIndexRepairState(alloc);
+            defer state.deinit(alloc);
+            var replacement = try IndexRepairSchedulerDirectory.buildFromState(self.async_context.alloc, state);
+            var replacement_owned = true;
+            defer if (replacement_owned) replacement.deinit(self.async_context.alloc);
+
+            lockAtomic(&self.async_context.index_repair_scheduler_mutex);
+            defer self.async_context.index_repair_scheduler_mutex.unlock();
+            if (self.async_context.index_repair_scheduler.initialized) return;
+            if (self.async_context.index_repair_scheduler_revision.load(.acquire) != observed_revision) continue;
+            self.async_context.index_repair_scheduler = replacement;
+            replacement_owned = false;
+            publishIndexRepairProgressWaitHint(self.async_context);
+            return;
+        }
+    }
 
     pub fn indexRepairIntentSummary(self: *DB, alloc: Allocator) !IndexRepairIntentSummary {
         if (self.managedAdmissionMaterializationPending()) try self.drainManagedIndexAdmissions(alloc);
-        var state = self.loadIndexRepairState(alloc) catch |err| switch (err) {
-            error.FileNotFound => return .{},
-            else => return err,
-        };
-        defer state.deinit(alloc);
-        var summary: IndexRepairIntentSummary = .{};
-        for (state.entries.items) |entry| {
-            if (entry.intent.phase == .terminal and retryableIndexRepairTerminalPhase(
-                entry.intent.last_error,
-                entry.intent.trigger,
-            ) == null) {
-                summary.terminal += 1;
-            } else if (entry.intent.automation == .paused) {
-                summary.paused += 1;
-            } else {
-                summary.runnable += 1;
-                if (entry.intent.next_retry_at_ms != 0 and
-                    (summary.earliest_retry_at_ms == 0 or entry.intent.next_retry_at_ms < summary.earliest_retry_at_ms))
-                {
-                    summary.earliest_retry_at_ms = entry.intent.next_retry_at_ms;
-                }
-            }
-        }
-        return summary;
+        try self.ensureIndexRepairSchedulerDirectory(alloc);
+        lockAtomic(&self.async_context.index_repair_scheduler_mutex);
+        defer self.async_context.index_repair_scheduler_mutex.unlock();
+        return self.async_context.index_repair_scheduler.summary();
     }
 
     pub fn loadIndexRepairState(self: *const DB, alloc: Allocator) !index_repair_state.State {
@@ -10526,12 +11214,25 @@ pub const DB = struct {
                     for (configs) |*cfg| cfg.deinit(alloc);
                     alloc.free(configs);
                 }
-                for (configs) |cfg| try self.core.index_manager.markRepairUnavailable(cfg.name);
+                for (configs) |cfg| try self.core.index_manager.markUnscopedRepairUnavailable(cfg.name);
                 return;
             },
             else => return err,
         };
         defer state.deinit(alloc);
+        // Opening already has to inspect every durable intent to install the
+        // fail-closed serving gates. Build the exact scheduler projection from
+        // that same snapshot so the first maintenance quantum never pays a
+        // second O(N) cold-directory reconstruction.
+        var scheduler = try IndexRepairSchedulerDirectory.buildFromState(self.async_context.alloc, state);
+        var scheduler_owned = true;
+        defer if (scheduler_owned) scheduler.deinit(self.async_context.alloc);
+        lockAtomic(&self.async_context.index_repair_scheduler_mutex);
+        if (!self.async_context.index_repair_scheduler.initialized) {
+            self.async_context.index_repair_scheduler = scheduler;
+            scheduler_owned = false;
+        }
+        self.async_context.index_repair_scheduler_mutex.unlock();
         for (state.entries.items) |entry| {
             var unavailable = indexRepairIntentBlocksService(entry.intent);
             if (!unavailable) {
@@ -10541,10 +11242,19 @@ pub const DB = struct {
                 }
             }
             if (unavailable) {
-                try self.core.index_manager.markRepairUnavailable(entry.intent.index_name);
-            } else {
-                self.core.index_manager.clearRepairUnavailable(entry.intent.index_name);
-            }
+                try self.core.index_manager.markUnscopedRepairUnavailable(entry.intent.index_name);
+                self.core.index_manager.publishRepairAdmission(
+                    entry.intent.index_name,
+                    repairAdmissionVersion(entry.intent, entry.intent.revision, entry.intent.control_revision),
+                    true,
+                    false,
+                );
+            } else self.core.index_manager.publishRepairAdmission(
+                entry.intent.index_name,
+                repairAdmissionVersion(entry.intent, entry.intent.revision, entry.intent.control_revision),
+                false,
+                false,
+            );
         }
     }
 
@@ -10593,7 +11303,10 @@ pub const DB = struct {
         // pinned in-memory generation, so it is the sole read-only exception.
         if (pinned_read_generation) {
             if (pinned_generation_proved_serviceable) {
-                self.core.index_manager.clearRepairUnavailable(index_name);
+                self.core.index_manager.publishRepairServiceabilityProof(
+                    index_name,
+                    repairAdmissionVersion(intent, intent.revision, intent.control_revision),
+                );
             }
             return;
         }
@@ -10601,7 +11314,10 @@ pub const DB = struct {
             const checkpoint = try self.core.loadProjectionCheckpoint(alloc, index_name);
             unavailable = checkpoint.status != .clean or checkpoint.config_hash != intent.config_hash;
         }
-        if (!unavailable) self.core.index_manager.clearRepairUnavailable(index_name);
+        if (!unavailable) self.core.index_manager.publishRepairServiceabilityProof(
+            index_name,
+            repairAdmissionVersion(intent, intent.revision, intent.control_revision),
+        );
     }
 
     /// Managed admission deliberately installs an empty, gated generation and
@@ -10853,7 +11569,7 @@ pub const DB = struct {
         const marker = self.core.store.get(alloc, key) catch |err| switch (err) {
             error.NotFound => {
                 self.core.index_manager.clearManagedAdmissionSnapshotForIndex(index_name);
-                self.core.index_manager.clearRepairUnavailable(index_name);
+                self.core.index_manager.clearUnscopedRepairUnavailable(index_name);
                 return;
             },
             else => return err,
@@ -10867,7 +11583,12 @@ pub const DB = struct {
             // Only an operator-requested rebuild starts from a generation that
             // is still proven healthy. Coverage mismatch or missing proof is
             // fail-closed until replacement validation publishes cleanup.
-            .operator_generation_rebuild => intent.phase == .activating or intent.phase == .validating,
+            .operator_generation_rebuild => intent.phase == .activating or
+                intent.phase == .validating or
+                intent.phase == .rolling_back,
+            .replay_artifact_unavailable => intent.phase == .activating or
+                intent.phase == .validating or
+                intent.phase == .rolling_back,
             .artifact_coverage_mismatch,
             .artifact_counter_missing,
             .root_generation_rebuild,
@@ -10875,6 +11596,30 @@ pub const DB = struct {
             .operator_generation_validation,
             => intent.phase != .cleanup,
         };
+    }
+
+    fn indexRepairAdmission(intent: index_repair_state.IndexRepairIntent) IndexRepairAdmission {
+        return if (indexRepairIntentBlocksService(intent)) .blocked else .serviceable;
+    }
+
+    fn repairAdmissionVersion(
+        intent: index_repair_state.IndexRepairIntent,
+        persisted_revision: u64,
+        control_revision: u64,
+    ) index_manager_mod.IndexManager.RepairAdmissionVersion {
+        return .{
+            .repair_id = intent.repair_id,
+            .control_revision = control_revision,
+            .revision = persisted_revision,
+            .config_hash = intent.config_hash,
+            .root_generation = intent.root_generation,
+        };
+    }
+
+    fn indexRepairActionRequired(intent: index_repair_state.IndexRepairIntent) bool {
+        if (intent.automation == .paused) return true;
+        return intent.phase == .terminal and
+            retryableIndexRepairTerminalPhase(intent.last_error, intent.trigger) == null;
     }
 
     fn loadOrCreateCurrentIndexRepairState(self: *DB, alloc: Allocator) !index_repair_state.State {
@@ -10926,10 +11671,12 @@ pub const DB = struct {
                 errdefer if (replacement_intent_owned) replacement_intent.deinit(alloc);
                 try replacement_intents.append(alloc, replacement_intent);
                 replacement_intent_owned = false;
-                try self.core.index_manager.markRepairUnavailable(entry.intent.index_name);
+                try self.core.index_manager.prepareRepairAdmissionRebind(
+                    entry.intent.index_name,
+                    repairAdmissionVersion(replacement_intent, 1, 1),
+                );
                 continue;
             }
-            self.core.index_manager.clearRepairUnavailable(entry.intent.index_name);
             const separator = std.mem.indexOfScalar(u8, candidate, '/') orelse return error.InvalidRepairCandidatePath;
             const shadow_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate[0..separator] });
             defer alloc.free(shadow_root);
@@ -10938,15 +11685,51 @@ pub const DB = struct {
             try std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_root);
         }
         const old_identity = state.identity;
-        state.deinit(alloc);
-        state_owned = false;
-        return try index_repair_state.resetForRootGenerationWithIntentsAt(
+        const replacement = try index_repair_state.resetForRootGenerationWithIntentsAt(
             alloc,
             location,
             old_identity,
             self.core.root_generation,
             replacement_intents.items,
         );
+        for (replacement.entries.items) |entry| {
+            self.core.index_manager.publishRepairAdmission(
+                entry.intent.index_name,
+                repairAdmissionVersion(entry.intent, entry.intent.revision, entry.intent.control_revision),
+                indexRepairIntentBlocksService(entry.intent),
+                false,
+            );
+        }
+        // Only the checkpoint replacement authorizes retirement of old-root
+        // admissions. Active candidates were pre-bound to their new identity,
+        // so the exact old publication is ignored for them; inactive entries
+        // are released without allowing a same-name incarnation to be opened.
+        for (state.entries.items) |entry| {
+            self.core.index_manager.publishRepairAdmission(
+                entry.intent.index_name,
+                repairAdmissionVersion(entry.intent, entry.intent.revision +| 1, state.control_revision +| 1),
+                false,
+                false,
+            );
+            self.core.index_manager.clearUnscopedRepairUnavailable(entry.intent.index_name);
+        }
+        state.deinit(alloc);
+        state_owned = false;
+        invalidateIndexRepairSchedulerDirectory(self.async_context);
+        const observed_revision = self.async_context.index_repair_scheduler_revision.load(.acquire);
+        var scheduler = try IndexRepairSchedulerDirectory.buildFromState(self.async_context.alloc, replacement);
+        var scheduler_owned = true;
+        defer if (scheduler_owned) scheduler.deinit(self.async_context.alloc);
+        lockAtomic(&self.async_context.index_repair_scheduler_mutex);
+        if (!self.async_context.index_repair_scheduler.initialized and
+            self.async_context.index_repair_scheduler_revision.load(.acquire) == observed_revision)
+        {
+            self.async_context.index_repair_scheduler = scheduler;
+            scheduler_owned = false;
+        }
+        publishIndexRepairProgressWaitHint(self.async_context);
+        self.async_context.index_repair_scheduler_mutex.unlock();
+        return replacement;
     }
 
     fn loadIndexRepairEntryById(
@@ -11013,12 +11796,26 @@ pub const DB = struct {
                 .index_name = try alloc.dupe(u8, entry.intent.index_name),
                 .retain_after_sequence = 0,
             };
-            try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
+            const control_revision = try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
+            self.core.index_manager.publishRepairAdmission(
+                entry.intent.index_name,
+                repairAdmissionVersion(entry.intent, expected.revision +| 1, control_revision),
+                indexRepairIntentBlocksService(entry.intent),
+                true,
+            );
+            noteIndexRepairSchedulerUpsert(self.async_context, entry.intent, expected.revision +| 1, control_revision);
         } else {
             // Re-entering snapshot acquisition must become conservative before
             // replacing a previously finalized build floor.
             entry.pin.?.retain_after_sequence = 0;
-            try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
+            const control_revision = try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
+            self.core.index_manager.publishRepairAdmission(
+                entry.intent.index_name,
+                repairAdmissionVersion(entry.intent, expected.revision +| 1, control_revision),
+                indexRepairIntentBlocksService(entry.intent),
+                true,
+            );
+            noteIndexRepairSchedulerUpsert(self.async_context, entry.intent, expected.revision +| 1, control_revision);
         }
         expected.revision +|= 1;
         self.async_context.index_repair_replay_pinned.store(true, .release);
@@ -11029,7 +11826,14 @@ pub const DB = struct {
         entry.intent.build_floor_sequence = build_floor;
         entry.intent.updated_at_ms = currentTimeNs() / std.time.ns_per_ms;
         entry.pin.?.retain_after_sequence = build_floor;
-        try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
+        const control_revision = try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
+        self.core.index_manager.publishRepairAdmission(
+            entry.intent.index_name,
+            repairAdmissionVersion(entry.intent, expected.revision +| 1, control_revision),
+            indexRepairIntentBlocksService(entry.intent),
+            true,
+        );
+        noteIndexRepairSchedulerUpsert(self.async_context, entry.intent, expected.revision +| 1, control_revision);
         return .{
             .txn = txn,
             .repair_id = repair_id,
@@ -11038,6 +11842,11 @@ pub const DB = struct {
     }
 
     const IndexRepairIntentUpdate = struct {
+        const AttemptFailure = struct {
+            err_name: []const u8,
+            terminal: bool,
+        };
+
         trigger: ?index_repair_state.Trigger = null,
         operator_job_id: ?u64 = null,
         operator_job_created_at_ms: ?u64 = null,
@@ -11061,7 +11870,34 @@ pub const DB = struct {
         owner_epoch: ?u64 = null,
         last_error: ?[]const u8 = null,
         replace_last_error: bool = false,
+        /// Relative retry accounting must be derived from the authoritative
+        /// entry while repair-control ownership is held. Supplying absolute
+        /// counters from an earlier snapshot can lose a concurrent failure.
+        attempt_failure: ?AttemptFailure = null,
     };
+
+    fn indexRepairPhaseHasActivationCertification(phase: index_repair_state.Phase) bool {
+        return switch (phase) {
+            .activating, .validating, .cleanup, .rolling_back => true,
+            else => false,
+        };
+    }
+
+    /// Resolve the phase produced by the complete update transaction. Failure
+    /// accounting can move an intent to `terminal` without populating the
+    /// explicit phase field, while an explicit phase retains the historical
+    /// last-writer precedence of the mutation block below. Safety invariants
+    /// must reason about this effective phase, not the update's encoding.
+    fn indexRepairIntentEffectivePhase(
+        current: index_repair_state.Phase,
+        update: IndexRepairIntentUpdate,
+    ) index_repair_state.Phase {
+        if (update.phase) |phase| return phase;
+        if (update.attempt_failure) |failure| {
+            if (failure.terminal) return .terminal;
+        }
+        return current;
+    }
 
     fn indexRepairRetryDelayMs(repair_id: u128, attempt_count: u32) u64 {
         const exponent: u6 = @intCast(@min(attempt_count -| 1, 5));
@@ -11123,6 +11959,26 @@ pub const DB = struct {
         repair_id: u128,
         update: IndexRepairIntentUpdate,
     ) !void {
+        return try self.updateIndexRepairIntentWithBindingEffect(
+            alloc,
+            repair_id,
+            update,
+            .retain,
+        );
+    }
+
+    const IndexRepairBindingEffect = enum { retain, release };
+
+    fn updateIndexRepairIntentWithBindingEffect(
+        self: *DB,
+        alloc: Allocator,
+        repair_id: u128,
+        update: IndexRepairIntentUpdate,
+        binding_effect: IndexRepairBindingEffect,
+    ) !void {
+        lockAtomic(&self.async_context.index_repair_control_mutex);
+        var control_locked = true;
+        defer if (control_locked) self.async_context.index_repair_control_mutex.unlock();
         const location = try self.indexRepairStateLocation();
         var state = try index_repair_state.loadAt(alloc, location);
         defer state.deinit(alloc);
@@ -11134,6 +11990,18 @@ pub const DB = struct {
         };
         var entry = try state.entries.items[i].clone(alloc);
         defer entry.deinit(alloc);
+        const effective_phase = indexRepairIntentEffectivePhase(entry.intent.phase, update);
+        if (update.candidate_applied_sequence) |candidate_sequence| {
+            const remains_activation_certified = indexRepairPhaseHasActivationCertification(entry.intent.phase) and
+                indexRepairPhaseHasActivationCertification(effective_phase);
+            if (remains_activation_certified and candidate_sequence != entry.intent.candidate_applied_sequence) {
+                return error.InvalidIndexRepairState;
+            }
+        }
+        const previous_admission = indexRepairAdmission(entry.intent);
+        const previous_action_required = indexRepairActionRequired(entry.intent);
+        const previous_trigger = entry.intent.trigger;
+        const previous_phase = entry.intent.phase;
         const expected = index_repair_state.ExpectedTransition{
             .repair_id = entry.intent.repair_id,
             .revision = entry.intent.revision,
@@ -11142,23 +12010,75 @@ pub const DB = struct {
             .root_generation = entry.intent.root_generation,
             .owner_epoch = entry.intent.owner_epoch,
         };
+        if (update.attempt_failure != null and update.replace_last_error) {
+            return error.InvalidArgument;
+        }
+
+        // Stage every fallible owned-string replacement before mutating the
+        // cloned intent. Once staging succeeds, the swaps below are infallible;
+        // on a later checkpoint failure, entry.deinit owns the replacements.
+        const replacement_candidate_path = if (update.replace_candidate_path)
+            if (update.candidate_relative_path) |value| try alloc.dupe(u8, value) else null
+        else
+            null;
+        var replacement_candidate_path_owned = replacement_candidate_path != null;
+        errdefer if (replacement_candidate_path_owned) alloc.free(replacement_candidate_path.?);
+
+        const replacement_previous_active_path = if (update.replace_previous_active_path)
+            if (update.previous_active_relative_path) |value| try alloc.dupe(u8, value) else null
+        else
+            null;
+        var replacement_previous_active_path_owned = replacement_previous_active_path != null;
+        errdefer if (replacement_previous_active_path_owned) alloc.free(replacement_previous_active_path.?);
+
+        const replacement_build_resume_key = if (update.replace_build_resume_key)
+            if (update.build_resume_key) |value| try alloc.dupe(u8, value) else null
+        else
+            null;
+        var replacement_build_resume_key_owned = replacement_build_resume_key != null;
+        errdefer if (replacement_build_resume_key_owned) alloc.free(replacement_build_resume_key.?);
+
+        const replaces_last_error = update.attempt_failure != null or update.replace_last_error;
+        const replacement_last_error_source = if (update.attempt_failure) |failure|
+            @as(?[]const u8, failure.err_name)
+        else
+            update.last_error;
+        const replacement_last_error = if (replaces_last_error)
+            if (replacement_last_error_source) |value| try alloc.dupe(u8, value) else null
+        else
+            null;
+        var replacement_last_error_owned = replacement_last_error != null;
+        errdefer if (replacement_last_error_owned) alloc.free(replacement_last_error.?);
+
+        const now_ms = currentTimeNs() / std.time.ns_per_ms;
+        if (update.attempt_failure) |failure| {
+            entry.intent.attempt_count = @max(entry.intent.attempt_count, 1);
+            entry.intent.failure_streak +|= 1;
+            entry.intent.next_retry_at_ms = if (failure.terminal)
+                0
+            else
+                now_ms +| indexRepairRetryDelayMs(repair_id, entry.intent.failure_streak);
+        }
         if (update.trigger) |value| entry.intent.trigger = value;
         if (update.operator_job_id) |value| entry.intent.operator_job_id = value;
         if (update.operator_job_created_at_ms) |value| entry.intent.operator_job_created_at_ms = value;
-        if (update.phase) |value| entry.intent.phase = value;
+        if (update.phase != null or update.attempt_failure != null) entry.intent.phase = effective_phase;
         if (update.replace_candidate_path) {
             if (entry.intent.candidate_relative_path) |value| alloc.free(value);
-            entry.intent.candidate_relative_path = if (update.candidate_relative_path) |value| try alloc.dupe(u8, value) else null;
+            entry.intent.candidate_relative_path = replacement_candidate_path;
+            replacement_candidate_path_owned = false;
         }
         if (update.previous_pointer_captured) |value| entry.intent.previous_pointer_captured = value;
         if (update.replace_previous_active_path) {
             if (entry.intent.previous_active_relative_path) |value| alloc.free(value);
-            entry.intent.previous_active_relative_path = if (update.previous_active_relative_path) |value| try alloc.dupe(u8, value) else null;
+            entry.intent.previous_active_relative_path = replacement_previous_active_path;
+            replacement_previous_active_path_owned = false;
         }
         if (update.candidate_applied_sequence) |value| entry.intent.candidate_applied_sequence = value;
         if (update.replace_build_resume_key) {
             if (entry.intent.build_resume_key) |value| alloc.free(value);
-            entry.intent.build_resume_key = if (update.build_resume_key) |value| try alloc.dupe(u8, value) else null;
+            entry.intent.build_resume_key = replacement_build_resume_key;
+            replacement_build_resume_key_owned = false;
         }
         if (update.build_reprocessed) |value| entry.intent.build_reprocessed = value;
         if (update.estimated_candidate_bytes) |value| entry.intent.estimated_candidate_bytes = value;
@@ -11169,24 +12089,72 @@ pub const DB = struct {
         if (update.next_retry_at_ms) |value| entry.intent.next_retry_at_ms = value;
         if (update.automation) |value| entry.intent.automation = value;
         if (update.owner_epoch) |value| entry.intent.owner_epoch = value;
-        if (update.replace_last_error) {
+        if (replaces_last_error) {
             if (entry.intent.last_error) |value| alloc.free(value);
-            entry.intent.last_error = if (update.last_error) |value| try alloc.dupe(u8, value) else null;
+            entry.intent.last_error = replacement_last_error;
+            replacement_last_error_owned = false;
         }
-        entry.intent.updated_at_ms = currentTimeNs() / std.time.ns_per_ms;
-        try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
-        if (indexRepairIntentBlocksService(entry.intent)) {
-            try self.core.index_manager.markRepairUnavailable(entry.intent.index_name);
+        entry.intent.updated_at_ms = now_ms;
+        const blocks_service = indexRepairIntentBlocksService(entry.intent);
+        const preserve_serviceability = blocks_service and
+            previous_admission == .blocked and
+            previous_trigger == entry.intent.trigger and
+            previous_phase == entry.intent.phase;
+        var admission_fence: ?index_manager_mod.IndexManager.RepairAdmissionFence = if (blocks_service and
+            !preserve_serviceability)
+            try self.core.index_manager.beginRepairAdmissionFence(entry.intent.index_name)
+        else
+            null;
+        defer if (admission_fence) |*fence| {
+            self.core.index_manager.cancelRepairAdmissionFence(fence, entry.intent.index_name);
+        };
+        const control_revision = try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
+        const persisted_revision = entry.intent.revision +| 1;
+        if (admission_fence) |*fence| {
+            self.core.index_manager.finishRepairAdmissionFence(
+                fence,
+                entry.intent.index_name,
+                repairAdmissionVersion(entry.intent, persisted_revision, control_revision),
+                true,
+                false,
+            );
         } else {
-            self.core.index_manager.clearRepairUnavailable(entry.intent.index_name);
-        }
-        if (update.automation) |automation| {
-            notifyQueryVisibilityHook(
-                self.async_context,
-                if (automation == .enabled) .index_repair_pending else .index_repair_cleared,
+            self.core.index_manager.publishRepairAdmission(
+                entry.intent.index_name,
+                repairAdmissionVersion(entry.intent, persisted_revision, control_revision),
+                blocks_service,
+                preserve_serviceability,
             );
         }
-        if (update.phase) |phase| {
+        noteIndexRepairSchedulerUpsert(self.async_context, entry.intent, persisted_revision, control_revision);
+        if (binding_effect == .release) {
+            self.core.index_manager.releaseFailedIndexLoadRepairClaim(
+                entry.intent.index_name,
+                entry.intent.repair_id,
+            );
+        }
+        // Hooks may enqueue work or inspect the DB. Publish them only after the
+        // durable transition, scheduler projection, and binding effect are one
+        // completed control transaction.
+        self.async_context.index_repair_control_mutex.unlock();
+        control_locked = false;
+        const admission = indexRepairAdmission(entry.intent);
+        const action_required = indexRepairActionRequired(entry.intent);
+        if (previous_admission != admission or
+            previous_action_required != action_required)
+        {
+            notifyIndexRepairVisibilityHook(
+                self.async_context,
+                .index_repair_pending,
+                entry.intent,
+                persisted_revision,
+                previous_admission,
+                previous_action_required,
+            );
+        }
+        const persisted_phase = update.phase orelse
+            if (update.attempt_failure != null) entry.intent.phase else null;
+        if (persisted_phase) |phase| {
             if (self.shadow_index_repair_hook) |hook| {
                 if (hook.after_phase_persisted) |after_phase| {
                     try after_phase(hook.ptr, self, repair_id, phase);
@@ -11367,6 +12335,80 @@ pub const DB = struct {
         return .online_safe;
     }
 
+    /// Replay has already identified the affected dense incarnation and
+    /// proved that ordinary catch-up cannot apply its next journal record.
+    /// Persist that stronger classification before returning to the repair
+    /// scheduler; otherwise an older operator-validation intent waits for the
+    /// same impossible replay forever.
+    pub fn markDenseReplayArtifactRepairRequired(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+    ) !void {
+        return try self.markDenseReplayRepairRequired(
+            alloc,
+            index_name,
+            .projection_generation_invalid,
+            "dense_replay_artifact_missing",
+        );
+    }
+
+    fn markDenseReplayArtifactCoverageRepairRequired(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+    ) !void {
+        return try self.markDenseReplayRepairRequired(
+            alloc,
+            index_name,
+            .artifact_coverage_mismatch,
+            "dense_replay_artifact_unreadable",
+        );
+    }
+
+    fn markDenseReplayRepairRequired(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        blocking_trigger: index_repair_state.Trigger,
+        reason: []const u8,
+    ) !void {
+        const cfg = self.core.index_manager.get(index_name) orelse return error.NotFound;
+        if (cfg.kind != .dense_vector) return error.InvalidArgument;
+        if (try self.indexRepairIdForIndex(alloc, index_name)) |repair_id| {
+            var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
+            defer entry.deinit(alloc);
+            // Replaying the same unavailable artifact must not revoke the
+            // serviceability proof that created this shadow-repair intent.
+            // Only an unrelated pre-existing intent is promoted to the
+            // conservative blocking classification below.
+            if (entry.intent.trigger == .replay_artifact_unavailable) return;
+            // A resumable shadow already owns recovery. Do not replace its
+            // phase or candidate merely because the stale active generation
+            // still cannot consume replay.
+            const classifiable_phase = entry.intent.phase == .detected or entry.intent.phase == .preflight;
+            if (!classifiable_phase or entry.intent.candidate_relative_path != null) return;
+            try self.updateIndexRepairIntent(alloc, repair_id, .{
+                // Preserve the pre-existing intent's fail-closed contract.
+                // Only debt created from this replay observation has proof
+                // that the retained physical generation is serviceable.
+                .trigger = blocking_trigger,
+                .next_retry_at_ms = 0,
+                .last_error = reason,
+                .replace_last_error = true,
+            });
+            return;
+        }
+        _ = try self.createGenerationRepairIntent(
+            alloc,
+            cfg.*,
+            .replay_artifact_unavailable,
+            0,
+            0,
+            reason,
+        );
+    }
+
     fn createGenerationRepairIntent(
         self: *DB,
         alloc: Allocator,
@@ -11397,6 +12439,9 @@ pub const DB = struct {
         last_error: ?[]const u8,
         minimum_target_sequence: ?u64,
     ) !u128 {
+        lockAtomic(&self.async_context.index_repair_control_mutex);
+        var control_locked = true;
+        defer if (control_locked) self.async_context.index_repair_control_mutex.unlock();
         var state = try self.loadOrCreateCurrentIndexRepairState(alloc);
         defer state.deinit(alloc);
         if (state.findIndex(cfg.name)) |i| return state.entries.items[i].intent.repair_id;
@@ -11433,7 +12478,15 @@ pub const DB = struct {
         };
         intent_allocations_transferred = true;
         defer intent.deinit(alloc);
-        index_repair_state.putEntryAt(alloc, location, state.identity, null, .{ .intent = intent }) catch |err| switch (err) {
+        const blocks_service = indexRepairIntentBlocksService(intent);
+        var admission_fence: ?index_manager_mod.IndexManager.RepairAdmissionFence = if (blocks_service)
+            try self.core.index_manager.beginRepairAdmissionFence(intent.index_name)
+        else
+            null;
+        defer if (admission_fence) |*fence| {
+            self.core.index_manager.cancelRepairAdmissionFence(fence, intent.index_name);
+        };
+        const control_revision = index_repair_state.putEntryAt(alloc, location, state.identity, null, .{ .intent = intent }) catch |err| switch (err) {
             // Another operator/maintenance caller may win creation between the
             // optimistic state read and the checkpoint CAS. Adopt that durable
             // intent; callers subsequently attach their job identity or
@@ -11441,10 +12494,27 @@ pub const DB = struct {
             error.RepairTransitionConflict => return (try self.indexRepairIdForIndex(alloc, cfg.name)) orelse return err,
             else => return err,
         };
-        if (indexRepairIntentBlocksService(intent)) {
-            try self.core.index_manager.markRepairUnavailable(intent.index_name);
+        const persisted_revision: u64 = 1;
+        if (admission_fence) |*fence| {
+            self.core.index_manager.finishRepairAdmissionFence(
+                fence,
+                intent.index_name,
+                repairAdmissionVersion(intent, persisted_revision, control_revision),
+                true,
+                false,
+            );
         }
-        notifyQueryVisibilityHook(self.async_context, .index_repair_pending);
+        noteIndexRepairSchedulerUpsert(self.async_context, intent, persisted_revision, control_revision);
+        self.async_context.index_repair_control_mutex.unlock();
+        control_locked = false;
+        notifyIndexRepairVisibilityHook(
+            self.async_context,
+            .index_repair_pending,
+            intent,
+            persisted_revision,
+            .serviceable,
+            false,
+        );
         return repair_id;
     }
 
@@ -11618,7 +12688,7 @@ pub const DB = struct {
                 // mismatch is corruption and retains its fail-closed marker.
                 try self.core.store.delete(admission.key);
                 self.core.index_manager.clearManagedAdmissionSnapshotForIndex(index_name);
-                self.core.index_manager.clearRepairUnavailable(index_name);
+                self.core.index_manager.clearUnscopedRepairUnavailable(index_name);
                 continue;
             }
             _ = try self.materializeManagedIndexAdmissionValueLocked(
@@ -11661,7 +12731,7 @@ pub const DB = struct {
     fn automaticDenseGenerationRepairTriggerPriority(trigger: index_repair_state.Trigger) u8 {
         return switch (trigger) {
             .operator_generation_rebuild, .operator_generation_validation => 0,
-            .artifact_coverage_mismatch => 1,
+            .artifact_coverage_mismatch, .replay_artifact_unavailable => 1,
             .artifact_counter_missing => 2,
             .incomplete_bulk_publish, .root_generation_rebuild, .projection_generation_invalid => 3,
         };
@@ -11702,7 +12772,7 @@ pub const DB = struct {
         // proof. Close the query gate before persistence so an I/O failure
         // cannot leave a known-unverified index available.
         const was_unavailable = self.core.index_manager.repairUnavailable(cfg.name);
-        try self.core.index_manager.markRepairUnavailable(cfg.name);
+        try self.core.index_manager.markUnscopedRepairUnavailable(cfg.name);
 
         const existing_repair_id = try self.indexRepairIdForIndex(alloc, cfg.name);
         const repair_id = existing_repair_id orelse try self.createGenerationRepairIntent(
@@ -11997,19 +13067,17 @@ pub const DB = struct {
         err_name: []const u8,
         terminal: bool,
     ) !void {
-        var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
-        defer entry.deinit(alloc);
-        const now_ms = currentTimeNs() / std.time.ns_per_ms;
-        const attempt_count = @max(entry.intent.attempt_count, 1);
-        const failure_streak = entry.intent.failure_streak +| 1;
-        try self.updateIndexRepairIntent(alloc, repair_id, .{
-            .phase = if (terminal) .terminal else entry.intent.phase,
-            .attempt_count = attempt_count,
-            .failure_streak = failure_streak,
-            .next_retry_at_ms = if (terminal) 0 else now_ms +| indexRepairRetryDelayMs(repair_id, failure_streak),
-            .last_error = err_name,
-            .replace_last_error = true,
-        });
+        try self.updateIndexRepairIntentWithBindingEffect(
+            alloc,
+            repair_id,
+            .{
+                .attempt_failure = .{
+                    .err_name = err_name,
+                    .terminal = terminal,
+                },
+            },
+            if (terminal) .release else .retain,
+        );
     }
 
     fn indexRepairFailureIsTerminal(err: anyerror) bool {
@@ -12026,25 +13094,6 @@ pub const DB = struct {
             => true,
             else => false,
         };
-    }
-
-    fn retryableIndexRepairTerminalPhase(
-        last_error: ?[]const u8,
-        trigger: index_repair_state.Trigger,
-    ) ?index_repair_state.Phase {
-        const reason = last_error orelse return null;
-        if (!std.mem.eql(u8, reason, @errorName(error.RepairSourceCoverageIncomplete))) return null;
-        // Only managed replacement/artifact generations can become complete
-        // after source artifacts are reprocessed. Structural-invalid and
-        // externally supplied generations retain fail-closed classification.
-        if (trigger != .operator_generation_rebuild and
-            trigger != .artifact_coverage_mismatch)
-        {
-            return null;
-        }
-        // Durable transitions permit terminal -> detected, after which the
-        // ordinary state machine revalidates current-generation coverage.
-        return .detected;
     }
 
     test "index repair treats source coverage lag as retryable" {
@@ -12066,11 +13115,102 @@ pub const DB = struct {
         );
     }
 
+    test "rollback predecessor retry policy preserves automatic recovery boundaries" {
+        try std.testing.expectEqual(
+            ActivatedIndexRepairRollback.retry_deferred,
+            activatedIndexRepairRollbackFailureDisposition(.retry_open),
+        );
+        try std.testing.expectEqual(
+            ActivatedIndexRepairRollback.rebuild_required,
+            activatedIndexRepairRollbackFailureDisposition(.rebuild_from_artifacts),
+        );
+        try std.testing.expectEqual(
+            ActivatedIndexRepairRollback.action_required,
+            activatedIndexRepairRollbackFailureDisposition(.manual_intervention),
+        );
+    }
+
+    test "rollback action required atomically retires activation certification" {
+        const alloc = std.testing.allocator;
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
+        const repair_id = try db.createGenerationRepairIntent(
+            alloc,
+            cfg.*,
+            .operator_generation_validation,
+            0,
+            0,
+            null,
+        );
+        try db.updateIndexRepairIntent(alloc, repair_id, .{ .phase = .preflight });
+        try db.updateIndexRepairIntent(alloc, repair_id, .{
+            .phase = .building,
+            .candidate_relative_path = ".repair-shadow-terminal/indexes/dense_idx",
+            .replace_candidate_path = true,
+        });
+        try db.updateIndexRepairIntent(alloc, repair_id, .{
+            .phase = .catching_up,
+            .candidate_applied_sequence = 17,
+        });
+        try db.updateIndexRepairIntent(alloc, repair_id, .{
+            .phase = .ready,
+            .candidate_applied_sequence = 17,
+        });
+        try db.updateIndexRepairIntent(alloc, repair_id, .{
+            .phase = .activating,
+            .candidate_applied_sequence = 17,
+            .target_sequence = 17,
+        });
+        try std.testing.expectError(error.InvalidIndexRepairState, db.updateIndexRepairIntent(alloc, repair_id, .{
+            .phase = .validating,
+            .candidate_applied_sequence = 18,
+        }));
+        try db.updateIndexRepairIntent(alloc, repair_id, .{ .phase = .rolling_back });
+
+        // The real manual-predecessor-failure disposition deletes the inactive
+        // candidate and combines its reset with a terminal failure update. The
+        // terminal phase leaves the certified family, so clearing the obsolete
+        // manifest sequence is both safe and required for coherent status.
+        try db.discardInactiveIndexRepairCandidateWithTerminal(
+            alloc,
+            repair_id,
+            "rollback_predecessor_manual_intervention",
+        );
+
+        var terminal = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer terminal.deinit(alloc);
+        try std.testing.expectEqual(index_repair_state.Phase.terminal, terminal.intent.phase);
+        try std.testing.expect(terminal.intent.candidate_relative_path == null);
+        try std.testing.expectEqual(@as(u64, 0), terminal.intent.candidate_applied_sequence);
+        try std.testing.expectEqualStrings(
+            "rollback_predecessor_manual_intervention",
+            terminal.intent.last_error.?,
+        );
+        try std.testing.expect(indexRepairActionRequired(terminal.intent));
+    }
+
     fn removeIndexRepairIntentAndPin(self: *DB, alloc: Allocator, repair_id: u128) !void {
         return try removeIndexRepairIntentAndPinContext(self.async_context, alloc, repair_id);
     }
 
     fn removeIndexRepairIntentAndPinContext(ctx: *AsyncContext, alloc: Allocator, repair_id: u128) !void {
+        lockAtomic(&ctx.index_repair_control_mutex);
+        var control_locked = true;
+        defer if (control_locked) ctx.index_repair_control_mutex.unlock();
         // Pin creation, pin removal, the in-memory pressure gate, and replay
         // truncation must observe one serialization order. Per-index repair
         // leases are insufficient because two different indexes may complete
@@ -12106,7 +13246,7 @@ pub const DB = struct {
             error.NotFound => {},
             else => return err,
         };
-        try index_repair_state.removeEntryAndPinAt(alloc, location, state.identity, .{
+        const control_revision = try index_repair_state.removeEntryAndPinAt(alloc, location, state.identity, .{
             .repair_id = repair_id,
             .revision = entry.intent.revision,
             .phase = entry.intent.phase,
@@ -12114,12 +13254,36 @@ pub const DB = struct {
             .root_generation = entry.intent.root_generation,
             .owner_epoch = entry.intent.owner_epoch,
         });
+        noteIndexRepairSchedulerRemove(ctx, state.identity, repair_id, control_revision);
         ctx.index_repair_replay_pinned.store(remaining_replay_pin, .release);
-        ctx.index_manager.clearRepairUnavailable(entry.intent.index_name);
-        notifyQueryVisibilityHook(
-            ctx,
-            if (remaining_replay_pin) .index_repair_pending else .index_repair_cleared,
+        ctx.index_manager.publishRepairAdmission(
+            entry.intent.index_name,
+            repairAdmissionVersion(entry.intent, entry.intent.revision +| 1, control_revision),
+            false,
+            false,
         );
+        ctx.index_manager.releaseFailedIndexLoadRepairClaim(
+            entry.intent.index_name,
+            entry.intent.repair_id,
+        );
+        ctx.index_repair_control_mutex.unlock();
+        control_locked = false;
+        notifyIndexRepairVisibilityHook(
+            ctx,
+            .index_repair_cleared,
+            entry.intent,
+            entry.intent.revision,
+            indexRepairAdmission(entry.intent),
+            indexRepairActionRequired(entry.intent),
+        );
+        if (remaining_replay_pin) {
+            // The removed intent identifies only the cleared index; replay is
+            // still pinned by one or more different durable intents. Never
+            // mislabel that group debt as belonging to the removed target.
+            // Unknown scope deliberately forces conservative group-wide
+            // invalidation in the coordination layer.
+            notifyQueryVisibilityHook(ctx, .index_repair_pending);
+        }
     }
 
     pub fn denseRepairWriteBackpressured(self: *const DB) bool {
@@ -12132,6 +13296,23 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         repair_id: u128,
+    ) !void {
+        return try self.discardInactiveIndexRepairCandidateWithTerminal(
+            alloc,
+            repair_id,
+            null,
+        );
+    }
+
+    /// Deletes only a proven-inactive candidate, then publishes its durable
+    /// disposition in one repair-control checkpoint. A manual predecessor
+    /// failure must not expose an intermediate runnable preflight intent if the
+    /// process stops after filesystem cleanup.
+    fn discardInactiveIndexRepairCandidateWithTerminal(
+        self: *DB,
+        alloc: Allocator,
+        repair_id: u128,
+        terminal_reason: ?[]const u8,
     ) !void {
         var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
         defer entry.deinit(alloc);
@@ -12157,7 +13338,7 @@ pub const DB = struct {
             // shadow in the unwind path.
             try std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_root);
         }
-        try self.updateIndexRepairIntent(alloc, repair_id, .{
+        const reset = IndexRepairIntentUpdate{
             .phase = .preflight,
             .replace_candidate_path = true,
             .replace_build_resume_key = true,
@@ -12167,32 +13348,137 @@ pub const DB = struct {
             .failure_streak = 0,
             .next_retry_at_ms = 0,
             .replace_last_error = true,
-        });
+        };
+        if (terminal_reason) |reason| {
+            var terminal = reset;
+            terminal.phase = null;
+            terminal.failure_streak = null;
+            terminal.next_retry_at_ms = null;
+            terminal.replace_last_error = false;
+            terminal.attempt_failure = .{
+                .err_name = reason,
+                .terminal = true,
+            };
+            try self.updateIndexRepairIntentWithBindingEffect(
+                alloc,
+                repair_id,
+                terminal,
+                .release,
+            );
+        } else {
+            try self.updateIndexRepairIntent(alloc, repair_id, reset);
+        }
         if (entry.intent.kind == .algebraic) self.scheduleInactiveRepairShadowCleanup();
     }
 
-    /// Completes the idempotent half of activation recovery. Returns false
-    /// when the recorded candidate is not the active loaded generation, which
-    /// means the caller may safely discard/rebuild only that candidate.
+    const ActivatedIndexRepairCertificationFailure = enum {
+        manifest_missing,
+        manifest_invalid,
+        manifest_identity_mismatch,
+        manifest_sequence_mismatch,
+
+        fn reason(self: @This()) []const u8 {
+            return switch (self) {
+                .manifest_missing => "activation_manifest_missing",
+                .manifest_invalid => "activation_manifest_invalid",
+                .manifest_identity_mismatch => "activation_manifest_identity_mismatch",
+                .manifest_sequence_mismatch => "activation_manifest_sequence_mismatch",
+            };
+        }
+
+        fn fromReason(raw: []const u8) ?@This() {
+            inline for (std.meta.tags(@This())) |failure| {
+                if (std.mem.eql(u8, raw, failure.reason())) return failure;
+            }
+            return null;
+        }
+    };
+
+    const ActivatedIndexRepairReconciliation = union(enum) {
+        committed,
+        not_active,
+        certification_failed: ActivatedIndexRepairCertificationFailure,
+    };
+
+    /// Completes the idempotent half of activation recovery. Certification
+    /// failures are data outcomes rather than raw scheduler errors: the caller
+    /// must durably roll the untrusted incarnation back or expose an exact
+    /// action-required terminal state.
     fn reconcileActivatedIndexRepair(
         self: *DB,
         alloc: Allocator,
         repair_id: u128,
-    ) !bool {
+    ) !ActivatedIndexRepairReconciliation {
+        // Restart reconciliation is the second half of the same catalog
+        // transaction as ordinary activation. Serialize it with every live
+        // index publication and foreground apply, then reload the durable
+        // intent inside that fence so pointer, runtime, config, manifest,
+        // checkpoint, and admission retirement describe one incarnation.
+        if (comptime builtin.is_test) {
+            if (test_index_repair_reconcile_fence_hook) |hook| {
+                if (hook.before_fence) |before_fence| try before_fence(hook.ptr, self, repair_id);
+            }
+        }
+        var structural_guard = self.beginIndexStructuralMutation("index repair activation reconciliation", "*");
+        defer structural_guard.deinit();
+        lockApply(self);
+        defer self.core.unlockApply();
+
         var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
         defer entry.deinit(alloc);
-        const candidate = entry.intent.candidate_relative_path orelse return false;
+        switch (entry.intent.phase) {
+            .activating, .validating, .cleanup, .rolling_back => {},
+            else => return .not_active,
+        }
+        if (entry.intent.root_generation != self.core.root_generation or
+            entry.intent.group_id != self.localRepairGroupId())
+        {
+            return error.RepairOwnershipLost;
+        }
+        const candidate = entry.intent.candidate_relative_path orelse return .not_active;
         try index_repair_state.validateCandidateRelativePath(entry.intent.index_name, candidate);
-        if (!try self.core.index_manager.isRepairCandidateActive(entry.intent.index_name, candidate)) return false;
+        const active_pointer = try self.core.index_manager.captureActiveIndexRootPointer(entry.intent.index_name);
+        defer if (active_pointer) |value| alloc.free(value);
+        if (active_pointer == null or !std.mem.eql(u8, active_pointer.?, candidate)) return .not_active;
+        const cfg = self.core.index_manager.get(entry.intent.index_name) orelse return .not_active;
+        if (cfg.kind != entry.intent.kind or types.indexConfigHash(cfg.*) != entry.intent.config_hash) {
+            return error.IndexRepairConfigurationChanged;
+        }
         if (!self.core.index_manager.has(entry.intent.index_name) or
             self.core.index_manager.loadFailure(entry.intent.index_name) != null)
         {
-            return false;
+            return .not_active;
         }
 
+        const candidate_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate });
+        defer alloc.free(candidate_path);
+        const certification = try index_generation_manifest.certifyReady(
+            alloc,
+            candidate_path,
+            repair_id,
+            entry.intent.index_name,
+            entry.intent.config_hash,
+        );
+        const manifest_sequence = switch (certification) {
+            .ready => |sequence| sequence,
+            .missing => return .{ .certification_failed = .manifest_missing },
+            .invalid => return .{ .certification_failed = .manifest_invalid },
+            .identity_mismatch => return .{ .certification_failed = .manifest_identity_mismatch },
+        };
+        if (manifest_sequence != entry.intent.candidate_applied_sequence) {
+            return .{ .certification_failed = .manifest_sequence_mismatch };
+        }
+        if (comptime builtin.is_test) {
+            if (test_index_repair_reconcile_fence_hook) |hook| {
+                if (hook.after_validation) |after_validation| try after_validation(hook.ptr, self, repair_id);
+            }
+        }
         try self.core.index_manager.syncIndexByName(entry.intent.index_name, true);
         const checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.intent.index_name);
-        const applied_sequence = @max(checkpoint.applied_sequence, entry.intent.candidate_applied_sequence);
+        const applied_sequence = @max(
+            checkpoint.applied_sequence,
+            @max(entry.intent.candidate_applied_sequence, manifest_sequence),
+        );
         if (entry.intent.phase != .cleanup or checkpoint.status != .clean or checkpoint.config_hash != entry.intent.config_hash) {
             const update = apply_state.AppliedSequenceUpdate{
                 .index_name = entry.intent.index_name,
@@ -12211,46 +13497,199 @@ pub const DB = struct {
             });
             try self.updateIndexRepairIntent(alloc, repair_id, .{
                 .phase = .cleanup,
-                .candidate_applied_sequence = applied_sequence,
                 .target_sequence = applied_sequence,
                 .next_retry_at_ms = 0,
                 .replace_last_error = true,
             });
         }
+        if (comptime builtin.is_test) {
+            if (test_index_repair_reconcile_fence_hook) |hook| {
+                if (hook.before_retirement) |before_retirement| try before_retirement(hook.ptr, self, repair_id);
+            }
+        }
         try self.removeIndexRepairIntentAndPin(alloc, repair_id);
         self.scheduleInactiveRepairShadowCleanup();
-        return true;
+        return .committed;
+    }
+
+    const ActivatedIndexRepairRollback = enum {
+        not_active,
+        prior_generation_restored,
+        retry_deferred,
+        rebuild_required,
+        action_required,
+    };
+
+    fn activatedIndexRepairRollbackFailureDisposition(
+        action: index_manager_mod.IndexManager.IndexLoadRecoveryAction,
+    ) ActivatedIndexRepairRollback {
+        return switch (action) {
+            .retry_open => .retry_deferred,
+            .rebuild_from_artifacts => .rebuild_required,
+            .manual_intervention => .action_required,
+        };
     }
 
     /// Rolls a failed-to-load activated candidate back to the exact pointer
-    /// captured before activation. The candidate is then inactive and may be
-    /// discarded without risking the prior generation. A poisoned in-place
-    /// root may still fail to reopen; that is expected and leaves the index
-    /// quarantined while a fresh candidate is built.
+    /// captured before activation. `rolling_back` is checkpointed while the
+    /// structural/apply fence and exact quarantine claim are both held, before
+    /// the pointer changes. Restart can therefore distinguish a crash before
+    /// activation from an interrupted rollback and idempotently finish from
+    /// either pointer. Slow reopen I/O remains outside the service fence while
+    /// the exact repair claim prevents discovery or an ordinary retry from
+    /// publishing underneath it.
     fn rollbackUnavailableActivatedIndexRepair(
         self: *DB,
         alloc: Allocator,
         repair_id: u128,
-    ) !bool {
+        certification_failure: ?ActivatedIndexRepairCertificationFailure,
+    ) !ActivatedIndexRepairRollback {
         var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
         defer entry.deinit(alloc);
-        if (!entry.intent.previous_pointer_captured) return false;
-        const candidate = entry.intent.candidate_relative_path orelse return false;
-        if (!try self.core.index_manager.isRepairCandidateActive(entry.intent.index_name, candidate)) return false;
+        if (!entry.intent.previous_pointer_captured) return .not_active;
+        const candidate = entry.intent.candidate_relative_path orelse return .not_active;
+        const rollback_certification_failure = certification_failure orelse blk: {
+            if (entry.intent.phase != .rolling_back) break :blk null;
+            break :blk ActivatedIndexRepairCertificationFailure.fromReason(
+                entry.intent.last_error orelse break :blk null,
+            );
+        };
+        var claim: ?index_manager_mod.IndexManager.FailedIndexLoadRepairClaim = null;
+        var predecessor_loaded = false;
         {
             var structural_guard = self.beginIndexStructuralMutation("index repair rollback", entry.intent.index_name);
             defer structural_guard.deinit();
             lockApply(self);
             defer self.core.unlockApply();
-            try self.core.index_manager.restoreActiveIndexRootPointer(
-                entry.intent.index_name,
-                candidate,
-                entry.intent.previous_active_relative_path,
-            );
+
+            const active_pointer = try self.core.index_manager.captureActiveIndexRootPointer(entry.intent.index_name);
+            defer if (active_pointer) |value| alloc.free(value);
+            const candidate_active = active_pointer != null and
+                std.mem.eql(u8, active_pointer.?, candidate);
+            const predecessor_active = if (entry.intent.previous_active_relative_path) |previous|
+                active_pointer != null and std.mem.eql(u8, active_pointer.?, previous)
+            else
+                active_pointer == null;
+
+            if (entry.intent.phase != .rolling_back and !candidate_active) return .not_active;
+            if (entry.intent.phase == .rolling_back and !candidate_active and !predecessor_active) {
+                return error.RepairOwnershipLost;
+            }
+
+            if (self.core.index_manager.failedIndexLoadSnapshot(entry.intent.index_name)) |failure| {
+                claim = switch (self.core.index_manager.claimFailedIndexLoadRepair(
+                    entry.intent.index_name,
+                    .{ .exact = failure.token },
+                    entry.intent.repair_id,
+                )) {
+                    .claimed, .already_claimed => |value| value,
+                    .absent, .mismatch, .claimed_by_other => return error.RepairOwnershipLost,
+                };
+            } else if (predecessor_active and self.core.index_manager.has(entry.intent.index_name)) {
+                // A restart may have already opened the restored predecessor
+                // before the durable rollback owner resumes.
+                predecessor_loaded = true;
+            } else if (!candidate_active or rollback_certification_failure == null) {
+                // A loaded active candidate is reconciled by the caller before
+                // entering rollback. Absence here has no safe retry identity;
+                // an inactive pointer with no loaded predecessor is likewise
+                // not evidence that rollback completed.
+                return error.RepairOwnershipLost;
+            }
+
+            if (entry.intent.phase != .rolling_back) {
+                var checkpointed = false;
+                defer if (!checkpointed) self.core.index_manager.releaseFailedIndexLoadRepairClaim(
+                    entry.intent.index_name,
+                    entry.intent.repair_id,
+                );
+                try self.updateIndexRepairIntent(alloc, repair_id, .{
+                    .phase = .rolling_back,
+                    .next_retry_at_ms = 0,
+                    .last_error = if (rollback_certification_failure) |failure| failure.reason() else null,
+                    .replace_last_error = true,
+                });
+                checkpointed = true;
+            }
+            if (candidate_active) {
+                if (rollback_certification_failure) |failure| {
+                    claim = try self.core.index_manager.rollbackUncertifiedActiveIndexRoot(
+                        entry.intent.index_name,
+                        candidate,
+                        entry.intent.previous_active_relative_path,
+                        entry.intent.config_hash,
+                        failure.reason(),
+                        repair_id,
+                    );
+                } else {
+                    try self.core.index_manager.restoreActiveIndexRootPointer(
+                        entry.intent.index_name,
+                        candidate,
+                        entry.intent.previous_active_relative_path,
+                    );
+                }
+            }
         }
-        _ = try self.retryQuarantinedIndexLoads(true);
-        try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
-        return true;
+
+        if (predecessor_loaded) {
+            try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
+            return .prior_generation_restored;
+        }
+        if (comptime builtin.is_test) {
+            if (test_index_repair_rollback_retry_hook) |hook| {
+                try hook.before_retry(hook.ptr, self, repair_id);
+            }
+        }
+        const retry = try self.retryQuarantinedIndexLoadTarget(.{
+            .name = entry.intent.index_name,
+            .token = claim.?.token,
+            .authority = .{ .repair_claim = entry.intent.repair_id },
+        }, true);
+        switch (retry.target_outcome) {
+            .recovered => {
+                try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
+                return .prior_generation_restored;
+            },
+            .attempted_failed => switch (activatedIndexRepairRollbackFailureDisposition(
+                retry.target_action orelse return error.RepairOwnershipLost,
+            )) {
+                .retry_deferred => {
+                    // Retain both the rollback phase and exact claim. The
+                    // durable repair backoff owns subsequent retries, avoiding
+                    // a hot loop and preventing generic retry from racing it.
+                    try self.recordIndexRepairAttemptFailure(
+                        alloc,
+                        repair_id,
+                        if (rollback_certification_failure) |failure|
+                            failure.reason()
+                        else
+                            "rollback_predecessor_retry_open",
+                        false,
+                    );
+                    return .retry_deferred;
+                },
+                .action_required => {
+                    try self.discardInactiveIndexRepairCandidateWithTerminal(
+                        alloc,
+                        repair_id,
+                        if (rollback_certification_failure) |failure|
+                            failure.reason()
+                        else
+                            "rollback_predecessor_manual_intervention",
+                    );
+                    return .action_required;
+                },
+                .rebuild_required => {
+                    try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
+                    return .rebuild_required;
+                },
+                .not_active, .prior_generation_restored => unreachable,
+            },
+            // An exact repair-authorized forced retry is always targeted and
+            // ignores backoff. Any other outcome means its incarnation or
+            // ownership changed while detached I/O was in flight.
+            .not_targeted, .absent, .stale, .repair_claimed, .backoff => return error.RepairOwnershipLost,
+        }
     }
 
     /// Cheap startup discovery. This authorizes and durably records repair
@@ -12262,30 +13701,93 @@ pub const DB = struct {
         limit: usize,
     ) !StartupIndexRepairDiscovery {
         var result: StartupIndexRepairDiscovery = .{};
-        var state = try self.loadOrCreateCurrentIndexRepairState(alloc);
-        defer state.deinit(alloc);
+        try self.ensureIndexRepairSchedulerDirectory(alloc);
+        lockAtomic(&self.async_context.index_repair_scheduler_mutex);
+        const state_identity = self.async_context.index_repair_scheduler.identity orelse {
+            self.async_context.index_repair_scheduler_mutex.unlock();
+            return error.InvalidIndexRepairState;
+        };
+        self.async_context.index_repair_scheduler_mutex.unlock();
         const location = try self.indexRepairStateLocation();
 
-        const configs = try self.core.index_manager.listIndexesPublic(alloc);
-        defer {
-            for (configs) |*cfg| cfg.deinit(alloc);
-            alloc.free(configs);
-        }
-        for (configs) |cfg| {
-            const action = self.core.index_manager.recoveryActionForIndex(cfg.name) orelse continue;
-            if (state.findIndex(cfg.name)) |i| {
-                if (state.entries.items[i].intent.phase == .terminal) {
+        const inspection_limit = @max(
+            @as(usize, 1),
+            std.math.mul(usize, limit, index_repair_inspections_per_execution_slot) catch std.math.maxInt(usize),
+        );
+        var quantum = try self.core.index_manager.failedIndexLoadRecoveryCandidates(
+            alloc,
+            .rebuild_from_artifacts,
+            inspection_limit,
+        );
+        defer quantum.deinit(alloc);
+        // Classification performs detached durable work. Preserve successful
+        // acknowledgements even if a later candidate errors, while exact
+        // epoch/revision checks prevent this unwind from certifying stale debt.
+        errdefer _ = self.core.index_manager.finishFailedIndexLoadRecoveryQuantum(
+            .rebuild_from_artifacts,
+            quantum.queue_epoch,
+            quantum.candidates,
+        );
+        result.automatic_remaining = quantum.action_total;
+        result.automatic_sweep_complete = quantum.sweep_complete;
+        for (quantum.candidates) |*candidate| {
+            const cfg = candidate.config;
+            const action = candidate.token.action;
+            if (!self.core.index_manager.failedIndexLoadRecoveryCandidateIsCurrent(candidate.*)) {
+                result.automatic_deferred += 1;
+                result.automatic_sweep_complete = false;
+                continue;
+            }
+            // Directory observation and its resident binding effect share the
+            // same control transaction as durable phase transitions. The
+            // directory remains a cache, but its revision cannot change from
+            // pending to terminal (or back) between classification and claim.
+            lockAtomic(&self.async_context.index_repair_control_mutex);
+            lockAtomic(&self.async_context.index_repair_scheduler_mutex);
+            const existing = if (self.async_context.index_repair_scheduler.by_name.get(cfg.name)) |record_index|
+                self.async_context.index_repair_scheduler.records.items[record_index]
+            else
+                null;
+            self.async_context.index_repair_scheduler_mutex.unlock();
+            if (existing) |record| {
+                if (comptime builtin.is_test) {
+                    if (test_index_repair_discovery_observation_hook) |hook| {
+                        try hook.after_observation(hook.ptr, self, record.repair_id);
+                    }
+                }
+                if (record.phase_terminal) {
+                    self.core.index_manager.releaseFailedIndexLoadRecoveryCandidate(
+                        cfg.name,
+                        candidate.token,
+                        record.repair_id,
+                    );
                     result.terminal += 1;
                     result.existing_terminal += 1;
                 } else {
+                    switch (self.core.index_manager.claimFailedIndexLoadRecoveryCandidate(
+                        candidate.*,
+                        record.repair_id,
+                    )) {
+                        .claimed, .already_claimed => {},
+                        .absent, .stale, .claimed_by_other => {
+                            self.async_context.index_repair_control_mutex.unlock();
+                            result.automatic_deferred += 1;
+                            result.automatic_sweep_complete = false;
+                            continue;
+                        },
+                    }
                     result.already_pending += 1;
                 }
+                self.async_context.index_repair_control_mutex.unlock();
+                candidate.classified = true;
                 continue;
             }
+            self.async_context.index_repair_control_mutex.unlock();
             switch (action) {
                 .retry_open => continue,
                 .manual_intervention => {
                     result.terminal += 1;
+                    candidate.classified = true;
                     continue;
                 },
                 .rebuild_from_artifacts => {},
@@ -12295,9 +13797,13 @@ pub const DB = struct {
             // destructive automatic-reconstruction allowlist.
             if (cfg.kind != .dense_vector) {
                 result.terminal += 1;
+                candidate.classified = true;
                 continue;
             }
-            if (result.discovered >= limit) continue;
+            if (result.discovered >= limit) {
+                result.automatic_deferred += 1;
+                continue;
+            }
 
             const checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
             const now_ms = currentTimeNs() / std.time.ns_per_ms;
@@ -12306,10 +13812,10 @@ pub const DB = struct {
             const index_name = try alloc.dupe(u8, cfg.name);
             var intent = index_repair_state.IndexRepairIntent{
                 .repair_id = repair_id,
-                .db_identity = state.identity.db_identity,
+                .db_identity = state_identity.db_identity,
                 .group_id = self.localRepairGroupId(),
-                .replica_id = state.identity.replica_id,
-                .root_generation = state.identity.root_generation,
+                .replica_id = state_identity.replica_id,
+                .root_generation = state_identity.root_generation,
                 .index_name = index_name,
                 .kind = cfg.kind,
                 .config_hash = types.indexConfigHash(cfg),
@@ -12320,10 +13826,65 @@ pub const DB = struct {
                 .owner_epoch = 0,
             };
             defer intent.deinit(alloc);
-            try index_repair_state.putEntryAt(alloc, location, state.identity, null, .{ .intent = intent });
-            try self.core.index_manager.markRepairUnavailable(cfg.name);
-            notifyQueryVisibilityHook(self.async_context, .index_repair_pending);
-            result.discovered += 1;
+            var catalog_incarnation = self.beginIndexCatalogIncarnationGuard();
+            defer catalog_incarnation.deinit();
+            lockAtomic(&self.async_context.index_repair_control_mutex);
+            var repair_control_locked = true;
+            defer if (repair_control_locked) self.async_context.index_repair_control_mutex.unlock();
+            // Detached config cloning and checkpoint inspection run without the
+            // catalog lock. Revalidate under the same short lifecycle boundary
+            // used by drop/recreate and quarantine publication so the durable
+            // intent cannot bind a stale same-name catalog incarnation.
+            if (!self.core.index_manager.failedIndexLoadRecoveryCandidateIsCurrent(candidate.*)) {
+                result.automatic_deferred += 1;
+                result.automatic_sweep_complete = false;
+                continue;
+            }
+            switch (self.core.index_manager.claimFailedIndexLoadRecoveryCandidate(candidate.*, repair_id)) {
+                .claimed, .already_claimed => {},
+                .absent, .stale, .claimed_by_other => {
+                    result.automatic_deferred += 1;
+                    result.automatic_sweep_complete = false;
+                    continue;
+                },
+            }
+            var release_repair_claim = true;
+            defer if (release_repair_claim) self.core.index_manager.releaseFailedIndexLoadRecoveryCandidate(
+                candidate.config.name,
+                candidate.token,
+                repair_id,
+            );
+            var admission_fence = try self.core.index_manager.beginRepairAdmissionFence(intent.index_name);
+            defer self.core.index_manager.cancelRepairAdmissionFence(&admission_fence, intent.index_name);
+            const control_revision = index_repair_state.putEntryAt(
+                alloc,
+                location,
+                state_identity,
+                null,
+                .{ .intent = intent },
+            ) catch |err| switch (err) {
+                // Another authorized creator won after the initial directory
+                // observation. The exact candidate claim unwinds below and a
+                // later bounded pass adopts the committed durable intent.
+                error.RepairTransitionConflict => {
+                    result.automatic_deferred += 1;
+                    result.automatic_sweep_complete = false;
+                    continue;
+                },
+                else => return err,
+            };
+            // The durable intent now owns this exact quarantine incarnation.
+            // Keep the claim until terminal classification or successful
+            // replacement removes the failed-load entry.
+            release_repair_claim = false;
+            self.core.index_manager.finishRepairAdmissionFence(
+                &admission_fence,
+                intent.index_name,
+                repairAdmissionVersion(intent, 1, control_revision),
+                true,
+                false,
+            );
+            noteIndexRepairSchedulerUpsert(self.async_context, intent, 1, control_revision);
 
             // Intent durability precedes the serviceability marker. If this
             // checkpoint write fails, restart still rediscovers the intent and
@@ -12334,7 +13895,27 @@ pub const DB = struct {
                 .generation = checkpoint.generation,
                 .config_hash = types.indexConfigHash(cfg),
             });
+            self.async_context.index_repair_control_mutex.unlock();
+            repair_control_locked = false;
+            catalog_incarnation.release();
+            notifyIndexRepairVisibilityHook(
+                self.async_context,
+                .index_repair_pending,
+                intent,
+                1,
+                .serviceable,
+                false,
+            );
+            result.discovered += 1;
+            candidate.classified = true;
         }
+        const final_queue = self.core.index_manager.finishFailedIndexLoadRecoveryQuantum(
+            .rebuild_from_artifacts,
+            quantum.queue_epoch,
+            quantum.candidates,
+        );
+        result.automatic_remaining = final_queue.action_total;
+        result.automatic_sweep_complete = final_queue.sweep_complete;
         return result;
     }
 
@@ -12578,11 +14159,65 @@ pub const DB = struct {
         repair_id: u128,
         options: types.ArtifactRepairRunOptions,
     ) anyerror!IndexRepairAdvanceResult {
+        // Resolve the durable name before taking the process-local lease, then
+        // reload after acquisition. A pause or terminal transition which wins
+        // between those operations must be observed by this owner; using the
+        // locator snapshot would let an acknowledged pause start one more
+        // repair quantum. The checkpoint is already read repeatedly by a
+        // material state-machine turn, while deferred intents remain on the
+        // O(1) scheduler path and never pay this ownership handoff cost.
+        var locator = try self.loadIndexRepairEntryById(alloc, repair_id);
+        defer locator.deinit(alloc);
+        if (!(try self.beginIndexRepairLease(locator.intent.index_name))) {
+            return .{
+                .repair_id = repair_id,
+                .busy = true,
+            };
+        }
+        defer self.endIndexRepairLease(locator.intent.index_name);
+
+        var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
+        defer entry.deinit(alloc);
+        if (!std.mem.eql(u8, locator.intent.index_name, entry.intent.index_name)) {
+            return error.InvalidIndexRepairState;
+        }
+        if (comptime builtin.is_test) {
+            if (test_index_repair_advance_lease_hook) |hook| {
+                try hook.after_acquire(hook.ptr, self, repair_id);
+            }
+        }
+        var run_control = DurableIndexRepairRunControl{
+            .db = self,
+            .index_name = entry.intent.index_name,
+            .upstream = options.cancel_check,
+            .ownership = options.activation_check,
+        };
+        var owned_options = options;
+        owned_options.cancel_check = .{
+            .ptr = &run_control,
+            .is_requested = DurableIndexRepairRunControl.cancelled,
+        };
+        return try self.advanceIndexRepairIntentOwned(
+            alloc,
+            repair_id,
+            owned_options,
+            &entry,
+        );
+    }
+
+    /// Executes one repair quantum while `active_index_repairs[index_name]` is
+    /// held by the caller. Keeping the lease outside every phase makes pause,
+    /// cancel, deletion, rollback, and activation share one ownership domain.
+    fn advanceIndexRepairIntentOwned(
+        self: *DB,
+        alloc: Allocator,
+        repair_id: u128,
+        options: types.ArtifactRepairRunOptions,
+        entry: *index_repair_state.Entry,
+    ) anyerror!IndexRepairAdvanceResult {
         var result = IndexRepairAdvanceResult{ .repair_id = repair_id };
         var effective_options = options;
         if (effective_options.capacity_source == null) effective_options.capacity_source = self.capacity_source;
-        var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
-        defer entry.deinit(alloc);
 
         if (entry.intent.root_generation != self.core.root_generation or
             entry.intent.group_id != self.localRepairGroupId())
@@ -12602,9 +14237,48 @@ pub const DB = struct {
                     .replace_last_error = true,
                 });
                 entry.intent.phase = retry_phase;
+                entry.intent.revision +|= 1;
             } else {
                 result.terminal = true;
                 return result;
+            }
+        }
+        // Only startup discovery creates incomplete_bulk_publish intents, so
+        // this durable provenance is the authority to reclaim quarantine
+        // ownership. Operator and generation-health intents may coexist with
+        // retry/manual load failures but must not be reclassified as automatic
+        // destructive recovery merely because they share an index name.
+        if (entry.intent.trigger == .incomplete_bulk_publish and
+            entry.intent.phase != .rolling_back)
+        {
+            // Retryable terminal phases release their quarantine claim so an
+            // operator may intervene. Reclaiming classifies action/config and
+            // claims the current incarnation in one catalog-locked operation.
+            // Policy or identity drift is terminal for this durable intent: a
+            // fresh audit must authorize any different action.
+            switch (self.core.index_manager.claimFailedIndexLoadRepair(
+                entry.intent.index_name,
+                .{ .current_policy = .{
+                    .action = .rebuild_from_artifacts,
+                    .config_hash = entry.intent.config_hash,
+                } },
+                repair_id,
+            )) {
+                .claimed, .already_claimed, .absent => {},
+                .claimed_by_other => {
+                    result.deferred = true;
+                    return result;
+                },
+                .mismatch => |mismatch| {
+                    try self.recordIndexRepairAttemptFailure(
+                        alloc,
+                        repair_id,
+                        quarantineClaimMismatchReason(mismatch.differences),
+                        true,
+                    );
+                    result.terminal = true;
+                    return result;
+                },
             }
         }
         // A candidate which already failed coverage cannot manufacture an
@@ -12646,6 +14320,7 @@ pub const DB = struct {
         if (options.owner_epoch != 0 and entry.intent.owner_epoch != options.owner_epoch) {
             try self.updateIndexRepairIntent(alloc, repair_id, .{ .owner_epoch = options.owner_epoch });
             entry.intent.owner_epoch = options.owner_epoch;
+            entry.intent.revision +|= 1;
         }
 
         const cfg_ptr = self.core.index_manager.get(entry.intent.index_name) orelse {
@@ -12656,6 +14331,134 @@ pub const DB = struct {
         if (cfg_ptr.kind != entry.intent.kind or types.indexConfigHash(cfg_ptr.*) != entry.intent.config_hash) {
             try self.recordIndexRepairAttemptFailure(alloc, repair_id, "index_configuration_changed", true);
             result.terminal = true;
+            return result;
+        }
+
+        // Activation recovery is structural O(1) work and precedes corpus
+        // validation or capacity admission. `rolling_back` is an explicit
+        // durable decision: if restart finds the candidate healthy before the
+        // pointer moved, reconciliation may still commit it; otherwise the
+        // rollback owner must finish retiring it and must never resume it as a
+        // convergence candidate.
+        if (entry.intent.phase == .activating or
+            entry.intent.phase == .validating or
+            entry.intent.phase == .cleanup or
+            entry.intent.phase == .rolling_back)
+        {
+            if (entry.intent.candidate_relative_path == null) {
+                try self.recordIndexRepairAttemptFailure(alloc, repair_id, "activated_candidate_missing", true);
+                result.terminal = true;
+                return result;
+            }
+            const reconciliation = try self.reconcileActivatedIndexRepair(alloc, repair_id);
+            var certification_failure: ?ActivatedIndexRepairCertificationFailure = null;
+            switch (reconciliation) {
+                .committed => {
+                    result.attempted = true;
+                    var repair = types.ArtifactRepairResult{ .indexes_rebuilt = 1 };
+                    try self.finalizeCommittedIndexRepairOutcome(alloc, entry.intent.index_name, 0, &repair);
+                    applyCommittedRepairOutcomeToAdvance(&result, repair);
+                    result.repaired = repair.indexes_degraded_after == 0 and !repair.debt_remaining;
+                    return result;
+                },
+                .not_active => {},
+                .certification_failed => |failure| certification_failure = failure,
+            }
+            const rolled_back = try self.rollbackUnavailableActivatedIndexRepair(
+                alloc,
+                repair_id,
+                certification_failure,
+            );
+            switch (rolled_back) {
+                .not_active => {
+                    // `activating` is durable before pointer publication. If
+                    // that publication never happened, retain the ready shadow
+                    // and resume its bounded convergence path.
+                    try self.updateIndexRepairIntent(alloc, repair_id, .{
+                        .phase = .waiting_for_convergence,
+                    });
+                    entry.intent.phase = .waiting_for_convergence;
+                },
+                .prior_generation_restored => {
+                    // Yield after the rollback quantum. The restored generation
+                    // is immediately available while the original durable
+                    // repair resumes from preflight on the next owner turn.
+                    result.attempted = true;
+                    result.deferred = true;
+                    return result;
+                },
+                .retry_deferred => {
+                    var deferred = try self.loadIndexRepairEntryById(alloc, repair_id);
+                    defer deferred.deinit(alloc);
+                    result.attempted = true;
+                    result.deferred = true;
+                    result.next_retry_at_ms = deferred.intent.next_retry_at_ms;
+                    return result;
+                },
+                .action_required => {
+                    result.attempted = true;
+                    result.terminal = true;
+                    return result;
+                },
+                .rebuild_required => {},
+            }
+        }
+
+        // Activation/rollback recovery is a committed-generation safety
+        // boundary and therefore wins a concurrent cancellation. Everything
+        // below may start new scan/build work and must honor the cancellation
+        // bit installed by pause/cancel while this lease is visible.
+        if (effective_options.cancelled()) {
+            result.deferred = true;
+            return result;
+        }
+
+        // Check the exact index generation before the shared enrichment
+        // producer fence. Other indexes can legitimately advance that global
+        // runtime while this managed admission is already complete. Letting
+        // unrelated producer work win here keeps a healthy durable intent at
+        // the head of a one-slot repair queue forever.
+        if (try self.managedAdmissionGenerationIsServiceable(alloc, entry.intent)) {
+            try self.removeIndexRepairIntentAndPin(alloc, repair_id);
+            result.attempted = true;
+            result.repaired = true;
+            return result;
+        }
+
+        // Progressive admission has already published a trustworthy canonical
+        // generation. Keep serving and advancing that generation instead of
+        // allocating a shadow candidate, which would otherwise make query
+        // admission regress from queryable_partial back to fail-closed. The
+        // durable intent remains pending and the stronger proof above retires
+        // it once coverage and replay converge.
+        if (try self.managedAdmissionGenerationIsQueryable(alloc, entry.intent)) {
+            const observed_sequence = try self.managedIndexAppliedSequence(alloc, entry.intent.index_name);
+            const wake_at_sequence = @max(
+                observed_sequence +| 1,
+                try self.projectionStatsTargetSequence(alloc, cfg_ptr.*, observed_sequence),
+            );
+            if (!self.deferIndexRepairForProgress(
+                repair_id,
+                entry.intent.revision,
+                wake_at_sequence,
+            )) {
+                // A concurrent durable transition invalidated this observation.
+                // Consume one bounded slot and let its newer schedule decide
+                // the next wake instead of publishing a stale progress wait.
+                result.busy = true;
+                return result;
+            }
+            // Arm-then-recheck closes the lost-wakeup window between proving
+            // partial serviceability and installing the resident wait.
+            const current_sequence = try self.managedIndexAppliedSequence(alloc, entry.intent.index_name);
+            if (current_sequence >= wake_at_sequence) {
+                _ = wakeIndexRepairForProgressContext(
+                    self.async_context,
+                    entry.intent.index_name,
+                    current_sequence,
+                );
+            }
+            result.deferred = true;
             return result;
         }
 
@@ -12684,32 +14487,6 @@ pub const DB = struct {
             // Do not wait for the ordinary canonical worker to apply each
             // generated record individually. Large chunked admissions are
             // intentionally completed by the bounded bulk snapshot path.
-        }
-
-        // The admitted active generation may have converged through the
-        // normal enrichment/replay workers while this durable repair waited
-        // for its scheduler turn. Retire the now-obsolete debt before counter
-        // bootstrap, capacity admission, or shadow allocation. This proof is
-        // restricted to managed-admission intents whose active generation is
-        // already the durable result; there is no candidate activation to
-        // record, so remove the detected intent directly instead of inventing
-        // illegal intermediate shadow-build transitions.
-        if (try self.managedAdmissionGenerationIsServiceable(alloc, entry.intent)) {
-            try self.removeIndexRepairIntentAndPin(alloc, repair_id);
-            result.attempted = true;
-            result.repaired = true;
-            return result;
-        }
-
-        // Progressive admission has already published a trustworthy canonical
-        // generation. Keep serving and advancing that generation instead of
-        // allocating a shadow candidate, which would otherwise make query
-        // admission regress from queryable_partial back to fail-closed. The
-        // durable intent remains pending and the stronger proof above retires
-        // it once coverage and replay converge.
-        if (try self.managedAdmissionGenerationIsQueryable(alloc, entry.intent)) {
-            result.deferred = true;
-            return result;
         }
 
         // Missing-counter projections bootstrap coverage from a stable primary
@@ -12787,41 +14564,6 @@ pub const DB = struct {
             entry.intent.planned_disk_bytes = planned_disk_bytes;
         }
 
-        // A process may stop after pointer activation but before publishing a
-        // clean checkpoint or deleting the intent. Never rebuild in that case:
-        // prove that the recorded candidate is active and loaded, finish the
-        // validation checkpoint, then atomically release intent and replay pin.
-        if (entry.intent.phase == .activating or
-            entry.intent.phase == .validating or
-            entry.intent.phase == .cleanup)
-        {
-            if (entry.intent.candidate_relative_path == null) {
-                try self.recordIndexRepairAttemptFailure(alloc, repair_id, "activated_candidate_missing", true);
-                result.terminal = true;
-                return result;
-            }
-            if (try self.reconcileActivatedIndexRepair(alloc, repair_id)) {
-                result.attempted = true;
-                var repair = types.ArtifactRepairResult{ .indexes_rebuilt = 1 };
-                try self.finalizeCommittedIndexRepairOutcome(alloc, entry.intent.index_name, 0, &repair);
-                applyCommittedRepairOutcomeToAdvance(&result, repair);
-                result.repaired = repair.indexes_degraded_after == 0 and !repair.debt_remaining;
-                return result;
-            }
-            const rolled_back = try self.rollbackUnavailableActivatedIndexRepair(alloc, repair_id);
-            // `activating` was persisted before the pointer write. If the
-            // candidate is not active, retain the ready generation and resume
-            // convergence. This transition is authorized only after the durable
-            // pointer was checked above; an ambiguous or failed rollback leaves
-            // the intent in `activating` and fails closed.
-            if (!rolled_back) {
-                try self.updateIndexRepairIntent(alloc, repair_id, .{
-                    .phase = .waiting_for_convergence,
-                });
-                entry.intent.phase = .waiting_for_convergence;
-            }
-        }
-
         // Capacity is checked and claimed through the shared ResourceManager
         // so every DB on the node participates in one admission domain. Existing
         // candidate bytes are already reflected in filesystem availability;
@@ -12890,36 +14632,25 @@ pub const DB = struct {
         });
         entry.intent.attempt_count = attempt_count;
         result.attempted = true;
-        var run_control = DurableIndexRepairRunControl{
-            .db = self,
-            .index_name = entry.intent.index_name,
-            .upstream = options.cancel_check,
-            .ownership = options.activation_check,
-        };
         var run_options = effective_options;
-        run_options.cancel_check = .{
-            .ptr = &run_control,
-            .is_requested = DurableIndexRepairRunControl.cancelled,
-        };
         run_options.capacity_check = .{
             .ptr = &capacity_guard,
             .reconcile = RepairCapacityGuard.reconcile,
             .revalidate = RepairCapacityGuard.revalidate,
             .bind_candidate_root = RepairCapacityGuard.bindCandidateRoot,
         };
-        run_options.executing_durable_index_repair = true;
         const artifact_kind = artifactRepairKindForIndexKind(entry.intent.kind) orelse {
             try self.recordIndexRepairAttemptFailure(alloc, repair_id, "unsupported_index_kind", true);
             result.terminal = true;
             return result;
         };
-        const repair = self.repairArtifactIssuesWithRequestOptions(alloc, .{
+        const repair = self.repairArtifactIssuesWithRequestOptionsInternal(alloc, .{
             .target = .index,
             .artifact_kind = artifact_kind,
             .index_name = entry.intent.index_name,
             .limit = 1,
             .force = true,
-        }, run_options) catch |err| {
+        }, run_options, .already_held) catch |err| {
             // Fault-injection hooks model process loss, not an ordinary
             // returned repair failure. Let the test harness observe the
             // injected stop without persisting retry/backoff state that a
@@ -12943,7 +14674,8 @@ pub const DB = struct {
                 entry.intent.kind == .dense_vector and
                 self.enrichment_runtime != null and
                 (current_trigger == .operator_generation_rebuild or
-                    current_trigger == .artifact_coverage_mismatch))
+                    current_trigger == .artifact_coverage_mismatch or
+                    current_trigger == .replay_artifact_unavailable))
             {
                 // A shadow rebuild consumes stored embedding artifacts and
                 // cannot repair one missing below its snapshot floor. Re-arm
@@ -12984,7 +14716,8 @@ pub const DB = struct {
             const retryable_replacement_coverage =
                 err == error.RepairSourceCoverageIncomplete and
                 (current_trigger == .operator_generation_rebuild or
-                    current_trigger == .artifact_coverage_mismatch);
+                    current_trigger == .artifact_coverage_mismatch or
+                    current_trigger == .replay_artifact_unavailable);
             const terminal_failure =
                 !retryable_replacement_coverage and indexRepairFailureIsTerminal(err);
             try self.recordIndexRepairAttemptFailure(
@@ -13053,7 +14786,102 @@ pub const DB = struct {
         disk_waits: usize = 0,
         documents_reprocessed: u64 = 0,
         next_retry_at_ms: u64 = 0,
+        wake: IndexRepairWake = .empty,
+        inspected: usize = 0,
+        automatic_discovery_pending: bool = false,
     };
+
+    const index_repair_inspections_per_execution_slot: usize = 8;
+
+    const IndexRepairInspectionWindow = struct {
+        start: usize,
+        budget: usize,
+    };
+
+    fn indexRepairInspectionWindow(
+        candidate_count: usize,
+        execution_limit: usize,
+        cursor: u64,
+    ) IndexRepairInspectionWindow {
+        if (candidate_count == 0 or execution_limit == 0) return .{ .start = 0, .budget = 0 };
+        return .{
+            .start = @intCast(cursor % candidate_count),
+            .budget = @min(
+                candidate_count,
+                std.math.mul(
+                    usize,
+                    execution_limit,
+                    index_repair_inspections_per_execution_slot,
+                ) catch std.math.maxInt(usize),
+            ),
+        };
+    }
+
+    const IndexRepairSchedulerSelection = struct {
+        repair_ids: std.ArrayListUnmanaged(u128) = .empty,
+        inspected: usize = 0,
+        deferred: usize = 0,
+        terminal: usize = 0,
+        remaining: usize = 0,
+        next_retry_at_ms: u64 = 0,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            self.repair_ids.deinit(alloc);
+            self.* = undefined;
+        }
+    };
+
+    fn selectIndexRepairSchedulerQuantum(
+        self: *DB,
+        alloc: Allocator,
+        execution_limit: usize,
+    ) !IndexRepairSchedulerSelection {
+        try self.ensureIndexRepairSchedulerDirectory(alloc);
+        var selection: IndexRepairSchedulerSelection = .{};
+        errdefer selection.deinit(alloc);
+        lockAtomic(&self.async_context.index_repair_scheduler_mutex);
+        defer self.async_context.index_repair_scheduler_mutex.unlock();
+        const directory = &self.async_context.index_repair_scheduler;
+        selection.terminal = directory.terminal;
+        selection.deferred = directory.paused;
+        selection.remaining = directory.records.items.len;
+        selection.next_retry_at_ms = directory.earliestRetryDeadline();
+        const inspection = indexRepairInspectionWindow(
+            directory.records.items.len,
+            execution_limit,
+            @intCast(directory.cursor),
+        );
+        try selection.repair_ids.ensureTotalCapacity(alloc, inspection.budget);
+        const now_ms = currentTimeNs() / std.time.ns_per_ms;
+        while (selection.inspected < inspection.budget) : (selection.inspected += 1) {
+            const record_index = (inspection.start + selection.inspected) % directory.records.items.len;
+            const record = directory.records.items[record_index];
+            directory.cursor = (record_index + 1) % directory.records.items.len;
+            if (record.class != .runnable) continue;
+            if (record.next_retry_at_ms > now_ms) {
+                selection.deferred += 1;
+                if (selection.next_retry_at_ms == 0 or record.next_retry_at_ms < selection.next_retry_at_ms) {
+                    selection.next_retry_at_ms = record.next_retry_at_ms;
+                }
+                continue;
+            }
+            if (record.progress_wait_until_sequence != null) {
+                // The slow audit deadline fired without a matching progress
+                // callback. Clear the process-local wait before execution so
+                // the new observation can arm a fresh token and deadline.
+                const mutable = &directory.records.items[record_index];
+                mutable.progress_wait_until_sequence = null;
+                directory.progress_waiters -= 1;
+                mutable.next_retry_at_ms = mutable.durable_next_retry_at_ms;
+                directory.rescheduleRunnable(mutable.repair_id);
+                if (directory.progress_waiters == 0) {
+                    self.async_context.index_repair_progress_wait_pending.store(false, .release);
+                }
+            }
+            selection.repair_ids.appendAssumeCapacity(record.repair_id);
+        }
+        return selection;
+    }
 
     /// Bounded owner-side pass used by managed startup workers and periodic
     /// repair scans. Discovery itself is cheap; callers choose when execution
@@ -13067,50 +14895,23 @@ pub const DB = struct {
         var result: StartupIndexRepairResult = .{};
         const discovery = try self.discoverRecoverableStartupIndexFailures(alloc, limit);
         result.discovered = discovery.discovered;
+        result.automatic_discovery_pending = discovery.automaticDiscoveryPending();
         // Existing terminal intents are counted from the durable state below.
         // Discovery contributes only terminal load failures for which no intent
         // exists, avoiding double-counting checkpointed failures.
         result.terminal = discovery.terminal - discovery.existing_terminal;
 
-        var state = try self.loadIndexRepairState(alloc);
-        defer state.deinit(alloc);
-        const Candidate = struct {
-            repair_id: u128,
-            started_at_ms: u64,
-        };
-        var candidates = std.ArrayListUnmanaged(Candidate).empty;
-        defer candidates.deinit(alloc);
-        const now_ms = currentTimeNs() / std.time.ns_per_ms;
-        for (state.entries.items) |entry| {
-            if (entry.intent.phase == .terminal and retryableIndexRepairTerminalPhase(
-                entry.intent.last_error,
-                entry.intent.trigger,
-            ) == null) {
-                result.terminal += 1;
-                continue;
-            }
-            if (entry.intent.automation == .paused or entry.intent.next_retry_at_ms > now_ms) {
-                result.deferred += 1;
-                if (entry.intent.next_retry_at_ms != 0 and
-                    (result.next_retry_at_ms == 0 or entry.intent.next_retry_at_ms < result.next_retry_at_ms))
-                {
-                    result.next_retry_at_ms = entry.intent.next_retry_at_ms;
-                }
-                continue;
-            }
-            try candidates.append(alloc, .{
-                .repair_id = entry.intent.repair_id,
-                .started_at_ms = entry.intent.started_at_ms,
-            });
-        }
-        std.mem.sort(Candidate, candidates.items, {}, struct {
-            fn lessThan(_: void, a: Candidate, b: Candidate) bool {
-                if (a.started_at_ms != b.started_at_ms) return a.started_at_ms < b.started_at_ms;
-                return a.repair_id < b.repair_id;
-            }
-        }.lessThan);
-        for (candidates.items[0..@min(limit, candidates.items.len)]) |candidate| {
-            const advanced = try self.advanceIndexRepairIntent(alloc, candidate.repair_id, options);
+        var selection = try self.selectIndexRepairSchedulerQuantum(alloc, limit);
+        defer selection.deinit(alloc);
+        result.terminal += selection.terminal;
+        result.deferred += selection.deferred;
+        result.next_retry_at_ms = selection.next_retry_at_ms;
+        result.inspected = selection.inspected;
+        result.remaining = selection.remaining;
+        var consumed_slots: usize = 0;
+        for (selection.repair_ids.items) |repair_id| {
+            if (consumed_slots >= limit) break;
+            const advanced = try self.advanceIndexRepairIntent(alloc, repair_id, options);
             result.attempted += @intFromBool(advanced.attempted);
             result.repaired += @intFromBool(advanced.repaired);
             result.degraded += @intFromBool(advanced.indexes_degraded_after != 0);
@@ -13118,15 +14919,26 @@ pub const DB = struct {
             result.disk_waits += @intFromBool(advanced.disk_wait);
             result.busy += @intFromBool(advanced.busy);
             result.documents_reprocessed += advanced.documents_reprocessed;
-            if (advanced.next_retry_at_ms != 0 and
-                (result.next_retry_at_ms == 0 or advanced.next_retry_at_ms < result.next_retry_at_ms))
-            {
-                result.next_retry_at_ms = advanced.next_retry_at_ms;
+            // Material execution and inspection are independently bounded.
+            // Deferred progressive generations do not consume a repair slot,
+            // while the rotating cursor prevents them from pinning every
+            // future quantum ahead of later damaged indexes.
+            if (advanced.attempted or advanced.busy or advanced.terminal) {
+                consumed_slots += 1;
             }
         }
-        var after = try self.loadIndexRepairState(alloc);
-        defer after.deinit(alloc);
-        result.remaining = after.entries.items.len;
+        // Mutations update the directory synchronously after their durable
+        // checkpoint commit, so this exact count costs O(1) in steady state.
+        // If a post-commit projection allocation failed, rebuild from the
+        // durable authority before returning rather than misreporting an empty
+        // aggregate. That exceptional recovery is allowed to fail explicitly.
+        try self.ensureIndexRepairSchedulerDirectory(alloc);
+        lockAtomic(&self.async_context.index_repair_scheduler_mutex);
+        const directory = &self.async_context.index_repair_scheduler;
+        result.remaining = directory.records.items.len;
+        result.wake = directory.wake();
+        result.next_retry_at_ms = result.wake.retryAtMs();
+        self.async_context.index_repair_scheduler_mutex.unlock();
         return result;
     }
 
@@ -13144,8 +14956,37 @@ pub const DB = struct {
         req: types.ArtifactRepairRunRequest,
         options: types.ArtifactRepairRunOptions,
     ) !types.ArtifactRepairResult {
+        return try self.repairArtifactIssuesWithRequestOptionsInternal(
+            alloc,
+            req,
+            options,
+            .acquire,
+        );
+    }
+
+    const IndexRepairLeaseAuthority = enum {
+        acquire,
+        already_held,
+    };
+
+    /// Private recursion boundary. Public callers always enter with
+    /// `.acquire`; only the full-quantum durable owner can supply
+    /// `.already_held`, so the public options struct cannot forge lease
+    /// ownership.
+    fn repairArtifactIssuesWithRequestOptionsInternal(
+        self: *DB,
+        alloc: Allocator,
+        req: types.ArtifactRepairRunRequest,
+        options: types.ArtifactRepairRunOptions,
+        lease_authority: IndexRepairLeaseAuthority,
+    ) !types.ArtifactRepairResult {
         try checkArtifactRepairCancelled(options);
-        if (req.target == .index) return try self.repairIndexIssuesWithRequest(alloc, req, options);
+        if (req.target == .index) return try self.repairIndexIssuesWithRequest(
+            alloc,
+            req,
+            options,
+            lease_authority,
+        );
 
         const page = try self.listArtifactRepairIssuesPage(alloc, .{
             .artifact_kind = req.artifact_kind,
@@ -13321,6 +15162,7 @@ pub const DB = struct {
         alloc: Allocator,
         req: types.ArtifactRepairRunRequest,
         options: types.ArtifactRepairRunOptions,
+        lease_authority: IndexRepairLeaseAuthority,
     ) !types.ArtifactRepairResult {
         try checkArtifactRepairCancelled(options);
         const requested_index = req.index_name orelse return error.InvalidArgument;
@@ -13376,9 +15218,12 @@ pub const DB = struct {
             return result;
         }
 
-        const had_load_failure = self.core.index_manager.loadFailure(cfg.name) != null;
+        const initial_load_failure = self.core.index_manager.failedIndexLoadSnapshot(cfg.name);
+        const had_load_failure = initial_load_failure != null;
         var durable_repair_id = try self.indexRepairIdForIndex(alloc, cfg.name);
-        if (had_load_failure and self.core.index_manager.recoveryActionForIndex(cfg.name) == .rebuild_from_artifacts) {
+        if (initial_load_failure != null and
+            initial_load_failure.?.token.action == .rebuild_from_artifacts)
+        {
             _ = try self.discoverRecoverableStartupIndexFailures(alloc, 1);
             durable_repair_id = try self.indexRepairIdForIndex(alloc, cfg.name);
         }
@@ -13411,8 +15256,10 @@ pub const DB = struct {
         // Public/operator entry points never execute a durable generation
         // rebuild through this lower-level function. Managed callers enqueue
         // the exact group; standalone callers synchronously enter the same
-        // admitted state machine used by the owner-side scheduler.
-        if (durable_repair_id) |repair_id| if (!options.executing_durable_index_repair) {
+        // admitted state machine used by the owner-side scheduler. The private
+        // lease authority is also the recursion capability: public options
+        // cannot bypass the durable owner by setting a data bit.
+        if (durable_repair_id) |repair_id| if (lease_authority == .acquire) {
             result.scanned = 1;
             result.indexes_degraded_before = @intFromBool(repair_required);
             result.indexes_degraded_after = 1;
@@ -13463,26 +15310,28 @@ pub const DB = struct {
             return result;
         };
 
-        if (!(try self.beginIndexRepairLease(cfg.name))) {
-            result.scanned += 1;
-            result.in_progress += 1;
-            result.unresolved += 1;
-            // A contended durable repair remains degraded. Do not publish the
-            // zero-value gauge as an authoritative healthy observation.
-            result.indexes_degraded_after = 1;
-            result.debt_remaining = true;
-            return result;
+        // Durable state-machine execution owns the lease at its outermost
+        // boundary. Standalone non-durable repair retains the same exclusion
+        // by acquiring it here. This avoids a nested, non-reentrant lease while
+        // keeping all direct rebuild callers serialized with deletion.
+        var local_repair_lease = false;
+        if (lease_authority == .acquire) {
+            if (!(try self.beginIndexRepairLease(cfg.name))) {
+                result.scanned += 1;
+                result.in_progress += 1;
+                result.unresolved += 1;
+                // A contended durable repair remains degraded. Do not publish
+                // the zero-value gauge as an authoritative healthy observation.
+                result.indexes_degraded_after = 1;
+                result.debt_remaining = true;
+                return result;
+            }
+            local_repair_lease = true;
         }
-        defer self.endIndexRepairLease(cfg.name);
+        defer if (local_repair_lease) self.endIndexRepairLease(cfg.name);
 
         result.scanned += 1;
         if (durable_repair_id) |repair_id| {
-            if (try self.reconcileActivatedIndexRepair(alloc, repair_id)) {
-                result.indexes_rebuilt += 1;
-                try self.finalizeCommittedIndexRepairOutcome(alloc, cfg.name, 0, &result);
-                return result;
-            }
-            _ = try self.rollbackUnavailableActivatedIndexRepair(alloc, repair_id);
             var durable_entry = try self.loadIndexRepairEntryById(alloc, repair_id);
             defer durable_entry.deinit(alloc);
             const resumable = durable_entry.intent.candidate_relative_path != null and switch (durable_entry.intent.phase) {
@@ -13538,19 +15387,47 @@ pub const DB = struct {
         }
         result.indexes_degraded_before = @intFromBool(repair_required);
         result.indexes_degraded_after = 1;
-        if (self.core.index_manager.loadFailure(cfg.name) != null) {
-            const recovery_action = self.core.index_manager.recoveryActionForIndex(cfg.name).?;
+        if (self.core.index_manager.failedIndexLoadSnapshot(cfg.name)) |failure| {
+            const recovery_action = failure.token.action;
             switch (recovery_action) {
                 .retry_open, .manual_intervention => {
-                    // Explicit named operator repair may first retry any
-                    // quarantined open. This does not broaden the automatic
-                    // destructive-rebuild allowlist.
-                    _ = try self.retryQuarantinedIndexLoads(true);
-                    if (self.core.index_manager.loadFailure(cfg.name) != null and recovery_action == .retry_open) {
-                        result.failed += 1;
-                        result.unresolved += 1;
-                        result.debt_remaining = true;
-                        return result;
+                    // Explicit named operator repair may first retry that
+                    // exact quarantined incarnation. If its identity changes,
+                    // defer so the next pass re-audits the new policy instead
+                    // of carrying stale authorization into reconstruction.
+                    const retry_result = try self.retryQuarantinedIndexLoadTarget(.{
+                        .name = cfg.name,
+                        .token = failure.token,
+                    }, true);
+                    switch (retry_result.target_outcome) {
+                        .stale, .repair_claimed, .backoff => {
+                            result.in_progress += 1;
+                            result.unresolved += 1;
+                            result.debt_remaining = true;
+                            return result;
+                        },
+                        .not_targeted => unreachable,
+                        .absent, .attempted_failed, .recovered => {},
+                    }
+                    const remaining_failure = self.core.index_manager.failedIndexLoadSnapshot(cfg.name);
+                    if (remaining_failure) |current| {
+                        // A failed open advances the resident revision by
+                        // design. Re-audit its policy, but retain operator
+                        // authorization only for the same durable config.
+                        if (current.token.config_hash != failure.token.config_hash) {
+                            result.in_progress += 1;
+                            result.unresolved += 1;
+                            result.debt_remaining = true;
+                            return result;
+                        }
+                        if (recovery_action == .retry_open or
+                            current.token.action == .retry_open)
+                        {
+                            result.failed += 1;
+                            result.unresolved += 1;
+                            result.debt_remaining = true;
+                            return result;
+                        }
                     }
                 },
                 .rebuild_from_artifacts => {
@@ -16962,9 +18839,9 @@ pub const DB = struct {
         // Allocate the service gate before committing admission. Once the
         // catalog and marker become durable, allocation failure must not
         // create an ungated window in the current process.
-        try self.core.index_manager.markRepairUnavailable(cfg.name);
+        try self.core.index_manager.markUnscopedRepairUnavailable(cfg.name);
         errdefer if (!catalog_committed) {
-            self.core.index_manager.clearRepairUnavailable(cfg.name);
+            self.core.index_manager.clearUnscopedRepairUnavailable(cfg.name);
         };
 
         // Managed empty-source admission still bypasses ordinary synchronous
@@ -17057,8 +18934,11 @@ pub const DB = struct {
             else => return err,
         };
         self.core.index_manager.clearManagedAdmissionSnapshotForIndex(index_name);
-        self.core.index_manager.clearRepairUnavailable(index_name);
-        notifyQueryVisibilityHook(self.async_context, .index_repair_cleared);
+        self.core.index_manager.clearUnscopedRepairUnavailable(index_name);
+        notifyQueryVisibilityEvent(self.async_context, .{
+            .change = .index_repair_cleared,
+            .repair = .{ .index_name = index_name },
+        });
     }
 
     fn recoverCommittedIndexAdmission(self: *DB, cfg: types.IndexConfig, activation_err: anyerror) !?u128 {
@@ -19051,10 +20931,51 @@ pub const DB = struct {
     /// its persisted rebuild state and catches up before registering.
     pub fn retryQuarantinedIndexLoads(self: *DB, force: bool) !index_manager_mod.IndexManager.QuarantineRetryResult {
         var publication_fence = QuarantineIndexPublicationFence{ .db = self };
+        const execution_limit = if (force)
+            self.core.index_manager.failedIndexLoadSummary().total
+        else
+            @as(usize, 8);
         return try self.core.index_manager.retryFailedIndexLoads(
             self.core.store,
             monotonicTimeNs(),
             force,
+            null,
+            execution_limit,
+            publication_fence.iface(),
+        );
+    }
+
+    /// Retry exactly one quarantined index. Ignoring backoff is orthogonal to
+    /// scope: targeted rollback and operator repair must never inspect, clone,
+    /// open, or publish unrelated failed indexes.
+    pub fn retryQuarantinedIndexLoad(
+        self: *DB,
+        index_name: []const u8,
+        force: bool,
+    ) !index_manager_mod.IndexManager.QuarantineRetryResult {
+        const failure = self.core.index_manager.failedIndexLoadSnapshot(index_name) orelse
+            return .{
+                .remaining = self.core.index_manager.failedIndexLoadSummary().total,
+                .target_outcome = .absent,
+            };
+        return try self.retryQuarantinedIndexLoadTarget(.{
+            .name = index_name,
+            .token = failure.token,
+        }, force);
+    }
+
+    fn retryQuarantinedIndexLoadTarget(
+        self: *DB,
+        target: index_manager_mod.IndexManager.FailedIndexLoadRetryTarget,
+        force: bool,
+    ) !index_manager_mod.IndexManager.QuarantineRetryResult {
+        var publication_fence = QuarantineIndexPublicationFence{ .db = self };
+        return try self.core.index_manager.retryFailedIndexLoads(
+            self.core.store,
+            monotonicTimeNs(),
+            force,
+            target,
+            1,
             publication_fence.iface(),
         );
     }
@@ -21280,6 +23201,23 @@ pub const DB = struct {
         }
     }
 
+    /// A serviceable admission disposition does not by itself prove that a
+    /// physical generation is installed.
+    fn repairGenerationInstalled(
+        self: *DB,
+        intent: index_repair_state.IndexRepairIntent,
+    ) bool {
+        const cfg = self.core.index_manager.get(intent.index_name) orelse return false;
+        if (types.indexConfigHash(cfg.*) != intent.config_hash) return false;
+        return switch (intent.kind) {
+            .full_text => self.core.index_manager.textIndexEntry(intent.index_name) != null,
+            .dense_vector => self.core.index_manager.denseIndex(intent.index_name) != null,
+            .sparse_vector => self.core.index_manager.sparseIndex(intent.index_name) != null,
+            .graph => self.core.index_manager.graphIndex(intent.index_name) != null,
+            .algebraic => self.core.index_manager.algebraicIndex(intent.index_name) != null,
+        };
+    }
+
     fn applyDurableIndexRepairStats(
         self: *DB,
         alloc: Allocator,
@@ -21292,6 +23230,7 @@ pub const DB = struct {
             item.index_repair_phase = "terminal";
             item.index_repair_wait_reason = "terminal";
             item.index_repair_status = .failed;
+            item.index_repair_action_required = true;
             item.repair_degraded = true;
             return;
         }
@@ -21316,15 +23255,19 @@ pub const DB = struct {
             "terminal"
         else if (intent.next_retry_at_ms > currentTimeNs() / std.time.ns_per_ms)
             "backoff"
+        else if (intent.phase == .rolling_back)
+            "rollback"
         else if (intent.phase == .waiting_for_convergence)
             "convergence"
         else
             "none";
+        item.index_repair_action_required = indexRepairActionRequired(intent);
         item.index_repair_status = index_repair_status.summarize(
             true,
             item.index_repair_automation,
             item.index_repair_phase,
             item.index_repair_wait_reason,
+            item.index_repair_action_required,
         );
         // Keep status available when either optional bounded proof cannot be
         // read; query admission independently retries it and remains closed.
@@ -21334,8 +23277,36 @@ pub const DB = struct {
         // their physical artifact count can still be advancing.
         const active_generation_complete =
             self.managedAdmissionGenerationIsServiceable(alloc, intent) catch false;
+        const active_generation_queryable =
+            self.managedAdmissionGenerationIsQueryable(alloc, intent) catch false;
+        const managed_admission = intent.trigger == .projection_generation_invalid and
+            intent.last_error != null and
+            std.mem.eql(u8, intent.last_error.?, managed_catalog_admission_rebuild_reason);
+        const generation_installed = self.repairGenerationInstalled(intent);
+        // The resident gate is version/incarnation fenced. Pair its decision
+        // with physical presence so neither a missing slot nor a stale config
+        // can manufacture serviceability.
+        const resident_admission_open = !self.core.index_manager.repairUnavailable(intent.index_name) and
+            self.core.index_manager.loadFailure(intent.index_name) == null and
+            generation_installed;
+        const admitted_serving_generation = indexRepairAdmission(intent) == .serviceable and
+            resident_admission_open;
+        // Query admission is monotonic for one managed incarnation. Once an
+        // authoritative status sample proves the progressive generation safe,
+        // clear the same resident gate used by search. A following producer
+        // batch can temporarily move the artifact counter ahead of the HBC
+        // publication boundary; that must not make status revoke a generation
+        // which queries continue serving from its last published snapshot.
+        if (active_generation_complete or active_generation_queryable) {
+            self.core.index_manager.publishRepairServiceabilityProof(
+                intent.index_name,
+                repairAdmissionVersion(intent, intent.revision, intent.control_revision),
+            );
+        }
         item.index_repair_active_generation_serviceable = active_generation_complete or
-            (self.managedAdmissionGenerationIsQueryable(alloc, intent) catch false);
+            active_generation_queryable or
+            admitted_serving_generation or
+            (managed_admission and resident_admission_open);
         switch (intent.trigger) {
             .incomplete_bulk_publish,
             .root_generation_rebuild,
@@ -21348,6 +23319,10 @@ pub const DB = struct {
                 item.backfill_active = intent.phase != .terminal;
                 item.repair_degraded = true;
             },
+            .replay_artifact_unavailable => {
+                item.backfill_active = intent.phase != .terminal;
+                item.repair_degraded = true;
+            },
             .operator_generation_rebuild => {
                 // The prior generation remains the serving generation during
                 // construction. Report background rebuild activity without
@@ -21356,6 +23331,7 @@ pub const DB = struct {
                 item.backfill_active = intent.phase != .terminal;
                 item.repair_degraded = intent.phase == .activating or
                     intent.phase == .validating or
+                    intent.phase == .rolling_back or
                     intent.phase == .terminal;
             },
         }
@@ -21367,6 +23343,7 @@ pub const DB = struct {
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.operator_generation_validation)) or
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.artifact_coverage_mismatch)) or
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.artifact_counter_missing)) or
+            std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.replay_artifact_unavailable)) or
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.projection_generation_invalid));
         return generation_build and
             !std.mem.eql(u8, item.index_repair_phase, @tagName(index_repair_state.Phase.terminal));
@@ -42157,7 +44134,21 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .require_graph_resolution_contract = true,
     };
-    try applyDerivedBatchToIndexContext(&ctx, batch, index_ref);
+    applyDerivedBatchToIndexContext(&ctx, batch, index_ref) catch |err| switch (err) {
+        // External-vector dense indexes can discover a missing artifact while
+        // replaying an otherwise valid journal window. Treat that as repair
+        // debt so startup can finish and the generation-repair path remains
+        // reachable instead of failing every attempt to open the table.
+        error.NotFound => if (index_ref.kind == .dense_vector) {
+            try self.markDenseReplayArtifactRepairRequired(self.alloc, index_ref.name);
+            return error.ArtifactRepairRequired;
+        } else return err,
+        error.ArtifactRepairRequired => if (index_ref.kind == .dense_vector) {
+            try self.markDenseReplayArtifactCoverageRepairRequired(self.alloc, index_ref.name);
+            return err;
+        } else return err,
+        else => return err,
+    };
     return true;
 }
 
@@ -51287,13 +53278,13 @@ test "db enrichment status changes notify query visibility hook" {
         saw_db: bool = false,
         change: ?QueryVisibilityChange = null,
 
-        fn onChange(ptr: *anyopaque, table_name: []const u8, group_id: u64, changed_db: ?*DB, change: QueryVisibilityChange) void {
+        fn onChange(ptr: *anyopaque, table_name: []const u8, group_id: u64, changed_db: ?*DB, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             self.table_name = table_name;
             self.group_id = group_id;
             self.saw_db = changed_db != null;
-            self.change = change;
+            self.change = event.change;
         }
     };
     var hook_ctx = HookCtx{};
@@ -53617,7 +55608,7 @@ test "db query repair gate revalidates stale debt" {
     // Model a reader that loaded repair debt immediately before its durable
     // intent was removed. The first rejected request proves absence and heals
     // the process-local gate instead of wedging the reader indefinitely.
-    try db.core.index_manager.markRepairUnavailable("stale_repair");
+    try db.core.index_manager.markUnscopedRepairUnavailable("stale_repair");
     try db.failIfIndexQuarantined("stale_repair");
     try std.testing.expect(!db.core.index_manager.repairUnavailable("stale_repair"));
 }
@@ -58553,6 +60544,121 @@ test "db managed operator repair persists intent without running reconstruction 
     try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
 }
 
+test "index repair advance lease covers cancellation and deletion" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "graph_v1", .kind = .graph, .config_json = "{}" });
+
+    var queued = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
+        .target = .index,
+        .index_name = "graph_v1",
+        .limit = 1,
+        .force = true,
+    }, .{ .defer_durable_index_repair_execution = true });
+    defer queued.deinit(alloc);
+    const repair_id = (try db.indexRepairIdForIndex(alloc, "graph_v1")) orelse
+        return error.TestUnexpectedResult;
+
+    const Race = struct {
+        db: *DB,
+        repair_id: u128,
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        result: ?DB.IndexRepairAdvanceResult = null,
+        err: ?anyerror = null,
+
+        fn afterAcquire(raw: *anyopaque, _: *DB, observed_repair_id: u128) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.repair_id, observed_repair_id);
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+        }
+
+        fn run(self: *@This()) void {
+            self.result = self.db.advanceIndexRepairIntent(self.db.alloc, self.repair_id, .{}) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var race = Race{ .db = &db, .repair_id = repair_id };
+    DB.test_index_repair_advance_lease_hook = .{
+        .ptr = &race,
+        .after_acquire = Race.afterAcquire,
+    };
+    defer DB.test_index_repair_advance_lease_hook = null;
+
+    var advance_thread = try std.Thread.spawn(.{}, Race.run, .{&race});
+    var joined = false;
+    defer if (!joined) {
+        race.release.store(true, .release);
+        advance_thread.join();
+    };
+    var entered = false;
+    for (0..100_000) |_| {
+        if (race.entered.load(.acquire)) {
+            entered = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    if (!entered) return error.TestTimeout;
+
+    // Both controls observe the same full-quantum owner. Cancellation is
+    // accepted, while deletion must retry instead of crossing an unowned
+    // preflight/reconciliation interval.
+    try std.testing.expect(try db.cancelCurrentIndexRepairAttempt(alloc, "graph_v1", repair_id));
+    try std.testing.expectError(
+        error.IndexRepairInProgress,
+        db.prepareIndexRepairForDeletion(alloc, "graph_v1"),
+    );
+
+    race.release.store(true, .release);
+    advance_thread.join();
+    joined = true;
+    DB.test_index_repair_advance_lease_hook = null;
+    try std.testing.expect(race.err == null);
+    try std.testing.expect(race.result != null);
+    try std.testing.expect(race.result.?.deferred);
+    try std.testing.expect(!race.result.?.attempted);
+    try std.testing.expect(!db.activeIndexRepairCancellationRequested("graph_v1"));
+
+    // Cancellation is attempt-scoped. Once the owner releases its lease, the
+    // next quantum can finish the still-enabled durable repair normally. A
+    // non-activation phase must not even enter restart reconciliation's global
+    // structural/apply fence; the ordinary activation path takes its own
+    // bounded publication fence only after the candidate is ready.
+    const ReconcileProbe = struct {
+        calls: usize = 0,
+
+        fn beforeFence(raw: *anyopaque, _: *DB, _: u128) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var reconcile_probe = ReconcileProbe{};
+    DB.test_index_repair_reconcile_fence_hook = .{
+        .ptr = &reconcile_probe,
+        .before_fence = ReconcileProbe.beforeFence,
+    };
+    defer DB.test_index_repair_reconcile_fence_hook = null;
+    const completed = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+    DB.test_index_repair_reconcile_fence_hook = null;
+    try std.testing.expectEqual(@as(usize, 0), reconcile_probe.calls);
+    try std.testing.expect(completed.attempted);
+    try std.testing.expect(completed.repaired);
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+}
+
 test "db index repair targets one graph index per selected config" {
     const alloc = std.testing.allocator;
 
@@ -61636,6 +63742,40 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
     });
     defer search_result.deinit();
     try std.testing.expectEqual(@as(u32, 400), search_result.total_hits);
+}
+
+test "db targeted quarantine retry does not open unrelated failed indexes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.core.index_manager.addAllNoBackfill(db.core.store, &.{
+            .{ .name = "ft_target", .kind = .full_text, .config_json = "{}" },
+            .{ .name = "ft_unrelated", .kind = .full_text, .config_json = "{}" },
+        });
+    }
+
+    index_manager_mod.test_inject_index_open_error = error.InvalidIndexConfig;
+    defer index_manager_mod.test_inject_index_open_error = null;
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_target") != null);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_unrelated") != null);
+
+    index_manager_mod.test_inject_index_open_error = null;
+    const result = try db.retryQuarantinedIndexLoad("ft_target", true);
+    try std.testing.expectEqual(@as(usize, 1), result.recovered);
+    try std.testing.expectEqual(@as(usize, 1), result.remaining);
+    try std.testing.expectEqual(.recovered, result.target_outcome);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_target") == null);
+    try std.testing.expect(db.core.textIndexEntry("ft_target") != null);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_unrelated") != null);
+    try std.testing.expect(db.core.textIndexEntry("ft_unrelated") == null);
 }
 
 test "db read-only open propagates transient index load errors instead of quarantining" {
@@ -70509,6 +72649,36 @@ test "db replay blocks and preserves corrupt dense embedding artifacts" {
     try std.testing.expectEqual(.embedding, issues[0].artifact_kind);
     try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
     try std.testing.expectEqualStrings("dv_v1", issues[0].artifact_name);
+    const repair_id = (try reopened.indexRepairIdForIndex(alloc, "dv_v1")) orelse
+        return error.TestUnexpectedResult;
+    var replay_repair = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+    defer replay_repair.deinit(alloc);
+    try std.testing.expectEqual(
+        index_repair_state.Trigger.replay_artifact_unavailable,
+        replay_repair.intent.trigger,
+    );
+    try std.testing.expect(!reopened.core.index_manager.repairUnavailable("dv_v1"));
+
+    // A terminal replacement failure is actionable completeness debt, but it
+    // cannot revoke the explicitly retained active generation. Status and the
+    // API query coordinator consume this same scoped serviceability proof.
+    try reopened.updateIndexRepairIntent(alloc, repair_id, .{
+        .phase = .terminal,
+        .last_error = "IndexRepairConfigurationChanged",
+        .replace_last_error = true,
+    });
+    const terminal_stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, terminal_stats);
+    var observed_terminal_repair = false;
+    for (terminal_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "dv_v1")) continue;
+        observed_terminal_repair = true;
+        try std.testing.expectEqual(types.IndexRepairStatus.failed, index_stats.index_repair_status.?);
+        try std.testing.expect(index_stats.index_repair_action_required);
+        try std.testing.expect(index_stats.index_repair_active_generation_serviceable);
+    }
+    try std.testing.expect(observed_terminal_repair);
+    try std.testing.expect(!reopened.core.index_manager.repairUnavailable("dv_v1"));
 
     var result = try reopened.search(alloc, .{
         .index_name = "dv_v1",
@@ -70552,6 +72722,67 @@ test "db replay blocks and preserves corrupt dense embedding artifacts" {
     try std.testing.expectEqual(@as(usize, 1), issues_after_repair.len);
     try std.testing.expectEqual(@as(u64, 1), issues_after_repair[0].attempts);
     try std.testing.expectEqualStrings("embedding_enrichment_unavailable", issues_after_repair[0].last_error);
+}
+
+test "db repeated replay preserves nonblocking dense artifact repair intent" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.put(stored_key, "{\"title\":\"alpha\"}");
+
+        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try db.core.store.put(artifact_key, "bad-artifact");
+        _ = try appendDerivedBatchRecord(&db, .{
+            .dense_embeddings = &.{.{
+                .index_name = "dv_v1",
+                .doc_key = "doc:a",
+                .artifact_key = artifact_key,
+                .vector = &[_]f32{ 1, 0 },
+            }},
+        });
+    }
+
+    for (0..2) |_| {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reopened.close();
+
+        const repair_id = (try reopened.indexRepairIdForIndex(alloc, "dv_v1")) orelse
+            return error.TestUnexpectedResult;
+        var replay_repair = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+        defer replay_repair.deinit(alloc);
+        try std.testing.expectEqual(
+            index_repair_state.Trigger.replay_artifact_unavailable,
+            replay_repair.intent.trigger,
+        );
+        try std.testing.expect(!reopened.core.index_manager.repairUnavailable("dv_v1"));
+
+        var result = try reopened.search(alloc, .{
+            .index_name = "dv_v1",
+            .dense = .{ .vector = &[_]f32{ 1, 0 }, .k = 1 },
+            .limit = 1,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+    }
 }
 
 test "db replay records wrong-dimension dense embedding artifact as repair debt" {
@@ -73664,7 +75895,8 @@ test "db index repair rebuilds dense index quarantined by incomplete bulk publis
     try std.testing.expect(try reopened.hasPendingIndexRepairIntents(alloc));
     const duplicate_discovery = try reopened.discoverRecoverableStartupIndexFailures(alloc, 1);
     try std.testing.expectEqual(@as(usize, 0), duplicate_discovery.discovered);
-    try std.testing.expectEqual(@as(usize, 1), duplicate_discovery.already_pending);
+    try std.testing.expectEqual(@as(usize, 0), duplicate_discovery.already_pending);
+    try std.testing.expect(duplicate_discovery.automatic_sweep_complete);
     var discovered_state = try reopened.loadIndexRepairState(alloc);
     const repair_id = discovered_state.entries.items[0].intent.repair_id;
     try std.testing.expectEqual(index_repair_state.Phase.detected, discovered_state.entries.items[0].intent.phase);
@@ -73802,6 +76034,118 @@ test "db index repair rebuilds dense index quarantined by incomplete bulk publis
     try std.testing.expectEqualStrings("doc:c", after_adoption.hits[0].id);
 }
 
+test "quarantine binding reconciliation serializes with terminal transition" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
+            .sync_level = .full_index,
+        });
+    }
+
+    const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_path);
+    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    defer alloc.free(dense_path_z);
+    {
+        var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
+            .dims = 2,
+            .storage_backend = .lsm,
+        }, .{});
+        try hbc.beginBulkIngestSession();
+        hbc.close();
+    }
+
+    var repair_id: u128 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        _ = try db.discoverRecoverableStartupIndexFailures(alloc, 1);
+        repair_id = (try db.indexRepairIdForIndex(alloc, "dense_idx")) orelse
+            return error.TestUnexpectedResult;
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const Context = struct {
+        db: *DB,
+        repair_id: u128,
+        observed: std.atomic.Value(bool) = .init(false),
+        terminal_attempted: std.atomic.Value(bool) = .init(false),
+        terminal_error: ?anyerror = null,
+
+        fn terminal(ptr: *@This()) void {
+            while (!ptr.observed.load(.acquire)) std.Thread.yield() catch {};
+            ptr.terminal_attempted.store(true, .release);
+            ptr.db.recordIndexRepairAttemptFailure(
+                ptr.db.alloc,
+                ptr.repair_id,
+                "test_terminal",
+                true,
+            ) catch |err| {
+                ptr.terminal_error = err;
+            };
+        }
+
+        fn afterObservation(raw: *anyopaque, _: *DB, observed_repair_id: u128) !void {
+            const ptr: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(ptr.repair_id, observed_repair_id);
+            ptr.observed.store(true, .release);
+            while (!ptr.terminal_attempted.load(.acquire)) std.Thread.yield() catch {};
+            // The terminal thread is now waiting on repair-control ownership.
+            // Returning lets discovery finish its pending binding transaction;
+            // terminalization must then release that exact binding.
+        }
+    };
+    var context = Context{ .db = &reopened, .repair_id = repair_id };
+    var terminal_thread = try std.Thread.spawn(.{}, Context.terminal, .{&context});
+    var terminal_thread_joined = false;
+    defer if (!terminal_thread_joined) {
+        context.observed.store(true, .release);
+        terminal_thread.join();
+    };
+    DB.test_index_repair_discovery_observation_hook = .{
+        .ptr = &context,
+        .after_observation = Context.afterObservation,
+    };
+    defer DB.test_index_repair_discovery_observation_hook = null;
+    const discovery = try reopened.discoverRecoverableStartupIndexFailures(alloc, 1);
+    terminal_thread.join();
+    terminal_thread_joined = true;
+    try std.testing.expect(context.terminal_error == null);
+    try std.testing.expectEqual(@as(usize, 1), discovery.already_pending);
+
+    var terminal = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+    defer terminal.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Phase.terminal, terminal.intent.phase);
+    try std.testing.expect(
+        reopened.core.index_manager.failedIndexLoadSnapshot("dense_idx").?.claim_owner_repair_id == null,
+    );
+}
+
 test "db restart reconciles activated dense repair without rebuilding" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -73891,7 +76235,88 @@ test "db restart reconciles activated dense repair without rebuilding" {
         .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 1 } },
         .limit = 1,
     }));
-    const reconciled = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+
+    const ReconcileRace = struct {
+        db: *DB,
+        repair_id: u128,
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        structural_started: std.atomic.Value(bool) = .init(false),
+        structural_acquired: std.atomic.Value(bool) = .init(false),
+        result: ?DB.IndexRepairAdvanceResult = null,
+        err: ?anyerror = null,
+
+        fn afterValidation(raw: *anyopaque, _: *DB, observed_repair_id: u128) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.repair_id, observed_repair_id);
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+        }
+
+        fn reconcile(self: *@This()) void {
+            self.result = self.db.advanceIndexRepairIntent(self.db.alloc, self.repair_id, .{}) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+
+        fn structural(self: *@This()) void {
+            self.structural_started.store(true, .release);
+            var guard = self.db.beginIndexStructuralMutation("test concurrent index publication", "dense_idx");
+            defer guard.deinit();
+            self.structural_acquired.store(true, .release);
+        }
+    };
+    var race = ReconcileRace{ .db = &reopened, .repair_id = repair_id };
+    DB.test_index_repair_reconcile_fence_hook = .{
+        .ptr = &race,
+        .after_validation = ReconcileRace.afterValidation,
+    };
+    defer DB.test_index_repair_reconcile_fence_hook = null;
+
+    var reconcile_thread = try std.Thread.spawn(.{}, ReconcileRace.reconcile, .{&race});
+    var reconcile_joined = false;
+    defer if (!reconcile_joined) {
+        race.release.store(true, .release);
+        reconcile_thread.join();
+    };
+    var reconcile_entered = false;
+    for (0..100_000) |_| {
+        if (race.entered.load(.acquire)) {
+            reconcile_entered = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    if (!reconcile_entered) return error.TestTimeout;
+
+    var structural_thread = try std.Thread.spawn(.{}, ReconcileRace.structural, .{&race});
+    var structural_joined = false;
+    defer if (!structural_joined) {
+        race.release.store(true, .release);
+        structural_thread.join();
+    };
+    var structural_started = false;
+    for (0..100_000) |_| {
+        if (race.structural_started.load(.acquire)) {
+            structural_started = true;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    if (!structural_started) return error.TestTimeout;
+    for (0..256) |_| std.Thread.yield() catch {};
+    try std.testing.expect(!race.structural_acquired.load(.acquire));
+
+    race.release.store(true, .release);
+    reconcile_thread.join();
+    reconcile_joined = true;
+    structural_thread.join();
+    structural_joined = true;
+    DB.test_index_repair_reconcile_fence_hook = null;
+    try std.testing.expect(race.err == null);
+    const reconciled = race.result orelse return error.TestUnexpectedResult;
+    try std.testing.expect(race.structural_acquired.load(.acquire));
     try std.testing.expect(reconciled.attempted);
     try std.testing.expect(reconciled.repaired);
     try std.testing.expect(!try reopened.hasPendingIndexRepairIntents(alloc));
@@ -74634,6 +77059,420 @@ test "db managed repair scheduler defers canonical worker until shadow activatio
     try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
 }
 
+test "index repair inspection window is bounded and rotates fairly" {
+    const candidate_count = 257;
+    var seen = [_]bool{false} ** candidate_count;
+    var cursor: u64 = 0;
+    var pass: usize = 0;
+    while (pass < 33) : (pass += 1) {
+        const window = DB.indexRepairInspectionWindow(candidate_count, 1, cursor);
+        try std.testing.expectEqual(@as(usize, 8), window.budget);
+        var offset: usize = 0;
+        while (offset < window.budget) : (offset += 1) {
+            seen[(window.start + offset) % candidate_count] = true;
+        }
+        cursor = @intCast((window.start + window.budget) % candidate_count);
+    }
+    for (seen) |inspected| try std.testing.expect(inspected);
+}
+
+test "resident index repair scheduler skips deferred prefixes with bounded fair quanta" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    _ = try db.indexRepairIntentSummary(alloc);
+
+    {
+        lockAtomic(&db.async_context.index_repair_scheduler_mutex);
+        defer db.async_context.index_repair_scheduler_mutex.unlock();
+        for (0..18) |i| {
+            const index_name = try std.fmt.allocPrint(alloc, "repair-{d}", .{i});
+            var intent = index_repair_state.IndexRepairIntent{
+                .repair_id = i + 1,
+                .db_identity = 1,
+                .group_id = 1,
+                .replica_id = 1,
+                .root_generation = 1,
+                .index_name = index_name,
+                .kind = .full_text,
+                .config_hash = 1,
+                .detected_sequence = 1,
+                .target_sequence = 1,
+                .started_at_ms = 1,
+                .updated_at_ms = 1,
+                .owner_epoch = 0,
+                .automation = if (i < 17) .paused else .enabled,
+            };
+            try db.async_context.index_repair_scheduler.upsert(db.async_context.alloc, intent, 1);
+            intent.deinit(alloc);
+        }
+    }
+
+    var first = try db.selectIndexRepairSchedulerQuantum(alloc, 1);
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 8), first.inspected);
+    try std.testing.expectEqual(@as(usize, 0), first.repair_ids.items.len);
+
+    var second = try db.selectIndexRepairSchedulerQuantum(alloc, 1);
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 8), second.inspected);
+    try std.testing.expectEqual(@as(usize, 0), second.repair_ids.items.len);
+
+    var third = try db.selectIndexRepairSchedulerQuantum(alloc, 1);
+    defer third.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 8), third.inspected);
+    try std.testing.expectEqualSlices(u128, &.{18}, third.repair_ids.items);
+}
+
+test "resident index repair scheduler maintains exact aggregate wake precedence" {
+    const alloc = std.testing.allocator;
+    var directory = IndexRepairSchedulerDirectory{
+        .initialized = true,
+        .identity = .{ .db_identity = 1, .replica_id = 1, .root_generation = 1 },
+    };
+    defer directory.deinit(alloc);
+
+    const Intent = struct {
+        fn make(
+            allocator: Allocator,
+            id: u128,
+            deadline: u64,
+            automation: index_repair_state.Automation,
+        ) !index_repair_state.IndexRepairIntent {
+            return .{
+                .repair_id = id,
+                .revision = 1,
+                .db_identity = 1,
+                .group_id = 1,
+                .replica_id = 1,
+                .root_generation = 1,
+                .index_name = try std.fmt.allocPrint(allocator, "repair-{d}", .{id}),
+                .kind = .full_text,
+                .config_hash = 1,
+                .detected_sequence = 1,
+                .target_sequence = 1,
+                .started_at_ms = 1,
+                .updated_at_ms = 1,
+                .owner_epoch = 0,
+                .next_retry_at_ms = deadline,
+                .automation = automation,
+            };
+        }
+    };
+
+    var future = try Intent.make(alloc, 1, 900, .enabled);
+    defer future.deinit(alloc);
+    try directory.upsert(alloc, future, future.revision);
+    var immediate = try Intent.make(alloc, 2, 0, .enabled);
+    defer immediate.deinit(alloc);
+    try directory.upsert(alloc, immediate, immediate.revision);
+    var earlier = try Intent.make(alloc, 3, 400, .enabled);
+    defer earlier.deinit(alloc);
+    try directory.upsert(alloc, earlier, earlier.revision);
+    try std.testing.expectEqual(@as(usize, 3), directory.runnable_heap.items.len);
+    try std.testing.expectEqual(DB.IndexRepairWake.immediate, directory.wake());
+
+    // Deadline churn updates one indexed heap position; it never accumulates
+    // lazy tombstones that later require an unbounded owner-side compaction.
+    for (0..4096) |i| {
+        immediate.revision += 1;
+        immediate.next_retry_at_ms = if (i % 2 == 0) 0 else 800;
+        try directory.upsert(alloc, immediate, immediate.revision);
+        try std.testing.expectEqual(@as(usize, 3), directory.runnable_heap.items.len);
+    }
+    immediate.next_retry_at_ms = 0;
+    immediate.revision += 1;
+    try directory.upsert(alloc, immediate, immediate.revision);
+
+    // Model the first selected intent deferring itself. A different immediate
+    // intent must continue to dominate the aggregate wake until it too moves.
+    future.next_retry_at_ms = 1_200;
+    future.revision += 1;
+    try directory.upsert(alloc, future, future.revision);
+    try std.testing.expectEqual(DB.IndexRepairWake.immediate, directory.wake());
+    immediate.next_retry_at_ms = 700;
+    immediate.revision += 1;
+    try directory.upsert(alloc, immediate, immediate.revision);
+    try std.testing.expectEqual(@as(u64, 400), directory.wake().at_realtime_ms);
+
+    earlier.automation = .paused;
+    earlier.revision += 1;
+    try directory.upsert(alloc, earlier, earlier.revision);
+    try std.testing.expectEqual(@as(u64, 700), directory.wake().at_realtime_ms);
+    try std.testing.expectEqual(directory.runnable, directory.runnable_heap.items.len);
+    directory.remove(alloc, 2);
+    directory.remove(alloc, 1);
+    try std.testing.expectEqual(DB.IndexRepairWake.parked, directory.wake());
+    try std.testing.expectEqual(@as(usize, 0), directory.runnable_heap.items.len);
+
+    // A durable clear advances the materialized-view revision even though it
+    // removes the record. A delayed pre-clear upsert is then stale and cannot
+    // resurrect debt which is absent from the checkpoint. A missed event is a
+    // gap, forcing reconstruction rather than accepting a partial view.
+    directory.control_revision = 41;
+    const identity = directory.identity.?;
+    try std.testing.expectEqual(
+        IndexRepairSchedulerDirectory.ControlMutationDisposition.next,
+        directory.classifyControlMutation(identity, 42),
+    );
+    directory.control_revision = 42;
+    try std.testing.expectEqual(
+        IndexRepairSchedulerDirectory.ControlMutationDisposition.stale,
+        directory.classifyControlMutation(identity, 41),
+    );
+    try std.testing.expectEqual(
+        IndexRepairSchedulerDirectory.ControlMutationDisposition.gap,
+        directory.classifyControlMutation(identity, 44),
+    );
+}
+
+test "resident index repair progress waits are revision scoped and event driven" {
+    const alloc = std.testing.allocator;
+    var directory = IndexRepairSchedulerDirectory{
+        .initialized = true,
+        .identity = .{ .db_identity = 1, .replica_id = 1, .root_generation = 1 },
+    };
+    defer directory.deinit(alloc);
+
+    var intent = index_repair_state.IndexRepairIntent{
+        .repair_id = 17,
+        .revision = 1,
+        .db_identity = 1,
+        .group_id = 1,
+        .replica_id = 1,
+        .root_generation = 1,
+        .index_name = try alloc.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .config_hash = 9,
+        .detected_sequence = 1,
+        .target_sequence = 20,
+        .started_at_ms = 1,
+        .updated_at_ms = 1,
+        .owner_epoch = 0,
+    };
+    defer intent.deinit(alloc);
+    try directory.upsert(alloc, intent, intent.revision);
+
+    try std.testing.expect(directory.deferForProgress(17, 1, 20, 500));
+    try std.testing.expectEqual(@as(usize, 1), directory.progress_waiters);
+    try std.testing.expectEqual(@as(u64, 500), directory.wake().at_realtime_ms);
+    // An idempotent durable projection must not erase a resident wait.
+    try directory.upsert(alloc, intent, intent.revision);
+    try std.testing.expectEqual(@as(u64, 500), directory.wake().at_realtime_ms);
+    try std.testing.expect(!directory.wakeForIndexProgress("semantic_idx", 10));
+    try std.testing.expect(!directory.wakeForIndexProgress("semantic_idx", 19));
+    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", 20));
+    try std.testing.expectEqual(@as(usize, 0), directory.progress_waiters);
+    try std.testing.expectEqual(DB.IndexRepairWake.immediate, directory.wake());
+    try std.testing.expect(!directory.wakeForIndexProgress("unrelated", 99));
+
+    try std.testing.expect(directory.deferForProgress(17, 1, 30, 600));
+    intent.revision += 1;
+    intent.next_retry_at_ms = 700;
+    try directory.upsert(alloc, intent, intent.revision);
+    try std.testing.expectEqual(@as(usize, 0), directory.progress_waiters);
+    try std.testing.expectEqual(@as(u64, 700), directory.wake().at_realtime_ms);
+    // A delayed event from the prior revision cannot wake the new schedule.
+    try std.testing.expect(!directory.wakeForIndexProgress("semantic_idx", 12));
+}
+
+test "index repair intent string replacement is allocation failure safe" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
+    const repair_id = try db.createGenerationRepairIntent(
+        alloc,
+        cfg.*,
+        .operator_generation_validation,
+        0,
+        0,
+        "old-error",
+    );
+    try db.updateIndexRepairIntent(alloc, repair_id, .{
+        .candidate_relative_path = ".repair-shadow-old/indexes/dense_idx",
+        .replace_candidate_path = true,
+        .previous_pointer_captured = true,
+        .previous_active_relative_path = ".repair-shadow-old-active/indexes/dense_idx",
+        .replace_previous_active_path = true,
+        .build_resume_key = "old-resume",
+        .replace_build_resume_key = true,
+        .last_error = "old-error-2",
+        .replace_last_error = true,
+    });
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        struct {
+            fn run(failing_alloc: Allocator, target_db: *DB, target_repair_id: u128) !void {
+                try target_db.updateIndexRepairIntent(failing_alloc, target_repair_id, .{
+                    .candidate_relative_path = ".repair-shadow-new/indexes/dense_idx",
+                    .replace_candidate_path = true,
+                    .previous_active_relative_path = ".repair-shadow-new-active/indexes/dense_idx",
+                    .replace_previous_active_path = true,
+                    .build_resume_key = "new-resume",
+                    .replace_build_resume_key = true,
+                    .last_error = "new-error",
+                    .replace_last_error = true,
+                });
+            }
+        }.run,
+        .{ &db, repair_id },
+    );
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        struct {
+            fn run(failing_alloc: Allocator, target_db: *DB, target_repair_id: u128) !void {
+                try target_db.recordIndexRepairAttemptFailure(
+                    failing_alloc,
+                    target_repair_id,
+                    "next-failure",
+                    false,
+                );
+            }
+        }.run,
+        .{ &db, repair_id },
+    );
+
+    var updated = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer updated.deinit(alloc);
+    try std.testing.expectEqualStrings(".repair-shadow-new/indexes/dense_idx", updated.intent.candidate_relative_path.?);
+    try std.testing.expectEqualStrings(".repair-shadow-new-active/indexes/dense_idx", updated.intent.previous_active_relative_path.?);
+    try std.testing.expectEqualStrings("new-resume", updated.intent.build_resume_key.?);
+    try std.testing.expectEqualStrings("next-failure", updated.intent.last_error.?);
+    try std.testing.expectEqual(@as(u32, 1), updated.intent.failure_streak);
+}
+
+test "repair admission revisions stay fail closed and reject delayed publishers" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try std.testing.expect(db.async_context.index_repair_scheduler.initialized);
+
+    const name = "revisioned-repair";
+    var older = try db.core.index_manager.beginRepairAdmissionFence(name);
+    try std.testing.expect(db.core.index_manager.repairUnavailable(name));
+    const version = index_manager_mod.IndexManager.RepairAdmissionVersion{
+        .repair_id = 7,
+        .control_revision = 3,
+        .revision = 3,
+        .config_hash = 11,
+        .root_generation = 13,
+    };
+    // A later non-fenced durable mutation may publish before an earlier
+    // blocking fence's callback. Durable control order, not callback/fence
+    // order, decides which committed state survives.
+    db.core.index_manager.publishRepairAdmission(name, version, false, false);
+    // The older transition is still between precommit fencing and publication.
+    try std.testing.expect(db.core.index_manager.repairUnavailable(name));
+    var older_version = version;
+    older_version.control_revision = 2;
+    older_version.revision = 2;
+    db.core.index_manager.finishRepairAdmissionFence(&older, name, older_version, true, false);
+    // Its delayed revision cannot overwrite the newer serviceable decision.
+    try std.testing.expect(!db.core.index_manager.repairUnavailable(name));
+
+    var committed = try db.core.index_manager.beginRepairAdmissionFence(name);
+    var committed_version = version;
+    committed_version.control_revision = 4;
+    committed_version.revision = 4;
+    db.core.index_manager.finishRepairAdmissionFence(&committed, name, committed_version, true, false);
+    db.core.index_manager.clearUnscopedRepairUnavailable(name);
+    // Clearing an unrelated structural/legacy marker cannot open a durable
+    // repair fence.
+    try std.testing.expect(db.core.index_manager.repairUnavailable(name));
+    db.core.index_manager.publishRepairServiceabilityProof(name, committed_version);
+    try std.testing.expect(!db.core.index_manager.repairUnavailable(name));
+    // Durable debt remains resident for exact revision checks, but aggregate
+    // availability reports the effective service gate, not map occupancy.
+    try std.testing.expect(!db.core.index_manager.hasRepairUnavailableIndexes());
+    var progress_version = version;
+    progress_version.control_revision = 5;
+    progress_version.revision = 5;
+    db.core.index_manager.publishRepairAdmission(name, progress_version, true, true);
+    try std.testing.expect(!db.core.index_manager.repairUnavailable(name));
+    var unsafe_transition = try db.core.index_manager.beginRepairAdmissionFence(name);
+    try std.testing.expect(db.core.index_manager.repairUnavailable(name));
+    db.core.index_manager.cancelRepairAdmissionFence(&unsafe_transition, name);
+    try std.testing.expect(!db.core.index_manager.repairUnavailable(name));
+    var replacement_fence = try db.core.index_manager.beginRepairAdmissionFence(name);
+    const replacement_version = index_manager_mod.IndexManager.RepairAdmissionVersion{
+        .repair_id = 8,
+        .control_revision = 6,
+        .revision = 1,
+        .config_hash = 12,
+        .root_generation = 13,
+    };
+    db.core.index_manager.finishRepairAdmissionFence(
+        &replacement_fence,
+        name,
+        replacement_version,
+        true,
+        false,
+    );
+    db.core.index_manager.publishRepairServiceabilityProof(name, committed_version);
+    try std.testing.expect(db.core.index_manager.repairUnavailable(name));
+    var cleared_version = replacement_version;
+    cleared_version.control_revision = 7;
+    cleared_version.revision = 2;
+    db.core.index_manager.publishRepairAdmission(name, cleared_version, false, false);
+    try std.testing.expect(!db.core.index_manager.repairUnavailable(name));
+
+    var rebound_version = replacement_version;
+    rebound_version.repair_id = 9;
+    rebound_version.root_generation = 14;
+    rebound_version.control_revision = 1;
+    try db.core.index_manager.prepareRepairAdmissionRebind(name, rebound_version);
+    try std.testing.expect(db.core.index_manager.repairUnavailable(name));
+    // A delayed old-root completion cannot claim the preallocated new-root
+    // gate or make the replacement incarnation serviceable.
+    var old_root_fence = try db.core.index_manager.beginRepairAdmissionFence(name);
+    db.core.index_manager.finishRepairAdmissionFence(
+        &old_root_fence,
+        name,
+        cleared_version,
+        false,
+        false,
+    );
+    db.core.index_manager.publishRepairAdmission(name, cleared_version, false, false);
+    try std.testing.expect(db.core.index_manager.repairUnavailable(name));
+    db.core.index_manager.publishRepairAdmission(name, rebound_version, false, false);
+    try std.testing.expect(!db.core.index_manager.repairUnavailable(name));
+
+    var cancelled = try db.core.index_manager.beginRepairAdmissionFence(name);
+    db.core.index_manager.cancelRepairAdmissionFence(&cancelled, name);
+    try std.testing.expect(!db.core.index_manager.repairUnavailable(name));
+}
+
 test "db progressive managed admission serves a checkpointed partial generation" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -74694,7 +77533,30 @@ test "db progressive managed admission serves a checkpointed partial generation"
         saw_partial_repair_degraded = index_stats.repair_degraded;
     }
     try std.testing.expect(saw_partial_repair_degraded);
+    try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
     try db.failIfIndexQuarantined(cfg.name);
+
+    // The next producer batch can publish its artifact target before the HBC
+    // reaches the matching visibility boundary. Reproduce that short window:
+    // readiness must honor the already-published incarnation instead of
+    // flipping from queryable back to rebuilding.
+    const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, cfg.name);
+    defer alloc.free(counter_key);
+    const target_before = (try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, cfg.name)).?;
+    var advanced_target: [8]u8 = undefined;
+    std.mem.writeInt(u64, &advanced_target, target_before + 1, .little);
+    try db.core.store.put(counter_key, &advanced_target);
+    try std.testing.expect(!try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
+    const in_flight_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, in_flight_stats);
+    for (in_flight_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+        try std.testing.expect(index_stats.index_repair_active_generation_serviceable);
+    }
+    try db.failIfIndexQuarantined(cfg.name);
+    var restored_target: [8]u8 = undefined;
+    std.mem.writeInt(u64, &restored_target, target_before, .little);
+    try db.core.store.put(counter_key, &restored_target);
 
     var partial = try db.search(alloc, .{
         .index_name = cfg.name,
@@ -74704,6 +77566,31 @@ test "db progressive managed admission serves a checkpointed partial generation"
     defer partial.deinit();
     try std.testing.expectEqual(@as(u32, 1), partial.total_hits);
     try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+
+    // A queryable progressive intent remains durable while its worker
+    // converges, but it must not consume the bounded scheduler's only repair
+    // slot and starve a later damaged index. Keep this intent oldest, then
+    // prove a one-slot pass advances the second intent.
+    while (currentTimeNs() / std.time.ns_per_ms <= repair.intent.started_at_ms) {
+        std.atomic.spinLoopHint();
+    }
+    try db.addIndex(.{
+        .name = "damaged_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}",
+    });
+    const damaged_cfg = db.core.index_manager.get("damaged_idx") orelse return error.TestUnexpectedResult;
+    const damaged_repair_id = try db.createOperatorGenerationRepairIntent(alloc, damaged_cfg.*, 0, 0);
+    const scheduler_pass = try db.repairRecoverableStartupIndexFailures(alloc, 1, repair_completion_test_options);
+    try std.testing.expectEqual(@as(usize, 1), scheduler_pass.attempted);
+    try std.testing.expectEqual(@as(usize, 2), scheduler_pass.inspected);
+    try std.testing.expect((try db.indexRepairIdForIndex(alloc, cfg.name)) != null);
+    if (try db.indexRepairIdForIndex(alloc, "damaged_idx")) |remaining_repair_id| {
+        try std.testing.expectEqual(damaged_repair_id, remaining_repair_id);
+        var damaged_repair = try db.loadIndexRepairEntryById(alloc, damaged_repair_id);
+        defer damaged_repair.deinit(alloc);
+        try std.testing.expect(damaged_repair.intent.attempt_count != 0);
+    }
 
     // The durable checkpoint and repair ownership are sufficient to restore
     // the same partial generation as queryable after a process restart.
@@ -74726,6 +77613,11 @@ test "db progressive managed admission serves a checkpointed partial generation"
 
     try db.runUntilIdle();
     try std.testing.expect(try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent));
+    const shared_enrichment = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    const enrichment_before_unrelated_work = shared_enrichment.stats();
+    shared_enrichment.notifySequence(enrichment_before_unrelated_work.applied_sequence + 1);
+    const enrichment_with_unrelated_work = shared_enrichment.stats();
+    try std.testing.expect(enrichment_with_unrelated_work.applied_sequence < enrichment_with_unrelated_work.target_sequence);
     const completed = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
     try std.testing.expect(completed.repaired);
     try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
@@ -76009,10 +78901,10 @@ test "db managed visibility hook rehydrates durable repair debt once" {
             _: []const u8,
             _: u64,
             _: ?*DB,
-            change: QueryVisibilityChange,
+            event: QueryVisibilityEvent,
         ) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (change == .index_repair_pending) self.pending += 1;
+            if (event.change == .index_repair_pending) self.pending += 1;
         }
     };
     var hook = Hook{};
@@ -76254,6 +79146,146 @@ test "db dense repair uses resource manager capacity admission before building" 
     defer refreshed.deinit(alloc);
     try std.testing.expectEqual(larger_estimate, refreshed.intent.estimated_candidate_bytes);
     try std.testing.expect(refreshed.intent.planned_disk_bytes > first_reservation);
+}
+
+test "db dense replay failure upgrades a preflight validation intent" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}",
+    });
+    const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
+    const repair_id = try db.createOperatorGenerationRepairIntent(alloc, cfg.*, 0, 0);
+    try db.updateIndexRepairIntent(alloc, repair_id, .{
+        .phase = .preflight,
+        .last_error = "OperatorGenerationValidationPending",
+        .replace_last_error = true,
+    });
+
+    try db.markDenseReplayArtifactRepairRequired(alloc, cfg.name);
+    var upgraded = try db.loadIndexRepairEntryById(alloc, repair_id);
+    try std.testing.expectEqual(index_repair_state.Trigger.projection_generation_invalid, upgraded.intent.trigger);
+    try std.testing.expectEqual(index_repair_state.Phase.preflight, upgraded.intent.phase);
+    try std.testing.expectEqualStrings("dense_replay_artifact_missing", upgraded.intent.last_error.?);
+    try std.testing.expectEqual(@as(u64, 0), upgraded.intent.next_retry_at_ms);
+    upgraded.deinit(alloc);
+
+    try db.updateIndexRepairIntent(alloc, repair_id, .{
+        .trigger = .operator_generation_validation,
+        .last_error = "OperatorGenerationValidationPending",
+        .replace_last_error = true,
+    });
+    try db.markDenseReplayArtifactCoverageRepairRequired(alloc, cfg.name);
+    upgraded = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer upgraded.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Trigger.artifact_coverage_mismatch, upgraded.intent.trigger);
+    try std.testing.expectEqualStrings("dense_replay_artifact_unreadable", upgraded.intent.last_error.?);
+}
+
+test "db durable repair classification emits exact admission and action edges" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "search_idx",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    const cfg = db.core.index_manager.get("search_idx") orelse return error.TestUnexpectedResult;
+    const repair_id = try db.createGenerationRepairIntent(
+        alloc,
+        cfg.*,
+        .operator_generation_rebuild,
+        0,
+        0,
+        null,
+    );
+    const serviceable_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, serviceable_stats);
+    var observed_serviceable_rebuild = false;
+    for (serviceable_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "search_idx")) continue;
+        observed_serviceable_rebuild = true;
+        try std.testing.expectEqual(types.IndexRepairStatus.rebuilding, index_stats.index_repair_status.?);
+        try std.testing.expect(index_stats.index_repair_active_generation_serviceable);
+    }
+    try std.testing.expect(observed_serviceable_rebuild);
+
+    const Capture = struct {
+        count: usize = 0,
+        repair_id: u128 = 0,
+        previous_admission: IndexRepairAdmission = .unknown,
+        admission: IndexRepairAdmission = .unknown,
+        previous_action_required: bool = false,
+        action_required: bool = false,
+
+        fn onChange(
+            ptr: *anyopaque,
+            _: []const u8,
+            _: u64,
+            _: ?*DB,
+            event: QueryVisibilityEvent,
+        ) void {
+            if (event.change != .index_repair_pending) return;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const repair = event.repair orelse return;
+            self.count += 1;
+            self.repair_id = repair.repair_id;
+            self.previous_admission = repair.previous_admission;
+            self.admission = repair.admission;
+            self.previous_action_required = repair.previous_action_required;
+            self.action_required = repair.action_required;
+        }
+    };
+    var capture = Capture{};
+    db.setQueryVisibilityHook(.{
+        .ptr = &capture,
+        .table_name = "docs",
+        .group_id = 1,
+        .db = &db,
+        .on_change = Capture.onChange,
+    });
+
+    try db.updateIndexRepairIntent(alloc, repair_id, .{
+        .trigger = .projection_generation_invalid,
+        .last_error = "projection_identity_invalid",
+        .replace_last_error = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(repair_id, capture.repair_id);
+    try std.testing.expectEqual(IndexRepairAdmission.serviceable, capture.previous_admission);
+    try std.testing.expectEqual(IndexRepairAdmission.blocked, capture.admission);
+
+    // Diagnostic progress alone does not create visibility churn.
+    try db.updateIndexRepairIntent(alloc, repair_id, .{
+        .last_error = "more_specific_projection_identity_invalid",
+        .replace_last_error = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+
+    try db.updateIndexRepairIntent(alloc, repair_id, .{ .automation = .paused });
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    try std.testing.expectEqual(IndexRepairAdmission.blocked, capture.previous_admission);
+    try std.testing.expectEqual(IndexRepairAdmission.blocked, capture.admission);
+    try std.testing.expect(!capture.previous_action_required);
+    try std.testing.expect(capture.action_required);
 }
 
 test "db forced generation repair completion is crash idempotent before api acknowledgement" {
@@ -76591,6 +79623,35 @@ test "db removing one repair pin preserves pressure gate for another index" {
             .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
         });
     }
+    const Hook = struct {
+        cleared_a: usize = 0,
+        pending_unknown: usize = 0,
+        pending_exact: usize = 0,
+
+        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            switch (event.change) {
+                .index_repair_cleared => if (event.repair) |repair| {
+                    self.cleared_a += @intFromBool(std.mem.eql(u8, repair.index_name, "dense_a"));
+                },
+                .index_repair_pending => if (event.repair == null) {
+                    self.pending_unknown += 1;
+                } else {
+                    self.pending_exact += 1;
+                },
+                else => {},
+            }
+        }
+    };
+    var hook = Hook{};
+    db.setQueryVisibilityHook(.{
+        .ptr = &hook,
+        .table_name = "docs",
+        .group_id = 7001,
+        .db = &db,
+        .on_change = Hook.onChange,
+    });
+    defer db.setQueryVisibilityHook(null);
     const cfg_a = db.core.index_manager.get("dense_a") orelse return error.TestUnexpectedResult;
     const cfg_b = db.core.index_manager.get("dense_b") orelse return error.TestUnexpectedResult;
     const repair_a = try db.createOperatorGenerationRepairIntent(alloc, cfg_a.*, 0, 0);
@@ -76600,8 +79661,12 @@ test "db removing one repair pin preserves pressure gate for another index" {
     var snapshot_b = try db.beginPinnedIndexRepairSnapshot(alloc, repair_b);
     snapshot_b.deinit();
 
+    hook = .{};
     try db.removeIndexRepairIntentAndPin(alloc, repair_a);
     try std.testing.expect(db.async_context.index_repair_replay_pinned.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), hook.cleared_a);
+    try std.testing.expectEqual(@as(usize, 1), hook.pending_unknown);
+    try std.testing.expectEqual(@as(usize, 0), hook.pending_exact);
     var remaining = try db.loadIndexRepairState(alloc);
     try std.testing.expect(remaining.minimumRetainAfterSequence() != null);
     remaining.deinit(alloc);
@@ -77000,19 +80065,170 @@ test "db restart clears stale dense generation intent after clean checkpoint" {
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer reopened.close();
+    var reopened_closed = false;
+    defer if (!reopened_closed) reopened.close();
     try std.testing.expectError(error.IndexRebuilding, reopened.search(alloc, .{
         .index_name = "dense_idx",
         .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 1 } },
         .limit = 1,
     }));
-    const reconciled = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+
+    var before_reconcile = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+    const certified_sequence = before_reconcile.intent.candidate_applied_sequence;
+    before_reconcile.deinit(alloc);
+    try reopened.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1]}}" }},
+        .sync_level = .full_index,
+    });
+    const progressed_checkpoint = try reopened.core.loadProjectionCheckpoint(alloc, "dense_idx");
+    try std.testing.expect(progressed_checkpoint.applied_sequence > certified_sequence);
+
+    const RetirementCrash = struct {
+        fn beforeRetirement(_: *anyopaque, _: *DB, _: u128) !void {
+            return error.TestCrashBeforeRepairRetirement;
+        }
+    };
+    var retirement_hook_ctx: u8 = 0;
+    DB.test_index_repair_reconcile_fence_hook = .{
+        .ptr = &retirement_hook_ctx,
+        .before_retirement = RetirementCrash.beforeRetirement,
+    };
+    defer DB.test_index_repair_reconcile_fence_hook = null;
+    try std.testing.expectError(
+        error.TestCrashBeforeRepairRetirement,
+        reopened.advanceIndexRepairIntent(alloc, repair_id, .{}),
+    );
+    DB.test_index_repair_reconcile_fence_hook = null;
+
+    var cleanup = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+    defer cleanup.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Phase.cleanup, cleanup.intent.phase);
+    // The manifest certification is immutable even though the serving
+    // checkpoint advanced before retirement. A retry can therefore validate
+    // the same installed incarnation and finish idempotently.
+    try std.testing.expectEqual(certified_sequence, cleanup.intent.candidate_applied_sequence);
+    try std.testing.expectEqual(progressed_checkpoint.applied_sequence, cleanup.intent.target_sequence);
+
+    reopened.close();
+    reopened_closed = true;
+    var final_reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer final_reopened.close();
+
+    const reconciled = try final_reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
     try std.testing.expect(reconciled.attempted);
     try std.testing.expect(reconciled.repaired);
     try std.testing.expectEqual(@as(u64, 0), reconciled.documents_reprocessed);
-    try std.testing.expect(!try reopened.hasPendingIndexRepairIntents(alloc));
+    try std.testing.expect(!try final_reopened.hasPendingIndexRepairIntents(alloc));
 
-    var result = try reopened.search(alloc, .{
+    var result = try final_reopened.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 2 } },
+        .limit = 2,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+const InterruptedActivatedDenseRepair = struct {
+    repair_id: u128,
+    candidate_relative_path: []u8,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.candidate_relative_path);
+        self.* = undefined;
+    }
+};
+
+fn interruptDenseRepairAfterActivation(
+    alloc: Allocator,
+    db: *DB,
+) !InterruptedActivatedDenseRepair {
+    const CrashHook = struct {
+        fn afterSnapshot(_: *anyopaque, _: *DB, _: []const u8, _: u64) !void {}
+
+        fn afterActivation(_: *anyopaque, _: *DB, _: []const u8) !void {
+            return error.TestCrashBeforeActivationCertification;
+        }
+    };
+    var hook_ctx: u8 = 0;
+    db.shadow_index_repair_hook = .{
+        .ptr = &hook_ctx,
+        .after_snapshot_build = CrashHook.afterSnapshot,
+        .after_pointer_activation = CrashHook.afterActivation,
+    };
+    defer db.shadow_index_repair_hook = null;
+    try std.testing.expectError(error.TestCrashBeforeActivationCertification, db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .embedding,
+        .index_name = "dense_idx",
+        .limit = 1,
+        .force = true,
+    }));
+
+    const repair_id = (try db.indexRepairIdForIndex(alloc, "dense_idx")) orelse
+        return error.TestUnexpectedResult;
+    var entry = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Phase.activating, entry.intent.phase);
+    try std.testing.expect(entry.intent.previous_pointer_captured);
+    try std.testing.expect(try db.core.index_manager.isRepairCandidateActive(
+        "dense_idx",
+        entry.intent.candidate_relative_path.?,
+    ));
+    return .{
+        .repair_id = repair_id,
+        .candidate_relative_path = try alloc.dupe(u8, entry.intent.candidate_relative_path.?),
+    };
+}
+
+test "db missing activation certification rolls back to serviceable dense predecessor" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
+        .sync_level = .full_index,
+    });
+
+    var interrupted = try interruptDenseRepairAfterActivation(alloc, &db);
+    defer interrupted.deinit(alloc);
+    const manifest_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/{s}/.antfly-index-generation",
+        .{ std.mem.span(path), interrupted.candidate_relative_path },
+    );
+    defer alloc.free(manifest_path);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, manifest_path);
+
+    const resumed = try db.advanceIndexRepairIntent(alloc, interrupted.repair_id, .{});
+    try std.testing.expect(resumed.attempted);
+    try std.testing.expect(resumed.deferred);
+    try std.testing.expect(!resumed.terminal);
+    try std.testing.expect(db.core.index_manager.failedIndexLoadSnapshot("dense_idx") == null);
+
+    var reset = try db.loadIndexRepairEntryById(alloc, interrupted.repair_id);
+    defer reset.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Phase.preflight, reset.intent.phase);
+    try std.testing.expect(reset.intent.candidate_relative_path == null);
+
+    var result = try db.search(alloc, .{
         .index_name = "dense_idx",
         .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 1 } },
         .limit = 1,
@@ -77020,6 +80236,107 @@ test "db restart clears stale dense generation intent after clean checkpoint" {
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db missing activation certification exposes predecessor action required" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
+        .sync_level = .full_index,
+    });
+
+    var interrupted = try interruptDenseRepairAfterActivation(alloc, &db);
+    defer interrupted.deinit(alloc);
+    const manifest_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/{s}/.antfly-index-generation",
+        .{ std.mem.span(path), interrupted.candidate_relative_path },
+    );
+    defer alloc.free(manifest_path);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, manifest_path);
+
+    const CrashAfterRollback = struct {
+        fn beforeRetry(_: *anyopaque, _: *DB, _: u128) !void {
+            return error.TestCrashAfterUncertifiedRollback;
+        }
+    };
+    var rollback_hook_ctx: u8 = 0;
+    DB.test_index_repair_rollback_retry_hook = .{
+        .ptr = &rollback_hook_ctx,
+        .before_retry = CrashAfterRollback.beforeRetry,
+    };
+    defer DB.test_index_repair_rollback_retry_hook = null;
+    try std.testing.expectError(
+        error.TestCrashAfterUncertifiedRollback,
+        db.advanceIndexRepairIntent(alloc, interrupted.repair_id, .{}),
+    );
+    DB.test_index_repair_rollback_retry_hook = null;
+    var rolling_back = try db.loadIndexRepairEntryById(alloc, interrupted.repair_id);
+    defer rolling_back.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Phase.rolling_back, rolling_back.intent.phase);
+    try std.testing.expectEqualStrings("activation_manifest_missing", rolling_back.intent.last_error.?);
+    try std.testing.expect(!try db.core.index_manager.isRepairCandidateActive(
+        "dense_idx",
+        interrupted.candidate_relative_path,
+    ));
+    try std.testing.expectEqual(
+        interrupted.repair_id,
+        db.core.index_manager.failedIndexLoadSnapshot("dense_idx").?.claim_owner_repair_id.?,
+    );
+
+    index_manager_mod.test_inject_index_open_error = error.InvalidIndexConfig;
+    defer index_manager_mod.test_inject_index_open_error = null;
+    const resumed = try db.advanceIndexRepairIntent(alloc, interrupted.repair_id, .{});
+    index_manager_mod.test_inject_index_open_error = null;
+    try std.testing.expect(resumed.attempted);
+    try std.testing.expect(resumed.terminal);
+
+    var terminal = try db.loadIndexRepairEntryById(alloc, interrupted.repair_id);
+    defer terminal.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Phase.terminal, terminal.intent.phase);
+    try std.testing.expectEqualStrings("activation_manifest_missing", terminal.intent.last_error.?);
+    try std.testing.expect(terminal.intent.candidate_relative_path == null);
+    try std.testing.expect(DB.indexRepairActionRequired(terminal.intent));
+
+    const failure = db.core.index_manager.failedIndexLoadSnapshot("dense_idx") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("InvalidIndexConfig", failure.err_name);
+    try std.testing.expectEqual(
+        index_manager_mod.IndexManager.IndexLoadRecoveryAction.manual_intervention,
+        failure.token.action,
+    );
+    try std.testing.expect(failure.claim_owner_repair_id == null);
+    const terminal_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, terminal_stats);
+    var observed_terminal_status = false;
+    for (terminal_stats.indexes) |item| {
+        if (!std.mem.eql(u8, item.name, "dense_idx")) continue;
+        observed_terminal_status = true;
+        try std.testing.expectEqual(types.IndexRepairStatus.failed, item.index_repair_status.?);
+        try std.testing.expect(item.index_repair_action_required);
+        try std.testing.expectEqualStrings("activation_manifest_missing", item.index_repair_last_error.?);
+        try std.testing.expectEqualStrings("InvalidIndexConfig", item.load_error.?);
+    }
+    try std.testing.expect(observed_terminal_status);
+    try std.testing.expectError(error.IndexUnavailable, db.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 1 } },
+        .limit = 1,
+    }));
 }
 
 test "db failed activated dense generation rolls back to retained predecessor" {
@@ -77091,14 +80408,21 @@ test "db failed activated dense generation rolls back to retained predecessor" {
         candidate_relative_path = try alloc.dupe(u8, interrupted.intent.candidate_relative_path.?);
     }
 
-    // Remove only the newly active candidate. A pointer-selected root without
-    // its ready manifest must fail closed instead of being recreated empty.
+    // Poison only the newly active candidate. The retained predecessor remains
+    // valid, while this exact failure is eligible for automatic discovery and
+    // can therefore exercise the rollback/retry ownership handoff.
     const candidate_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ std.mem.span(path), candidate_relative_path.? });
     defer alloc.free(candidate_path);
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    try std.Io.Dir.cwd().deleteTree(io_impl.io(), candidate_path);
-    try ensureDirPath(candidate_path);
+    const candidate_path_z = try alloc.dupeZ(u8, candidate_path);
+    defer alloc.free(candidate_path_z);
+    {
+        var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, candidate_path_z, .{
+            .dims = 2,
+            .storage_backend = .lsm,
+        }, .{});
+        try hbc.beginBulkIngestSession();
+        hbc.close();
+    }
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
@@ -77106,8 +80430,90 @@ test "db failed activated dense generation rolls back to retained predecessor" {
         .ttl_cleanup = .{ .enabled = false },
     });
     defer reopened.close();
-    try std.testing.expect(reopened.core.index_manager.loadFailure("dense_idx") != null);
-    try std.testing.expect(try reopened.rollbackUnavailableActivatedIndexRepair(alloc, repair_id));
+    try std.testing.expectEqualStrings(
+        "IncompleteBulkPublish",
+        reopened.core.index_manager.loadFailure("dense_idx") orelse return error.TestUnexpectedResult,
+    );
+
+    const RollbackCheckpointCrash = struct {
+        fn afterSnapshot(_: *anyopaque, _: *DB, _: []const u8, _: u64) !void {}
+
+        fn afterPhase(_: *anyopaque, _: *DB, _: u128, phase: index_repair_state.Phase) !void {
+            if (phase == .rolling_back) return error.TestCrashBeforeRollbackPointerRestore;
+        }
+    };
+    var rollback_checkpoint_ctx: u8 = 0;
+    reopened.shadow_index_repair_hook = .{
+        .ptr = &rollback_checkpoint_ctx,
+        .after_snapshot_build = RollbackCheckpointCrash.afterSnapshot,
+        .after_phase_persisted = RollbackCheckpointCrash.afterPhase,
+    };
+    try std.testing.expectError(
+        error.TestCrashBeforeRollbackPointerRestore,
+        reopened.rollbackUnavailableActivatedIndexRepair(alloc, repair_id, null),
+    );
+    reopened.shadow_index_repair_hook = null;
+    {
+        var checkpointed = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+        defer checkpointed.deinit(alloc);
+        try std.testing.expectEqual(index_repair_state.Phase.rolling_back, checkpointed.intent.phase);
+        try std.testing.expect(try reopened.core.index_manager.isRepairCandidateActive(
+            "dense_idx",
+            checkpointed.intent.candidate_relative_path.?,
+        ));
+    }
+
+    const RollbackDiscovery = struct {
+        repair_id: u128,
+        observed: bool = false,
+
+        fn beforeRetry(raw: *anyopaque, db: *DB, observed_repair_id: u128) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.repair_id, observed_repair_id);
+            var rolling_back = try db.loadIndexRepairEntryById(db.alloc, observed_repair_id);
+            defer rolling_back.deinit(db.alloc);
+            try std.testing.expectEqual(index_repair_state.Phase.rolling_back, rolling_back.intent.phase);
+            const generic_retry = try db.retryQuarantinedIndexLoad("dense_idx", true);
+            try std.testing.expectEqual(
+                index_manager_mod.IndexManager.QuarantineRetryTargetOutcome.repair_claimed,
+                generic_retry.target_outcome,
+            );
+            const discovery = try db.discoverRecoverableStartupIndexFailures(db.alloc, 1);
+            try std.testing.expectEqual(@as(usize, 0), discovery.discovered);
+            try std.testing.expectEqual(@as(usize, 1), discovery.already_pending);
+            try std.testing.expectEqual(
+                self.repair_id,
+                db.core.index_manager.failedIndexLoadSnapshot("dense_idx").?.claim_owner_repair_id.?,
+            );
+            self.observed = true;
+            return error.TestCrashAfterRollbackPointerRestore;
+        }
+    };
+    var rollback_discovery = RollbackDiscovery{ .repair_id = repair_id };
+    DB.test_index_repair_rollback_retry_hook = .{
+        .ptr = &rollback_discovery,
+        .before_retry = RollbackDiscovery.beforeRetry,
+    };
+    defer DB.test_index_repair_rollback_retry_hook = null;
+    try std.testing.expectError(
+        error.TestCrashAfterRollbackPointerRestore,
+        reopened.rollbackUnavailableActivatedIndexRepair(alloc, repair_id, null),
+    );
+    try std.testing.expect(rollback_discovery.observed);
+    {
+        var interrupted_rollback = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+        defer interrupted_rollback.deinit(alloc);
+        try std.testing.expectEqual(index_repair_state.Phase.rolling_back, interrupted_rollback.intent.phase);
+        try std.testing.expect(!try reopened.core.index_manager.isRepairCandidateActive(
+            "dense_idx",
+            interrupted_rollback.intent.candidate_relative_path.?,
+        ));
+    }
+    DB.test_index_repair_rollback_retry_hook = null;
+    try std.testing.expectEqual(
+        DB.ActivatedIndexRepairRollback.prior_generation_restored,
+        try reopened.rollbackUnavailableActivatedIndexRepair(alloc, repair_id, null),
+    );
     try std.testing.expect(reopened.core.index_manager.loadFailure("dense_idx") == null);
 
     // The previous generation is immediately serviceable after rollback,
@@ -86417,7 +89823,7 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
             _: []const u8,
             _: u64,
             _: ?*DB,
-            _: QueryVisibilityChange,
+            _: QueryVisibilityEvent,
         ) void {}
     };
     db.setQueryVisibilityHook(.{
@@ -87938,9 +91344,9 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
         publish_blocking_checkpoint_clean: bool = false,
         invalidate_calls: u64 = 0,
 
-        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, changed_db: ?*DB, change: QueryVisibilityChange) void {
+        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, changed_db: ?*DB, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            switch (change) {
+            switch (event.change) {
                 .status => {
                     self.publish_calls += 1;
                     self.status_calls += 1;
@@ -87978,7 +91384,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
                     }
                 },
                 .invalidate => self.invalidate_calls += 1,
-                .index_repair_pending, .index_repair_cleared => {},
+                .index_repair_pending, .index_repair_cleared, .index_repair_progress => {},
             }
         }
     };
