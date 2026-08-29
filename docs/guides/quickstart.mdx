@@ -359,14 +359,14 @@ atomic` when a replacement generation must remain unavailable until fully built
 and validated. See [Troubleshooting](#troubleshooting) below.
 
 <Callout type="info">
-For chunked indexes, `INDEXED` and `SEARCHABLE` describe physical chunks or
-vector records, not source documents, so they can exceed 10,000. Embeddings
-status keeps these dimensions separate: `source_coverage` reports durable
-source outcomes, `searchable_vectors` reports query-visible physical entries,
-and `activity` reports incarnation-scoped chunk and embedding work. Activity
-explains current speed but never changes readiness. `queryable_partial` means
-the active generation is safe to query but incomplete; `ready` means coverage
-is complete.
+For chunked indexes, `INDEXED` and `SEARCHABLE` describe
+physical chunks or vector records, not source documents, so they can exceed
+10,000. Embeddings status keeps these dimensions separate: `source_coverage`
+reports durable source outcomes, `searchable_vectors` reports query-visible
+physical entries, and `activity` reports incarnation-scoped chunk and embedding
+work. Activity explains current speed but never changes readiness.
+`queryable_partial` means the active generation is safe to query but incomplete;
+`ready` means coverage is complete.
 </Callout>
 
 ## Search
