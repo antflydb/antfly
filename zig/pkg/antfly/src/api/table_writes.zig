@@ -6539,6 +6539,10 @@ pub const ProvisionedTableWriteSource = struct {
     write_coalesce_ready: Io.Condition = .init,
     write_coalesce_queues: std.ArrayListUnmanaged(WriteCoalesceQueue) = .empty,
     read_cache: ?*table_reads.ProvisionedTableReadCache = null,
+    /// Dropped-table cleanup is post-commit convergence backed by a durable
+    /// repair intent. Bound foreground lease draining so an abandoned reader
+    /// cannot pin the user request; recovery resumes the idempotent cleanup.
+    drop_cleanup_read_drain_timeout_ns: u64 = 5 * std.time.ns_per_s,
     write_cache: ?*ProvisionedTableWriteCache = null,
     startup_write_cache: ?*ProvisionedTableWriteCache = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
@@ -10591,6 +10595,15 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?table_reads.ProvisionedTableReadCache.ExclusiveTableAccess {
         const cache = self.read_cache orelse return null;
         return try cache.beginExclusiveTableAccess(table_name);
+    }
+
+    fn beginReadCacheExclusiveWithDeadline(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        deadline_ns: u64,
+    ) !?table_reads.ProvisionedTableReadCache.ExclusiveTableAccess {
+        const cache = self.read_cache orelse return null;
+        return try cache.beginExclusiveTableAccessWithDeadline(table_name, deadline_ns);
     }
 
     fn beginReadCacheGroupExclusive(
@@ -16250,7 +16263,12 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateWriteCache(table_name);
         self.invalidateReadCache(table_name);
         self.invalidateRuntimeStatusCache(table_name);
-        var read_cache_exclusive = self.beginReadCacheExclusive(table_name) catch |err| {
+        const read_drain_deadline_ns = platform_time.monotonicNs() +|
+            self.drop_cleanup_read_drain_timeout_ns;
+        var read_cache_exclusive = self.beginReadCacheExclusiveWithDeadline(
+            table_name,
+            read_drain_deadline_ns,
+        ) catch |err| {
             self.local_db_mutex.unlock();
             return err;
         };
@@ -45341,12 +45359,10 @@ test "provisioned table write source drop table waits for active read cache leas
 
     const Probe = struct {
         entered: std.atomic.Value(bool) = .init(false),
-        release: std.atomic.Value(bool) = .init(false),
 
         fn run(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
         }
     };
 
@@ -45363,6 +45379,7 @@ test "provisioned table write source drop table waits for active read cache leas
 
     var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
     source.read_cache = &read_cache;
+    source.drop_cleanup_read_drain_timeout_ns = 250 * std.time.ns_per_ms;
 
     var probe = Probe{};
     test_before_drop_table_delete_hook = .{ .ptr = &probe, .run = Probe.run };
@@ -45371,30 +45388,20 @@ test "provisioned table write source drop table waits for active read cache leas
     var worker = DropWorker{ .source = &source };
     const thread = try std.Thread.spawn(.{}, DropWorker.run, .{&worker});
     var thread_joined = false;
-    defer if (!thread_joined) {
-        probe.release.store(true, .release);
-        thread.join();
-    };
+    defer if (!thread_joined) thread.join();
 
     io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
     try std.testing.expect(!probe.entered.load(.acquire));
 
     read_lease.release();
     read_lease_active = false;
-    const entered_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
-    while (!probe.entered.load(.acquire) and platform_time.monotonicNs() < entered_deadline_ns) {
-        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
-    }
-    if (!probe.entered.load(.acquire)) {
-        thread.join();
-        thread_joined = true;
-        if (worker.err) |err| return err;
-        return error.TestUnexpectedResult;
-    }
-    probe.release.store(true, .release);
+    // The production drain contract bounds this join even if lease retirement
+    // regresses. The hook is observation-only, so the test itself cannot
+    // manufacture an unbounded worker lifetime.
     thread.join();
     thread_joined = true;
     if (worker.err) |err| return err;
+    try std.testing.expect(probe.entered.load(.acquire));
 }
 
 test "provisioned table write source backup releases read cache exclusive before native snapshot copy" {
