@@ -2065,6 +2065,13 @@ pub const ApiHttpServer = struct {
         );
     }
 
+    /// Bind a routing-aware source after the server reaches its final address.
+    /// The cache pointer must never target the temporary returned-by-value
+    /// server used during construction.
+    pub fn bindIncomingGraphRoutes(self: *ApiHttpServer, source: table_reads.TableReadSource) void {
+        source.bindIncomingGraphRoutes(&self.incoming_graph_routes);
+    }
+
     pub fn initForTestingWithRequestAllocator(
         owner_alloc: std.mem.Allocator,
         request_alloc: std.mem.Allocator,

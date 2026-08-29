@@ -2671,8 +2671,14 @@ pub const ProvisionedTableReadSource = struct {
                 .document_artifact_manifests = documentArtifactManifests,
                 .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
                 .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocal,
+                .bind_incoming_graph_routes = bindIncomingGraphRoutes,
             },
         };
+    }
+
+    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *distributed_graph.IncomingSourceGroupCache) void {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        _ = self.withIncomingGraphRoutes(cache);
     }
 
     pub fn warmTableGroup(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8) !void {
@@ -3928,8 +3934,14 @@ pub const HostedProvisionedTableReadSource = struct {
                 .document_artifact_manifests = documentArtifactManifests,
                 .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
                 .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocal,
+                .bind_incoming_graph_routes = bindIncomingGraphRoutes,
             },
         };
+    }
+
+    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *distributed_graph.IncomingSourceGroupCache) void {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        _ = self.withIncomingGraphRoutes(cache);
     }
 
     fn lookup(
