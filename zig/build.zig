@@ -7215,7 +7215,7 @@ pub fn build(b: *std.Build) void {
     const run_query_embedding_cache_vopr_tests = b.addRunArtifact(query_embedding_cache_vopr_tests);
     const query_embedding_cache_vopr_test_step = b.step(
         "query-embedding-cache-vopr-test",
-        "Run query embedding coalescing, cancellation, timeout, admission, TTL, LRU, and pin races on VoprIo",
+        "Run query embedding coalescing, cancellation, timeout, admission, TTL, LRU, pin, and service-rate races on VoprIo",
     );
     query_embedding_cache_vopr_test_step.dependOn(&run_query_embedding_cache_vopr_tests.step);
 

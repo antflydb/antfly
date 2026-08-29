@@ -13,7 +13,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "query-embedding-cache";
-    pub const version: u32 = 1;
+    pub const version: u32 = 2;
 
     const sound_id = vopr.id.stable(name, "outcomes-sound");
     const single_producer_id = vopr.id.stable(name, "same-key-single-producer");
@@ -22,6 +22,7 @@ pub const Scenario = struct {
     const expiry_id = vopr.id.stable(name, "ttl-expiry-uses-borrowed-clock");
     const eviction_id = vopr.id.stable(name, "lru-eviction-bounded");
     const pinned_id = vopr.id.stable(name, "pinned-copy-survives-eviction");
+    const service_rate_id = vopr.id.stable(name, "service-rate-composes-and-heals");
     const complete_id = vopr.id.stable(name, "mode-completes");
 
     pub const properties = &[_]vopr.property.Declaration{
@@ -32,10 +33,11 @@ pub const Scenario = struct {
         .{ .id = expiry_id, .name = name ++ ".ttl-expiry-uses-borrowed-clock", .kind = .always },
         .{ .id = eviction_id, .name = name ++ ".lru-eviction-bounded", .kind = .always },
         .{ .id = pinned_id, .name = name ++ ".pinned-copy-survives-eviction", .kind = .always },
+        .{ .id = service_rate_id, .name = name ++ ".service-rate-composes-and-heals", .kind = .always },
         .{ .id = complete_id, .name = name ++ ".mode-completes", .kind = .reachable },
     };
 
-    const Mode = enum { coalesce, timeout, cancellation, overload, ttl, lru, pinned_eviction };
+    const Mode = enum { coalesce, timeout, cancellation, overload, ttl, lru, pinned_eviction, service_rate };
     const mode_ids = [_]vopr.id.StableId{
         vopr.id.stable(name, "coalesce"),
         vopr.id.stable(name, "timeout"),
@@ -44,6 +46,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "ttl"),
         vopr.id.stable(name, "lru"),
         vopr.id.stable(name, "pinned-eviction"),
+        vopr.id.stable(name, "service-rate"),
     };
     const mode_names = [_][]const u8{
         name ++ ".coalesce",
@@ -53,10 +56,48 @@ pub const Scenario = struct {
         name ++ ".ttl",
         name ++ ".lru",
         name ++ ".pinned-eviction",
+        name ++ ".service-rate",
     };
 
     const key_a: query_cache.Key = [_]u8{0xa1} ** 32;
     const key_b: query_cache.Key = [_]u8{0xb2} ** 32;
+
+    const cache_node = vopr.service_rate.Node{
+        .id = vopr.id.stable(name, "node.cache-owner"),
+        .name = name ++ ".node.cache-owner",
+    };
+    const request_operation = vopr.service_rate.Operation.named(name ++ ".request", 2);
+    const hit_copy_operation = vopr.service_rate.Operation.named(name ++ ".hit-copy", 1);
+    const coalesced_wait_operation = vopr.service_rate.Operation.named(name ++ ".coalesced-wait", 3);
+    const producer_operation = vopr.service_rate.Operation.named(name ++ ".producer-compute", 5);
+    const service_nodes = [_]vopr.service_rate.Node{cache_node};
+    const service_operations = [_]vopr.service_rate.Operation{
+        request_operation,
+        hit_copy_operation,
+        coalesced_wait_operation,
+        producer_operation,
+    };
+    const node_slow_fault_id = vopr.id.stable(name, "fault.node-slow");
+    const hit_slow_fault_id = vopr.id.stable(name, "fault.hit-copy-slow");
+
+    const ServiceRateAdapter = struct {
+        port: vopr.service_rate.Port,
+
+        fn iface(self: *ServiceRateAdapter) query_cache.WorkCostPort {
+            return .{ .ptr = self, .charge_fn = charge };
+        }
+
+        fn charge(raw: *anyopaque, kind: query_cache.WorkKind, units: u64) !void {
+            const self: *ServiceRateAdapter = @ptrCast(@alignCast(raw));
+            const operation = switch (kind) {
+                .request => request_operation,
+                .hit_copy => hit_copy_operation,
+                .coalesced_wait => coalesced_wait_operation,
+                .producer_compute => producer_operation,
+            };
+            _ = try self.port.charge(operation.id, units);
+        }
+    };
 
     const State = struct {
         owner_allocator: std.mem.Allocator,
@@ -65,6 +106,8 @@ pub const Scenario = struct {
         sim: vopr.vopr_io.VoprIo,
         budget: cache_budget.CacheBudget,
         cache: ?query_cache.QueryEmbeddingCache = null,
+        service_rate_model: ?vopr.service_rate.Model = null,
+        service_rate_adapter: ServiceRateAdapter = undefined,
         mode: ?Mode = null,
         compute_release: std.Io.Event = .unset,
         pin_release: std.Io.Event = .unset,
@@ -81,6 +124,7 @@ pub const Scenario = struct {
         expiry_sound: bool = true,
         eviction_sound: bool = true,
         pinned_sound: bool = true,
+        service_rate_sound: bool = true,
         complete: bool = false,
 
         fn init(allocator: std.mem.Allocator) !*State {
@@ -105,13 +149,14 @@ pub const Scenario = struct {
 
         fn deinit(self: *State) void {
             if (self.cache) |*cache| cache.deinit(&self.budget);
+            if (self.service_rate_model) |*model| model.deinit();
             self.sim.deinit();
             const owner_allocator = self.owner_allocator;
             std.debug.assert(self.fixture_allocator.deinit() == .ok);
             owner_allocator.destroy(self);
         }
 
-        fn start(self: *State, mode: Mode) void {
+        fn start(self: *State, mode: Mode) !void {
             self.mode = mode;
             const charge = query_cache.QueryEmbeddingCache.entryChargeBytes(3);
             const config: query_cache.Config = switch (mode) {
@@ -119,6 +164,7 @@ pub const Scenario = struct {
                 .overload => .{ .max_bytes = 0, .max_inflight = 1 },
                 .ttl => .{ .max_bytes = charge * 2, .ttl_ns = 5, .max_inflight = 1 },
                 .lru, .pinned_eviction => .{ .max_bytes = charge, .ttl_ns = 1_000, .max_inflight = 1 },
+                .service_rate => .{ .max_bytes = charge * 2, .ttl_ns = 1_000, .max_inflight = 1 },
             };
             self.budget = cache_budget.CacheBudget.init(config.max_bytes);
             self.cache = query_cache.QueryEmbeddingCache.init(self.allocator, self.sim.io(), config);
@@ -126,6 +172,17 @@ pub const Scenario = struct {
                 .ptr = self,
                 .after_pin = afterPin,
             });
+            if (mode == .service_rate) {
+                self.service_rate_model = try vopr.service_rate.Model.init(
+                    self.allocator,
+                    &service_nodes,
+                    &service_operations,
+                );
+                self.service_rate_adapter = .{
+                    .port = try self.service_rate_model.?.port(self.sim.io(), cache_node.id),
+                };
+                self.cache.?.setWorkCostPort(self.service_rate_adapter.iface());
+            }
             _ = self.sim.io().async(runRoot, .{self});
         }
 
@@ -213,6 +270,7 @@ pub const Scenario = struct {
                 .ttl => try self.runTtl(),
                 .lru => try self.runLru(),
                 .pinned_eviction => try self.runPinnedEviction(),
+                .service_rate => try self.runServiceRate(),
             }
         }
 
@@ -298,6 +356,56 @@ pub const Scenario = struct {
             self.pinned_sound = self.pinned_sound and self.successful_results == 3 and
                 stats.entries == 0 and stats.live_bytes == 0 and self.budget.stats().used_bytes == 0;
         }
+
+        fn runServiceRate(self: *State) !void {
+            var started = self.nowNs();
+            try self.fetch(key_a, null);
+            const miss_cost = self.nowNs() -| started;
+
+            const model = &self.service_rate_model.?;
+            try model.activate(.{
+                .fault_id = node_slow_fault_id,
+                .node_id = cache_node.id,
+                .multiplier_ppm = 2 * vopr.service_rate.parts_per_million,
+            });
+            try model.activate(.{
+                .fault_id = hit_slow_fault_id,
+                .node_id = cache_node.id,
+                .operation_id = hit_copy_operation.id,
+                .multiplier_ppm = 3 * vopr.service_rate.parts_per_million,
+            });
+            started = self.nowNs();
+            self.fetch(key_a, started +| 21) catch |err| {
+                if (err != error.Timeout) self.service_rate_sound = false;
+            };
+            const timed_out_cost = self.nowNs() -| started;
+            started = self.nowNs();
+            try self.fetch(key_a, null);
+            const overlapping_cost = self.nowNs() -| started;
+
+            try model.heal(hit_slow_fault_id);
+            started = self.nowNs();
+            try self.fetch(key_a, null);
+            const node_only_cost = self.nowNs() -| started;
+
+            try model.heal(node_slow_fault_id);
+            started = self.nowNs();
+            try self.fetch(key_a, null);
+            const healed_cost = self.nowNs() -| started;
+
+            const usage = try model.nodeUsage(cache_node.id);
+            const stats = self.cache.?.stats(&self.budget);
+            self.service_rate_sound = self.service_rate_sound and miss_cost == 7 and
+                timed_out_cost == 22 and
+                overlapping_cost == 22 and
+                node_only_cost == 10 and
+                healed_cost == 5 and
+                usage.operations == 18 and
+                usage.charged_ns == 66 and
+                model.active.items.len == 0 and
+                self.compute_calls == 1 and stats.hits == 4 and stats.misses == 1 and
+                self.successful_results == 4;
+        }
     };
 
     pub const World = struct { state: *State };
@@ -319,7 +427,7 @@ pub const Scenario = struct {
                 .name = mode_name,
                 .kind = switch (mode) {
                     .coalesce, .ttl, .lru => .workload,
-                    .timeout, .cancellation, .overload, .pinned_eviction => .fault,
+                    .timeout, .cancellation, .overload, .pinned_eviction, .service_rate => .fault,
                 },
             });
             return;
@@ -332,7 +440,7 @@ pub const Scenario = struct {
         if (state.mode == null) {
             var found = false;
             inline for (std.meta.tags(Mode), mode_ids) |mode, id| if (selected.id == id) {
-                state.start(mode);
+                try state.start(mode);
                 found = true;
             };
             if (!found) return error.InvalidQueryEmbeddingCacheMode;
@@ -352,6 +460,11 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".inflight", @intCast(stats.inflight));
         try builder.addNamed(allocator, name ++ ".entries", @intCast(stats.entries));
         try builder.addNamed(allocator, name ++ ".budget-used", @intCast(state.budget.stats().used_bytes));
+        const charged_ns = if (state.service_rate_model) |*model|
+            (try model.nodeUsage(cache_node.id)).charged_ns
+        else
+            0;
+        try builder.addNamed(allocator, name ++ ".service-rate-charged-ns", @intCast(charged_ns));
         try builder.addNamed(allocator, name ++ ".complete", @intFromBool(state.complete));
     }
 
@@ -364,6 +477,7 @@ pub const Scenario = struct {
         try sink.check(allocator, expiry_id, !state.complete or state.expiry_sound);
         try sink.check(allocator, eviction_id, !state.complete or state.eviction_sound);
         try sink.check(allocator, pinned_id, !state.complete or state.pinned_sound);
+        try sink.check(allocator, service_rate_id, !state.complete or state.service_rate_sound);
         try sink.check(allocator, complete_id, state.complete);
     }
 
@@ -376,7 +490,8 @@ pub const Scenario = struct {
             .recovery_expected = state.mode == .timeout or state.mode == .cancellation or state.mode == .overload,
             .recovery_complete = state.complete and stats.inflight == 0,
             .consistency_valid = state.sound and state.single_producer and state.waiter_clean and
-                state.bounded and state.expiry_sound and state.eviction_sound and state.pinned_sound,
+                state.bounded and state.expiry_sound and state.eviction_sound and state.pinned_sound and
+                state.service_rate_sound,
             .cleanup_complete = state.complete and stats.inflight == 0,
         });
     }
@@ -386,7 +501,7 @@ pub const Scenario = struct {
     }
 };
 
-test "query embedding cache VOPR exact replays coalescing cancellation admission TTL LRU and pin races" {
+test "query embedding cache VOPR exact replays coalescing cancellation admission TTL LRU pin and service-rate races" {
     const backend_ids = vopr.vopr_io.artifactBackendIds();
     for (Scenario.mode_ids, 0..) |mode_id, mode_ordinal| {
         for (0..4) |schedule_ordinal| {
@@ -398,7 +513,7 @@ test "query embedding cache VOPR exact replays coalescing cancellation admission
                 .system = "antfly",
                 .transition_budget = 512,
                 .backend_ids = &backend_ids,
-                .source_revision = "query-embedding-cache-vopr-v1",
+                .source_revision = "query-embedding-cache-vopr-v2",
                 .target = "native",
                 .optimize = @tagName(@import("builtin").mode),
             });
