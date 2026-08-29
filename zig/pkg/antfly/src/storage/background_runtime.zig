@@ -549,6 +549,7 @@ pub const DurableJobLane = struct {
         drain_owner: *const fn (ptr: *anyopaque, owner_id: u64) void,
         close_owner: *const fn (ptr: *anyopaque, owner_id: u64) void,
         poll: *const fn (ptr: *anyopaque, max_jobs: usize) anyerror!usize,
+        is_accepting: ?*const fn (ptr: *anyopaque) bool = null,
         executes_inline: bool = false,
     };
 
@@ -568,6 +569,14 @@ pub const DurableJobLane = struct {
 
     pub fn poll(self: DurableJobLane, max_jobs: usize) !usize {
         return try self.vtable.poll(self.ptr, max_jobs);
+    }
+
+    /// Whether the lane still admits successor work. Durable jobs use this to
+    /// make delayed retries responsive to runtime shutdown while leaving their
+    /// on-disk intent available for reconciliation on the next open.
+    pub fn isAccepting(self: DurableJobLane) bool {
+        const callback = self.vtable.is_accepting orelse return true;
+        return callback(self.ptr);
     }
 
     /// Manual runtimes execute submissions on the caller's stack. Workers
@@ -1224,6 +1233,10 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     fn poll(_: *anyopaque, _: usize) !usize {
         return 0;
     }
+
+    fn isAccepting(_: *anyopaque) bool {
+        return false;
+    }
 } else struct {
     const Entry = struct {
         lane: *ThreadedDurableJobLane,
@@ -1248,6 +1261,7 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     reap_mutex: std.atomic.Mutex = .unlocked,
     shutdown_reaper: std.atomic.Value(bool) = .init(false),
     completed_count: std.atomic.Value(usize) = .init(0),
+    accepting: std.atomic.Value(bool) = .init(true),
     reaper_future: ?Io.Future(void) = null,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
 
@@ -1271,6 +1285,7 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn deinit(self: *ThreadedDurableJobLane) void {
+        self.accepting.store(false, .release);
         self.shutdown_reaper.store(true, .release);
         if (self.reaper_future) |*future| {
             _ = future.await(self.io_impl.io());
@@ -1283,8 +1298,10 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
 
     fn submit(ptr: *anyopaque, job: Job) !void {
         const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
+        if (!self.accepting.load(.acquire)) return error.BackendRuntimeShuttingDown;
         try self.owners.beginJob(job.owner_id);
         errdefer self.owners.finishJob(job.owner_id);
+        if (!self.accepting.load(.acquire)) return error.BackendRuntimeShuttingDown;
         const entry = try self.alloc.create(Entry);
         entry.* = .{
             .lane = self,
@@ -1316,6 +1333,11 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     fn poll(ptr: *anyopaque, max_jobs: usize) !usize {
         const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
         return self.reapCompleted(max_jobs);
+    }
+
+    fn isAccepting(ptr: *anyopaque) bool {
+        const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
+        return self.accepting.load(.acquire);
     }
 
     fn runEntry(entry: *Entry) void {
@@ -1431,6 +1453,7 @@ const threaded_vtable = DurableJobLane.VTable{
     .drain_owner = ThreadedDurableJobLane.drainOwner,
     .close_owner = ThreadedDurableJobLane.closeOwner,
     .poll = ThreadedDurableJobLane.poll,
+    .is_accepting = ThreadedDurableJobLane.isAccepting,
 };
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {

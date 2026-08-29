@@ -559,6 +559,13 @@ fn prepareRestoreSnapshot(
     // v0.2.0 native snapshots predate the generation manifest. Preserve their
     // released compatibility path, including whole-tree integrity validation;
     // unreleased intermediate manifest schemas are never inferred here.
+    const legacy_restore_open_options = try db_mod.DB.resolveNativeRestoreOpenOptions(
+        staged_path,
+        options.expected_identity_namespace,
+        restore.backend_runtime,
+    );
+    if (legacy_restore_open_options.physical_root_mode != .filesystem_managed)
+        return error.NativeBackupStorageBackendUnsupported;
     const snapshot_root = try stageRestoreSnapshot(alloc, io, path, &location, snapshot_path, restore.cancellation);
     defer {
         destroyPathIfExistsWithIo(io, snapshot_root);
@@ -574,10 +581,7 @@ fn prepareRestoreSnapshot(
     );
 
     std.log.info("native restore staged generation phase=materialization", .{});
-    try db_mod.DB.restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation(&staged_generation, alloc, io, snapshot_root, staged_path, .{
-        .identity_namespace = options.expected_identity_namespace,
-        .backend_runtime = restore.backend_runtime,
-    }, .{
+    try db_mod.DB.restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation(&staged_generation, alloc, io, snapshot_root, staged_path, legacy_restore_open_options, .{
         .backup_id = restore.backup_id,
         .location = restoreIdentityLocation(restore),
         .artifact_sha256 = shard.artifact_sha256,
@@ -631,6 +635,17 @@ fn applyManifestNativeRestore(
     }
 
     const staged_path = staged_generation.path();
+    const restore_open_options = try db_mod.DB.resolveNativeRestoreOpenOptions(
+        staged_path,
+        options.expected_identity_namespace,
+        restore.backend_runtime,
+    );
+    // Directory exchange cannot publish a composed external namespace. Reject
+    // immediately after the authenticated bounded manifest read, before any
+    // primary or projection corpus transfer. Portable restore remains the
+    // source-portable fallback for these backends.
+    if (restore_open_options.physical_root_mode != .filesystem_managed)
+        return error.NativeBackupStorageBackendUnsupported;
     const logical_primary_root = try std.fmt.allocPrint(alloc, "{s}/.native-primary-import", .{staged_path});
     defer alloc.free(logical_primary_root);
     defer destroyPathIfExistsWithIo(io, logical_primary_root);
@@ -665,10 +680,7 @@ fn applyManifestNativeRestore(
         io,
         if (physical_primary) staged_path else logical_primary_root,
         staged_path,
-        .{
-            .identity_namespace = options.expected_identity_namespace,
-            .backend_runtime = restore.backend_runtime,
-        },
+        restore_open_options,
         .{
             .backup_id = restore.backup_id,
             .location = restoreIdentityLocation(restore),
@@ -715,10 +727,7 @@ fn applyManifestNativeRestore(
         alloc,
         io,
         staged_path,
-        .{
-            .identity_namespace = options.expected_identity_namespace,
-            .backend_runtime = restore.backend_runtime,
-        },
+        restore_open_options,
         &generation,
         true,
     );

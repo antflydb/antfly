@@ -51,6 +51,10 @@ const types = @import("types.zig");
 
 const store_snapshot_file_name = "store.bin";
 const store_snapshot_v2_magic = "AFSTKV02";
+const logical_store_artifact_format = "antfly-kv-stream";
+const logical_store_artifact_version: u32 = 2;
+pub const logical_snapshot_manifest_file_name = "SNAPSHOT.json";
+const logical_snapshot_manifest_format_version: u32 = 1;
 const store_snapshot_batch_entries: usize = 8192;
 const store_snapshot_batch_bytes: usize = 8 * 1024 * 1024;
 const legacy_store_snapshot_max_bytes: usize = 256 * 1024 * 1024;
@@ -2026,6 +2030,7 @@ pub fn importStoreSnapshotWithIo(
     snapshot_root: []const u8,
     cancellation: types.CancellationToken,
 ) !bool {
+    try validateLogicalSnapshotManifestIfPresent(alloc, io, snapshot_root);
     const snapshot_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, store_snapshot_file_name });
     defer alloc.free(snapshot_path);
     if (try storeSnapshotHasV2Magic(io, snapshot_path)) {
@@ -2058,6 +2063,54 @@ pub fn importStoreSnapshotWithIo(
 
     try store.sync(true);
     return false;
+}
+
+const LogicalSnapshotManifest = struct {
+    format_version: u32 = logical_snapshot_manifest_format_version,
+    primary_artifact_format: []const u8 = logical_store_artifact_format,
+    primary_artifact_version: u32 = logical_store_artifact_version,
+    replay_embedded: bool = true,
+};
+
+/// Publishes the format identity for logical snapshots which travel without a
+/// native-generation manifest (HA seeds, split/bootstrap snapshots, and the C
+/// API). v0.2.0 snapshots have no descriptor and remain readable through the
+/// legacy store.bin/change-journal.bin path.
+pub fn writeLogicalSnapshotManifest(alloc: Allocator, io: std.Io, snapshot_root: []const u8) !u64 {
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, logical_snapshot_manifest_file_name });
+    defer alloc.free(path);
+    const encoded = try std.json.Stringify.valueAlloc(alloc, LogicalSnapshotManifest{}, .{});
+    defer alloc.free(encoded);
+    var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
+    defer file.close(io);
+    var writer_buffer: [1024]u8 = undefined;
+    var writer = file.writer(io, &writer_buffer);
+    try writer.interface.writeAll(encoded);
+    try writer.end();
+    try file.sync(io);
+    try fs_paths.syncDirPortable(io, snapshot_root);
+    return @intCast(encoded.len);
+}
+
+fn validateLogicalSnapshotManifestIfPresent(alloc: Allocator, io: std.Io, snapshot_root: []const u8) !void {
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, logical_snapshot_manifest_file_name });
+    defer alloc.free(path);
+    const encoded = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(4096)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer alloc.free(encoded);
+    var parsed = std.json.parseFromSlice(LogicalSnapshotManifest, alloc, encoded, .{
+        .ignore_unknown_fields = false,
+    }) catch return error.InvalidTableFile;
+    defer parsed.deinit();
+    if (parsed.value.format_version != logical_snapshot_manifest_format_version or
+        !std.mem.eql(u8, parsed.value.primary_artifact_format, logical_store_artifact_format) or
+        parsed.value.primary_artifact_version != logical_store_artifact_version or
+        !parsed.value.replay_embedded)
+    {
+        return error.UnsupportedBackupFormat;
+    }
 }
 
 pub fn importChangeJournalSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snapshot_root: []const u8) !void {
@@ -2209,14 +2262,14 @@ pub const PinnedStoreSnapshot = union(enum) {
 
     pub fn artifactFormat(self: *const PinnedStoreSnapshot) []const u8 {
         return switch (self.*) {
-            .logical => "antfly-kv-stream",
+            .logical => logical_store_artifact_format,
             .lsm => "antfly-lsm-checkpoint",
         };
     }
 
     pub fn artifactVersion(self: *const PinnedStoreSnapshot) u32 {
         return switch (self.*) {
-            .logical => 2,
+            .logical => logical_store_artifact_version,
             .lsm => 1,
         };
     }

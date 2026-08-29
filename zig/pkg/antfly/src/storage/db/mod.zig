@@ -30,6 +30,7 @@ pub const lease = @import("lease.zig");
 pub const ownership = @import("ownership.zig");
 pub const generation_lifecycle = @import("generation_lifecycle.zig");
 pub const native_backup = @import("native_backup.zig");
+pub const logical_snapshot_manifest_file_name = @import("core.zig").logical_snapshot_manifest_file_name;
 pub const transaction_resolution = @import("transaction_resolution.zig");
 pub const apply_state = @import("derived/apply_state.zig");
 pub const embedder = @import("enrichment/embedder.zig");

@@ -176,6 +176,7 @@ var test_fail_reconciliation_sync = false;
 var test_disable_atomic_exchange = false;
 var test_block_retired_cleanup = std.atomic.Value(bool).init(false);
 var test_retired_cleanup_started = std.atomic.Value(bool).init(false);
+var test_retired_cleanup_failures_remaining = std.atomic.Value(usize).init(0);
 
 pub fn failNextPublishedParentSyncForTest() void {
     std.debug.assert(builtin.is_test);
@@ -1249,9 +1250,11 @@ fn acknowledgeCleanupIntent(
 const RetiredGenerationCleanupBatch = struct {
     alloc: Allocator,
     io: std.Io,
+    scheduler: CleanupScheduler,
     paths: [][]u8,
     parent: []u8,
     live_path: []u8,
+    retry_round: u8,
 
     fn run(ptr: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1259,24 +1262,61 @@ const RetiredGenerationCleanupBatch = struct {
             test_retired_cleanup_started.store(true, .release);
             while (test_block_retired_cleanup.load(.acquire)) platform.time.yieldBriefly();
         }
-        const max_attempts = 3;
-        var attempt: usize = 0;
-        while (true) : (attempt += 1) {
-            const result = cleanup: {
-                deleteRetiredGenerationPaths(self.alloc, self.io, self.paths, self.parent) catch |err| break :cleanup err;
-                for (self.paths) |path| {
-                    acknowledgeCleanupIntent(
-                        self.alloc,
-                        self.io,
-                        self.live_path,
-                        std.fs.path.basename(path),
-                    ) catch |err| break :cleanup err;
+        var retry_round = self.retry_round;
+        while (true) {
+            const max_attempts = 3;
+            var attempt: usize = 0;
+            while (true) : (attempt += 1) {
+                const result = cleanup: {
+                    if (consumeTestRetiredCleanupFailure()) break :cleanup error.TestRetiredCleanupFailure;
+                    deleteRetiredGenerationPaths(self.alloc, self.io, self.paths, self.parent) catch |err| break :cleanup err;
+                    for (self.paths) |path| {
+                        acknowledgeCleanupIntent(
+                            self.alloc,
+                            self.io,
+                            self.live_path,
+                            std.fs.path.basename(path),
+                        ) catch |err| break :cleanup err;
+                    }
+                    return;
+                };
+                if (attempt + 1 != max_attempts) {
+                    const delay_ms: i64 = if (attempt == 0) 10 else 100;
+                    self.io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch return result;
+                    continue;
                 }
+
+                if (!self.scheduler.lane.isAccepting()) return;
+                const retry_delay_ms = retiredCleanupRetryDelayMs(retry_round, self.live_path);
+                std.log.warn("retired generation cleanup remains pending; retrying path={s} delay_ms={} err={s}", .{
+                    self.live_path,
+                    retry_delay_ms,
+                    @errorName(result),
+                });
+                if (!try waitForRetiredCleanupRetry(self, retry_delay_ms)) return;
+                const next_round = if (retry_round == std.math.maxInt(u8)) retry_round else retry_round + 1;
+                scheduleRetiredGenerationCleanupBatchAtRound(
+                    self.scheduler,
+                    self.paths,
+                    self.parent,
+                    self.live_path,
+                    next_round,
+                ) catch |err| switch (err) {
+                    error.BackendRuntimeShuttingDown,
+                    error.BackgroundOwnerClosing,
+                    error.BackgroundOwnerClosed,
+                    => return,
+                    else => {
+                        // Keep the current payload alive when allocating or
+                        // admitting its successor fails. The durable intent is
+                        // never left without an in-process retry while the
+                        // runtime can still make progress.
+                        retry_round = next_round;
+                        break;
+                    },
+                };
                 return;
-            };
-            if (attempt + 1 == max_attempts) return result;
-            const delay_ms: i64 = if (attempt == 0) 10 else 100;
-            self.io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch return result;
+            }
         }
     }
 
@@ -1290,6 +1330,45 @@ const RetiredGenerationCleanupBatch = struct {
         alloc.destroy(self);
     }
 };
+
+fn consumeTestRetiredCleanupFailure() bool {
+    if (!builtin.is_test) return false;
+    var remaining = test_retired_cleanup_failures_remaining.load(.acquire);
+    while (remaining != 0) {
+        if (test_retired_cleanup_failures_remaining.cmpxchgWeak(
+            remaining,
+            remaining - 1,
+            .acq_rel,
+            .acquire,
+        )) |observed| {
+            remaining = observed;
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn retiredCleanupRetryDelayMs(retry_round: u8, live_path: []const u8) i64 {
+    if (builtin.is_test) return 1;
+    const shift: u6 = @intCast(@min(retry_round, 5));
+    const exponential_ms = @as(u64, 1_000) << shift;
+    const base_ms = @min(exponential_ms, 30_000);
+    const jitter_window = @divFloor(base_ms, 4) + 1;
+    const jitter_ms = std.hash.Wyhash.hash(retry_round, live_path) % jitter_window;
+    return @intCast(base_ms + jitter_ms);
+}
+
+fn waitForRetiredCleanupRetry(self: *RetiredGenerationCleanupBatch, delay_ms: i64) !bool {
+    var remaining_ms = delay_ms;
+    while (remaining_ms > 0) {
+        if (!self.scheduler.lane.isAccepting()) return false;
+        const slice_ms = @min(remaining_ms, 100);
+        try self.io.sleep(std.Io.Duration.fromMilliseconds(slice_ms), .awake);
+        remaining_ms -= slice_ms;
+    }
+    return self.scheduler.lane.isAccepting();
+}
 
 fn deleteRetiredGenerationPaths(alloc: Allocator, io: std.Io, paths: []const []const u8, parent: []const u8) !void {
     const lock_path = try std.fs.path.join(alloc, &.{ parent, retired_cleanup_lock_name });
@@ -1340,6 +1419,16 @@ fn scheduleRetiredGenerationCleanupBatch(
     live_path: []const u8,
 ) !void {
     const active = scheduler orelse return;
+    return try scheduleRetiredGenerationCleanupBatchAtRound(active, paths, parent, live_path, 0);
+}
+
+fn scheduleRetiredGenerationCleanupBatchAtRound(
+    active: CleanupScheduler,
+    paths: []const []const u8,
+    parent: []const u8,
+    live_path: []const u8,
+    retry_round: u8,
+) !void {
     if (paths.len == 0) return;
     const work = try active.alloc.create(RetiredGenerationCleanupBatch);
     errdefer active.alloc.destroy(work);
@@ -1353,15 +1442,19 @@ fn scheduleRetiredGenerationCleanupBatch(
         owned_paths[i] = try active.alloc.dupe(u8, path);
         initialized += 1;
     }
+    const owned_parent = try active.alloc.dupe(u8, parent);
+    errdefer active.alloc.free(owned_parent);
+    const owned_live_path = try active.alloc.dupe(u8, live_path);
+    errdefer active.alloc.free(owned_live_path);
     work.* = .{
         .alloc = active.alloc,
         .io = active.io,
+        .scheduler = active,
         .paths = owned_paths,
-        .parent = try active.alloc.dupe(u8, parent),
-        .live_path = try active.alloc.dupe(u8, live_path),
+        .parent = owned_parent,
+        .live_path = owned_live_path,
+        .retry_round = retry_round,
     };
-    errdefer active.alloc.free(work.parent);
-    errdefer active.alloc.free(work.live_path);
     try active.lane.submit(.{
         .owner_id = active.owner_id,
         .class = .cleanup,
@@ -2275,6 +2368,46 @@ test "durable publication retires the previous generation through the cleanup ru
     try std.testing.expect(!pathExists(std.testing.io, staged.path()));
     try std.testing.expect(!pathExists(std.testing.io, marker_path));
     try std.testing.expect(!pathExists(std.testing.io, intent_path));
+}
+
+test "durable cleanup debt is rescheduled until the retired generation is reclaimed" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retry-retire", .{tmp.sub_path});
+    defer alloc.free(live_path);
+    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
+    defer alloc.free(live_value_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = live_value_path, .data = "previous" });
+
+    var runtime = try background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var transition = try beginProcessExclusiveWithRuntime(live_path, runtime.ptr());
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
+    defer alloc.free(staged_value_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "current" });
+
+    test_retired_cleanup_failures_remaining.store(3, .release);
+    defer test_retired_cleanup_failures_remaining.store(0, .release);
+    try std.testing.expectEqual(PublicationOutcome.durable, try staged.publish());
+    const retired_path = try alloc.dupe(u8, staged.path());
+    defer alloc.free(retired_path);
+    const intent_path = try cleanupIntentPathAlloc(alloc, live_path, std.fs.path.basename(retired_path));
+    defer alloc.free(intent_path);
+
+    const scheduler = staged.cleanup_scheduler orelse return error.TestUnexpectedResult;
+    scheduler.lane.drainOwner(scheduler.owner_id);
+    try std.testing.expectEqual(@as(usize, 0), test_retired_cleanup_failures_remaining.load(.acquire));
+    try std.testing.expect(!pathExists(std.testing.io, retired_path));
+    try std.testing.expect(!pathExists(std.testing.io, intent_path));
+    const current = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
+    defer alloc.free(current);
+    try std.testing.expectEqualStrings("current", current);
 }
 
 test "older cleanup cannot acknowledge a newer prepared publication" {

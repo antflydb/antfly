@@ -385,6 +385,10 @@ pub const OpenOptions = struct {
     prefer_existing_identity_namespace: bool = false,
     executor: derived_executor_mod.Config = .{},
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
+    /// Internal capability bit: the runtime's storage configurator has already
+    /// resolved this path. Restore planning sets it so materialization,
+    /// validation, and DB.open all consume one immutable backend decision.
+    backend_configuration_resolved: bool = false,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     start_index_workers: bool = true,
@@ -3145,6 +3149,7 @@ pub const DB = struct {
     open_mode: OpenOptions.OpenMode,
     primary_backend: PrimaryBackend,
     primary_lsm_storage: ?lsm_backend_mod.Storage,
+    physical_root_mode: OpenOptions.PhysicalRootMode,
     index_backends: db_config.IndexBackendOptions,
     core: db_core.DBCore,
     /// Durable identity of the physical DB root. Unlike `core.root_generation`,
@@ -3443,9 +3448,11 @@ pub const DB = struct {
             // options until a runtime has adopted them so partial opens have
             // exactly one cleanup owner.
             errdefer if (opts.enrichment) |*cfg| deinitOwnedEnrichmentConfig(alloc, cfg);
-            if (opts.backend_runtime) |runtime| {
-                if (runtime.db_open_configurator) |configurator| {
-                    try configurator.configure(path, &opts);
+            if (!opts.backend_configuration_resolved) {
+                if (opts.backend_runtime) |runtime| {
+                    if (runtime.db_open_configurator) |configurator| {
+                        try configurator.configure(path, &opts);
+                    }
                 }
             }
             var generation_read_lease = if (opts.staged_generation) |staged_generation| staged_blk: {
@@ -3592,6 +3599,7 @@ pub const DB = struct {
                 .open_mode = opts.open_mode,
                 .primary_backend = stored_primary_backend,
                 .primary_lsm_storage = resolved_config.primary_lsm_storage,
+                .physical_root_mode = opts.physical_root_mode,
                 .index_backends = resolved_config.index_backends,
                 .core = db_core.DBCore.fromOpened(alloc, core),
                 .async_context = async_context,
@@ -3790,6 +3798,27 @@ pub const DB = struct {
             }
             break :blk db;
         };
+    }
+
+    /// Resolves the exact storage configuration used by native restore before
+    /// any corpus bytes are fetched. The returned options are safe to pass to
+    /// DB.open without invoking a path-sensitive configurator a second time.
+    pub fn resolveNativeRestoreOpenOptions(
+        path: []const u8,
+        identity_namespace: ?doc_identity.Namespace,
+        backend_runtime: ?*background_runtime_mod.BackendRuntime,
+    ) !OpenOptions {
+        var opts = OpenOptions{
+            .identity_namespace = identity_namespace,
+            .backend_runtime = backend_runtime,
+        };
+        if (backend_runtime) |runtime| {
+            if (runtime.db_open_configurator) |configurator| {
+                try configurator.configure(path, &opts);
+            }
+        }
+        opts.backend_configuration_resolved = true;
+        return opts;
     }
 
     pub fn close(self: *DB) void {
@@ -15591,6 +15620,23 @@ pub const DB = struct {
         defer self.snapshot_publication_mutex.unlock();
         try ensureSnapshotActive(cancellation);
         try validateSnapshotId(id);
+        if (include_generated) {
+            // Host-path exchange is the only native publication adapter
+            // currently implemented. External stores need a backend-owned
+            // staged namespace and atomic generation pointer; until that
+            // capability exists, fail before creating or syncing artifacts.
+            if (self.physical_root_mode != .filesystem_managed)
+                return error.NativeBackupStorageBackendUnsupported;
+            if (self.primary_lsm_storage) |storage| {
+                if (!storage.supportsHostPathGenerationPublication()) {
+                    std.log.err(
+                        "native backup requires atomic host-path generation publication for primary storage",
+                        .{},
+                    );
+                    return error.NativeBackupStorageBackendUnsupported;
+                }
+            }
+        }
         const io = self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
         const snapshot_parent = try std.fmt.allocPrint(self.alloc, "{s}.snapshots", .{self.core.path});
         defer self.alloc.free(snapshot_parent);
@@ -15617,25 +15663,20 @@ pub const DB = struct {
             defer primary_snapshot.deinit();
             self.core.unlockApply();
             apply_held = false;
-            const total = try primary_snapshot.materialize(
+            var total = try primary_snapshot.materialize(
                 self.alloc,
                 io,
                 staging_root,
                 cancellation,
             );
+            total = std.math.add(
+                u64,
+                total,
+                try db_core.writeLogicalSnapshotManifest(self.alloc, io, staging_root),
+            ) catch return error.SnapshotTooLarge;
             try publishSnapshotStaging(io, snapshot_parent, staging_root, snapshot_root);
             published = true;
             return total;
-        }
-
-        if (self.primary_lsm_storage) |storage| {
-            if (!storage.supportsHostPathGenerationPublication()) {
-                std.log.err(
-                    "native backup requires atomic host-path generation publication for primary storage",
-                    .{},
-                );
-                return error.NativeBackupStorageBackendUnsupported;
-            }
         }
 
         // Close primary/catalog admission before selecting the target. The
@@ -92831,6 +92872,72 @@ test "db native snapshot rejects storage without atomic host generation publicat
     );
 }
 
+test "db native snapshot rejects an external physical root before creating artifacts" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = std.mem.span(tempPath(&path_buf));
+    defer cleanupTempDir(path);
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "native-capture-external" });
+    defer runtime_store.deinit();
+    var db = try DB.open(alloc, path, .{
+        .primary_backend = .{ .mem = .{} },
+        .primary_runtime_store = &runtime_store,
+        .physical_root_mode = .external_backend,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:one", .value = "{\"title\":\"one\"}" }} });
+
+    try std.testing.expectError(
+        error.NativeBackupStorageBackendUnsupported,
+        db.snapshotNative("unsupported-external-root"),
+    );
+    const snapshot_parent = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{path});
+    defer alloc.free(snapshot_parent);
+    try std.testing.expect(!try snapshotPathExists(std.testing.io, snapshot_parent));
+}
+
+test "native restore backend configuration is resolved exactly once" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = std.mem.span(tempPath(&path_buf));
+    defer cleanupTempDir(path);
+
+    const ConfiguratorContext = struct {
+        expected_path: []const u8,
+        calls: usize = 0,
+
+        fn configure(ptr: *anyopaque, configured_path: []const u8, opaque_options: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const opts: *OpenOptions = @ptrCast(@alignCast(opaque_options));
+            if (!std.mem.eql(u8, configured_path, self.expected_path)) return error.UnexpectedConfiguredPath;
+            self.calls += 1;
+            opts.start_index_workers = false;
+            opts.start_optional_runtimes = false;
+            opts.ttl_cleanup = .{ .enabled = false };
+        }
+    };
+    var context = ConfiguratorContext{ .expected_path = path };
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+    runtime.ptr().db_open_configurator = .{
+        .ptr = &context,
+        .configure_fn = ConfiguratorContext.configure,
+    };
+
+    const resolved = try DB.resolveNativeRestoreOpenOptions(path, null, runtime.ptr());
+    try std.testing.expect(resolved.backend_configuration_resolved);
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    var db = try DB.open(alloc, path, resolved);
+    defer db.close();
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+}
+
 test "db native snapshot admission bounds capture under concurrent writes" {
     const alloc = std.heap.page_allocator;
     var path_buf: [256]u8 = undefined;
@@ -93043,6 +93150,12 @@ test "db snapshot exports logical store only for durable lsm primary backend" {
 
     const store_snapshot_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1/store.bin", .{std.mem.span(path)});
     defer alloc.free(store_snapshot_path);
+    const snapshot_manifest_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}.snapshots/snap1/{s}",
+        .{ std.mem.span(path), db_core.logical_snapshot_manifest_file_name },
+    );
+    defer alloc.free(snapshot_manifest_path);
     defer {
         var snapshots_buf: [512]u8 = undefined;
         if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(path)})) |snapshots| {
@@ -93054,6 +93167,7 @@ test "db snapshot exports logical store only for durable lsm primary backend" {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     try std.Io.Dir.accessAbsolute(io_impl.io(), store_snapshot_path, .{});
+    try std.Io.Dir.accessAbsolute(io_impl.io(), snapshot_manifest_path, .{});
 }
 
 test "db native deferred restore preserves generated dense generation without embedder" {
@@ -93408,6 +93522,64 @@ test "db restore snapshot recreates logical store for durable lsm primary backen
     });
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+}
+
+test "logical snapshot descriptor is strict while descriptorless compatibility remains readable" {
+    const alloc = std.testing.allocator;
+    var src_buf: [256]u8 = undefined;
+    const src_path = tempPath(&src_buf);
+    defer cleanupTempDir(src_path);
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(src_path), .{
+            .primary_backend = primary_backend,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "doc:legacy", .value = "{\"title\":\"legacy\"}" }} });
+        _ = try db.snapshot("compat");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/compat", .{std.mem.span(src_path)});
+    defer alloc.free(snapshot_root);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(src_path)})) |snapshots| {
+            var cleanup_io = threadedIo();
+            defer cleanup_io.deinit();
+            std.Io.Dir.cwd().deleteTree(cleanup_io.io(), snapshots) catch {};
+        } else |_| {}
+    }
+    const descriptor_path = try std.fs.path.join(alloc, &.{ snapshot_root, db_core.logical_snapshot_manifest_file_name });
+    defer alloc.free(descriptor_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = descriptor_path,
+        .data = "{\"format_version\":2,\"primary_artifact_format\":\"antfly-kv-stream\",\"primary_artifact_version\":2,\"replay_embedded\":true}",
+    });
+    try std.testing.expectError(
+        error.UnsupportedBackupFormat,
+        DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+        }),
+    );
+
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, descriptor_path);
+    try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
+        .primary_backend = primary_backend,
+        .start_index_workers = false,
+    });
+    var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+        .primary_backend = primary_backend,
+        .start_index_workers = false,
+    });
+    defer restored.close();
+    const doc = (try restored.get(alloc, "doc:legacy")) orelse return error.TestExpectedEqual;
+    defer alloc.free(doc);
+    try std.testing.expectEqualStrings("{\"title\":\"legacy\"}", doc);
 }
 
 test "db restore snapshot repeatedly validates run-backed doc identity metadata" {
