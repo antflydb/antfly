@@ -153,6 +153,8 @@ pub const BackupRestoreBootstrapRecord = struct {
     connection: []const u8,
     artifact_size_bytes: u64,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
 
     pub fn validate(self: BackupRestoreBootstrapRecord) !void {
         if (self.backup_id.len == 0 or
@@ -165,7 +167,10 @@ pub const BackupRestoreBootstrapRecord = struct {
             self.snapshot_path.len > 4096 or
             self.connection.len == 0 or
             self.connection.len > 256 or
-            self.artifact_sha256.len != std.crypto.hash.sha2.Sha256.digest_length * 2)
+            self.artifact_sha256.len != std.crypto.hash.sha2.Sha256.digest_length * 2 or
+            ((self.native_manifest_size_bytes == 0) != (self.native_manifest_sha256.len == 0)) or
+            (self.native_manifest_sha256.len != 0 and
+                self.native_manifest_sha256.len != std.crypto.hash.sha2.Sha256.digest_length * 2))
         {
             return error.InvalidBackupRestoreBootstrap;
         }
@@ -202,6 +207,10 @@ pub const BackupRestoreBootstrapRecord = struct {
             if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f'))
                 return error.InvalidBackupRestoreBootstrap;
         }
+        for (self.native_manifest_sha256) |c| {
+            if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f'))
+                return error.InvalidBackupRestoreBootstrap;
+        }
     }
 
     pub fn clone(self: BackupRestoreBootstrapRecord, alloc: std.mem.Allocator) !BackupRestoreBootstrapRecord {
@@ -213,6 +222,8 @@ pub const BackupRestoreBootstrapRecord = struct {
             .connection = "",
             .artifact_size_bytes = self.artifact_size_bytes,
             .artifact_sha256 = "",
+            .native_manifest_size_bytes = self.native_manifest_size_bytes,
+            .native_manifest_sha256 = "",
         };
         cloned.backup_id = try alloc.dupe(u8, self.backup_id);
         errdefer alloc.free(cloned.backup_id);
@@ -225,6 +236,8 @@ pub const BackupRestoreBootstrapRecord = struct {
         cloned.connection = try alloc.dupe(u8, self.connection);
         errdefer alloc.free(cloned.connection);
         cloned.artifact_sha256 = try alloc.dupe(u8, self.artifact_sha256);
+        errdefer alloc.free(cloned.artifact_sha256);
+        cloned.native_manifest_sha256 = try alloc.dupe(u8, self.native_manifest_sha256);
         return cloned;
     }
 
@@ -235,6 +248,7 @@ pub const BackupRestoreBootstrapRecord = struct {
         alloc.free(self.snapshot_path);
         alloc.free(self.connection);
         alloc.free(self.artifact_sha256);
+        alloc.free(self.native_manifest_sha256);
         self.* = undefined;
     }
 };
@@ -312,6 +326,8 @@ pub fn eqlReplicaRecord(left: ReplicaRecord, right: ReplicaRecord) bool {
         if (!std.mem.eql(u8, backup.connection, other.connection)) return false;
         if (backup.artifact_size_bytes != other.artifact_size_bytes) return false;
         if (!std.mem.eql(u8, backup.artifact_sha256, other.artifact_sha256)) return false;
+        if (backup.native_manifest_size_bytes != other.native_manifest_size_bytes) return false;
+        if (!std.mem.eql(u8, backup.native_manifest_sha256, other.native_manifest_sha256)) return false;
     }
     return true;
 }

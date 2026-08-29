@@ -3231,7 +3231,10 @@ pub const MetadataHttpClusterSimulation = struct {
             alloc.free(backend_runtimes);
         }
         for (backend_runtimes) |*runtime| {
-            runtime.* = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+            runtime.* = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
+                .backend = .manual,
+                .filesystem_io = std.testing.io,
+            });
             backend_runtime_count += 1;
         }
         for (configs, 0..) |cfg, i| {

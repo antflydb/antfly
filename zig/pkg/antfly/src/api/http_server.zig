@@ -7997,7 +7997,9 @@ pub const ApiHttpServer = struct {
         verification_cache: ?*backups_api.ArtifactVerificationCache,
         destination_authorization_fingerprint: []const u8,
         destination_authorization_principal: []const u8,
+        cancellation: api_operation.CancellationToken,
     ) !OwnedRestoreOutcome {
+        try cancellation.check();
         var manifest = backups_api.readManifestFromLocationWithArtifactBackupId(
             self.alloc,
             backup_location,
@@ -8167,6 +8169,7 @@ pub const ApiHttpServer = struct {
                     .replace_existing = replace_existing,
                     .publication_hook = publication_hook,
                     .io = self.sharedApiIo(),
+                    .cancellation = cancellation,
                 }) catch |err| switch (err) {
                     error.UnsupportedOperation => return error.UnsupportedOperation,
                     error.UnsupportedBackupFormat => return error.UnsupportedBackupFormat,
@@ -8181,6 +8184,7 @@ pub const ApiHttpServer = struct {
                     },
                 }) != null) break;
 
+                try cancellation.check();
                 if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
                 sleepNs(poll_interval_ns);
             }
@@ -8271,7 +8275,9 @@ pub const ApiHttpServer = struct {
                 range.restore_snapshot_path.len > 0 or
                 range.restore_connection.len > 0 or
                 range.restore_artifact_size_bytes > 0 or
-                range.restore_artifact_sha256.len > 0;
+                range.restore_artifact_sha256.len > 0 or
+                range.restore_native_manifest_size_bytes > 0 or
+                range.restore_native_manifest_sha256.len > 0;
             if (!has_active_restore) {
                 if (!std.mem.eql(
                     u8,
@@ -8326,6 +8332,7 @@ pub const ApiHttpServer = struct {
         backup_id: []const u8,
         destination_authorization_fingerprint: []const u8,
         destination_authorization_principal: []const u8,
+        cancellation: api_operation.CancellationToken,
     ) !OwnedRestoreOutcome {
         return try self.restoreOwnedTableWithRetryAndLifecycle(
             table_name,
@@ -8338,6 +8345,7 @@ pub const ApiHttpServer = struct {
             null,
             destination_authorization_fingerprint,
             destination_authorization_principal,
+            cancellation,
         );
     }
 
@@ -8353,10 +8361,12 @@ pub const ApiHttpServer = struct {
         verification_cache: ?*backups_api.ArtifactVerificationCache,
         destination_authorization_fingerprint: []const u8,
         destination_authorization_principal: []const u8,
+        cancellation: api_operation.CancellationToken,
     ) !OwnedRestoreOutcome {
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
-            const outcome = self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, artifact_backup_id, restore_lifecycle_already_active, replace_existing, verification_cache, destination_authorization_fingerprint, destination_authorization_principal) catch |err| switch (err) {
+            try cancellation.check();
+            const outcome = self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, artifact_backup_id, restore_lifecycle_already_active, replace_existing, verification_cache, destination_authorization_fingerprint, destination_authorization_principal, cancellation) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
                     if (attempt + 1 >= 3) return err;
                     if (!replace_existing and (self.tableExists(table_name) catch false)) {
@@ -10091,6 +10101,7 @@ pub const ApiHttpServer = struct {
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.NativeBackupStorageBackendUnsupported, error.NativeBackupProjectionBackendUnsupported => return error.UnsupportedBackupFormat,
             error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
             error.UnsupportedMultiRangeTable => return error.UnsupportedMultiRangeTable,
             else => {
@@ -10210,6 +10221,7 @@ pub const ApiHttpServer = struct {
             backup_id,
             request.destination_authorization_fingerprint,
             request.destination_authorization_principal,
+            request.cancellation,
         ) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -10236,6 +10248,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedBackupMigrationState => error.UnsupportedBackupMigrationState,
             error.UnsupportedMultiRangeTable => error.UnsupportedMultiRangeTable,
             error.UnsupportedBackupFormat => error.UnsupportedBackupFormat,
+            error.NativeBackupProjectionValidationIndeterminate => error.RestoreValidationPending,
             error.RestoreDurabilityPending, error.GenerationDurabilityUncertain => error.RestoreDurabilityPending,
             error.RestoreDurabilityConfirmed => error.RestoreDurabilityConfirmed,
             error.BackupManifestTooLarge => error.BackupManifestTooLarge,
@@ -11570,6 +11583,28 @@ pub const ApiHttpServer = struct {
 
     const RestoreCancellation = struct { job_id: u64, attempt_id: u64 };
 
+    const RestoreRepairCancellation = struct {
+        server: *ApiHttpServer,
+        restore: RestoreCancellation,
+
+        fn token(self: *const @This()) api_operation.CancellationToken {
+            return .{
+                .ptr = self,
+                .is_cancelled_fn = isCancelled,
+            };
+        }
+
+        fn isCancelled(ptr: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            if (!self.server.restoreExecutionPermitted()) return true;
+            return (self.server.restore_job_store.attemptState(
+                self.server.alloc,
+                self.restore.job_id,
+                self.restore.attempt_id,
+            ) catch return true) != .active;
+        }
+    };
+
     fn mapClusterRestoreRepositoryError(
         err: anyerror,
     ) cluster_api_http.ClusterApi.ExecuteRestoreError {
@@ -11602,6 +11637,11 @@ pub const ApiHttpServer = struct {
     ) cluster_api_http.ClusterApi.ExecuteRestoreError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const op_alloc = self.alloc;
+        var repair_cancellation_context: RestoreRepairCancellation = undefined;
+        const repair_cancellation = if (cancellation) |restore| blk: {
+            repair_cancellation_context = .{ .server = self, .restore = restore };
+            break :blk repair_cancellation_context.token();
+        } else api_operation.CancellationToken.none;
         const restore_connection = req.connection orelse return error.InvalidRequest;
         if (restore_connection.len == 0 or restore_connection.len > 256) return error.InvalidRequest;
         const restore_io = self.sharedApiIo() orelse return error.InternalFailure;
@@ -11946,8 +11986,11 @@ pub const ApiHttpServer = struct {
                 else
                     "",
                 destination_authorization_principal,
+                repair_cancellation,
             ) catch |err| {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
+                if (err == error.NativeBackupProjectionValidationIndeterminate)
+                    return error.RestoreValidationPending;
                 if (err == error.RestoreDestinationReauthorizationRequired or
                     err == error.StoredDestinationAuthorizationRevoked)
                     return error.RestoreDestinationReauthorizationRequired;
@@ -13921,6 +13964,10 @@ pub const ApiHttpServer = struct {
         const state = parsed.value;
         if (state.phase != .running or state.attempt_id != begin.attempt_id)
             return error.CorruptRestoreJobStore;
+        var repair_cancellation = RestoreRepairCancellation{
+            .server = self,
+            .restore = .{ .job_id = state.job_id, .attempt_id = state.attempt_id },
+        };
         var location = backups_api.openBackupLocationWithOptions(self.alloc, state.location, .{
             .secret_store = self.cfg.secret_store,
             .node_config = self.cfg.node_config,
@@ -13958,6 +14005,7 @@ pub const ApiHttpServer = struct {
                         state.connection,
                         &location,
                         .{
+                            .cancellation = repair_cancellation.token(),
                             .destination_authorization_fingerprint = state.destination_authorization_fingerprint,
                             .destination_authorization_principal = state.destination_authorization_principal,
                         },
@@ -13983,6 +14031,22 @@ pub const ApiHttpServer = struct {
                         },
                         else => {
                             if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
+                            if (restoreJobErrorIsRetryable(err)) {
+                                const retry_delay_ns = restoreRepositoryRetryDelayNs(
+                                    state.job_id,
+                                    state.attempt_id,
+                                );
+                                const retried = try self.restore_job_store.retryRunning(
+                                    self.alloc,
+                                    state,
+                                    @errorName(err),
+                                    retry_delay_ns,
+                                );
+                                self.alloc.free(retried);
+                                self.signalRestoreRetryWakeup();
+                                try self.ensureRestoreRetryWakeup();
+                                return;
+                            }
                             const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                             self.alloc.free(failed);
                             return;
@@ -14032,7 +14096,7 @@ pub const ApiHttpServer = struct {
                 .table_names = state.table_names,
                 .restore_mode = state.restore_mode,
             }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
-                if (err == error.BackupRepositoryBusy) {
+                if (restoreJobErrorIsRetryable(err)) {
                     const retry_delay_ns = restoreRepositoryRetryDelayNs(
                         state.job_id,
                         state.attempt_id,
@@ -14518,6 +14582,11 @@ fn restoreJobErrorIsFenced(err: anyerror) bool {
         metadata_authority.isRetryableError(err);
 }
 
+fn restoreJobErrorIsRetryable(err: anyerror) bool {
+    return err == error.BackupRepositoryBusy or
+        err == error.RestoreValidationPending;
+}
+
 fn restoreJobFailureRequiresRecovery(begin_established: bool, err: anyerror) bool {
     return !begin_established or restoreJobErrorIsFenced(err);
 }
@@ -14529,6 +14598,17 @@ test "restore job ownership failures remain retryable" {
     try std.testing.expect(!restoreJobErrorIsFenced(error.InvalidArguments));
     try std.testing.expect(restoreJobFailureRequiresRecovery(false, error.OutOfMemory));
     try std.testing.expect(!restoreJobFailureRequiresRecovery(true, error.OutOfMemory));
+}
+
+test "native restore validation uncertainty remains an asynchronous retry" {
+    try std.testing.expectEqual(
+        @as(public_table_http.TableApi.ExecuteRestoreError, error.RestoreValidationPending),
+        ApiHttpServer.mapExecuteRestoreError(error.NativeBackupProjectionValidationIndeterminate),
+    );
+    try std.testing.expect(!restoreJobErrorIsFenced(error.RestoreValidationPending));
+    try std.testing.expect(restoreJobErrorIsRetryable(error.RestoreValidationPending));
+    try std.testing.expect(restoreJobErrorIsRetryable(error.BackupRepositoryBusy));
+    try std.testing.expect(!restoreJobErrorIsRetryable(error.BackupIntegrityFailure));
 }
 
 test "restore worker authority is fenced across leadership reacquisition" {

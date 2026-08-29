@@ -62,6 +62,364 @@ const public_table_http = @import("public_table_http.zig");
 const runtime_status = @import("runtime_status.zig");
 const stored_destination_authorization = @import("stored_destination_authorization.zig");
 
+fn nativeSnapshotAttemptTokenAlloc(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    backup_id: []const u8,
+    shard_label: []const u8,
+) ![]u8 {
+    var entropy: [16]u8 = undefined;
+    try io.randomSecure(&entropy);
+    const nonce = std.fmt.bytesToHex(entropy, .lower);
+    return try std.fmt.allocPrint(alloc, "{s}-{s}-attempt-{s}", .{ backup_id, shard_label, &nonce });
+}
+
+const native_snapshot_attempt_marker_suffix = ".native-backup-attempt.json";
+const native_snapshot_attempt_marker_directory = ".native-backup-attempts";
+const native_snapshot_attempt_stale_ns: i128 = 24 * std.time.ns_per_hour;
+const native_snapshot_attempt_reclaim_limit: usize = 8;
+const native_snapshot_attempt_scan_limit: usize = 8192;
+
+const NativeSnapshotAttemptMarker = struct {
+    snapshot_token: []const u8,
+    created_at_unix_ns: i128,
+};
+
+/// Process/crash ownership for one native snapshot export. The kernel lease is
+/// the authority that an attempt is still active; wall-clock age is used only
+/// to bound how often abandoned attempts are considered for reclamation.
+const NativeSnapshotAttempt = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    marker_path: []u8,
+    lease: std.Io.File,
+    active: bool = true,
+
+    fn deinit(self: *@This()) void {
+        if (!self.active) return;
+        self.lease.close(self.io);
+        deleteNativeSnapshotAttemptMarker(self.io, self.marker_path);
+        self.alloc.free(self.marker_path);
+        self.active = false;
+    }
+
+    fn abandonForTest(self: *@This()) void {
+        std.debug.assert(builtin.is_test and self.active);
+        self.lease.close(self.io);
+        self.alloc.free(self.marker_path);
+        self.active = false;
+    }
+};
+
+fn nativeSnapshotAttemptMarkerPathAlloc(
+    alloc: std.mem.Allocator,
+    db_path: []const u8,
+    snapshot_token: []const u8,
+) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}/{s}{s}", .{
+        db_path,
+        native_snapshot_attempt_marker_directory,
+        snapshot_token,
+        native_snapshot_attempt_marker_suffix,
+    });
+}
+
+fn createNativeSnapshotAttemptMarker(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    db_path: []const u8,
+    snapshot_token: []const u8,
+    created_at_unix_ns: i128,
+) !NativeSnapshotAttempt {
+    const snapshot_parent = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{db_path});
+    defer alloc.free(snapshot_parent);
+    try fs_paths.createDirPathPortable(io, snapshot_parent);
+    const marker_directory = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_parent, native_snapshot_attempt_marker_directory });
+    defer alloc.free(marker_directory);
+    try fs_paths.createDirPathPortable(io, marker_directory);
+    const marker_path = try nativeSnapshotAttemptMarkerPathAlloc(alloc, db_path, snapshot_token);
+    errdefer alloc.free(marker_path);
+    errdefer deleteNativeSnapshotAttemptMarker(io, marker_path);
+    const body = try std.json.Stringify.valueAlloc(alloc, NativeSnapshotAttemptMarker{
+        .snapshot_token = snapshot_token,
+        .created_at_unix_ns = created_at_unix_ns,
+    }, .{});
+    defer alloc.free(body);
+    var file = try std.Io.Dir.cwd().createFile(io, marker_path, .{
+        .read = true,
+        .truncate = true,
+        .exclusive = true,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    });
+    errdefer file.close(io);
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    try writer.interface.writeAll(body);
+    try writer.end();
+    try file.sync(io);
+    try fs_paths.syncDirPortable(io, marker_directory);
+    try fs_paths.syncDirPortable(io, snapshot_parent);
+    return .{
+        .alloc = alloc,
+        .io = io,
+        .marker_path = marker_path,
+        .lease = file,
+    };
+}
+
+fn deleteNativeSnapshotAttemptMarker(io: std.Io, marker_path: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(io, marker_path) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => {
+            std.log.warn("failed to remove native snapshot attempt marker path={s} err={s}", .{ marker_path, @errorName(err) });
+            return;
+        },
+    };
+    const parent = std.fs.path.dirname(marker_path) orelse return;
+    fs_paths.syncDirPortable(io, parent) catch |err| {
+        std.log.warn("failed to sync native snapshot attempt marker deletion path={s} err={s}", .{ marker_path, @errorName(err) });
+    };
+}
+
+fn reclaimStaleNativeSnapshotAttempts(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    db_path: []const u8,
+) !void {
+    const snapshot_parent = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{db_path});
+    defer alloc.free(snapshot_parent);
+    const marker_directory = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_parent, native_snapshot_attempt_marker_directory });
+    defer alloc.free(marker_directory);
+    var stale_tokens = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (stale_tokens.items) |token| alloc.free(token);
+        stale_tokens.deinit(alloc);
+    }
+    const now = platform_time.realtimeNs();
+    {
+        var dir = std.Io.Dir.cwd().openDir(io, marker_directory, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        var examined: usize = 0;
+        while (try iterator.next(io)) |entry| {
+            examined += 1;
+            // Reclamation is bounded maintenance, not backup admission. A
+            // large marker directory may defer some cleanup, but must not
+            // turn historical cleanup debt into a foreground backup outage.
+            if (examined > native_snapshot_attempt_scan_limit) break;
+            if (stale_tokens.items.len == native_snapshot_attempt_reclaim_limit) break;
+            if (entry.kind != .file or entry.name.len <= native_snapshot_attempt_marker_suffix.len or
+                !std.mem.endsWith(u8, entry.name, native_snapshot_attempt_marker_suffix))
+            {
+                continue;
+            }
+            const token = entry.name[0 .. entry.name.len - native_snapshot_attempt_marker_suffix.len];
+            if (std.mem.indexOfAny(u8, token, "/\\\x00") != null or
+                std.mem.indexOf(u8, token, "-attempt-") == null)
+            {
+                continue;
+            }
+            // Age identifies candidates; the nonblocking kernel lease below is
+            // the only proof that their owner is gone.
+            var lease = dir.openFile(io, entry.name, .{
+                .mode = .read_write,
+                .lock = .exclusive,
+                .lock_nonblocking = true,
+            }) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                error.FileNotFound => continue,
+                error.FileLocksUnsupported => return error.FileLocksUnsupported,
+                else => return err,
+            };
+            defer lease.close(io);
+            var created_at_unix_ns: i128 = @intCast((try lease.stat(io)).mtime.toNanoseconds());
+            const marker_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ marker_directory, entry.name });
+            defer alloc.free(marker_path);
+            if (std.Io.Dir.cwd().readFileAlloc(io, marker_path, alloc, .limited(4096)) catch null) |raw| {
+                defer alloc.free(raw);
+                if (std.json.parseFromSlice(NativeSnapshotAttemptMarker, alloc, raw, .{})) |parsed_value| {
+                    var parsed = parsed_value;
+                    defer parsed.deinit();
+                    if (std.mem.eql(u8, parsed.value.snapshot_token, token))
+                        created_at_unix_ns = parsed.value.created_at_unix_ns;
+                } else |_| {}
+            }
+            if (created_at_unix_ns > now or
+                now - created_at_unix_ns < native_snapshot_attempt_stale_ns)
+            {
+                continue;
+            }
+            try stale_tokens.append(alloc, try alloc.dupe(u8, token));
+        }
+    }
+
+    for (stale_tokens.items) |token| {
+        const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_parent, token });
+        defer alloc.free(snapshot_root);
+        // `deleteTree` is already idempotent for an absent path. Propagate
+        // type/permission failures so a non-directory collision cannot be
+        // silently orphaned while its durable marker is removed.
+        try std.Io.Dir.cwd().deleteTree(io, snapshot_root);
+
+        var cleanup_dir = std.Io.Dir.cwd().openDir(io, snapshot_parent, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer cleanup_dir.close(io);
+        const staging_prefix = try std.fmt.allocPrint(alloc, ".{s}.staging-", .{token});
+        defer alloc.free(staging_prefix);
+        var cleanup_iterator = cleanup_dir.iterate();
+        while (try cleanup_iterator.next(io)) |entry| {
+            if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, staging_prefix)) continue;
+            const staging_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_parent, entry.name });
+            defer alloc.free(staging_path);
+            try std.Io.Dir.cwd().deleteTree(io, staging_path);
+        }
+        const marker_path = try nativeSnapshotAttemptMarkerPathAlloc(alloc, db_path, token);
+        defer alloc.free(marker_path);
+        deleteNativeSnapshotAttemptMarker(io, marker_path);
+    }
+    try fs_paths.syncDirPortable(io, snapshot_parent);
+}
+
+test "native backup local attempt tokens are retry unique" {
+    const first = try nativeSnapshotAttemptTokenAlloc(std.testing.allocator, std.testing.io, "backup", "g7");
+    defer std.testing.allocator.free(first);
+    const second = try nativeSnapshotAttemptTokenAlloc(std.testing.allocator, std.testing.io, "backup", "g7");
+    defer std.testing.allocator.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(std.mem.startsWith(u8, first, "backup-g7-attempt-"));
+}
+
+test "native backup reclaims crash-left snapshot attempts from durable markers" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-db", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    const token = "backup-g7-attempt-00000000000000000000000000000000";
+    var attempt = try createNativeSnapshotAttemptMarker(
+        alloc,
+        std.testing.io,
+        db_path,
+        token,
+        platform_time.realtimeNs() - 25 * std.time.ns_per_hour,
+    );
+    defer attempt.deinit();
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, token });
+    defer alloc.free(snapshot_root);
+    try fs_paths.createDirPathPortable(std.testing.io, snapshot_root);
+    const staging_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/.{s}.staging-deadbeef", .{ db_path, token });
+    defer alloc.free(staging_root);
+    try fs_paths.createDirPathPortable(std.testing.io, staging_root);
+
+    try reclaimStaleNativeSnapshotAttempts(alloc, std.testing.io, db_path);
+    const marker_path = try alloc.dupe(u8, attempt.marker_path);
+    defer alloc.free(marker_path);
+    attempt.abandonForTest();
+    try reclaimStaleNativeSnapshotAttempts(alloc, std.testing.io, db_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, marker_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, snapshot_root, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, staging_root, .{}));
+}
+
+test "native backup reclaims a crash marker before snapshot root creation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-db", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    const token = "backup-g7-attempt-11111111111111111111111111111111";
+    var attempt = try createNativeSnapshotAttemptMarker(
+        alloc,
+        std.testing.io,
+        db_path,
+        token,
+        platform_time.realtimeNs() - 25 * std.time.ns_per_hour,
+    );
+    const marker_path = try alloc.dupe(u8, attempt.marker_path);
+    defer alloc.free(marker_path);
+    attempt.abandonForTest();
+
+    try reclaimStaleNativeSnapshotAttempts(alloc, std.testing.io, db_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, marker_path, .{}));
+}
+
+test "native backup never reclaims an old attempt with a live lease" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-db", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    const token = "backup-g7-attempt-22222222222222222222222222222222";
+    var attempt = try createNativeSnapshotAttemptMarker(
+        alloc,
+        std.testing.io,
+        db_path,
+        token,
+        platform_time.realtimeNs() - 25 * std.time.ns_per_hour,
+    );
+    defer attempt.deinit();
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, token });
+    defer alloc.free(snapshot_root);
+    try fs_paths.createDirPathPortable(std.testing.io, snapshot_root);
+
+    try reclaimStaleNativeSnapshotAttempts(alloc, std.testing.io, db_path);
+    try std.Io.Dir.cwd().access(std.testing.io, attempt.marker_path, .{});
+    try std.Io.Dir.cwd().access(std.testing.io, snapshot_root, .{});
+}
+
+test "native restore admits selective repair only with authenticated generation manifest" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-selective", .{tmp.sub_path});
+    defer alloc.free(root);
+    const manifest_path = try std.fmt.allocPrint(alloc, "{s}/native-generation.json", .{root});
+    defer alloc.free(manifest_path);
+    const projection_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/data.bin", .{root});
+    defer alloc.free(projection_path);
+    try fs_paths.createDirPathPortable(std.testing.io, std.fs.path.dirname(projection_path).?);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = "authenticated-generation" });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = projection_path, .data = "projection" });
+
+    var tree_integrity = try backups_api.artifactIntegrityAlloc(alloc, std.testing.io, .native, root);
+    defer tree_integrity.deinit(alloc);
+    var manifest_integrity = try backups_api.nativeGenerationManifestIntegrityAllocWithCancellation(
+        alloc,
+        std.testing.io,
+        root,
+        .none,
+    );
+    defer manifest_integrity.deinit(alloc);
+    const shard = backups_api.ShardSnapshot{
+        .group_id = 1,
+        .start_key = "",
+        .snapshot_path = "native-selective",
+        .artifact_size_bytes = tree_integrity.size_bytes,
+        .artifact_sha256 = tree_integrity.sha256,
+        .native_manifest_size_bytes = manifest_integrity.size_bytes,
+        .native_manifest_sha256 = manifest_integrity.sha256,
+    };
+
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, projection_path);
+    try std.testing.expectError(
+        error.BackupArtifactIntegrityMismatch,
+        backups_api.verifyShardArtifactIntegrityWithCancellation(alloc, std.testing.io, .native, root, &shard, .none),
+    );
+    try backups_api.verifyRestorableShardArtifactIntegrityWithCancellation(alloc, std.testing.io, .native, root, &shard, .none);
+
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = "tampered-generation!!!!" });
+    try std.testing.expectError(
+        error.BackupArtifactIntegrityMismatch,
+        backups_api.verifyRestorableShardArtifactIntegrityWithCancellation(alloc, std.testing.io, .native, root, &shard, .none),
+    );
+}
+
 pub const LsmOwnerMetricStats = struct {
     table_name: []u8,
     group_id: u64,
@@ -417,6 +775,74 @@ fn isPendingRestoreRuntimeRepairError(err: anyerror) bool {
         err == error.RestoreDenseCoverageProofIncomplete or
         err == error.RestoreDenseCheckpointIncomplete or
         err == error.RestoreIndexAvailabilityIncomplete;
+}
+
+fn repairRestoredDbRuntimeStateUntilCompleteWithIo(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    io: Io,
+    group_id: u64,
+    open_attempts: usize,
+    cancellation: db_mod.types.CancellationToken,
+) !void {
+    var repair_cancellation = db_mod.types.RepairCancellation{ .token = cancellation };
+    var attempts: usize = 0;
+    std.log.info("restore asynchronous repair begin group_id={d}", .{group_id});
+    while (true) {
+        try cancellation.check();
+        if (!try db.restoreRuntimeRepairNeeded()) break;
+        attempts += 1;
+        const repair_io = db.backend_runtime.filesystemIo() orelse io;
+        const repaired = db.repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
+            alloc,
+            repair_io,
+            .{ .cancel_check = repair_cancellation.check() },
+        ) catch |err| switch (err) {
+            error.RestoreRuntimeRepairIncomplete,
+            error.RestoreDenseArtifactRebuildIncomplete,
+            error.RestoreDenseConfigProofIncomplete,
+            error.RestoreDenseCounterProofIncomplete,
+            error.RestoreDenseIndexProofIncomplete,
+            error.RestoreDenseCoverageProofIncomplete,
+            error.RestoreDenseCheckpointIncomplete,
+            error.RestoreIndexAvailabilityIncomplete,
+            => {
+                io.sleep(Io.Duration.fromMilliseconds(100), .awake) catch |sleep_err| switch (sleep_err) {
+                    error.Canceled => Io.recancel(io),
+                };
+                continue;
+            },
+            else => return err,
+        };
+        if (repaired) db.clearDenseHbcCaches();
+    }
+    std.log.info("restore asynchronous repair complete group_id={d} attempts={d} open_attempts={d}", .{
+        group_id,
+        attempts,
+        open_attempts,
+    });
+}
+
+fn repairNativeRestoreProjectionsUntilCompleteWithIo(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    io: Io,
+    cancellation: db_mod.types.CancellationToken,
+) !void {
+    var cancel_ctx = db_mod.types.RepairCancellation{ .token = cancellation };
+    var attempts: usize = 0;
+    while (true) {
+        try cancellation.check();
+        attempts += 1;
+        if (try db.repairNativeRestoreProjectionIntentsStep(alloc, .{
+            .cancel_check = cancel_ctx.check(),
+        })) break;
+        io.sleep(Io.Duration.fromMilliseconds(100), .awake) catch |err| switch (err) {
+            error.Canceled => Io.recancel(io),
+        };
+    }
+    try db.syncIndexes(true);
+    std.log.info("native restore projection repair complete attempts={d}", .{attempts});
 }
 
 const TestExecutionHook = struct {
@@ -5673,21 +6099,32 @@ pub const BoundTableWriteSource = struct {
     ) !?[]backups_api.ShardSnapshot {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        if (plan.cancellation.isCancelled()) return error.Canceled;
         const db = try self.activeDb();
         if (plan.format == .portable) {
             return try exportPortableBackupShard(alloc, db, plan.backup_root, plan.backup_id, 0, plan.io);
         }
 
-        const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-local", .{plan.backup_id});
+        const snapshot_io = plan.io orelse db.backend_runtime.filesystemIo() orelse
+            return error.BackendRuntimeIoUnavailable;
+        try reclaimStaleNativeSnapshotAttempts(alloc, snapshot_io, db.core.path);
+        const snapshot_token = try nativeSnapshotAttemptTokenAlloc(alloc, snapshot_io, plan.backup_id, "local");
         defer alloc.free(snapshot_token);
-        _ = try db.snapshot(snapshot_token);
+        var snapshot_attempt = try createNativeSnapshotAttemptMarker(
+            alloc,
+            snapshot_io,
+            db.core.path,
+            snapshot_token,
+            platform_time.realtimeNs(),
+        );
+        defer snapshot_attempt.deinit();
+        _ = try db.snapshotNativeWithCancellation(snapshot_token, plan.cancellation);
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db.core.path, snapshot_token });
         defer alloc.free(snapshot_root);
+        defer ProvisionedTableWriteSource.deleteLocalNativeSnapshot(snapshot_io, snapshot_root);
         const dest_root = try backups_api.shardSnapshotPath(alloc, plan.backup_root, plan.backup_id, 0);
         defer alloc.free(dest_root);
-        try backups_api.copyDirectoryRecursiveUsingIo(alloc, plan.io, snapshot_root, dest_root);
-
         const rel_path = try backups_api.shardSnapshotRelPath(alloc, plan.backup_id, 0);
         errdefer alloc.free(rel_path);
         const byte_range = db.getRange();
@@ -5699,7 +6136,25 @@ pub const BoundTableWriteSource = struct {
             .snapshot_path = rel_path,
         };
         errdefer shards[0].deinit(alloc);
-        try backups_api.populateShardArtifactIntegrity(alloc, plan.io, .native, dest_root, &shards[0]);
+        var integrity = try backups_api.copyNativeDirectoryWithIntegrityUsingIo(
+            alloc,
+            snapshot_io,
+            snapshot_root,
+            dest_root,
+            plan.cancellation,
+        );
+        shards[0].artifact_size_bytes = integrity.size_bytes;
+        shards[0].artifact_sha256 = integrity.sha256;
+        integrity = undefined;
+        var native_manifest_integrity = try backups_api.nativeGenerationManifestIntegrityAllocWithCancellation(
+            alloc,
+            snapshot_io,
+            dest_root,
+            plan.cancellation,
+        );
+        shards[0].native_manifest_size_bytes = native_manifest_integrity.size_bytes;
+        shards[0].native_manifest_sha256 = native_manifest_integrity.sha256;
+        native_manifest_integrity = undefined;
         return shards;
     }
 
@@ -5716,15 +6171,29 @@ pub const BoundTableWriteSource = struct {
         if (plan.reconcile_only) return error.RestoreIdentityMismatch;
         const db = try self.activeDb();
 
+        const native_restore_plan: ?db_mod.NativeRestoreOpenPlan = if (plan.manifest.format == .native) blk: {
+            const resolved = try db_mod.DB.resolveNativeRestoreOpenPlan(db.core.path, .{
+                .primary_backend = db.primary_backend,
+                .backend_runtime = db.backend_runtime,
+            });
+            // External namespaces require a backend-owned stage/promote
+            // capability. Fail before integrity-scanning corpus bytes or
+            // closing the currently serving DB.
+            if (resolved.physicalRootMode() != .filesystem_managed)
+                return error.NativeBackupStorageBackendUnsupported;
+            break :blk resolved;
+        } else null;
+
         const shard = &plan.manifest.shards[0];
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, shard.snapshot_path });
         defer alloc.free(snapshot_root);
-        try backups_api.verifyShardArtifactIntegrity(
+        try backups_api.verifyRestorableShardArtifactIntegrityWithCancellation(
             alloc,
             plan.io,
             plan.manifest.format,
             snapshot_root,
             shard,
+            plan.cancellation,
         );
 
         const db_path = try alloc.dupe(u8, db.core.path);
@@ -5752,15 +6221,22 @@ pub const BoundTableWriteSource = struct {
             .primary_backend = primary_backend,
             .backend_runtime = backend_runtime,
         };
+        var effective_recovery_open_options = recovery_open_options;
+        var effective_restored_open_options = restored_open_options;
+        if (native_restore_plan) |resolved| {
+            effective_recovery_open_options = try resolved.optionsForTarget(db_path);
+            effective_recovery_open_options.identity_namespace = identity_namespace;
+            effective_restored_open_options = try resolved.optionsForTarget(db_path);
+        }
         const publication_outcome = restoreBoundTableGeneration(
             alloc,
             snapshot_root,
             db_path,
-            plan.manifest.format,
-            restored_open_options,
-            plan.io,
+            effective_restored_open_options,
+            native_restore_plan,
+            plan,
         ) catch |restore_err| {
-            self.db.* = db_mod.DB.open(alloc, db_path, recovery_open_options) catch |reopen_err| {
+            self.db.* = db_mod.DB.open(alloc, db_path, effective_recovery_open_options) catch |reopen_err| {
                 std.log.err("bound restore recovery failed phase=reopen restore_class={s} reopen_class={s}", .{
                     @errorName(restore_err),
                     @errorName(reopen_err),
@@ -5771,7 +6247,7 @@ pub const BoundTableWriteSource = struct {
             owned_backend_runtime = null;
             return restore_err;
         };
-        self.db.* = db_mod.DB.open(alloc, db_path, restored_open_options) catch |reopen_err| {
+        self.db.* = db_mod.DB.open(alloc, db_path, effective_restored_open_options) catch |reopen_err| {
             std.log.err("bound restore recovery failed phase=published_reopen class={s}", .{@errorName(reopen_err)});
             return reopen_err;
         };
@@ -5784,35 +6260,90 @@ pub const BoundTableWriteSource = struct {
         alloc: std.mem.Allocator,
         snapshot_root: []const u8,
         live_path: []const u8,
-        format: backups_api.BackupFormat,
         open_options: db_mod.OpenOptions,
-        shared_io: ?std.Io,
+        native_restore_plan: ?db_mod.NativeRestoreOpenPlan,
+        plan: backups_api.TableRestorePlan,
     ) !db_mod.generation_lifecycle.PublicationOutcome {
-        var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntime(live_path, open_options.backend_runtime);
+        try plan.cancellation.check();
+        const backend_runtime = open_options.backend_runtime orelse return error.MissingBackendRuntime;
+        const restore_io = plan.io orelse backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
+        var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntimeAndIo(
+            live_path,
+            open_options.backend_runtime,
+            restore_io,
+        );
         defer transition.deinit();
         var staged = try transition.beginStaging();
         defer staged.deinit();
+        const candidate_open_options = if (native_restore_plan) |resolved|
+            try resolved.optionsForStagedGeneration(&staged)
+        else
+            open_options;
 
-        switch (format) {
+        switch (plan.manifest.format) {
             .portable => {
                 var staged_open_options = open_options;
                 staged_open_options.staged_generation = &staged;
                 var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
                 defer restored.close();
-                try importPortableBackupFile(alloc, restored.core.store, snapshot_root, shared_io);
+                try importPortableBackupFileWithIo(alloc, restored.core.store, snapshot_root, restore_io);
+                try plan.cancellation.check();
                 _ = try restored.rebuildDenseIndexesForTargetCoverage(alloc);
+                try plan.cancellation.check();
                 _ = try restored.rebuildSparseIndexesForTargetCoverage(alloc);
+                try plan.cancellation.check();
                 try restored.rebuildGraphIndexesForTargetCoverage(alloc);
                 try restored.syncIndexes(true);
             },
-            .native => try db_mod.DB.restoreSnapshotToStagedGeneration(
-                &staged,
-                alloc,
-                snapshot_root,
-                staged.path(),
-                open_options,
-            ),
+            .native => {
+                const restored_native_generation = try db_mod.DB.restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation(
+                    &staged,
+                    alloc,
+                    restore_io,
+                    snapshot_root,
+                    staged.path(),
+                    candidate_open_options,
+                    plan.cancellation,
+                );
+                if (!restored_native_generation) {
+                    // Legacy native backups contain only the primary store.
+                    // Complete their derived indexes in the restore job without
+                    // imposing a foreground deadline or inventing a Raft repair
+                    // identity for this process-local database.
+                    var staged_open_options = candidate_open_options;
+                    staged_open_options.staged_generation = &staged;
+                    var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
+                    defer restored.close();
+                    try plan.cancellation.check();
+                    _ = try restored.rebuildDenseIndexesForTargetCoverage(alloc);
+                    try plan.cancellation.check();
+                    _ = try restored.rebuildSparseIndexesForTargetCoverage(alloc);
+                    try plan.cancellation.check();
+                    try restored.rebuildGraphIndexesForTargetCoverage(alloc);
+                    try restored.syncIndexes(true);
+                } else {
+                    // Native validation may have retained healthy projections
+                    // while creating durable intents for only the damaged or
+                    // incompatible ones. Keep the candidate unservable until
+                    // every such intent has activated and validated.
+                    var staged_open_options = candidate_open_options;
+                    staged_open_options.open_mode = .writer_no_replay;
+                    staged_open_options.staged_generation = &staged;
+                    staged_open_options.start_index_workers = false;
+                    staged_open_options.start_optional_runtimes = false;
+                    staged_open_options.start_optional_runtime_workers = false;
+                    var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
+                    defer restored.close();
+                    try repairNativeRestoreProjectionsUntilCompleteWithIo(
+                        alloc,
+                        &restored,
+                        restore_io,
+                        plan.cancellation,
+                    );
+                }
+            },
         }
+        try plan.cancellation.check();
         return try staged.publish();
     }
 
@@ -11399,6 +11930,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         var summary: metadata_table_provisioner.ProvisionSummary = .{};
+        const active_backend_runtime = backend_runtime orelse self.backend_runtime;
         for (hosted_group_ids) |group_id| {
             if (group_id == metadata_group_id) continue;
             const range = findRangeRecord(ranges, group_id) orelse continue;
@@ -11408,16 +11940,23 @@ pub const ProvisionedTableWriteSource = struct {
             const path = try metadata_table_provisioner.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
-            try fs_paths.createDirPathPortable(io_impl.io(), path);
-            try metadata_table_provisioner.applyRestoreIntentIfNeededWithOptions(
+            var provision_io_impl: ?std.Io.Threaded = null;
+            defer if (provision_io_impl) |*owned| owned.deinit();
+            const provision_io = if (active_backend_runtime) |runtime|
+                runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable
+            else blk: {
+                provision_io_impl = std.Io.Threaded.init(alloc, .{});
+                break :blk provision_io_impl.?.io();
+            };
+            try fs_paths.createDirPathPortable(provision_io, path);
+            try metadata_table_provisioner.applyRestoreIntentIfNeededWithRuntime(
                 alloc,
                 path,
                 group_id,
                 table,
                 range,
                 self.restore_open_options,
+                active_backend_runtime,
             );
 
             const lsm_root_generation = self.visibleRootGeneration(group_id);
@@ -14480,9 +15019,11 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: []const u8,
         indexes_json: []const u8,
-        staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration,
+        prepared_restore: ?*const backup_restore.PreparedRestore,
     ) !db_mod.DB {
         const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+        const staged_generation = if (prepared_restore) |prepared| prepared.stagedGeneration() else null;
+        const native_restore_open_plan = if (prepared_restore) |prepared| prepared.nativeOpenPlan() else null;
         var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
             alloc,
             path,
@@ -14497,7 +15038,10 @@ pub const ProvisionedTableWriteSource = struct {
             self.secret_store,
             self.remote_content,
             identity_namespace,
-            .{ .staged_generation = staged_generation },
+            .{
+                .staged_generation = staged_generation,
+                .native_restore_open_plan = native_restore_open_plan,
+            },
         );
         errdefer db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
@@ -14533,7 +15077,7 @@ pub const ProvisionedTableWriteSource = struct {
         return db;
     }
 
-    fn repairRestoredTableRuntimeStateBlocking(
+    fn repairRestoredTableRuntimeStateUntilComplete(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         path: []const u8,
@@ -14541,14 +15085,14 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         indexes_json_override: ?[]const u8,
         schema_json_override: ?[]const u8,
-        staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration,
+        prepared_restore: ?*const backup_restore.PreparedRestore,
+        cancellation: db_mod.types.CancellationToken,
     ) !void {
-        const open_retry_timeout_ns = 2 * std.time.ns_per_s;
-        const open_start_ns = platform_time.monotonicNs();
         var open_attempts: usize = 0;
         var logged_open_wait = false;
-        var raft_apply_marker_reset = staged_generation == null;
+        var raft_apply_marker_reset = prepared_restore == null;
         while (true) {
+            try cancellation.check();
             const runtime_repair_needed = try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(
                 alloc,
                 self.table_activity_threaded.io(),
@@ -14570,13 +15114,12 @@ pub const ProvisionedTableWriteSource = struct {
                 group_id,
                 table_name,
                 indexes_json,
-                staged_generation,
+                prepared_restore,
             ) catch |err| {
                 if (isTransientWriterOpenConflict(err)) {
-                    if (platform_time.monotonicNs() -| open_start_ns >= open_retry_timeout_ns) return err;
                     if (!logged_open_wait) {
                         logged_open_wait = true;
-                        std.log.warn("restore foreground repair waiting for writer group_id={d} class={s}", .{
+                        std.log.warn("restore asynchronous repair waiting for writer group_id={d} class={s}", .{
                             group_id,
                             @errorName(err),
                         });
@@ -14602,66 +15145,41 @@ pub const ProvisionedTableWriteSource = struct {
                 try applyLocalTableSchemaJson(alloc, &db, schema_json);
             }
             if (runtime_repair_needed) {
-                try self.repairRestoredDbRuntimeStateBlocking(alloc, &db, group_id, open_attempts);
+                try self.repairRestoredDbRuntimeStateUntilComplete(alloc, &db, group_id, open_attempts, cancellation);
             }
             return;
         }
     }
 
-    fn repairRestoredDbRuntimeStateBlocking(
+    fn repairRestoredDbRuntimeStateUntilComplete(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         db: *db_mod.DB,
         group_id: u64,
         open_attempts: usize,
+        cancellation: db_mod.types.CancellationToken,
     ) !void {
-        const timeout_ns = 30 * std.time.ns_per_s;
-        const start_ns = platform_time.monotonicNs();
-        var attempts: usize = 0;
-        std.log.info("restore foreground repair begin group_id={d}", .{group_id});
-        while (try db.restoreRuntimeRepairNeeded()) {
-            attempts += 1;
-            const repaired = db.repairRestoreRuntimeStateStepIfNeeded(alloc) catch |err| switch (err) {
-                error.RestoreRuntimeRepairIncomplete,
-                error.RestoreDenseArtifactRebuildIncomplete,
-                error.RestoreDenseConfigProofIncomplete,
-                error.RestoreDenseCounterProofIncomplete,
-                error.RestoreDenseIndexProofIncomplete,
-                error.RestoreDenseCoverageProofIncomplete,
-                error.RestoreDenseCheckpointIncomplete,
-                error.RestoreIndexAvailabilityIncomplete,
-                => {
-                    if (platform_time.monotonicNs() -| start_ns >= timeout_ns)
-                        return error.TableVisibilityTimeout;
-                    self.table_activity_threaded.io().sleep(Io.Duration.fromMilliseconds(100), .awake) catch |sleep_err| switch (sleep_err) {
-                        error.Canceled => Io.recancel(self.table_activity_threaded.io()),
-                    };
-                    continue;
-                },
-                else => return err,
-            };
-            if (repaired) {
-                db.clearDenseHbcCaches();
-            }
-            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
-        }
-        std.log.info("restore foreground repair complete group_id={d} attempts={d} open_attempts={d}", .{
+        return try repairRestoredDbRuntimeStateUntilCompleteWithIo(
+            alloc,
+            db,
+            self.table_activity_threaded.io(),
             group_id,
-            attempts,
             open_attempts,
-        });
+            cancellation,
+        );
     }
 
     /// Complete an idempotent restore retry through the authoritative cached
     /// writer when one is already open. Opening a second repair DB would
     /// contend with that writer and could make an exact-identity retry report
     /// success while the durable runtime-repair marker remained incomplete.
-    fn repairPublishedRestoreRuntimeStateBlocking(
+    fn repairPublishedRestoreRuntimeStateUntilComplete(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         path: []const u8,
         group_id: u64,
         table_name: []const u8,
+        cancellation: db_mod.types.CancellationToken,
     ) !void {
         if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, self.table_activity_threaded.io(), path)) return;
 
@@ -14705,7 +15223,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .destination_authorizer = self.destination_authorizer,
                 },
             );
-            try self.repairRestoredDbRuntimeStateBlocking(alloc, cached.db, group_id, 0);
+            try self.repairRestoredDbRuntimeStateUntilComplete(alloc, cached.db, group_id, 0, cancellation);
 
             const entry = cached.entry orelse return error.StaleCachedDbLease;
             {
@@ -14721,7 +15239,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
             }
         } else {
-            try self.repairRestoredTableRuntimeStateBlocking(
+            try self.repairRestoredTableRuntimeStateUntilComplete(
                 alloc,
                 path,
                 group_id,
@@ -14729,6 +15247,7 @@ pub const ProvisionedTableWriteSource = struct {
                 indexes_json,
                 schema_json,
                 null,
+                cancellation,
             );
         }
 
@@ -17240,6 +17759,7 @@ pub const ProvisionedTableWriteSource = struct {
         plan: backups_api.TableBackupPlan,
     ) !?[]backups_api.ShardSnapshot {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (plan.cancellation.isCancelled()) return error.Canceled;
         const group_id = (try resolveFencedBackupGroup(self.catalog, table_name, plan.fence)) orelse return null;
         self.beginGroupOperation(table_name, group_id);
         defer {
@@ -17320,12 +17840,16 @@ pub const ProvisionedTableWriteSource = struct {
 
     const NativeBackupShardSnapshot = struct {
         snapshot_root: []const u8,
+        snapshot_attempt: NativeSnapshotAttempt,
         dest_root: []const u8,
-        io: ?std.Io,
+        io: std.Io,
+        cancellation: db_mod.types.CancellationToken,
         shard: backups_api.ShardSnapshot,
         owns_shard: bool = true,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            deleteLocalNativeSnapshot(self.io, self.snapshot_root);
+            self.snapshot_attempt.deinit();
             alloc.free(@constCast(self.snapshot_root));
             alloc.free(@constCast(self.dest_root));
             if (self.owns_shard) self.shard.deinit(alloc);
@@ -17340,6 +17864,17 @@ pub const ProvisionedTableWriteSource = struct {
         }
     };
 
+    fn deleteLocalNativeSnapshot(io: std.Io, snapshot_root: []const u8) void {
+        std.Io.Dir.cwd().deleteTree(io, snapshot_root) catch |err| {
+            std.log.warn("failed to remove exported native snapshot staging root={s} err={s}", .{ snapshot_root, @errorName(err) });
+        };
+        if (std.fs.path.dirname(snapshot_root)) |parent| {
+            fs_paths.syncDirPortable(io, parent) catch |err| {
+                std.log.warn("failed to sync exported native snapshot deletion root={s} err={s}", .{ snapshot_root, @errorName(err) });
+            };
+        }
+    }
+
     fn prepareNativeBackupShardSnapshot(
         alloc: std.mem.Allocator,
         db: *db_mod.DB,
@@ -17349,9 +17884,22 @@ pub const ProvisionedTableWriteSource = struct {
     ) !NativeBackupShardSnapshot {
         std.debug.assert(plan.format == .native);
 
-        const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-g{d}", .{ plan.backup_id, group_id });
+        const snapshot_io = plan.io orelse db.backend_runtime.filesystemIo() orelse
+            return error.BackendRuntimeIoUnavailable;
+        try reclaimStaleNativeSnapshotAttempts(alloc, snapshot_io, db_path);
+        const group_label = try std.fmt.allocPrint(alloc, "g{d}", .{group_id});
+        defer alloc.free(group_label);
+        const snapshot_token = try nativeSnapshotAttemptTokenAlloc(alloc, snapshot_io, plan.backup_id, group_label);
         defer alloc.free(snapshot_token);
-        _ = try db.snapshot(snapshot_token);
+        var snapshot_attempt = try createNativeSnapshotAttemptMarker(
+            alloc,
+            snapshot_io,
+            db_path,
+            snapshot_token,
+            platform_time.realtimeNs(),
+        );
+        errdefer snapshot_attempt.deinit();
+        _ = try db.snapshotNativeWithCancellation(snapshot_token, plan.cancellation);
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, snapshot_token });
         errdefer alloc.free(snapshot_root);
@@ -17368,8 +17916,10 @@ pub const ProvisionedTableWriteSource = struct {
 
         return .{
             .snapshot_root = snapshot_root,
+            .snapshot_attempt = snapshot_attempt,
             .dest_root = dest_root,
-            .io = plan.io,
+            .io = snapshot_io,
+            .cancellation = plan.cancellation,
             .shard = .{
                 .group_id = group_id,
                 .start_key = start_key,
@@ -17384,19 +17934,25 @@ pub const ProvisionedTableWriteSource = struct {
         native_snapshot: *NativeBackupShardSnapshot,
     ) ![]backups_api.ShardSnapshot {
         runTestBeforeNativeBackupCopyHook();
-        try backups_api.copyDirectoryRecursiveUsingIo(
+        var integrity = try backups_api.copyNativeDirectoryWithIntegrityUsingIo(
             alloc,
             native_snapshot.io,
             native_snapshot.snapshot_root,
             native_snapshot.dest_root,
+            native_snapshot.cancellation,
         );
-        try backups_api.populateShardArtifactIntegrity(
+        native_snapshot.shard.artifact_size_bytes = integrity.size_bytes;
+        native_snapshot.shard.artifact_sha256 = integrity.sha256;
+        integrity = undefined;
+        var native_manifest_integrity = try backups_api.nativeGenerationManifestIntegrityAllocWithCancellation(
             alloc,
             native_snapshot.io,
-            .native,
             native_snapshot.dest_root,
-            &native_snapshot.shard,
+            native_snapshot.cancellation,
         );
+        native_snapshot.shard.native_manifest_size_bytes = native_manifest_integrity.size_bytes;
+        native_snapshot.shard.native_manifest_sha256 = native_manifest_integrity.sha256;
+        native_manifest_integrity = undefined;
         return try native_snapshot.toShardsAlloc(alloc);
     }
 
@@ -17435,8 +17991,12 @@ pub const ProvisionedTableWriteSource = struct {
             .authority = .staged_local,
             .expected_artifact_size_bytes = source_shard.artifact_size_bytes,
             .expected_artifact_sha256 = source_shard.artifact_sha256,
+            .expected_native_manifest_size_bytes = source_shard.native_manifest_size_bytes,
+            .expected_native_manifest_sha256 = source_shard.native_manifest_sha256,
             .manifest = plan.manifest,
+            .backend_runtime = self.backend_runtime,
             .io = restore_io,
+            .cancellation = plan.cancellation,
         };
 
         var all_groups_already_admitted = true;
@@ -17458,11 +18018,12 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (all_groups_already_admitted and plan.publication_hook == null) {
             if (plan.reconcile_only) return;
-            try self.repairPublishedRestoreRuntimeStateBlocking(
+            try self.repairPublishedRestoreRuntimeStateUntilComplete(
                 alloc,
                 path,
                 group_id,
                 table_name,
+                plan.cancellation,
             );
             return;
         }
@@ -17480,11 +18041,15 @@ pub const ProvisionedTableWriteSource = struct {
 
         var preparation: ?db_mod.generation_lifecycle.PreparationTransition = null;
         defer if (preparation) |*value| value.deinit();
-        var prepared_generation: ?db_mod.generation_lifecycle.StagedGeneration = null;
+        var prepared_generation: ?backup_restore.PreparedRestore = null;
         defer if (prepared_generation) |*generation| generation.deinit();
 
         if (!plan.reconcile_only) {
-            preparation = try db_mod.generation_lifecycle.beginProcessPreparationWithRuntime(path, self.backend_runtime);
+            preparation = try db_mod.generation_lifecycle.beginProcessPreparationWithRuntimeAndIo(
+                path,
+                self.backend_runtime,
+                restore_io,
+            );
             prepared_generation = backup_restore.prepareRestoreSnapshotToPathWithPreparation(&preparation.?, alloc, path, group_id, restore_source, .{
                 .expected_table_name = table_name,
                 .expected_identity_namespace = identity_namespace,
@@ -17497,7 +18062,7 @@ pub const ProvisionedTableWriteSource = struct {
             };
             // Import, derived rebuild, and validation run against the isolated
             // sibling while the current generation remains admitted.
-            if (prepared_generation) |*generation| try self.repairRestoredTableRuntimeStateBlocking(
+            if (prepared_generation) |*generation| try self.repairRestoredTableRuntimeStateUntilComplete(
                 alloc,
                 generation.path(),
                 group_id,
@@ -17505,6 +18070,7 @@ pub const ProvisionedTableWriteSource = struct {
                 plan.manifest.indexes_json,
                 plan.manifest.schema_json,
                 generation,
+                plan.cancellation,
             );
             if (prepared_generation) |*generation| try generation.seal();
             if (prepared_generation == null) {
@@ -17553,7 +18119,7 @@ pub const ProvisionedTableWriteSource = struct {
             // published generation. Keep that maintenance under exclusivity.
             var shard_transition = try transition.beginShardStorageTransition(path);
             defer shard_transition.deinit();
-            try self.repairRestoredTableRuntimeStateBlocking(
+            try self.repairRestoredTableRuntimeStateUntilComplete(
                 alloc,
                 path,
                 group_id,
@@ -17561,6 +18127,7 @@ pub const ProvisionedTableWriteSource = struct {
                 plan.manifest.indexes_json,
                 plan.manifest.schema_json,
                 null,
+                plan.cancellation,
             );
             if (plan.publication_hook) |hook| try hook.publish();
         }
@@ -24008,6 +24575,66 @@ test "managed db open modes never drain resolver backfill on raft apply" {
     try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.status_only));
 }
 
+test "managed native restore repair retains target backend admission for staged open" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-native-restore-plan", .{tmp.sub_path});
+    defer alloc.free(path);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, path) catch {};
+
+    const ConfiguratorContext = struct {
+        expected_path: []const u8,
+        calls: usize = 0,
+
+        fn configure(ptr: *anyopaque, configured_path: []const u8, opaque_options: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const opts: *db_mod.OpenOptions = @ptrCast(@alignCast(opaque_options));
+            if (!std.mem.eql(u8, configured_path, self.expected_path)) return error.UnexpectedConfiguredPath;
+            self.calls += 1;
+            opts.start_index_workers = false;
+            opts.start_optional_runtimes = false;
+            opts.ttl_cleanup = .{ .enabled = false };
+        }
+    };
+    var context = ConfiguratorContext{ .expected_path = path };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    runtime.ptr().db_open_configurator = .{
+        .ptr = &context,
+        .configure_fn = ConfiguratorContext.configure,
+    };
+
+    const native_plan = try db_mod.DB.resolveNativeRestoreOpenPlan(path, .{ .backend_runtime = runtime.ptr() });
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntime(path, runtime.ptr());
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+
+    var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+        alloc,
+        staged.path(),
+        "{}",
+        null,
+        null,
+        0,
+        null,
+        .restore_repair,
+        runtime.ptr(),
+        null,
+        null,
+        null,
+        null,
+        .{
+            .staged_generation = &staged,
+            .native_restore_open_plan = &native_plan,
+        },
+    );
+    defer db.close();
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+}
+
 fn haMirrorForManagedDbOpenMode(mode: ManagedDbOpenMode, mirror: ?db_mod.HAAsyncEffectMirror) ?db_mod.HAAsyncEffectMirror {
     return switch (mode) {
         .default, .default_async, .writer_no_replay => mirror,
@@ -24176,6 +24803,11 @@ const ManagedDbOpenOptions = struct {
     ha_async_batch_mirror: ?db_mod.HAAsyncBatchMirror = null,
     ha_async_metadata_mirror: ?db_mod.HAAsyncMetadataMirror = null,
     staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration = null,
+    /// Immutable native backend decision retained by PreparedRestore. Only
+    /// repair execution policy and owned enrichment providers may be layered
+    /// over this plan; storage topology remains the one admitted at the live
+    /// target path.
+    native_restore_open_plan: ?*const db_mod.NativeRestoreOpenPlan = null,
     identity_validation: StartupCatchUpMetadata.IdentityValidation = .exact,
     transaction_recovery: db_mod.transaction_runtime.Config = .{},
     /// Restrict metadata reconciliation during a cold open to one index. The
@@ -24393,6 +25025,34 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                 break :blk try tables_api.deriveRuntimeTableSchema(allocator, parsed_schema);
             } else null;
             defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema);
+
+            if (open_options.native_restore_open_plan) |native_plan| {
+                if (open_mode != .restore_repair) return error.InvalidNativeRestoreOpenMode;
+                const staged_generation = open_options.staged_generation orelse
+                    return error.InvalidGenerationTransition;
+                var resolved = try native_plan.optionsForStagedGeneration(staged_generation);
+                // The plan owns every storage/root decision. These overlays
+                // are request-scoped runtime policy or move-only providers and
+                // cannot redirect candidate I/O outside the staged generation.
+                resolved.secret_store = store;
+                resolved.remote_content = remote;
+                resolved.identity_namespace = namespace;
+                resolved.prefer_existing_identity_namespace = namespace != null;
+                resolved.enrichment = enrichment_cfg;
+                resolved.ha_write_gate = open_options.ha_write_gate;
+                resolved.ha_async_effect_mirror = null;
+                resolved.ha_async_batch_mirror = null;
+                resolved.ha_async_metadata_mirror = null;
+                resolved.schema_before_index_load = schema_before_index_load;
+                resolved.open_mode = .writer_no_replay;
+                resolved.start_index_workers = false;
+                resolved.start_optional_runtimes = enrichment_cfg != null;
+                resolved.start_optional_runtime_workers = false;
+                resolved.ttl_cleanup = .{ .enabled = false };
+                resolved.transaction_recovery = .{ .enabled = false };
+                resolved.text_merge = .{ .enabled = false };
+                return try db_mod.DB.open(allocator, db_path, resolved);
+            }
 
             const base: db_mod.OpenOptions = .{
                 .lsm_cache = cache,
@@ -27113,6 +27773,11 @@ fn cloneShardSnapshots(
                 try alloc.dupe(u8, shard.artifact_sha256)
             else
                 "",
+            .native_manifest_size_bytes = shard.native_manifest_size_bytes,
+            .native_manifest_sha256 = if (shard.native_manifest_sha256.len > 0)
+                try alloc.dupe(u8, shard.native_manifest_sha256)
+            else
+                "",
         };
         initialized += 1;
     }
@@ -27716,6 +28381,73 @@ test "bound table write source applies batch writes" {
     var result = (try db.lookup(alloc, "doc:a", .{})).?;
     defer result.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
+}
+
+test "bound native restore preserves the validated generated generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-native-generation-db", .{tmp.sub_path});
+    defer alloc.free(path);
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-native-generation-backup", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+
+    var deterministic = db_embedder.DeterministicDenseEmbedder{};
+    var db = try db_mod.DB.open(alloc, path, .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .enrichment = .{
+            .owner_id = "bound-native-generation",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:native", .value = "{\"body\":\"native generation\"}" }},
+        .sync_level = .full_index,
+    });
+    try db.runUntilIdle();
+    const source_checkpoint = try db.core.loadProjectionCheckpoint(alloc, "semantic_idx");
+    const source_count = db.core.index_manager.denseIndex("semantic_idx").?.index.stats().active_count;
+    try std.testing.expect(source_count > 0);
+
+    var source = BoundTableWriteSource.init("docs", &db);
+    const shards = (try source.source().backupTable(alloc, "docs", .{
+        .backup_root = backup_root,
+        .backup_id = "bound-native",
+        .format = .native,
+    })).?;
+    defer freeBackupShards(alloc, shards);
+    const local_snapshot = try std.fmt.allocPrint(alloc, "{s}.snapshots/bound-native-local", .{path});
+    defer alloc.free(local_snapshot);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, local_snapshot, .{}));
+    const manifest = backups_api.TableBackupManifest{
+        .format = .native,
+        .backup_id = "bound-native",
+        .table_name = "docs",
+        .description = "",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .shards = shards,
+    };
+    _ = (try source.source().restoreTable(alloc, "docs", .{
+        .backup_root = backup_root,
+        .manifest = &manifest,
+        .artifact_backup_id = "bound-native",
+        .source_location = "file://bound-native-generation-backup",
+    })).?;
+
+    try std.testing.expect(!(try db.restoreRuntimeRepairNeeded()));
+    const restored_checkpoint = try db.core.loadProjectionCheckpoint(alloc, "semantic_idx");
+    try std.testing.expectEqual(source_checkpoint.generation, restored_checkpoint.generation);
+    try std.testing.expectEqual(source_checkpoint.applied_sequence, restored_checkpoint.applied_sequence);
+    try std.testing.expectEqual(source_count, db.core.index_manager.denseIndex("semantic_idx").?.index.stats().active_count);
 }
 
 test "bound table sources inspect and reprocess document artifact manifests" {
@@ -28697,7 +29429,12 @@ test "bound table write source backs up and restores a local table" {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 
-    var db = try db_mod.DB.open(alloc, path, .{});
+    var db = try db_mod.DB.open(alloc, path, .{
+        // Exercise transfer of the runtime-owned filesystem authority across
+        // the close/restore/reopen boundary. Threaded runtimes own their
+        // executor internally and cannot expose a split-ownership regression.
+        .executor = .{ .backend = .manual },
+    });
     defer {
         db.close();
         std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -28721,6 +29458,9 @@ test "bound table write source backs up and restores a local table" {
         .backup_id = "snap1",
     })).?;
     defer freeBackupShards(alloc, shards);
+    const local_snapshot = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1-local", .{path});
+    defer alloc.free(local_snapshot);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), local_snapshot, .{}));
 
     var manifest = try backups_api.createManifest(alloc, "snap1", .native, &.{
         .table_id = 1,
@@ -29108,14 +29848,19 @@ test "provisioned table restore retry repairs exact incomplete restore state thr
     source.restore_repair_work_group.await(source.table_activity_threaded.io()) catch {};
     source.drainRestoreRepairCompletionsScheduled();
 
-    try db_mod.DB.markRestorePrimaryRestoredForPathWithArtifact(
+    try db_mod.DB.markRestorePrimaryRestoredForPathWithIdentityWithIo(
         alloc,
+        io_impl.io(),
         db_path,
-        "snap1",
-        location,
-        shards[0].artifact_sha256,
-        shards[0].snapshot_path,
-        7001,
+        .{
+            .backup_id = "snap1",
+            .location = location,
+            .artifact_sha256 = shards[0].artifact_sha256,
+            .native_manifest_size_bytes = shards[0].native_manifest_size_bytes,
+            .native_manifest_sha256 = shards[0].native_manifest_sha256,
+            .snapshot_path = shards[0].snapshot_path,
+            .group_id = 7001,
+        },
     );
 
     // An object-store key can be overwritten between retries without changing
@@ -29249,6 +29994,29 @@ test "provisioned restore repair source deinit cancels sleeping retry worker" {
     source.deinit();
     const deinit_elapsed_ns = platform_time.monotonicNs() -| deinit_start_ns;
     try std.testing.expect(deinit_elapsed_ns < 75 * std.time.ns_per_ms);
+}
+
+test "restore asynchronous repair observes cancellation before staged work" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-repair-cancellation", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Canceled,
+        repairRestoredDbRuntimeStateUntilCompleteWithIo(
+            alloc,
+            &db,
+            std.testing.io,
+            7001,
+            1,
+            db_mod.types.CancellationToken.fromAtomic(&cancelled),
+        ),
+    );
 }
 
 test "provisioned restore repair worker retries transient step failures to completion" {
@@ -32790,7 +33558,10 @@ test "provisioned table write source routes batch writes across ranges" {
 
     var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(
         alloc,
-        .{ .backend = .manual },
+        .{
+            .backend = .manual,
+            .filesystem_io = io_impl.io(),
+        },
     );
     defer backend_runtime.deinit();
     var write_cache = ProvisionedTableWriteCache.init(alloc);
@@ -46858,7 +47629,7 @@ test "provisioned create reuses a generation opened by startup reconciliation" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer backend_runtime.deinit();
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/create-startup-owner-race", .{tmp.sub_path});
