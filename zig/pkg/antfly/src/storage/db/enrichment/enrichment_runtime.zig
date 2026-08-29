@@ -5591,6 +5591,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
     var owned_pdf_session: ?document_extraction_mod.PdfRenderSession = null;
     defer if (owned_pdf_session) |*session| session.deinit();
     var pdf_session: ?*document_extraction_mod.PdfRenderSession = null;
+    var pdf_render_deadline: ?document_extraction_mod.PdfRenderDeadline = null;
     if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) {
         // The reader and decoded stream graph consume the pre-reserved decoder
         // credit. The RGBA canvas, PNG encoder, and serialized OCR request are
@@ -5598,6 +5599,8 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         // working allocator below.
         owned_pdf_session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(decoder_alloc, source_bytes, config.pdf_decode_limits);
         pdf_session = &owned_pdf_session.?;
+        pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
+        pdf_session.?.setCancellationProbe(pdf_render_deadline.?.probe());
     }
     for (units, 0..) |unit, idx| {
         if (unit.extraction_status == null or !std.mem.eql(u8, unit.extraction_status.?, pending_status)) continue;
@@ -5619,8 +5622,8 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                 units[idx].ocr_rendered_width = rendered_page.width;
                 units[idx].ocr_rendered_height = rendered_page.height;
                 units[idx].ocr_rendered_bytes = rendered_page.png.len;
-                try document_extraction_mod.recordPdfRenderQualityWarningAlloc(alloc, &units[idx], rendered_page);
                 rendered = rendered_page.png;
+                try document_extraction_mod.recordPdfRenderQualityWarningAlloc(alloc, &units[idx], rendered_page);
                 logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, rendered_page.effective_dpi, rendered_page.width, rendered_page.height, rendered_page.png.len, render_started_ns, null);
             }
         }
@@ -5887,10 +5890,13 @@ fn completeRuntimeDocumentExtractionGeneratedTextUnit(
             return err;
         };
         defer rendered_page.deinit();
+        var pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
+        rendered_page.setCancellationProbe(pdf_render_deadline.probe());
         const page = rendered_page.renderPagePngAdaptiveAlloc(runtime.alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
             try setRuntimeGeneratedUnitFailureStage(runtime.alloc, unit, kind, "render");
             return err;
         };
+        errdefer runtime.alloc.free(page.png);
         unit.ocr_effective_render_dpi = page.effective_dpi;
         unit.ocr_rendered_width = page.width;
         unit.ocr_rendered_height = page.height;
@@ -13235,6 +13241,12 @@ test "synchronous document extraction OCR batches honor request execution item c
     try std.testing.expectEqualStrings("ocr text 0", units[0].text);
     try std.testing.expectEqualStrings("ocr text 1", units[1].text);
     try std.testing.expectEqualStrings("ocr text 0", units[2].text);
+}
+
+test "PDF render deadline installs an active monotonic cancellation probe" {
+    const expired = document_extraction_mod.PdfRenderDeadline{ .deadline_ns = 0 };
+    const probe = expired.probe();
+    try std.testing.expect(probe.is_cancelled_fn.?(probe.context));
 }
 
 test "document-wide OCR resource failure preserves units and marks pending pages" {

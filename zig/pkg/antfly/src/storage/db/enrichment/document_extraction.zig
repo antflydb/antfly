@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const platform_time = @import("antfly_platform").time;
 const reader_config = @import("antfly_reader_config");
 // The PDF package has a dedicated test artifact. Keeping it out of the already
 // large Antfly unit-test root prevents the Zig compiler and test process from
@@ -28,6 +29,11 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                 max_working_set_bytes: usize = 128 * 1024 * 1024,
             };
 
+            pub const CancellationProbe = struct {
+                context: ?*const anyopaque = null,
+                is_cancelled_fn: ?*const fn (?*const anyopaque) bool = null,
+            };
+
             pub const Reader = struct {
                 pub fn init(_: Allocator, _: []const u8) anyerror!Reader {
                     return error.PdfExtractionUnavailable;
@@ -38,6 +44,8 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                 }
 
                 pub fn deinit(_: *Reader) void {}
+
+                pub fn setCancellationProbe(_: *Reader, _: CancellationProbe) void {}
 
                 pub fn pageCount(_: *Reader) anyerror!usize {
                     return 0;
@@ -314,6 +322,28 @@ pub fn renderPdfPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_numbe
 }
 
 pub const RenderedPdfPage = pdf.RenderedPagePng;
+pub const PdfCancellationProbe = pdf.reader.CancellationProbe;
+
+/// A stack-owned monotonic deadline suitable for synchronous native PDF
+/// parsing and rendering. The owner must keep this value alive for as long as
+/// a reader holds the returned probe.
+pub const PdfRenderDeadline = struct {
+    deadline_ns: u64,
+
+    pub fn init(timeout_ms: u64) @This() {
+        const timeout_ns = std.math.mul(u64, @max(timeout_ms, 1), std.time.ns_per_ms) catch std.math.maxInt(u64);
+        return .{ .deadline_ns = platform_time.monotonicNs() +| timeout_ns };
+    }
+
+    fn isCancelled(context: ?*const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(context orelse return true));
+        return platform_time.monotonicNs() >= self.deadline_ns;
+    }
+
+    pub fn probe(self: *const @This()) PdfCancellationProbe {
+        return .{ .context = self, .is_cancelled_fn = isCancelled };
+    }
+};
 
 pub fn recordPdfRenderQualityWarningAlloc(alloc: Allocator, unit: *Unit, rendered: RenderedPdfPage) !void {
     if (rendered.quality == .native) return;
@@ -345,6 +375,10 @@ pub const PdfRenderSession = struct {
     pub fn deinit(self: *PdfRenderSession) void {
         self.parsed.deinit();
         self.* = undefined;
+    }
+
+    pub fn setCancellationProbe(self: *PdfRenderSession, probe: PdfCancellationProbe) void {
+        self.parsed.setCancellationProbe(probe);
     }
 
     pub fn renderPagePngAlloc(self: *PdfRenderSession, alloc: Allocator, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
@@ -780,10 +814,17 @@ pub fn preferOcrTextForContentAlloc(alloc: Allocator, embedded_text: []const u8,
 
 pub const OcrTextChoice = enum { embedded, ocr, ocr_with_embedded_numeric_rows };
 
+const max_numeric_recall_unique_tokens: usize = 65_536;
+const max_numeric_recall_token_occurrences: usize = 1_000_000;
+
 pub fn chooseOcrTextForContentAlloc(alloc: Allocator, embedded_text: []const u8, ocr_text: []const u8, embedded: OcrQuality, ocr: OcrQuality) !OcrTextChoice {
     const quality_prefers_ocr = preferOcrText(embedded, ocr);
     if (!quality_prefers_ocr) return .embedded;
     const numeric_recall = try numericTokenRecallAlloc(alloc, embedded_text, ocr_text);
+    // A page that exceeds the bounded comparison workspace is too dense to
+    // prove OCR numeric recall safely. Preserve the embedded text rather than
+    // failing the document or silently accepting a lossy transcription.
+    if (!numeric_recall.complete) return .embedded;
     if (numeric_recall.reference_count >= 8 and numeric_recall.recall < 0.85 and
         embedded.replacement_char_ratio <= 0.20)
         return .ocr_with_embedded_numeric_rows;
@@ -794,14 +835,40 @@ pub fn chooseOcrTextForContentAlloc(alloc: Allocator, embedded_text: []const u8,
 /// OCR. Candidate token counts are consumed in document order, so repeated
 /// values are handled as a multiset instead of being mistaken for one match.
 pub fn mergeOcrWithEmbeddedNumericRowsAlloc(alloc: Allocator, embedded_text: []const u8, ocr_text: []const u8) ![]u8 {
+    return try mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
+        alloc,
+        embedded_text,
+        ocr_text,
+        max_numeric_recall_unique_tokens,
+        max_numeric_recall_token_occurrences,
+    );
+}
+
+fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
+    alloc: Allocator,
+    embedded_text: []const u8,
+    ocr_text: []const u8,
+    max_unique_tokens: usize,
+    max_token_occurrences: usize,
+) ![]u8 {
     var candidate_counts = std.StringHashMapUnmanaged(u32).empty;
     defer candidate_counts.deinit(alloc);
-    var tokens = std.mem.tokenizeAny(u8, ocr_text, &std.ascii.whitespace);
+    var reference_occurrences: usize = 0;
+    var tokens = std.mem.tokenizeAny(u8, embedded_text, &std.ascii.whitespace);
     while (tokens.next()) |raw| {
         const token = normalizedNumericToken(raw) orelse continue;
+        reference_occurrences +|= 1;
+        if (reference_occurrences > max_token_occurrences) return try alloc.dupe(u8, embedded_text);
         const entry = try candidate_counts.getOrPut(alloc, token);
-        if (!entry.found_existing) entry.value_ptr.* = 0;
-        entry.value_ptr.* +|= 1;
+        if (!entry.found_existing) {
+            if (candidate_counts.count() > max_unique_tokens) return try alloc.dupe(u8, embedded_text);
+            entry.value_ptr.* = 0;
+        }
+    }
+    tokens = std.mem.tokenizeAny(u8, ocr_text, &std.ascii.whitespace);
+    while (tokens.next()) |raw| {
+        const token = normalizedNumericToken(raw) orelse continue;
+        if (candidate_counts.getPtr(token)) |count| count.* +|= 1;
     }
 
     var retained = std.ArrayList(u8).empty;
@@ -848,21 +915,41 @@ pub fn mergeOcrWithEmbeddedNumericRowsAlloc(alloc: Allocator, embedded_text: []c
     );
 }
 
-const NumericTokenRecall = struct { reference_count: usize, recall: f64 };
+const NumericTokenRecall = struct { reference_count: usize, recall: f64, complete: bool = true };
 
 fn numericTokenRecallAlloc(alloc: Allocator, reference: []const u8, candidate: []const u8) !NumericTokenRecall {
+    return try numericTokenRecallAllocWithLimits(
+        alloc,
+        reference,
+        candidate,
+        max_numeric_recall_unique_tokens,
+        max_numeric_recall_token_occurrences,
+    );
+}
+
+fn numericTokenRecallAllocWithLimits(
+    alloc: Allocator,
+    reference: []const u8,
+    candidate: []const u8,
+    max_unique_tokens: usize,
+    max_token_occurrences: usize,
+) !NumericTokenRecall {
     var remaining = std.StringHashMapUnmanaged(u32).empty;
     defer remaining.deinit(alloc);
     var reference_count: usize = 0;
     var tokens = std.mem.tokenizeAny(u8, reference, &std.ascii.whitespace);
     while (tokens.next()) |raw| {
         const token = normalizedNumericToken(raw) orelse continue;
-        reference_count += 1;
+        reference_count +|= 1;
+        if (reference_count > max_token_occurrences)
+            return .{ .reference_count = reference_count, .recall = 0, .complete = false };
         // Keys borrow from `reference`, which outlives this page-local map.
         // Avoid one allocation per table cell while preserving duplicate
         // counts for recall.
         const entry = try remaining.getOrPut(alloc, token);
         if (!entry.found_existing) {
+            if (remaining.count() > max_unique_tokens)
+                return .{ .reference_count = reference_count, .recall = 0, .complete = false };
             entry.key_ptr.* = token;
             entry.value_ptr.* = 0;
         }
@@ -3990,6 +4077,36 @@ test "OCR text selection preserves dense embedded numeric tables" {
     try std.testing.expect(std.mem.indexOf(u8, merged, "Q1 101 81 20") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged, "Q4 140 100 40") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged, "numeric accuracy") != null);
+}
+
+test "numeric recall limits preserve embedded text without exhausting scratch memory" {
+    const recall = try numericTokenRecallAllocWithLimits(
+        std.testing.allocator,
+        "row 101 102 103",
+        "row 101 102 103",
+        2,
+        100,
+    );
+    try std.testing.expect(!recall.complete);
+
+    const occurrence_limited = try numericTokenRecallAllocWithLimits(
+        std.testing.allocator,
+        "101 101 101",
+        "101 101 101",
+        10,
+        2,
+    );
+    try std.testing.expect(!occurrence_limited.complete);
+
+    const merged = try mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
+        std.testing.allocator,
+        "row 101 102 103",
+        "row 101",
+        2,
+        100,
+    );
+    defer std.testing.allocator.free(merged);
+    try std.testing.expectEqualStrings("row 101 102 103", merged);
 }
 
 test "PDF render quality warning preserves prior diagnostics and fallback reason" {

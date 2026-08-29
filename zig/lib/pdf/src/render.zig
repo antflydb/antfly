@@ -124,6 +124,25 @@ const RawPageCanvas = struct {
     height: usize,
 };
 
+const BilevelSampleBudget = struct {
+    const minimum_samples: u64 = 262_144;
+    const maximum_samples: u64 = 32_000_000;
+    const samples_per_canvas_pixel: u64 = 8;
+
+    remaining_samples: u64,
+
+    fn init(canvas_pixels: usize) BilevelSampleBudget {
+        const scaled = std.math.mul(u64, canvas_pixels, samples_per_canvas_pixel) catch maximum_samples;
+        return .{ .remaining_samples = @min(maximum_samples, @max(minimum_samples, scaled)) };
+    }
+
+    fn reserve(self: *BilevelSampleBudget, samples: u64) bool {
+        if (samples > self.remaining_samples) return false;
+        self.remaining_samples -= samples;
+        return true;
+    }
+};
+
 fn rotateRawPageCanvasAlloc(alloc: Allocator, raw: *RawPageCanvas, rotation: PageRotation, cancellation: reader.CancellationProbe) !void {
     switch (rotation) {
         .none => return,
@@ -472,6 +491,7 @@ fn renderChildGroupAlloc(
     plan: *const RenderPlan,
     group_index: usize,
     cancellation: reader.CancellationProbe,
+    bilevel_sample_budget: *BilevelSampleBudget,
 ) anyerror!void {
     try cancellation.check();
     const meta = plan.groups[group_index];
@@ -482,11 +502,11 @@ fn renderChildGroupAlloc(
     } else {
         @memcpy(child, target);
     }
-    try renderGroupChildrenAlloc(alloc, child, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout, cancellation);
+    try renderGroupChildrenAlloc(alloc, child, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout, cancellation, bilevel_sample_budget);
     if (meta.isolated) {
-        compositeGroupCanvas(target, child);
+        try compositeGroupCanvasCancelable(target, child, cancellation);
     } else {
-        @memcpy(target, child);
+        try copyCanvasCancelable(target, child, width, height, cancellation);
     }
 }
 
@@ -504,15 +524,16 @@ fn renderChoiceAlloc(
     plan: *const RenderPlan,
     choice: RenderChoice,
     cancellation: reader.CancellationProbe,
+    bilevel_sample_budget: *BilevelSampleBudget,
 ) !void {
     try cancellation.check();
     switch (choice) {
-        .text => |idx| drawTextRun(canvas, width, height, 0, page_box.min_x, page_box.max_y, text_runs[idx]),
-        .image => |idx| try drawImageRunCancelable(canvas, width, height, 0, page_box.min_x, page_box.max_y, image_runs[idx], cancellation),
+        .text => |idx| try drawTextRunCancelable(canvas, width, height, 0, page_box.min_x, page_box.max_y, text_runs[idx], cancellation),
+        .image => |idx| try drawImageRunCancelable(canvas, width, height, 0, page_box.min_x, page_box.max_y, image_runs[idx], cancellation, bilevel_sample_budget),
         .shading => |idx| try drawShadingRunCancelable(canvas, width, height, page_box.min_x, page_box.max_y, shading_runs[idx], cancellation),
-        .pattern => |idx| try drawPatternRunCancelable(alloc, canvas, width, height, page_box.min_x, page_box.max_y, pattern_runs[idx], cancellation),
+        .pattern => |idx| try drawPatternRunCancelable(alloc, canvas, width, height, page_box.min_x, page_box.max_y, pattern_runs[idx], cancellation, bilevel_sample_budget),
         .shape => |idx| try drawShapeRunAllocCancelable(alloc, canvas, width, height, page_box.min_x, page_box.max_y, shape_runs[idx], cancellation),
-        .group => |idx| try renderChildGroupAlloc(alloc, canvas, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, idx, cancellation),
+        .group => |idx| try renderChildGroupAlloc(alloc, canvas, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, idx, cancellation, bilevel_sample_budget),
     }
 }
 
@@ -593,6 +614,16 @@ fn copyCanvasRect(dst: []u8, src: []const u8, canvas_width: usize, rect: PixelRe
     }
 }
 
+fn copyCanvasRectCancelable(dst: []u8, src: []const u8, canvas_width: usize, rect: PixelRect, cancellation: reader.CancellationProbe) !void {
+    var y = rect.y0;
+    while (y < rect.y1) : (y += 1) {
+        if ((y - rect.y0) & 31 == 0) try cancellation.check();
+        const start = (y * canvas_width + rect.x0) * 4;
+        const end = (y * canvas_width + rect.x1) * 4;
+        @memcpy(dst[start..end], src[start..end]);
+    }
+}
+
 fn renderGroupChildrenAlloc(
     alloc: Allocator,
     canvas: []u8,
@@ -608,6 +639,7 @@ fn renderGroupChildrenAlloc(
     schedule_index: usize,
     knockout: bool,
     cancellation: reader.CancellationProbe,
+    bilevel_sample_budget: *BilevelSampleBudget,
 ) anyerror!void {
     const backdrop = if (knockout) try alloc.dupe(u8, canvas) else null;
     defer if (backdrop) |buf| alloc.free(buf);
@@ -619,11 +651,11 @@ fn renderGroupChildrenAlloc(
         if (knockout) {
             const rect = renderChoicePixelRect(choice, width, height, page_box, text_runs, image_runs, pattern_runs, shape_runs);
             if (rect.empty()) continue;
-            copyCanvasRect(scratch.?, backdrop.?, width, rect);
-            try renderChoiceAlloc(alloc, scratch.?, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice, cancellation);
-            replaceCanvasWhereChangedRect(canvas, scratch.?, backdrop.?, width, rect);
+            try copyCanvasRectCancelable(scratch.?, backdrop.?, width, rect, cancellation);
+            try renderChoiceAlloc(alloc, scratch.?, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice, cancellation, bilevel_sample_budget);
+            try replaceCanvasWhereChangedRectCancelable(canvas, scratch.?, backdrop.?, width, rect, cancellation);
         } else {
-            try renderChoiceAlloc(alloc, canvas, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice, cancellation);
+            try renderChoiceAlloc(alloc, canvas, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice, cancellation, bilevel_sample_budget);
         }
     }
 }
@@ -637,6 +669,20 @@ fn renderPageContentRgbaInBoxAlloc(
     pattern_runs: []const reader.PatternRun,
     shape_runs: []const reader.ShapeRun,
     cancellation: reader.CancellationProbe,
+) !RawPageCanvas {
+    return try renderPageContentRgbaInBoxAllocWithBudget(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null);
+}
+
+fn renderPageContentRgbaInBoxAllocWithBudget(
+    alloc: Allocator,
+    page_box: reader.PageBox,
+    text_runs: []const reader.TextRun,
+    image_runs: []const reader.ImageRun,
+    shading_runs: []const reader.ShadingRun,
+    pattern_runs: []const reader.PatternRun,
+    shape_runs: []const reader.ShapeRun,
+    cancellation: reader.CancellationProbe,
+    shared_bilevel_sample_budget: ?*BilevelSampleBudget,
 ) !RawPageCanvas {
     try cancellation.check();
     const page_w = @max(1.0, page_box.max_x - page_box.min_x);
@@ -655,7 +701,9 @@ fn renderPageContentRgbaInBoxAlloc(
     const rgba = try alloc.alloc(u8, rgba_len);
     errdefer alloc.free(rgba);
     @memset(rgba, 0xff);
-    try renderGroupChildrenAlloc(alloc, rgba, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, &plan, 0, false, cancellation);
+    var local_bilevel_sample_budget = BilevelSampleBudget.init(pixel_count);
+    const bilevel_sample_budget = shared_bilevel_sample_budget orelse &local_bilevel_sample_budget;
+    try renderGroupChildrenAlloc(alloc, rgba, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, &plan, 0, false, cancellation, bilevel_sample_budget);
 
     return .{ .rgba = rgba, .width = width, .height = height };
 }
@@ -781,37 +829,64 @@ fn drawTextRun(
     max_y: f64,
     run: reader.TextRun,
 ) void {
+    drawTextRunCancelable(rgba, width, height, margin, min_x, max_y, run, .{}) catch unreachable;
+}
+
+fn drawTextRunCancelable(
+    rgba: []u8,
+    width: usize,
+    height: usize,
+    margin: usize,
+    min_x: f64,
+    max_y: f64,
+    run: reader.TextRun,
+    cancellation: reader.CancellationProbe,
+) !void {
     var cursor: f64 = 0;
     const advance_scale = estimatedRunAdvanceScale(run);
     var view = std.unicode.Utf8View.init(run.text) catch {
-        for (run.text) |ch| {
+        for (run.text, 0..) |ch, index| {
+            if (index & 31 == 0) try cancellation.check();
             const advance = estimatedRunCodepointAdvance(run, if (ch == ' ') ' ' else 0xfffd, advance_scale);
             switch (ch) {
                 ' ' => {},
                 '\n', '\r' => {},
-                else => drawAffineFallbackGlyph(rgba, width, height, margin, min_x, max_y, run, ch, cursor, advance),
+                else => try drawAffineFallbackGlyphCancelable(rgba, width, height, margin, min_x, max_y, run, ch, cursor, advance, cancellation),
             }
             cursor += advance;
         }
         return;
     };
     var iter = view.iterator();
+    var codepoint_index: usize = 0;
     while (iter.nextCodepoint()) |cp| {
+        if (codepoint_index & 31 == 0) try cancellation.check();
+        codepoint_index += 1;
         const advance = estimatedRunCodepointAdvance(run, cp, advance_scale);
         switch (cp) {
             ' ' => {},
             '\n', '\r' => {},
-            else => drawAffineFallbackGlyph(rgba, width, height, margin, min_x, max_y, run, cp, cursor, advance),
+            else => try drawAffineFallbackGlyphCancelable(rgba, width, height, margin, min_x, max_y, run, cp, cursor, advance, cancellation),
         }
         cursor += advance;
     }
 }
 
 fn drawImageRun(canvas: []u8, canvas_w: usize, canvas_h: usize, margin: usize, min_x: f64, max_y: f64, run: reader.ImageRun) void {
-    drawImageRunCancelable(canvas, canvas_w, canvas_h, margin, min_x, max_y, run, .{}) catch unreachable;
+    drawImageRunCancelable(canvas, canvas_w, canvas_h, margin, min_x, max_y, run, .{}, null) catch unreachable;
 }
 
-fn drawImageRunCancelable(canvas: []u8, canvas_w: usize, canvas_h: usize, margin: usize, min_x: f64, max_y: f64, run: reader.ImageRun, cancellation: reader.CancellationProbe) !void {
+fn drawImageRunCancelable(
+    canvas: []u8,
+    canvas_w: usize,
+    canvas_h: usize,
+    margin: usize,
+    min_x: f64,
+    max_y: f64,
+    run: reader.ImageRun,
+    cancellation: reader.CancellationProbe,
+    bilevel_sample_budget: ?*BilevelSampleBudget,
+) !void {
     const det = run.a * run.d - run.b * run.c;
     if (@abs(det) < 0.000001) return;
 
@@ -854,7 +929,7 @@ fn drawImageRunCancelable(canvas: []u8, canvas_w: usize, canvas_h: usize, margin
             const dst = (py * canvas_w + px) * 4;
             var sample: [4]u8 = undefined;
             if (coverage_minify) {
-                sample = try coveragePreservingBilevelSample(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d, cancellation);
+                sample = try coveragePreservingBilevelSample(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d, cancellation, bilevel_sample_budget);
             } else if (filtered) {
                 sample = bilinearImageSample(run, u, 1.0 - v);
             } else {
@@ -996,12 +1071,43 @@ fn adaptiveAffineBilevelSample(run: reader.ImageRun, world_x: f64, world_y: f64,
     return result;
 }
 
-fn coveragePreservingBilevelSample(run: reader.ImageRun, world_x: f64, world_y: f64, inv_a: f64, inv_b: f64, inv_c: f64, inv_d: f64, cancellation: reader.CancellationProbe) ![4]u8 {
+fn boxFilterSourceSampleCount(run: reader.ImageRun, footprint: SourceFootprint) u64 {
+    const width_f: f64 = @floatFromInt(run.width);
+    const height_f: f64 = @floatFromInt(run.height);
+    const min_x = std.math.clamp(footprint.min_x, 0.0, width_f);
+    const max_x = std.math.clamp(footprint.max_x, 0.0, width_f);
+    const min_y = std.math.clamp(footprint.min_y, 0.0, height_f);
+    const max_y = std.math.clamp(footprint.max_y, 0.0, height_f);
+    if (min_x >= max_x or min_y >= max_y) return 0;
+    const columns = @as(usize, @intFromFloat(@ceil(max_x))) - @as(usize, @intFromFloat(@floor(min_x)));
+    const rows = @as(usize, @intFromFloat(@ceil(max_y))) - @as(usize, @intFromFloat(@floor(min_y)));
+    return std.math.mul(u64, columns, rows) catch std.math.maxInt(u64);
+}
+
+fn coveragePreservingBilevelSample(
+    run: reader.ImageRun,
+    world_x: f64,
+    world_y: f64,
+    inv_a: f64,
+    inv_b: f64,
+    inv_c: f64,
+    inv_d: f64,
+    cancellation: reader.CancellationProbe,
+    bilevel_sample_budget: ?*BilevelSampleBudget,
+) ![4]u8 {
     const footprint = imageSourceFootprint(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d) orelse return .{ 0, 0, 0, 0 };
     const epsilon = 0.000000001;
     const orthogonal = (@abs(inv_b) <= epsilon and @abs(inv_c) <= epsilon) or
         (@abs(inv_a) <= epsilon and @abs(inv_d) <= epsilon);
-    if (orthogonal) return try boxFilteredBilevelSample(run, footprint, cancellation);
+    if (orthogonal) {
+        const source_samples = boxFilterSourceSampleCount(run, footprint);
+        if (bilevel_sample_budget == null or bilevel_sample_budget.?.reserve(source_samples))
+            return try boxFilteredBilevelSample(run, footprint, cancellation);
+    }
+    // Once exact source integration would exceed the page budget, retain a
+    // deterministic bounded approximation instead of timing out the entire
+    // OCR request. The shared budget prevents repeated XObject placements
+    // from multiplying source-sized work.
     return try adaptiveAffineBilevelSample(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d, footprint, cancellation);
 }
 
@@ -1273,7 +1379,7 @@ fn drawPatternRun(
     max_y: f64,
     run: reader.PatternRun,
 ) anyerror!void {
-    return try drawPatternRunCancelable(alloc, canvas, canvas_w, canvas_h, min_x, max_y, run, .{});
+    return try drawPatternRunCancelable(alloc, canvas, canvas_w, canvas_h, min_x, max_y, run, .{}, null);
 }
 
 fn drawPatternRunCancelable(
@@ -1285,6 +1391,7 @@ fn drawPatternRunCancelable(
     max_y: f64,
     run: reader.PatternRun,
     cancellation: reader.CancellationProbe,
+    bilevel_sample_budget: ?*BilevelSampleBudget,
 ) anyerror!void {
     const ShapeKind = @FieldType(reader.ShapeRun, "kind");
     const bounds = shapeRunBounds(.{
@@ -1375,7 +1482,7 @@ fn drawPatternRunCancelable(
         return;
     }
 
-    const tile = try renderPatternTileCanvasAlloc(alloc, run, cancellation);
+    const tile = try renderPatternTileCanvasAlloc(alloc, run, cancellation, bilevel_sample_budget);
     defer alloc.free(tile.rgba);
     const det = run.pattern_matrix.a * run.pattern_matrix.d - run.pattern_matrix.b * run.pattern_matrix.c;
     if (@abs(det) < 0.000001) return;
@@ -1465,8 +1572,13 @@ const RawTile = struct {
     height: usize,
 };
 
-fn renderPatternTileCanvasAlloc(alloc: Allocator, run: reader.PatternRun, cancellation: reader.CancellationProbe) anyerror!RawTile {
-    const raw = try renderPageContentRgbaInBoxAlloc(
+fn renderPatternTileCanvasAlloc(
+    alloc: Allocator,
+    run: reader.PatternRun,
+    cancellation: reader.CancellationProbe,
+    bilevel_sample_budget: ?*BilevelSampleBudget,
+) anyerror!RawTile {
+    const raw = try renderPageContentRgbaInBoxAllocWithBudget(
         alloc,
         run.pattern_bbox,
         run.tile_text_runs,
@@ -1475,6 +1587,7 @@ fn renderPatternTileCanvasAlloc(alloc: Allocator, run: reader.PatternRun, cancel
         run.tile_pattern_runs,
         run.tile_shape_runs,
         cancellation,
+        bilevel_sample_budget,
     );
     return .{ .rgba = raw.rgba, .width = raw.width, .height = raw.height };
 }
@@ -1954,6 +2067,22 @@ fn drawAffineFallbackGlyph(
     local_x: f64,
     local_w: f64,
 ) void {
+    drawAffineFallbackGlyphCancelable(rgba, width, height, margin, min_x, max_y, run, codepoint, local_x, local_w, .{}) catch unreachable;
+}
+
+fn drawAffineFallbackGlyphCancelable(
+    rgba: []u8,
+    width: usize,
+    height: usize,
+    margin: usize,
+    min_x: f64,
+    max_y: f64,
+    run: reader.TextRun,
+    codepoint: u21,
+    local_x: f64,
+    local_w: f64,
+    cancellation: reader.CancellationProbe,
+) !void {
     if (local_w <= 0 or run.font_size <= 0) return;
 
     const det = run.a * run.d - run.b * run.c;
@@ -1995,6 +2124,7 @@ fn drawAffineFallbackGlyph(
 
     var py = y0;
     while (py < y1) : (py += 1) {
+        if ((py - y0) & 31 == 0) try cancellation.check();
         var px = x0;
         while (px < x1) : (px += 1) {
             const world_x = pixelWorldX(min_x, margin, px);
@@ -2177,10 +2307,24 @@ fn blendPixelMode(canvas: []u8, dst: usize, src: [4]u8, mode: reader.BlendMode) 
 }
 
 fn compositeGroupCanvas(canvas: []u8, group_canvas: []const u8) void {
+    compositeGroupCanvasCancelable(canvas, group_canvas, .{}) catch unreachable;
+}
+
+fn compositeGroupCanvasCancelable(canvas: []u8, group_canvas: []const u8, cancellation: reader.CancellationProbe) !void {
     var i: usize = 0;
     while (i + 3 < group_canvas.len) : (i += 4) {
+        if (i & 65_535 == 0) try cancellation.check();
         if (group_canvas[i + 3] == 0) continue;
         blendPixelMode(canvas, i, .{ group_canvas[i + 0], group_canvas[i + 1], group_canvas[i + 2], group_canvas[i + 3] }, .normal);
+    }
+}
+
+fn copyCanvasCancelable(dst: []u8, src: []const u8, width: usize, height: usize, cancellation: reader.CancellationProbe) !void {
+    const row_bytes = std.math.mul(usize, width, 4) catch return error.RenderedPageTooLarge;
+    for (0..height) |row| {
+        if (row & 31 == 0) try cancellation.check();
+        const start = row * row_bytes;
+        @memcpy(dst[start .. start + row_bytes], src[start .. start + row_bytes]);
     }
 }
 
@@ -2196,8 +2340,13 @@ fn clearCanvasWhereOpaque(canvas: []u8, mask: []const u8) void {
 }
 
 fn replaceCanvasWhereChangedRect(canvas: []u8, next: []const u8, backdrop: []const u8, canvas_width: usize, rect: PixelRect) void {
+    replaceCanvasWhereChangedRectCancelable(canvas, next, backdrop, canvas_width, rect, .{}) catch unreachable;
+}
+
+fn replaceCanvasWhereChangedRectCancelable(canvas: []u8, next: []const u8, backdrop: []const u8, canvas_width: usize, rect: PixelRect, cancellation: reader.CancellationProbe) !void {
     var y = rect.y0;
     while (y < rect.y1) : (y += 1) {
+        if ((y - rect.y0) & 31 == 0) try cancellation.check();
         var i = (y * canvas_width + rect.x0) * 4;
         const end = (y * canvas_width + rect.x1) * 4;
         while (i < end) : (i += 4) {
@@ -2868,6 +3017,40 @@ test "page raster cancellation propagates before paint" {
     ));
 }
 
+test "fallback text raster observes cancellation" {
+    const Cancelled = struct {
+        fn check(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    var canvas = [_]u8{0xff} ** (32 * 32 * 4);
+    try std.testing.expectError(error.Canceled, drawTextRunCancelable(
+        &canvas,
+        32,
+        32,
+        0,
+        0,
+        32,
+        .{ .text = @constCast("fallback"), .x = 1, .y = 20, .font_size = 12 },
+        .{ .is_cancelled_fn = Cancelled.check },
+    ));
+}
+
+test "group canvas operations observe cancellation" {
+    const Cancelled = struct {
+        fn check(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    const cancellation: reader.CancellationProbe = .{ .is_cancelled_fn = Cancelled.check };
+    var canvas = [_]u8{0xff} ** (4 * 4 * 4);
+    var next = [_]u8{0} ** (4 * 4 * 4);
+    try std.testing.expectError(error.Canceled, compositeGroupCanvasCancelable(&canvas, &next, cancellation));
+    try std.testing.expectError(error.Canceled, copyCanvasCancelable(&canvas, &next, 4, 4, cancellation));
+    try std.testing.expectError(error.Canceled, copyCanvasRectCancelable(&canvas, &next, 4, PixelRect.full(4, 4), cancellation));
+    try std.testing.expectError(error.Canceled, replaceCanvasWhereChangedRectCancelable(&canvas, &next, &canvas, 4, PixelRect.full(4, 4), cancellation));
+}
+
 test "draw shape run respects clip box" {
     const alloc = std.testing.allocator;
     const points = try alloc.dupe([2]f64, &.{ .{ 2, 2 }, .{ 18, 2 }, .{ 18, 18 }, .{ 2, 18 } });
@@ -3414,6 +3597,34 @@ test "OCR bilevel area filter retains thin rules beyond four-to-one minification
     try std.testing.expectEqual(canvas[0], canvas[1]);
     try std.testing.expectEqual(canvas[0], canvas[2]);
     try std.testing.expectEqual(@as(u8, 0xff), canvas[3]);
+}
+
+test "OCR bilevel exact integration degrades when the shared page budget is exhausted" {
+    var rgba = [_]u8{0xff} ** (1024 * 4);
+    rgba[0] = 0;
+    rgba[1] = 0;
+    rgba[2] = 0;
+    const run: reader.ImageRun = .{
+        .rgba = &rgba,
+        .width = 1024,
+        .height = 1,
+        .bilevel = true,
+        .ocr_coverage_minify = true,
+        .a = 1,
+        .b = 0,
+        .c = 0,
+        .d = 1,
+        .e = 0,
+        .f = 0,
+        .x = 0,
+        .y = 0,
+        .draw_width = 1,
+        .draw_height = 1,
+    };
+    var budget = BilevelSampleBudget{ .remaining_samples = 8 };
+    const sample = try coveragePreservingBilevelSample(run, 0.5, 0.5, 1, 0, 0, 1, .{}, &budget);
+    try std.testing.expectEqual(@as(u64, 8), budget.remaining_samples);
+    try std.testing.expectEqual(@as(u8, 0xff), sample[3]);
 }
 
 test "legacy shape raster path observes cancellation" {
