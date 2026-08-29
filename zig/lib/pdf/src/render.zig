@@ -183,9 +183,11 @@ fn pixelWorldY(max_y: f64, margin: usize, py: usize) f64 {
 const GroupMeta = struct {
     id: u32,
     parent_id: ?u32,
+    parent_index: ?usize = null,
     isolated: bool,
     knockout: bool,
     min_paint_order: usize,
+    min_paint_phase: usize,
 };
 
 const RenderChoice = union(enum) {
@@ -225,13 +227,19 @@ fn addOrUpdateGroupMeta(
     isolated: bool,
     knockout: bool,
     paint_order: usize,
+    paint_phase: usize,
 ) anyerror!void {
     if (group_indices.get(id)) |idx| {
         const group = &groups.items[idx];
         group.parent_id = parent_id;
         group.isolated = isolated;
         group.knockout = knockout;
-        group.min_paint_order = @min(group.min_paint_order, paint_order);
+        if (paint_order < group.min_paint_order) {
+            group.min_paint_order = paint_order;
+            group.min_paint_phase = paint_phase;
+        } else if (paint_order == group.min_paint_order) {
+            group.min_paint_phase = @min(group.min_paint_phase, paint_phase);
+        }
         return;
     }
     const idx = groups.items.len;
@@ -241,6 +249,7 @@ fn addOrUpdateGroupMeta(
         .isolated = isolated,
         .knockout = knockout,
         .min_paint_order = paint_order,
+        .min_paint_phase = paint_phase,
     });
     try group_indices.put(alloc, id, idx);
 }
@@ -250,6 +259,7 @@ const RenderSchedule = std.ArrayListUnmanaged(RenderChoice);
 const RenderPlan = struct {
     groups: []GroupMeta,
     schedules: []RenderSchedule,
+    peak_canvas_count: usize,
 
     fn deinit(self: *RenderPlan, alloc: Allocator) void {
         for (self.schedules) |*schedule| schedule.deinit(alloc);
@@ -258,6 +268,39 @@ const RenderPlan = struct {
         self.* = undefined;
     }
 };
+
+fn peakRenderCanvasCountAlloc(alloc: Allocator, groups: []const GroupMeta) !usize {
+    const VisitState = enum { unseen, visiting, complete };
+    const states = try alloc.alloc(VisitState, groups.len);
+    defer alloc.free(states);
+    @memset(states, .unseen);
+    const counts = try alloc.alloc(usize, groups.len);
+    defer alloc.free(counts);
+
+    const Visitor = struct {
+        fn visit(all_groups: []const GroupMeta, all_states: []VisitState, all_counts: []usize, index: usize) !usize {
+            switch (all_states[index]) {
+                .complete => return all_counts[index],
+                .visiting => return error.InvalidRenderGroup,
+                .unseen => {},
+            }
+            all_states[index] = .visiting;
+            const parent_count = if (all_groups[index].parent_index) |parent|
+                try visit(all_groups, all_states, all_counts, parent)
+            else
+                1; // The page canvas.
+            const group_canvases: usize = 1 + if (all_groups[index].knockout) @as(usize, 2) else 0;
+            const count = std.math.add(usize, parent_count, group_canvases) catch return error.RenderedPageTooLarge;
+            all_counts[index] = count;
+            all_states[index] = .complete;
+            return count;
+        }
+    };
+
+    var peak: usize = 1;
+    for (groups, 0..) |_, index| peak = @max(peak, try Visitor.visit(groups, states, counts, index));
+    return peak;
+}
 
 fn renderChoiceKindOrder(choice: RenderChoice) u8 {
     return switch (choice) {
@@ -276,6 +319,25 @@ fn renderChoiceIndex(choice: RenderChoice) usize {
     };
 }
 
+fn renderChoicePhase(
+    choice: RenderChoice,
+    text_runs: []const reader.TextRun,
+    image_runs: []const reader.ImageRun,
+    shading_runs: []const reader.ShadingRun,
+    pattern_runs: []const reader.PatternRun,
+    shape_runs: []const reader.ShapeRun,
+    groups: []const GroupMeta,
+) usize {
+    return switch (choice) {
+        .text => |idx| text_runs[idx].paint_phase,
+        .image => |idx| image_runs[idx].paint_phase,
+        .shading => |idx| shading_runs[idx].paint_phase,
+        .pattern => |idx| pattern_runs[idx].paint_phase,
+        .shape => |idx| shape_runs[idx].paint_phase,
+        .group => |idx| groups[idx].min_paint_phase,
+    };
+}
+
 const RenderChoiceSortContext = struct {
     text_runs: []const reader.TextRun,
     image_runs: []const reader.ImageRun,
@@ -288,6 +350,9 @@ const RenderChoiceSortContext = struct {
         const a_order = choiceOrder(a, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs, ctx.groups);
         const b_order = choiceOrder(b, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs, ctx.groups);
         if (a_order != b_order) return a_order < b_order;
+        const a_phase = renderChoicePhase(a, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs, ctx.groups);
+        const b_phase = renderChoicePhase(b, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs, ctx.groups);
+        if (a_phase != b_phase) return a_phase < b_phase;
         const a_kind = renderChoiceKindOrder(a);
         const b_kind = renderChoiceKindOrder(b);
         if (a_kind != b_kind) return a_kind < b_kind;
@@ -308,14 +373,40 @@ fn buildRenderPlanAlloc(
     var group_indices = std.AutoHashMapUnmanaged(u32, usize).empty;
     defer group_indices.deinit(alloc);
 
-    for (text_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
-    for (image_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
-    for (shading_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
-    for (pattern_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
-    for (shape_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
+    for (text_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
+    for (image_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
+    for (shading_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
+    for (pattern_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
+    for (shape_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
+
+    // A parent group may contain only nested transparency groups. Propagate
+    // descendant minima so its position in its own parent remains the true
+    // earliest `(paint_order, paint_phase)` in the whole subtree.
+    var pass: usize = 0;
+    while (pass < groups.items.len) : (pass += 1) {
+        var changed = false;
+        for (groups.items) |child| if (child.parent_id) |parent_id| {
+            const parent_idx = group_indices.get(parent_id) orelse continue;
+            const parent = &groups.items[parent_idx];
+            if (child.min_paint_order < parent.min_paint_order or
+                (child.min_paint_order == parent.min_paint_order and child.min_paint_phase < parent.min_paint_phase))
+            {
+                parent.min_paint_order = child.min_paint_order;
+                parent.min_paint_phase = child.min_paint_phase;
+                changed = true;
+            }
+        };
+        if (!changed) break;
+    }
 
     const owned_groups = try groups.toOwnedSlice(alloc);
     errdefer alloc.free(owned_groups);
+    for (owned_groups) |*group| if (group.parent_id) |parent_id| {
+        const parent_index = group_indices.get(parent_id) orelse continue;
+        if (parent_index == group_indices.get(group.id).?) return error.InvalidRenderGroup;
+        group.parent_index = parent_index;
+    };
+    const peak_canvas_count = try peakRenderCanvasCountAlloc(alloc, owned_groups);
     const schedules = try alloc.alloc(RenderSchedule, owned_groups.len + 1);
     errdefer alloc.free(schedules);
     for (schedules) |*schedule| schedule.* = .empty;
@@ -345,7 +436,7 @@ fn buildRenderPlanAlloc(
     };
     for (schedules) |schedule| std.mem.sort(RenderChoice, schedule.items, sort_context, RenderChoiceSortContext.lessThan);
     initialized_schedules = 0;
-    return .{ .groups = owned_groups, .schedules = schedules };
+    return .{ .groups = owned_groups, .schedules = schedules, .peak_canvas_count = peak_canvas_count };
 }
 
 fn renderChildGroupAlloc(
@@ -402,6 +493,83 @@ fn renderChoiceAlloc(
     }
 }
 
+const PixelRect = struct {
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+
+    fn full(width: usize, height: usize) PixelRect {
+        return .{ .x0 = 0, .y0 = 0, .x1 = width, .y1 = height };
+    }
+
+    fn empty(self: PixelRect) bool {
+        return self.x0 >= self.x1 or self.y0 >= self.y1;
+    }
+};
+
+fn boundsPixelRect(bounds: anytype, page_box: reader.PageBox, width: usize, height: usize, padding: f64) PixelRect {
+    return .{
+        .x0 = floorToCanvas(bounds.min_x - page_box.min_x - padding, width),
+        .x1 = ceilToCanvas(bounds.max_x - page_box.min_x + padding, width),
+        .y0 = floorToCanvas(page_box.max_y - bounds.max_y - padding, height),
+        .y1 = ceilToCanvas(page_box.max_y - bounds.min_y + padding, height),
+    };
+}
+
+fn patternRunBounds(run: reader.PatternRun) struct { min_x: f64, max_x: f64, min_y: f64, max_y: f64 } {
+    if (run.points.len == 0) return .{ .min_x = 0, .max_x = 0, .min_y = 0, .max_y = 0 };
+    var min_x = run.points[0][0];
+    var max_x = min_x;
+    var min_y = run.points[0][1];
+    var max_y = min_y;
+    for (run.points[1..]) |point| {
+        min_x = @min(min_x, point[0]);
+        max_x = @max(max_x, point[0]);
+        min_y = @min(min_y, point[1]);
+        max_y = @max(max_y, point[1]);
+    }
+    if (run.kind == .stroke) {
+        const radius = run.stroke_width / 2.0;
+        const padding = if (run.line_join == .miter) radius * @max(1.0, run.miter_limit) else radius;
+        min_x -= padding;
+        max_x += padding;
+        min_y -= padding;
+        max_y += padding;
+    }
+    return .{ .min_x = min_x, .max_x = max_x, .min_y = min_y, .max_y = max_y };
+}
+
+fn renderChoicePixelRect(
+    choice: RenderChoice,
+    width: usize,
+    height: usize,
+    page_box: reader.PageBox,
+    text_runs: []const reader.TextRun,
+    image_runs: []const reader.ImageRun,
+    pattern_runs: []const reader.PatternRun,
+    shape_runs: []const reader.ShapeRun,
+) PixelRect {
+    return switch (choice) {
+        .text => |idx| boundsPixelRect(textRunBounds(text_runs[idx]), page_box, width, height, @max(1.0, text_runs[idx].stroke_width)),
+        .image => |idx| boundsPixelRect(imageRunBounds(image_runs[idx]), page_box, width, height, 1.0),
+        // Shadings and nested transparency groups can affect the whole clip;
+        // retaining the full-page conservative region preserves semantics.
+        .shading, .group => PixelRect.full(width, height),
+        .pattern => |idx| boundsPixelRect(patternRunBounds(pattern_runs[idx]), page_box, width, height, 1.0),
+        .shape => |idx| boundsPixelRect(shapeRunBounds(shape_runs[idx]), page_box, width, height, 1.0),
+    };
+}
+
+fn copyCanvasRect(dst: []u8, src: []const u8, canvas_width: usize, rect: PixelRect) void {
+    var y = rect.y0;
+    while (y < rect.y1) : (y += 1) {
+        const start = (y * canvas_width + rect.x0) * 4;
+        const end = (y * canvas_width + rect.x1) * 4;
+        @memcpy(dst[start..end], src[start..end]);
+    }
+}
+
 fn renderGroupChildrenAlloc(
     alloc: Allocator,
     canvas: []u8,
@@ -419,13 +587,16 @@ fn renderGroupChildrenAlloc(
 ) anyerror!void {
     const backdrop = if (knockout) try alloc.dupe(u8, canvas) else null;
     defer if (backdrop) |buf| alloc.free(buf);
+    const scratch = if (knockout) try alloc.dupe(u8, canvas) else null;
+    defer if (scratch) |buf| alloc.free(buf);
 
     for (plan.schedules[schedule_index].items) |choice| {
         if (knockout) {
-            const scratch = try alloc.dupe(u8, backdrop orelse canvas);
-            defer alloc.free(scratch);
-            try renderChoiceAlloc(alloc, scratch, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice);
-            replaceCanvasWhereChanged(canvas, scratch, backdrop orelse canvas);
+            const rect = renderChoicePixelRect(choice, width, height, page_box, text_runs, image_runs, pattern_runs, shape_runs);
+            if (rect.empty()) continue;
+            copyCanvasRect(scratch.?, backdrop.?, width, rect);
+            try renderChoiceAlloc(alloc, scratch.?, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice);
+            replaceCanvasWhereChangedRect(canvas, scratch.?, backdrop.?, width, rect);
         } else {
             try renderChoiceAlloc(alloc, canvas, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice);
         }
@@ -451,8 +622,7 @@ fn renderPageContentRgbaInBoxAlloc(
 
     var plan = try buildRenderPlanAlloc(alloc, text_runs, image_runs, shading_runs, pattern_runs, shape_runs);
     defer plan.deinit(alloc);
-    const canvas_count = std.math.add(usize, plan.groups.len, 1) catch return error.RenderedPageTooLarge;
-    const planned_pixels = std.math.mul(usize, pixel_count, canvas_count) catch return error.RenderedPageTooLarge;
+    const planned_pixels = std.math.mul(usize, pixel_count, plan.peak_canvas_count) catch return error.RenderedPageTooLarge;
     if (planned_pixels > 200_000_000) return error.RenderedPageTooLarge;
 
     const rgba = try alloc.alloc(u8, rgba_len);
@@ -592,7 +762,7 @@ fn drawTextRun(
             switch (ch) {
                 ' ' => {},
                 '\n', '\r' => {},
-                else => drawAffineGlyphBox(rgba, width, height, margin, min_x, max_y, run, cursor, advance),
+                else => drawAffineFallbackGlyph(rgba, width, height, margin, min_x, max_y, run, ch, cursor, advance),
             }
             cursor += advance;
         }
@@ -604,7 +774,7 @@ fn drawTextRun(
         switch (cp) {
             ' ' => {},
             '\n', '\r' => {},
-            else => drawAffineGlyphBox(rgba, width, height, margin, min_x, max_y, run, cursor, advance),
+            else => drawAffineFallbackGlyph(rgba, width, height, margin, min_x, max_y, run, cp, cursor, advance),
         }
         cursor += advance;
     }
@@ -626,6 +796,10 @@ fn drawImageRun(canvas: []u8, canvas_w: usize, canvas_h: usize, margin: usize, m
     const y0 = floorToCanvas(margin_f + max_y - bounds.max_y, canvas_h);
     const y1 = ceilToCanvas(margin_f + max_y - bounds.min_y, canvas_h);
     const has_clip = run.clip_box != null or run.clip_points != null;
+    // PDF interpolation is opt-in. In particular, preserve hard sample
+    // boundaries for bilevel scans and line art when /Interpolate is absent
+    // or false, even when the image is minified.
+    const filtered = run.interpolate;
 
     var py = y0;
     while (py < y1) : (py += 1) {
@@ -640,14 +814,53 @@ fn drawImageRun(canvas: []u8, canvas_w: usize, canvas_h: usize, margin: usize, m
             const v = inv_b * dx + inv_d * dy;
             if (!finite(u) or !finite(v) or u < 0 or u > 1 or v < 0 or v > 1) continue;
 
-            const sx = @min(run.width - 1, @as(u32, @intFromFloat(@floor(u * @as(f64, @floatFromInt(run.width))))));
-            const sy = @min(run.height - 1, @as(u32, @intFromFloat(@floor((1.0 - v) * @as(f64, @floatFromInt(run.height))))));
-            const src = (@as(usize, sy) * @as(usize, run.width) + @as(usize, sx)) * 4;
             const dst = (py * canvas_w + px) * 4;
-            const alpha = @as(u8, @intCast((@as(u16, run.rgba[src + 3]) * @as(u16, run.alpha) + 127) / 255));
-            blendPixelMode(canvas, dst, .{ run.rgba[src + 0], run.rgba[src + 1], run.rgba[src + 2], alpha }, run.blend_mode);
+            var sample: [4]u8 = undefined;
+            if (filtered) {
+                sample = bilinearImageSample(run, u, 1.0 - v);
+            } else {
+                const sx = @min(run.width - 1, @as(u32, @intFromFloat(@floor(u * @as(f64, @floatFromInt(run.width))))));
+                const sy = @min(run.height - 1, @as(u32, @intFromFloat(@floor((1.0 - v) * @as(f64, @floatFromInt(run.height))))));
+                const src = (@as(usize, sy) * @as(usize, run.width) + @as(usize, sx)) * 4;
+                sample = .{ run.rgba[src], run.rgba[src + 1], run.rgba[src + 2], run.rgba[src + 3] };
+            }
+            sample[3] = @intCast((@as(u16, sample[3]) * @as(u16, run.alpha) + 127) / 255);
+            blendPixelMode(canvas, dst, sample, run.blend_mode);
         }
     }
+}
+
+fn bilinearImageSample(run: reader.ImageRun, u: f64, v: f64) [4]u8 {
+    const width_f: f64 = @floatFromInt(run.width);
+    const height_f: f64 = @floatFromInt(run.height);
+    const x = std.math.clamp(u * width_f - 0.5, 0.0, @max(0.0, width_f - 1.0));
+    const y = std.math.clamp(v * height_f - 0.5, 0.0, @max(0.0, height_f - 1.0));
+    const x0: u32 = @intFromFloat(@floor(x));
+    const y0: u32 = @intFromFloat(@floor(y));
+    const x1 = @min(run.width - 1, x0 + 1);
+    const y1 = @min(run.height - 1, y0 + 1);
+    const tx = x - @as(f64, @floatFromInt(x0));
+    const ty = y - @as(f64, @floatFromInt(y0));
+    const weights = [4]f64{ (1.0 - tx) * (1.0 - ty), tx * (1.0 - ty), (1.0 - tx) * ty, tx * ty };
+    const indices = [4]usize{
+        (@as(usize, y0) * @as(usize, run.width) + @as(usize, x0)) * 4,
+        (@as(usize, y0) * @as(usize, run.width) + @as(usize, x1)) * 4,
+        (@as(usize, y1) * @as(usize, run.width) + @as(usize, x0)) * 4,
+        (@as(usize, y1) * @as(usize, run.width) + @as(usize, x1)) * 4,
+    };
+    var alpha: f64 = 0;
+    for (weights, indices) |weight, index| alpha += weight * @as(f64, @floatFromInt(run.rgba[index + 3]));
+    var out: [4]u8 = .{ 0, 0, 0, @intFromFloat(@round(std.math.clamp(alpha, 0.0, 255.0))) };
+    if (alpha > 0.000001) {
+        for (0..3) |channel| {
+            var premultiplied: f64 = 0;
+            for (weights, indices) |weight, index| {
+                premultiplied += weight * @as(f64, @floatFromInt(run.rgba[index + channel])) * @as(f64, @floatFromInt(run.rgba[index + 3]));
+            }
+            out[channel] = @intFromFloat(@round(std.math.clamp(premultiplied / alpha, 0.0, 255.0)));
+        }
+    }
+    return out;
 }
 
 fn imageRunBounds(run: reader.ImageRun) struct { min_x: f64, max_x: f64, min_y: f64, max_y: f64 } {
@@ -681,8 +894,17 @@ fn drawShapeRun(canvas: []u8, canvas_w: usize, canvas_h: usize, min_x: f64, max_
         while (px < x1) : (px += 1) {
             const world_x = min_x + (@as(f64, @floatFromInt(px)) + 0.5);
             const world_y = max_y - (@as(f64, @floatFromInt(py)) + 0.5);
-            if (has_clip and !pointPassesClip(world_x, world_y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
+            if (has_clip and !run.antialias and !pointPassesClip(world_x, world_y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
             const dst = (py * canvas_w + px) * 4;
+            if (run.antialias) {
+                const coverage = shapeCoverage4x(px, py, min_x, max_y, run);
+                if (coverage > 0) {
+                    var color = run.color;
+                    color[3] = @intCast((@as(u16, color[3]) * coverage + 2) / 4);
+                    blendPixelMode(canvas, dst, color, run.blend_mode);
+                }
+                continue;
+            }
             if (run.kind == .fill) {
                 if (pointInShape(world_x, world_y, run)) {
                     blendPixelMode(canvas, dst, run.color, run.blend_mode);
@@ -694,6 +916,23 @@ fn drawShapeRun(canvas: []u8, canvas_w: usize, canvas_h: usize, min_x: f64, max_
             }
         }
     }
+}
+
+fn shapeCoverage4x(px: usize, py: usize, min_x: f64, max_y: f64, run: reader.ShapeRun) u16 {
+    const offsets = [2]f64{ 0.25, 0.75 };
+    var coverage: u16 = 0;
+    for (offsets) |oy| {
+        for (offsets) |ox| {
+            const x = min_x + @as(f64, @floatFromInt(px)) + ox;
+            const y = max_y - (@as(f64, @floatFromInt(py)) + oy);
+            if (run.clip_box != null or run.clip_points != null) {
+                if (!pointPassesClip(x, y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
+            }
+            const inside = if (run.kind == .fill) pointInShape(x, y, run) else pointInStrokeShape(x, y, run);
+            if (inside) coverage += 1;
+        }
+    }
+    return coverage;
 }
 
 fn drawShadingRun(canvas: []u8, canvas_w: usize, canvas_h: usize, min_x: f64, max_y: f64, run: reader.ShadingRun) void {
@@ -747,6 +986,7 @@ fn drawPatternRun(
         .clip_points = run.clip_points,
         .clip_fill_rule = run.clip_fill_rule,
         .points = run.points,
+        .subpath_starts = run.subpath_starts,
     });
     const x0 = floorToCanvas(bounds.min_x - min_x, canvas_w);
     const x1 = ceilToCanvas(bounds.max_x - min_x, canvas_w);
@@ -764,10 +1004,15 @@ fn drawPatternRun(
                 const world_y = max_y - (@as(f64, @floatFromInt(py)) + 0.5);
                 if (has_clip and !pointPassesClip(world_x, world_y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
                 const target_hit = if (run.kind == .fill)
-                    switch (run.fill_rule) {
-                        .even_odd => pointInPolygonEvenOdd(world_x, world_y, run.points),
-                        .nonzero => pointInPolygonNonZero(world_x, world_y, run.points),
-                    }
+                    pointInShape(world_x, world_y, .{
+                        .kind = .fill,
+                        .color = .{ 0, 0, 0, 0 },
+                        .stroke_width = 0,
+                        .closed = true,
+                        .fill_rule = run.fill_rule,
+                        .points = run.points,
+                        .subpath_starts = run.subpath_starts,
+                    })
                 else blk: {
                     const tmp: reader.ShapeRun = .{
                         .kind = .stroke,
@@ -790,6 +1035,7 @@ fn drawPatternRun(
                         .clip_points = run.clip_points,
                         .clip_fill_rule = run.clip_fill_rule,
                         .points = run.points,
+                        .subpath_starts = run.subpath_starts,
                     };
                     break :blk pointInStrokeShape(world_x, world_y, tmp);
                 };
@@ -823,10 +1069,15 @@ fn drawPatternRun(
             const world_y = max_y - (@as(f64, @floatFromInt(py)) + 0.5);
             if (has_clip and !pointPassesClip(world_x, world_y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
             const target_hit = if (run.kind == .fill)
-                switch (run.fill_rule) {
-                    .even_odd => pointInPolygonEvenOdd(world_x, world_y, run.points),
-                    .nonzero => pointInPolygonNonZero(world_x, world_y, run.points),
-                }
+                pointInShape(world_x, world_y, .{
+                    .kind = .fill,
+                    .color = .{ 0, 0, 0, 0 },
+                    .stroke_width = 0,
+                    .closed = true,
+                    .fill_rule = run.fill_rule,
+                    .points = run.points,
+                    .subpath_starts = run.subpath_starts,
+                })
             else blk: {
                 const tmp: reader.ShapeRun = .{
                     .kind = .stroke,
@@ -849,6 +1100,7 @@ fn drawPatternRun(
                     .clip_points = run.clip_points,
                     .clip_fill_rule = run.clip_fill_rule,
                     .points = run.points,
+                    .subpath_starts = run.subpath_starts,
                 };
                 break :blk pointInStrokeShape(world_x, world_y, tmp);
             };
@@ -985,6 +1237,22 @@ fn shapeRunBounds(run: reader.ShapeRun) struct { min_x: f64, max_x: f64, min_y: 
 }
 
 fn pointInShape(x: f64, y: f64, run: reader.ShapeRun) bool {
+    if (run.subpath_starts) |starts| {
+        if (run.fill_rule == .even_odd) {
+            var inside = false;
+            for (starts, 0..) |start, i| {
+                const end = if (i + 1 < starts.len) starts[i + 1] else run.points.len;
+                if (end > start + 2 and pointInPolygonEvenOdd(x, y, run.points[start..end])) inside = !inside;
+            }
+            return inside;
+        }
+        var winding: i32 = 0;
+        for (starts, 0..) |start, i| {
+            const end = if (i + 1 < starts.len) starts[i + 1] else run.points.len;
+            if (end > start + 2) winding += polygonWindingNumber(x, y, run.points[start..end]);
+        }
+        return winding != 0;
+    }
     return switch (run.fill_rule) {
         .even_odd => pointInPolygonEvenOdd(x, y, run.points),
         .nonzero => pointInPolygonNonZero(x, y, run.points),
@@ -1005,6 +1273,10 @@ fn pointInPolygonEvenOdd(x: f64, y: f64, points: []const [2]f64) bool {
 }
 
 fn pointInPolygonNonZero(x: f64, y: f64, points: []const [2]f64) bool {
+    return polygonWindingNumber(x, y, points) != 0;
+}
+
+fn polygonWindingNumber(x: f64, y: f64, points: []const [2]f64) i32 {
     var winding: i32 = 0;
     var j = points.len - 1;
     for (points, 0..) |point, i| {
@@ -1016,7 +1288,7 @@ fn pointInPolygonNonZero(x: f64, y: f64, points: []const [2]f64) bool {
         }
         j = i;
     }
-    return winding != 0;
+    return winding;
 }
 
 fn isLeft(a: [2]f64, b: [2]f64, x: f64, y: f64) f64 {
@@ -1039,6 +1311,21 @@ fn polygonEdgeDistance(x: f64, y: f64, points: []const [2]f64, closed: bool) f64
 }
 
 fn pointInStrokeShape(x: f64, y: f64, run: reader.ShapeRun) bool {
+    if (run.subpath_starts) |starts| {
+        for (starts, 0..) |start, i| {
+            const end = if (i + 1 < starts.len) starts[i + 1] else run.points.len;
+            if (end <= start + 1) continue;
+            var subpath = run;
+            subpath.points = run.points[start..end];
+            subpath.subpath_starts = null;
+            if (pointInStrokeShapeSingle(x, y, subpath)) return true;
+        }
+        return false;
+    }
+    return pointInStrokeShapeSingle(x, y, run);
+}
+
+fn pointInStrokeShapeSingle(x: f64, y: f64, run: reader.ShapeRun) bool {
     const radius = run.stroke_width / 2.0;
     if (strokeContainsPoint(x, y, run, radius)) return true;
 
@@ -1325,7 +1612,12 @@ fn drawScaledGlyphBox(
     }
 }
 
-fn drawAffineGlyphBox(
+/// Draws a bounded, allocation-free 5x7 glyph when an embedded outline cannot
+/// be admitted. The previous solid affine rectangle destroyed character
+/// identity precisely when a page hit its vector-work limit. This compact
+/// native fallback keeps dense numbers OCR-readable and follows the original
+/// text matrix, clipping, colors, alpha, blend mode, and render mode.
+fn drawAffineFallbackGlyph(
     rgba: []u8,
     width: usize,
     height: usize,
@@ -1333,6 +1625,7 @@ fn drawAffineGlyphBox(
     min_x: f64,
     max_y: f64,
     run: reader.TextRun,
+    codepoint: u21,
     local_x: f64,
     local_w: f64,
 ) void {
@@ -1385,40 +1678,125 @@ fn drawAffineGlyphBox(
             const dy = world_y - run.y;
             const lx = inv_a * dx + inv_c * dy;
             const ly = inv_b * dx + inv_d * dy;
-            if (lx < local_x or lx > local_x + local_w or ly < -descent or ly > ascent) continue;
-            if (glyphModeColor(run, local_x, local_w, lx, ly)) |color| {
+            if (lx < local_x or lx >= local_x + local_w or ly <= -descent or ly > ascent) continue;
+            if (fallbackGlyphModeColor(run, codepoint, local_x, local_w, lx, ly)) |color| {
                 blendPixelMode(rgba, (py * width + px) * 4, color, run.blend_mode);
             }
         }
     }
 }
 
-fn glyphModeColor(run: reader.TextRun, local_x: f64, local_w: f64, lx: f64, ly: f64) ?[4]u8 {
+fn fallbackGlyphModeColor(run: reader.TextRun, codepoint: u21, local_x: f64, local_w: f64, lx: f64, ly: f64) ?[4]u8 {
     const mode = @mod(run.render_mode, 8);
+    const filled = fallbackGlyphContains(run, codepoint, local_x, local_w, lx, ly);
     return switch (mode) {
-        0, 4 => colorWithAlpha(run.fill_color, run.alpha),
-        1, 5 => if (glyphPointIsStroke(run, local_x, local_w, lx, ly)) colorWithAlpha(run.stroke_color, run.stroke_alpha) else null,
-        2, 6 => if (glyphPointIsStroke(run, local_x, local_w, lx, ly)) colorWithAlpha(run.stroke_color, run.stroke_alpha) else colorWithAlpha(run.fill_color, run.alpha),
+        0, 4 => if (filled) colorWithAlpha(run.fill_color, run.alpha) else null,
+        1, 5 => if (fallbackGlyphStrokeContains(run, codepoint, local_x, local_w, lx, ly)) colorWithAlpha(run.stroke_color, run.stroke_alpha) else null,
+        2, 6 => if (fallbackGlyphStrokeContains(run, codepoint, local_x, local_w, lx, ly)) colorWithAlpha(run.stroke_color, run.stroke_alpha) else if (filled) colorWithAlpha(run.fill_color, run.alpha) else null,
         3, 7 => null,
-        else => colorWithAlpha(run.fill_color, run.alpha),
+        else => if (filled) colorWithAlpha(run.fill_color, run.alpha) else null,
     };
 }
 
-fn glyphPointIsStroke(run: reader.TextRun, local_x: f64, local_w: f64, lx: f64, ly: f64) bool {
+fn fallbackGlyphContains(run: reader.TextRun, codepoint: u21, local_x: f64, local_w: f64, lx: f64, ly: f64) bool {
     const ascent = effectiveRunAscent(run);
     const descent = effectiveRunDescent(run);
-    const usable_w = @max(1.0, local_w);
-    const usable_h = @max(1.0, ascent + descent);
+    const normalized_x = (lx - local_x) / local_w;
+    const normalized_y = (ascent - ly) / @max(0.000001, ascent + descent);
+    if (normalized_x < 0 or normalized_x >= 1 or normalized_y < 0 or normalized_y >= 1) return false;
+    const column: u3 = @intFromFloat(@min(4.0, @floor(normalized_x * 5.0)));
+    const row: u3 = @intFromFloat(@min(6.0, @floor(normalized_y * 7.0)));
+    return fallbackGlyphRow(codepoint, row) & (@as(u5, 0b10000) >> column) != 0;
+}
+
+fn fallbackGlyphStrokeContains(run: reader.TextRun, codepoint: u21, local_x: f64, local_w: f64, lx: f64, ly: f64) bool {
+    const ascent = effectiveRunAscent(run);
+    const descent = effectiveRunDescent(run);
+    const glyph_h = @max(0.000001, ascent + descent);
     const basis_x = @sqrt(run.a * run.a + run.b * run.b);
     const basis_y = @sqrt(run.c * run.c + run.d * run.d);
     const avg_scale = @max(0.000001, (basis_x + basis_y) / 2.0);
-    const stroke_from_width = run.stroke_width / avg_scale;
-    const stroke = std.math.clamp(@max(stroke_from_width, @min(usable_w, usable_h) * 0.12), 0.5, @min(usable_w, usable_h) / 2.0);
-    const left = lx - local_x;
-    const right = local_x + local_w - lx;
-    const bottom = ly + descent;
-    const top = ascent - ly;
-    return left <= stroke or right <= stroke or bottom <= stroke or top <= stroke;
+    const stroke = @max(run.stroke_width / avg_scale, @min(local_w / 5.0, glyph_h / 7.0) * 0.35);
+    if (!fallbackGlyphContains(run, codepoint, local_x, local_w, lx, ly)) {
+        return fallbackGlyphContains(run, codepoint, local_x, local_w, lx - stroke, ly) or
+            fallbackGlyphContains(run, codepoint, local_x, local_w, lx + stroke, ly) or
+            fallbackGlyphContains(run, codepoint, local_x, local_w, lx, ly - stroke) or
+            fallbackGlyphContains(run, codepoint, local_x, local_w, lx, ly + stroke);
+    }
+    return !fallbackGlyphContains(run, codepoint, local_x, local_w, lx - stroke, ly) or
+        !fallbackGlyphContains(run, codepoint, local_x, local_w, lx + stroke, ly) or
+        !fallbackGlyphContains(run, codepoint, local_x, local_w, lx, ly - stroke) or
+        !fallbackGlyphContains(run, codepoint, local_x, local_w, lx, ly + stroke);
+}
+
+fn fallbackGlyphRow(codepoint: u21, row: u3) u5 {
+    const cp: u21 = if (codepoint >= 'a' and codepoint <= 'z') codepoint - ('a' - 'A') else codepoint;
+    const rows: [7]u5 = switch (cp) {
+        '0' => .{ 0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110 },
+        '1' => .{ 0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110 },
+        '2' => .{ 0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111 },
+        '3' => .{ 0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110 },
+        '4' => .{ 0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010 },
+        '5' => .{ 0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110 },
+        '6' => .{ 0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110 },
+        '7' => .{ 0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000 },
+        '8' => .{ 0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110 },
+        '9' => .{ 0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110 },
+        'A' => .{ 0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001 },
+        'B' => .{ 0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110 },
+        'C' => .{ 0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111 },
+        'D' => .{ 0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110 },
+        'E' => .{ 0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111 },
+        'F' => .{ 0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000 },
+        'G' => .{ 0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111 },
+        'H' => .{ 0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001 },
+        'I' => .{ 0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110 },
+        'J' => .{ 0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100 },
+        'K' => .{ 0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001 },
+        'L' => .{ 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111 },
+        'M' => .{ 0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001 },
+        'N' => .{ 0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001 },
+        'O' => .{ 0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110 },
+        'P' => .{ 0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000 },
+        'Q' => .{ 0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101 },
+        'R' => .{ 0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001 },
+        'S' => .{ 0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110 },
+        'T' => .{ 0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100 },
+        'U' => .{ 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110 },
+        'V' => .{ 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100 },
+        'W' => .{ 0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010 },
+        'X' => .{ 0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001 },
+        'Y' => .{ 0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100 },
+        'Z' => .{ 0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111 },
+        '.' => .{ 0, 0, 0, 0, 0, 0b00110, 0b00110 },
+        ',' => .{ 0, 0, 0, 0, 0b00110, 0b00110, 0b00100 },
+        ':' => .{ 0, 0b00110, 0b00110, 0, 0b00110, 0b00110, 0 },
+        ';' => .{ 0, 0b00110, 0b00110, 0, 0b00110, 0b00110, 0b00100 },
+        '-' => .{ 0, 0, 0, 0b11111, 0, 0, 0 },
+        '_' => .{ 0, 0, 0, 0, 0, 0, 0b11111 },
+        '=' => .{ 0, 0, 0b11111, 0, 0b11111, 0, 0 },
+        '+' => .{ 0, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0 },
+        '/' => .{ 0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000 },
+        '\\' => .{ 0b10000, 0b01000, 0b01000, 0b00100, 0b00010, 0b00010, 0b00001 },
+        '(' => .{ 0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010 },
+        ')' => .{ 0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000 },
+        '[' => .{ 0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110 },
+        ']' => .{ 0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110 },
+        '<' => .{ 0b00010, 0b00100, 0b01000, 0b10000, 0b01000, 0b00100, 0b00010 },
+        '>' => .{ 0b01000, 0b00100, 0b00010, 0b00001, 0b00010, 0b00100, 0b01000 },
+        '!' => .{ 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0, 0b00100 },
+        '?' => .{ 0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0, 0b00100 },
+        '\'' => .{ 0b00100, 0b00100, 0b00010, 0, 0, 0, 0 },
+        '"' => .{ 0b01010, 0b01010, 0b00100, 0, 0, 0, 0 },
+        '#' => .{ 0b01010, 0b11111, 0b01010, 0b01010, 0b11111, 0b01010, 0 },
+        '&' => .{ 0b01100, 0b10010, 0b10100, 0b01000, 0b10101, 0b10010, 0b01101 },
+        '*' => .{ 0, 0b10101, 0b01110, 0b11111, 0b01110, 0b10101, 0 },
+        '|' => .{ 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100 },
+        '$' => .{ 0b00100, 0b01111, 0b10100, 0b01110, 0b00101, 0b11110, 0b00100 },
+        '%' => .{ 0b11001, 0b11010, 0b00100, 0b01000, 0b10110, 0b00110, 0 },
+        else => .{ 0b11111, 0b10001, 0b00010, 0b00100, 0b00000, 0b00100, 0b00100 },
+    };
+    return rows[row];
 }
 
 fn blendChannel(mode: reader.BlendMode, src: u8, dst: u8) u8 {
@@ -1490,18 +1868,36 @@ fn clearCanvasWhereOpaque(canvas: []u8, mask: []const u8) void {
     }
 }
 
-fn replaceCanvasWhereChanged(canvas: []u8, next: []const u8, backdrop: []const u8) void {
-    var i: usize = 0;
-    while (i + 3 < next.len) : (i += 4) {
-        if (next[i + 0] == backdrop[i + 0] and
-            next[i + 1] == backdrop[i + 1] and
-            next[i + 2] == backdrop[i + 2] and
-            next[i + 3] == backdrop[i + 3]) continue;
-        canvas[i + 0] = next[i + 0];
-        canvas[i + 1] = next[i + 1];
-        canvas[i + 2] = next[i + 2];
-        canvas[i + 3] = next[i + 3];
+fn replaceCanvasWhereChangedRect(canvas: []u8, next: []const u8, backdrop: []const u8, canvas_width: usize, rect: PixelRect) void {
+    var y = rect.y0;
+    while (y < rect.y1) : (y += 1) {
+        var i = (y * canvas_width + rect.x0) * 4;
+        const end = (y * canvas_width + rect.x1) * 4;
+        while (i < end) : (i += 4) {
+            if (next[i + 0] == backdrop[i + 0] and
+                next[i + 1] == backdrop[i + 1] and
+                next[i + 2] == backdrop[i + 2] and
+                next[i + 3] == backdrop[i + 3]) continue;
+            canvas[i + 0] = next[i + 0];
+            canvas[i + 1] = next[i + 1];
+            canvas[i + 2] = next[i + 2];
+            canvas[i + 3] = next[i + 3];
+        }
     }
+}
+
+test "knockout dirty replacement never scans or mutates outside its bounds" {
+    var backdrop = [_]u8{0} ** (4 * 4 * 4);
+    var canvas = backdrop;
+    var next = backdrop;
+    next[0] = 99;
+    const inside = (1 * 4 + 1) * 4;
+    next[inside] = 42;
+    next[inside + 3] = 255;
+    replaceCanvasWhereChangedRect(&canvas, &next, &backdrop, 4, .{ .x0 = 1, .y0 = 1, .x1 = 2, .y1 = 2 });
+    try std.testing.expectEqual(@as(u8, 0), canvas[0]);
+    try std.testing.expectEqual(@as(u8, 42), canvas[inside]);
+    try std.testing.expectEqual(@as(u8, 255), canvas[inside + 3]);
 }
 
 fn colorWithAlpha(color: [4]u8, alpha: u8) [4]u8 {
@@ -1537,18 +1933,20 @@ test "render plan preserves paint order ties and nested group schedules" {
     const alloc = std.testing.allocator;
     const text_runs = [_]reader.TextRun{
         .{ .text = "root", .x = 0, .y = 0, .font_size = 12, .paint_order = 4 },
-        .{ .text = "child", .x = 0, .y = 0, .font_size = 12, .paint_order = 6, .group_id = 1 },
-        .{ .text = "nested", .x = 0, .y = 0, .font_size = 12, .paint_order = 8, .group_id = 2, .group_parent_id = 1 },
+        .{ .text = "child", .x = 0, .y = 0, .font_size = 12, .paint_order = 6, .group_id = 1, .group_knockout = true },
+        .{ .text = "nested", .x = 0, .y = 0, .font_size = 12, .paint_order = 8, .group_id = 2, .group_parent_id = 1, .group_knockout = true },
     };
     const shape_runs = [_]reader.ShapeRun{
         .{ .kind = .fill, .paint_order = 4, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
-        .{ .kind = .fill, .paint_order = 7, .group_id = 1, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
+        .{ .kind = .fill, .paint_order = 7, .group_id = 1, .group_knockout = true, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
     };
 
     var plan = try buildRenderPlanAlloc(alloc, &text_runs, &.{}, &.{}, &.{}, &shape_runs);
     defer plan.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), plan.groups.len);
+    // Page + one child/backdrop/scratch trio for each active knockout group.
+    try std.testing.expectEqual(@as(usize, 7), plan.peak_canvas_count);
     try std.testing.expectEqual(@as(usize, 3), plan.schedules[0].items.len);
     try std.testing.expect(plan.schedules[0].items[0] == .text);
     try std.testing.expect(plan.schedules[0].items[1] == .shape);
@@ -1563,6 +1961,23 @@ test "render plan preserves paint order ties and nested group schedules" {
     try std.testing.expect(child_schedule[0] == .text);
     try std.testing.expect(child_schedule[1] == .shape);
     try std.testing.expect(child_schedule[2] == .group);
+}
+
+test "render plan schedules transparency groups by earliest paint phase" {
+    const alloc = std.testing.allocator;
+    const shape_runs = [_]reader.ShapeRun{
+        .{ .kind = .fill, .paint_order = 10, .paint_phase = 4, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
+        .{ .kind = .fill, .paint_order = 10, .paint_phase = 8, .group_id = 7, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
+        .{ .kind = .fill, .paint_order = 10, .paint_phase = 12, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
+    };
+    var plan = try buildRenderPlanAlloc(alloc, &.{}, &.{}, &.{}, &.{}, &shape_runs);
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), plan.schedules[0].items.len);
+    try std.testing.expect(plan.schedules[0].items[0] == .shape);
+    try std.testing.expect(plan.schedules[0].items[1] == .group);
+    try std.testing.expect(plan.schedules[0].items[2] == .shape);
+    try std.testing.expectEqual(@as(usize, 8), plan.groups[0].min_paint_phase);
 }
 
 test "render plan schedules a large page exactly once per choice" {
@@ -2259,10 +2674,13 @@ test "draw text run stroke-only mode leaves interior white" {
         .d = 1,
         .render_mode = 1,
     });
-    const edge = ((4 * 32) + 8) * 4;
-    const interior = ((4 * 32) + 10) * 4;
-    try std.testing.expectEqual(@as(u8, 0), canvas[edge + 0]);
-    try std.testing.expectEqual(@as(u8, 0xff), canvas[interior + 0]);
+    var black: usize = 0;
+    var white: usize = 0;
+    for (canvas[0..], 0..) |channel, i| if (@mod(i, 4) == 0) {
+        if (channel == 0) black += 1 else if (channel == 0xff) white += 1;
+    };
+    try std.testing.expect(black > 0);
+    try std.testing.expect(white > black);
 }
 
 test "draw text run stroke-only mode uses stroke color" {
@@ -2283,10 +2701,12 @@ test "draw text run stroke-only mode uses stroke color" {
         .render_mode = 1,
         .stroke_color = .{ 0x00, 0x00, 0xff, 0xff },
     });
-    const edge = ((4 * 32) + 8) * 4;
-    try std.testing.expectEqual(@as(u8, 0x00), canvas[edge + 0]);
-    try std.testing.expectEqual(@as(u8, 0x00), canvas[edge + 1]);
-    try std.testing.expectEqual(@as(u8, 0xff), canvas[edge + 2]);
+    var found_blue = false;
+    for (0..canvas.len / 4) |i| {
+        const px = i * 4;
+        if (canvas[px] == 0 and canvas[px + 1] == 0 and canvas[px + 2] == 0xff) found_blue = true;
+    }
+    try std.testing.expect(found_blue);
 }
 
 test "draw text run fill-stroke mode still fills interior" {
@@ -2329,14 +2749,15 @@ test "draw text run fill-stroke mode uses fill and stroke colors" {
         .fill_color = .{ 0xff, 0x00, 0x00, 0xff },
         .stroke_color = .{ 0x00, 0x00, 0xff, 0xff },
     });
-    const edge = ((4 * 32) + 8) * 4;
-    const interior = ((4 * 32) + 10) * 4;
-    try std.testing.expectEqual(@as(u8, 0x00), canvas[edge + 0]);
-    try std.testing.expectEqual(@as(u8, 0x00), canvas[edge + 1]);
-    try std.testing.expectEqual(@as(u8, 0xff), canvas[edge + 2]);
-    try std.testing.expectEqual(@as(u8, 0xff), canvas[interior + 0]);
-    try std.testing.expectEqual(@as(u8, 0x00), canvas[interior + 1]);
-    try std.testing.expectEqual(@as(u8, 0x00), canvas[interior + 2]);
+    var found_blue = false;
+    var found_red = false;
+    for (0..canvas.len / 4) |i| {
+        const px = i * 4;
+        if (canvas[px] == 0 and canvas[px + 1] == 0 and canvas[px + 2] == 0xff) found_blue = true;
+        if (canvas[px] == 0xff and canvas[px + 1] == 0 and canvas[px + 2] == 0) found_red = true;
+    }
+    try std.testing.expect(found_blue);
+    try std.testing.expect(found_red);
 }
 
 test "draw text run stroke-only mode uses stroke alpha" {
@@ -2357,9 +2778,11 @@ test "draw text run stroke-only mode uses stroke alpha" {
         .render_mode = 1,
         .stroke_alpha = 0x80,
     });
-    const edge = ((4 * 32) + 8) * 4;
-    try std.testing.expect(canvas[edge + 0] > 0);
-    try std.testing.expect(canvas[edge + 0] < 0xff);
+    var found_translucent_stroke = false;
+    for (canvas[0..], 0..) |channel, i| if (@mod(i, 4) == 0 and channel > 0 and channel < 0xff) {
+        found_translucent_stroke = true;
+    };
+    try std.testing.expect(found_translucent_stroke);
 }
 
 test "draw text run stroke width changes outline thickness" {
@@ -2367,13 +2790,13 @@ test "draw text run stroke width changes outline thickness" {
     const text = try alloc.dupe(u8, "I");
     defer alloc.free(text);
 
-    var thin: [32 * 32 * 4]u8 = undefined;
+    var thin: [64 * 64 * 4]u8 = undefined;
     @memset(&thin, 0xff);
-    drawTextRun(&thin, 32, 32, 0, 0, 32, .{
+    drawTextRun(&thin, 64, 64, 0, 0, 64, .{
         .text = text,
-        .x = 8,
-        .y = 24,
-        .font_size = 8,
+        .x = 12,
+        .y = 52,
+        .font_size = 28,
         .a = 1,
         .b = 0,
         .c = 0,
@@ -2382,24 +2805,51 @@ test "draw text run stroke width changes outline thickness" {
         .stroke_width = 1,
     });
 
-    var thick: [32 * 32 * 4]u8 = undefined;
+    var thick: [64 * 64 * 4]u8 = undefined;
     @memset(&thick, 0xff);
-    drawTextRun(&thick, 32, 32, 0, 0, 32, .{
+    drawTextRun(&thick, 64, 64, 0, 0, 64, .{
         .text = text,
-        .x = 8,
-        .y = 24,
-        .font_size = 8,
+        .x = 12,
+        .y = 52,
+        .font_size = 28,
         .a = 1,
         .b = 0,
         .c = 0,
         .d = 1,
         .render_mode = 1,
-        .stroke_width = 3,
+        .stroke_width = 5,
     });
 
-    const near_interior = ((4 * 32) + 9) * 4;
-    try std.testing.expectEqual(@as(u8, 0xff), thin[near_interior + 0]);
-    try std.testing.expectEqual(@as(u8, 0x00), thick[near_interior + 0]);
+    var thin_pixels: usize = 0;
+    var thick_pixels: usize = 0;
+    for (thin[0..], thick[0..], 0..) |thin_channel, thick_channel, i| if (@mod(i, 4) == 0) {
+        if (thin_channel != 0xff) thin_pixels += 1;
+        if (thick_channel != 0xff) thick_pixels += 1;
+    };
+    try std.testing.expect(thick_pixels > thin_pixels);
+}
+
+test "fallback glyphs preserve numeric character identity" {
+    try std.testing.expect(fallbackGlyphRow('1', 0) != fallbackGlyphRow('8', 0));
+    try std.testing.expect(fallbackGlyphRow('1', 3) != fallbackGlyphRow('8', 3));
+
+    var canvas: [48 * 24 * 4]u8 = undefined;
+    @memset(&canvas, 0xff);
+    drawTextRun(&canvas, 48, 24, 0, 0, 24, .{
+        .text = @constCast("18"),
+        .x = 4,
+        .y = 20,
+        .font_size = 14,
+        .a = 1,
+        .b = 0,
+        .c = 0,
+        .d = 1,
+    });
+    var changed: usize = 0;
+    for (canvas[0..], 0..) |channel, i| if (@mod(i, 4) == 0 and channel != 0xff) {
+        changed += 1;
+    };
+    try std.testing.expect(changed > 10);
 }
 
 test "draw text run invisible mode skips rendering" {
@@ -2461,6 +2911,40 @@ test "draw image run respects polygon clip" {
     const outside = ((10 * 16) + 8) * 4;
     try std.testing.expectEqual(@as(u8, 0), canvas[inside]);
     try std.testing.expectEqual(@as(u8, 0xff), canvas[outside]);
+}
+
+test "image minification honors explicit interpolation policy" {
+    var rgba = [_]u8{
+        0xff, 0x00, 0x00, 0xff,
+        0x00, 0x00, 0xff, 0xff,
+    };
+    const base: reader.ImageRun = .{
+        .rgba = &rgba,
+        .width = 2,
+        .height = 1,
+        .a = 1,
+        .b = 0,
+        .c = 0,
+        .d = 1,
+        .e = 0,
+        .f = 0,
+        .x = 0,
+        .y = 0,
+        .draw_width = 1,
+        .draw_height = 1,
+    };
+
+    var nearest = [_]u8{0xff} ** 4;
+    drawImageRun(&nearest, 1, 1, 0, 0, 1, base);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0xff, 0xff }, &nearest);
+
+    var filtered = [_]u8{0xff} ** 4;
+    var interpolated = base;
+    interpolated.interpolate = true;
+    drawImageRun(&filtered, 1, 1, 0, 0, 1, interpolated);
+    try std.testing.expect(filtered[0] > 0 and filtered[2] > 0);
+    try std.testing.expectEqual(@as(u8, 0), filtered[1]);
+    try std.testing.expectEqual(@as(u8, 0xff), filtered[3]);
 }
 
 test "draw shape run round cap paints endpoint beyond segment" {
@@ -2660,4 +3144,54 @@ test "draw pattern run recolors uncolored cell content" {
     const green_px = ((2 * 4) + 1) * 4;
     try std.testing.expectEqual(@as(u8, 0x00), canvas[green_px + 0]);
     try std.testing.expect(canvas[green_px + 1] > 0x80);
+}
+
+test "nonzero glyph paths preserve counter contours" {
+    var points = [_][2]f64{
+        .{ 0, 0 }, .{ 10, 0 }, .{ 10, 10 }, .{ 0, 10 },
+        .{ 3, 3 }, .{ 3, 7 },  .{ 7, 7 },   .{ 7, 3 },
+    };
+    var starts = [_]usize{ 0, 4 };
+    const run: reader.ShapeRun = .{
+        .kind = .fill,
+        .color = .{ 0, 0, 0, 255 },
+        .stroke_width = 0,
+        .closed = true,
+        .points = &points,
+        .subpath_starts = &starts,
+    };
+    try std.testing.expect(pointInShape(1, 1, run));
+    try std.testing.expect(!pointInShape(5, 5, run));
+}
+
+test "render plan preserves text fill before stroke across backing kinds" {
+    var points = [_][2]f64{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 } };
+    const patterns = [_]reader.PatternRun{.{
+        .kind = .stroke,
+        .paint_order = 4,
+        .paint_phase = 1,
+        .points = &points,
+        .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
+        .pattern_x_step = 1,
+        .pattern_y_step = 1,
+    }};
+    const shapes = [_]reader.ShapeRun{.{
+        .kind = .fill,
+        .paint_order = 4,
+        .paint_phase = 0,
+        .color = .{ 0, 0, 0, 255 },
+        .stroke_width = 0,
+        .closed = true,
+        .points = &points,
+    }};
+    const context = RenderChoiceSortContext{
+        .text_runs = &.{},
+        .image_runs = &.{},
+        .shading_runs = &.{},
+        .pattern_runs = &patterns,
+        .shape_runs = &shapes,
+        .groups = &.{},
+    };
+    try std.testing.expect(context.lessThan(.{ .shape = 0 }, .{ .pattern = 0 }));
+    try std.testing.expect(!context.lessThan(.{ .pattern = 0 }, .{ .shape = 0 }));
 }

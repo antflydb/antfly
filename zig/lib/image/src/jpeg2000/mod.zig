@@ -46,6 +46,7 @@ pub const decodeHeader = decode.decodeHeader;
 pub const decodeHeaderBytes = decode.decodeHeaderBytes;
 pub const decodeU8 = decode.decodeU8;
 pub const decodeU8Bytes = decode.decodeU8Bytes;
+pub const decodeU8BytesAtResolution = decode.decodeU8BytesAtResolution;
 pub const decodeU16Bytes = decode.decodeU16Bytes;
 pub const nativeDecodeSupport = decode.nativeDecodeSupport;
 pub const nativeDecodeSupportBytes = decode.nativeDecodeSupportBytes;
