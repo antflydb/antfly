@@ -15248,6 +15248,8 @@ const RemoteMetadataSource = struct {
     // concurrent authoritative readers may supersede one another, while a
     // mutation must reject every snapshot whose I/O began before it.
     snapshot_invalidation_generation: u64 = 0,
+    next_snapshot_fetch_sequence: u64 = 0,
+    published_snapshot_fetch_sequence: u64 = 0,
     next_linearizable_snapshot_sequence: u64 = 0,
     published_linearizable_snapshot_sequence: u64 = 0,
     linearizable_snapshot_unsupported_until_ns: []u64,
@@ -15376,9 +15378,20 @@ const RemoteMetadataSource = struct {
         sequence: u64,
     };
 
+    const SnapshotFetchTicket = struct {
+        fence_generation: u64,
+        sequence: u64,
+    };
+
     const LinearizableSnapshotAcceptance = enum {
         published,
         superseded,
+    };
+
+    const NormalSnapshotFreshness = enum {
+        older,
+        equal_or_unknown,
+        newer,
     };
 
     fn beginLinearizableSnapshot(self: *RemoteMetadataSource) LinearizableSnapshotTicket {
@@ -15388,6 +15401,20 @@ const RemoteMetadataSource = struct {
         return .{
             .invalidation_generation = self.snapshot_invalidation_generation,
             .sequence = self.next_linearizable_snapshot_sequence,
+        };
+    }
+
+    fn beginSnapshotFetch(self: *RemoteMetadataSource) SnapshotFetchTicket {
+        lockAtomic(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        return self.beginSnapshotFetchLocked();
+    }
+
+    fn beginSnapshotFetchLocked(self: *RemoteMetadataSource) SnapshotFetchTicket {
+        self.next_snapshot_fetch_sequence +%= 1;
+        return .{
+            .fence_generation = self.snapshot_fence_generation,
+            .sequence = self.next_snapshot_fetch_sequence,
         };
     }
 
@@ -15425,6 +15452,25 @@ const RemoteMetadataSource = struct {
             .metadata_incarnation = snapshot.status.metadata_incarnation,
             .metadata_epoch = snapshot.status.metadata_epoch,
         };
+    }
+
+    fn normalSnapshotFreshness(
+        cached: *const antfly.metadata_api.AdminSnapshot,
+        fresh: *const antfly.metadata_api.AdminSnapshot,
+    ) NormalSnapshotFreshness {
+        if (!sameMetadataIncarnation(snapshotHead(cached), snapshotHead(fresh))) return .equal_or_unknown;
+        const cached_index = cached.projection_raft_applied_index;
+        const fresh_index = fresh.projection_raft_applied_index;
+        if (cached_index != 0 and fresh_index != 0) {
+            if (fresh_index < cached_index) return .older;
+            if (fresh_index > cached_index) return .newer;
+            return .equal_or_unknown;
+        }
+        const cached_epoch = cached.status.metadata_epoch;
+        const fresh_epoch = fresh.status.metadata_epoch;
+        if (fresh_epoch < cached_epoch) return .older;
+        if (fresh_epoch > cached_epoch) return .newer;
+        return .equal_or_unknown;
     }
 
     fn requireValidMetadataIncarnation(
@@ -15596,7 +15642,6 @@ const RemoteMetadataSource = struct {
         try ensureBudgetActive(budget);
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         lockAtomic(&self.cache_mutex);
-        const observed_fence_generation = self.snapshot_fence_generation;
         if (self.cached_snapshot) |snapshot| {
             const cached_snapshot_head = snapshotHead(&snapshot);
             if (self.cached_head != null and
@@ -15608,33 +15653,43 @@ const RemoteMetadataSource = struct {
                 return try cloneAdminSnapshotOwned(self.alloc, snapshot);
             }
         }
+        const ticket = self.beginSnapshotFetchLocked();
         self.cache_mutex.unlock();
 
-        var fresh = try self.fetchSnapshotRemoteWithBudget(head, budget);
+        const fresh = try self.fetchSnapshotRemoteWithBudget(head, budget);
+        return try self.acceptFetchedSnapshot(fresh, head, ticket);
+    }
+
+    fn acceptFetchedSnapshot(
+        self: *RemoteMetadataSource,
+        candidate: antfly.metadata_api.AdminSnapshot,
+        head: antfly.metadata_api.MetadataHead,
+        ticket: SnapshotFetchTicket,
+    ) !antfly.metadata_api.AdminSnapshot {
+        var fresh = candidate;
         var fresh_owned = true;
         defer if (fresh_owned) freeAdminSnapshotOwned(self.alloc, &fresh);
-        const fresh_head = snapshotHead(&fresh);
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
 
         lockAtomic(&self.cache_mutex);
         defer self.cache_mutex.unlock();
-        // A fenced snapshot or mutation invalidation completed during I/O.
-        // Never let the older in-flight request overwrite that transition.
-        if (self.snapshot_fence_generation != observed_fence_generation) {
+        if (self.snapshot_fence_generation != ticket.fence_generation) {
             if (self.cached_snapshot) |snapshot| return try cloneAdminSnapshotOwned(self.alloc, snapshot);
             return error.MetadataSnapshotHeadMismatch;
         }
         if (self.cached_head) |current_head| {
             if (!std.meta.eql(current_head, head)) return error.MetadataSnapshotHeadMismatch;
         }
+        var freshness: NormalSnapshotFreshness = .equal_or_unknown;
         if (self.cached_snapshot) |snapshot| {
-            const cached_snapshot_head = snapshotHead(&snapshot);
-            // Concurrent follower reads may complete after a leader read.
-            // Never let that race regress the process-wide catalog view.
-            if (sameMetadataIncarnation(cached_snapshot_head, fresh_head) and
-                cached_snapshot_head.metadata_epoch > fresh_head.metadata_epoch)
-            {
+            freshness = normalSnapshotFreshness(&snapshot, &fresh);
+            if (freshness == .older) {
                 return try cloneAdminSnapshotOwned(self.alloc, snapshot);
             }
+        }
+        if (freshness != .newer and ticket.sequence < self.published_snapshot_fetch_sequence) {
+            if (self.cached_snapshot) |snapshot| return try cloneAdminSnapshotOwned(self.alloc, snapshot);
+            return error.MetadataSnapshotHeadMismatch;
         }
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         self.cached_snapshot = fresh;
@@ -15642,6 +15697,7 @@ const RemoteMetadataSource = struct {
         self.cached_head = head;
         self.cached_head_at_ms = now_ms;
         self.cached_snapshot_at_ms = now_ms;
+        self.published_snapshot_fetch_sequence = @max(self.published_snapshot_fetch_sequence, ticket.sequence);
         return try cloneAdminSnapshotOwned(self.alloc, self.cached_snapshot.?);
     }
 
@@ -16416,6 +16472,7 @@ fn remoteGroupReadyForTableLifecycle(
 fn cloneAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: antfly.metadata_api.AdminSnapshot) !antfly.metadata_api.AdminSnapshot {
     var owned: antfly.metadata_api.AdminSnapshot = .{
         .status = try cloneMetadataStatusOwned(alloc, snapshot.status),
+        .projection_raft_applied_index = snapshot.projection_raft_applied_index,
         .reallocation_request = snapshot.reallocation_request,
         .tables = &.{},
         .ranges = &.{},
@@ -30608,6 +30665,377 @@ test "remote metadata source retains mutation authority across cache invalidatio
     source.noteMetadataReadSuccess(1);
     try std.testing.expectEqual(@as(usize, 2), source.metadataApiIndexForAttempt(0));
     try std.testing.expectEqual(@as(usize, 1), source.metadataReadApiIndexForAttempt(0));
+}
+
+fn remoteMetadataSnapshotForTest(
+    alloc: std.mem.Allocator,
+    incarnation: antfly.metadata_api.MetadataClusterIncarnation,
+    epoch: u64,
+    commit_index: u64,
+    applied_index: u64,
+    tables: []const antfly.metadata.table_manager.TableRecord,
+) !antfly.metadata_api.AdminSnapshot {
+    return try cloneAdminSnapshotOwned(alloc, .{
+        .status = .{
+            .metadata_group_id = 9,
+            .metadata_incarnation = incarnation,
+            .metadata_epoch = epoch,
+            .metadata_raft_commit_index = commit_index,
+            .metrics = .{},
+        },
+        .projection_raft_applied_index = applied_index,
+        .tables = @constCast(tables),
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    });
+}
+
+test "remote metadata source accepts a fresh snapshot after metadata process restart" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const head = antfly.metadata_api.MetadataHead{
+        .metadata_group_id = 9,
+        .metadata_incarnation = incarnation,
+        .metadata_epoch = 77,
+    };
+    source.cached_head = head;
+    source.cached_snapshot = try remoteMetadataSnapshotForTest(
+        std.testing.allocator,
+        incarnation,
+        20_000,
+        100,
+        100,
+        &.{.{ .table_id = 1, .name = "existing" }},
+    );
+
+    const fresh = try remoteMetadataSnapshotForTest(
+        std.testing.allocator,
+        incarnation,
+        10,
+        101,
+        101,
+        &.{
+            .{ .table_id = 1, .name = "existing" },
+            .{ .table_id = 2, .name = "after-restart" },
+        },
+    );
+    var accepted = try source.acceptFetchedSnapshot(fresh, head, source.beginSnapshotFetch());
+    defer freeAdminSnapshotOwned(std.testing.allocator, &accepted);
+
+    try std.testing.expectEqual(@as(u64, 10), accepted.status.metadata_epoch);
+    try std.testing.expectEqual(@as(usize, 2), accepted.tables.len);
+    try std.testing.expectEqualStrings("after-restart", accepted.tables[1].name);
+}
+
+test "remote metadata source rejects a superseded normal snapshot fetch" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const head = antfly.metadata_api.MetadataHead{
+        .metadata_group_id = 9,
+        .metadata_incarnation = incarnation,
+        .metadata_epoch = 77,
+    };
+    source.cached_head = head;
+    const older_ticket = source.beginSnapshotFetch();
+    const newer_ticket = source.beginSnapshotFetch();
+
+    const newer = try remoteMetadataSnapshotForTest(
+        std.testing.allocator,
+        incarnation,
+        10,
+        101,
+        101,
+        &.{.{ .table_id = 2, .name = "newer" }},
+    );
+    var accepted_newer = try source.acceptFetchedSnapshot(newer, head, newer_ticket);
+    defer freeAdminSnapshotOwned(std.testing.allocator, &accepted_newer);
+
+    const older = try remoteMetadataSnapshotForTest(
+        std.testing.allocator,
+        incarnation,
+        20_000,
+        101,
+        101,
+        &.{.{ .table_id = 1, .name = "older" }},
+    );
+    var accepted_older = try source.acceptFetchedSnapshot(older, head, older_ticket);
+    defer freeAdminSnapshotOwned(std.testing.allocator, &accepted_older);
+
+    try std.testing.expectEqual(@as(u64, 10), accepted_older.status.metadata_epoch);
+    try std.testing.expectEqualStrings("newer", accepted_older.tables[0].name);
+    try std.testing.expectEqualStrings("newer", source.cached_snapshot.?.tables[0].name);
+}
+
+test "remote metadata source accepts a newer snapshot from an earlier fetch" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const head = antfly.metadata_api.MetadataHead{
+        .metadata_group_id = 9,
+        .metadata_incarnation = incarnation,
+        .metadata_epoch = 77,
+    };
+    source.cached_head = head;
+    const newer_ticket = source.beginSnapshotFetch();
+    const lagging_ticket = source.beginSnapshotFetch();
+
+    const lagging = try remoteMetadataSnapshotForTest(
+        std.testing.allocator,
+        incarnation,
+        30_000,
+        150,
+        150,
+        &.{.{ .table_id = 1, .name = "lagging" }},
+    );
+    var accepted_lagging = try source.acceptFetchedSnapshot(lagging, head, lagging_ticket);
+    defer freeAdminSnapshotOwned(std.testing.allocator, &accepted_lagging);
+
+    const newer = try remoteMetadataSnapshotForTest(
+        std.testing.allocator,
+        incarnation,
+        10,
+        200,
+        200,
+        &.{.{ .table_id = 2, .name = "newer" }},
+    );
+    var accepted_newer = try source.acceptFetchedSnapshot(newer, head, newer_ticket);
+    defer freeAdminSnapshotOwned(std.testing.allocator, &accepted_newer);
+
+    try std.testing.expectEqual(@as(u64, 200), accepted_newer.projection_raft_applied_index);
+    try std.testing.expectEqualStrings("newer", accepted_newer.tables[0].name);
+    try std.testing.expectEqualStrings("newer", source.cached_snapshot.?.tables[0].name);
+}
+
+test "remote metadata source rejects a later fetch from a lagging replica" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const head = antfly.metadata_api.MetadataHead{
+        .metadata_group_id = 9,
+        .metadata_incarnation = incarnation,
+        .metadata_epoch = 77,
+    };
+    source.cached_head = head;
+    const caught_up_ticket = source.beginSnapshotFetch();
+    const lagging_ticket = source.beginSnapshotFetch();
+    const caught_up = try remoteMetadataSnapshotForTest(
+        std.testing.allocator,
+        incarnation,
+        10,
+        101,
+        101,
+        &.{.{ .table_id = 2, .name = "caught-up" }},
+    );
+    var accepted_caught_up = try source.acceptFetchedSnapshot(caught_up, head, caught_up_ticket);
+    defer freeAdminSnapshotOwned(std.testing.allocator, &accepted_caught_up);
+
+    const lagging = try remoteMetadataSnapshotForTest(
+        std.testing.allocator,
+        incarnation,
+        30_000,
+        105,
+        100,
+        &.{.{ .table_id = 1, .name = "lagging" }},
+    );
+    var accepted_lagging = try source.acceptFetchedSnapshot(lagging, head, lagging_ticket);
+    defer freeAdminSnapshotOwned(std.testing.allocator, &accepted_lagging);
+
+    try std.testing.expectEqual(@as(u64, 101), accepted_lagging.projection_raft_applied_index);
+    try std.testing.expectEqualStrings("caught-up", accepted_lagging.tables[0].name);
+    try std.testing.expectEqualStrings("caught-up", source.cached_snapshot.?.tables[0].name);
+}
+
+test "remote metadata source legacy snapshot does not pin the cache" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const head = antfly.metadata_api.MetadataHead{
+        .metadata_group_id = 9,
+        .metadata_incarnation = incarnation,
+        .metadata_epoch = 77,
+    };
+    source.cached_head = head;
+    source.cached_snapshot = try remoteMetadataSnapshotForTest(
+        std.testing.allocator,
+        incarnation,
+        10,
+        200,
+        200,
+        &.{.{ .table_id = 1, .name = "current-binary" }},
+    );
+
+    const legacy = try remoteMetadataSnapshotForTest(
+        std.testing.allocator,
+        incarnation,
+        20_000,
+        0,
+        0,
+        &.{.{ .table_id = 2, .name = "rolling-upgrade-peer" }},
+    );
+    var accepted = try source.acceptFetchedSnapshot(legacy, head, source.beginSnapshotFetch());
+    defer freeAdminSnapshotOwned(std.testing.allocator, &accepted);
+
+    try std.testing.expectEqual(@as(u64, 0), accepted.projection_raft_applied_index);
+    try std.testing.expectEqualStrings("rolling-upgrade-peer", accepted.tables[0].name);
+    try std.testing.expectEqualStrings("rolling-upgrade-peer", source.cached_snapshot.?.tables[0].name);
+}
+
+test "remote metadata source legacy follower does not regress the cache" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const head = antfly.metadata_api.MetadataHead{
+        .metadata_group_id = 9,
+        .metadata_incarnation = incarnation,
+        .metadata_epoch = 77,
+    };
+    source.cached_head = head;
+    const current = try remoteMetadataSnapshotForTest(
+        std.testing.allocator,
+        incarnation,
+        100,
+        0,
+        0,
+        &.{.{ .table_id = 2, .name = "current" }},
+    );
+    var accepted_current = try source.acceptFetchedSnapshot(current, head, source.beginSnapshotFetch());
+    defer freeAdminSnapshotOwned(std.testing.allocator, &accepted_current);
+
+    const lagging = try remoteMetadataSnapshotForTest(
+        std.testing.allocator,
+        incarnation,
+        90,
+        0,
+        0,
+        &.{.{ .table_id = 1, .name = "lagging" }},
+    );
+    var accepted_lagging = try source.acceptFetchedSnapshot(lagging, head, source.beginSnapshotFetch());
+    defer freeAdminSnapshotOwned(std.testing.allocator, &accepted_lagging);
+
+    try std.testing.expectEqual(@as(u64, 100), accepted_lagging.status.metadata_epoch);
+    try std.testing.expectEqualStrings("current", accepted_lagging.tables[0].name);
+    try std.testing.expectEqualStrings("current", source.cached_snapshot.?.tables[0].name);
+}
+
+test "remote metadata source rejects a normal snapshot across invalidation" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const head = antfly.metadata_api.MetadataHead{
+        .metadata_group_id = 9,
+        .metadata_incarnation = incarnation,
+        .metadata_epoch = 77,
+    };
+    source.cached_head = head;
+    const ticket = source.beginSnapshotFetch();
+    source.invalidateCache();
+    const candidate = try remoteMetadataSnapshotForTest(std.testing.allocator, incarnation, 1, 1, 1, &.{});
+
+    try std.testing.expectError(
+        error.MetadataSnapshotHeadMismatch,
+        source.acceptFetchedSnapshot(candidate, head, ticket),
+    );
+    try std.testing.expect(source.cached_snapshot == null);
+}
+
+test "remote metadata source fenced snapshot blocks an older normal fetch" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const head = antfly.metadata_api.MetadataHead{
+        .metadata_group_id = 9,
+        .metadata_incarnation = incarnation,
+        .metadata_epoch = 77,
+    };
+    source.cached_head = head;
+    const normal_ticket = source.beginSnapshotFetch();
+    const fenced = try remoteMetadataSnapshotForTest(
+        std.testing.allocator,
+        incarnation,
+        2,
+        102,
+        102,
+        &.{.{ .table_id = 2, .name = "fenced" }},
+    );
+    try std.testing.expectEqual(
+        RemoteMetadataSource.LinearizableSnapshotAcceptance.published,
+        try source.acceptLinearizableSnapshot(fenced, source.beginLinearizableSnapshot()),
+    );
+
+    const normal = try remoteMetadataSnapshotForTest(
+        std.testing.allocator,
+        incarnation,
+        1,
+        101,
+        101,
+        &.{.{ .table_id = 1, .name = "normal" }},
+    );
+    var accepted = try source.acceptFetchedSnapshot(normal, head, normal_ticket);
+    defer freeAdminSnapshotOwned(std.testing.allocator, &accepted);
+
+    try std.testing.expectEqualStrings("fenced", accepted.tables[0].name);
+    try std.testing.expectEqualStrings("fenced", source.cached_snapshot.?.tables[0].name);
 }
 
 test "remote metadata source installs fenced snapshot without comparing epoch domains" {

@@ -183,6 +183,7 @@ pub const ReplicationSourceActionHint = struct {
 
 pub const AdminSnapshot = struct {
     status: MetadataStatus,
+    projection_raft_applied_index: u64 = 0,
     reallocation_request: ?reallocation_request.ReallocationRequestRecord = null,
     tables: []table_manager.TableRecord,
     ranges: []table_manager.RangeRecord,

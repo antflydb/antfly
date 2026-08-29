@@ -5688,6 +5688,8 @@ pub const MetadataHttpService = struct {
             defer self.unlockRuntime();
             self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
             defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+            snapshot.projection_raft_applied_index =
+                serviceGroupRaftTopologyObservation(self, self.metadata_group_id).applied_index;
             const catalog = try self.catalogValidationSnapshotLocked();
             const core = try self.projectedCoreSnapshotLocked();
             const store = self.projectedStore() orelse return error.MissingMetadataStore;
