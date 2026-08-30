@@ -1734,12 +1734,23 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const wasm_vellum_mod = b.createModule(.{
+        .root_source_file = b.path("lib/vellum/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
     const regex_mod = b.createModule(.{
         .root_source_file = b.path("lib/regex/src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
     regex_mod.addImport("antfly_vellum", vellum_mod);
+    const wasm_regex_mod = b.createModule(.{
+        .root_source_file = b.path("lib/regex/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_regex_mod.addImport("antfly_vellum", wasm_vellum_mod);
     const jsonschema_mod = b.createModule(.{
         .root_source_file = b.path("lib/jsonschema/src/mod.zig"),
         .target = target,
@@ -2334,8 +2345,8 @@ pub fn build(b: *std.Build) void {
         wasm_bloom_mod,
         wasm_vector_mod,
         wasm_vectorindex_mod,
-        vellum_mod,
-        regex_mod,
+        wasm_vellum_mod,
+        wasm_regex_mod,
         wasm_image_mod,
         wasm_font_mod,
         wasm_pdf_mod,
