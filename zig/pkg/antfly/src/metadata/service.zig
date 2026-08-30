@@ -1108,6 +1108,57 @@ fn catalogRoutingChangeResult(
     };
 }
 
+const catalog_routing_confirmation_reserve_ns: u64 = 25 * std.time.ns_per_ms;
+
+fn waitForCatalogRoutingChangeImpl(
+    comptime Service: type,
+    svc: *Service,
+    observed_token: metadata_api.CatalogRoutingChangeToken,
+    deadline_ns: u64,
+    confirm_absence: bool,
+) !metadata_api.CatalogRoutingChangeResult {
+    try svc.ensureLifecycleListenerRegistered();
+    const started_ns = platform_time.monotonicNs();
+    if (started_ns >= deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+    const watch_deadline_ns = if (confirm_absence) blk: {
+        const remaining_ns = deadline_ns - started_ns;
+        const reserve_ns = @min(catalog_routing_confirmation_reserve_ns, @max(@as(u64, 1), remaining_ns / 2));
+        break :blk deadline_ns - reserve_ns;
+    } else deadline_ns;
+
+    while (true) {
+        const current = try svc.catalogRoutingChangeToken();
+        if (catalogRoutingDisposition(observed_token, current)) |disposition| {
+            return catalogRoutingChangeResult(current, disposition);
+        }
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= watch_deadline_ns) break;
+        const signal = svc.lifecycle_signal.snapshot(null);
+        const after_capture = try svc.catalogRoutingChangeToken();
+        if (catalogRoutingDisposition(observed_token, after_capture)) |disposition| {
+            return catalogRoutingChangeResult(after_capture, disposition);
+        }
+        const wait_started_ns = platform_time.monotonicNs();
+        if (wait_started_ns >= watch_deadline_ns) break;
+        svc.lifecycle_signal.wait(signal, watch_deadline_ns - wait_started_ns);
+    }
+
+    if (!confirm_absence) {
+        return catalogRoutingChangeResult(try svc.catalogRoutingChangeToken(), .unchanged);
+    }
+    svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+        error.DeadlineExceeded,
+        error.MetadataLinearizableReadTimeout,
+        => return error.CatalogRoutingSnapshotTimeout,
+        else => return err,
+    };
+    const authoritative = try svc.catalogRoutingChangeToken();
+    return catalogRoutingChangeResult(
+        authoritative,
+        catalogRoutingDisposition(observed_token, authoritative) orelse .unchanged,
+    );
+}
+
 fn projectionSignalChangesProjectedCore(kind: metadata_storage.raft_apply_store.ProjectionSignalKind) bool {
     return switch (kind) {
         .store, .shuffle_join_lease, .schema_progress, .restore_progress, .replication_source_status => true,
@@ -2235,29 +2286,15 @@ pub const MetadataService = struct {
         return try durableCatalogRoutingToken(self.metadata_group_id, self.projectedStore());
     }
 
-    /// Wait for the durable applied cursor to advance. The cursor is checked
-    /// on both sides of signal capture to avoid a lost wakeup; unrelated
-    /// metadata commits may cause a harmless re-resolution.
+    /// Wait for the durable catalog cursor to advance. The cursor is checked
+    /// on both sides of signal capture to avoid a lost wakeup.
     pub fn waitForCatalogRoutingChange(
         self: *MetadataService,
         observed_token: metadata_api.CatalogRoutingChangeToken,
         deadline_ns: u64,
+        confirm_absence: bool,
     ) !metadata_api.CatalogRoutingChangeResult {
-        try self.ensureLifecycleListenerRegistered();
-        while (true) {
-            const current = try self.catalogRoutingChangeToken();
-            if (catalogRoutingDisposition(observed_token, current)) |disposition| {
-                return catalogRoutingChangeResult(current, disposition);
-            }
-            const now_ns = platform_time.monotonicNs();
-            if (now_ns >= deadline_ns) return catalogRoutingChangeResult(current, .unchanged);
-            const signal = self.lifecycle_signal.snapshot(null);
-            const after_capture = try self.catalogRoutingChangeToken();
-            if (catalogRoutingDisposition(observed_token, after_capture)) |disposition| {
-                return catalogRoutingChangeResult(after_capture, disposition);
-            }
-            self.lifecycle_signal.wait(signal, deadline_ns - now_ns);
-        }
+        return try waitForCatalogRoutingChangeImpl(MetadataService, self, observed_token, deadline_ns, confirm_absence);
     }
 
     pub fn setLifecycleReconcileHook(self: *MetadataService, hook: ?LifecycleReconcileHook) void {
@@ -4065,22 +4102,9 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         observed_token: metadata_api.CatalogRoutingChangeToken,
         deadline_ns: u64,
+        confirm_absence: bool,
     ) !metadata_api.CatalogRoutingChangeResult {
-        try self.ensureLifecycleListenerRegistered();
-        while (true) {
-            const current = try self.catalogRoutingChangeToken();
-            if (catalogRoutingDisposition(observed_token, current)) |disposition| {
-                return catalogRoutingChangeResult(current, disposition);
-            }
-            const now_ns = platform_time.monotonicNs();
-            if (now_ns >= deadline_ns) return catalogRoutingChangeResult(current, .unchanged);
-            const signal = self.lifecycle_signal.snapshot(null);
-            const after_capture = try self.catalogRoutingChangeToken();
-            if (catalogRoutingDisposition(observed_token, after_capture)) |disposition| {
-                return catalogRoutingChangeResult(after_capture, disposition);
-            }
-            self.lifecycle_signal.wait(signal, deadline_ns - now_ns);
-        }
+        return try waitForCatalogRoutingChangeImpl(MetadataHttpService, self, observed_token, deadline_ns, confirm_absence);
     }
 
     pub fn setLifecycleReconcileHook(self: *MetadataHttpService, hook: ?LifecycleReconcileHook) void {

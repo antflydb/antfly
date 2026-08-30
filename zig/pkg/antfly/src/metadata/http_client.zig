@@ -256,9 +256,10 @@ pub const MetadataHttpClient = struct {
         self: *MetadataHttpClient,
         base_uri: []const u8,
         observed_token: metadata_api.CatalogRoutingChangeToken,
+        confirm_absence: bool,
         budget: RequestBudget,
     ) !std.json.Parsed(metadata_api.CatalogRoutingChangeResult) {
-        const uri = try join(self.alloc, base_uri, routes.Routes.internal_routing_change);
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_routing_authority);
         defer self.alloc.free(uri);
 
         const now_ns = platform_time.monotonicNs();
@@ -272,6 +273,7 @@ pub const MetadataHttpClient = struct {
         const remaining = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms});
         const body = try std.json.Stringify.valueAlloc(self.alloc, metadata_api.CatalogRoutingChangeRequest{
             .observed_token = observed_token,
+            .confirm_absence = confirm_absence,
         }, .{});
         defer self.alloc.free(body);
         const headers = [_]http_common.RequestHeader{
@@ -293,6 +295,45 @@ pub const MetadataHttpClient = struct {
         if (resp.status == 504) return error.CatalogRoutingSnapshotTimeout;
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
         return try parseJson(metadata_api.CatalogRoutingChangeResult, self.alloc, resp.body);
+    }
+
+    pub fn awaitCatalogRoute(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        request: metadata_api.CatalogRouteResolveRequest,
+        budget: RequestBudget,
+    ) !std.json.Parsed(metadata_api.CatalogRouteResolveResult) {
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_await_route);
+        defer self.alloc.free(uri);
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= budget.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+        const remaining_ms = @max(
+            @as(u64, 1),
+            ((budget.deadline_ns - now_ns) +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms,
+        );
+        var remaining_buf: [32]u8 = undefined;
+        const remaining = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms});
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = routes.routing_remaining_ms_header, .value = remaining },
+        };
+        var resp = self.executeWithRetryBudget(.{
+            .method = .POST,
+            .uri = uri,
+            .body = body,
+            .content_type = "application/json",
+            .headers = headers[0..],
+            .timeout_ms = default_request_timeout_ms,
+        }, budget) catch |err| switch (err) {
+            error.Timeout, error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        };
+        defer resp.deinit(self.alloc);
+        if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
+        if (resp.status == 504) return error.CatalogRoutingSnapshotTimeout;
+        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        return try parseJson(metadata_api.CatalogRouteResolveResult, self.alloc, resp.body);
     }
 
     pub fn validateCatalogPublication(
@@ -1096,12 +1137,13 @@ test "metadata routing change client forwards an authority-scoped long poll" {
 
         fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
             try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_routing_change));
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_routing_authority));
             _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
             const parsed = try std.json.parseFromSlice(metadata_api.CatalogRoutingChangeRequest, alloc, req.body, .{});
             defer parsed.deinit();
             try std.testing.expectEqual(@as(u64, 7), parsed.value.observed_token.metadata_group_id);
             try std.testing.expectEqual(@as(u64, 17), parsed.value.observed_token.revision);
+            try std.testing.expect(parsed.value.confirm_absence);
             return .{
                 .status = 200,
                 .content_type = try alloc.dupe(u8, "application/json"),
@@ -1115,12 +1157,50 @@ test "metadata routing change client forwards an authority-scoped long poll" {
     var result = try client.waitForRoutingChange(
         "http://127.0.0.1:9000",
         .{ .metadata_group_id = 7, .revision = 17 },
+        true,
         .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
     );
     defer result.deinit();
     try std.testing.expect(result.value.changed);
     try std.testing.expectEqual(metadata_api.CatalogRoutingChangeResult.Disposition.advanced, result.value.effectiveDisposition());
     try std.testing.expectEqual(@as(u64, 18), result.value.token.revision);
+}
+
+test "metadata route authority client forwards the query and decodes a route plan" {
+    const Executor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_await_route));
+            _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
+            const parsed = try std.json.parseFromSlice(metadata_api.CatalogRouteResolveRequest, alloc, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("docs", parsed.value.query.table_name);
+            try std.testing.expectEqual(metadata_api.CatalogRouteSelector.key, parsed.value.query.selector);
+            try std.testing.expectEqualStrings("row-17", parsed.value.query.key);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"disposition":"found","token":{"metadata_group_id":1,"revision":9},"plan":{"metadata_group_id":1,"metadata_incarnation":null,"catalog_revision":9,"table_id":7,"topology_epoch":3,"groups":[{"group_id":71,"range_id":4,"identity_namespace":{"table_id":7,"shard_id":71,"range_id":4}}]}}
+                ),
+            };
+        }
+    };
+
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    var result = try client.awaitCatalogRoute(
+        "http://127.0.0.1:9000",
+        .{ .query = .{ .table_name = "docs", .selector = .key, .key = "row-17" } },
+        .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(metadata_api.CatalogRouteResolveResult.Disposition.found, result.value.disposition);
+    try std.testing.expectEqual(@as(u64, 71), result.value.plan.?.groups[0].group_id);
 }
 
 test "metadata http client uses the reallocation route and maps upgrade gating" {

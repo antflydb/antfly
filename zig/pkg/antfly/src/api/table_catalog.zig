@@ -44,6 +44,7 @@ pub const CatalogSource = struct {
         linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         wait_for_routing_change: *const fn (ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, probe_interval_ns: u64) anyerror!CatalogChangeWaitResult = defaultWaitForRoutingChange,
+        await_route: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, deadline_ns: u64, probe_interval_ns: u64) anyerror!AwaitRouteResult = null,
         /// Production sources must fail closed when either linearizable
         /// publication validator is unavailable.
         requires_linearizable_publication_fence: bool = false,
@@ -73,11 +74,17 @@ pub const CatalogSource = struct {
             return error.CatalogRoutingUnavailable;
         }
         return .{
-            .ptr = self.ptr,
-            .eventual_snapshot = self.vtable.routing_snapshot,
-            .linearizable_snapshot = linearizable_snapshot,
-            .free_snapshot = self.vtable.free_routing_snapshot,
-            .wait_for_change = self.vtable.wait_for_routing_change,
+            .projection = .{
+                .ptr = self.ptr,
+                .snapshot = self.vtable.routing_snapshot,
+                .free_snapshot = self.vtable.free_routing_snapshot,
+            },
+            .authority = .{
+                .ptr = self.ptr,
+                .linearizable_snapshot = linearizable_snapshot,
+                .wait_for_change = self.vtable.wait_for_routing_change,
+                .await_route = self.vtable.await_route,
+            },
         };
     }
 
@@ -147,19 +154,36 @@ pub const CatalogSource = struct {
 /// may be used by admin-only code and fixtures, this type cannot represent an
 /// eventual reader without its matching authoritative negative-confirmation
 /// reader and ownership release operation.
-pub const CatalogRoutingSource = struct {
+pub const CatalogProjectionSource = struct {
     ptr: *anyopaque,
-    eventual_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot,
-    linearizable_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot,
+    snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot,
     free_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void,
+
+    fn capture(self: @This(), deadline_ns: ?u64) !OwnedRoutingSnapshot {
+        return .{ .source = self, .value = try self.snapshot(self.ptr, deadline_ns) };
+    }
+};
+
+pub const CatalogRouteAuthority = struct {
+    ptr: *anyopaque,
+    linearizable_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot,
     wait_for_change: *const fn (ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, probe_interval_ns: u64) anyerror!CatalogChangeWaitResult = defaultWaitForRoutingChange,
+    await_route: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, deadline_ns: u64, probe_interval_ns: u64) anyerror!AwaitRouteResult = null,
+};
+
+pub const CatalogRoutingSource = struct {
+    projection: CatalogProjectionSource,
+    authority: CatalogRouteAuthority,
 
     pub fn eventualSnapshot(self: CatalogRoutingSource, deadline_ns: ?u64) !OwnedRoutingSnapshot {
-        return .{ .source = self, .value = try self.eventual_snapshot(self.ptr, deadline_ns) };
+        return try self.projection.capture(deadline_ns);
     }
 
     pub fn linearizableSnapshot(self: CatalogRoutingSource, deadline_ns: ?u64) !OwnedRoutingSnapshot {
-        return .{ .source = self, .value = try self.linearizable_snapshot(self.ptr, deadline_ns) };
+        return .{
+            .source = self.projection,
+            .value = try self.authority.linearizable_snapshot(self.authority.ptr, deadline_ns),
+        };
     }
 
     pub fn waitForChange(
@@ -168,7 +192,7 @@ pub const CatalogRoutingSource = struct {
         deadline_ns: u64,
         probe_interval_ns: u64,
     ) !CatalogChangeWaitResult {
-        return try self.wait_for_change(self.ptr, observed_token, deadline_ns, probe_interval_ns);
+        return try self.authority.wait_for_change(self.authority.ptr, observed_token, deadline_ns, probe_interval_ns);
     }
 };
 
@@ -176,7 +200,7 @@ pub const CatalogRoutingSource = struct {
 /// release operation with the value prevents wrapper layers from pairing a
 /// snapshot with a missing or different free callback.
 pub const OwnedRoutingSnapshot = struct {
-    source: CatalogRoutingSource,
+    source: CatalogProjectionSource,
     value: metadata_api.CatalogRoutingSnapshot,
 
     pub fn deinit(self: *@This()) void {
@@ -190,7 +214,9 @@ pub const CatalogChangeWaitResult = enum {
     /// The bounded watch completed without proving that the caller's overall
     /// deadline expired. Re-resolve so replica selection can make progress.
     retry,
-    deadline_reached,
+    /// The authority completed a linearizable confirmation and the catalog
+    /// cursor still matches the snapshot in which the route was absent.
+    authoritative_absence,
 };
 
 pub fn emptyCatalogSource() CatalogSource {
@@ -217,14 +243,14 @@ fn unsupportedFreeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRouting
 /// with their catalog publication signal.
 fn defaultWaitForRoutingChange(_: *anyopaque, _: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, probe_interval_ns: u64) !CatalogChangeWaitResult {
     const now_ns = platform_time.monotonicNs();
-    if (now_ns >= deadline_ns) return .deadline_reached;
+    if (now_ns >= deadline_ns) return .retry;
     const effective_probe_ns = @max(probe_interval_ns, std.time.ns_per_ms);
     const wait_ns = @min(deadline_ns - now_ns, effective_probe_ns);
     if (wait_ns > 0) {
         const wait_ms = @max(@as(u64, 1), @divTrunc(wait_ns, std.time.ns_per_ms));
         platform_clock.Clock.real().sleepMs(wait_ms);
     }
-    return if (platform_time.monotonicNs() >= deadline_ns) .deadline_reached else .changed;
+    return .retry;
 }
 
 /// Explicit adapter for static test doubles whose fixture data is authored as
@@ -1043,6 +1069,16 @@ pub fn awaitRoute(
     deadline_ns: u64,
     probe_interval_ns: u64,
 ) !AwaitRouteResult {
+    if (routing.authority.await_route) |await_route| {
+        return try await_route(
+            routing.authority.ptr,
+            alloc,
+            table_name,
+            query,
+            deadline_ns,
+            probe_interval_ns,
+        );
+    }
     while (true) {
         if (platform_time.monotonicNs() >= deadline_ns) return .timed_out;
         var resolved = try resolveRouteObserved(alloc, routing, table_name, query, deadline_ns);
@@ -1056,7 +1092,7 @@ pub fn awaitRoute(
                 switch (try routing.waitForChange(observed_token, deadline_ns, probe_interval_ns)) {
                     .changed => continue,
                     .retry => continue,
-                    .deadline_reached => return .publication_not_observed,
+                    .authoritative_absence => return .publication_not_observed,
                 }
             },
         }
@@ -1077,7 +1113,7 @@ fn resolveGroupsForSpanWithDeadline(
     } }, deadline_ns);
 }
 
-fn routePlanFromSnapshot(
+pub fn routePlanFromSnapshot(
     alloc: std.mem.Allocator,
     snapshot: metadata_api.CatalogRoutingSnapshot,
     table_name: []const u8,
@@ -1229,8 +1265,11 @@ fn metadataServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.C
 
 fn metadataServiceWaitForRoutingChange(ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, _: u64) !CatalogChangeWaitResult {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-    const result = try svc.waitForCatalogRoutingChange(observed_token, deadline_ns);
-    return if (result.effectiveDisposition() == .unchanged) .deadline_reached else .changed;
+    const result = svc.waitForCatalogRoutingChange(observed_token, deadline_ns, true) catch |err| switch (err) {
+        error.CatalogRoutingSnapshotTimeout => return .retry,
+        else => return err,
+    };
+    return if (result.effectiveDisposition() == .unchanged) .authoritative_absence else .changed;
 }
 
 fn metadataServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -1272,8 +1311,11 @@ fn metadataHttpServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_a
 
 fn metadataHttpServiceWaitForRoutingChange(ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, _: u64) !CatalogChangeWaitResult {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    const result = try svc.waitForCatalogRoutingChange(observed_token, deadline_ns);
-    return if (result.effectiveDisposition() == .unchanged) .deadline_reached else .changed;
+    const result = svc.waitForCatalogRoutingChange(observed_token, deadline_ns, true) catch |err| switch (err) {
+        error.CatalogRoutingSnapshotTimeout => return .retry,
+        else => return err,
+    };
+    return if (result.effectiveDisposition() == .unchanged) .authoritative_absence else .changed;
 }
 
 fn metadataHttpServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -1315,8 +1357,11 @@ fn metadataServerFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Ca
 
 fn metadataServerWaitForRoutingChange(ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, _: u64) !CatalogChangeWaitResult {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
-    const result = try srv.svc.waitForCatalogRoutingChange(observed_token, deadline_ns);
-    return if (result.effectiveDisposition() == .unchanged) .deadline_reached else .changed;
+    const result = srv.svc.waitForCatalogRoutingChange(observed_token, deadline_ns, true) catch |err| switch (err) {
+        error.CatalogRoutingSnapshotTimeout => return .retry,
+        else => return err,
+    };
+    return if (result.effectiveDisposition() == .unchanged) .authoritative_absence else .changed;
 }
 
 fn metadataServerValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -1937,7 +1982,7 @@ test "await route distinguishes persistent absence from capture timeout" {
         fn waitForChange(ptr: *anyopaque, _: metadata_api.CatalogRoutingChangeToken, _: u64, _: u64) !CatalogChangeWaitResult {
             const state: *State = @ptrCast(@alignCast(ptr));
             state.waits += 1;
-            return .deadline_reached;
+            return .authoritative_absence;
         }
     };
 

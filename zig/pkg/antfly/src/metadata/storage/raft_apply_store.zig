@@ -709,6 +709,7 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     try source.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 2, .entries_bytes = entries });
     try std.testing.expectEqual(first, (try source.getMetadataIncarnation(group_id)).?);
     try std.testing.expectEqual(@as(usize, 1), capture.incarnation_signals);
+    try std.testing.expectEqual(@as(u64, 2), (try source.captureCatalogCursor(group_id)).revision);
     try std.testing.expectEqual(@as(u16, 0), try source.getRuntimeStatusProtocolActivationVersion(group_id));
 
     var repair_indexes = [_]metadata.RuntimeIndexStatusReport{.{
@@ -736,6 +737,7 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     });
     defer std.testing.allocator.free(activate_entries);
     try source.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 3, .entries_bytes = activate_entries });
+    try std.testing.expectEqual(@as(u64, 2), (try source.captureCatalogCursor(group_id)).revision);
     try std.testing.expectEqual(
         runtime_status_protocol.repair_status_record_version,
         try source.getRuntimeStatusProtocolActivationVersion(group_id),
@@ -755,6 +757,7 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
         .commit_index = 4,
         .entries_bytes = reporter_fence_entries,
     });
+    try std.testing.expectEqual(@as(u64, 2), (try source.captureCatalogCursor(group_id)).revision);
     try std.testing.expectEqual(
         runtime_status_protocol.current_record_version,
         try source.getRuntimeStatusProtocolActivationVersion(group_id),
@@ -768,7 +771,7 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     try std.testing.expectEqual(first, (try reopened.getMetadataIncarnation(group_id)).?);
     const reopened_cursor = try reopened.captureCatalogCursor(group_id);
     try std.testing.expectEqual(first, reopened_cursor.metadata_incarnation.?);
-    try std.testing.expectEqual(@as(u64, 4), reopened_cursor.revision);
+    try std.testing.expectEqual(@as(u64, 2), reopened_cursor.revision);
     try std.testing.expectEqual(
         runtime_status_protocol.current_record_version,
         try reopened.getRuntimeStatusProtocolActivationVersion(group_id),
@@ -780,7 +783,7 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     try std.testing.expectEqual(first, (try target.getMetadataIncarnation(group_id)).?);
     const installed_cursor = try target.captureCatalogCursor(group_id);
     try std.testing.expectEqual(first, installed_cursor.metadata_incarnation.?);
-    try std.testing.expectEqual(@as(u64, 4), installed_cursor.revision);
+    try std.testing.expectEqual(@as(u64, 2), installed_cursor.revision);
     try std.testing.expectEqual(
         runtime_status_protocol.current_record_version,
         try target.getRuntimeStatusProtocolActivationVersion(group_id),
@@ -1650,9 +1653,9 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
 
-        var apply_key_buf: [128]u8 = undefined;
-        const apply_key = try keyForGroup(&apply_key_buf, group_id);
-        const applied = txn.get(apply_key) catch |err| switch (err) {
+        var revision_key_buf: [160]u8 = undefined;
+        const revision_key = try catalogRevisionKeyForGroup(&revision_key_buf, group_id);
+        const applied = txn.get(revision_key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
@@ -1697,9 +1700,9 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
 
-        var apply_key_buf: [128]u8 = undefined;
-        const apply_key = try keyForGroup(&apply_key_buf, group_id);
-        const applied = txn.get(apply_key) catch |err| switch (err) {
+        var revision_key_buf: [160]u8 = undefined;
+        const revision_key = try catalogRevisionKeyForGroup(&revision_key_buf, group_id);
+        const applied = txn.get(revision_key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
@@ -2154,6 +2157,7 @@ pub const RaftApplyStore = struct {
         reconcile_lease,
         reallocation_request,
         reallocation_request_pending,
+        catalog_revision,
     };
     const MetadataSnapshotKey = union(enum) {
         prefix: MetadataSnapshotKeyFn,
@@ -2186,6 +2190,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .reconcile_lease, .key = .{ .point = reconcileLeaseKeyForGroup } },
         .{ .projection = .reallocation_request, .key = .{ .point = reallocationRequestKeyForGroup } },
         .{ .projection = .reallocation_request_pending, .key = .{ .point = pendingReallocationRequestKeyForGroup } },
+        .{ .projection = .catalog_revision, .key = .{ .point = catalogRevisionKeyForGroup } },
     };
 
     fn metadataSnapshotProjectionBit(projection: MetadataSnapshotProjection) u32 {
@@ -2197,20 +2202,24 @@ pub const RaftApplyStore = struct {
     /// without classifying its durable output is therefore a compile error.
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) u32 {
         return switch (tag) {
-            .initialize_metadata_incarnation => metadataSnapshotProjectionBit(.metadata_incarnation),
+            .initialize_metadata_incarnation => metadataSnapshotProjectionBit(.metadata_incarnation) |
+                metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_node, .register_node, .remove_node => metadataSnapshotProjectionBit(.node),
             .request_node_shutdown, .cancel_node_shutdown, .finalize_node_shutdown => metadataSnapshotProjectionBit(.node) | metadataSnapshotProjectionBit(.store),
             .upsert_store, .register_store, .remove_store => metadataSnapshotProjectionBit(.store),
             .upsert_replica_intent, .remove_replica_intent => metadataSnapshotProjectionBit(.placement) |
                 metadataSnapshotProjectionBit(.placement_version),
-            .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.table),
+            .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.table) |
+                metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
             .upsert_restore_progress, .remove_restore_progress => metadataSnapshotProjectionBit(.restore_progress),
             .upsert_replication_source_status, .claim_replication_source_cutover, .complete_replication_source_retirement => metadataSnapshotProjectionBit(.replication_source_status),
-            .upsert_range, .complete_restore_range, .remove_range => metadataSnapshotProjectionBit(.range),
+            .upsert_range, .complete_restore_range, .remove_range => metadataSnapshotProjectionBit(.range) |
+                metadataSnapshotProjectionBit(.catalog_revision),
             .admit_split_transition => metadataSnapshotProjectionBit(.split_transition) |
                 metadataSnapshotProjectionBit(.range) |
-                metadataSnapshotProjectionBit(.table_transition_fence),
+                metadataSnapshotProjectionBit(.table_transition_fence) |
+                metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_split_transition, .remove_split_transition => metadataSnapshotProjectionBit(.split_transition) |
                 metadataSnapshotProjectionBit(.table_transition_fence),
             .upsert_merge_transition, .remove_merge_transition => metadataSnapshotProjectionBit(.merge_transition) |
@@ -2228,7 +2237,8 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.table_transition_fence) |
                 metadataSnapshotProjectionBit(.installed_extension) |
                 metadataSnapshotProjectionBit(.extension_member) |
-                metadataSnapshotProjectionBit(.extension_dependency),
+                metadataSnapshotProjectionBit(.extension_dependency) |
+                metadataSnapshotProjectionBit(.catalog_revision),
         };
     }
 
@@ -2483,6 +2493,13 @@ pub const RaftApplyStore = struct {
         try txn.put(key, value);
         try self.projectEntriesTxn(&txn, group_id, entries_bytes);
         if (outcome.failure) |err| return err;
+        if (outcomeChangesCatalog(outcome.projection_signals.items)) {
+            var catalog_revision_buf: [@sizeOf(u64)]u8 = undefined;
+            std.mem.writeInt(u64, &catalog_revision_buf, commit_index, .little);
+            var catalog_revision_key_buf: [160]u8 = undefined;
+            const catalog_revision_key = try catalogRevisionKeyForGroup(&catalog_revision_key_buf, group_id);
+            try txn.put(catalog_revision_key, &catalog_revision_buf);
+        }
         try txn.commit();
 
         if (self.batches.getPtr(group_id)) |existing| {
@@ -2528,6 +2545,14 @@ pub const RaftApplyStore = struct {
 
     fn keyForGroup(buf: []u8, group_id: u64) ![]const u8 {
         return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_raft_apply:{d}", .{group_id});
+    }
+
+    fn outcomeChangesCatalog(signals: []const OwnedProjectionSignal) bool {
+        for (signals) |signal| switch (signal.signal.kind) {
+            .metadata_incarnation, .table, .range => return true,
+            else => {},
+        };
+        return false;
     }
 
     fn projectEntriesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, entries_bytes: []const u8) !void {
@@ -7777,6 +7802,10 @@ pub fn metadataIncarnationKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_incarnation:{d}", .{group_id});
 }
 
+pub fn catalogRevisionKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_catalog_revision:{d}", .{group_id});
+}
+
 pub fn reallocationRequestKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_reallocation_request:{d}", .{group_id});
 }
@@ -7966,7 +7995,7 @@ test "metadata raft apply store persists batches across reopen" {
             .entries_bytes = "metadata-batch",
         });
         const cursor = try store.captureCatalogCursor(21);
-        try std.testing.expectEqual(@as(u64, 13), cursor.revision);
+        try std.testing.expectEqual(@as(u64, 0), cursor.revision);
     }
 
     {
@@ -7976,7 +8005,7 @@ test "metadata raft apply store persists batches across reopen" {
         try std.testing.expectEqual(@as(u64, 13), batch.commit_index);
         try std.testing.expectEqualStrings("metadata-batch", batch.entries_bytes);
         const cursor = try store.captureCatalogCursor(21);
-        try std.testing.expectEqual(@as(u64, 13), cursor.revision);
+        try std.testing.expectEqual(@as(u64, 0), cursor.revision);
         try std.testing.expectEqual(@as(?metadata_incarnation.MetadataClusterIncarnation, null), cursor.metadata_incarnation);
     }
 }

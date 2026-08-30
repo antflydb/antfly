@@ -248,6 +248,10 @@ pub const CatalogRoutingChangeToken = struct {
 
 pub const CatalogRoutingChangeRequest = struct {
     observed_token: CatalogRoutingChangeToken,
+    /// Terminal absence is valid only when the server completes a
+    /// linearizable confirmation after its bounded watch. Short failover
+    /// probes leave this false and treat an unchanged replica as retryable.
+    confirm_absence: bool = false,
 };
 
 pub const CatalogRoutingChangeResult = struct {
@@ -266,6 +270,66 @@ pub const CatalogRoutingChangeResult = struct {
     pub fn effectiveDisposition(self: @This()) Disposition {
         return self.disposition orelse if (self.changed) .advanced else .unchanged;
     }
+};
+
+pub const CatalogRouteSelector = enum {
+    table,
+    all_ranges,
+    key,
+    span,
+    group,
+};
+
+pub const CatalogRouteQuery = struct {
+    table_name: []const u8,
+    selector: CatalogRouteSelector,
+    key: []const u8 = "",
+    from_key: []const u8 = "",
+    to_key: []const u8 = "",
+    group_id: u64 = 0,
+};
+
+pub const CatalogIdentityNamespace = struct {
+    table_id: u64,
+    shard_id: u64,
+    range_id: u64,
+};
+
+pub const CatalogGroupRoute = struct {
+    group_id: u64,
+    range_id: u64,
+    identity_namespace: CatalogIdentityNamespace,
+};
+
+pub const CatalogRoutePlan = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation,
+    catalog_revision: u64,
+    table_id: u64,
+    topology_epoch: u64,
+    groups: []CatalogGroupRoute,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.groups);
+        self.* = undefined;
+    }
+};
+
+pub const CatalogRouteResolveRequest = struct {
+    query: CatalogRouteQuery,
+};
+
+pub const CatalogRouteResolveResult = struct {
+    disposition: Disposition,
+    token: CatalogRoutingChangeToken = .{},
+    plan: ?CatalogRoutePlan = null,
+
+    pub const Disposition = enum {
+        found,
+        not_found,
+        timed_out,
+        authority_changed,
+    };
 };
 
 /// Compact catalog values consumed while staging one data-Raft generation.

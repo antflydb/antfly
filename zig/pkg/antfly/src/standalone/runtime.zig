@@ -16,6 +16,7 @@ const std = @import("std");
 const lease_executor = @import("lease_executor.zig");
 const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
+const platform_clock = @import("antfly_platform").clock;
 const httpx = @import("httpx");
 const antfly = @import("runtime_root.zig");
 const group_ids = @import("../common/group_ids.zig");
@@ -820,6 +821,7 @@ const LocalStandaloneMetadata = struct {
                 .routing_snapshot = catalogRoutingSnapshot,
                 .linearizable_routing_snapshot = catalogRoutingSnapshot,
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
+                .wait_for_routing_change = catalogWaitForRoutingChange,
             },
         };
     }
@@ -992,10 +994,50 @@ const LocalStandaloneMetadata = struct {
         return .{
             .metadata_group_id = group_ids.main_metadata_group_id,
             .catalog_revision = self.epoch,
-            .change_token = .{ .revision = self.epoch },
+            .change_token = .{
+                .metadata_group_id = group_ids.main_metadata_group_id,
+                .revision = self.epoch,
+            },
             .tables = tables,
             .ranges = ranges,
         };
+    }
+
+    fn catalogWaitForRoutingChange(
+        ptr: *anyopaque,
+        observed_token: antfly.metadata_api.CatalogRoutingChangeToken,
+        deadline_ns: u64,
+        probe_interval_ns: u64,
+    ) !antfly.public_api.table_catalog.CatalogChangeWaitResult {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return .retry;
+        if (standaloneCatalogTokenChanged(self, observed_token)) {
+            self.mutex.unlock();
+            return .changed;
+        }
+        self.mutex.unlock();
+
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns < deadline_ns) {
+            const wait_ns = @min(deadline_ns - now_ns, @max(probe_interval_ns, std.time.ns_per_ms));
+            platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
+        }
+        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return .retry;
+        defer self.mutex.unlock();
+        if (standaloneCatalogTokenChanged(self, observed_token)) return .changed;
+        return if (platform_time.monotonicNs() >= deadline_ns) .authoritative_absence else .retry;
+    }
+
+    fn standaloneCatalogTokenChanged(
+        self: *const LocalStandaloneMetadata,
+        observed_token: antfly.metadata_api.CatalogRoutingChangeToken,
+    ) bool {
+        if (observed_token.metadata_group_id != 0 and
+            observed_token.metadata_group_id != group_ids.main_metadata_group_id)
+        {
+            return true;
+        }
+        return observed_token.revision != self.epoch;
     }
 
     fn catalogFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *antfly.metadata_api.CatalogRoutingSnapshot) void {

@@ -1092,10 +1092,15 @@ pub const StatusSource = struct {
         const linearizable = self.vtable.linearizable_routing_snapshot orelse return null;
         const release = self.vtable.free_routing_snapshot orelse return null;
         return .{
-            .ptr = self.ptr,
-            .eventual_snapshot = eventual,
-            .linearizable_snapshot = linearizable,
-            .free_snapshot = release,
+            .projection = .{
+                .ptr = self.ptr,
+                .snapshot = eventual,
+                .free_snapshot = release,
+            },
+            .authority = .{
+                .ptr = self.ptr,
+                .linearizable_snapshot = linearizable,
+            },
         };
     }
 
@@ -4275,6 +4280,7 @@ pub const ApiHttpServer = struct {
                 .linearizable_routing_snapshot = apiHttpServerCatalogLinearizableRoutingSnapshot,
                 .free_routing_snapshot = apiHttpServerCatalogFreeRoutingSnapshot,
                 .wait_for_routing_change = apiHttpServerCatalogWaitForRoutingChange,
+                .await_route = apiHttpServerCatalogAwaitRoute,
             },
         };
     }
@@ -6754,25 +6760,45 @@ pub const ApiHttpServer = struct {
     fn apiHttpServerCatalogRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const routing = self.source.routingSource() orelse return error.CatalogRoutingUnavailable;
-        return try routing.eventual_snapshot(routing.ptr, deadline_ns);
+        return try routing.projection.snapshot(routing.projection.ptr, deadline_ns);
     }
 
     fn apiHttpServerCatalogLinearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const routing = self.source.routingSource() orelse return error.CatalogRoutingUnavailable;
-        return try routing.linearizable_snapshot(routing.ptr, deadline_ns);
+        return try routing.authority.linearizable_snapshot(routing.authority.ptr, deadline_ns);
     }
 
     fn apiHttpServerCatalogFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const routing = self.source.routingSource() orelse unreachable;
-        routing.free_snapshot(routing.ptr, snapshot);
+        routing.projection.free_snapshot(routing.projection.ptr, snapshot);
     }
 
     fn apiHttpServerCatalogWaitForRoutingChange(ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, probe_interval_ns: u64) !table_catalog.CatalogChangeWaitResult {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const routing = self.source.routingSource() orelse return error.CatalogRoutingUnavailable;
         return try routing.waitForChange(observed_token, deadline_ns, probe_interval_ns);
+    }
+
+    fn apiHttpServerCatalogAwaitRoute(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        query: table_catalog.RouteQuery,
+        deadline_ns: u64,
+        probe_interval_ns: u64,
+    ) !table_catalog.AwaitRouteResult {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const routing = self.source.routingSource() orelse return error.CatalogRoutingUnavailable;
+        return try table_catalog.awaitRoute(
+            alloc,
+            routing,
+            table_name,
+            query,
+            deadline_ns,
+            probe_interval_ns,
+        );
     }
 
     fn waitForTableMetadata(
