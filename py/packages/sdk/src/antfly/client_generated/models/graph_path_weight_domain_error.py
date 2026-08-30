@@ -5,8 +5,8 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.graph_path_objective import GraphPathObjective
 from ..models.graph_path_weight_domain_error_error import GraphPathWeightDomainErrorError
-from ..models.graph_path_weight_domain_error_mode import GraphPathWeightDomainErrorMode
 from ..models.graph_path_weight_domain_error_status import GraphPathWeightDomainErrorStatus
 from ..models.graph_path_weight_domain_error_violation import GraphPathWeightDomainErrorViolation
 
@@ -22,9 +22,11 @@ class GraphPathWeightDomainError:
         message (str):
         retryable (bool):
         operation (str): Named shortest-path operation that encountered the incompatible edge weight.
-        mode (GraphPathWeightDomainErrorMode): Exact path algorithm whose numeric domain was violated.
+        objective (GraphPathObjective): Objective used to rank graph paths:
+            - min_hops: Minimize the number of edges.
+            - min_weight_sum: Minimize the sum of finite non-negative edge weights.
+            - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to be in [0,1].
         violation (GraphPathWeightDomainErrorViolation): Stable machine-readable reason the weight was rejected.
-        allowed_range (str): Required edge-weight interval for exact execution in the selected mode.
         remediation (str): Stable user-facing guidance for correcting the graph or query.
     """
 
@@ -33,9 +35,8 @@ class GraphPathWeightDomainError:
     message: str
     retryable: bool
     operation: str
-    mode: GraphPathWeightDomainErrorMode
+    objective: GraphPathObjective
     violation: GraphPathWeightDomainErrorViolation
-    allowed_range: str
     remediation: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -49,11 +50,9 @@ class GraphPathWeightDomainError:
 
         operation = self.operation
 
-        mode = self.mode.value
+        objective = self.objective.value
 
         violation = self.violation.value
-
-        allowed_range = self.allowed_range
 
         remediation = self.remediation
 
@@ -66,9 +65,8 @@ class GraphPathWeightDomainError:
                 "message": message,
                 "retryable": retryable,
                 "operation": operation,
-                "mode": mode,
+                "objective": objective,
                 "violation": violation,
-                "allowed_range": allowed_range,
                 "remediation": remediation,
             }
         )
@@ -88,11 +86,9 @@ class GraphPathWeightDomainError:
 
         operation = d.pop("operation")
 
-        mode = GraphPathWeightDomainErrorMode(d.pop("mode"))
+        objective = GraphPathObjective(d.pop("objective"))
 
         violation = GraphPathWeightDomainErrorViolation(d.pop("violation"))
-
-        allowed_range = d.pop("allowed_range")
 
         remediation = d.pop("remediation")
 
@@ -102,9 +98,8 @@ class GraphPathWeightDomainError:
             message=message,
             retryable=retryable,
             operation=operation,
-            mode=mode,
+            objective=objective,
             violation=violation,
-            allowed_range=allowed_range,
             remediation=remediation,
         )
 

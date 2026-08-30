@@ -12867,7 +12867,7 @@ pub const GraphAggregatesResult = struct {
     kind: []const u8,
     /// Keys are the GraphIdentifiers selected by the corresponding aggregate return projection.
     aggregates: std.json.ArrayHashMap(GraphAggregateValue),
-    stats: GraphQueryStats,
+    stats: GraphExactResultStats,
 };
 
 pub const GraphAggregatesReturn = struct {
@@ -13210,7 +13210,7 @@ pub const GraphBindingsResult = struct {
     /// Stable discriminator for the graph result shape.
     kind: []const u8,
     rows: []const GraphResultRow,
-    stats: GraphQueryStats,
+    stats: GraphResultStats,
 };
 
 pub const GraphBindingsReturn = struct {
@@ -13849,6 +13849,14 @@ pub const GraphEdgeWeightRange = struct {
         }
         try jw.endObject();
     }
+};
+
+/// Completion statistics for a graph result that is exact or fails without producing a result.
+pub const GraphExactResultStats = struct {
+    /// Number of primary result items returned (paths or aggregates).
+    returned_items: i64,
+    /// Always false. Exact graph operations fail instead of returning partial output.
+    truncated: bool,
 };
 
 /// User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes.
@@ -14616,7 +14624,7 @@ pub const GraphNodesResult = struct {
     kind: []const u8,
     /// Traversal result nodes; requested paths are stored on each node.
     nodes: []const GraphResultNode,
-    stats: GraphQueryStats,
+    stats: GraphResultStats,
 };
 
 pub const GraphNotEqualPredicate = struct {
@@ -14854,12 +14862,10 @@ pub const GraphPathWeightDomainError = struct {
     retryable: bool,
     /// Named shortest-path operation that encountered the incompatible edge weight.
     operation: []const u8,
-    /// Exact path algorithm whose numeric domain was violated.
-    mode: []const u8,
+    /// Canonical path objective selected by the named operation.
+    objective: GraphPathObjective,
     /// Stable machine-readable reason the weight was rejected.
     violation: []const u8,
-    /// Required edge-weight interval for exact execution in the selected mode.
-    allowed_range: []const u8,
     /// Stable user-facing guidance for correcting the graph or query.
     remediation: []const u8,
 };
@@ -14869,7 +14875,7 @@ pub const GraphPathsResult = struct {
     /// Stable discriminator for the graph result shape.
     kind: []const u8,
     paths: []const GraphPathResult,
-    stats: GraphQueryStats,
+    stats: GraphExactResultStats,
 };
 
 /// Named canonical graph operations. When graph_queries is present it must contain at least one operation. A request may contain at most 64 operations, of which at most eight may be MATCH operations. Keys use the versioned GraphIdentifier policy.
@@ -15045,13 +15051,6 @@ pub const GraphQueryParams = struct {
 
 /// Non-empty canonical graph results keyed exactly by graph_queries operation name. Keys use the versioned GraphIdentifier policy.
 pub const GraphQueryResults = std.json.ArrayHashMap(GraphResult);
-
-pub const GraphQueryStats = struct {
-    /// Number of primary result items returned (nodes, paths, rows, or aggregates).
-    returned_items: i64,
-    /// True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input.
-    truncated: bool,
-};
 
 /// Deprecated discriminator used by LegacyGraphQuery.
 pub const GraphQueryType = enum {
@@ -15508,6 +15507,14 @@ pub const GraphResultRefNodeSelector = struct {
 };
 
 pub const GraphResultRow = std.json.ArrayHashMap(GraphResultBinding);
+
+/// Completion statistics for a bounded graph result.
+pub const GraphResultStats = struct {
+    /// Number of primary result items returned (nodes, paths, rows, or aggregates).
+    returned_items: i64,
+    /// True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input.
+    truncated: bool,
+};
 
 /// Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive.
 pub const GraphReturn = union(enum) {
@@ -25460,10 +25467,10 @@ pub const QueryTemporarilyUnavailableError = struct {
 
 pub const QueryUnprocessableError = union(enum) {
     unsupported_hierarchy_grouping_error: *UnsupportedHierarchyGroupingError,
-    graph_path_weight_domain_error: *GraphPathWeightDomainError,
     graph_work_budget_exceeded_error: *GraphWorkBudgetExceededError,
     exact_sort_error: *ExactSortError,
     graph_distinct_budget_exceeded_error: *GraphDistinctBudgetExceededError,
+    graph_path_weight_domain_error: *GraphPathWeightDomainError,
     query_candidate_budget_exceeded_error: *QueryCandidateBudgetExceededError,
     graph_query_unsupported_error: *GraphQueryUnsupportedError,
     graph_match_operation_limit_exceeded_error: *GraphMatchOperationLimitExceededError,
@@ -25521,21 +25528,6 @@ pub const QueryUnprocessableError = union(enum) {
             "retryable",
             "operation",
             "mode",
-            "violation",
-            "allowed_range",
-            "remediation",
-        }) and
-            objectStringEquals(source.object, "error", "graph_path_weight_domain_error"))
-        {
-            if (try parseStructuralVariant(GraphPathWeightDomainError, allocator, source, options)) |parsed| return .{ .graph_path_weight_domain_error = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "status",
-            "error",
-            "message",
-            "retryable",
-            "operation",
-            "mode",
             "dimension",
             "maximum",
             "remediation",
@@ -25571,6 +25563,20 @@ pub const QueryUnprocessableError = union(enum) {
             objectStringEquals(source.object, "error", "graph_distinct_budget_exceeded"))
         {
             if (try parseStructuralVariant(GraphDistinctBudgetExceededError, allocator, source, options)) |parsed| return .{ .graph_distinct_budget_exceeded_error = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
+            "retryable",
+            "operation",
+            "objective",
+            "violation",
+            "remediation",
+        }) and
+            objectStringEquals(source.object, "error", "graph_path_weight_domain_error"))
+        {
+            if (try parseStructuralVariant(GraphPathWeightDomainError, allocator, source, options)) |parsed| return .{ .graph_path_weight_domain_error = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "error",
@@ -25646,10 +25652,10 @@ pub const QueryUnprocessableError = union(enum) {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
             .unsupported_hierarchy_grouping_error => |v| try jw.write(v.*),
-            .graph_path_weight_domain_error => |v| try jw.write(v.*),
             .graph_work_budget_exceeded_error => |v| try jw.write(v.*),
             .exact_sort_error => |v| try jw.write(v.*),
             .graph_distinct_budget_exceeded_error => |v| try jw.write(v.*),
+            .graph_path_weight_domain_error => |v| try jw.write(v.*),
             .query_candidate_budget_exceeded_error => |v| try jw.write(v.*),
             .graph_query_unsupported_error => |v| try jw.write(v.*),
             .graph_match_operation_limit_exceeded_error => |v| try jw.write(v.*),
@@ -25661,7 +25667,7 @@ pub const QueryUnprocessableError = union(enum) {
 };
 
 /// An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
-pub const RawQuery = OpenApiRawJson;
+pub const RawQuery = @import("antfly-json").RawObject;
 
 pub const RegexpQuery = struct {
     regexp: []const u8,
@@ -32457,97 +32463,6 @@ pub fn OpenApiOptionalNullable(comptime T: type) type {
         }
     };
 }
-
-/// Syntactically validated JSON retained as compact owned bytes.
-pub const OpenApiRawJson = struct {
-    bytes: []const u8,
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        var output: std.Io.Writer.Allocating = .init(allocator);
-        errdefer output.deinit();
-        var stringify: std.json.Stringify = .{ .writer = &output.writer };
-        copyValue(allocator, source, options, &stringify) catch |err| switch (err) {
-            error.WriteFailed => return error.OutOfMemory,
-            else => |parse_err| return parse_err,
-        };
-        return .{ .bytes = try output.toOwnedSlice() };
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
-        return .{ .bytes = try std.json.Stringify.valueAlloc(allocator, source, .{}) };
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginWriteRaw();
-        try jw.writer.writeAll(self.bytes);
-        jw.endWriteRaw();
-    }
-
-    fn copyValue(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions, jw: *std.json.Stringify) !void {
-        switch (try source.peekNextTokenType()) {
-            .object_begin => {
-                _ = try source.next();
-                try jw.beginObject();
-                while (try source.peekNextTokenType() != .object_end) {
-                    const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
-                    switch (token) {
-                        .string => |name| try jw.objectField(name),
-                        .allocated_string => |name| {
-                            defer allocator.free(name);
-                            try jw.objectField(name);
-                        },
-                        else => return error.UnexpectedToken,
-                    }
-                    try copyValue(allocator, source, options, jw);
-                }
-                _ = try source.next();
-                try jw.endObject();
-            },
-            .array_begin => {
-                _ = try source.next();
-                try jw.beginArray();
-                while (try source.peekNextTokenType() != .array_end) try copyValue(allocator, source, options, jw);
-                _ = try source.next();
-                try jw.endArray();
-            },
-            .string => switch (try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?)) {
-                .string => |value| try jw.write(value),
-                .allocated_string => |value| {
-                    defer allocator.free(value);
-                    try jw.write(value);
-                },
-                else => unreachable,
-            },
-            .number => switch (try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?)) {
-                .number => |value| try writeNumber(jw, value),
-                .allocated_number => |value| {
-                    defer allocator.free(value);
-                    try writeNumber(jw, value);
-                },
-                else => unreachable,
-            },
-            .true => {
-                _ = try source.next();
-                try jw.write(true);
-            },
-            .false => {
-                _ = try source.next();
-                try jw.write(false);
-            },
-            .null => {
-                _ = try source.next();
-                try jw.write(null);
-            },
-            .object_end, .array_end, .end_of_document => return error.UnexpectedToken,
-        }
-    }
-
-    fn writeNumber(jw: *std.json.Stringify, value: []const u8) !void {
-        try jw.beginWriteRaw();
-        try jw.writer.writeAll(value);
-        jw.endWriteRaw();
-    }
-};
 
 /// Parse an OpenAPI object without materializing a second JSON tree while
 /// rejecting explicit null for optional properties whose schemas are non-nullable.

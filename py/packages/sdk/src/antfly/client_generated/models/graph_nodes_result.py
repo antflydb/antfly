@@ -8,8 +8,8 @@ from attrs import define as _attrs_define
 from ..models.graph_nodes_result_kind import GraphNodesResultKind
 
 if TYPE_CHECKING:
-    from ..models.graph_query_stats import GraphQueryStats
     from ..models.graph_result_node import GraphResultNode
+    from ..models.graph_result_stats import GraphResultStats
 
 
 T = TypeVar("T", bound="GraphNodesResult")
@@ -22,12 +22,12 @@ class GraphNodesResult:
     Attributes:
         kind (GraphNodesResultKind): Stable discriminator for the graph result shape.
         nodes (list[GraphResultNode]): Traversal result nodes; requested paths are stored on each node.
-        stats (GraphQueryStats):
+        stats (GraphResultStats): Completion statistics for a bounded graph result.
     """
 
     kind: GraphNodesResultKind
     nodes: list[GraphResultNode]
-    stats: GraphQueryStats
+    stats: GraphResultStats
 
     def to_dict(self) -> dict[str, Any]:
         kind = self.kind.value
@@ -53,8 +53,8 @@ class GraphNodesResult:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.graph_query_stats import GraphQueryStats
         from ..models.graph_result_node import GraphResultNode
+        from ..models.graph_result_stats import GraphResultStats
 
         d = dict(src_dict)
         kind = GraphNodesResultKind(d.pop("kind"))
@@ -66,7 +66,7 @@ class GraphNodesResult:
 
             nodes.append(nodes_item)
 
-        stats = GraphQueryStats.from_dict(d.pop("stats"))
+        stats = GraphResultStats.from_dict(d.pop("stats"))
 
         graph_nodes_result = cls(
             kind=kind,

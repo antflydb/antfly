@@ -366,6 +366,7 @@ from .graph_document_term_range_body import GraphDocumentTermRangeBody
 from .graph_document_term_range_filter import GraphDocumentTermRangeFilter
 from .graph_document_wildcard_filter import GraphDocumentWildcardFilter
 from .graph_edge_weight_range import GraphEdgeWeightRange
+from .graph_exact_result_stats import GraphExactResultStats
 from .graph_identity_node_selector import GraphIdentityNodeSelector
 from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
@@ -405,7 +406,6 @@ from .graph_path_result import GraphPathResult
 from .graph_path_result_document import GraphPathResultDocument
 from .graph_path_weight_domain_error import GraphPathWeightDomainError
 from .graph_path_weight_domain_error_error import GraphPathWeightDomainErrorError
-from .graph_path_weight_domain_error_mode import GraphPathWeightDomainErrorMode
 from .graph_path_weight_domain_error_status import GraphPathWeightDomainErrorStatus
 from .graph_path_weight_domain_error_violation import GraphPathWeightDomainErrorViolation
 from .graph_paths_result import GraphPathsResult
@@ -414,7 +414,6 @@ from .graph_queries import GraphQueries
 from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
 from .graph_query_results import GraphQueryResults
-from .graph_query_stats import GraphQueryStats
 from .graph_query_type import GraphQueryType
 from .graph_query_unsupported_error import GraphQueryUnsupportedError
 from .graph_query_unsupported_error_error import GraphQueryUnsupportedErrorError
@@ -429,6 +428,7 @@ from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
 from .graph_result_ref_node_selector import GraphResultRefNodeSelector
 from .graph_result_row import GraphResultRow
+from .graph_result_stats import GraphResultStats
 from .graph_row_count_aggregate import GraphRowCountAggregate
 from .graph_row_count_target import GraphRowCountTarget
 from .graph_shortest_path import GraphShortestPath
@@ -1340,6 +1340,7 @@ __all__ = (
     "GraphDocumentTermRangeFilter",
     "GraphDocumentWildcardFilter",
     "GraphEdgeWeightRange",
+    "GraphExactResultStats",
     "GraphIdentityNodeSelector",
     "GraphIndexConfig",
     "GraphIndexStats",
@@ -1381,14 +1382,12 @@ __all__ = (
     "GraphPathsResultKind",
     "GraphPathWeightDomainError",
     "GraphPathWeightDomainErrorError",
-    "GraphPathWeightDomainErrorMode",
     "GraphPathWeightDomainErrorStatus",
     "GraphPathWeightDomainErrorViolation",
     "GraphQueries",
     "GraphQueryParams",
     "GraphQueryParamsAlgorithmParams",
     "GraphQueryResults",
-    "GraphQueryStats",
     "GraphQueryType",
     "GraphQueryUnsupportedError",
     "GraphQueryUnsupportedErrorError",
@@ -1403,6 +1402,7 @@ __all__ = (
     "GraphResultNodeEvidence",
     "GraphResultRefNodeSelector",
     "GraphResultRow",
+    "GraphResultStats",
     "GraphRowCountAggregate",
     "GraphRowCountTarget",
     "GraphShortestPath",

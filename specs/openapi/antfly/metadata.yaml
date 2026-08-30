@@ -2031,7 +2031,7 @@ components:
     GraphPathWeightDomainError:
       type: object
       additionalProperties: false
-      required: [status, error, message, retryable, operation, mode, violation, allowed_range, remediation]
+      required: [status, error, message, retryable, operation, objective, violation, remediation]
       properties:
         status:
           type: integer
@@ -2048,17 +2048,13 @@ components:
         operation:
           type: string
           description: Named shortest-path operation that encountered the incompatible edge weight.
-        mode:
-          type: string
-          enum: [min_weight, max_weight, weighted_path]
-          description: Exact path algorithm whose numeric domain was violated.
+        objective:
+          $ref: "indexes.yaml#/components/schemas/GraphPathObjective"
+          description: Canonical path objective selected by the named operation.
         violation:
           type: string
           enum: [negative_edge_weight, edge_weight_above_one, path_sum_overflow]
           description: Stable machine-readable reason the weight was rejected.
-        allowed_range:
-          type: string
-          description: Required edge-weight interval for exact execution in the selected mode.
         remediation:
           type: string
           description: Stable user-facing guidance for correcting the graph or query.
@@ -6906,7 +6902,7 @@ components:
       oneOf:
         - $ref: "query.yaml#/components/schemas/Query"
       x-go-type: json.RawMessage
-      x-zig-type: raw_json
+      x-zig-type: raw_json_object
       description: An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
 
     HierarchyProjection:

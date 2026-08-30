@@ -459,7 +459,7 @@ pub fn executeGraphQueriesWithSets(
             request_budgets,
         ) catch |err| {
             if (graph_path_weight_diagnostic.isDomainError(err)) {
-                graph_path_weight_diagnostic.record(graph_queries[query_index].name, err);
+                graph_path_weight_diagnostic.record(graph_queries[query_index].name, graph_queries[query_index].query, err);
             }
             if (err == error.GraphWorkBudgetExceeded) {
                 if (request_work_budget.exhaustion()) |exhaustion| {

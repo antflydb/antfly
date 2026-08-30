@@ -21,6 +21,9 @@
         .httpx = .{
             .path = "../httpx",
         },
+        .antfly_json = .{
+            .path = "../json",
+        },
     },
     .paths = .{
         "build.zig",

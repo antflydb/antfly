@@ -7,10 +7,10 @@
 const std = @import("std");
 const graph_query = @import("query.zig");
 
-pub const Mode = enum {
-    min_weight,
-    max_weight,
-    weighted_path,
+pub const Objective = enum {
+    min_hops,
+    min_weight_sum,
+    max_weight_product,
 };
 
 pub const Violation = enum {
@@ -21,9 +21,8 @@ pub const Violation = enum {
 
 pub const Diagnostic = struct {
     operation: []const u8,
-    mode: Mode,
+    objective: Objective,
     violation: Violation,
-    allowed_range: []const u8,
 };
 
 pub const Storage = struct {
@@ -64,36 +63,28 @@ pub fn isDomainError(err: anyerror) bool {
         err == error.GraphPathWeightOverflow;
 }
 
-pub fn record(operation: []const u8, err: anyerror) void {
+pub fn record(operation: []const u8, query: graph_query.GraphQuery, err: anyerror) void {
     const storage = active_storage orelse return;
     if (operation.len == 0 or operation.len > storage.operation_buf.len or !isDomainError(err)) {
         storage.diagnostic = null;
         return;
     }
     @memcpy(storage.operation_buf[0..operation.len], operation);
-    const mode: Mode = if (err == error.GraphMinWeightDomainViolation)
-        .min_weight
-    else if (err == error.GraphMaxWeightDomainViolation)
-        .max_weight
-    else
-        .weighted_path;
+    const objective: Objective = switch (query.params.weight_mode) {
+        .min_hops => .min_hops,
+        .min_weight => .min_weight_sum,
+        .max_weight => .max_weight_product,
+    };
     const violation: Violation = if (err == error.GraphMinWeightDomainViolation)
         .negative_edge_weight
     else if (err == error.GraphMaxWeightDomainViolation)
         .edge_weight_above_one
     else
         .path_sum_overflow;
-    const allowed_range: []const u8 = if (err == error.GraphMinWeightDomainViolation)
-        "[0,+inf) with a finite path sum"
-    else if (err == error.GraphMaxWeightDomainViolation)
-        "[0,1]"
-    else
-        "finite f64";
     storage.diagnostic = .{
         .operation = storage.operation_buf[0..operation.len],
-        .mode = mode,
+        .objective = objective,
         .violation = violation,
-        .allowed_range = allowed_range,
     };
 }
 
@@ -101,10 +92,14 @@ test "path weight overflow has a stable public diagnostic" {
     var storage: Storage = .{};
     const binding = bind(&storage);
     defer binding.deinit();
-    record("route", error.GraphPathWeightOverflow);
+    record("route", .{
+        .query_type = .neighbors,
+        .index_name = "relationships",
+        .start_nodes = .{ .keys = &.{} },
+        .params = .{ .weight_mode = .min_weight },
+    }, error.GraphPathWeightOverflow);
     const diagnostic = take().?;
     try std.testing.expectEqualStrings("route", diagnostic.operation);
-    try std.testing.expectEqual(Mode.weighted_path, diagnostic.mode);
+    try std.testing.expectEqual(Objective.min_weight_sum, diagnostic.objective);
     try std.testing.expectEqual(Violation.path_sum_overflow, diagnostic.violation);
-    try std.testing.expectEqualStrings("finite f64", diagnostic.allowed_range);
 }

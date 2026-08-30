@@ -855,23 +855,29 @@ pub fn graphWorkBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
 }
 
 pub fn graphPathWeightDomainErrorBody(alloc: std.mem.Allocator) ![]u8 {
-    const diagnostic = graph_path_weight_diagnostic.take() orelse graph_path_weight_diagnostic.Diagnostic{
-        .operation = "$request",
-        .mode = .weighted_path,
-        .violation = .path_sum_overflow,
-        .allowed_range = "mode-dependent",
-    };
+    const diagnostic = graph_path_weight_diagnostic.take() orelse
+        return error.MissingGraphPathWeightDiagnostic;
     return try std.json.Stringify.valueAlloc(alloc, .{
         .status = @as(u16, 422),
         .@"error" = "graph_path_weight_domain_error",
         .message = "an edge weight or accumulated path score is outside the path algorithm's exact numeric domain",
         .retryable = false,
         .operation = diagnostic.operation,
-        .mode = @tagName(diagnostic.mode),
+        .objective = @tagName(diagnostic.objective),
         .violation = @tagName(diagnostic.violation),
-        .allowed_range = diagnostic.allowed_range,
         .remediation = "normalize edge weights or select a compatible path weight mode",
     }, .{});
+}
+
+test "graph path weight error body fails closed without its diagnostic" {
+    var storage: graph_path_weight_diagnostic.Storage = .{};
+    const binding = graph_path_weight_diagnostic.bind(&storage);
+    defer binding.deinit();
+    graph_path_weight_diagnostic.reset();
+    try std.testing.expectError(
+        error.MissingGraphPathWeightDiagnostic,
+        graphPathWeightDomainErrorBody(std.testing.allocator),
+    );
 }
 
 pub fn graphDistinctBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
@@ -3838,7 +3844,12 @@ test "public table query handler maps exact graph execution failures" {
                     return error.GraphWorkBudgetExceeded;
                 },
                 .path_weight_domain => {
-                    graph_path_weight_diagnostic.record("strongest", error.GraphMaxWeightDomainViolation);
+                    graph_path_weight_diagnostic.record("strongest", .{
+                        .query_type = .neighbors,
+                        .index_name = "relationships",
+                        .start_nodes = .{ .keys = &.{} },
+                        .params = .{ .weight_mode = .max_weight },
+                    }, error.GraphMaxWeightDomainViolation);
                     return error.GraphMaxWeightDomainViolation;
                 },
                 .distinct_budget => {
@@ -3918,8 +3929,7 @@ test "public table query handler maps exact graph execution failures" {
     };
     try std.testing.expect(!weight_error.retryable);
     try std.testing.expectEqualStrings("strongest", weight_error.operation);
-    try std.testing.expectEqualStrings("max_weight", weight_error.mode);
-    try std.testing.expectEqualStrings("[0,1]", weight_error.allowed_range);
+    try std.testing.expectEqual(.max_weight_product, weight_error.objective);
 
     kind = .distinct_budget;
     var resp = try handleTableQueryRequest(

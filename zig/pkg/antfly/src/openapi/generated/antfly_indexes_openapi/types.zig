@@ -3887,7 +3887,7 @@ pub const GraphAggregatesResult = struct {
     kind: []const u8,
     /// Keys are the GraphIdentifiers selected by the corresponding aggregate return projection.
     aggregates: std.json.ArrayHashMap(GraphAggregateValue),
-    stats: GraphQueryStats,
+    stats: GraphExactResultStats,
 };
 
 pub const GraphAggregatesReturn = struct {
@@ -4243,7 +4243,7 @@ pub const GraphBindingsResult = struct {
     /// Stable discriminator for the graph result shape.
     kind: []const u8,
     rows: []const GraphResultRow,
-    stats: GraphQueryStats,
+    stats: GraphResultStats,
 };
 
 pub const GraphBindingsReturn = struct {
@@ -4867,6 +4867,14 @@ pub const GraphEdgeWeightRange = struct {
         }
         try jw.endObject();
     }
+};
+
+/// Completion statistics for a graph result that is exact or fails without producing a result.
+pub const GraphExactResultStats = struct {
+    /// Number of primary result items returned (paths or aggregates).
+    returned_items: i64,
+    /// Always false. Exact graph operations fail instead of returning partial output.
+    truncated: bool,
 };
 
 pub const GraphIdentityNodeSelector = struct {
@@ -5623,7 +5631,7 @@ pub const GraphNodesResult = struct {
     kind: []const u8,
     /// Traversal result nodes; requested paths are stored on each node.
     nodes: []const GraphResultNode,
-    stats: GraphQueryStats,
+    stats: GraphResultStats,
 };
 
 pub const GraphNotEqualPredicate = struct {
@@ -5859,7 +5867,7 @@ pub const GraphPathsResult = struct {
     /// Stable discriminator for the graph result shape.
     kind: []const u8,
     paths: []const GraphPathResult,
-    stats: GraphQueryStats,
+    stats: GraphExactResultStats,
 };
 
 /// Named canonical graph operations. When graph_queries is present it must contain at least one operation. A request may contain at most 64 operations, of which at most eight may be MATCH operations. Keys use the versioned GraphIdentifier policy.
@@ -6035,13 +6043,6 @@ pub const GraphQueryParams = struct {
 
 /// Non-empty canonical graph results keyed exactly by graph_queries operation name. Keys use the versioned GraphIdentifier policy.
 pub const GraphQueryResults = std.json.ArrayHashMap(GraphResult);
-
-pub const GraphQueryStats = struct {
-    /// Number of primary result items returned (nodes, paths, rows, or aggregates).
-    returned_items: i64,
-    /// True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input.
-    truncated: bool,
-};
 
 /// Deprecated discriminator used by LegacyGraphQuery.
 pub const GraphQueryType = enum {
@@ -6394,6 +6395,14 @@ pub const GraphResultRefNodeSelector = struct {
 };
 
 pub const GraphResultRow = std.json.ArrayHashMap(GraphResultBinding);
+
+/// Completion statistics for a bounded graph result.
+pub const GraphResultStats = struct {
+    /// Number of primary result items returned (nodes, paths, rows, or aggregates).
+    returned_items: i64,
+    /// True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input.
+    truncated: bool,
+};
 
 /// Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive.
 pub const GraphReturn = union(enum) {

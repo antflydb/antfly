@@ -8,8 +8,8 @@ from attrs import define as _attrs_define
 from ..models.graph_bindings_result_kind import GraphBindingsResultKind
 
 if TYPE_CHECKING:
-    from ..models.graph_query_stats import GraphQueryStats
     from ..models.graph_result_row import GraphResultRow
+    from ..models.graph_result_stats import GraphResultStats
 
 
 T = TypeVar("T", bound="GraphBindingsResult")
@@ -23,12 +23,12 @@ class GraphBindingsResult:
         Attributes:
             kind (GraphBindingsResultKind): Stable discriminator for the graph result shape.
             rows (list[GraphResultRow]):
-            stats (GraphQueryStats):
+            stats (GraphResultStats): Completion statistics for a bounded graph result.
     """
 
     kind: GraphBindingsResultKind
     rows: list[GraphResultRow]
-    stats: GraphQueryStats
+    stats: GraphResultStats
 
     def to_dict(self) -> dict[str, Any]:
         kind = self.kind.value
@@ -54,8 +54,8 @@ class GraphBindingsResult:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.graph_query_stats import GraphQueryStats
         from ..models.graph_result_row import GraphResultRow
+        from ..models.graph_result_stats import GraphResultStats
 
         d = dict(src_dict)
         kind = GraphBindingsResultKind(d.pop("kind"))
@@ -67,7 +67,7 @@ class GraphBindingsResult:
 
             rows.append(rows_item)
 
-        stats = GraphQueryStats.from_dict(d.pop("stats"))
+        stats = GraphResultStats.from_dict(d.pop("stats"))
 
         graph_bindings_result = cls(
             kind=kind,

@@ -2040,7 +2040,7 @@ fn executeCrossRangeOnce(
             &request_distinct_budget,
         ) catch |err| {
             if (graph_path_weight_diagnostic.isDomainError(err)) {
-                graph_path_weight_diagnostic.record(graph_query.name, err);
+                graph_path_weight_diagnostic.record(graph_query.name, graph_query.query, err);
             }
             if (err == error.GraphWorkBudgetExceeded) {
                 if (request_work_budget.exhaustion()) |exhaustion| {

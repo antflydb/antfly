@@ -18,11 +18,13 @@ const simd_stage1 = @import("simd_stage1.zig");
 const _skip_tape = @import("skip_tape.zig");
 const simd_typed = @import("simd_typed.zig");
 const simd_value = @import("simd_value.zig");
+const raw_mod = @import("raw.zig");
 
 pub const testing = @import("testing.zig");
 
 test {
     _ = testing;
+    _ = raw_mod;
 }
 
 const Allocator = std.mem.Allocator;
@@ -31,6 +33,9 @@ pub const ObjectMap = std.json.ObjectMap;
 pub const Array = std.json.Array;
 pub const Value = std.json.Value;
 pub const ArrayHashMap = std.json.ArrayHashMap;
+pub const RawValue = raw_mod.RawValue;
+pub const RawObject = raw_mod.RawObject;
+pub const max_raw_nesting = raw_mod.max_raw_nesting;
 
 pub const Scanner = std.json.Scanner;
 pub const validate = std.json.validate;

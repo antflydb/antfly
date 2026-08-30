@@ -478,13 +478,13 @@ type graphBindingNodeValidation struct {
 type graphBindingsResultValidation struct {
 	Kind  GraphBindingsResultKind                  `json:"kind"`
 	Rows  []map[string]*graphBindingNodeValidation `json:"rows"`
-	Stats GraphQueryStats                          `json:"stats"`
+	Stats GraphResultStats                         `json:"stats"`
 }
 
 type graphAggregatesResultValidation struct {
 	Aggregates map[string]GraphAggregateValue `json:"aggregates"`
 	Kind       GraphAggregatesResultKind      `json:"kind"`
-	Stats      GraphQueryStats                `json:"stats"`
+	Stats      GraphExactResultStats          `json:"stats"`
 }
 
 type graphPathEdgeValidation struct {
@@ -519,7 +519,7 @@ type graphResultNodeValidation struct {
 type graphNodesResultValidation struct {
 	Kind  GraphNodesResultKind        `json:"kind"`
 	Nodes []graphResultNodeValidation `json:"nodes"`
-	Stats GraphQueryStats             `json:"stats"`
+	Stats GraphResultStats            `json:"stats"`
 }
 
 type graphPathResultValidation struct {
@@ -530,7 +530,7 @@ type graphPathResultValidation struct {
 type graphPathsResultValidation struct {
 	Kind  GraphPathsResultKind        `json:"kind"`
 	Paths []graphPathResultValidation `json:"paths"`
-	Stats GraphQueryStats             `json:"stats"`
+	Stats GraphExactResultStats       `json:"stats"`
 }
 
 func validateCanonicalGraphResultPayload(

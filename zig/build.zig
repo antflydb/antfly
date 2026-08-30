@@ -1730,6 +1730,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Raw OpenAPI schema overrides resolve to the shared validated JSON
+    // runtime rather than emitting a private implementation per module.
+    public_openapi_mod.addImport("antfly-json", json_mod);
+    client_openapi_mod.addImport("antfly-json", json_mod);
+    metadata_openapi_mod.addImport("antfly-json", json_mod);
     const toon_mod = b.addModule("antfly_toon", .{
         .root_source_file = b.path("lib/toon/src/mod.zig"),
         .target = target,
@@ -6291,6 +6296,8 @@ pub fn build(b: *std.Build) void {
             "public create index exposes unsupported deployment capability",
             "public create index returns normalized created resource",
             "public table query handler maps doc identity unavailable errors",
+            "public table query handler maps exact graph execution failures",
+            "graph path weight error body fails closed without its diagnostic",
             "public table query handler preserves structured filter and hierarchy diagnostics",
             "public table query handler preserves retryable failure status",
             "public table query handler maps HA read gate errors",

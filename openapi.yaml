@@ -8687,9 +8687,8 @@ components:
         - message
         - retryable
         - operation
-        - mode
+        - objective
         - violation
-        - allowed_range
         - remediation
       properties:
         status:
@@ -8710,13 +8709,9 @@ components:
         operation:
           type: string
           description: Named shortest-path operation that encountered the incompatible edge weight.
-        mode:
-          type: string
-          enum:
-            - min_weight
-            - max_weight
-            - weighted_path
-          description: Exact path algorithm whose numeric domain was violated.
+        objective:
+          $ref: '#/components/schemas/GraphPathObjective'
+          description: Canonical path objective selected by the named operation.
         violation:
           type: string
           enum:
@@ -8724,9 +8719,6 @@ components:
             - edge_weight_above_one
             - path_sum_overflow
           description: Stable machine-readable reason the weight was rejected.
-        allowed_range:
-          type: string
-          description: Required edge-weight interval for exact execution in the selected mode.
         remediation:
           type: string
           description: Stable user-facing guidance for correcting the graph or query.
@@ -14136,7 +14128,7 @@ components:
       oneOf:
         - $ref: '#/components/schemas/Query'
       x-go-type: json.RawMessage
-      x-zig-type: raw_json
+      x-zig-type: raw_json_object
       description: An Antfly query expression retained as syntactically validated JSON and compiled by
         the query engine.
     HierarchyProjection:
@@ -17390,6 +17382,21 @@ components:
             are applied as additional narrowing.
       required:
         - name
+    GraphPathObjective:
+      type: string
+      enum:
+        - min_hops
+        - min_weight_sum
+        - max_weight_product
+      description: >
+        Objective used to rank graph paths:
+
+        - min_hops: Minimize the number of edges.
+
+        - min_weight_sum: Minimize the sum of finite non-negative edge weights.
+
+        - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to
+        be in [0,1].
     EnrichmentKind:
       type: string
       enum:
@@ -24274,21 +24281,6 @@ components:
           pattern: .*\S.*
         traverse:
           $ref: '#/components/schemas/GraphTraversal'
-    GraphPathObjective:
-      type: string
-      enum:
-        - min_hops
-        - min_weight_sum
-        - max_weight_product
-      description: >
-        Objective used to rank graph paths:
-
-        - min_hops: Minimize the number of edges.
-
-        - min_weight_sum: Minimize the sum of finite non-negative edge weights.
-
-        - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to
-        be in [0,1].
     GraphShortestPath:
       type: object
       additionalProperties: false
@@ -24760,12 +24752,13 @@ components:
         $ref: '#/components/schemas/GraphResultBinding'
       x-antfly-property-name-schema:
         $ref: '#/components/schemas/GraphIdentifier'
-    GraphQueryStats:
+    GraphResultStats:
       type: object
       additionalProperties: false
       required:
         - returned_items
         - truncated
+      description: Completion statistics for a bounded graph result.
       properties:
         returned_items:
           type: integer
@@ -24799,7 +24792,7 @@ components:
           items:
             $ref: '#/components/schemas/GraphResultRow'
         stats:
-          $ref: '#/components/schemas/GraphQueryStats'
+          $ref: '#/components/schemas/GraphResultStats'
     GraphAggregateValue:
       type: object
       additionalProperties: false
@@ -24816,6 +24809,26 @@ components:
           enum:
             - true
           description: Always true. Exact aggregate execution fails instead of returning a partial value.
+    GraphExactResultStats:
+      type: object
+      additionalProperties: false
+      required:
+        - returned_items
+        - truncated
+      description: Completion statistics for a graph result that is exact or fails without producing a
+        result.
+      properties:
+        returned_items:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 10000
+          description: Number of primary result items returned (paths or aggregates).
+        truncated:
+          type: boolean
+          enum:
+            - false
+          description: Always false. Exact graph operations fail instead of returning partial output.
     GraphAggregatesResult:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -24841,7 +24854,7 @@ components:
             $ref: '#/components/schemas/GraphIdentifier'
           description: Keys are the GraphIdentifiers selected by the corresponding aggregate return projection.
         stats:
-          $ref: '#/components/schemas/GraphQueryStats'
+          $ref: '#/components/schemas/GraphExactResultStats'
     GraphPathEdgeDirection:
       type: string
       enum:
@@ -24966,7 +24979,7 @@ components:
             $ref: '#/components/schemas/GraphResultNode'
           description: Traversal result nodes; requested paths are stored on each node.
         stats:
-          $ref: '#/components/schemas/GraphQueryStats'
+          $ref: '#/components/schemas/GraphResultStats'
     GraphPath:
       type: object
       additionalProperties: false
@@ -25048,7 +25061,7 @@ components:
           items:
             $ref: '#/components/schemas/GraphPathResult'
         stats:
-          $ref: '#/components/schemas/GraphQueryStats'
+          $ref: '#/components/schemas/GraphExactResultStats'
     GraphResult:
       description: A canonical result produced by graph_queries. Bindings, exact aggregates, and node/path
         results use required stable discriminators.

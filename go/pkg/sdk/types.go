@@ -318,7 +318,8 @@ type (
 	GraphPathsResultKind           = oapi.GraphPathsResultKind
 	LegacyGraphSearchResult        = oapi.LegacyGraphSearchResult
 	LegacyGraphSearchResultKind    = oapi.LegacyGraphSearchResultKind
-	GraphQueryStats                = oapi.GraphQueryStats
+	GraphResultStats               = oapi.GraphResultStats
+	GraphExactResultStats          = oapi.GraphExactResultStats
 	GraphNodeSelector              = oapi.GraphNodeSelector
 	GraphKeyNodeSelector           = oapi.GraphKeyNodeSelector
 	GraphIdentityNodeSelector      = oapi.GraphIdentityNodeSelector

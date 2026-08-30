@@ -3231,7 +3231,7 @@ pub const HttpHandler = struct {
                     .{ named_query.name, graph_query_diagnostic.feature(named_query.query), err },
                 );
                 if (graph_path_weight_diagnostic.isDomainError(err)) {
-                    graph_path_weight_diagnostic.record(named_query.name, err);
+                    graph_path_weight_diagnostic.record(named_query.name, named_query.query, err);
                 }
                 if (err == error.GraphWorkBudgetExceeded) {
                     if (request_work_budget.exhaustion()) |exhaustion| {

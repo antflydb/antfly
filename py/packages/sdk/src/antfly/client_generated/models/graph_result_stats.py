@@ -5,12 +5,13 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
-T = TypeVar("T", bound="GraphQueryStats")
+T = TypeVar("T", bound="GraphResultStats")
 
 
 @_attrs_define
-class GraphQueryStats:
-    """
+class GraphResultStats:
+    """Completion statistics for a bounded graph result.
+
     Attributes:
         returned_items (int): Number of primary result items returned (nodes, paths, rows, or aggregates).
         truncated (bool): True when execution stopped before exhaustive enumeration; an unbounded result reference
@@ -43,9 +44,9 @@ class GraphQueryStats:
 
         truncated = d.pop("truncated")
 
-        graph_query_stats = cls(
+        graph_result_stats = cls(
             returned_items=returned_items,
             truncated=truncated,
         )
 
-        return graph_query_stats
+        return graph_result_stats

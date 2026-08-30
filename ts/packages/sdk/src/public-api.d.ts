@@ -3145,18 +3145,13 @@ export interface components {
             retryable: false;
             /** @description Named shortest-path operation that encountered the incompatible edge weight. */
             operation: string;
-            /**
-             * @description Exact path algorithm whose numeric domain was violated.
-             * @enum {string}
-             */
-            mode: "min_weight" | "max_weight" | "weighted_path";
+            /** @description Canonical path objective selected by the named operation. */
+            objective: components["schemas"]["GraphPathObjective"];
             /**
              * @description Stable machine-readable reason the weight was rejected.
              * @enum {string}
              */
             violation: "negative_edge_weight" | "edge_weight_above_one" | "path_sum_overflow";
-            /** @description Required edge-weight interval for exact execution in the selected mode. */
-            allowed_range: string;
             /** @description Stable user-facing guidance for correcting the graph or query. */
             remediation: string;
         };
@@ -8564,6 +8559,14 @@ export interface components {
             } | null;
         };
         /**
+         * @description Objective used to rank graph paths:
+         *     - min_hops: Minimize the number of edges.
+         *     - min_weight_sum: Minimize the sum of finite non-negative edge weights.
+         *     - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to be in [0,1].
+         * @enum {string}
+         */
+        GraphPathObjective: "min_hops" | "min_weight_sum" | "max_weight_product";
+        /**
          * @description Managed generated artifact kind.
          * @enum {string}
          */
@@ -12603,14 +12606,6 @@ export interface components {
             index: string;
             traverse: components["schemas"]["GraphTraversal"];
         };
-        /**
-         * @description Objective used to rank graph paths:
-         *     - min_hops: Minimize the number of edges.
-         *     - min_weight_sum: Minimize the sum of finite non-negative edge weights.
-         *     - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to be in [0,1].
-         * @enum {string}
-         */
-        GraphPathObjective: "min_hops" | "min_weight_sum" | "max_weight_product";
         /** @description Find the best path from `from` to `to` in the requested stored-edge direction. */
         GraphShortestPath: {
             from: components["schemas"]["GraphPathEndpoint"];
@@ -12844,7 +12839,8 @@ export interface components {
         GraphResultRow: {
             [key: string]: components["schemas"]["GraphResultBinding"];
         };
-        GraphQueryStats: {
+        /** @description Completion statistics for a bounded graph result. */
+        GraphResultStats: {
             /**
              * Format: uint64
              * @description Number of primary result items returned (nodes, paths, rows, or aggregates).
@@ -12861,7 +12857,7 @@ export interface components {
              */
             kind: "bindings";
             rows: components["schemas"]["GraphResultRow"][];
-            stats: components["schemas"]["GraphQueryStats"];
+            stats: components["schemas"]["GraphResultStats"];
         };
         GraphAggregateValue: {
             /** @description Decimal string so counts remain lossless in JavaScript. */
@@ -12871,6 +12867,19 @@ export interface components {
              * @enum {boolean}
              */
             exact: true;
+        };
+        /** @description Completion statistics for a graph result that is exact or fails without producing a result. */
+        GraphExactResultStats: {
+            /**
+             * Format: uint64
+             * @description Number of primary result items returned (paths or aggregates).
+             */
+            returned_items: number;
+            /**
+             * @description Always false. Exact graph operations fail instead of returning partial output.
+             * @enum {boolean}
+             */
+            truncated: false;
         };
         /** @description Complete exact aggregates from a canonical graph MATCH query. */
         GraphAggregatesResult: {
@@ -12883,7 +12892,7 @@ export interface components {
             aggregates: {
                 [key: string]: components["schemas"]["GraphAggregateValue"];
             };
-            stats: components["schemas"]["GraphQueryStats"];
+            stats: components["schemas"]["GraphExactResultStats"];
         };
         /**
          * @description Physical stored-edge orientation relative to this path edge's `from` endpoint. `out` means the stored relationship points from `from` to `to`; `in` means the path traversed a relationship stored from `to` to `from`. This keeps paths lossless when a `both` query encounters reciprocal relationships.
@@ -12937,7 +12946,7 @@ export interface components {
             kind: "nodes";
             /** @description Traversal result nodes; requested paths are stored on each node. */
             nodes: components["schemas"]["GraphResultNode"][];
-            stats: components["schemas"]["GraphQueryStats"];
+            stats: components["schemas"]["GraphResultStats"];
         };
         /** @description An ordered canonical graph path with table-qualified node identities and a self-describing ranking score. */
         GraphPath: {
@@ -12974,7 +12983,7 @@ export interface components {
              */
             kind: "paths";
             paths: components["schemas"]["GraphPathResult"][];
-            stats: components["schemas"]["GraphQueryStats"];
+            stats: components["schemas"]["GraphExactResultStats"];
         };
         /** @description A canonical result produced by graph_queries. Bindings, exact aggregates, and node/path results use required stable discriminators. */
         GraphResult: components["schemas"]["GraphBindingsResult"] | components["schemas"]["GraphAggregatesResult"] | components["schemas"]["GraphNodesResult"] | components["schemas"]["GraphPathsResult"];

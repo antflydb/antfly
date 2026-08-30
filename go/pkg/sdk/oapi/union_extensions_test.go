@@ -223,7 +223,7 @@ func TestQueryUnprocessableErrorSelectsStrictGraphArm(t *testing.T) {
 		t.Fatalf("expected missing generated required field to be rejected, got %v", err)
 	}
 
-	if err := json.Unmarshal([]byte(`{"status":422,"error":"graph_path_weight_domain_error","message":"bad weight","retryable":false,"operation":"route","mode":"weight_sum","violation":"path_sum_overflow","allowed_range":"finite f64","remediation":"normalize weights"}`), &union); err != nil {
+	if err := json.Unmarshal([]byte(`{"status":422,"error":"graph_path_weight_domain_error","message":"bad weight","retryable":false,"operation":"route","objective":"weight_sum","violation":"path_sum_overflow","remediation":"normalize weights"}`), &union); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := union.DecodeStrictGraphError(); err == nil || !strings.Contains(err.Error(), "invalid enum") {

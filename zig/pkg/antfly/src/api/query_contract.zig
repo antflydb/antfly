@@ -5527,7 +5527,7 @@ fn buildGraphQueryResults(
                 response_format,
             )) catch |err| {
             if (graph_path_weight_diagnostic.isDomainError(err)) {
-                graph_path_weight_diagnostic.record(graph_query.name, err);
+                graph_path_weight_diagnostic.record(graph_query.name, graph_query.query, err);
             }
             return err;
         };

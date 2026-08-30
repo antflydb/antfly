@@ -9,7 +9,7 @@ from ..models.graph_aggregates_result_kind import GraphAggregatesResultKind
 
 if TYPE_CHECKING:
     from ..models.graph_aggregates_result_aggregates import GraphAggregatesResultAggregates
-    from ..models.graph_query_stats import GraphQueryStats
+    from ..models.graph_exact_result_stats import GraphExactResultStats
 
 
 T = TypeVar("T", bound="GraphAggregatesResult")
@@ -23,12 +23,13 @@ class GraphAggregatesResult:
         kind (GraphAggregatesResultKind): Stable discriminator for the graph result shape.
         aggregates (GraphAggregatesResultAggregates): Keys are the GraphIdentifiers selected by the corresponding
             aggregate return projection.
-        stats (GraphQueryStats):
+        stats (GraphExactResultStats): Completion statistics for a graph result that is exact or fails without producing
+            a result.
     """
 
     kind: GraphAggregatesResultKind
     aggregates: GraphAggregatesResultAggregates
-    stats: GraphQueryStats
+    stats: GraphExactResultStats
 
     def to_dict(self) -> dict[str, Any]:
         kind = self.kind.value
@@ -52,14 +53,14 @@ class GraphAggregatesResult:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.graph_aggregates_result_aggregates import GraphAggregatesResultAggregates
-        from ..models.graph_query_stats import GraphQueryStats
+        from ..models.graph_exact_result_stats import GraphExactResultStats
 
         d = dict(src_dict)
         kind = GraphAggregatesResultKind(d.pop("kind"))
 
         aggregates = GraphAggregatesResultAggregates.from_dict(d.pop("aggregates"))
 
-        stats = GraphQueryStats.from_dict(d.pop("stats"))
+        stats = GraphExactResultStats.from_dict(d.pop("stats"))
 
         graph_aggregates_result = cls(
             kind=kind,

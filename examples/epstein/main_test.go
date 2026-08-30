@@ -347,8 +347,7 @@ func TestBuildGraphVisualizationConvertsGraphResults(t *testing.T) {
 				},
 			},
 		},
-		Paths: []antfly.GraphPath{},
-		Stats: antfly.GraphQueryStats{ReturnedItems: 3, Truncated: false},
+		Stats: antfly.GraphResultStats{ReturnedItems: 3, Truncated: false},
 	})
 	if err != nil {
 		t.Fatalf("construct graph result: %v", err)

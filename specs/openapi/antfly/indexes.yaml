@@ -3922,10 +3922,11 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PathEdge'
-    GraphQueryStats:
+    GraphResultStats:
       type: object
       additionalProperties: false
       required: [returned_items, truncated]
+      description: Completion statistics for a bounded graph result.
       properties:
         returned_items:
           type: integer
@@ -3936,6 +3937,22 @@ components:
         truncated:
           type: boolean
           description: True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input.
+    GraphExactResultStats:
+      type: object
+      additionalProperties: false
+      required: [returned_items, truncated]
+      description: Completion statistics for a graph result that is exact or fails without producing a result.
+      properties:
+        returned_items:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 10000
+          description: Number of primary result items returned (paths or aggregates).
+        truncated:
+          type: boolean
+          enum: [false]
+          description: Always false. Exact graph operations fail instead of returning partial output.
     GraphBindingsResult:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -3951,7 +3968,7 @@ components:
           type: array
           maxItems: 10000
           items: { $ref: '#/components/schemas/GraphResultRow' }
-        stats: { $ref: '#/components/schemas/GraphQueryStats' }
+        stats: { $ref: '#/components/schemas/GraphResultStats' }
     GraphAggregatesResult:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -3972,7 +3989,7 @@ components:
           x-antfly-property-name-schema:
             $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier'
           description: Keys are the GraphIdentifiers selected by the corresponding aggregate return projection.
-        stats: { $ref: '#/components/schemas/GraphQueryStats' }
+        stats: { $ref: '#/components/schemas/GraphExactResultStats' }
     GraphNodesResult:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -3989,7 +4006,7 @@ components:
           maxItems: 10000
           items: { $ref: '#/components/schemas/GraphResultNode' }
           description: Traversal result nodes; requested paths are stored on each node.
-        stats: { $ref: '#/components/schemas/GraphQueryStats' }
+        stats: { $ref: '#/components/schemas/GraphResultStats' }
     GraphPathResult:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -4022,7 +4039,7 @@ components:
           type: array
           maxItems: 100
           items: { $ref: '#/components/schemas/GraphPathResult' }
-        stats: { $ref: '#/components/schemas/GraphQueryStats' }
+        stats: { $ref: '#/components/schemas/GraphExactResultStats' }
     LegacyGraphSearchResult:
       x-go-type-skip-optional-pointer: true
       type: object

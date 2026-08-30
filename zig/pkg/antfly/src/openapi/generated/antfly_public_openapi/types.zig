@@ -4332,14 +4332,53 @@ pub const GraphPathWeightDomainError = struct {
     retryable: bool,
     /// Named shortest-path operation that encountered the incompatible edge weight.
     operation: []const u8,
-    /// Exact path algorithm whose numeric domain was violated.
-    mode: []const u8,
+    /// Canonical path objective selected by the named operation.
+    objective: antfly_indexes_openapi.GraphPathObjective,
     /// Stable machine-readable reason the weight was rejected.
     violation: []const u8,
-    /// Required edge-weight interval for exact execution in the selected mode.
-    allowed_range: []const u8,
     /// Stable user-facing guidance for correcting the graph or query.
     remediation: []const u8,
+
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "status", "status", false },
+        .{ "error", "error", false },
+        .{ "message", "message", false },
+        .{ "retryable", "retryable", false },
+        .{ "operation", "operation", false },
+        .{ "objective", "objective", false },
+        .{ "violation", "violation", false },
+        .{ "remediation", "remediation", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("error");
+        try jw.write(self.@"error");
+        try jw.objectField("message");
+        try jw.write(self.message);
+        try jw.objectField("retryable");
+        try jw.write(self.retryable);
+        try jw.objectField("operation");
+        try jw.write(self.operation);
+        try jw.objectField("objective");
+        try jw.write(self.objective);
+        try jw.objectField("violation");
+        try jw.write(self.violation);
+        try jw.objectField("remediation");
+        try jw.write(self.remediation);
+        try jw.endObject();
+    }
 };
 
 pub const GraphQueryUnprocessableError = union(enum) {
@@ -7606,10 +7645,10 @@ pub const QueryTemporarilyUnavailableError = struct {
 
 pub const QueryUnprocessableError = union(enum) {
     unsupported_hierarchy_grouping_error: *UnsupportedHierarchyGroupingError,
-    graph_path_weight_domain_error: *GraphPathWeightDomainError,
     graph_work_budget_exceeded_error: *GraphWorkBudgetExceededError,
     exact_sort_error: *ExactSortError,
     graph_distinct_budget_exceeded_error: *GraphDistinctBudgetExceededError,
+    graph_path_weight_domain_error: *GraphPathWeightDomainError,
     query_candidate_budget_exceeded_error: *QueryCandidateBudgetExceededError,
     graph_query_unsupported_error: *GraphQueryUnsupportedError,
     graph_match_operation_limit_exceeded_error: *GraphMatchOperationLimitExceededError,
@@ -7667,21 +7706,6 @@ pub const QueryUnprocessableError = union(enum) {
             "retryable",
             "operation",
             "mode",
-            "violation",
-            "allowed_range",
-            "remediation",
-        }) and
-            objectStringEquals(source.object, "error", "graph_path_weight_domain_error"))
-        {
-            if (try parseStructuralVariant(GraphPathWeightDomainError, allocator, source, options)) |parsed| return .{ .graph_path_weight_domain_error = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "status",
-            "error",
-            "message",
-            "retryable",
-            "operation",
-            "mode",
             "dimension",
             "maximum",
             "remediation",
@@ -7717,6 +7741,20 @@ pub const QueryUnprocessableError = union(enum) {
             objectStringEquals(source.object, "error", "graph_distinct_budget_exceeded"))
         {
             if (try parseStructuralVariant(GraphDistinctBudgetExceededError, allocator, source, options)) |parsed| return .{ .graph_distinct_budget_exceeded_error = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
+            "retryable",
+            "operation",
+            "objective",
+            "violation",
+            "remediation",
+        }) and
+            objectStringEquals(source.object, "error", "graph_path_weight_domain_error"))
+        {
+            if (try parseStructuralVariant(GraphPathWeightDomainError, allocator, source, options)) |parsed| return .{ .graph_path_weight_domain_error = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "error",
@@ -7792,10 +7830,10 @@ pub const QueryUnprocessableError = union(enum) {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
             .unsupported_hierarchy_grouping_error => |v| try jw.write(v.*),
-            .graph_path_weight_domain_error => |v| try jw.write(v.*),
             .graph_work_budget_exceeded_error => |v| try jw.write(v.*),
             .exact_sort_error => |v| try jw.write(v.*),
             .graph_distinct_budget_exceeded_error => |v| try jw.write(v.*),
+            .graph_path_weight_domain_error => |v| try jw.write(v.*),
             .query_candidate_budget_exceeded_error => |v| try jw.write(v.*),
             .graph_query_unsupported_error => |v| try jw.write(v.*),
             .graph_match_operation_limit_exceeded_error => |v| try jw.write(v.*),
@@ -7807,7 +7845,7 @@ pub const QueryUnprocessableError = union(enum) {
 };
 
 /// An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
-pub const RawQuery = OpenApiRawJson;
+pub const RawQuery = @import("antfly-json").RawObject;
 
 /// Bounded request to list table repair issues.
 pub const RepairIssueListRequest = struct {
@@ -12696,97 +12734,6 @@ pub fn OpenApiOptionalNullable(comptime T: type) type {
         }
     };
 }
-
-/// Syntactically validated JSON retained as compact owned bytes.
-pub const OpenApiRawJson = struct {
-    bytes: []const u8,
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        var output: std.Io.Writer.Allocating = .init(allocator);
-        errdefer output.deinit();
-        var stringify: std.json.Stringify = .{ .writer = &output.writer };
-        copyValue(allocator, source, options, &stringify) catch |err| switch (err) {
-            error.WriteFailed => return error.OutOfMemory,
-            else => |parse_err| return parse_err,
-        };
-        return .{ .bytes = try output.toOwnedSlice() };
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
-        return .{ .bytes = try std.json.Stringify.valueAlloc(allocator, source, .{}) };
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginWriteRaw();
-        try jw.writer.writeAll(self.bytes);
-        jw.endWriteRaw();
-    }
-
-    fn copyValue(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions, jw: *std.json.Stringify) !void {
-        switch (try source.peekNextTokenType()) {
-            .object_begin => {
-                _ = try source.next();
-                try jw.beginObject();
-                while (try source.peekNextTokenType() != .object_end) {
-                    const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
-                    switch (token) {
-                        .string => |name| try jw.objectField(name),
-                        .allocated_string => |name| {
-                            defer allocator.free(name);
-                            try jw.objectField(name);
-                        },
-                        else => return error.UnexpectedToken,
-                    }
-                    try copyValue(allocator, source, options, jw);
-                }
-                _ = try source.next();
-                try jw.endObject();
-            },
-            .array_begin => {
-                _ = try source.next();
-                try jw.beginArray();
-                while (try source.peekNextTokenType() != .array_end) try copyValue(allocator, source, options, jw);
-                _ = try source.next();
-                try jw.endArray();
-            },
-            .string => switch (try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?)) {
-                .string => |value| try jw.write(value),
-                .allocated_string => |value| {
-                    defer allocator.free(value);
-                    try jw.write(value);
-                },
-                else => unreachable,
-            },
-            .number => switch (try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?)) {
-                .number => |value| try writeNumber(jw, value),
-                .allocated_number => |value| {
-                    defer allocator.free(value);
-                    try writeNumber(jw, value);
-                },
-                else => unreachable,
-            },
-            .true => {
-                _ = try source.next();
-                try jw.write(true);
-            },
-            .false => {
-                _ = try source.next();
-                try jw.write(false);
-            },
-            .null => {
-                _ = try source.next();
-                try jw.write(null);
-            },
-            .object_end, .array_end, .end_of_document => return error.UnexpectedToken,
-        }
-    }
-
-    fn writeNumber(jw: *std.json.Stringify, value: []const u8) !void {
-        try jw.beginWriteRaw();
-        try jw.writer.writeAll(value);
-        jw.endWriteRaw();
-    }
-};
 
 /// Parse an OpenAPI object without materializing a second JSON tree while
 /// rejecting explicit null for optional properties whose schemas are non-nullable.
