@@ -66,7 +66,7 @@ pub fn createFilePortable(io: anytype, path: []const u8, flags: std.Io.Dir.Creat
     return try createAbsoluteFilePortable(io, path, flags);
 }
 
-pub fn syncDirPortable(io: anytype, path: []const u8) !void {
+pub fn syncDirPortable(io: anytype, path: []const u8) anyerror!void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableDirectorySyncUnsupported;
 
@@ -445,6 +445,9 @@ fn createAbsoluteDirPathPosix(path: []const u8) !void {
 }
 
 fn createAbsoluteFilePortable(io: anytype, path: []const u8, flags: std.Io.Dir.CreateFileOptions) !std.Io.File {
+    if (comptime builtin.os.tag == .wasi) {
+        return std.Io.Dir.createFileAbsolute(io, path, flags);
+    }
     return createAbsoluteFileViaParentDir(path, flags) catch |err| switch (err) {
         error.BadPathName => createAbsoluteFileViaAbsolutePath(path, flags) catch |fallback_err| switch (fallback_err) {
             error.BadPathName => std.Io.Dir.createFileAbsolute(io, path, flags),

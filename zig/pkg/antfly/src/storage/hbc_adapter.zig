@@ -33,6 +33,20 @@ const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const AtomicU64 = platform.atomic.Value(u64);
+
+fn atomicLoadU64(value: *const u64, comptime order: std.builtin.AtomicOrder) u64 {
+    if (comptime builtin.cpu.arch == .wasm32) return value.*;
+    return @atomicLoad(u64, value, order);
+}
+
+fn atomicFetchAddU64(value: *u64, operand: u64, comptime order: std.builtin.AtomicOrder) u64 {
+    if (comptime builtin.cpu.arch == .wasm32) {
+        const previous = value.*;
+        value.* +%= operand;
+        return previous;
+    }
+    return @atomicRmw(u64, value, .Add, operand, order);
+}
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const hbc_backend = @import("hbc_backend.zig");
@@ -256,8 +270,8 @@ const HbcPhysicalAccounting = struct {
     mutex: std.atomic.Mutex = .unlocked,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     current_bytes: u64 = 0,
-    published_bytes: std.atomic.Value(u64) = .init(0),
-    pinned_bytes: std.atomic.Value(u64) = .init(0),
+    published_bytes: AtomicU64 = .init(0),
+    pinned_bytes: AtomicU64 = .init(0),
 
     fn attach(self: *HbcPhysicalAccounting, manager: *resource_manager_mod.ResourceManager) void {
         lockAtomic(&self.mutex);
@@ -709,8 +723,8 @@ fn snapshotHbcKindStats(stored: *HbcCacheKindStats) HbcCacheKindStats {
     return .{
         .used_bytes = stored.used_bytes,
         .peak_bytes = stored.peak_bytes,
-        .hits = @atomicLoad(u64, &stored.hits, .monotonic),
-        .misses = @atomicLoad(u64, &stored.misses, .monotonic),
+        .hits = atomicLoadU64(&stored.hits, .monotonic),
+        .misses = atomicLoadU64(&stored.misses, .monotonic),
         .insertions = stored.insertions,
         .replacements = stored.replacements,
         .sampled_admissions = stored.sampled_admissions,
@@ -770,7 +784,7 @@ fn noteHbcKindAdmissionSkip(stats: *HbcCacheStats, kind: HbcCacheKind) void {
     hbcKindStats(stats, kind).admission_skips += 1;
 }
 
-fn cacheFillEpochCurrent(fill_epoch: ?*const std.atomic.Value(u64), expected_epoch: u64) bool {
+fn cacheFillEpochCurrent(fill_epoch: ?*const AtomicU64, expected_epoch: u64) bool {
     const epoch = fill_epoch orelse return true;
     return expected_epoch & 1 == 0 and epoch.load(.acquire) == expected_epoch;
 }
@@ -786,16 +800,16 @@ pub const Cache = struct {
     reclaimer_identity: u64 = 0,
     physical_accounting: HbcPhysicalAccounting = .{},
     namespace_pinned_accounting: HbcNamespacePinnedAccounting,
-    admission_target_bytes: std.atomic.Value(u64) = .init(0),
+    admission_target_bytes: AtomicU64 = .init(0),
     concurrent_vector_admission_stride: std.atomic.Value(u32) = .init(1),
-    concurrent_vector_admission_counter: std.atomic.Value(u64) = .init(0),
-    decoded_query_reserved_bytes: std.atomic.Value(u64) = .init(0),
+    concurrent_vector_admission_counter: AtomicU64 = .init(0),
+    decoded_query_reserved_bytes: AtomicU64 = .init(0),
     // Query leases claim logical capacity before their primary-store batch is
     // read, then atomically transfer that entitlement to physical precharge.
     // This prevents concurrent cold-start requests from all observing the
     // same free bytes without charging the full request up front.
-    decoded_query_entitled_bytes: std.atomic.Value(u64) = .init(0),
-    decoded_query_replacement_entitled_bytes: std.atomic.Value(u64) = .init(0),
+    decoded_query_entitled_bytes: AtomicU64 = .init(0),
+    decoded_query_replacement_entitled_bytes: AtomicU64 = .init(0),
     /// Coalesce duplicate exact-vector publication and keep cloning outside
     /// the global map/admission lock. These locks do not guard visibility;
     /// the map lock plus HBC's mutation epoch remain authoritative.
@@ -1072,16 +1086,16 @@ pub const Cache = struct {
     fn noteLookupLocked(self: *Cache, kind: HbcCacheKind, namespace: u64, hit: bool) void {
         const global = hbcKindStats(&self.global_stats, kind);
         if (hit) {
-            _ = @atomicRmw(u64, &global.hits, .Add, 1, .monotonic);
+            _ = atomicFetchAddU64(&global.hits, 1, .monotonic);
         } else {
-            _ = @atomicRmw(u64, &global.misses, .Add, 1, .monotonic);
+            _ = atomicFetchAddU64(&global.misses, 1, .monotonic);
         }
         if (self.namespace_stats.getPtr(namespace)) |stats| {
             const counters = hbcKindStats(stats, kind);
             if (hit) {
-                _ = @atomicRmw(u64, &counters.hits, .Add, 1, .monotonic);
+                _ = atomicFetchAddU64(&counters.hits, 1, .monotonic);
             } else {
-                _ = @atomicRmw(u64, &counters.misses, .Add, 1, .monotonic);
+                _ = atomicFetchAddU64(&counters.misses, 1, .monotonic);
             }
         }
     }
@@ -1307,7 +1321,7 @@ pub const Cache = struct {
         self: *Cache,
         namespace: u64,
         node: *const Node,
-        fill_epoch: ?*const std.atomic.Value(u64),
+        fill_epoch: ?*const AtomicU64,
         expected_epoch: u64,
     ) !bool {
         const cloned = try node.clone(self.alloc);
@@ -1352,7 +1366,7 @@ pub const Cache = struct {
         namespace: u64,
         node_id: u64,
         qs: *const QuantizedSet,
-        fill_epoch: ?*const std.atomic.Value(u64),
+        fill_epoch: ?*const AtomicU64,
         expected_epoch: u64,
     ) !bool {
         var cloned = try qs.clone(self.alloc);
@@ -1420,7 +1434,7 @@ pub const Cache = struct {
         namespace: u64,
         vector_id: u64,
         vector_data: []const f32,
-        fill_epoch: ?*const std.atomic.Value(u64),
+        fill_epoch: ?*const AtomicU64,
         expected_epoch: u64,
         must_cache: bool,
         precharged: bool,
@@ -1508,7 +1522,7 @@ pub const Cache = struct {
         namespace: u64,
         vector_id: u64,
         metadata: []const u8,
-        fill_epoch: ?*const std.atomic.Value(u64),
+        fill_epoch: ?*const AtomicU64,
         expected_epoch: u64,
     ) ![]const u8 {
         const copied = try self.alloc.dupe(u8, metadata);
@@ -2196,7 +2210,7 @@ pub const HBCIndex = struct {
     /// Seqlock-style epoch for optimistic complete-snapshot searches. Every
     /// mutation, including an aborted one that leaves the durable generation
     /// unchanged, advances this from even -> odd -> even.
-    published_mutation_epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    published_mutation_epoch: AtomicU64 = AtomicU64.init(0),
     /// Publication commits may include durable I/O. Readers of an odd
     /// generation retain the active flight and sleep on its runtime event
     /// instead of occupying an OS thread with an unbounded seqlock spin.
@@ -2205,7 +2219,7 @@ pub const HBCIndex = struct {
     published_spare_flight: ?*PublishedSearchStateFlight = null,
     /// Exact reachable-vector coverage is immutable within a published
     /// generation, so only the first complete search needs to validate it.
-    complete_coverage_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(std.math.maxInt(u64)),
+    complete_coverage_generation: AtomicU64 = AtomicU64.init(std.math.maxInt(u64)),
     /// Short state lock for the generation validation flight. Long waits use
     /// CompleteCoverageFlight.ready on the backend runtime's std.Io; they never
     /// spin on an OS-thread mutex or retain a search transaction/workspace.
@@ -2263,8 +2277,8 @@ pub const HBCIndex = struct {
     // without retaining one version record per vector. A dirty stripe is odd;
     // commit/abort publication returns it to even. Existing keys in the same
     // stripe remain usable because only miss admission consults this fence.
-    vector_cache_fill_epochs: [vector_cache_fill_stripe_count]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
-    vector_cache_fill_dirty: [vector_cache_fill_dirty_word_count]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
+    vector_cache_fill_epochs: [vector_cache_fill_stripe_count]AtomicU64 = @splat(AtomicU64.init(0)),
+    vector_cache_fill_dirty: [vector_cache_fill_dirty_word_count]AtomicU64 = @splat(AtomicU64.init(0)),
     hbc_cache_bytes_accounted: u64 = 0,
     detached_hbc_accounting: HbcPhysicalAccounting = .{},
     search_workspace_bytes_accounted: u64 = 0,
@@ -4228,9 +4242,9 @@ pub const HBCIndex = struct {
     fn noteHbcCacheLookup(self: *HBCIndex, kind: HbcCacheKind, hit: bool) void {
         const counters = &self.hbc_cache_kind_stats[@backingInt(kind)];
         if (hit) {
-            _ = @atomicRmw(u64, &counters.hits, .Add, 1, .monotonic);
+            _ = atomicFetchAddU64(&counters.hits, 1, .monotonic);
         } else {
-            _ = @atomicRmw(u64, &counters.misses, .Add, 1, .monotonic);
+            _ = atomicFetchAddU64(&counters.misses, 1, .monotonic);
         }
     }
 

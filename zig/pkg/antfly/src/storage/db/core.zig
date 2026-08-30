@@ -2382,8 +2382,8 @@ fn storeSnapshotHasV2Magic(io: std.Io, path: []const u8) !bool {
     return std.mem.eql(u8, &magic, store_snapshot_v2_magic);
 }
 
-fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
-    if (builtin.os.tag == .freestanding) return;
+fn threadedIo() if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi) void else std.Io.Threaded {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return;
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 

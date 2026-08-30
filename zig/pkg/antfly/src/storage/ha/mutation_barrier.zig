@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 
 threadlocal var shared_barrier: ?*MutationBarrier = null;
 threadlocal var shared_depth: usize = 0;
@@ -30,8 +31,8 @@ pub const MutationBarrier = struct {
     reader_mutex: std.atomic.Mutex = .unlocked,
     resource_mutex: std.atomic.Mutex = .unlocked,
     reader_count: usize = 0,
-    shared_waiters: std.atomic.Value(u64) = .init(0),
-    exclusive_waiters: std.atomic.Value(u64) = .init(0),
+    shared_waiters: AtomicU64 = .init(0),
+    exclusive_waiters: AtomicU64 = .init(0),
 
     pub const SharedLease = struct {
         barrier: *MutationBarrier,

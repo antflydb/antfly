@@ -1446,7 +1446,7 @@ pub fn build(b: *std.Build) void {
     const strip = b.option(bool, "strip", "Omit debug information from release artifacts") orelse false;
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
-        .os_tag = .freestanding,
+        .os_tag = .wasi,
         .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory, .simd128 }),
     });
     const lmdb_backend = b.option(LmdbBackend, "lmdb_backend", "Select the LMDB backend scaffold (c or zig)") orelse .zig;
@@ -1518,7 +1518,9 @@ pub fn build(b: *std.Build) void {
     const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, true, antfly_version);
     const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, false, antfly_version);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
-    const lmdb_engine_wasm_mod = makeLmdbEngineModule(b, wasm_target, optimize, false, lmdb_build_options);
+    const wasm_lmdb_build_options = makeLmdbBuildOptions(b, .zig, false, false);
+    const wasm_build_options = makeRootBuildOptions(b, .zig, false, false, false, true, false, false, false, antfly_version);
+    const lmdb_engine_wasm_mod = makeLmdbEngineModule(b, wasm_target, optimize, false, wasm_lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
         .root_source_file = b.path("lib/raft/src/root.zig"),
         .target = target,
@@ -1640,7 +1642,7 @@ pub fn build(b: *std.Build) void {
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
         .target = wasm_target,
         .optimize = optimize,
-        .link_libc = false,
+        .link_libc = true,
     });
     const objectstore_mod = b.createModule(.{
         .root_source_file = b.path("lib/objectstore/src/root.zig"),
@@ -2324,7 +2326,7 @@ pub fn build(b: *std.Build) void {
     antfly_client_pkg_mod.addImport("httpx", httpx_mod);
 
     const embedded_wasm_deps = .{
-        build_options,
+        wasm_build_options,
         lmdb_engine_wasm_mod,
         json_mod,
         public_openapi_mod,
@@ -2347,12 +2349,50 @@ pub fn build(b: *std.Build) void {
         handlebars_mod,
     };
 
+    const wasm_inference_tokenizer_mod = b.createModule(.{
+        .root_source_file = b.path("lib/tokenizer/src/tokenizer.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSafe,
+    });
+    wasm_inference_tokenizer_mod.addImport("sentencepiece_proto", sentencepiece_proto_mod);
+    const wasm_inference_hf_tokenizer_mod = b.createModule(.{
+        .root_source_file = b.path("lib/tokenizer/src/hf_root.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSafe,
+    });
+    wasm_inference_hf_tokenizer_mod.addImport("inference_tokenizer", wasm_inference_tokenizer_mod);
+    const wasm_inference_audio_mod = b.createModule(.{
+        .root_source_file = b.path("lib/audio/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSafe,
+    });
+    const wasm_inference_chunker_mod = b.createModule(.{
+        .root_source_file = b.path("lib/chunker/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSafe,
+    });
+    wasm_inference_chunker_mod.addImport("inference_audio", wasm_inference_audio_mod);
+    wasm_inference_chunker_mod.addImport("inference_hf_tokenizer", wasm_inference_hf_tokenizer_mod);
+    wasm_inference_chunker_mod.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
+    wasm_inference_chunker_mod.addImport("antfly_image", wasm_image_mod);
+
     const embedded_support_wasm_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/embedded_root.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
     @call(.auto, configureEmbeddedModule, .{ b, embedded_support_wasm_mod } ++ embedded_wasm_deps ++ .{addSnowballModule});
+    const wasm_reader_config_mod = b.createModule(.{
+        .root_source_file = b.path("lib/readers/src/config.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    embedded_support_wasm_mod.addImport("antfly_reader_config", wasm_reader_config_mod);
+    embedded_support_wasm_mod.addImport("inference_chunker", wasm_inference_chunker_mod);
+    embedded_support_wasm_mod.addImport("antfly_matcher", matcher_mod);
+    embedded_support_wasm_mod.addImport("antfly_resolver", resolver_mod);
+    embedded_support_wasm_mod.addImport("httpx", httpx_mod);
+    embedded_support_wasm_mod.addImport("inference_api", inference_api_mod);
 
     const embedded_wasm_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/embedded/root.zig"),
@@ -2423,18 +2463,6 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
         .single_threaded = true,
     });
-    const wasm_inference_tokenizer_mod = b.createModule(.{
-        .root_source_file = b.path("lib/tokenizer/src/tokenizer.zig"),
-        .target = wasm_target,
-        .optimize = .ReleaseSafe,
-    });
-    wasm_inference_tokenizer_mod.addImport("sentencepiece_proto", sentencepiece_proto_mod);
-    const wasm_inference_hf_tokenizer_mod = b.createModule(.{
-        .root_source_file = b.path("lib/tokenizer/src/hf_root.zig"),
-        .target = wasm_target,
-        .optimize = .ReleaseSafe,
-    });
-    wasm_inference_hf_tokenizer_mod.addImport("inference_tokenizer", wasm_inference_tokenizer_mod);
     const wasm_inference_linalg_mod = b.createModule(.{
         .root_source_file = b.path("lib/linalg/src/mod.zig"),
         .target = wasm_target,
@@ -2455,13 +2483,8 @@ pub fn build(b: *std.Build) void {
     });
     wasm_inference_onnx_graph_mod.addImport("protobuf", protobuf_mod);
     wasm_inference_onnx_graph_mod.addImport("ml", wasm_inference_ml_mod);
-    const wasm_inference_audio_mod = b.createModule(.{
-        .root_source_file = b.path("lib/audio/src/mod.zig"),
-        .target = wasm_target,
-        .optimize = .ReleaseSafe,
-    });
     const inference_wasm_inference_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/inference/src/wasm_entry.zig"),
+        .root_source_file = b.path("pkg/inference/src/wasm_entry_wasm32.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSafe,
     });
@@ -2480,6 +2503,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("examples/antfly_wasm.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSafe,
+        .link_libc = false,
+        .single_threaded = true,
     });
     antfly_wasm_mod.addImport("antfly_embedded_db", antfly_embedded_db_pkg_wasm_mod);
     antfly_wasm_mod.addImport("antfly_embedded_api", antfly_embedded_api_pkg_wasm_mod);

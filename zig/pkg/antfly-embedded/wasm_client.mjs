@@ -187,6 +187,108 @@ function createHostImports(options = {}) {
         new DataView(exports.memory.buffer).setUint32(Number(ptr), Number(value), true);
     }
 
+    function writeU64(ptr, value) {
+        const exports = requireExports();
+        new DataView(exports.memory.buffer).setBigUint64(Number(ptr), BigInt(value), true);
+    }
+
+    const wasiErrnoBadf = 8;
+    const wasiErrnoNosys = 52;
+    const wasiUnsupported = () => wasiErrnoNosys;
+    const wasi = {
+        args_get: () => 0,
+        args_sizes_get(argcPtr, argvBufferSizePtr) {
+            writeU32(argcPtr, 0);
+            writeU32(argvBufferSizePtr, 0);
+            return 0;
+        },
+        environ_get: () => 0,
+        environ_sizes_get(countPtr, bufferSizePtr) {
+            writeU32(countPtr, 0);
+            writeU32(bufferSizePtr, 0);
+            return 0;
+        },
+        clock_res_get(_clockId, resolutionPtr) {
+            writeU64(resolutionPtr, 1_000_000n);
+            return 0;
+        },
+        clock_time_get(clockId, _precision, timePtr) {
+            const nowNs = Number(clockId) === 0
+                ? BigInt(Date.now()) * 1_000_000n
+                : BigInt(Math.trunc(globalThis.performance.now() * 1_000_000));
+            writeU64(timePtr, nowNs);
+            return 0;
+        },
+        fd_close: () => 0,
+        fd_fdstat_get: wasiUnsupported,
+        fd_filestat_get: wasiUnsupported,
+        fd_filestat_set_size: wasiUnsupported,
+        fd_filestat_set_times: wasiUnsupported,
+        fd_pread: wasiUnsupported,
+        fd_prestat_get: () => wasiErrnoBadf,
+        fd_prestat_dir_name: () => wasiErrnoBadf,
+        fd_pwrite: wasiUnsupported,
+        fd_read: wasiUnsupported,
+        fd_readdir: wasiUnsupported,
+        fd_seek: wasiUnsupported,
+        fd_sync: wasiUnsupported,
+        fd_write(_fd, iovsPtr, iovsLen, writtenPtr) {
+            const exports = requireExports();
+            const view = new DataView(exports.memory.buffer);
+            let written = 0;
+            let output = "";
+            for (let i = 0; i < Number(iovsLen); i += 1) {
+                const ptr = view.getUint32(Number(iovsPtr) + i * 8, true);
+                const len = view.getUint32(Number(iovsPtr) + i * 8 + 4, true);
+                written += len;
+                if (options.wasiDebug) output += readUtf8(ptr, len);
+            }
+            if (output) console.debug(output.trimEnd());
+            writeU32(writtenPtr, written);
+            return 0;
+        },
+        path_create_directory: wasiUnsupported,
+        path_filestat_get: wasiUnsupported,
+        path_filestat_set_times: wasiUnsupported,
+        path_link: wasiUnsupported,
+        path_open(_fd, _dirflags, pathPtr, pathLen) {
+            if (options.wasiDebug) {
+                console.debug("WASI path_open", readUtf8(pathPtr, pathLen));
+            }
+            return wasiErrnoNosys;
+        },
+        path_readlink: wasiUnsupported,
+        path_remove_directory: wasiUnsupported,
+        path_rename: wasiUnsupported,
+        path_symlink: wasiUnsupported,
+        path_unlink_file: wasiUnsupported,
+        poll_oneoff: wasiUnsupported,
+        proc_exit(code) {
+            throw new Error(`WASI process exited with code ${Number(code)}`);
+        },
+        random_get(bufferPtr, bufferLen) {
+            const exports = requireExports();
+            const bytes = new Uint8Array(exports.memory.buffer, Number(bufferPtr), Number(bufferLen));
+            for (let offset = 0; offset < bytes.length; offset += 65_536) {
+                globalThis.crypto.getRandomValues(bytes.subarray(offset, Math.min(offset + 65_536, bytes.length)));
+            }
+            return 0;
+        },
+        sched_yield: () => 0,
+    };
+    const wasiImports = options.wasiDebug
+        ? new Proxy(wasi, {
+            get(target, property) {
+                const fn = Reflect.get(target, property);
+                return (...args) => {
+                    const result = fn(...args);
+                    console.debug(`WASI ${String(property)}`, args.map(Number), result);
+                    return result;
+                };
+            },
+        })
+        : wasi;
+
     const noop = () => {};
     const webgpuStubs = {
         gpu_create_buffer: () => 0,
@@ -228,6 +330,11 @@ function createHostImports(options = {}) {
     } else {
         webgpuImports = webgpuStubs;
     }
+    webgpuImports = new Proxy(webgpuImports, {
+        get(target, property) {
+            return Reflect.get(target, property) ?? noop;
+        },
+    });
 
     return {
         imports: {
@@ -259,6 +366,7 @@ function createHostImports(options = {}) {
                     }
                 },
             },
+            wasi_snapshot_preview1: wasiImports,
             webgpu: webgpuImports,
         },
         setExports(exports) {

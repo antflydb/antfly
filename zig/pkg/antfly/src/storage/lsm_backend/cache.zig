@@ -984,7 +984,11 @@ pub const Cache = struct {
     }
 };
 
-const supports_waitable_pending = builtin.os.tag != .freestanding and builtin.link_libc and @hasDecl(std.c, "pthread_cond_wait");
+const supports_waitable_pending = builtin.os.tag != .freestanding and
+    builtin.os.tag != .wasi and
+    !builtin.single_threaded and
+    builtin.link_libc and
+    @hasDecl(std.c, "pthread_cond_wait");
 
 const PendingSync = if (supports_waitable_pending)
     struct {

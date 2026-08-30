@@ -339,6 +339,14 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
+      - name: Build and smoke-test browser WASM
+        if: needs.changes.outputs.zig_tests == 'true'
+        working-directory: zig
+        run: |
+          zig build wasm
+          cd pkg/inference
+          zig build -Dwasm=true -Dwasm-memory-model=wasm32 wasm
+
       - name: Test bounded-build tooling
         working-directory: zig
         run: >-

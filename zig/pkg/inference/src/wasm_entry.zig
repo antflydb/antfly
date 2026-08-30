@@ -42,5 +42,7 @@ pub const os = struct {
     pub const NAME_MAX = 255;
 };
 
-pub const std_options_debug_threaded_io: ?*std.Io.Threaded = null;
-pub const std_options_debug_io: std.Io = undefined;
+pub const std_options: std.Options = .{
+    .allow_stack_tracing = false,
+    .networking = false,
+};

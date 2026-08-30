@@ -58,7 +58,7 @@ fn validatePrecision(precision: u6) Error!void {
 }
 
 fn registerCount(precision: u6) usize {
-    return @as(usize, 1) << precision;
+    return @as(usize, 1) << @intCast(precision);
 }
 
 // Largest rho a well-formed sketch at `precision` can hold: one plus the

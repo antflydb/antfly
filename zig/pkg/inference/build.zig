@@ -2186,7 +2186,10 @@ pub fn build(b: *std.Build) void {
         const is_wasm64 = std.mem.eql(u8, wasm_memory_model, "wasm64");
         const wasm_target = b.resolveTargetQuery(.{
             .cpu_arch = if (is_wasm64) .wasm64 else .wasm32,
-            .os_tag = .freestanding,
+            // Zig 0.17 ships WASI libc for wasm32 only. Keep the experimental
+            // memory64 artifact freestanding until that toolchain surface
+            // exists, while using WASI for the supported browser default.
+            .os_tag = if (is_wasm64) .freestanding else .wasi,
             .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory, .simd128 }),
         });
         const wasm_root = if (is_wasm64)
@@ -2208,6 +2211,7 @@ pub fn build(b: *std.Build) void {
                 .single_threaded = true,
             }),
         });
+        wasm_lib.root_module.link_libc = !is_wasm64;
         wasm_lib.root_module.addImport("build_options", build_options_mod);
         wasm_lib.entry = .disabled;
         wasm_lib.rdynamic = true;

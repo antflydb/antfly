@@ -161,7 +161,7 @@ pub fn loadAppliedSequenceWithCheckpoint(
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
 ) !u64 {
-    if (comptime builtin.os.tag == .freestanding) return try loadAppliedSequence(alloc, store, index_name);
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try loadAppliedSequence(alloc, store, index_name);
     const path = checkpoint_path orelse return try loadAppliedSequence(alloc, store, index_name);
     const checkpoint = loadProjectionCheckpoint(alloc, io, path, index_name) catch |err| switch (err) {
         error.FileNotFound => return 0,
@@ -177,7 +177,7 @@ pub fn loadProjectionCheckpointWithSidecar(
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
 ) !ProjectionCheckpoint {
-    if (comptime builtin.os.tag == .freestanding) {
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) {
         return .{ .applied_sequence = try loadAppliedSequence(alloc, store, index_name) };
     }
     const path = checkpoint_path orelse return .{ .applied_sequence = try loadAppliedSequence(alloc, store, index_name) };
@@ -228,7 +228,7 @@ pub fn saveAppliedSequenceWithCheckpoint(
     index_name: []const u8,
     sequence: u64,
 ) !void {
-    if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequence(store, index_name, sequence);
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try saveAppliedSequence(store, index_name, sequence);
     if (checkpoint_path) |path| {
         try setAppliedSequencesCheckpoint(alloc, io, path, &[_]AppliedSequenceUpdate{.{
             .index_name = index_name,
@@ -246,7 +246,7 @@ pub fn saveAppliedSequenceUpdateWithCheckpoint(
     checkpoint_path: ?[]const u8,
     update: AppliedSequenceUpdate,
 ) !void {
-    if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequence(store, update.index_name, update.sequence);
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try saveAppliedSequence(store, update.index_name, update.sequence);
     if (checkpoint_path) |path| {
         try setAppliedSequencesCheckpoint(alloc, io, path, &[_]AppliedSequenceUpdate{update});
         return;
@@ -262,7 +262,7 @@ pub fn saveProjectionCheckpointWithSidecar(
     index_name: []const u8,
     checkpoint: ProjectionCheckpoint,
 ) !void {
-    if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequence(store, index_name, checkpoint.applied_sequence);
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try saveAppliedSequence(store, index_name, checkpoint.applied_sequence);
     if (checkpoint_path) |path| {
         try setProjectionCheckpoints(alloc, io, path, &[_]AppliedSequenceUpdate{.{
             .index_name = index_name,
@@ -284,7 +284,7 @@ pub fn saveAppliedSequencesWithCheckpoint(
     updates: []const AppliedSequenceUpdate,
 ) !void {
     if (updates.len == 0) return;
-    if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequences(store, updates);
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try saveAppliedSequences(store, updates);
     if (checkpoint_path) |path| {
         try saveAppliedSequencesCheckpoint(alloc, io, path, updates);
         return;
@@ -308,7 +308,7 @@ pub fn clearAppliedSequenceWithCheckpoint(
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
 ) !void {
-    if (comptime builtin.os.tag == .freestanding) return try clearAppliedSequence(store, index_name);
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try clearAppliedSequence(store, index_name);
     if (checkpoint_path) |path| {
         try clearAppliedSequenceCheckpoint(alloc, io, path, index_name);
         return;
@@ -582,10 +582,10 @@ fn decodeCheckpoint(alloc: Allocator, raw: []const u8) !CheckpointMap {
         pos += name_len;
         if (checkpoint.map.contains(name)) return error.InvalidDerivedApplyState;
         const status: ProjectionStatus = switch (status_raw) {
-            @intFromEnum(ProjectionStatus.clean) => .clean,
-            @intFromEnum(ProjectionStatus.rebuilding) => .rebuilding,
-            @intFromEnum(ProjectionStatus.degraded) => .degraded,
-            @intFromEnum(ProjectionStatus.repair_required) => .repair_required,
+            @backingInt(ProjectionStatus.clean) => .clean,
+            @backingInt(ProjectionStatus.rebuilding) => .rebuilding,
+            @backingInt(ProjectionStatus.degraded) => .degraded,
+            @backingInt(ProjectionStatus.repair_required) => .repair_required,
             else => return error.InvalidDerivedApplyState,
         };
         try checkpoint.putMax(alloc, name, .{
@@ -631,7 +631,7 @@ fn encodeCheckpoint(alloc: Allocator, checkpoint: *const CheckpointMap) ![]u8 {
         const value = checkpoint.map.get(name) orelse return error.InvalidDerivedApplyState;
         try appendCheckpointInt(alloc, &out, u32, @intCast(name.len));
         try appendCheckpointInt(alloc, &out, u64, value.applied_sequence);
-        try appendCheckpointInt(alloc, &out, u8, @intFromEnum(value.status));
+        try appendCheckpointInt(alloc, &out, u8, @backingInt(value.status));
         try appendCheckpointInt(alloc, &out, u64, value.generation);
         try appendCheckpointInt(alloc, &out, u64, value.config_hash);
         try out.appendSlice(alloc, name);

@@ -217,15 +217,15 @@ const public_table_schema = @import("../../schema/mod.zig");
 const ttl_mod = @import("../ttl.zig");
 const transactions_mod = @import("../transactions.zig");
 const lease_mod = @import("lease.zig");
-const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template_mod = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("template_stub.zig")
 else
     @import("../../template.zig");
-const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template_remote = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("template_remote_stub.zig")
 else
     @import("../../template_remote.zig");
-const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+const scraping = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or build_options.bench_minimal_deps)
     @import("scraping_stub.zig")
 else
     @import("antfly_scraping");
@@ -588,16 +588,16 @@ pub const HAAsyncEffectMirror = struct {
     /// every acknowledged write is wholly before or wholly after the frozen
     /// former-primary boundary.
     transition_mutex: ?*std.atomic.Mutex = null,
-    last_lsn: ?*std.atomic.Value(u64) = null,
-    failure_count: ?*std.atomic.Value(u64) = null,
+    last_lsn: ?*AtomicU64 = null,
+    failure_count: ?*AtomicU64 = null,
     sync_policy: ha_primary_mod.SyncPolicy = .{},
     sync_wait_ctx: ?*anyopaque = null,
     sync_wait_fn: ?HASyncWaitFn = null,
-    last_gate_lsn: ?*std.atomic.Value(u64) = null,
+    last_gate_lsn: ?*AtomicU64 = null,
     last_gate_action: ?*std.atomic.Value(u8) = null,
-    sync_reject_count: ?*std.atomic.Value(u64) = null,
-    sync_wait_count: ?*std.atomic.Value(u64) = null,
-    sync_degraded_count: ?*std.atomic.Value(u64) = null,
+    sync_reject_count: ?*AtomicU64 = null,
+    sync_wait_count: ?*AtomicU64 = null,
+    sync_degraded_count: ?*AtomicU64 = null,
 };
 
 pub const HASyncWaitFn = *const fn (
@@ -1260,7 +1260,7 @@ const AsyncContext = struct {
     /// Avoid taking the scheduler mutex on the common derived-watermark path
     /// when no repair is waiting for index progress.
     index_repair_progress_wait_pending: std.atomic.Value(bool) = .init(false),
-    index_repair_scheduler_revision: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    index_repair_scheduler_revision: AtomicU64 = AtomicU64.init(0),
     index_repair_scheduler: IndexRepairSchedulerDirectory = .{},
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
@@ -1459,7 +1459,7 @@ const artifact_repair_summary_invalidation_page_size: usize = 256;
 const dense_catch_up_startup_max_records_default: usize = 32;
 const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
 const graph_repair_rebuild_batch_size: usize = 2048;
-var test_graph_repair_stream_flushes: std.atomic.Value(u64) = .init(0);
+var test_graph_repair_stream_flushes: AtomicU64 = .init(0);
 var test_dense_repair_rebuild_batch_size: ?usize = null;
 var test_algebraic_repair_rebuild_batch_size: ?usize = null;
 var test_index_repair_catch_up_max_records_per_window: ?usize = null;
@@ -3871,8 +3871,8 @@ pub const DB = struct {
     // Managed admission is a durable outbox. Requested/completed generations
     // prevent a drain from erasing work committed while its marker snapshot is
     // in flight; the mutex makes concurrent drainers a single-flight loop.
-    managed_admission_materialization_requested: std.atomic.Value(u64) = .init(0),
-    managed_admission_materialization_completed: std.atomic.Value(u64) = .init(0),
+    managed_admission_materialization_requested: AtomicU64 = .init(0),
+    managed_admission_materialization_completed: AtomicU64 = .init(0),
     managed_admission_materialization_mutex: std.atomic.Mutex = .unlocked,
     index_structural_mutation_mutex: std.atomic.Mutex = .unlocked,
     snapshot_publication_mutex: std.atomic.Mutex = .unlocked,

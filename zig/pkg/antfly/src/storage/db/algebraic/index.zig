@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const platform_sync = @import("antfly_platform").sync;
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const adaptive_mod = @import("adaptive.zig");
 const algebra = @import("algebra.zig");
 const cylinder = @import("cylinder.zig");
@@ -3215,7 +3216,7 @@ pub const Index = struct {
     hll_observation_mutex: std.atomic.Mutex = .unlocked,
     hll_pending_observations: std.StringHashMapUnmanaged(u64) = .empty,
     hll_pending_observation_bytes: usize = 0,
-    hll_dropped_observations: std.atomic.Value(u64) = .init(0),
+    hll_dropped_observations: AtomicU64 = .init(0),
     // Coalesces dirty notifications into at most one queued/running maintenance
     // job. The persisted dirty/progress keys remain the source of truth.
     hll_maintenance_scheduled: std.atomic.Value(bool) = .init(false),
@@ -25463,7 +25464,7 @@ test "algebraic bulk ingest maintains ready adaptive aggregate tensors" {
     try std.testing.expectEqual(@as(u64, 1), idx.adaptive_maintenance_plan_build_count);
     try std.testing.expectEqual(@as(u64, 1), idx.adaptive_maintenance_cached_spec_count);
     var resource_stats = resource_manager.snapshot();
-    var algebraic_accumulator_stats = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)];
+    var algebraic_accumulator_stats = resource_stats.slices[@backingInt(resource_manager_mod.Slice.algebraic_tensor_accumulators)];
     try std.testing.expectEqual(@as(u64, 0), algebraic_accumulator_stats.used_bytes);
     try std.testing.expect(algebraic_accumulator_stats.peak_bytes > 0);
 
@@ -25486,7 +25487,7 @@ test "algebraic bulk ingest maintains ready adaptive aggregate tensors" {
     try std.testing.expectEqual(@as(u64, 1), idx.adaptive_maintenance_plan_build_count);
     try std.testing.expectEqual(@as(u64, 2), idx.adaptive_maintenance_cached_spec_count);
     resource_stats = resource_manager.snapshot();
-    algebraic_accumulator_stats = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)];
+    algebraic_accumulator_stats = resource_stats.slices[@backingInt(resource_manager_mod.Slice.algebraic_tensor_accumulators)];
     try std.testing.expectEqual(@as(u64, 0), algebraic_accumulator_stats.used_bytes);
     try std.testing.expect(algebraic_accumulator_stats.peak_bytes > 0);
 }

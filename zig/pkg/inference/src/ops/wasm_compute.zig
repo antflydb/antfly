@@ -1284,6 +1284,26 @@ pub const WasmCompute = struct {
         return geluOp(ctx, input);
     }
 
+    fn geluExactOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const self: *WasmCompute = @ptrCast(@alignCast(ctx));
+        const inp = toBuf(input);
+        const out = try self.allocator.alloc(f32, inp.len);
+        const inv_sqrt_two: f32 = 0.7071067811865476;
+        for (inp.data, out) |value, *result| {
+            result.* = 0.5 * value * (1.0 + erfApprox(value * inv_sqrt_two));
+        }
+        return fromBuf(try copyBufShape(WasmBuf.fromSlice(self.allocator, out, true), inp));
+    }
+
+    /// Abramowitz & Stegun 7.1.26 (maximum error approximately 1.5e-7).
+    fn erfApprox(value: f32) f32 {
+        const x = @abs(value);
+        const t = 1.0 / (1.0 + 0.3275911 * x);
+        const poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+        const result = 1.0 - poly * @exp(-x * x);
+        return if (value >= 0) result else -result;
+    }
+
     fn reluOp(ctx: *anyopaque, input: CT) anyerror!CT {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const inp = toBuf(input);
@@ -1851,6 +1871,7 @@ pub const WasmCompute = struct {
         _ = request.dim;
         return switch (request.kind) {
             .gelu, .gelu_new => try geluOp(ctx, request.input),
+            .gelu_exact => try geluExactOp(ctx, request.input),
             .silu => try siluOp(ctx, request.input),
             .relu => try reluOp(ctx, request.input),
             .quick_gelu => try quickGeluOp(ctx, request.input),
@@ -4247,13 +4268,8 @@ pub const WasmCompute = struct {
             var out_gpu = gpuUnary(a_gpu.id, output, .erf);
             return fromBuf(try copyBufShape(WasmBuf.fromSliceWithGpu(self.allocator, output, true, out_gpu.detach(), true), a_buf));
         }
-        // Abramowitz & Stegun approximation (max error ~1.5e-7)
         for (a_data, 0..) |v, i| {
-            const x = @abs(v);
-            const t = 1.0 / (1.0 + 0.3275911 * x);
-            const poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
-            const result = 1.0 - poly * @exp(-x * x);
-            output[i] = if (v >= 0) result else -result;
+            output[i] = erfApprox(v);
         }
         return fromBuf(try copyBufShape(WasmBuf.fromSlice(self.allocator, output, true), a_buf));
     }
@@ -4999,6 +5015,7 @@ pub const WasmCompute = struct {
         .layerNorm = layerNormOp,
         .rmsNorm = rmsNormOp,
         .gelu = geluOp,
+        .geluExact = geluExactOp,
         .geluNew = geluNewOp,
         .relu = reluOp,
         .silu = siluOp,

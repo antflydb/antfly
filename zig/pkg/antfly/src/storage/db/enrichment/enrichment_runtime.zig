@@ -42,7 +42,7 @@ const asset_producer_mod = @import("asset_producer.zig");
 const document_extraction_mod = @import("document_extraction.zig");
 const document_unit_fingerprint = @import("document_unit_fingerprint.zig");
 const artifact_ids = @import("../artifact_ids.zig");
-const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const chunker_mod = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("chunker_stub.zig")
 else
     @import("chunker.zig");
@@ -55,15 +55,15 @@ const types = @import("../types.zig");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const background_runtime_mod = @import("../../background_runtime.zig");
-const template = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_stub.zig")
 else
     @import("../../../template.zig");
-const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template_remote = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_remote_stub.zig")
 else
     @import("../../../template_remote.zig");
-const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+const scraping = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or build_options.bench_minimal_deps)
     @import("../scraping_stub.zig")
 else
     @import("antfly_scraping");

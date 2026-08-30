@@ -13,6 +13,7 @@
 // limitations.
 
 const builtin = @import("builtin");
+const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
 const std = @import("std");
 const platform = @import("antfly_platform");
 const runtime_backend = @import("runtime_backend.zig");
@@ -449,6 +450,9 @@ const LsmOwnerCloneRegistry = struct {
 };
 
 pub const Backend = runtime_backend.Backend;
+// Keep the concrete type available so host-oriented code remains type-correct
+// when compiled for WASI; `initIoLane` prevents constructing it on hostless
+// targets.
 pub const IoImpl = if (builtin.os.tag == .freestanding) void else Io.Threaded;
 pub const default_io_concurrent_limit: u32 = threaded_io_limits.service;
 
@@ -520,7 +524,7 @@ const LaneLeaseGate = struct {
             return;
         }
 
-        if (comptime builtin.os.tag == .freestanding or builtin.single_threaded) {
+        if (comptime is_hostless or builtin.single_threaded) {
             if (self.active() != 0) @panic("cannot drain a lane lease without an I/O coordinator");
             return;
         }
@@ -606,7 +610,7 @@ pub const Job = struct {
 };
 
 fn initIoLane(alloc: Allocator, concurrent_limit: u32) !*IoImpl {
-    if (comptime builtin.os.tag == .freestanding) {
+    if (comptime is_hostless) {
         return error.UnsupportedPlatform;
     } else {
         const io_impl = try alloc.create(IoImpl);
@@ -623,7 +627,7 @@ fn initIoLane(alloc: Allocator, concurrent_limit: u32) !*IoImpl {
 }
 
 fn deinitIoLane(alloc: Allocator, io_impl: *IoImpl) void {
-    if (comptime builtin.os.tag != .freestanding) {
+    if (comptime !is_hostless) {
         io_impl.deinit();
     }
     alloc.destroy(io_impl);
@@ -694,7 +698,7 @@ const OwnerRegistry = struct {
                 true;
             self.mutex.unlock();
             if (idle) return;
-            if (builtin.os.tag == .freestanding or builtin.single_threaded) {
+            if (is_hostless or builtin.single_threaded) {
                 std.atomic.spinLoopHint();
             } else {
                 std.Thread.yield() catch {};
@@ -778,7 +782,7 @@ pub const BackendRuntime = struct {
         runtime.durable_jobs = InlineDurableJobLane.lane(owner_registry);
 
         if (config.backend != .manual) {
-            if (comptime builtin.os.tag == .freestanding) {
+            if (comptime is_hostless) {
                 return error.UnsupportedPlatform;
             } else {
                 const io_impl = try initIoLane(alloc, threaded_io_limits.service);
@@ -865,7 +869,7 @@ pub const BackendRuntime = struct {
     }
 
     pub fn io(self: *BackendRuntime) ?Io {
-        if (comptime builtin.os.tag == .freestanding) return null;
+        if (comptime is_hostless) return null;
         return if (self.io_impl) |io_impl| io_impl.io() else null;
     }
 
@@ -943,27 +947,27 @@ pub const BackendRuntime = struct {
     }
 
     pub fn raftInboundIo(self: *BackendRuntime) ?Io {
-        if (comptime builtin.os.tag == .freestanding) return null;
+        if (comptime is_hostless) return null;
         return if (self.raft_inbound_io_impl) |io_impl| io_impl.io() else self.io();
     }
 
     pub fn raftInboundIoImpl(self: *BackendRuntime) ?*IoImpl {
-        if (comptime builtin.os.tag == .freestanding) return null;
+        if (comptime is_hostless) return null;
         return self.raft_inbound_io_impl orelse self.io_impl;
     }
 
     pub fn raftOutboundIo(self: *BackendRuntime) ?Io {
-        if (comptime builtin.os.tag == .freestanding) return null;
+        if (comptime is_hostless) return null;
         return if (self.raft_outbound_io_impl) |io_impl| io_impl.io() else self.io();
     }
 
     pub fn raftOutboundIoImpl(self: *BackendRuntime) ?*IoImpl {
-        if (comptime builtin.os.tag == .freestanding) return null;
+        if (comptime is_hostless) return null;
         return self.raft_outbound_io_impl orelse self.io_impl;
     }
 
     pub fn apiIoImpl(self: *BackendRuntime) ?*IoImpl {
-        if (comptime builtin.os.tag == .freestanding) return null;
+        if (comptime is_hostless) return null;
         return self.api_io_impl orelse self.io_impl;
     }
 
@@ -1024,7 +1028,7 @@ pub const BackendRuntime = struct {
     /// fan-out. A lifetime lease is required because the linked inference
     /// archive retains a copy of the interface until its node is destroyed.
     pub fn inferenceIo(self: *BackendRuntime) ?Io {
-        if (comptime builtin.os.tag == .freestanding) return null;
+        if (comptime is_hostless) return null;
         const io_impl = self.inference_io_impl orelse self.io_impl orelse return null;
         return io_impl.io();
     }
@@ -1066,7 +1070,7 @@ pub const BackendRuntime = struct {
     /// coordination. It is intentionally isolated from public API work so
     /// overload cannot consume the runtime's last observable control path.
     pub fn controlIo(self: *BackendRuntime) ?Io {
-        if (comptime builtin.os.tag == .freestanding) return null;
+        if (comptime is_hostless) return null;
         const io_impl = self.control_io_impl orelse self.io_impl orelse return null;
         return io_impl.io();
     }
@@ -1174,7 +1178,7 @@ pub const BackendRuntimeHandle = struct {
     }
 
     pub fn initManualWithOwnedFilesystemIo(alloc: Allocator) !BackendRuntimeHandle {
-        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
+        if (comptime is_hostless) return error.UnsupportedPlatform;
         const filesystem_io = try initIoLane(alloc, threaded_io_limits.service);
         errdefer deinitIoLane(alloc, filesystem_io);
         var handle = try init(alloc, .{
@@ -1240,7 +1244,7 @@ const inline_vtable = DurableJobLane.VTable{
     .executes_inline = true,
 };
 
-const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
+const ThreadedDurableJobLane = if (is_hostless) struct {
     fn init(_: Allocator, _: *IoImpl, _: *OwnerRegistry) ThreadedDurableJobLane {
         return .{};
     }
@@ -1492,7 +1496,7 @@ const threaded_vtable = DurableJobLane.VTable{
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) {
-        if (builtin.os.tag == .freestanding or builtin.single_threaded) {
+        if (is_hostless or builtin.single_threaded) {
             std.atomic.spinLoopHint();
             continue;
         }
@@ -1501,7 +1505,7 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
 }
 
 test "lane lease gate closes admission and drains a committed borrower" {
-    if (builtin.os.tag == .freestanding) return;
+    if (is_hostless) return;
 
     var gate = LaneLeaseGate{};
     try std.testing.expectEqual(@as(?usize, 1), gate.tryAcquire());

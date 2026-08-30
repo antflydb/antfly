@@ -22,7 +22,8 @@ const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 
 const Allocator = std.mem.Allocator;
 const CounterU64 = platform.atomic.Value(u64);
-const supports_native_storage = builtin.os.tag != .freestanding;
+const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
+const supports_native_storage = !is_hostless;
 const supports_posix_fd_cache = supports_native_storage and
     builtin.os.tag != .windows and
     builtin.os.tag != .wasi and
@@ -39,7 +40,7 @@ const supports_evented_runtime = false;
 // runtimes inject handles to the single RLIMIT-derived process pool.
 const fallback_cached_native_fds: usize = 64;
 const unlimited_fd_admission_capacity: usize = 1024;
-const fd_cache_shard_count: usize = if (builtin.os.tag == .freestanding) 1 else 16;
+const fd_cache_shard_count: usize = if (is_hostless) 1 else 16;
 const max_posix_io_chunk: usize = 64 * 1024 * 1024;
 
 pub const RuntimeKind = enum {
@@ -156,7 +157,7 @@ pub const RangeReadFuture = struct {
     }
 };
 
-pub const ReadRuntime = if (builtin.os.tag == .freestanding)
+pub const ReadRuntime = if (is_hostless)
     struct {
         pub fn init(_: anytype) ReadRuntime {
             return .{};
@@ -1392,7 +1393,7 @@ else
 
 var process_native_storage_pool_mutex: std.atomic.Mutex = .unlocked;
 var process_native_fd_cache: ?*FdCache = null;
-var native_storage_cache_namespace: std.atomic.Value(u64) = .init(1);
+var native_storage_cache_namespace: CounterU64 = .init(1);
 
 fn processNativeFdCache() *FdCache {
     const locked = lockAtomic(&process_native_storage_pool_mutex);
@@ -1627,7 +1628,7 @@ pub const NativeFdPermit = struct {
     }
 };
 
-const NativeRangeReadFuture = if (!supports_native_storage or builtin.os.tag == .freestanding)
+const NativeRangeReadFuture = if (!supports_native_storage)
     struct {}
 else
     struct {
@@ -3024,7 +3025,7 @@ pub const MemoryStorage = struct {
 };
 
 fn lockAtomic(mutex: *std.atomic.Mutex) bool {
-    if (builtin.os.tag == .freestanding) return false;
+    if (is_hostless) return false;
     platform_sync.lockYielding(mutex);
     return true;
 }

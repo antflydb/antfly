@@ -38,13 +38,14 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
+const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const native_artifact_sink = @import("native_artifact_sink.zig");
-const supports_main_lmdb = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
+const supports_main_lmdb = !is_hostless and build_options.lmdb_enabled;
 const lmdb = if (supports_main_lmdb) @import("lmdb.zig") else struct {
     pub const CommitBackend = enum {
         sync,
@@ -1337,7 +1338,7 @@ pub const PersistentIndex = struct {
         const index_path = try alloc.dupeSentinel(u8, index_path_raw, 0);
         defer alloc.free(index_path);
         const index_path_span = index_path[0..index_path.len];
-        if (builtin.os.tag != .freestanding and needs_host_dirs) {
+        if (!is_hostless and needs_host_dirs) {
             var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             try storage_io.createDirPathPortable(io_impl.io(), path_span);

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
 const storage_build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
@@ -1268,7 +1269,7 @@ pub const IndexManager = struct {
     // compacting an older schema generation) for CPU, mmap residency, and the
     // shared text-merge resource budget.
     text_backfill_active: std.atomic.Value(u32) = .init(0),
-    next_text_index_instance_id: std.atomic.Value(u64) = .init(1),
+    next_text_index_instance_id: platform.atomic.Value(u64) = .init(1),
     load_parallelism: ?usize = null,
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
@@ -1295,7 +1296,7 @@ pub const IndexManager = struct {
     /// A fresh value is assigned on every insertion, including same-name,
     /// same-config recreation, so detached work never derives identity from
     /// mutable record contents. Zero remains reserved as "no incarnation".
-    next_failed_index_load_incarnation_id: std.atomic.Value(u64) = .init(1),
+    next_failed_index_load_incarnation_id: platform.atomic.Value(u64) = .init(1),
     /// Stable resident retry ring. Every quarantined index is safe to reopen,
     /// even when destructive reconstruction requires operator authorization.
     /// Entries borrow the owned map keys and are updated under catalog_mutex.
@@ -12270,7 +12271,7 @@ pub const IndexManager = struct {
     }
 
     fn deleteIndexDirUsingIoIfPresentFallible(self: *const IndexManager, path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         if (self.io) |io| {
             try std.Io.Dir.cwd().deleteTree(io, path);
             return;
@@ -12285,7 +12286,7 @@ pub const IndexManager = struct {
     }
 
     pub fn writeRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
@@ -12301,7 +12302,7 @@ pub const IndexManager = struct {
     }
 
     pub fn clearRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
@@ -12315,7 +12316,7 @@ pub const IndexManager = struct {
     }
 
     fn readActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8, name: []const u8) !?[]u8 {
-        if (builtin.os.tag == .freestanding) return null;
+        if (is_hostless) return null;
         const marker_path = try self.activeIndexRootPointerPath(canonical_path);
         defer self.alloc.free(marker_path);
 
@@ -12355,7 +12356,7 @@ pub const IndexManager = struct {
     }
 
     fn writeActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8, relative_active_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         if (!validRelativeRepairIndexRoot(std.fs.path.basename(canonical_path), relative_active_path)) return error.InvalidIndexRootPointer;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
@@ -12369,7 +12370,7 @@ pub const IndexManager = struct {
     }
 
     fn clearActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         const marker_path = try self.activeIndexRootPointerPath(canonical_path);
         defer self.alloc.free(marker_path);
 
@@ -12413,7 +12414,7 @@ pub const IndexManager = struct {
         }
         const path = try self.activeIndexPath(name);
         defer self.alloc.free(path);
-        if (builtin.os.tag == .freestanding) return 0;
+        if (is_hostless) return 0;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
@@ -12519,7 +12520,7 @@ pub const IndexManager = struct {
     }
 
     fn pruneCanonicalIndexRootAfterPointerInstall(canonical_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
@@ -13256,7 +13257,7 @@ pub const IndexManager = struct {
                 defer self.alloc.free(forward_path);
                 const reverse_path = try std.fmt.allocPrint(self.alloc, "{s}/reverse", .{path});
                 defer self.alloc.free(reverse_path);
-                const reverse_store_missing = if (self.graph_lsm_storage != null) false else if (comptime builtin.os.tag == .freestanding) true else blk: {
+                const reverse_store_missing = if (self.graph_lsm_storage != null) false else if (comptime is_hostless) true else blk: {
                     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
                     defer io_impl.deinit();
                     var reverse_dir = std.Io.Dir.cwd().openDir(io_impl.io(), reverse_path, .{}) catch |err| switch (err) {
@@ -22534,7 +22535,7 @@ fn ensureIndexDir(alloc: Allocator, base_path: []const u8, path: []const u8) !vo
     const parent_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{base_path});
     defer alloc.free(parent_path);
 
-    if (builtin.os.tag != .freestanding) {
+    if (!is_hostless) {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         try fs_paths.createDirPathPortable(io_impl.io(), parent_path);
@@ -22551,7 +22552,7 @@ fn ensureIndexDirDurable(
     base_path: []const u8,
     path: []const u8,
 ) !void {
-    if (builtin.os.tag == .freestanding) return;
+    if (is_hostless) return;
 
     if (shared_io) |io| {
         return ensureIndexDirDurableWithIo(alloc, io, base_path, path);
@@ -22579,7 +22580,7 @@ fn ensureIndexDirDurableWithIo(
 }
 
 fn deleteIndexDirIfPresent(path: []const u8) void {
-    if (builtin.os.tag == .freestanding) return;
+    if (is_hostless) return;
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -22587,7 +22588,7 @@ fn deleteIndexDirIfPresent(path: []const u8) void {
 }
 
 fn repairShadowRootInProgress(path: []const u8) bool {
-    if (builtin.os.tag == .freestanding) return false;
+    if (is_hostless) return false;
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();

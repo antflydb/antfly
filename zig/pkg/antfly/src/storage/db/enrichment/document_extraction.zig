@@ -21,7 +21,7 @@ const reader_config = @import("antfly_reader_config");
 // large Antfly unit-test root prevents the Zig compiler and test process from
 // approaching the 15 GiB CI runner limit. Production builds and the PDF/OCR
 // E2E binary still use the full implementation.
-const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     struct {
         pub const reader = struct {
             pub const DecodeLimits = struct {
@@ -169,21 +169,21 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
     }
 else
     @import("antfly_pdf");
-const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+const scraping = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or build_options.bench_minimal_deps)
     @import("../scraping_stub.zig")
 else
     @import("antfly_scraping");
-const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template_remote = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_remote_stub.zig")
 else
     @import("../../../template_remote.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const pdf_runtime_available = builtin.os.tag != .freestanding and !builtin.is_test and !build_options.bench_minimal_deps;
+pub const pdf_runtime_available = builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !builtin.is_test and !build_options.bench_minimal_deps;
 
 pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.RemoteContentConfig) u64 {
-    if (comptime builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
+    if (comptime builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !build_options.bench_minimal_deps) {
         if (remote_content) |remote| {
             var snapshot = remote.acquire();
             defer snapshot.deinit();

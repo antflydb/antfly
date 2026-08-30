@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const resolver_lib = @import("antfly_resolver");
 const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
@@ -1604,8 +1605,8 @@ pub const ResolutionRuntime = struct {
     /// Optional name embedder, injected by the db from the enrichment config;
     /// used to backfill mention name embeddings for cosine/ann blocking.
     embedder: ?embedder_mod.DenseEmbedder,
-    applied_sequence: std.atomic.Value(u64),
-    target_sequence: std.atomic.Value(u64),
+    applied_sequence: AtomicU64,
+    target_sequence: AtomicU64,
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
     worker_started: std.atomic.Value(bool),

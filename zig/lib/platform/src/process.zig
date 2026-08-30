@@ -23,14 +23,14 @@ fn hasPosixProcessApi() bool {
 }
 
 pub fn currentId() ?u32 {
-    if (!hasPosixProcessApi()) return null;
+    if (comptime !hasPosixProcessApi()) return null;
     return @intCast(std.posix.system.getpid());
 }
 
 pub fn alive(pid: u32) bool {
     if (pid == 0) return false;
-    if (!hasPosixProcessApi()) return true;
-    switch (std.posix.errno(std.posix.system.kill(@intCast(pid), @enumFromInt(0)))) {
+    if (comptime !hasPosixProcessApi()) return true;
+    switch (std.posix.errno(std.posix.system.kill(@intCast(pid), @fromBackingInt(@intCast(0))))) {
         .SUCCESS => return true,
         .SRCH => return false,
         .PERM => return true,

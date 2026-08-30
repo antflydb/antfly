@@ -34,6 +34,7 @@ const roaring = @import("encoding/roaring.zig");
 const scorer_mod = @import("search/scorer.zig");
 const query_mod = @import("search/query.zig");
 const distributed_stats_mod = @import("search/distributed_stats.zig");
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const platform_time = @import("antfly_platform").time;
 const resource_manager_mod = @import("storage/resource_manager.zig");
 const CancellationToken = @import("common/cancellation.zig").CancellationToken;
@@ -140,7 +141,7 @@ pub const SegmentShared = struct {
     /// intact when this transitions to cold; only clean file-backed pages are
     /// advised away. A subsequent query marks the segment resident again.
     mapped_residency_state: std.atomic.Value(u8) = .init(mapped_residency_cold),
-    last_mapped_access_ns: std.atomic.Value(u64) = .init(0),
+    last_mapped_access_ns: AtomicU64 = .init(0),
     active_mapped_readers: std.atomic.Value(u32) = .init(0),
     /// Deletion bitmap shared by every snapshot referencing this segment.
     /// `deletion_lock` protects the bitmap's reallocatable containers. The
@@ -1398,7 +1399,7 @@ pub const IndexWriter = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     mapped_residency_mu: std.atomic.Mutex,
     mapped_residency_accounted_bytes: u64,
-    mapped_residency_next_check_ns: std.atomic.Value(u64),
+    mapped_residency_next_check_ns: AtomicU64,
     mapped_residency_evictions: u64,
 
     /// A completely allocated replacement snapshot held behind the writer
@@ -2484,7 +2485,7 @@ test "typed doc values corruption is classified lazily without rejecting segment
 }
 
 fn mapTestSegment(segment_bytes: []const u8) !SegmentData {
-    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     const mapped = try std.heap.page_allocator.alignedAlloc(

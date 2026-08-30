@@ -66,6 +66,8 @@ pub const WalCheckpointRetryReason = enum(u8) {
 };
 
 const supports_waitable_immutable_flush = builtin.os.tag != .freestanding and
+    builtin.os.tag != .wasi and
+    !builtin.single_threaded and
     builtin.link_libc and
     @hasDecl(std.c, "pthread_cond_wait");
 
@@ -4048,7 +4050,7 @@ pub const Backend = struct {
         self.obsolete_manifest_dirty = false;
     }
 
-    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64) !usize {
+    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64) !u64 {
         try validateRunLayoutForManifest(runs);
         const bytes = try repository_mod.persistManifestWithStorageCount(
             self.storage.?,
