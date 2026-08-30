@@ -650,6 +650,60 @@ pub const Fixture = struct {
         return self;
     }
 
+    /// Metadata-backed replication status boundary used by the composed
+    /// production-runner history. Every mutation crosses the live metadata
+    /// quorum owned by this fixture; no VOPR-only status ledger substitutes
+    /// for the Raft projection.
+    pub fn replaceReplicationSources(
+        self: *Fixture,
+        replication_sources_json: []const u8,
+    ) !void {
+        const metadata = self.metadata orelse return error.MetadataClusterUnavailable;
+        try metadata.replaceReplicationSources(replication_sources_json);
+    }
+
+    pub fn upsertReplicationSourceStatus(
+        self: *Fixture,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const metadata = self.metadata orelse return error.MetadataClusterUnavailable;
+        try metadata.upsertReplicationSourceStatus(record);
+    }
+
+    pub fn claimReplicationSourceCutoverDurable(
+        self: *Fixture,
+        expected_replication_sources_json: []const u8,
+        expected_authority_id: u64,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const metadata = self.metadata orelse return error.MetadataClusterUnavailable;
+        try metadata.claimReplicationSourceCutoverDurable(
+            expected_replication_sources_json,
+            expected_authority_id,
+            record,
+        );
+    }
+
+    pub fn replicationSourceAuthorityCurrent(
+        self: *Fixture,
+        expected_replication_sources_json: []const u8,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const metadata = self.metadata orelse return error.MetadataClusterUnavailable;
+        try metadata.replicationSourceAuthorityCurrent(
+            expected_replication_sources_json,
+            expected,
+        );
+    }
+
+    pub fn completeReplicationSourceCutoverRetirementDurable(
+        self: *Fixture,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const metadata = self.metadata orelse return error.MetadataClusterUnavailable;
+        try metadata.completeReplicationSourceCutoverRetirementDurable(expected);
+    }
+
     pub fn setActiveSplitEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.active_split_enabled = enabled;

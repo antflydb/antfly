@@ -3805,6 +3805,103 @@ pub const MetadataHttpNodeSimulation = struct {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
     }
 
+    /// Drive replication status through the same metadata-Raft transition
+    /// command used by the production service. Deployment-shaped VOPR tests
+    /// use these methods instead of maintaining a shadow status ledger.
+    pub fn upsertReplicationSourceStatus(
+        self: MetadataHttpNodeSimulation,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .upsert_replication_source_status = record });
+    }
+
+    pub fn claimReplicationSourceCutoverDurable(
+        self: MetadataHttpNodeSimulation,
+        expected_replication_sources_json: []const u8,
+        expected_authority_id: u64,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .claim_replication_source_cutover = .{
+            .expected_replication_sources_json = expected_replication_sources_json,
+            .expected_authority_id = expected_authority_id,
+            .record = record,
+        } });
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MissingMetadataStore;
+        const current_table = (try store.getTable(
+            self.cluster.alloc,
+            self.cluster.metadata_group_id,
+            record.table_id,
+        )) orelse return error.TableNotFound;
+        defer metadata_table_manager.freeTable(self.cluster.alloc, current_table);
+        if (!std.mem.eql(
+            u8,
+            current_table.replication_sources_json,
+            expected_replication_sources_json,
+        )) return error.ReplicationSourceConfigChanged;
+        const current = (try store.getReplicationSourceStatus(
+            self.cluster.alloc,
+            self.cluster.metadata_group_id,
+            record.table_id,
+            record.source_ordinal,
+        )) orelse return error.ReplicationCutoverAuthorityLost;
+        defer metadata_table_manager.freeReplicationSourceStatus(self.cluster.alloc, current);
+        if (!metadata_service.replicationCutoverIntentApplied(current, record))
+            return error.ReplicationCutoverAuthorityLost;
+    }
+
+    pub fn replicationSourceAuthorityCurrent(
+        self: MetadataHttpNodeSimulation,
+        expected_replication_sources_json: []const u8,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MissingMetadataStore;
+        const current_table = (try store.getTable(
+            self.cluster.alloc,
+            self.cluster.metadata_group_id,
+            expected.table_id,
+        )) orelse return error.ReplicationSourceConfigChanged;
+        defer metadata_table_manager.freeTable(self.cluster.alloc, current_table);
+        if (!std.mem.eql(
+            u8,
+            current_table.replication_sources_json,
+            expected_replication_sources_json,
+        )) return error.ReplicationSourceConfigChanged;
+        const current = (try store.getReplicationSourceStatus(
+            self.cluster.alloc,
+            self.cluster.metadata_group_id,
+            expected.table_id,
+            expected.source_ordinal,
+        )) orelse return error.ReplicationCutoverAuthorityLost;
+        defer metadata_table_manager.freeReplicationSourceStatus(self.cluster.alloc, current);
+        if (!metadata_service.replicationCutoverAuthorityMatches(current, expected))
+            return error.ReplicationCutoverAuthorityLost;
+    }
+
+    pub fn completeReplicationSourceCutoverRetirementDurable(
+        self: MetadataHttpNodeSimulation,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        try self.proposeTransitionCommand(.{
+            .complete_replication_source_retirement = expected,
+        });
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MissingMetadataStore;
+        const current = (try store.getReplicationSourceStatus(
+            self.cluster.alloc,
+            self.cluster.metadata_group_id,
+            expected.table_id,
+            expected.source_ordinal,
+        )) orelse return error.ReplicationCutoverAuthorityLost;
+        defer metadata_table_manager.freeReplicationSourceStatus(self.cluster.alloc, current);
+        if (!metadata_service.replicationCutoverAuthorityMatches(current, expected) or
+            current.retired_cutover_authority_id != 0 or
+            current.retired_slot_name.len != 0 or
+            current.retired_publication_name.len != 0)
+            return error.ReplicationCutoverAuthorityLost;
+    }
+
     pub fn removeTable(self: MetadataHttpNodeSimulation, table_id: u64) !void {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse
             return error.MissingMetadataStore;
@@ -6864,6 +6961,97 @@ pub const VoprPublicClusterFixture = struct {
     ) !raft_shard_ops.OwnedShardOperationAdapter.Registration {
         if (index >= node_count) return error.InvalidNodeIndex;
         return try self.cluster.node(index).replaceTransitionOps(ops);
+    }
+
+    /// Replace the source catalog through metadata Raft and wait until every
+    /// projected replica observes the exact bytes. Exact-cutover authority is
+    /// fenced against these bytes, so returning early would weaken the
+    /// topology-change history into a local callback race.
+    pub fn replaceReplicationSources(
+        self: *VoprPublicClusterFixture,
+        replication_sources_json: []const u8,
+    ) !void {
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
+            return error.MetadataLeaderUnavailable;
+        const leader = self.cluster.node(leader_index);
+        const tables = try leader.listProjectedTables(self.alloc);
+        defer leader.freeProjectedTables(self.alloc, tables);
+        const current = for (tables) |record| {
+            if (record.table_id == table_id) break record;
+        } else return error.TableNotFound;
+        var replacement = current;
+        replacement.replication_sources_json = replication_sources_json;
+        try leader.upsertTable(replacement);
+
+        for (0..64) |_| {
+            var all_current = true;
+            for (0..node_count) |index| {
+                const node = self.cluster.node(index);
+                const projected = try node.listProjectedTables(self.alloc);
+                defer node.freeProjectedTables(self.alloc, projected);
+                const matches = for (projected) |record| {
+                    if (record.table_id != table_id) continue;
+                    break std.mem.eql(
+                        u8,
+                        record.replication_sources_json,
+                        replication_sources_json,
+                    );
+                } else false;
+                if (!matches) {
+                    all_current = false;
+                    break;
+                }
+            }
+            if (all_current) return;
+            try self.cluster.stepAll();
+        }
+        return error.ReplicationSourceProjectionTimeout;
+    }
+
+    pub fn upsertReplicationSourceStatus(
+        self: *VoprPublicClusterFixture,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
+            return error.MetadataLeaderUnavailable;
+        try self.cluster.node(leader_index).upsertReplicationSourceStatus(record);
+    }
+
+    pub fn claimReplicationSourceCutoverDurable(
+        self: *VoprPublicClusterFixture,
+        expected_replication_sources_json: []const u8,
+        expected_authority_id: u64,
+        record: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
+            return error.MetadataLeaderUnavailable;
+        try self.cluster.node(leader_index).claimReplicationSourceCutoverDurable(
+            expected_replication_sources_json,
+            expected_authority_id,
+            record,
+        );
+    }
+
+    pub fn replicationSourceAuthorityCurrent(
+        self: *VoprPublicClusterFixture,
+        expected_replication_sources_json: []const u8,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
+            return error.MetadataLeaderUnavailable;
+        try self.cluster.node(leader_index).replicationSourceAuthorityCurrent(
+            expected_replication_sources_json,
+            expected,
+        );
+    }
+
+    pub fn completeReplicationSourceCutoverRetirementDurable(
+        self: *VoprPublicClusterFixture,
+        expected: metadata_table_manager.ReplicationSourceStatusRecord,
+    ) !void {
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
+            return error.MetadataLeaderUnavailable;
+        try self.cluster.node(leader_index).completeReplicationSourceCutoverRetirementDurable(expected);
     }
 
     /// Admit a structural transition into the metadata quorum while real,

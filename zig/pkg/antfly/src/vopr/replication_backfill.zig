@@ -146,11 +146,63 @@ pub const Scenario = struct {
     /// VoprIo, while deployment-shaped histories borrow the cluster runtime
     /// and may supply the real target write path and shared work permit.
     pub const Fixture = struct {
+        pub const MetadataAdapter = struct {
+            ptr: *anyopaque,
+            vtable: *const VTable,
+
+            pub const VTable = struct {
+                replace_sources: *const fn (*anyopaque, []const u8) anyerror!void,
+                upsert_status: *const fn (*anyopaque, table_manager.ReplicationSourceStatusRecord) anyerror!void,
+                claim_cutover: *const fn (*anyopaque, []const u8, u64, table_manager.ReplicationSourceStatusRecord) anyerror!void,
+                authority_current: *const fn (*anyopaque, []const u8, table_manager.ReplicationSourceStatusRecord) anyerror!void,
+                complete_retirement: *const fn (*anyopaque, table_manager.ReplicationSourceStatusRecord) anyerror!void,
+            };
+
+            fn replaceSources(self: @This(), sources: []const u8) !void {
+                try self.vtable.replace_sources(self.ptr, sources);
+            }
+
+            fn upsertStatus(self: @This(), record: table_manager.ReplicationSourceStatusRecord) !void {
+                try self.vtable.upsert_status(self.ptr, record);
+            }
+
+            fn claimCutover(
+                self: @This(),
+                sources: []const u8,
+                expected_authority_id: u64,
+                record: table_manager.ReplicationSourceStatusRecord,
+            ) !void {
+                try self.vtable.claim_cutover(
+                    self.ptr,
+                    sources,
+                    expected_authority_id,
+                    record,
+                );
+            }
+
+            fn authorityCurrent(
+                self: @This(),
+                sources: []const u8,
+                expected: table_manager.ReplicationSourceStatusRecord,
+            ) !void {
+                try self.vtable.authority_current(self.ptr, sources, expected);
+            }
+
+            fn completeRetirement(
+                self: @This(),
+                expected: table_manager.ReplicationSourceStatusRecord,
+            ) !void {
+                try self.vtable.complete_retirement(self.ptr, expected);
+            }
+        };
+
         allocator: std.mem.Allocator,
         owned_sim: ?vopr.vopr_io.VoprIo,
         sim: *vopr.vopr_io.VoprIo,
         registry: foreign.Registry = .{},
         records: std.ArrayListUnmanaged(table_manager.ReplicationSourceStatusRecord) = .empty,
+        metadata_adapter: ?MetadataAdapter = null,
+        target_table_id: u64 = 41,
         external_work_permit: ?replication.WorkPermit = null,
         external_write_source: ?table_writes.TableWriteSource = null,
         mode: Mode = .clean,
@@ -179,6 +231,14 @@ pub const Scenario = struct {
         stale_owner_rejected_offset: u64 = 0,
         stale_owner_session: u64 = 0,
         stale_owner_recovery_session: u64 = 0,
+        topology_change_injected: bool = false,
+        topology_rejected_offset: u64 = 0,
+        topology_old_authority_id: u64 = 0,
+        topology_new_authority_id: u64 = 0,
+        exact_cutover_prepares: u64 = 0,
+        exact_cutover_claims: u64 = 0,
+        exact_cutover_checks: u64 = 0,
+        exact_cutover_retirements: u64 = 0,
         first_attempt_error_code: u64 = 0,
         applied_mask: u8 = 0,
         apply_calls: u32 = 0,
@@ -191,10 +251,16 @@ pub const Scenario = struct {
 
         const config_v1 = "[{\"type\":\"postgres\",\"dsn\":\"postgres://vopr\",\"postgres_table\":\"users_v1\",\"key_template\":\"id\"}]";
         const config_v2 = "[{\"type\":\"postgres\",\"dsn\":\"postgres://vopr\",\"postgres_table\":\"users_v2\",\"key_template\":\"id\"}]";
+        const exact_config_v1 = "[{\"type\":\"postgres\",\"dsn\":\"postgres://vopr\",\"postgres_table\":\"users_v1\",\"key_template\":\"id\",\"require_exact_cutover\":true}]";
+        const exact_config_v2 = "[{\"type\":\"postgres\",\"dsn\":\"postgres://vopr\",\"postgres_table\":\"users_v2\",\"key_template\":\"id\",\"require_exact_cutover\":true}]";
 
         const SourceSession = struct {
             fixture: *Fixture,
             generation: u64,
+        };
+
+        const PreparedSnapshotSession = struct {
+            source: *SourceSession,
         };
 
         fn init(allocator: std.mem.Allocator) !*Fixture {
@@ -259,6 +325,19 @@ pub const Scenario = struct {
             self.external_write_source = write_source;
         }
 
+        pub fn setMetadataAdapter(self: *@This(), adapter: MetadataAdapter) void {
+            self.metadata_adapter = adapter;
+        }
+
+        pub fn setTargetTableId(self: *@This(), table_id: u64) !void {
+            if (table_id == 0) return error.InvalidReplicationTargetTableId;
+            self.target_table_id = table_id;
+        }
+
+        pub fn topologyInitialReplicationSources() []const u8 {
+            return exact_config_v1;
+        }
+
         fn enableServiceRates(self: *@This()) !void {
             self.service_model = try vopr.service_rate.Model.init(
                 self.allocator,
@@ -286,9 +365,14 @@ pub const Scenario = struct {
 
         fn table(self: *@This()) table_manager.TableRecord {
             return .{
-                .table_id = 41,
-                .name = if (self.target_rebalanced) "docs_rebalanced" else "docs",
-                .replication_sources_json = if (self.schema_changed) config_v2 else config_v1,
+                .table_id = self.target_table_id,
+                .name = "docs",
+                .replication_sources_json = if (self.mode == .topology_change)
+                    (if (self.target_rebalanced) exact_config_v2 else exact_config_v1)
+                else if (self.schema_changed)
+                    config_v2
+                else
+                    config_v1,
             };
         }
 
@@ -298,8 +382,117 @@ pub const Scenario = struct {
         }
 
         pub fn upsertReplicationSourceStatus(self: *@This(), record: table_manager.ReplicationSourceStatusRecord) !void {
+            if (self.metadata_adapter) |adapter| try adapter.upsertStatus(record);
             try self.records.append(self.allocator, try table_manager.cloneReplicationSourceStatus(self.allocator, record));
             self.max_snapshot_checkpoint = @max(self.max_snapshot_checkpoint, record.snapshot_offset);
+        }
+
+        pub fn claimReplicationSourceCutoverDurable(
+            self: *@This(),
+            expected_replication_sources_json: []const u8,
+            expected_authority_id: u64,
+            record: table_manager.ReplicationSourceStatusRecord,
+        ) !void {
+            if (!std.mem.eql(
+                u8,
+                self.table().replication_sources_json,
+                expected_replication_sources_json,
+            )) return error.ReplicationSourceConfigChanged;
+            const current_authority_id = if (self.latest()) |current|
+                current.cutover_authority_id
+            else
+                0;
+            if (current_authority_id != expected_authority_id)
+                return error.ReplicationCutoverAuthorityLost;
+            if (self.metadata_adapter) |adapter| try adapter.claimCutover(
+                expected_replication_sources_json,
+                expected_authority_id,
+                record,
+            );
+            self.exact_cutover_claims +|= 1;
+            try self.upsertLocalStatus(record);
+        }
+
+        pub fn replicationSourceAuthorityCurrent(
+            self: *@This(),
+            expected_replication_sources_json: []const u8,
+            expected: table_manager.ReplicationSourceStatusRecord,
+        ) !void {
+            if (!std.mem.eql(
+                u8,
+                self.table().replication_sources_json,
+                expected_replication_sources_json,
+            )) return error.ReplicationSourceConfigChanged;
+            const current = self.latest() orelse
+                return error.ReplicationCutoverAuthorityLost;
+            if (!authorityMatches(current, expected))
+                return error.ReplicationCutoverAuthorityLost;
+            if (self.metadata_adapter) |adapter| try adapter.authorityCurrent(
+                expected_replication_sources_json,
+                expected,
+            );
+            self.exact_cutover_checks +|= 1;
+        }
+
+        pub fn completeReplicationSourceCutoverRetirementDurable(
+            self: *@This(),
+            expected: table_manager.ReplicationSourceStatusRecord,
+        ) !void {
+            const current = self.latest() orelse
+                return error.ReplicationCutoverAuthorityLost;
+            if (!authorityMatches(current, expected) or
+                current.retired_cutover_authority_id != expected.retired_cutover_authority_id or
+                !std.mem.eql(u8, current.retired_slot_name, expected.retired_slot_name) or
+                !std.mem.eql(
+                    u8,
+                    current.retired_publication_name,
+                    expected.retired_publication_name,
+                )) return error.ReplicationCutoverAuthorityLost;
+            if (self.metadata_adapter) |adapter| try adapter.completeRetirement(expected);
+            var completed = expected;
+            completed.retired_cutover_authority_id = 0;
+            completed.retired_slot_name = "";
+            completed.retired_publication_name = "";
+            self.exact_cutover_retirements +|= 1;
+            try self.upsertLocalStatus(completed);
+        }
+
+        fn upsertLocalStatus(
+            self: *@This(),
+            record: table_manager.ReplicationSourceStatusRecord,
+        ) !void {
+            try self.records.append(
+                self.allocator,
+                try table_manager.cloneReplicationSourceStatus(self.allocator, record),
+            );
+            self.max_snapshot_checkpoint = @max(
+                self.max_snapshot_checkpoint,
+                record.snapshot_offset,
+            );
+        }
+
+        fn authorityMatches(
+            current: table_manager.ReplicationSourceStatusRecord,
+            expected: table_manager.ReplicationSourceStatusRecord,
+        ) bool {
+            return current.table_id == expected.table_id and
+                current.source_ordinal == expected.source_ordinal and
+                current.cutover_intent_id == expected.cutover_intent_id and
+                current.cutover_authority_id == expected.cutover_authority_id and
+                std.mem.eql(
+                    u8,
+                    &current.cutover_config_fingerprint,
+                    &expected.cutover_config_fingerprint,
+                ) and
+                std.mem.eql(
+                    u8,
+                    &current.cutover_provider_identity,
+                    &expected.cutover_provider_identity,
+                ) and
+                std.mem.eql(u8, current.source_kind, expected.source_kind) and
+                std.mem.eql(u8, current.external_table, expected.external_table) and
+                std.mem.eql(u8, current.slot_name, expected.slot_name) and
+                std.mem.eql(u8, current.publication_name, expected.publication_name);
         }
 
         fn checkpoint(ptr: *anyopaque, kind: replication.WorkKind) !void {
@@ -376,8 +569,13 @@ pub const Scenario = struct {
                 },
                 .topology_change => if (event.phase == .snapshot_batch_applied) {
                     self.fault_armed = false;
+                    if (event.authority_id == 0)
+                        return error.MissingReplicationCutoverAuthority;
+                    if (self.metadata_adapter) |adapter|
+                        try adapter.replaceSources(exact_config_v2);
                     self.target_rebalanced = true;
-                    return error.ConnectionResetByPeer;
+                    self.topology_change_injected = true;
+                    self.topology_old_authority_id = event.authority_id;
                 },
                 .schema_change => if (event.phase == .snapshot_batch_applied) {
                     self.fault_armed = false;
@@ -407,6 +605,7 @@ pub const Scenario = struct {
                 .deinit = sourceDeinit,
                 .query = sourceQuery,
                 .statistics = sourceStatistics,
+                .begin_prepared_replication_snapshot = beginPreparedReplicationSnapshot,
                 .prepare_replication = prepareReplication,
                 .poll_changes = pollChanges,
             } };
@@ -422,6 +621,62 @@ pub const Scenario = struct {
 
         fn sourceStatistics(_: *anyopaque, _: []const u8) !foreign.TableStatistics {
             return .{ .row_count = 2, .size_bytes = 64 };
+        }
+
+        fn beginPreparedReplicationSnapshot(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            params: foreign.ReplicationPollParams,
+            _: u64,
+        ) !foreign.PreparedReplicationSnapshot {
+            const session: *SourceSession = @ptrCast(@alignCast(ptr));
+            const self = session.fixture;
+            if (self.mode != .topology_change) return error.UnsupportedExactCutover;
+            const intent = params.exact_cutover_intent orelse
+                return error.InvalidReplicationCutoverIntent;
+            self.exact_cutover_prepares +|= 1;
+            try intent.persist([_]u8{0x7a} ** std.crypto.hash.sha2.Sha256.digest_length);
+            try intent.check();
+            if (params.retired_slot_name != null or
+                params.retired_publication_name != null)
+            {
+                if (params.retired_slot_name == null or
+                    params.retired_publication_name == null)
+                    return error.InvalidReplicationCutoverIntent;
+                try intent.retirementComplete();
+            }
+            const prepared_checkpoint = try allocator.dupe(u8, if (self.target_rebalanced)
+                "lsn:topology-v2"
+            else
+                "lsn:topology-v1");
+            errdefer allocator.free(prepared_checkpoint);
+            const prepared = try allocator.create(PreparedSnapshotSession);
+            errdefer allocator.destroy(prepared);
+            prepared.* = .{ .source = session };
+            return .{
+                .checkpoint = prepared_checkpoint,
+                .reader = .{
+                    .ptr = prepared,
+                    .vtable = &.{
+                        .deinit = preparedSnapshotDeinit,
+                        .query = preparedSnapshotQuery,
+                    },
+                },
+            };
+        }
+
+        fn preparedSnapshotDeinit(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+            const prepared: *PreparedSnapshotSession = @ptrCast(@alignCast(ptr));
+            allocator.destroy(prepared);
+        }
+
+        fn preparedSnapshotQuery(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            params: foreign.QueryParams,
+        ) !foreign.QueryResult {
+            const prepared: *PreparedSnapshotSession = @ptrCast(@alignCast(ptr));
+            return try sourceQuery(prepared.source, allocator, params);
         }
 
         fn sourceQuery(ptr: *anyopaque, allocator: std.mem.Allocator, params: foreign.QueryParams) !foreign.QueryResult {
@@ -545,6 +800,8 @@ pub const Scenario = struct {
                 self.stale_rejected = self.mode != .stale_owner or err == error.CdcWorkLeaseLost;
                 if (self.mode == .stale_owner)
                     self.stale_owner_rejected_offset = (self.latest() orelse return error.MissingReplicationStatus).snapshot_offset;
+                if (self.mode == .topology_change)
+                    self.topology_rejected_offset = (self.latest() orelse return error.MissingReplicationStatus).snapshot_offset;
             }
             if (!snapshot_complete) {
                 self.lease_valid = true;
@@ -594,6 +851,9 @@ pub const Scenario = struct {
                     status,
                 );
             }
+            if (self.mode == .topology_change)
+                self.topology_new_authority_id = (self.latest() orelse
+                    return error.MissingReplicationStatus).cutover_authority_id;
             self.complete = true;
         }
 
@@ -635,6 +895,16 @@ pub const Scenario = struct {
         /// checkpoint and prove one exact idempotent target replay.
         pub fn runStaleOwner(self: *@This()) !void {
             self.mode = .stale_owner;
+            self.fault_armed = true;
+            try self.run();
+        }
+
+        /// Change the replicated source catalog after one target apply. The
+        /// old exact-cutover authority must fail its post-apply check before
+        /// checkpoint publication; a newly claimed authority then retires the
+        /// predecessor and replays the undurable batch.
+        pub fn runTopologyChange(self: *@This()) !void {
+            self.mode = .topology_change;
             self.fault_armed = true;
             try self.run();
         }
@@ -686,6 +956,25 @@ pub const Scenario = struct {
                 self.source_sessions_closed == self.source_sessions_opened and
                 self.source_sessions_live == 0 and self.source_sessions_peak == 1 and
                 self.apply_calls == 4 and self.lease_valid and !self.fault_armed;
+        }
+
+        pub fn topologyChangeRecoverySound(self: *const @This()) bool {
+            return self.completionSound() and self.first_attempt_failed and
+                self.topology_change_injected and self.target_rebalanced and
+                self.schema_v2_query_seen and self.topology_rejected_offset == 0 and
+                self.first_attempt_error_code ==
+                    @intFromError(error.ReplicationSourceConfigChanged) and
+                self.topology_old_authority_id != 0 and
+                self.topology_new_authority_id != 0 and
+                self.topology_new_authority_id != self.topology_old_authority_id and
+                self.exact_cutover_prepares == 2 and
+                self.exact_cutover_claims == 2 and
+                self.exact_cutover_checks > 0 and
+                self.exact_cutover_retirements == 1 and
+                self.source_sessions_opened == 3 and
+                self.source_sessions_closed == self.source_sessions_opened and
+                self.source_sessions_live == 0 and self.source_sessions_peak == 1 and
+                self.apply_calls == 4 and !self.fault_armed;
         }
 
         pub fn firstAttemptFailed(self: *const @This()) bool {
@@ -755,6 +1044,14 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".stale-owner-rejected-offset", @intCast(world.state.stale_owner_rejected_offset));
         try builder.addNamed(allocator, name ++ ".stale-owner-session", @intCast(world.state.stale_owner_session));
         try builder.addNamed(allocator, name ++ ".stale-owner-recovery-session", @intCast(world.state.stale_owner_recovery_session));
+        try builder.addNamed(allocator, name ++ ".topology-change-injected", @intFromBool(world.state.topology_change_injected));
+        try builder.addNamed(allocator, name ++ ".topology-rejected-offset", @intCast(world.state.topology_rejected_offset));
+        try builder.addNamed(allocator, name ++ ".topology-old-authority", @bitCast(world.state.topology_old_authority_id));
+        try builder.addNamed(allocator, name ++ ".topology-new-authority", @bitCast(world.state.topology_new_authority_id));
+        try builder.addNamed(allocator, name ++ ".exact-cutover-prepares", @intCast(world.state.exact_cutover_prepares));
+        try builder.addNamed(allocator, name ++ ".exact-cutover-claims", @intCast(world.state.exact_cutover_claims));
+        try builder.addNamed(allocator, name ++ ".exact-cutover-checks", @intCast(world.state.exact_cutover_checks));
+        try builder.addNamed(allocator, name ++ ".exact-cutover-retirements", @intCast(world.state.exact_cutover_retirements));
         try builder.addNamed(allocator, name ++ ".first-attempt-error", @intCast(world.state.first_attempt_error_code));
     }
 
@@ -772,7 +1069,8 @@ pub const Scenario = struct {
             (state.mode == .clean or state.first_attempt_failed) and
             (state.mode != .source_crash or state.sourceCrashRecoverySound()) and
             (state.mode != .cancellation or state.cancellationRecoverySound()) and
-            (state.mode != .stale_owner or state.staleOwnerRecoverySound()));
+            (state.mode != .stale_owner or state.staleOwnerRecoverySound()) and
+            (state.mode != .topology_change or state.topologyChangeRecoverySound()));
     }
 
     pub fn healthSnapshot(world: *World) vopr.health.Snapshot {

@@ -1674,7 +1674,7 @@ fn cloneProjectedReplicationSourceStatusesOwned(
     return out;
 }
 
-fn replicationCutoverIntentApplied(
+pub fn replicationCutoverIntentApplied(
     record: metadata_table_manager.ReplicationSourceStatusRecord,
     expected: metadata_table_manager.ReplicationSourceStatusRecord,
 ) bool {
@@ -1712,7 +1712,7 @@ fn replicationCutoverIntentApplied(
         );
 }
 
-fn replicationCutoverAuthorityMatches(
+pub fn replicationCutoverAuthorityMatches(
     record: metadata_table_manager.ReplicationSourceStatusRecord,
     expected: metadata_table_manager.ReplicationSourceStatusRecord,
 ) bool {
@@ -1736,7 +1736,7 @@ fn replicationCutoverAuthorityMatches(
         std.mem.eql(u8, record.publication_name, expected.publication_name);
 }
 
-fn replicationCutoverRetirementMatches(
+pub fn replicationCutoverRetirementMatches(
     record: metadata_table_manager.ReplicationSourceStatusRecord,
     expected: metadata_table_manager.ReplicationSourceStatusRecord,
 ) bool {
