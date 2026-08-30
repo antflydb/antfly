@@ -15462,6 +15462,7 @@ func TestReconcileStandaloneStatefulSetHADisablePreservesActivatedSeedStorageTop
 	}}
 	testClient := newHAControllerTestClient(t, s, cluster, pvc)
 	reconciler := &AntflyClusterReconciler{Client: testClient, Scheme: s}
+	reenabledHA := cluster.Spec.HighAvailability.DeepCopy()
 
 	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
 	cluster.Spec.HighAvailability = nil
@@ -15490,6 +15491,38 @@ func TestReconcileStandaloneStatefulSetHADisablePreservesActivatedSeedStorageTop
 	g.Expect(container.Args[0]).NotTo(ContainSubstring("--ha-"), "disabling HA removes authority without relocating the database")
 	g.Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(haSeedTargetPVCUIDAnnotation, "pvc-uid-1"))
 	g.Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(haSeedGenerationAnnotation, "prod-standby-a-10"))
+
+	// Re-enabling HA on the retained promoted controller changes authority but
+	// not physical storage identity. The explicit activated PVC and its three
+	// generation-scoped data roots must remain intact; falling back to an
+	// immutable volumeClaimTemplate would either fail admission or fork data.
+	cluster.Spec.HighAvailability = reenabledHA
+	cluster.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRolePrimary
+	cluster.Spec.HighAvailability.Runtime.NodeID = "standby-a"
+	cluster.Spec.HighAvailability.Runtime.Standby = nil
+	cluster.Spec.HighAvailability.Runtime.Primary = &antflyv1.HAPrimaryRuntimeSpec{
+		LogPath: "/antflydb/ha/primary.wal", SlotsPath: "/antflydb/ha/slots",
+	}
+	cluster.Spec.HighAvailability.Runtime.StartupGate = nil
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(testClient.Get(context.Background(), types.NamespacedName{
+		Name: "test-standalone-standalone", Namespace: "default",
+	}, sts)).To(Succeed())
+	g.Expect(sts.Spec.VolumeClaimTemplates).To(BeEmpty())
+	g.Expect(sts.Spec.Template.Spec.Volumes).To(ContainElement(corev1.Volume{
+		Name: "standalone-storage", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: "standby-a-data",
+		}},
+	}))
+	for mountPath, leaf := range map[string]string{
+		"/antflydb/data": "data", "/antflydb/metadata": "metadata", "/antflydb/extensions": "extensions",
+	} {
+		g.Expect(sts.Spec.Template.Spec.Containers[0].VolumeMounts).To(ContainElement(corev1.VolumeMount{
+			Name: "standalone-storage", MountPath: mountPath,
+			SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/" + leaf,
+		}))
+	}
 }
 
 func TestReconcileStandaloneStatefulSetHADisableRejectsIncompleteExplicitSeedBinding(t *testing.T) {

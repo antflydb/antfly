@@ -4573,12 +4573,13 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	}
 
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, statefulSet, func() error {
-		// Removing HA management must not reinterpret a seeded runtime's disk as a
-		// fresh volumeClaimTemplate. Its database, metadata, and extensions live in
-		// one activated generation on an explicitly bound PVC. Preserve that exact,
-		// already-admitted storage topology while dropping only HA authority.
+		// Neither removing nor later re-enabling HA may reinterpret a seeded
+		// runtime's disk as a fresh volumeClaimTemplate. Its database, metadata,
+		// and extensions live in one activated generation on an explicitly bound
+		// PVC. Preserve that exact, already-admitted topology across every later
+		// authority transition.
 		var preservedSeedStorage *activatedStandaloneStorageBinding
-		if !activatedSeedGate && haManagementDisabled(cluster) {
+		if !activatedSeedGate {
 			preservedSeedStorage = existingActivatedStandaloneStorageBinding(statefulSet, storageVolumeName)
 			if preservedSeedStorage == nil && hasExplicitStandaloneStoragePVC(statefulSet, storageVolumeName) {
 				return fmt.Errorf("existing StatefulSet %s has an explicit standalone storage PVC without a complete activated-seed binding; refusing to reinterpret its on-disk layout", statefulSet.Name)
