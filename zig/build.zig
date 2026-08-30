@@ -3022,6 +3022,7 @@ pub fn build(b: *std.Build) void {
             "repository incremental upload streams only blobs absent from exact parent",
             "repository publishes resolves and materializes one complete deduplicated snapshot",
             "repository epoch fences GC and active publication leases retain candidates",
+            "repository reachability fails closed while an active lease manifest is missing",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

@@ -197,12 +197,32 @@ pub const PublicationSession = struct {
     }
 };
 
+/// Content-addressed objects may only be swept when the backend can keep the
+/// deletion fence valid for the entire deletion, including an arbitrarily
+/// paused owner. A local non-expiring file lock has that property. Renewable
+/// object-store coordinator leases do not; those repositories remain
+/// append-only until their catalog supports version-targeted two-phase delete.
+pub const GarbageCollector = struct {
+    /// The implementation must keep its reachability fence valid across the
+    /// entire operation. It may perform a local conditional delete under a
+    /// non-expiring lock or a durable catalog tombstone plus exact-version
+    /// delete; a renewable time lease alone is insufficient.
+    delete_unreachable: *const fn (
+        context: *anyopaque,
+        path: []const u8,
+        cutoff_unix_ns: i128,
+        expected_epoch: u64,
+    ) anyerror!bool,
+};
+
 /// Storage adapters implement this contract for local filesystems and object
 /// stores. Immutable puts must be create-if-absent (an existing byte-identical
 /// object is success); refs must use the backend's atomic compare-and-swap or
 /// conditional-write primitive. No backup is visible until `publish_ref`.
 pub const Backend = struct {
     context: *anyopaque,
+    /// Null means the immutable store is intentionally append-only.
+    garbage_collector: ?GarbageCollector,
     put_immutable: *const fn (context: *anyopaque, path: []const u8, bytes: []const u8) anyerror!void,
     read_alloc: *const fn (context: *anyopaque, alloc: std.mem.Allocator, path: []const u8, limit: usize) anyerror![]u8,
     contains: *const fn (context: *anyopaque, path: []const u8) anyerror!bool,
@@ -240,12 +260,6 @@ pub const Backend = struct {
         lease_path: []const u8,
         fencing_token: u64,
     ) anyerror!u64,
-    delete_if_older_than: *const fn (
-        context: *anyopaque,
-        path: []const u8,
-        cutoff_unix_ns: i128,
-        expected_epoch: u64,
-    ) anyerror!bool,
     /// Stream a verified local file into an immutable repository object. The
     /// backend must use create-if-absent semantics; an existing object is
     /// success only when its bytes match the declared digest and size.
@@ -455,10 +469,11 @@ pub fn manifestDigestHexAlloc(alloc: std.mem.Allocator, encoded: []const u8) ![]
     return try alloc.dupe(u8, &hex);
 }
 
-/// Installs the immutable candidate manifest and activates a durable,
-/// repository-epoch-fenced publication lease before any blob is trusted or
-/// reused. GC therefore sees the complete intended inventory while uploads
-/// remain concurrent.
+/// Activates a durable, repository-epoch-fenced publication lease and then
+/// installs its immutable candidate manifest before any blob is trusted or
+/// reused. Retention-expanding control mutations advance the repository epoch
+/// before installing the new root. A crash may therefore leave a lease whose
+/// manifest is not present; reachability must abort and retry in that state.
 pub fn beginPublication(
     alloc: std.mem.Allocator,
     backend: Backend,
@@ -476,10 +491,6 @@ pub fn beginPublication(
     defer alloc.free(encoded_manifest);
     const digest = try manifestDigestHexAlloc(alloc, encoded_manifest);
     errdefer alloc.free(digest);
-    const manifest_path = try manifestPathAlloc(alloc, digest);
-    defer alloc.free(manifest_path);
-    try backend.put_immutable(backend.context, manifest_path, encoded_manifest);
-
     const lease: Lease = .{
         .lease_id = lease_id,
         .manifest_sha256 = digest,
@@ -498,6 +509,9 @@ pub fn beginPublication(
         fencing_token,
     );
     errdefer _ = backend.release_lease(backend.context, lease_path, fencing_token) catch 0;
+    const manifest_path = try manifestPathAlloc(alloc, digest);
+    defer alloc.free(manifest_path);
+    try backend.put_immutable(backend.context, manifest_path, encoded_manifest);
     if (plan.base) |base| try verifyCommittedBaseStored(alloc, backend, base);
     return .{
         .lease_id = owned_lease_id,
@@ -1203,6 +1217,8 @@ pub fn sweepUnreachable(
     candidates: []const GarbageCandidate,
     grace_cutoff_unix_ns: i128,
 ) !usize {
+    const collector = backend.garbage_collector orelse
+        return error.BackupRepositoryGcUnsupported;
     var deleted: usize = 0;
     for (candidates) |candidate| {
         try bundle.validateSha256(candidate.sha256);
@@ -1218,7 +1234,7 @@ pub fn sweepUnreachable(
             .blob => try blobPathAlloc(alloc, candidate.sha256),
         };
         defer alloc.free(path);
-        if (try backend.delete_if_older_than(
+        if (try collector.delete_unreachable(
             backend.context,
             path,
             grace_cutoff_unix_ns,
@@ -1411,10 +1427,14 @@ const TestFilesystemBackend = struct {
     contains_calls: usize = 0,
     epoch: u64 = 1,
     active_lease_fence: u64 = 0,
+    require_active_lease_for_manifest: bool = false,
+    fail_next_lease_write: bool = false,
+    delete_calls: usize = 0,
 
     fn backend(self: *@This()) Backend {
         return .{
             .context = self,
+            .garbage_collector = .{ .delete_unreachable = deleteIfOlderThan },
             .put_immutable = putImmutable,
             .read_alloc = readAlloc,
             .contains = contains,
@@ -1423,7 +1443,6 @@ const TestFilesystemBackend = struct {
             .renew_lease = renewLease,
             .finalize_publication = finalizePublication,
             .release_lease = releaseLease,
-            .delete_if_older_than = deleteIfOlderThan,
             .put_blob_from_file = putBlobFromFile,
             .materialize_blob_to_file = materializeBlobToFile,
         };
@@ -1435,6 +1454,10 @@ const TestFilesystemBackend = struct {
 
     fn putImmutable(context: *anyopaque, path: []const u8, bytes: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(context));
+        if (self.require_active_lease_for_manifest and
+            std.mem.startsWith(u8, path, "manifests/") and
+            self.active_lease_fence == 0)
+            return error.BackupManifestPublishedWithoutLease;
         const absolute = try self.pathAlloc(path);
         defer self.alloc.free(absolute);
         const existing = std.Io.Dir.cwd().readFileAlloc(
@@ -1522,12 +1545,19 @@ const TestFilesystemBackend = struct {
         const self: *@This() = @ptrCast(@alignCast(context));
         if (fencing_token == 0 or self.active_lease_fence != 0)
             return error.BackupRepositoryBusy;
+        // Retention expansion is ordered epoch first. Failure after this
+        // point is conservative: an in-flight mark restarts even though the
+        // new root was not installed.
+        self.epoch +|= 1;
+        if (self.fail_next_lease_write) {
+            self.fail_next_lease_write = false;
+            return error.InjectedLeaseWriteFailure;
+        }
         const absolute = try self.pathAlloc(path);
         defer self.alloc.free(absolute);
         if (std.fs.path.dirname(absolute)) |parent| try fs_paths.createDirPathPortable(self.io, parent);
         try writeTestFile(self.io, absolute, encoded);
         self.active_lease_fence = fencing_token;
-        self.epoch +|= 1;
         return self.epoch;
     }
 
@@ -1616,8 +1646,14 @@ const TestFilesystemBackend = struct {
         };
         const renewed_encoded = try encodeLeaseCanonicalAlloc(self.alloc, renewed, now_unix_ns);
         defer self.alloc.free(renewed_encoded);
-        try writeTestFile(self.io, absolute, renewed_encoded);
+        // A longer lease expands retention and must invalidate an older mark
+        // before the extension can become observable.
         self.epoch +|= 1;
+        if (self.fail_next_lease_write) {
+            self.fail_next_lease_write = false;
+            return error.InjectedLeaseWriteFailure;
+        }
+        try writeTestFile(self.io, absolute, renewed_encoded);
         return self.epoch;
     }
 
@@ -1637,6 +1673,7 @@ const TestFilesystemBackend = struct {
 
     fn deleteIfOlderThan(context: *anyopaque, _: []const u8, _: i128, expected_epoch: u64) !bool {
         const self: *@This() = @ptrCast(@alignCast(context));
+        self.delete_calls += 1;
         if (self.epoch != expected_epoch) return error.BackupRepositoryEpochChanged;
         return false;
     }
@@ -1915,9 +1952,24 @@ test "repository publishes resolves and materializes one complete deduplicated s
         },
         .blobs = &.{.{ .content_sha256 = &digest, .storage_sha256 = &digest, .logical_size_bytes = 10, .stored_size_bytes = 10 }},
     };
-    var filesystem = TestFilesystemBackend{ .alloc = alloc, .io = io, .root = repository_root };
+    var filesystem = TestFilesystemBackend{
+        .alloc = alloc,
+        .io = io,
+        .root = repository_root,
+        .require_active_lease_for_manifest = true,
+    };
     const backend = filesystem.backend();
     const plan: SnapshotPlan = .{ .manifest = manifest };
+    const epoch_before_failed_activation = filesystem.epoch;
+    filesystem.fail_next_lease_write = true;
+    try std.testing.expectError(
+        error.InjectedLeaseWriteFailure,
+        beginPublication(alloc, backend, plan, "failed-activation", 20, 0, 100),
+    );
+    // A failed retention-expanding write still invalidates a concurrent mark,
+    // and beginPublication never exposes the manifest before that transition.
+    try std.testing.expectEqual(epoch_before_failed_activation + 1, filesystem.epoch);
+    try std.testing.expectEqual(@as(u64, 0), filesystem.active_lease_fence);
     var session = try beginPublication(alloc, backend, plan, "daily-publication", 21, 0, 100);
     defer session.deinit(alloc);
     const receipts = try uploadSnapshotBlobsFromDirectory(
@@ -1937,6 +1989,16 @@ test "repository publishes resolves and materializes one complete deduplicated s
     const renewal_epoch = try renewPublication(alloc, backend, &session, 1, 200);
     try std.testing.expectEqual(@as(i128, 200), session.expires_at_unix_ns);
     try std.testing.expect(renewal_epoch > session.activated_epoch);
+    const epoch_before_failed_renewal = filesystem.epoch;
+    filesystem.fail_next_lease_write = true;
+    try std.testing.expectError(
+        error.InjectedLeaseWriteFailure,
+        renewPublication(alloc, backend, &session, 2, 300),
+    );
+    // The epoch is durable before the extension is attempted, while the
+    // caller's session and stored lease retain their prior expiry on failure.
+    try std.testing.expectEqual(epoch_before_failed_renewal + 1, filesystem.epoch);
+    try std.testing.expectEqual(@as(i128, 200), session.expires_at_unix_ns);
 
     const lease_path = try leasePathAlloc(alloc, session.lease_id);
     defer alloc.free(lease_path);
@@ -2131,5 +2193,57 @@ test "repository epoch fences GC and active publication leases retain candidates
             .sha256 = digest,
         }}, 100),
     );
+    var append_only_backend = backend;
+    append_only_backend.garbage_collector = null;
+    const delete_calls_before_unsupported_sweep = filesystem.delete_calls;
+    try std.testing.expectError(
+        error.BackupRepositoryGcUnsupported,
+        sweepUnreachable(alloc, append_only_backend, &current_reachability, &.{.{
+            .kind = .blob,
+            .sha256 = digest,
+        }}, 100),
+    );
+    try std.testing.expectEqual(delete_calls_before_unsupported_sweep, filesystem.delete_calls);
     _ = try abortPublication(alloc, backend, session);
+}
+
+test "repository reachability fails closed while an active lease manifest is missing" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const missing_digest = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository_root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/missing-manifest-repository",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(repository_root);
+    try fs_paths.createDirPathPortable(io, repository_root);
+    var filesystem = TestFilesystemBackend{ .alloc = alloc, .io = io, .root = repository_root };
+    const backend = filesystem.backend();
+    const lease: Lease = .{
+        .lease_id = "missing-manifest",
+        .manifest_sha256 = missing_digest,
+        .fencing_token = 41,
+        .expires_at_unix_ns = 100,
+    };
+    const encoded_lease = try encodeLeaseCanonicalAlloc(alloc, lease, 0);
+    defer alloc.free(encoded_lease);
+    const lease_path = try leasePathAlloc(alloc, lease.lease_id);
+    defer alloc.free(lease_path);
+    const epoch = try backend.activate_lease(
+        backend.context,
+        lease_path,
+        encoded_lease,
+        lease.fencing_token,
+    );
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        buildReachability(alloc, backend, &.{}, &.{lease}, 1, epoch),
+    );
+    // Callers cannot obtain a partial mark and therefore cannot enter sweep.
+    try std.testing.expectEqual(@as(usize, 0), filesystem.delete_calls);
+    _ = try backend.release_lease(backend.context, lease_path, lease.fencing_token);
 }

@@ -93,8 +93,8 @@ private staging cache, rehashes it, materializes all logical objects, and only
 then permits the owner to publish the generation.
 
 Refs are published with compare-and-swap semantics through a fenced publication
-session. The session first installs the immutable candidate manifest and a
-durable, renewable lease naming that exact digest and any exact incremental
+session. The session first advances the repository epoch and installs a
+durable, renewable lease naming the candidate digest and any exact incremental
 base. Each newly required blob upload returns
 a backend-issued receipt bound to the session fence and to the verified object
 generation. Finalization accepts the complete receipt set, writes an immutable
@@ -102,8 +102,9 @@ completion seal, consumes the manifest-bound lease, and conditionally publishes
 the ref while holding the repository coordinator.
 It does not issue one remote existence request per blob.
 
-Garbage collection marks manifests, seals, and blobs reachable from refs and active
-leases at one repository epoch, then applies a grace period before deletion.
+Local garbage collection marks manifests, seals, and blobs reachable from refs
+and active leases at one repository epoch, then applies a grace period before
+deletion.
 Every lease/ref transition advances that epoch and every deletion rechecks it
 under the same coordinator. A publication that races an old mark therefore
 forces that sweep to restart instead of deleting its candidate artifacts.
@@ -111,15 +112,23 @@ Failed writers cannot expose partial snapshots, stale writers are fenced, and
 concurrent writers cannot silently replace one another. Parent links are
 informational lineage, not retention edges: complete child inventories directly
 retain every stored blob they need, avoiding unbounded ancestor retention.
-Remote coordinator owners refresh through an ETag compare-and-swap immediately
-before control mutations, and epoch updates are themselves conditional writes,
-so a process resumed after lease takeover cannot mutate repository state.
+Remote coordinator owners refresh through an ETag compare-and-swap around
+control mutations, and epoch updates are themselves conditional writes. Remote
+immutable storage is deliberately append-only: a renewable time lease cannot
+fence an owner paused for an arbitrary duration between refresh and delete, and
+a content-addressed object may be republished with the same ETag. Remote sweep
+requires a future transactional catalog that first tombstones an exact storage
+generation, lets publishers pin or replace it, and then deletes only that
+version. Until then, remote cleanup may retain unreachable bytes but can never
+delete bytes reachable by a backup.
 
 Publication order is part of the durability contract:
 
 1. validate a full capture or a typed committed base whose digest is recomputed
    from its canonical manifest and whose immutable completion seal matches;
-2. write the candidate manifest immutably and activate its fenced lease;
+2. advance the epoch, activate the fenced lease, and then write the candidate
+   manifest immutably (a lease whose manifest is temporarily missing makes GC
+   abort and retry);
 3. stream only newly required `blobs/sha256/<storage-sha256>` objects with
    create-if-absent semantics, keeping the source file generation pinned and
    post-verifying the stored object generation;

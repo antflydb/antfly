@@ -629,6 +629,10 @@ pub const RepositoryLocationBackend = struct {
     pub fn backend(self: *@This()) backup_repository.Backend {
         return .{
             .context = self,
+            .garbage_collector = switch (self.location.*) {
+                .file => .{ .delete_unreachable = deleteIfOlderThan },
+                .remote => null,
+            },
             .put_immutable = putImmutable,
             .read_alloc = readAlloc,
             .contains = contains,
@@ -637,7 +641,6 @@ pub const RepositoryLocationBackend = struct {
             .renew_lease = renewRepositoryLease,
             .finalize_publication = finalizeRepositoryPublication,
             .release_lease = releaseRepositoryLease,
-            .delete_if_older_than = deleteIfOlderThan,
             .put_blob_from_file = putBlobFromFile,
             .materialize_blob_to_file = materializeBlobToFile,
         };
@@ -978,8 +981,11 @@ pub const RepositoryLocationBackend = struct {
                     if (parsed.value.fencing_token != fencing_token or
                         !std.mem.eql(u8, value, encoded)) return error.BackupRepositoryBusy;
                 } else {
+                    const next = (try readLocalRepositoryEpochAssumeRoot(self, root)) +| 1;
+                    try self.writeLocalRepositoryEpochUnderLock(root, next);
                     try ensureBackupRelativeParentNoFollow(self.io, root, path);
                     try replaceFileInBackupRootUnderHeldLock(self.alloc, self.io, root, path, encoded);
+                    break :blk next;
                 }
                 const next = (try readLocalRepositoryEpochAssumeRoot(self, root)) +| 1;
                 try self.writeLocalRepositoryEpochUnderLock(root, next);
@@ -1001,8 +1007,11 @@ pub const RepositoryLocationBackend = struct {
                     if (parsed.value.fencing_token != fencing_token or
                         !std.mem.eql(u8, value, encoded)) return error.BackupRepositoryBusy;
                 } else {
+                    const next = (try readRemoteRepositoryEpochAssumeStore(self, store)) +| 1;
+                    try self.writeRemoteRepositoryEpochUnderLock(store, &coordinator, next);
                     try coordinator.refresh();
                     try store.writeBytesIfAbsent(self.alloc, path, encoded, "application/json");
+                    break :blk next;
                 }
                 const next = (try readRemoteRepositoryEpochAssumeStore(self, store)) +| 1;
                 try self.writeRemoteRepositoryEpochUnderLock(store, &coordinator, next);
@@ -1116,9 +1125,9 @@ pub const RepositoryLocationBackend = struct {
                 };
                 const renewed_encoded = try backup_repository.encodeLeaseCanonicalAlloc(self.alloc, renewed, now_unix_ns);
                 defer self.alloc.free(renewed_encoded);
-                try replaceFileInBackupRootUnderHeldLock(self.alloc, self.io, root, lease_path, renewed_encoded);
                 const next = (try readLocalRepositoryEpochAssumeRoot(self, root)) +| 1;
                 try self.writeLocalRepositoryEpochUnderLock(root, next);
+                try replaceFileInBackupRootUnderHeldLock(self.alloc, self.io, root, lease_path, renewed_encoded);
                 break :blk next;
             },
             .remote => |*store| blk: {
@@ -1151,6 +1160,8 @@ pub const RepositoryLocationBackend = struct {
                 const renewed_encoded = try backup_repository.encodeLeaseCanonicalAlloc(self.alloc, renewed, now_unix_ns);
                 defer self.alloc.free(renewed_encoded);
                 const etag = current.metadata.etag orelse return error.BackupReservationIdentityUnavailable;
+                const next = (try readRemoteRepositoryEpochAssumeStore(self, store)) +| 1;
+                try self.writeRemoteRepositoryEpochUnderLock(store, &coordinator, next);
                 try coordinator.refresh();
                 var result = store.client.putObject(store.bucket, key, renewed_encoded, .{
                     .content_type = "application/json",
@@ -1160,8 +1171,6 @@ pub const RepositoryLocationBackend = struct {
                     else => return err,
                 };
                 result.deinit(self.alloc);
-                const next = (try readRemoteRepositoryEpochAssumeStore(self, store)) +| 1;
-                try self.writeRemoteRepositoryEpochUnderLock(store, &coordinator, next);
                 break :blk next;
             },
         };
@@ -1247,29 +1256,13 @@ pub const RepositoryLocationBackend = struct {
                 try deleteFileDurablyFromBackupRoot(self.io, root, path);
                 break :blk true;
             },
-            .remote => |*store| blk: {
-                var coordinator = try acquireRemoteRepositoryCoordinator(self.alloc, store);
-                defer coordinator.deinit();
-                defer coordinator.release() catch {};
-                try coordinator.refresh();
-                if (try readRemoteRepositoryEpochAssumeStore(self, store) != expected_epoch)
-                    return error.BackupRepositoryEpochChanged;
-                const key = try store.keyAlloc(self.alloc, path);
-                defer self.alloc.free(key);
-                var metadata = store.client.statObject(store.bucket, key) catch |err| switch (err) {
-                    error.FileNotFound => break :blk false,
-                    else => return err,
-                };
-                defer metadata.deinit(self.alloc);
-                const modified_ms = metadata.last_modified_unix_ms orelse break :blk false;
-                if (@as(i128, modified_ms) * std.time.ns_per_ms >= cutoff_unix_ns) break :blk false;
-                const etag = metadata.etag orelse break :blk false;
-                try coordinator.refresh();
-                store.client.deleteObject(store.bucket, key, .{ .if_match_etag = etag }) catch |err| switch (err) {
-                    error.FileNotFound, error.PreconditionFailed => break :blk false,
-                    else => return err,
-                };
-                break :blk true;
+            .remote => blk: {
+                // A renewable coordinator plus ETag cannot fence a process
+                // paused after its last refresh. Content-addressed bytes can
+                // also be republished with the same ETag. Remote repositories
+                // therefore remain append-only until a transactional catalog
+                // can tombstone and delete an exact storage generation.
+                break :blk error.BackupRepositoryGcUnsupported;
             },
         };
     }
@@ -1578,6 +1571,23 @@ test "remote repository coordinator fences a resumed stale owner" {
         .io = store.io,
         .location = &location,
     };
+    const repository_backend = adapter.backend();
+    try std.testing.expect(repository_backend.garbage_collector == null);
+    var empty_reachability: backup_repository.Reachability = .{ .repository_epoch = 0 };
+    defer empty_reachability.deinit(alloc);
+    try std.testing.expectError(
+        error.BackupRepositoryGcUnsupported,
+        backup_repository.sweepUnreachable(
+            alloc,
+            repository_backend,
+            &empty_reachability,
+            &.{.{
+                .kind = .blob,
+                .sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            }},
+            0,
+        ),
+    );
     try adapter.writeRemoteRepositoryEpochUnderLock(store, &stale, 1);
     try std.testing.expectError(
         error.BackupRepositoryEpochChanged,
