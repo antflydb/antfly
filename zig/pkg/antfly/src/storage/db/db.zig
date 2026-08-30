@@ -22636,10 +22636,6 @@ pub const DB = struct {
         }
     }
 
-    fn drainReplayStagesUntilStable(self: *DB) !void {
-        try self.drainReplayStagesUntilStableWithOptions(.{ .wait_for_enrichment_retries = true });
-    }
-
     fn sleepArtifactRepairMetadataWorker(self: *DB, target_ns: u64) bool {
         var slept: u64 = 0;
         while (slept < target_ns) : (slept += artifact_repair_metadata_sleep_slice_ns) {
@@ -22755,8 +22751,8 @@ pub const DB = struct {
         try self.flushAppliedSequencesForIdle();
     }
 
-    pub fn runUntilIdle(self: *DB) !void {
-        try self.drainReplayStagesUntilStable();
+    fn runUntilIdleWithReplayDrainOptions(self: *DB, options: ReplayDrainOptions) !void {
+        try self.drainReplayStagesUntilStableWithOptions(options);
         _ = try self.evaluateAlgebraicAdaptiveCandidates();
         while (try self.runAlgebraicAdaptiveWork() != 0) {}
         try self.flushAppliedSequencesForIdle();
@@ -22764,6 +22760,18 @@ pub const DB = struct {
         try self.runArtifactRepairMetadataMaintenanceUntilIdle();
         _ = try self.runDensePostingMaintenanceForIdle();
         _ = try self.runLsmMaintenanceUntilIdle();
+    }
+
+    pub fn runUntilIdle(self: *DB) !void {
+        try self.runUntilIdleWithReplayDrainOptions(.{ .wait_for_enrichment_retries = true });
+    }
+
+    /// Resident managed writers already have an asynchronous enrichment owner.
+    /// Maintenance callers that only borrowed that writer must yield a bounded
+    /// quantum when its provider is retrying instead of becoming a second,
+    /// indefinitely waiting owner of the same replay tail.
+    pub fn runUntilIdleWithoutWaitingForEnrichmentRetries(self: *DB) !void {
+        try self.runUntilIdleWithReplayDrainOptions(.{});
     }
 
     pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
@@ -71341,7 +71349,10 @@ test "db enrichment retry makes monotonic progress across provider batches" {
     });
     const sequence = db.core.nextEnrichmentSequence();
 
-    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(sequence));
+    try std.testing.expectError(
+        error.EnrichmentRetryInProgress,
+        db.runUntilIdleWithoutWaitingForEnrichmentRetries(),
+    );
     sleepNs(550 * std.time.ns_per_ms);
     try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(sequence));
     sleepNs(550 * std.time.ns_per_ms);
