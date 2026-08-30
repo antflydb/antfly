@@ -1430,10 +1430,20 @@ class PdfOcrE2EServer:
 
 
 class OpenAiEmbeddingServer:
-    def __init__(self, host: str = "127.0.0.1", response_delay_s: float = 0.0):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        response_delay_s: float = 0.0,
+        rate_limit_after_requests: int | None = None,
+    ):
         port = find_free_port()
         self.url = f"http://{host}:{port}"
         self.response_delay_s = response_delay_s
+        self.rate_limit_after_requests = rate_limit_after_requests
+        self.rate_limit_input_substring: str | None = None
+        self._request_count = 0
+        self._request_lock = threading.Lock()
+        self._allow_rate_limited_requests = threading.Event()
 
         outer = self
 
@@ -1449,6 +1459,39 @@ class OpenAiEmbeddingServer:
                 inputs = payload.get("input", [])
                 if isinstance(inputs, str):
                     inputs = [inputs]
+
+                with outer._request_lock:
+                    outer._request_count += 1
+                    request_number = outer._request_count
+                    rate_limit_after_requests = outer.rate_limit_after_requests
+                    rate_limit_input_substring = outer.rate_limit_input_substring
+                should_rate_limit = (
+                    rate_limit_after_requests is not None
+                    and request_number > rate_limit_after_requests
+                    and not outer._allow_rate_limited_requests.is_set()
+                    and (
+                        rate_limit_input_substring is None
+                        or any(
+                            rate_limit_input_substring in str(value)
+                            for value in inputs
+                        )
+                    )
+                )
+                if should_rate_limit:
+                    body = json.dumps(
+                        {
+                            "error": {
+                                "message": "rate limit exceeded in test fixture",
+                                "type": "rate_limit_exceeded",
+                            }
+                        }
+                    ).encode("utf-8")
+                    self.send_response(429)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
 
                 if outer.response_delay_s > 0:
                     time.sleep(outer.response_delay_s)
@@ -1503,7 +1546,19 @@ class OpenAiEmbeddingServer:
             return [0.8, 0.2, 0.0]
         return [0.0, 0.0, 1.0]
 
+    def rate_limit_after_next_requests(
+        self, count: int, *, input_substring: str | None = None
+    ) -> None:
+        with self._request_lock:
+            self.rate_limit_after_requests = self._request_count + count
+            self.rate_limit_input_substring = input_substring
+            self._allow_rate_limited_requests.clear()
+
+    def allow_rate_limited_requests(self) -> None:
+        self._allow_rate_limited_requests.set()
+
     def stop(self) -> None:
+        self.allow_rate_limited_requests()
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=5)
@@ -2184,9 +2239,9 @@ def slow_openai_embedder():
 
 @pytest.fixture(scope="function")
 def progressive_openai_embedder():
-    """Keep initial backfill observable without making the E2E minutes long."""
-    server = OpenAiEmbeddingServer(response_delay_s=0.05)
-    yield server.url
+    """Throttle the second write after its first durable page is embedded."""
+    server = OpenAiEmbeddingServer()
+    yield server
     server.stop()
 
 
