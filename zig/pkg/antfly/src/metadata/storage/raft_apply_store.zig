@@ -4422,11 +4422,21 @@ fn storeHasRuntimeArtifactSourceStatus(record: metadata.StoreRecord) bool {
     return false;
 }
 
+fn storeHasRuntimePublicationTarget(record: metadata.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.publication_target_ready) return true;
+        }
+    }
+    return false;
+}
+
 fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
     if (record.native_generation_restore_version != 0 or
         record.artifact_sources_protocol_version != 0 or
         storeHasRuntimeRepairStatus(record) or
         storeHasRuntimeArtifactSourceStatus(record) or
+        storeHasRuntimePublicationTarget(record) or
         record.reporter_incarnation != 0 or record.status_generation != 0)
         return runtime_status_protocol.current_record_version;
     return null;
@@ -5846,7 +5856,10 @@ fn appendRuntimeIndexStatusRecord(
     try appendOptionalString(alloc, out, record.load_error);
     if (version == runtime_status_protocol.current_record_version) {
         // V15 is one atomic profile: safety-critical repair state and
-        // per-source replay state must never be projected independently.
+        // publication target, and per-source replay state must never be
+        // projected independently.
+        try appendInt(alloc, out, u64, record.publication_target_count);
+        try out.append(alloc, if (record.publication_target_ready) 1 else 0);
         try out.append(alloc, if (record.repair_status) |status| @intFromEnum(status) else 0);
         try out.append(
             alloc,
@@ -5900,6 +5913,17 @@ fn readRuntimeIndexStatusRecord(
     pos.* += 1;
     const load_error = try readOptionalString(alloc, encoded, pos);
     errdefer if (load_error) |value| alloc.free(value);
+    const publication_target_count = if (version == runtime_status_protocol.current_record_version)
+        try readInt(encoded, pos, u64)
+    else
+        0;
+    const publication_target_ready = if (version == runtime_status_protocol.current_record_version) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const value = encoded[pos.*];
+        pos.* += 1;
+        if (value > 1) return error.InvalidMetadataTransitionEncoding;
+        break :blk value == 1;
+    } else false;
     const repair_status: ?metadata.IndexRepairStatus = if (version == runtime_status_protocol.current_record_version) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const tag = encoded[pos.*];
@@ -5958,6 +5982,8 @@ fn readRuntimeIndexStatusRecord(
         .edge_count = edge_count,
         .node_count = node_count,
         .root_node = root_node,
+        .publication_target_count = publication_target_count,
+        .publication_target_ready = publication_target_ready,
         .coverage_produced_count = coverage_produced_count,
         .coverage_skipped_count = coverage_skipped_count,
         .coverage_terminal_failed_count = coverage_terminal_failed_count,
@@ -11577,6 +11603,8 @@ test "metadata runtime index status current profile preserves source failures" {
     try appendRuntimeIndexStatusRecord(alloc, &encoded, .{
         .name = "semantic",
         .kind = "dense_vector",
+        .publication_target_count = 2500,
+        .publication_target_ready = true,
         .source_replay = @constCast(sources[0..]),
     }, runtime_status_protocol.artifact_source_status_record_version);
 
@@ -11591,6 +11619,8 @@ test "metadata runtime index status current profile preserves source failures" {
     try std.testing.expectEqual(encoded.items.len, pos);
     try std.testing.expectEqual(@as(usize, 1), decoded.source_replay.len);
     try std.testing.expect(decoded.source_replay[0].failed);
+    try std.testing.expect(decoded.publication_target_ready);
+    try std.testing.expectEqual(@as(u64, 2500), decoded.publication_target_count);
 }
 
 test "metadata runtime status writer preserves the version twelve rolling-upgrade contract" {
@@ -11640,6 +11670,36 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
     );
     defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, v0_2_0_decoded);
     try std.testing.expectEqual(encoded.items.len, v0_2_0_pos);
+
+    encoded.clearRetainingCapacity();
+    indexes[0].publication_target_count = 2500;
+    indexes[0].publication_target_ready = true;
+    try appendRuntimeIndexStatusRecord(
+        alloc,
+        &encoded,
+        indexes[0],
+        runtime_status_protocol.v0_2_0_record_version,
+    );
+    var projected_pos: usize = 0;
+    const projected = try readRuntimeIndexStatusRecord(
+        alloc,
+        encoded.items,
+        &projected_pos,
+        runtime_status_protocol.v0_2_0_record_version,
+    );
+    defer metadata_table_manager.freeRuntimeIndexStatusReport(alloc, projected);
+    try std.testing.expect(!projected.publication_target_ready);
+    try std.testing.expectEqual(@as(u64, 0), projected.publication_target_count);
+    try std.testing.expectEqual(
+        runtime_status_protocol.publication_target_record_version,
+        storeRuntimeStatusRecordVersion(.{
+            .store_id = 3,
+            .node_id = 4,
+            .runtime_statuses = runtime_statuses[0..],
+        }).?,
+    );
+    indexes[0].publication_target_count = 0;
+    indexes[0].publication_target_ready = false;
 
     encoded.clearRetainingCapacity();
     indexes[0].repair_status = .rebuilding;

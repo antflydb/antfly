@@ -170,6 +170,13 @@ activation or renewal from briefly looking like a complete namespace.
   partial.
 - Native and portable are manifest values, never inferred from file extension
   or CLI flags during restore.
+- The AFB2 root manifest is sealed source identity. Import validates it before
+  copying any artifact and never rewrites it for a renamed restore. Native
+  staging instead derives a target-scoped restore envelope: the target table
+  name changes, while backup id, generation, object inventory, digests, and
+  compatibility facts remain identical. The ordinary table-restore path then
+  consumes that envelope, so restoring `source_docs` as `restored_docs` has the
+  same atomic publication and identity checks as a repository restore.
 - Compression and encryption are declared capabilities, not hints. Current
   writers emit uncompressed, unencrypted payloads and current restore paths
   fail closed on any other declaration until the corresponding streaming

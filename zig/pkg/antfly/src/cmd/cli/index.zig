@@ -477,6 +477,9 @@ const IndexSummary = struct {
     source_failed: ?i64 = null,
     indexed: ?i64,
     visible: ?i64,
+    publication_target: ?i64 = null,
+    publication_visible: ?i64 = null,
+    publication_complete: ?bool = null,
     complete: bool,
     queryable: bool = false,
     failed: bool,
@@ -586,6 +589,7 @@ fn summarizeStats(stats: anytype) IndexSummary {
     const readiness = if (@hasField(Stats, "readiness")) stats.readiness else null;
     const milestones = if (@hasField(Stats, "milestones")) stats.milestones else null;
     const activity = if (@hasField(Stats, "activity")) stats.activity else null;
+    const publication = if (@hasField(Stats, "publication")) stats.publication else null;
     const repair = if (@hasField(Stats, "repair")) stats.repair else null;
     const state = if (readiness) |value| @tagName(value.state) else legacy_state;
     const complete = if (milestones) |value|
@@ -623,6 +627,9 @@ fn summarizeStats(stats: anytype) IndexSummary {
         .source_failed = if (source_coverage) |coverage| coverage.failed else null,
         .indexed = indexed,
         .visible = visible,
+        .publication_target = if (publication) |value| value.target_vectors else null,
+        .publication_visible = if (publication) |value| value.searchable_vectors else null,
+        .publication_complete = if (publication) |value| value.complete else null,
         .complete = complete,
         .queryable = queryable,
         .failed = failed,
@@ -719,6 +726,15 @@ fn writeSourceCoverage(writer: anytype, summary: IndexSummary) !void {
     }
 }
 
+fn writePublication(writer: anytype, summary: IndexSummary) !void {
+    if (summary.publication_target == null) return;
+    try writer.writeAll(" publication=");
+    if (summary.publication_visible) |visible| try writer.print("{d}", .{visible}) else try writer.writeAll("?");
+    try writer.writeByte('/');
+    if (summary.publication_target) |target| try writer.print("{d}", .{target}) else try writer.writeAll("?");
+    try writer.writeAll(" vectors");
+}
+
 test "index wait source coverage keeps its stable public label" {
     var buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
@@ -771,6 +787,7 @@ fn writeIndexFailureDiagnostic(
         summary.state,
     });
     try writeSourceCoverage(writer, summary);
+    try writePublication(writer, summary);
     if (summary.incarnation) |incarnation| try writer.print(" incarnation={s}", .{incarnation});
     if (summary.error_text) |error_text| try writer.print(" error={s}", .{error_text});
     if (summary.repair_state) |repair_state| try writer.print(" repair_state={s}", .{repair_state});
@@ -812,6 +829,7 @@ fn printWaitProgress(index_name: []const u8, target: WaitTarget, summary: IndexS
         summary.state,
     }) catch return;
     writeSourceCoverage(&writer, summary) catch return;
+    writePublication(&writer, summary) catch return;
     if (std.mem.eql(u8, summary.index_type, "embeddings")) {
         if (summary.visible) |visible| writer.print(" searchable_vectors={d}", .{visible}) catch return;
         if (summary.activity_phase) |phase|
@@ -890,6 +908,7 @@ fn writeWaitSuccess(
         summary.state,
     });
     try writeSourceCoverage(writer, summary);
+    try writePublication(writer, summary);
     if (std.mem.eql(u8, summary.index_type, "embeddings")) {
         if (summary.visible) |visible| try writer.print(" searchable_vectors={d}", .{visible});
         if (summary.activity_phase) |phase|
@@ -1585,6 +1604,11 @@ test "index summary prefers typed embedding milestones coverage and activity" {
             .degraded = false,
         },
         .searchable_vectors = 44,
+        .publication = .{
+            .target_vectors = 50,
+            .searchable_vectors = 44,
+            .complete = false,
+        },
         .activity = .{
             .epoch = "a-current",
             .phase = .embedding,
@@ -1602,6 +1626,13 @@ test "index summary prefers typed embedding milestones coverage and activity" {
     try std.testing.expectEqual(@as(?i64, 20), summary.source_covered);
     try std.testing.expectEqual(@as(?i64, 75), summary.source_pending);
     try std.testing.expectEqual(@as(?i64, 44), summary.visible);
+    try std.testing.expectEqual(@as(?i64, 50), summary.publication_target);
+    try std.testing.expectEqual(@as(?i64, 44), summary.publication_visible);
+    try std.testing.expectEqual(@as(?bool, false), summary.publication_complete);
+    var publication_buffer: [64]u8 = undefined;
+    var publication_writer = std.Io.Writer.fixed(&publication_buffer);
+    try writePublication(&publication_writer, summary);
+    try std.testing.expectEqualStrings(" publication=44/50 vectors", publication_writer.buffered());
     try std.testing.expectEqualStrings("source_coverage", summary.complete_blockers[0]);
     try std.testing.expectEqualStrings("embedding", summary.activity_phase.?);
 

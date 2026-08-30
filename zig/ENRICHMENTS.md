@@ -145,6 +145,11 @@ collapsed into one generic progress percentage:
 - `searchable_vectors` is the number of physical dense or sparse entries in the
   query-visible publication. It can exceed source coverage when one source
   produces multiple chunks, and it may lag generated work until publication.
+- Dense status exposes `publication.target_vectors` as the durable physical
+  target for the current incarnation and `publication.searchable_vectors` as
+  the visible count; `publication.complete` requires exact equality. The
+  object is absent for sparse indexes or when its distributed proof is
+  unavailable, so completion fails closed without a scan on the status path.
 - `activity` is volatile, per-index and per-incarnation work telemetry:
   `chunks_created`, `embedding_batches_completed`, `embeddings_computed`,
   `active_batch_size`, and `last_progress_at`. Its opaque `epoch` changes when
@@ -162,7 +167,7 @@ Activity explains why counters are moving; it never proves readiness or
 failure, and losing volatile activity state on restart must not make an index
 less queryable.
 
-`index wait` mirrors those names. It prints `source_coverage`,
+`index wait` mirrors those names. It prints `source_coverage`, `publication`,
 `searchable_vectors`, and optional activity/chunk counters; it does not emit a
 generic `progress` percentage that could read as complete while publication is
 still pending. Blockers are labeled for the milestone they gate
@@ -174,8 +179,10 @@ claim/preparation sets `preparing`, a provider batch sets `embedding`, durable
 artifact publication sets `publishing`, a supervised retry sets
 `waiting_retry`, and releasing the last owned operation sets `idle`. Aggregation
 uses `waiting_retry > embedding > publishing > preparing > idle` only across
-observed owners. Counters sum, timestamps take the maximum, and rates require a
-stable epoch.
+observed owners. Each observation's reported phase is authoritative and is
+reduced independently of its counters, so an active batch on one shard cannot
+mask a retry owned by another. Counters sum, timestamps take the maximum, and
+rates require a stable epoch.
 
 Activity heartbeat protocol v1 is separate from durable runtime status. Data
 nodes coalesce counter updates to at most once per second while reporting phase

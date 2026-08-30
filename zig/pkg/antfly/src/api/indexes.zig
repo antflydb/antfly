@@ -1985,6 +1985,99 @@ fn embeddingActivityPhaseRank(phase: db_mod.types.EmbeddingActivityPhase) u8 {
     };
 }
 
+/// Public aggregation consumes already-derived owner observations. Keep its
+/// selected phase separate from summed counters so an active batch on one
+/// shard cannot mask a higher-priority retry owned by another shard.
+const AggregatedEmbeddingActivity = struct {
+    epoch: u64 = 0,
+    phase: db_mod.types.EmbeddingActivityPhase = .idle,
+    chunks_created: u64 = 0,
+    embedding_batches_completed: u64 = 0,
+    embeddings_computed: u64 = 0,
+    active_batch_size: u64 = 0,
+    last_progress_at_ms: u64 = 0,
+
+    fn merge(
+        self: *@This(),
+        group_id: u64,
+        observation: db_mod.types.EmbeddingActivityStats,
+    ) void {
+        std.debug.assert(observation.epoch != 0);
+        var activity_hasher = std.hash.Wyhash.init(group_id);
+        activity_hasher.update(std.mem.asBytes(&observation.epoch));
+        self.epoch ^= activity_hasher.final();
+        self.chunks_created +|= observation.chunks_created;
+        self.embedding_batches_completed +|= observation.embedding_batches_completed;
+        self.embeddings_computed +|= observation.embeddings_computed;
+        self.active_batch_size +|= observation.active_batch_size;
+        const candidate_phase = observation.effectivePhase();
+        if (embeddingActivityPhaseRank(candidate_phase) > embeddingActivityPhaseRank(self.phase))
+            self.phase = candidate_phase;
+        self.last_progress_at_ms = @max(self.last_progress_at_ms, observation.last_progress_at_ms);
+    }
+
+    fn effectivePhase(self: @This()) db_mod.types.EmbeddingActivityPhase {
+        return self.phase;
+    }
+};
+
+const PublicEmbeddingActivity = struct {
+    epoch: u64 = 0,
+    phase: db_mod.types.EmbeddingActivityPhase = .idle,
+    chunks_created: u64 = 0,
+    embedding_batches_completed: u64 = 0,
+    embeddings_computed: u64 = 0,
+    active_batch_size: u64 = 0,
+    last_progress_at_ms: u64 = 0,
+
+    fn from(observation: anytype) @This() {
+        return .{
+            .epoch = observation.epoch,
+            .phase = observation.effectivePhase(),
+            .chunks_created = observation.chunks_created,
+            .embedding_batches_completed = observation.embedding_batches_completed,
+            .embeddings_computed = observation.embeddings_computed,
+            .active_batch_size = observation.active_batch_size,
+            .last_progress_at_ms = observation.last_progress_at_ms,
+        };
+    }
+
+    fn effectivePhase(self: @This()) db_mod.types.EmbeddingActivityPhase {
+        return self.phase;
+    }
+};
+
+test "derived coverage embedding activity aggregation is order independent and phase authoritative" {
+    const retrying = db_mod.types.EmbeddingActivityStats{
+        .epoch = 11,
+        .chunks_created = 3,
+        .reported_phase = .waiting_retry,
+        .last_progress_at_ms = 100,
+    };
+    const embedding = db_mod.types.EmbeddingActivityStats{
+        .epoch = 12,
+        .embedding_batches_completed = 2,
+        .embeddings_computed = 8,
+        .active_batch_size = 4,
+        .last_progress_at_ms = 200,
+    };
+    var forward = AggregatedEmbeddingActivity{};
+    forward.merge(7, retrying);
+    forward.merge(8, embedding);
+    var reverse = AggregatedEmbeddingActivity{};
+    reverse.merge(8, embedding);
+    reverse.merge(7, retrying);
+
+    try std.testing.expectEqual(db_mod.types.EmbeddingActivityPhase.waiting_retry, forward.effectivePhase());
+    try std.testing.expectEqual(forward.effectivePhase(), reverse.effectivePhase());
+    try std.testing.expectEqual(forward.epoch, reverse.epoch);
+    try std.testing.expectEqual(@as(u64, 3), forward.chunks_created);
+    try std.testing.expectEqual(@as(u64, 2), forward.embedding_batches_completed);
+    try std.testing.expectEqual(@as(u64, 8), forward.embeddings_computed);
+    try std.testing.expectEqual(@as(u64, 4), forward.active_batch_size);
+    try std.testing.expectEqual(@as(u64, 200), forward.last_progress_at_ms);
+}
+
 test "index repair aggregation exposes a waiting shard over rebuilding shards" {
     try std.testing.expect(repairStateRank("waiting") > repairStateRank("rebuilding"));
     try std.testing.expect(repairStateRank("failed") > repairStateRank("waiting"));
@@ -2025,10 +2118,13 @@ const AggregatedIndexStatus = struct {
     edge_count: u64 = 0,
     node_count: u64 = 0,
     root_node: u64 = 0,
+    publication_target_count: u64 = 0,
+    publication_target_ready: bool = false,
+    publication_target_observation_count: u64 = 0,
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
-    embedding_activity: db_mod.types.EmbeddingActivityStats = .{},
+    embedding_activity: AggregatedEmbeddingActivity = .{},
     coverage_generation: u64 = 0,
     coverage_config_hash: u64 = 0,
     coverage_identity_ready: bool = false,
@@ -2447,23 +2543,17 @@ fn aggregateIndexStatusIndexed(
         aggregate.edge_count += item.edge_count;
         aggregate.node_count += item.node_count;
         aggregate.root_node = if (materialization_count == 1) item.root_node else 0;
+        if (item.kind == .dense_vector) {
+            aggregate.publication_target_count +|= item.publication_target_count;
+            aggregate.publication_target_ready = if (aggregate.publication_target_observation_count == 0)
+                item.publication_target_ready
+            else
+                aggregate.publication_target_ready and item.publication_target_ready;
+            aggregate.publication_target_observation_count +|= 1;
+        }
         if (item.kind == .dense_vector or item.kind == .sparse_vector) {
             if (item.embedding_activity.epoch != 0) {
-                var activity_hasher = std.hash.Wyhash.init(runtime.group_id);
-                activity_hasher.update(std.mem.asBytes(&item.embedding_activity.epoch));
-                aggregate.embedding_activity.epoch ^= activity_hasher.final();
-                aggregate.embedding_activity.chunks_created +|= item.embedding_activity.chunks_created;
-                aggregate.embedding_activity.embedding_batches_completed +|= item.embedding_activity.embedding_batches_completed;
-                aggregate.embedding_activity.embeddings_computed +|= item.embedding_activity.embeddings_computed;
-                aggregate.embedding_activity.active_batch_size +|= item.embedding_activity.active_batch_size;
-                const candidate_phase = item.embedding_activity.effectivePhase();
-                if (embeddingActivityPhaseRank(candidate_phase) >
-                    embeddingActivityPhaseRank(aggregate.embedding_activity.effectivePhase()))
-                    aggregate.embedding_activity.phase_override = candidate_phase;
-                aggregate.embedding_activity.last_progress_at_ms = @max(
-                    aggregate.embedding_activity.last_progress_at_ms,
-                    item.embedding_activity.last_progress_at_ms,
-                );
+                aggregate.embedding_activity.merge(runtime.group_id, item.embedding_activity);
             }
         }
         aggregate.replay_applied_sequence += public_item.replay_applied_sequence;
@@ -3230,6 +3320,7 @@ test "runnable repair owns its load error without becoming a terminal aggregate 
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
         .coverage_summary_ready = true,
+        .publication_target_ready = true,
         .index_repair_status = .rebuilding,
     }};
     const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
@@ -3417,6 +3508,8 @@ test "actionable repair remains visible while retained generation stays queryabl
         .doc_count = 1,
         .node_count = 1,
         .root_node = 1,
+        .publication_target_count = 1,
+        .publication_target_ready = true,
         .coverage_generation = 42,
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
@@ -3593,6 +3686,7 @@ test "stale in-place status preserves an incarnation-scoped serviceability proof
         .coverage_generation = 42,
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
+        .publication_target_ready = true,
         .index_repair_status = .rebuilding,
         .index_repair_active_generation_serviceable = true,
     }};
@@ -3650,6 +3744,8 @@ test "identity-proven embeddings stay current during sibling startup catch-up" {
         .runtime_observation_serviceable = true,
         .doc_count = 2,
         .node_count = 1,
+        .publication_target_count = 2,
+        .publication_target_ready = true,
         .coverage_produced_count = 2,
         .coverage_generation = 42,
         .coverage_config_hash = 99,
@@ -4644,8 +4740,84 @@ fn embeddingsArtifactVisible(item: anytype, sparse: bool) bool {
 }
 
 fn embeddingsArtifactPublishComplete(item: anytype, sparse: bool, expected_doc_count: u64) bool {
+    if (!sparse and @hasField(@TypeOf(item), "publication_target_ready")) {
+        if (!item.publication_target_ready) return false;
+        if (item.publication_target_count == 0) return item.doc_count == 0;
+        return item.doc_count == item.publication_target_count and embeddingsArtifactVisible(item, false);
+    }
     if (expected_doc_count == 0) return item.doc_count == 0;
     return item.doc_count >= expected_doc_count and embeddingsArtifactVisible(item, sparse);
+}
+
+test "chunked dense completion follows the physical publication target" {
+    var item = db_mod.types.DBIndexStats{
+        .name = "semantic_chunked_idx",
+        .kind = .dense_vector,
+        .doc_count = 2176,
+        .node_count = 1,
+        .root_node = 1,
+        .publication_target_count = 2500,
+        .publication_target_ready = true,
+        .coverage_produced_count = 500,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .replay_applied_sequence = 500,
+        .replay_target_sequence = 500,
+    };
+    var pending = std.ArrayListUnmanaged(u8).empty;
+    defer pending.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &pending,
+        .embeddings,
+        item,
+        500,
+        .external,
+        false,
+        42,
+        99,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        null,
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"searchable_vectors\":2176,\"publication\":{\"target_vectors\":2500,\"searchable_vectors\":2176,\"complete\":false},\"milestones\":{\"complete\":{\"reached\":false,\"blockers\":[\"publication\"]}},\"readiness\":{\"queryable\":true,\"complete\":false,\"pending_reasons\":[\"publication\"]}}",
+        pending.items,
+    );
+
+    item.doc_count = 2500;
+    var complete = std.ArrayListUnmanaged(u8).empty;
+    defer complete.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &complete,
+        .embeddings,
+        item,
+        500,
+        .external,
+        false,
+        42,
+        99,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        null,
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"publication\":{\"target_vectors\":2500,\"searchable_vectors\":2500,\"complete\":true},\"milestones\":{\"complete\":{\"reached\":true,\"blockers\":[]}},\"readiness\":{\"state\":\"ready\",\"queryable\":true,\"complete\":true,\"pending_reasons\":[]}}",
+        complete.items,
+    );
 }
 
 fn backfillState(index_type: ApiIndexType, active: bool, enrichment_degraded: bool, replay_applied_sequence: u64, replay_target_sequence: u64, enrichment: ?db_mod.types.EnrichmentStats) []const u8 {
@@ -5025,6 +5197,7 @@ fn appendSingleIndexRuntimeStatus(
         (if (visible_enrichment) |stats| stats.worker_failed else false);
     const terminal_load_failure = load_error != null and raw_load_error_matches_desired_incarnation;
     var source_coverage_complete_for_readiness = index_type != .embeddings;
+    var artifact_publish_pending = false;
 
     try out.append(alloc, '{');
     if (index_type != .algebraic) {
@@ -5131,18 +5304,26 @@ fn appendSingleIndexRuntimeStatus(
         const coverage_complete = coverage.complete;
         const source_coverage_complete = source_coverage.complete;
         source_coverage_complete_for_readiness = embeddings_coverage_policy == .external or source_coverage_complete;
-        const artifact_publish_pending = !embeddings_materialization_current or
-            (replay_target_sequence > 0 and
-                !embeddingsArtifactPublishComplete(item, embeddings_sparse, produced_count) and
-                !coverage_complete);
+        const publication_complete = embeddings_materialization_current and
+            embeddingsArtifactPublishComplete(item, embeddings_sparse, produced_count);
+        artifact_publish_pending = !publication_complete;
         const embedding_activity = if (embeddings_materialization_current and @hasField(@TypeOf(item), "embedding_activity"))
-            item.embedding_activity
+            PublicEmbeddingActivity.from(item.embedding_activity)
         else
-            db_mod.types.EmbeddingActivityStats{};
+            PublicEmbeddingActivity{};
         const activity_present = embedding_activity.epoch != 0;
         const activity_phase = @tagName(embedding_activity.effectivePhase());
         try out.appendSlice(alloc, ",\"searchable_vectors\":");
         try appendIntValue(alloc, out, visible_doc_count);
+        if (!embeddings_sparse and @hasField(@TypeOf(item), "publication_target_ready") and item.publication_target_ready) {
+            try out.appendSlice(alloc, ",\"publication\":{\"target_vectors\":");
+            try appendIntValue(alloc, out, item.publication_target_count);
+            try out.appendSlice(alloc, ",\"searchable_vectors\":");
+            try appendIntValue(alloc, out, visible_doc_count);
+            try out.appendSlice(alloc, ",\"complete\":");
+            try out.appendSlice(alloc, if (publication_complete) "true" else "false");
+            try out.append(alloc, '}');
+        }
         try out.appendSlice(alloc, ",\"source_coverage\":{");
         try appendJsonString(alloc, out, "policy");
         try out.append(alloc, ':');
@@ -5397,6 +5578,7 @@ fn appendSingleIndexRuntimeStatus(
         catch_up_active,
         active_generation_serviceable,
         source_coverage_complete_for_readiness,
+        artifact_publish_pending,
     );
     try out.appendSlice(alloc, ",\"async_indexing\":");
     try appendAsyncIndexingStatus(alloc, out, async_indexing);
@@ -5425,6 +5607,7 @@ fn appendIndexReadinessStatus(
     catch_up_active: bool,
     active_generation_serviceable: bool,
     source_coverage_complete: bool,
+    artifact_publish_pending: bool,
 ) !void {
     const Item = @TypeOf(item);
     const expected_source_observations: u64 = if (@hasField(Item, "fresh_group_count"))
@@ -5449,7 +5632,7 @@ fn appendIndexReadinessStatus(
         ((terminal_load_failure or terminal_enrichment_failure or repair_failed) and
             (!active_generation_serviceable or repair_blocks_queryable));
     const publication_pending = index_type == .embeddings and incarnation_current and
-        replay_target_sequence > replay_applied_sequence;
+        (replay_target_sequence > replay_applied_sequence or artifact_publish_pending);
     const coverage_pending = index_type == .embeddings and embeddings_coverage_policy != .external and
         !source_coverage_complete;
     const sources_complete = if (@hasField(Item, "source_replay")) blk: {
@@ -8394,6 +8577,8 @@ test "managed embeddings readiness ignores finalizing catch-up after rate-limit 
         .doc_count = 3,
         .node_count = 1,
         .root_node = 1,
+        .publication_target_count = 3,
+        .publication_target_ready = true,
         .coverage_produced_count = 3,
         .coverage_generation = 42,
         .coverage_config_hash = config_hash,

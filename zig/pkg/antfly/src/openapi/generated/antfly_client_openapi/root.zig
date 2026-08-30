@@ -125,6 +125,7 @@ pub const DataShapeDecl = types.DataShapeDecl;
 pub const DataShapeKind = types.DataShapeKind;
 pub const DateRangeStringQuery = types.DateRangeStringQuery;
 pub const DenseRepairBackpressureError = types.DenseRepairBackpressureError;
+pub const DenseVectorPublicationStatus = types.DenseVectorPublicationStatus;
 pub const DerivedCoverageObservationIncompleteReason = types.DerivedCoverageObservationIncompleteReason;
 pub const DerivedCoveragePolicy = types.DerivedCoveragePolicy;
 pub const DerivedCoverageStatus = types.DerivedCoverageStatus;

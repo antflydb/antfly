@@ -21,9 +21,9 @@ import json
 import struct
 import time
 from urllib.parse import quote
+
 import pytest
 import requests
-
 from conftest import ready_index_status
 from helpers import assert_created_index, json_doc, upsert, wait_until
 
@@ -168,7 +168,7 @@ def _ready_index(
         index_info = stateful_api.get_index(table_name, index_name)
     except Exception:
         return None
-    stats = ready_index_status(index_info, require_query_fresh=True)
+    stats = ready_index_status(index_info, until="complete", require_query_fresh=True)
     if stats is None:
         return None
     total_indexed = stats.get("total_indexed", stats.get("doc_count", 0))
@@ -184,7 +184,7 @@ def _ready_algebraic_index(
         index_info = stateful_api.get_index(table_name, index_name)
     except Exception:
         return None
-    return ready_index_status(index_info, require_query_fresh=True)
+    return ready_index_status(index_info, until="complete", require_query_fresh=True)
 
 
 def _algebraic_aggregations(stateful_api, table_name: str) -> dict:
@@ -203,7 +203,7 @@ def _algebraic_aggregations(stateful_api, table_name: str) -> dict:
     return responses[0].get("aggregations", {})
 
 
-def test_ready_index_status_requires_current_coverage_observation():
+def test_ready_index_status_uses_current_milestones_and_v020_fallback():
     ready_status = {
         "status": {
             "rebuilding": False,
@@ -211,8 +211,13 @@ def test_ready_index_status_requires_current_coverage_observation():
             "replay_catch_up_required": False,
             "catch_up_active": False,
             "readiness": {
+                "state": "queryable_partial",
                 "queryable": True,
                 "complete": False,
+            },
+            "milestones": {
+                "queryable": {"reached": True, "blockers": []},
+                "complete": {"reached": False, "blockers": ["source_coverage"]},
             },
             "coverage": {
                 "observation_complete": True,
@@ -220,28 +225,62 @@ def test_ready_index_status_requires_current_coverage_observation():
             },
         }
     }
-    assert ready_index_status(ready_status) is ready_status["status"]
-    assert (
-        ready_index_status(ready_status, until="queryable")
-        is ready_status["status"]
-    )
+    # Current queryability remains authoritative while later work is active.
+    ready_status["status"]["rebuilding"] = True
+    ready_status["status"]["dense_publish_pending"] = True
+    ready_status["status"]["replay_catch_up_required"] = True
+    ready_status["status"]["catch_up_active"] = True
+    assert ready_index_status(ready_status, until="queryable") is ready_status["status"]
     assert ready_index_status(ready_status, until="complete") is None
 
+    serviceable_repair = json.loads(json.dumps(ready_status))
+    serviceable_repair["status"]["repair"] = {
+        "state": "rebuilding",
+        "action_required": False,
+        "blocks_queryable": False,
+        "blocks_complete": True,
+    }
+    assert (
+        ready_index_status(serviceable_repair, until="queryable")
+        is serviceable_repair["status"]
+    )
+
+    failed_current = json.loads(json.dumps(ready_status))
+    failed_current["status"]["readiness"]["state"] = "failed"
+    assert ready_index_status(failed_current, until="queryable") is None
+
     complete_status = json.loads(json.dumps(ready_status))
+    complete_status["status"]["rebuilding"] = False
+    complete_status["status"]["dense_publish_pending"] = False
+    complete_status["status"]["replay_catch_up_required"] = False
+    complete_status["status"]["catch_up_active"] = False
+    complete_status["status"]["readiness"]["state"] = "ready"
     complete_status["status"]["readiness"]["complete"] = True
+    complete_status["status"]["milestones"]["complete"] = {
+        "reached": True,
+        "blockers": [],
+    }
     assert (
         ready_index_status(complete_status, until="complete")
         is complete_status["status"]
     )
 
-    stale_incarnation = json.loads(json.dumps(ready_status))
+    legacy_ready = json.loads(json.dumps(complete_status))
+    del legacy_ready["status"]["milestones"]
+    assert ready_index_status(legacy_ready, until="complete") is legacy_ready["status"]
+    assert ready_index_status(legacy_ready, until="queryable") is legacy_ready["status"]
+    legacy_not_queryable = json.loads(json.dumps(legacy_ready))
+    legacy_not_queryable["status"]["readiness"]["queryable"] = False
+    assert ready_index_status(legacy_not_queryable, until="queryable") is None
+
+    stale_incarnation = json.loads(json.dumps(legacy_ready))
     stale_incarnation["status"]["coverage"]["observation_complete"] = False
     stale_incarnation["status"]["coverage"]["config_mismatch_group_count"] = 1
-    assert ready_index_status(stale_incarnation) is None
+    assert ready_index_status(stale_incarnation, until="complete") is None
 
-    rebuilding = json.loads(json.dumps(ready_status))
+    rebuilding = json.loads(json.dumps(legacy_ready))
     rebuilding["status"]["repair"] = {"state": "rebuilding", "action_required": False}
-    assert ready_index_status(rebuilding) is None
+    assert ready_index_status(rebuilding, until="complete") is None
 
     for field, value in (
         ("error", "load failed: UnsupportedVersion"),
@@ -250,9 +289,9 @@ def test_ready_index_status_requires_current_coverage_observation():
         ("repair_summary_ready", False),
         ("repair_issue_count", 1),
     ):
-        terminal = json.loads(json.dumps(ready_status))
+        terminal = json.loads(json.dumps(legacy_ready))
         terminal["status"][field] = value
-        assert ready_index_status(terminal) is None
+        assert ready_index_status(terminal, until="complete") is None
 
 
 def _retrying_partial_index(
@@ -1480,7 +1519,7 @@ def test_stateful_managed_embeddings_status_reports_partial_retrying_backfill_af
     assert enrichment["fatal_error_count"] == 0
     assert enrichment["worker_failed"] is False
 
-    assert ready_index_status({"status": partial}) is None
+    assert ready_index_status({"status": partial}, until="complete") is None
 
     rate_limited_openai_embedder.allow_all_requests()
 
@@ -1597,6 +1636,7 @@ def test_stateful_managed_embeddings_provider_pacing_is_shared_across_tables(
         assert wait_until(
             lambda table_name=table_name: ready_index_status(
                 stateful_api.get_index(table_name, index_name),
+                until="complete",
                 require_query_fresh=True,
             ),
             timeout_s=30.0,
@@ -2520,9 +2560,9 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
     semantic_b = serverless_api.get_index(table_name, "semantic_b")
     sparse_a = serverless_api.get_index(table_name, "sparse_a")
     sparse_b = serverless_api.get_index(table_name, "sparse_b")
-    assert ready_index_status(semantic_b) is not None
-    assert ready_index_status(sparse_a) is not None
-    assert ready_index_status(sparse_b) is not None
+    assert ready_index_status(semantic_b, until="complete") is not None
+    assert ready_index_status(sparse_a, until="complete") is not None
+    assert ready_index_status(sparse_b, until="complete") is not None
 
 
 def test_serverless_same_name_dense_index_update_republishes_head(serverless_api):
@@ -2650,7 +2690,7 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
 
     detail = serverless_api.get_index(table_name, "semantic_idx")
     assert detail["status"]["head_publication_action"] == "rebuild"
-    assert ready_index_status(detail) is not None
+    assert ready_index_status(detail, until="complete") is not None
 
 
 def test_serverless_build_status_reports_head_actions_for_text_only_updates(
@@ -2908,5 +2948,5 @@ def test_serverless_schema_migration_republishes_versioned_full_text_indexes(
     next_index = serverless_api.get_index(table_name, "full_text_index_v1")
     assert active_index["status"]["head_publication_action"] == "reuse"
     assert next_index["status"]["head_publication_action"] == "rebuild"
-    assert ready_index_status(active_index) is not None
-    assert ready_index_status(next_index) is not None
+    assert ready_index_status(active_index, until="complete") is not None
+    assert ready_index_status(next_index, until="complete") is not None

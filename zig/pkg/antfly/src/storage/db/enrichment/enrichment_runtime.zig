@@ -4565,6 +4565,7 @@ test "malformed chunked dense batch is isolated without failing the worker" {
         .config = .{},
         .ownership = undefined,
     };
+    defer clearIndexEmbeddingActivity(&runtime);
     defer clearIsolatedFailedIndexes(&runtime);
     const request = enrichment_types.GeneratedEnrichmentRequest{
         .kind = .dense_embedding,

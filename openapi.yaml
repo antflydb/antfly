@@ -20027,6 +20027,26 @@ components:
           type: boolean
         degraded:
           type: boolean
+    DenseVectorPublicationStatus:
+      type: object
+      additionalProperties: false
+      description: Exact dense-vector publication cardinality for the observed index incarnation.
+      required:
+        - target_vectors
+        - searchable_vectors
+        - complete
+      properties:
+        target_vectors:
+          type: integer
+          format: uint64
+          description: Exact durable vector target for the current dense-index incarnation.
+        searchable_vectors:
+          type: integer
+          format: uint64
+          description: Physical vectors currently visible to queries.
+        complete:
+          type: boolean
+          description: Whether searchable_vectors exactly equals target_vectors.
     EmbeddingIndexActivityPhase:
       type: string
       enum:
@@ -20371,6 +20391,10 @@ components:
           format: uint64
           description: Physical vectors or sparse entries visible to queries; chunked indexes may exceed
             source coverage.
+        publication:
+          $ref: '#/components/schemas/DenseVectorPublicationStatus'
+          description: Dense-only exact publication status; absent for sparse indexes and when the target
+            proof is unavailable.
         activity:
           $ref: '#/components/schemas/EmbeddingIndexActivity'
           nullable: true

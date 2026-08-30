@@ -13200,6 +13200,25 @@ fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupManif
     };
 }
 
+/// Derive the mutable restore envelope for a destination table without
+/// changing the immutable source manifest that authenticated the backup.
+/// Native bundle extraction uses this after verifying the sealed AFB2 source;
+/// the resulting table manifest is the target-scoped intent consumed by the
+/// ordinary restore API.
+pub fn deriveRestoreManifestForTargetTable(
+    alloc: std.mem.Allocator,
+    source: TableBackupManifest,
+    target_table_name: []const u8,
+) !TableBackupManifest {
+    if (target_table_name.len == 0) return error.InvalidBackupRequest;
+    var target = try cloneTableBackupManifest(alloc, source);
+    errdefer target.deinit(alloc);
+    const owned_target_name = try alloc.dupe(u8, target_table_name);
+    alloc.free(@constCast(target.table_name));
+    target.table_name = owned_target_name;
+    return target;
+}
+
 fn cloneClusterBackupManifest(alloc: std.mem.Allocator, manifest: ClusterBackupManifest) !ClusterBackupManifest {
     const tables = try alloc.alloc(ClusterTableBackupEntry, manifest.tables.len);
     var initialized_tables: usize = 0;

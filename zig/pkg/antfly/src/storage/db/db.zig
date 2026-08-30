@@ -25614,9 +25614,10 @@ pub const DB = struct {
         return enrichment_status;
     }
 
-    /// Refresh lock-free worker diagnostics on a retained status snapshot.
-    /// Callers that only need runtime lifecycle facts can use this without
-    /// contending on the index apply lock or replacing durable coverage data.
+    /// Refresh readiness-neutral worker diagnostics on a retained status
+    /// snapshot. Publication lifecycle is deliberately excluded: a lock-free
+    /// observation may add activity, but it cannot prove that the artifact
+    /// counters in the retained snapshot crossed a completion boundary.
     pub fn overlayRuntimeStatusRuntimeBestEffort(self: *DB, runtime_stats: *types.DBStats) void {
         runtime_stats.async_indexing = self.snapshotAsyncIndexingStats();
         runtime_stats.enrichment = self.enrichmentStatsWithSupervisorState(runtime_stats.enrichment);
@@ -25641,7 +25642,11 @@ pub const DB = struct {
                 }
             }
         }
+    }
 
+    /// Apply lifecycle facts only when the caller also owns a consistent
+    /// artifact/coverage refresh boundary.
+    fn overlayRuntimeStatusLifecycleFromSnapshot(self: *DB, runtime_stats: *types.DBStats) void {
         for (runtime_stats.indexes) |*item| {
             const dense_catch_up = item.kind == .dense_vector and runtime_stats.async_indexing.dense_catch_up.active;
             if (!dense_catch_up) if (self.executor.appliedSequence(item.name)) |live_applied| {
@@ -25727,15 +25732,6 @@ pub const DB = struct {
             if (slot.*) |previous| alloc.free(previous);
             slot.* = null;
         }
-    }
-
-    fn overlayRuntimeStatusIndexesAssumeApplyLockHeld(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) void {
-        if (!self.core.tryLockApplyShared()) return;
-        defer self.core.unlockApplyShared();
-        self.overlayRuntimeStatusIndexesLocked(stats_alloc, runtime_stats) catch {
-            markMissingDerivedCoverageIdentities(runtime_stats.indexes);
-            return;
-        };
     }
 
     fn overlayRuntimeStatusIndexesLocked(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) !void {
@@ -25853,15 +25849,26 @@ pub const DB = struct {
         runtime_stats.text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot();
     }
 
-    pub fn overlayRuntimeStatusBestEffort(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) void {
+    /// Return whether lifecycle and physical index facts were refreshed under
+    /// one apply-lock boundary. On contention, only readiness-neutral runtime
+    /// diagnostics are overlaid and existing blockers remain intact.
+    pub fn overlayRuntimeStatusBestEffort(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) bool {
         self.overlayRuntimeStatusRuntimeBestEffort(runtime_stats);
-        self.overlayRuntimeStatusIndexesAssumeApplyLockHeld(stats_alloc, runtime_stats);
+        if (!self.core.tryLockApplyShared()) return false;
+        defer self.core.unlockApplyShared();
+        self.overlayRuntimeStatusLifecycleFromSnapshot(runtime_stats);
+        self.overlayRuntimeStatusIndexesLocked(stats_alloc, runtime_stats) catch {
+            markMissingDerivedCoverageIdentities(runtime_stats.indexes);
+            return false;
+        };
+        return true;
     }
 
     pub fn overlayRuntimeStatusConsistent(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) !void {
         self.overlayRuntimeStatusRuntimeBestEffort(runtime_stats);
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
+        self.overlayRuntimeStatusLifecycleFromSnapshot(runtime_stats);
         try self.overlayRuntimeStatusIndexesLocked(stats_alloc, runtime_stats);
     }
 
@@ -26918,6 +26925,7 @@ pub const DB = struct {
     fn markMissingDerivedCoverageIdentity(item: *types.DBIndexStats) void {
         item.coverage_identity_ready = false;
         item.coverage_summary_ready = false;
+        if (item.kind == .dense_vector) item.publication_target_ready = false;
         item.repair_degraded = true;
     }
 
@@ -26943,10 +26951,36 @@ pub const DB = struct {
     fn populateConfiguredDerivedCoverageCounts(self: *DB, index_name: []const u8, item: *types.DBIndexStats) !void {
         if (!item.coverage_identity_ready) {
             item.coverage_summary_ready = false;
+            if (item.kind == .dense_vector) item.publication_target_ready = false;
             item.repair_degraded = true;
             return;
         }
         try self.populateDerivedCoverageCounts(index_name, item.coverage_generation, item.coverage_config_hash, item);
+        try self.populateDensePublicationTarget(index_name, item);
+    }
+
+    /// Populate the exact physical cardinality expected from the current dense
+    /// incarnation without scanning documents or artifacts. Artifact-backed
+    /// indexes use the write-maintained target counter because source outcomes
+    /// cannot represent one-to-many chunk expansion. Direct managed indexes
+    /// publish one vector per produced outcome.
+    fn populateDensePublicationTarget(self: *DB, index_name: []const u8, item: *types.DBIndexStats) !void {
+        if (item.kind != .dense_vector) return;
+        item.publication_target_count = 0;
+        item.publication_target_ready = false;
+        const entry = self.core.denseIndex(index_name) orelse return;
+        if (denseIndexIsArtifactBacked(entry)) {
+            item.publication_target_count = (try loadDenseArtifactTargetCounter(
+                self.core.alloc,
+                self.core.store,
+                index_name,
+            )) orelse return;
+            item.publication_target_ready = true;
+            return;
+        }
+        if (!item.coverage_summary_ready) return;
+        item.publication_target_count = item.coverage_produced_count;
+        item.publication_target_ready = true;
     }
 
     fn populateConfiguredDerivedCoverageCountsBestEffort(self: *DB, index_name: []const u8, item: *types.DBIndexStats) void {
@@ -53398,6 +53432,39 @@ test "db runtime-only status overlay preserves a resident enrichment worker" {
     db.overlayRuntimeStatusRuntimeBestEffort(&recovered);
     try std.testing.expect(recovered.enrichment.enabled);
     try std.testing.expect(recovered.enrichment.worker_started);
+}
+
+test "runtime status best effort overlay cannot clear readiness under apply contention" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    var indexes = [_]types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .doc_count = 8,
+        .replay_applied_sequence = 10,
+        .replay_target_sequence = 10,
+        .catch_up_active = true,
+        .backfill_active = true,
+        .backfill_progress = 0.8,
+    }};
+    var retained: types.DBStats = .{
+        .index_count = 1,
+        .indexes = &indexes,
+    };
+
+    try std.testing.expect(db.core.tryLockApplyExclusive());
+    defer db.core.unlockApplyExclusive();
+    try std.testing.expect(!db.overlayRuntimeStatusBestEffort(alloc, &retained));
+    try std.testing.expect(indexes[0].catch_up_active);
+    try std.testing.expect(indexes[0].backfill_active);
+    try std.testing.expectEqual(@as(f64, 0.8), indexes[0].backfill_progress);
+    try std.testing.expectEqual(@as(u64, 8), indexes[0].doc_count);
 }
 
 test "db ttl cleanup enabled requires backend runtime io" {
@@ -82903,6 +82970,16 @@ test "db completed chunked managed admission uses physical artifact count" {
     const artifact_count = (try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, cfg.name)) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqual(artifact_count, physical_count);
+    const publication_stats = try db.runtimeStatusStatsConsistent(alloc);
+    defer types.freeDBStats(alloc, publication_stats);
+    const publication_index = blk: {
+        for (publication_stats.indexes) |index_stats| {
+            if (std.mem.eql(u8, index_stats.name, cfg.name)) break :blk index_stats;
+        }
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(publication_index.publication_target_ready);
+    try std.testing.expectEqual(physical_count, publication_index.publication_target_count);
     const calls_before_replay = counting.calls;
     try std.testing.expect(calls_before_replay > 0);
     const dense_replay_before = try db.core.store.latestReplaySequenceForHint(.dense_vector, 0);
@@ -86296,7 +86373,7 @@ test "db runtime status overlay refreshes identity totals with coverage counters
         error.InvalidDerivedCoverageOutcomeCount,
         db.overlayRuntimeStatusConsistent(alloc, &stale_stats),
     );
-    db.overlayRuntimeStatusBestEffort(alloc, &stale_stats);
+    _ = db.overlayRuntimeStatusBestEffort(alloc, &stale_stats);
     try std.testing.expect(!stale_stats.indexes[0].coverage_identity_ready);
     try std.testing.expect(!stale_stats.indexes[0].coverage_summary_ready);
     try std.testing.expect(stale_stats.indexes[0].repair_degraded);

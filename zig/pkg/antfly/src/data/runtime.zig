@@ -16930,6 +16930,8 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .edge_count = index.edge_count,
         .node_count = index.node_count,
         .root_node = index.root_node,
+        .publication_target_count = index.publication_target_count,
+        .publication_target_ready = index.publication_target_ready,
         .coverage_produced_count = index.coverage_produced_count,
         .coverage_skipped_count = index.coverage_skipped_count,
         .coverage_terminal_failed_count = index.coverage_terminal_failed_count,
@@ -16968,6 +16970,8 @@ test "data runtime report preserves compact managed repair admission state" {
     const report = try runtimeIndexStatusReportFromLocalIndex(alloc, .{
         .name = "thumbnail",
         .kind = .dense_vector,
+        .publication_target_count = 2500,
+        .publication_target_ready = true,
         .embedding_activity = .{
             .epoch = 7,
             .chunks_created = 9,
@@ -16984,12 +16988,14 @@ test "data runtime report preserves compact managed repair admission state" {
 
     try std.testing.expectEqual(antfly.metadata.table_manager.IndexRepairStatus.waiting, report.repair_status.?);
     try std.testing.expect(!report.repair_active_generation_serviceable);
+    try std.testing.expect(report.publication_target_ready);
+    try std.testing.expectEqual(@as(u64, 2500), report.publication_target_count);
 
     const encoded = try std.json.Stringify.valueAlloc(alloc, report, .{});
     defer alloc.free(encoded);
     try ant_json.testing.expectSubsetJsonText(
         alloc,
-        "{\"embedding_activity\":{\"epoch\":7,\"phase\":\"waiting_retry\",\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
+        "{\"publication_target_count\":2500,\"publication_target_ready\":true,\"embedding_activity\":{\"epoch\":7,\"phase\":\"waiting_retry\",\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
         encoded,
     );
 }

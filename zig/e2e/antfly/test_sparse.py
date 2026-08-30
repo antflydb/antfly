@@ -21,7 +21,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 import requests
-
 from helpers import (
     assert_created_index,
     create_index_payload,
@@ -164,6 +163,7 @@ def test_sparse_import_and_hybrid_query_with_external_embeddings(backup_api):
         dense_index,
         timeout_s=30.0,
         interval_s=0.5,
+        until="complete",
         require_query_fresh=True,
     )
     backup_api.wait_index_ready(
@@ -171,6 +171,7 @@ def test_sparse_import_and_hybrid_query_with_external_embeddings(backup_api):
         sparse_index,
         timeout_s=30.0,
         interval_s=0.5,
+        until="complete",
         require_query_fresh=True,
     )
 
@@ -393,6 +394,7 @@ def test_named_embedding_queries_use_requested_indexes(table_api):
                 index_name,
                 timeout_s=30.0,
                 interval_s=0.5,
+                until="complete",
                 require_query_fresh=True,
             )
 

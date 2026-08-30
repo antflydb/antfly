@@ -10133,7 +10133,7 @@ pub const ProvisionedTableWriteSource = struct {
         }) orelse return false;
         defer status.deinit(snapshot_cache.alloc);
 
-        db.overlayRuntimeStatusBestEffort(snapshot_cache.alloc, &status.stats);
+        _ = db.overlayRuntimeStatusBestEffort(snapshot_cache.alloc, &status.stats);
         _ = snapshot_cache.publishGroup(publication_token, table_name, status) catch |err| {
             std.log.warn("managed runtime status overlay publish failed table={s} group_id={} err={s}", .{
                 table_name,
@@ -12192,7 +12192,7 @@ pub const ProvisionedTableWriteSource = struct {
                             db_mod.types.freeDBStats(alloc, status.stats);
                             status.stats = fresh_stats;
                         } else {
-                            owned.db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
+                            _ = owned.db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
                         }
                         self.markManagedWriterRuntimeStatus(&status);
                         status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
@@ -12227,7 +12227,7 @@ pub const ProvisionedTableWriteSource = struct {
                 var owned = cached;
                 const release_alloc = if (owned.cache) |cache| cache.alloc else std.heap.page_allocator;
                 defer owned.deinit(release_alloc);
-                owned.db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
+                _ = owned.db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
                 self.markManagedWriterRuntimeStatus(status);
                 status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
                 if (status.created_at_millis == 0) {
@@ -24696,17 +24696,19 @@ fn overlayRuntimeStatusReplayTargetFromDb(
     db: *db_mod.DB,
 ) void {
     // Cold/query-only recovery has no producer runtime of its own. If a live
-    // writer is resident, overlay its lock-free lifecycle snapshot together
-    // with replay watermarks so a just-recovered status cannot transiently
-    // report a ready managed index with `enrichment_runtime.enabled=false`.
-    db.overlayRuntimeStatusRuntimeBestEffort(&status.stats);
+    // writer is resident, overlay its runtime diagnostics and try to refresh
+    // lifecycle plus physical counters under one apply-lock boundary. A
+    // contended best-effort read may add debt but must not remove a blocker.
+    const lifecycle_authoritative = db.overlayRuntimeStatusBestEffort(alloc, &status.stats);
     const async_stats = status.stats.async_indexing;
     for (status.stats.indexes) |*item| {
         const prior_backfill_active = item.backfill_active;
         const prior_backfill_progress = item.backfill_progress;
         const preserve_non_replay_backfill = runtimeStatusHasNonReplayBackfillSignal(item.*);
-        if (db.executor.appliedSequence(item.name)) |live_applied| {
-            item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
+        if (lifecycle_authoritative) {
+            if (db.executor.appliedSequence(item.name)) |live_applied| {
+                item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
+            }
         }
         // The primary replay head is shared by every managed index. Derive the
         // target from this index's matching replay lane so unrelated commits
@@ -24720,9 +24722,12 @@ fn overlayRuntimeStatusReplayTargetFromDb(
         item.replay_target_sequence = @max(item.replay_target_sequence, item.replay_applied_sequence);
         item.catch_up_target_sequence = item.replay_target_sequence;
         item.catch_up_applied_sequence = item.replay_applied_sequence;
-        item.catch_up_active = item.kind == .dense_vector and async_stats.dense_catch_up.active;
-        item.catch_up_phase = if (item.kind == .dense_vector) async_stats.dense_catch_up.phase else .idle;
-        item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
+        const live_catch_up_active = item.kind == .dense_vector and async_stats.dense_catch_up.active;
+        item.catch_up_active = live_catch_up_active or (!lifecycle_authoritative and item.catch_up_active);
+        if (live_catch_up_active or lifecycle_authoritative)
+            item.catch_up_phase = if (item.kind == .dense_vector) async_stats.dense_catch_up.phase else .idle;
+        item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence or
+            (!lifecycle_authoritative and item.replay_catch_up_required);
         if (item.catch_up_active or item.replay_catch_up_required) {
             item.backfill_active = true;
             if (item.replay_target_sequence > 0) {
@@ -24732,7 +24737,7 @@ fn overlayRuntimeStatusReplayTargetFromDb(
                         @as(f64, @floatFromInt(item.replay_target_sequence)),
                 );
             }
-        } else if (prior_backfill_active and preserve_non_replay_backfill) {
+        } else if (prior_backfill_active and (!lifecycle_authoritative or preserve_non_replay_backfill)) {
             item.backfill_active = true;
             item.backfill_progress = prior_backfill_progress;
         } else {

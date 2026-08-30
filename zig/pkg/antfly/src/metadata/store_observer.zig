@@ -457,6 +457,8 @@ fn runtimeStatusEqual(
             left.edge_count != right.edge_count or
             left.node_count != right.node_count or
             left.root_node != right.root_node or
+            left.publication_target_count != right.publication_target_count or
+            left.publication_target_ready != right.publication_target_ready or
             left.coverage_produced_count != right.coverage_produced_count or
             left.coverage_skipped_count != right.coverage_skipped_count or
             left.coverage_terminal_failed_count != right.coverage_terminal_failed_count or

@@ -613,6 +613,16 @@ pub const CreatedProviderConfig = struct {
     timeout: ?i64 = null,
 };
 
+/// Exact dense-vector publication cardinality for the observed index incarnation.
+pub const DenseVectorPublicationStatus = struct {
+    /// Exact durable vector target for the current dense-index incarnation.
+    target_vectors: i64,
+    /// Physical vectors currently visible to queries.
+    searchable_vectors: i64,
+    /// Whether searchable_vectors exactly equals target_vectors.
+    complete: bool,
+};
+
 /// A structured reason why the coverage projection cannot be treated as globally complete.
 pub const DerivedCoverageObservationIncompleteReason = enum {
     runtime_unavailable,
@@ -997,6 +1007,8 @@ pub const EmbeddingsIndexStats = struct {
     source_coverage: ?EmbeddingSourceCoverageStatus = null,
     /// Physical vectors or sparse entries visible to queries; chunked indexes may exceed source coverage.
     searchable_vectors: ?i64 = null,
+    /// Dense-only exact publication status; absent for sparse indexes and when the target proof is unavailable.
+    publication: ?DenseVectorPublicationStatus = null,
     /// Fresh owner-reported activity, or null when no heartbeat for this index incarnation is available.
     activity: ?EmbeddingIndexActivity = null,
     /// Error message if stats could not be retrieved

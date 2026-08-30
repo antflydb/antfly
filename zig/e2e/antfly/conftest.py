@@ -49,12 +49,11 @@ import time
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
 from typing import Any, Callable, Literal
+from urllib.parse import quote, unquote, urlparse
 
 import pytest
 import requests
-
 from helpers import create_index_payload, start_http_server
 from port_reservations import LoopbackPortReservations, find_free_port
 
@@ -315,7 +314,7 @@ def _created_table_from_path(path: str) -> str | None:
 def ready_index_status(
     index_info: dict[str, Any],
     *,
-    until: Literal["queryable", "complete"] | None = None,
+    until: Literal["queryable", "complete"],
     require_query_fresh: bool = False,
 ) -> dict[str, Any] | None:
     status = index_info.get("status")
@@ -325,6 +324,26 @@ def ready_index_status(
         return None
     if status.get("error"):
         return None
+    # Current status owns readiness through milestone-specific facts. Once the
+    # requested milestone is reached, background work belonging only to a
+    # later milestone must not be reinterpreted as a blocker by this client.
+    # Absence of `milestones` identifies the released v0.2.0 fallback below.
+    if isinstance(status.get("milestones"), dict):
+        milestone = status["milestones"].get(until)
+        readiness = status.get("readiness")
+        if not isinstance(milestone, dict) or milestone.get("reached") is not True:
+            return None
+        blockers = milestone.get("blockers")
+        if not isinstance(blockers, list) or blockers:
+            return None
+        if isinstance(readiness, dict) and readiness.get("state") == "failed":
+            return None
+        if require_query_fresh and not _index_query_observation_fresh(status):
+            return None
+        return status
+
+    # v0.2.0 has no milestone contract. Its only safe interpretation is the
+    # historical fully-settled state for either requested milestone.
     if status.get("materialization_blocked", False):
         return None
     if status.get("rebuilding", status.get("backfill_active", False)):
@@ -346,10 +365,9 @@ def ready_index_status(
         return None
     if status.get("catch_up_active", False):
         return None
-    if until is not None:
-        readiness = status.get("readiness")
-        if not isinstance(readiness, dict) or readiness.get(until) is not True:
-            return None
+    readiness = status.get("readiness")
+    if not isinstance(readiness, dict) or readiness.get(until) is not True:
+        return None
     coverage = status.get("coverage")
     if isinstance(coverage, dict):
         if coverage.get("observation_complete") is not True:
@@ -357,21 +375,24 @@ def ready_index_status(
         mismatch_count = coverage.get("config_mismatch_group_count")
         if type(mismatch_count) is not int or mismatch_count != 0:
             return None
-    if require_query_fresh:
-        expected_groups = status.get("expected_groups")
-        fresh_groups = status.get("fresh_groups")
-        if not isinstance(expected_groups, int) or expected_groups <= 0:
-            return None
-        if not isinstance(fresh_groups, int) or fresh_groups < expected_groups:
-            return None
-        if status.get("runtime_present") is not True:
-            return None
-        stale_groups = status.get("stale_groups")
-        if isinstance(stale_groups, int) and stale_groups > 0:
-            return None
-        if status.get("runtime_fresh") is False:
-            return None
+    if require_query_fresh and not _index_query_observation_fresh(status):
+        return None
     return status
+
+
+def _index_query_observation_fresh(status: dict[str, Any]) -> bool:
+    expected_groups = status.get("expected_groups")
+    fresh_groups = status.get("fresh_groups")
+    if not isinstance(expected_groups, int) or expected_groups <= 0:
+        return False
+    if not isinstance(fresh_groups, int) or fresh_groups < expected_groups:
+        return False
+    if status.get("runtime_present") is not True:
+        return False
+    stale_groups = status.get("stale_groups")
+    if isinstance(stale_groups, int) and stale_groups > 0:
+        return False
+    return status.get("runtime_fresh") is not False
 
 
 def _index_ready_timeout_message(
@@ -1480,8 +1501,7 @@ class OpenAiEmbeddingServer:
                     and (
                         rate_limit_input_substring is None
                         or any(
-                            rate_limit_input_substring in str(value)
-                            for value in inputs
+                            rate_limit_input_substring in str(value) for value in inputs
                         )
                     )
                 )
@@ -2091,7 +2111,7 @@ def serverless_api(serverless_runtime):
             *,
             timeout_s: float = 30.0,
             interval_s: float = 0.5,
-            until: Literal["queryable", "complete"] = "queryable",
+            until: Literal["queryable", "complete"],
             require_query_fresh: bool = False,
         ) -> dict:
             deadline = time.monotonic() + timeout_s
@@ -3256,7 +3276,7 @@ def backup_api(request: pytest.FixtureRequest):
             *,
             timeout_s: float = 30.0,
             interval_s: float = 0.5,
-            until: Literal["queryable", "complete"] = "queryable",
+            until: Literal["queryable", "complete"],
             require_query_fresh: bool = False,
         ) -> dict:
             deadline = time.monotonic() + timeout_s
@@ -3516,7 +3536,7 @@ def table_api(request):
             *,
             timeout_s: float = 30.0,
             interval_s: float = 0.5,
-            until: Literal["queryable", "complete"] = "queryable",
+            until: Literal["queryable", "complete"],
             require_query_fresh: bool = False,
         ) -> dict:
             deadline = time.monotonic() + timeout_s

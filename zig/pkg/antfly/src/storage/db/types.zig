@@ -2185,9 +2185,10 @@ pub const EmbeddingActivityStats = struct {
     // inputs, not public counters: clients see only `effectivePhase()`.
     active_preparations: u64 = 0,
     active_publications: u64 = 0,
-    // Used only when aggregating already-derived shard phases. Runtime owners
-    // leave this null and publish the exact scopes above.
-    phase_override: ?EmbeddingActivityPhase = null,
+    // A status received from another runtime is already an owner-derived
+    // observation. Local owners leave this null and expose their exact scopes;
+    // transport adapters set it so counters cannot reinterpret that phase.
+    reported_phase: ?EmbeddingActivityPhase = null,
     chunks_created: u64 = 0,
     embedding_batches_completed: u64 = 0,
     embeddings_computed: u64 = 0,
@@ -2196,11 +2197,12 @@ pub const EmbeddingActivityStats = struct {
     last_progress_at_ms: u64 = 0,
 
     pub fn effectivePhase(self: @This()) EmbeddingActivityPhase {
+        if (self.reported_phase) |phase| return phase;
         if (self.retrying) return .waiting_retry;
         if (self.active_batch_size != 0) return .embedding;
         if (self.active_publications != 0) return .publishing;
         if (self.active_preparations != 0) return .preparing;
-        return self.phase_override orelse .idle;
+        return .idle;
     }
 };
 
@@ -2961,6 +2963,11 @@ pub const DBIndexStats = struct {
     edge_count: u64 = 0,
     node_count: u64 = 0,
     root_node: u64 = 0,
+    // Exact physical artifact cardinality owned by this index incarnation.
+    // Unlike source coverage, this remains correct for chunked projections
+    // where one source document can publish multiple searchable vectors.
+    publication_target_count: u64 = 0,
+    publication_target_ready: bool = false,
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,

@@ -40,6 +40,7 @@ pub const repair_status_record_version: u16 = current_record_version;
 pub const native_restore_identity_record_version: u16 = current_record_version;
 pub const artifact_source_status_record_version: u16 = current_record_version;
 pub const artifact_source_failure_status_record_version: u16 = current_record_version;
+pub const publication_target_record_version: u16 = current_record_version;
 
 pub fn isSupported(version: u16) bool {
     return isNegotiable(version);

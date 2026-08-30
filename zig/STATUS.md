@@ -348,10 +348,19 @@ Embeddings status additionally separates lifecycle truth from work telemetry:
   `pending` is `null` and `observation_incomplete_reasons` says why.
 - `searchable_vectors` reports physical query-visible entries. It is not a
   source-document counter and may be larger for chunked indexes.
+- Dense embeddings expose `publication.target_vectors`,
+  `publication.searchable_vectors`, and `publication.complete`. The object is
+  emitted only when an exact durable target exists for the current
+  incarnation; completion requires equality, not a lower-bound comparison
+  with source outcomes. Other index types should define publication facts in
+  their own physical units rather than reuse vector semantics.
 - `activity` reports volatile, incarnation-scoped work. Its counters are
   maintained by the owning enrichment runtime and aggregated only from current
   shard observations. A client may calculate throughput only across samples
-  whose opaque activity `epoch` is unchanged.
+  whose opaque activity `epoch` is unchanged. Owners report an authoritative
+  phase independently of counters; aggregation reduces those phases with
+  `waiting_retry > embedding > publishing > preparing > idle`. A counter from
+  a lower-priority owner cannot mask a higher-priority phase.
 
 These dimensions have a strict dependency direction:
 
@@ -366,12 +375,25 @@ activity and its epoch without changing durable coverage or the queryable
 publication. This keeps status useful for UX while preserving fail-closed
 admission and bounded request-path performance.
 
+Wait clients select `queryable` or `complete` explicitly. For current responses,
+the selected milestone and its blockers are authoritative; generic lifecycle,
+catch-up, and coverage fields may describe work that belongs only to the later
+milestone. The v0.2.0 response has no milestone map, so clients use its
+historical fully-settled readiness rules only as a separate compatibility path.
+
+A best-effort live overlay may add activity or newly observed debt, but it may
+remove a readiness blocker only when lifecycle, physical artifact counters, and
+coverage were refreshed under the same apply-lock boundary. On contention the
+retained blocker wins until the next bounded authoritative refresh. This avoids
+publishing `complete` from an idle worker snapshot paired with stale vector
+counts, without adding blocking work to ordinary status requests.
+
 Distributed publication has two released profiles: v12 for v0.2.0 peers and
 v15 for current admission/restore safety facts. V13 and v14 were development
 artifacts and are rejected rather than negotiated. During rolling upgrades,
 writers emit v12 until every metadata voter advertises v15; repair state,
-reporter fences, and native-restore identity then activate together and remain
-mandatory/fail-closed. Embedding activity is not projected through this codec:
+reporter fences, native-restore identity, and exact publication targets then
+activate together and remain mandatory/fail-closed. Embedding activity is not projected through this codec:
 its separately versioned TTL heartbeat remains optional. Capability proofs are
 scoped to the metadata incarnation, membership fingerprint, and required
 profile.

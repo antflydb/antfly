@@ -26,6 +26,7 @@ pub const CreatedGraphIndexConfig = types.CreatedGraphIndexConfig;
 pub const CreatedIndex = types.CreatedIndex;
 pub const CreatedIndexCommon = types.CreatedIndexCommon;
 pub const CreatedProviderConfig = types.CreatedProviderConfig;
+pub const DenseVectorPublicationStatus = types.DenseVectorPublicationStatus;
 pub const DerivedCoverageObservationIncompleteReason = types.DerivedCoverageObservationIncompleteReason;
 pub const DerivedCoveragePolicy = types.DerivedCoveragePolicy;
 pub const DerivedCoverageStatus = types.DerivedCoverageStatus;

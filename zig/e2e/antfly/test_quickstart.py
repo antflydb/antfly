@@ -728,7 +728,13 @@ def test_public_managed_semantic_full_index_pipeline(backup_api, openai_embedder
         "embeddings",
     )
 
-    backup_api.wait_index_ready(table_name, index_name, timeout_s=30.0, interval_s=0.5)
+    backup_api.wait_index_ready(
+        table_name,
+        index_name,
+        timeout_s=30.0,
+        interval_s=0.5,
+        until="complete",
+    )
 
     batch = backup_api.batch_write(
         table_name,
@@ -878,7 +884,11 @@ def test_public_managed_chunked_semantic_full_index_pipeline(
     )
 
     backup_api.wait_index_ready(
-        table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5
+        table_name,
+        "semantic_chunked_idx",
+        timeout_s=30.0,
+        interval_s=0.5,
+        until="complete",
     )
 
     batch = backup_api.batch_write(
@@ -957,7 +967,12 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     # The public quickstart omits the policy. Verify the API and runtime apply
     # the v0.2 default instead of relying on an explicit test-only override.
     assert created["publication_policy"] == "progressive"
-    backup_api.wait_index_ready(table_name, index_name, timeout_s=30.0)
+    backup_api.wait_index_ready(
+        table_name,
+        index_name,
+        timeout_s=30.0,
+        until="complete",
+    )
     progressive_openai_embedder.rate_limit_after_next_requests(
         10, input_substring="progressive publication document"
     )
@@ -1047,7 +1062,9 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         timeout_s=10.0,
         interval_s=0.05,
     )
-    assert activity_status is not None, "current incarnation emitted no activity heartbeat"
+    assert activity_status is not None, (
+        "current incarnation emitted no activity heartbeat"
+    )
     activity = activity_status["activity"]
     assert activity["epoch"].startswith("a-")
     assert activity["phase"] in {
@@ -1247,7 +1264,11 @@ def test_public_managed_antfly_chunked_semantic_full_index_pipeline(
     )
 
     backup_api.wait_index_ready(
-        table_name, "semantic_antfly_idx", timeout_s=30.0, interval_s=0.5
+        table_name,
+        "semantic_antfly_idx",
+        timeout_s=30.0,
+        interval_s=0.5,
+        until="complete",
     )
 
     batch = backup_api.batch_write(
@@ -1334,7 +1355,11 @@ def test_public_managed_antfly_clipclap_gguf_embedder_smoke(real_clipclap_backup
     )
 
     backup_api.wait_index_ready(
-        table_name, "semantic_clipclap_idx", timeout_s=60.0, interval_s=0.5
+        table_name,
+        "semantic_clipclap_idx",
+        timeout_s=60.0,
+        interval_s=0.5,
+        until="complete",
     )
 
 
@@ -1389,7 +1414,11 @@ def test_public_managed_antfly_clipclap_gguf_chunked_full_index_pipeline(
     )
 
     backup_api.wait_index_ready(
-        table_name, "semantic_clipclap_idx", timeout_s=60.0, interval_s=0.5
+        table_name,
+        "semantic_clipclap_idx",
+        timeout_s=60.0,
+        interval_s=0.5,
+        until="complete",
     )
 
     batch = backup_api.batch_write(

@@ -913,6 +913,10 @@ pub const RuntimeIndexStatusReport = struct {
     edge_count: u64 = 0,
     node_count: u64 = 0,
     root_node: u64 = 0,
+    /// Exact physical artifact cardinality for the reported incarnation.
+    /// Missing proof is deliberately false so current readers fail closed.
+    publication_target_count: u64 = 0,
+    publication_target_ready: bool = false,
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
@@ -2273,6 +2277,8 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .edge_count = record.edge_count,
         .node_count = record.node_count,
         .root_node = record.root_node,
+        .publication_target_count = record.publication_target_count,
+        .publication_target_ready = record.publication_target_ready,
         .coverage_produced_count = record.coverage_produced_count,
         .coverage_skipped_count = record.coverage_skipped_count,
         .coverage_terminal_failed_count = record.coverage_terminal_failed_count,

@@ -1331,6 +1331,8 @@ fn preserveIndexArtifactVisibility(dst: *db_mod.types.DBIndexStats, cached: db_m
     dst.edge_count = cached.edge_count;
     dst.node_count = cached.node_count;
     dst.root_node = cached.root_node;
+    dst.publication_target_count = cached.publication_target_count;
+    dst.publication_target_ready = cached.publication_target_ready;
     dst.text_merge = cached.text_merge;
     dst.hbc_cache = cached.hbc_cache;
     dst.hbc_posting = cached.hbc_posting;
@@ -1797,6 +1799,8 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .edge_count = item.edge_count,
             .node_count = item.node_count,
             .root_node = item.root_node,
+            .publication_target_count = item.publication_target_count,
+            .publication_target_ready = item.publication_target_ready,
             .coverage_produced_count = item.coverage_produced_count,
             .coverage_skipped_count = item.coverage_skipped_count,
             .coverage_terminal_failed_count = item.coverage_terminal_failed_count,

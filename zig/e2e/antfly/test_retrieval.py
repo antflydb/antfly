@@ -21,9 +21,7 @@ import time
 
 import pytest
 import requests
-
 from helpers import assert_created_index, wait_until
-
 
 pytestmark = pytest.mark.reuse_antfly_process
 
@@ -410,6 +408,7 @@ def test_retrieval_agent_semantic_and_hybrid_queries(backup_api):
         "dense_idx",
         timeout_s=30.0,
         interval_s=0.5,
+        until="complete",
         require_query_fresh=True,
     )
     backup_api.wait_index_ready(
@@ -417,6 +416,7 @@ def test_retrieval_agent_semantic_and_hybrid_queries(backup_api):
         "sparse_idx",
         timeout_s=30.0,
         interval_s=0.5,
+        until="complete",
         require_query_fresh=True,
     )
 

@@ -275,27 +275,33 @@ fn stageNativeAfbRestoreBackup(
     defer std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
     try backup_bundle_io.extractNativeFileToStagingDirectory(allocator, io, source, source_size, staging_root);
 
-    var manifest = try backups_api.readManifest(allocator, staging_root, root_manifest.backup_id);
-    defer manifest.deinit(allocator);
-    if (manifest.format != .native or !std.mem.eql(u8, manifest.table_name, root_manifest.table_name))
+    var source_manifest = try backups_api.readManifest(allocator, staging_root, root_manifest.backup_id);
+    defer source_manifest.deinit(allocator);
+    if (source_manifest.format != .native or !std.mem.eql(u8, source_manifest.table_name, root_manifest.table_name))
         return error.BackupArtifactFormatMismatch;
 
     var location = try backups_api.openBackupLocation(allocator, location_uri);
     defer location.deinit(allocator);
-    for (manifest.shards) |shard| {
-        const canonical_path = try backups_api.shardSnapshotRelPath(allocator, manifest.backup_id, shard.group_id);
+    for (source_manifest.shards) |shard| {
+        const canonical_path = try backups_api.shardSnapshotRelPath(allocator, source_manifest.backup_id, shard.group_id);
         defer allocator.free(canonical_path);
         if (!std.mem.eql(u8, canonical_path, shard.snapshot_path)) return error.InvalidBackupManifest;
         const extracted_shard = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ staging_root, shard.snapshot_path });
         defer allocator.free(extracted_shard);
-        try backups_api.copyDirectoryToLocation(allocator, &location, manifest.backup_id, shard.group_id, extracted_shard);
+        try backups_api.copyDirectoryToLocation(allocator, &location, source_manifest.backup_id, shard.group_id, extracted_shard);
     }
-    try backups_api.writeManifestToLocation(allocator, &location, &manifest);
+    var target_manifest = try backups_api.deriveRestoreManifestForTargetTable(
+        allocator,
+        source_manifest,
+        target_table_name,
+    );
+    defer target_manifest.deinit(allocator);
+    try backups_api.writeManifestToLocation(allocator, &location, &target_manifest);
 
     return .{
-        .backup_id = try allocator.dupe(u8, manifest.backup_id),
+        .backup_id = try allocator.dupe(u8, target_manifest.backup_id),
         .location = try allocator.dupe(u8, location_uri),
-        .snapshot_path = try allocator.dupe(u8, manifest.shards[0].snapshot_path),
+        .snapshot_path = try allocator.dupe(u8, target_manifest.shards[0].snapshot_path),
         .table_name = try allocator.dupe(u8, target_table_name),
     };
 }
@@ -921,7 +927,10 @@ test "lite restore staging expands a self-contained native AFB2 bundle" {
     var target = try backups_api.readManifest(allocator, target_root, backup_id);
     defer target.deinit(allocator);
     try std.testing.expectEqual(backups_api.BackupFormat.native, target.format);
-    try std.testing.expectEqualStrings("source_docs", target.table_name);
+    try std.testing.expectEqualStrings("restored_docs", target.table_name);
+    const restore_table = try backups_api.deriveRestoreTableRecord(allocator, "restored_docs", target_location, &target);
+    defer @import("../../metadata/table_manager.zig").freeTable(allocator, restore_table);
+    try std.testing.expectEqualStrings("restored_docs", restore_table.name);
     const restored_payload = try std.fmt.allocPrint(allocator, "{s}/{s}/primary.bin", .{ target_root, snapshot_path });
     defer allocator.free(restored_payload);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, restored_payload, allocator, .limited(128));
