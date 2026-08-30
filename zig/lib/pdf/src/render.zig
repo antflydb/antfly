@@ -1510,25 +1510,47 @@ const ImageAlphaSampler = struct {
     inv_b: f64,
     inv_c: f64,
     inv_d: f64,
+    coverage_minify: bool,
+    cancellation: BilevelCancellationPoller,
 
-    fn init(run: reader.ImageRun) ?ImageAlphaSampler {
+    fn init(run: reader.ImageRun, cancellation: reader.CancellationProbe) ?ImageAlphaSampler {
         const det = run.a * run.d - run.b * run.c;
         if (@abs(det) < 0.000001) return null;
+        const projected_width = @sqrt(run.a * run.a + run.b * run.b);
+        const projected_height = @sqrt(run.c * run.c + run.d * run.d);
         return .{
             .run = run,
             .inv_a = run.d / det,
             .inv_b = -run.b / det,
             .inv_c = -run.c / det,
             .inv_d = run.a / det,
+            .coverage_minify = run.ocr_coverage_minify and run.bilevel and
+                (@as(f64, @floatFromInt(run.width)) > projected_width or
+                    @as(f64, @floatFromInt(run.height)) > projected_height),
+            .cancellation = BilevelCancellationPoller.init(cancellation),
         };
     }
 
-    fn alphaAt(self: ImageAlphaSampler, world_x: f64, world_y: f64) u8 {
+    fn alphaAt(self: *ImageAlphaSampler, world_x: f64, world_y: f64, bilevel_sample_budget: ?*BilevelSampleBudget) !u8 {
         const dx = world_x - self.run.e;
         const dy = world_y - self.run.f;
         const u = self.inv_a * dx + self.inv_c * dy;
         const v = self.inv_b * dx + self.inv_d * dy;
         if (!finite(u) or !finite(v) or u < 0 or u > 1 or v < 0 or v > 1) return 0;
+        if (self.coverage_minify) {
+            const sample = try coveragePreservingBilevelSample(
+                self.run,
+                world_x,
+                world_y,
+                self.inv_a,
+                self.inv_b,
+                self.inv_c,
+                self.inv_d,
+                &self.cancellation,
+                bilevel_sample_budget,
+            );
+            return sample[3];
+        }
         if (self.run.interpolate) return bilinearImageSample(self.run, u, 1.0 - v)[3];
         const sx = @min(self.run.width - 1, @as(u32, @intFromFloat(@floor(u * @as(f64, @floatFromInt(self.run.width))))));
         const sy = @min(self.run.height - 1, @as(u32, @intFromFloat(@floor((1.0 - v) * @as(f64, @floatFromInt(self.run.height))))));
@@ -1536,8 +1558,14 @@ const ImageAlphaSampler = struct {
     }
 };
 
-fn patternTargetAlpha(run: reader.PatternRun, mask_sampler: ?ImageAlphaSampler, world_x: f64, world_y: f64) u8 {
-    if (mask_sampler) |sampler| return sampler.alphaAt(world_x, world_y);
+fn patternTargetAlpha(
+    run: reader.PatternRun,
+    mask_sampler: *?ImageAlphaSampler,
+    world_x: f64,
+    world_y: f64,
+    bilevel_sample_budget: ?*BilevelSampleBudget,
+) !u8 {
+    if (mask_sampler.*) |*sampler| return try sampler.alphaAt(world_x, world_y, bilevel_sample_budget);
     const shape = patternTargetShape(run);
     const hit = if (run.kind == .fill)
         pointInShape(world_x, world_y, shape)
@@ -1557,7 +1585,7 @@ fn drawPatternRunCancelable(
     cancellation: reader.CancellationProbe,
     bilevel_sample_budget: ?*BilevelSampleBudget,
 ) anyerror!void {
-    const mask_sampler = if (run.stencil_mask) |mask| ImageAlphaSampler.init(mask) else null;
+    var mask_sampler = if (run.stencil_mask) |mask| ImageAlphaSampler.init(mask, cancellation) else null;
     if (run.stencil_mask != null and mask_sampler == null) return;
     const bounds: reader.PageBox = if (run.stencil_mask) |mask| blk: {
         const value = imageRunBounds(mask);
@@ -1582,7 +1610,7 @@ fn drawPatternRunCancelable(
                 const world_x = min_x + (@as(f64, @floatFromInt(px)) + 0.5);
                 const world_y = max_y - (@as(f64, @floatFromInt(py)) + 0.5);
                 if (has_clip and !pointPassesClip(world_x, world_y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
-                const target_alpha = patternTargetAlpha(run, mask_sampler, world_x, world_y);
+                const target_alpha = try patternTargetAlpha(run, &mask_sampler, world_x, world_y, bilevel_sample_budget);
                 if (target_alpha == 0) continue;
                 const t_opt = switch (shading.kind) {
                     .axial => axialShadingT(world_x, world_y, shading),
@@ -1614,7 +1642,7 @@ fn drawPatternRunCancelable(
             const world_x = min_x + (@as(f64, @floatFromInt(px)) + 0.5);
             const world_y = max_y - (@as(f64, @floatFromInt(py)) + 0.5);
             if (has_clip and !pointPassesClip(world_x, world_y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
-            const target_alpha = patternTargetAlpha(run, mask_sampler, world_x, world_y);
+            const target_alpha = try patternTargetAlpha(run, &mask_sampler, world_x, world_y, bilevel_sample_budget);
             if (target_alpha == 0) continue;
 
             const dx = world_x - run.pattern_matrix.e;
@@ -3709,6 +3737,52 @@ test "OCR bilevel minification preserves source ink coverage" {
     try std.testing.expectEqual(ocr_canvas[0], ocr_canvas[1]);
     try std.testing.expectEqual(ocr_canvas[0], ocr_canvas[2]);
     try std.testing.expectEqual(@as(u8, 0xff), ocr_canvas[3]);
+}
+
+test "OCR pattern stencil minification preserves sparse mask coverage" {
+    const alloc = std.testing.allocator;
+    var tile_points = [_][2]f64{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
+    var tile_shapes = [_]reader.ShapeRun{.{
+        .kind = .fill,
+        .color = .{ 0xff, 0, 0, 0xff },
+        .stroke_width = 1,
+        .closed = true,
+        .points = &tile_points,
+    }};
+    var mask_rgba = [_]u8{0} ** (8 * 4);
+    mask_rgba[0..4].* = .{ 0xff, 0xff, 0xff, 0xff };
+    const run: reader.PatternRun = .{
+        .kind = .fill,
+        .points = &.{},
+        .stencil_mask = .{
+            .rgba = &mask_rgba,
+            .width = 8,
+            .height = 1,
+            .bilevel = true,
+            .ocr_coverage_minify = true,
+            .a = 1,
+            .b = 0,
+            .c = 0,
+            .d = 1,
+            .e = 0,
+            .f = 0,
+            .x = 0,
+            .y = 0,
+            .draw_width = 1,
+            .draw_height = 1,
+        },
+        .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
+        .pattern_x_step = 1,
+        .pattern_y_step = 1,
+        .tile_shape_runs = &tile_shapes,
+    };
+
+    var canvas = [_]u8{0xff} ** 4;
+    try drawPatternRun(alloc, &canvas, 1, 1, 0, 1, run);
+    try std.testing.expectEqual(@as(u8, 0xff), canvas[0]);
+    try std.testing.expect(canvas[1] >= 222 and canvas[1] <= 224);
+    try std.testing.expectEqual(canvas[1], canvas[2]);
+    try std.testing.expectEqual(@as(u8, 0xff), canvas[3]);
 }
 
 test "OCR bilevel area filter retains thin rules beyond four-to-one minification" {

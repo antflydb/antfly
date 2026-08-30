@@ -1894,10 +1894,11 @@ fn colorSpaceSelectionFromName(color_spaces: []const PageColorSpace, name: []con
                 color_space.selection.kind != .unsupported and
                 colorSpaceComponentCount(color_space.selection.kind) == colorSpaceComponentCount(direct))
                 return color_space.selection;
-            // A declared Default* space replaces the corresponding device
-            // space. Never silently reinterpret its operands as raw device
-            // samples when the declaration is malformed or unsupported.
-            return colorSpaceSelectionForKind(.unsupported);
+            // PDF default-space remapping is optional for a consumer that
+            // does not recognize the declared replacement. Preserve the
+            // original device space rather than turning a valid page into a
+            // terminal render failure.
+            return colorSpaceSelectionForKind(direct);
         }
         return colorSpaceSelectionForKind(direct);
     }
@@ -2131,15 +2132,15 @@ fn buildBilevelFallbackSample(rgba: []const u8, cancellation: CancellationProbe)
 /// never consumes these summaries and therefore avoids an additional O(pixels)
 /// pass over every one-bit image. Reused XObjects share a decoded RGBA buffer;
 /// keying by that immutable buffer computes each summary once per page.
-pub fn prepareOcrBilevelFallbacksAlloc(
+fn prepareOcrImageRunsWithSummariesAlloc(
     alloc: Allocator,
     image_runs: []ImageRun,
+    summaries: *std.AutoHashMapUnmanaged(usize, [4]u8),
     cancellation: CancellationProbe,
 ) !void {
-    var summaries = std.AutoHashMapUnmanaged(usize, [4]u8).empty;
-    defer summaries.deinit(alloc);
     for (image_runs, 0..) |*run, index| {
         if (index & 255 == 0) try cancellation.check();
+        run.ocr_coverage_minify = run.bilevel;
         if (!run.bilevel or run.rgba.len == 0) continue;
         const key = @intFromPtr(run.rgba.ptr);
         const entry = try summaries.getOrPut(alloc, key);
@@ -2151,6 +2152,51 @@ pub fn prepareOcrBilevelFallbacksAlloc(
         }
         run.bilevel_fallback = entry.value_ptr.*;
     }
+}
+
+fn prepareOcrPatternRunsWithSummariesAlloc(
+    alloc: Allocator,
+    pattern_runs: []PatternRun,
+    summaries: *std.AutoHashMapUnmanaged(usize, [4]u8),
+    cancellation: CancellationProbe,
+    depth: u8,
+) !void {
+    // Resource collection currently retains at most two nested pattern
+    // levels. Keep a defensive ceiling so future collectors cannot turn OCR
+    // preparation into unbounded recursion.
+    if (depth >= 8) return;
+    for (pattern_runs, 0..) |*pattern, index| {
+        if (index & 63 == 0) try cancellation.check();
+        if (pattern.stencil_mask) |*mask|
+            try prepareOcrImageRunsWithSummariesAlloc(alloc, @as(*[1]ImageRun, @ptrCast(mask))[0..], summaries, cancellation);
+        try prepareOcrImageRunsWithSummariesAlloc(alloc, pattern.tile_image_runs, summaries, cancellation);
+        try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern.tile_pattern_runs, summaries, cancellation, depth + 1);
+    }
+}
+
+/// Prepare every bilevel resource reachable by OCR rendering, including
+/// pattern-cell images and image masks retained as Pattern paint targets.
+/// Shared decoded XObjects use one summary regardless of how many occurrences
+/// reference them.
+pub fn prepareOcrRenderRunsAlloc(
+    alloc: Allocator,
+    image_runs: []ImageRun,
+    pattern_runs: []PatternRun,
+    cancellation: CancellationProbe,
+) !void {
+    var summaries = std.AutoHashMapUnmanaged(usize, [4]u8).empty;
+    defer summaries.deinit(alloc);
+    try prepareOcrImageRunsWithSummariesAlloc(alloc, image_runs, &summaries, cancellation);
+    try prepareOcrPatternRunsWithSummariesAlloc(alloc, pattern_runs, &summaries, cancellation, 0);
+}
+
+/// Compatibility helper for callers that render only standalone images.
+pub fn prepareOcrBilevelFallbacksAlloc(
+    alloc: Allocator,
+    image_runs: []ImageRun,
+    cancellation: CancellationProbe,
+) !void {
+    return prepareOcrRenderRunsAlloc(alloc, image_runs, &.{}, cancellation);
 }
 
 const PageShading = struct {
@@ -5861,15 +5907,15 @@ pub const Reader = struct {
         const black = (try self.calibratedDictTriple(&dict, "BlackPoint", .{ 0, 0, 0 })) orelse
             return colorSpaceSelectionForKind(.unsupported);
         if (white[0] <= 0 or @abs(white[1] - 1.0) > 0.000001 or white[2] <= 0 or
-            black[0] < 0 or black[1] < 0 or black[2] < 0 or
-            black[0] >= white[0] or black[1] >= white[1] or black[2] >= white[2])
+            black[0] < 0 or black[1] < 0 or black[2] < 0)
             return colorSpaceSelectionForKind(.unsupported);
         const white_lms = [3]f64{
             0.8951 * white[0] + 0.2664 * white[1] - 0.1614 * white[2],
             -0.7502 * white[0] + 1.7135 * white[1] + 0.0367 * white[2],
             0.0389 * white[0] - 0.0685 * white[1] + 1.0296 * white[2],
         };
-        if (@abs(white_lms[0]) < 0.000001 or @abs(white_lms[1]) < 0.000001 or @abs(white_lms[2]) < 0.000001)
+        if (!std.math.isFinite(white_lms[0]) or !std.math.isFinite(white_lms[1]) or !std.math.isFinite(white_lms[2]) or
+            @abs(white_lms[0]) < 0.000001 or @abs(white_lms[1]) < 0.000001 or @abs(white_lms[2]) < 0.000001)
             return colorSpaceSelectionForKind(.unsupported);
 
         if (std.mem.eql(u8, family, "CalGray")) {
@@ -15261,16 +15307,17 @@ fn cmykColor(c: f64, m: f64, y: f64, k: f64) [4]u8 {
 }
 
 fn calibratedColor(space: CalibratedColorSpace, components: [4]f64) [4]u8 {
-    const xyz_and_white = switch (space) {
+    const colorimetry = switch (space) {
         .gray => |gray| blk: {
             const ag = std.math.pow(f64, std.math.clamp(components[0], 0.0, 1.0), gray.gamma);
             break :blk .{
                 [3]f64{
-                    gray.black_point[0] + ag * (gray.white_point[0] - gray.black_point[0]),
-                    gray.black_point[1] + ag * (gray.white_point[1] - gray.black_point[1]),
-                    gray.black_point[2] + ag * (gray.white_point[2] - gray.black_point[2]),
+                    gray.white_point[0] * ag,
+                    gray.white_point[1] * ag,
+                    gray.white_point[2] * ag,
                 },
                 gray.white_point,
+                gray.black_point,
             };
         },
         .rgb => |rgb| blk: {
@@ -15279,27 +15326,25 @@ fn calibratedColor(space: CalibratedColorSpace, components: [4]f64) [4]u8 {
             const c = std.math.pow(f64, std.math.clamp(components[2], 0.0, 1.0), rgb.gamma[2]);
             // PDF stores the CalRGB matrix by input component: XA YA ZA,
             // XB YB ZB, XC YC ZC.
-            const normalized = [3]f64{
+            // Matrix ABC maps the gamma-decoded components directly to final
+            // CIE XYZ. WhitePoint and BlackPoint describe the source gamut;
+            // they are not another scale/offset applied to the matrix output.
+            const xyz = [3]f64{
                 rgb.matrix[0] * a + rgb.matrix[3] * b + rgb.matrix[6] * c,
                 rgb.matrix[1] * a + rgb.matrix[4] * b + rgb.matrix[7] * c,
                 rgb.matrix[2] * a + rgb.matrix[5] * b + rgb.matrix[8] * c,
             };
             break :blk .{
-                [3]f64{
-                    rgb.black_point[0] + normalized[0] * (rgb.white_point[0] - rgb.black_point[0]),
-                    rgb.black_point[1] + normalized[1] * (rgb.white_point[1] - rgb.black_point[1]),
-                    rgb.black_point[2] + normalized[2] * (rgb.white_point[2] - rgb.black_point[2]),
-                },
+                xyz,
                 rgb.white_point,
+                rgb.black_point,
             };
         },
     };
-    return xyzColorAdaptedToSrgb(xyz_and_white[0], xyz_and_white[1]);
+    return xyzColorAdaptedToSrgb(colorimetry[0], colorimetry[1], colorimetry[2]);
 }
 
-fn xyzColorAdaptedToSrgb(xyz: [3]f64, source_white: [3]f64) [4]u8 {
-    // Bradford chromatic adaptation keeps calibrated PDF spaces portable and
-    // deterministic while converting their declared white point to sRGB D65.
+fn bradfordAdaptXyzToD65(xyz: [3]f64, source_white: [3]f64) [3]f64 {
     const source_lms = [3]f64{
         0.8951 * source_white[0] + 0.2664 * source_white[1] - 0.1614 * source_white[2],
         -0.7502 * source_white[0] + 1.7135 * source_white[1] + 0.0367 * source_white[2],
@@ -15311,15 +15356,39 @@ fn xyzColorAdaptedToSrgb(xyz: [3]f64, source_white: [3]f64) [4]u8 {
         (-0.7502 * xyz[0] + 1.7135 * xyz[1] + 0.0367 * xyz[2]) * d65_lms[1] / source_lms[1],
         (0.0389 * xyz[0] - 0.0685 * xyz[1] + 1.0296 * xyz[2]) * d65_lms[2] / source_lms[2],
     };
-    const adapted = [3]f64{
+    return .{
         0.9869929 * lms[0] - 0.1470543 * lms[1] + 0.1599627 * lms[2],
         0.4323053 * lms[0] + 0.5183603 * lms[1] + 0.0492912 * lms[2],
         -0.0085287 * lms[0] + 0.0400428 * lms[1] + 0.9684867 * lms[2],
     };
+}
+
+fn xyzColorAdaptedToSrgb(xyz: [3]f64, source_white: [3]f64, source_black: [3]f64) [4]u8 {
+    // Use a deterministic native relative-colorimetric transform. Bradford
+    // adapts the source white to sRGB D65; per-channel black-point
+    // compensation maps the declared diffuse black to the destination black
+    // without altering the CalGray/CalRGB decode equations above.
+    const d65 = [3]f64{ 0.95047, 1.0, 1.08883 };
+    const adapted = bradfordAdaptXyzToD65(xyz, source_white);
+    const adapted_black = bradfordAdaptXyzToD65(source_black, source_white);
+    var compensated = adapted;
+    for (0..3) |channel| {
+        // Syntactically finite PDF numbers can still overflow the matrix
+        // arithmetic. Never allow an adversarial color space to carry NaN
+        // into float-to-byte conversion.
+        if (!std.math.isFinite(adapted[channel]) or !std.math.isFinite(adapted_black[channel])) {
+            compensated[channel] = 0;
+            continue;
+        }
+        const span = d65[channel] - adapted_black[channel];
+        if (!std.math.isFinite(span) or @abs(span) <= 0.000001) continue;
+        const channel_value = (adapted[channel] - adapted_black[channel]) * d65[channel] / span;
+        compensated[channel] = if (std.math.isFinite(channel_value)) channel_value else 0;
+    }
     return rgbColor(
-        linearToSrgb(3.2406 * adapted[0] - 1.5372 * adapted[1] - 0.4986 * adapted[2]),
-        linearToSrgb(-0.9689 * adapted[0] + 1.8758 * adapted[1] + 0.0415 * adapted[2]),
-        linearToSrgb(0.0557 * adapted[0] - 0.2040 * adapted[1] + 1.0570 * adapted[2]),
+        linearToSrgb(3.2406 * compensated[0] - 1.5372 * compensated[1] - 0.4986 * compensated[2]),
+        linearToSrgb(-0.9689 * compensated[0] + 1.8758 * compensated[1] + 0.0415 * compensated[2]),
+        linearToSrgb(0.0557 * compensated[0] - 0.2040 * compensated[1] + 1.0570 * compensated[2]),
     );
 }
 
@@ -16112,6 +16181,59 @@ test "OCR bilevel summaries are prepared lazily and reused by decoded buffer" {
     try prepareOcrBilevelFallbacksAlloc(std.testing.allocator, &runs, .{});
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0xff }, &runs[0].bilevel_fallback.?);
     try std.testing.expectEqual(runs[0].bilevel_fallback, runs[1].bilevel_fallback);
+    try std.testing.expect(runs[0].ocr_coverage_minify);
+    try std.testing.expect(runs[1].ocr_coverage_minify);
+}
+
+test "OCR preparation reaches retained pattern stencils and tile images" {
+    var stencil_rgba = [_]u8{ 0xff, 0xff, 0xff, 0x80 };
+    var tile_rgba = [_]u8{ 0, 0, 0, 0xff };
+    var tile_images = [_]ImageRun{.{
+        .rgba = &tile_rgba,
+        .width = 1,
+        .height = 1,
+        .bilevel = true,
+        .a = 1,
+        .b = 0,
+        .c = 0,
+        .d = 1,
+        .e = 0,
+        .f = 0,
+        .x = 0,
+        .y = 0,
+        .draw_width = 1,
+        .draw_height = 1,
+    }};
+    var patterns = [_]PatternRun{.{
+        .kind = .fill,
+        .points = &.{},
+        .stencil_mask = .{
+            .rgba = &stencil_rgba,
+            .width = 1,
+            .height = 1,
+            .bilevel = true,
+            .a = 1,
+            .b = 0,
+            .c = 0,
+            .d = 1,
+            .e = 0,
+            .f = 0,
+            .x = 0,
+            .y = 0,
+            .draw_width = 1,
+            .draw_height = 1,
+        },
+        .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
+        .pattern_x_step = 1,
+        .pattern_y_step = 1,
+        .tile_image_runs = &tile_images,
+    }};
+
+    try prepareOcrRenderRunsAlloc(std.testing.allocator, &.{}, &patterns, .{});
+    try std.testing.expect(patterns[0].stencil_mask.?.ocr_coverage_minify);
+    try std.testing.expectEqual(@as(u8, 0x80), patterns[0].stencil_mask.?.bilevel_fallback.?[3]);
+    try std.testing.expect(patterns[0].tile_image_runs[0].ocr_coverage_minify);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0xff }, &patterns[0].tile_image_runs[0].bilevel_fallback.?);
 }
 
 test "decode allocator enforces cumulative churn before allocating" {
@@ -18879,7 +19001,7 @@ test "reader decodes CalRGB image xobject draw" {
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
         try std.fmt.allocPrint(
             alloc,
-            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace [/CalRGB << /WhitePoint [1 1 1] >>] /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace [/CalRGB << /WhitePoint [0.95047 1 1.08883] /Matrix [0.4124564 0.2126729 0.0193339 0.3575761 0.7151522 0.1191920 0.1804375 0.0721750 0.9503041] >>] /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
             .{ image_data.len, image_data },
         ),
     };
@@ -18915,9 +19037,9 @@ test "reader decodes CalRGB image xobject draw" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), runs.len);
-    try std.testing.expect(runs[0].rgba[0] > 240);
-    try std.testing.expect(runs[0].rgba[0] > runs[0].rgba[1]);
-    try std.testing.expect(runs[0].rgba[0] > runs[0].rgba[2]);
+    try std.testing.expect(runs[0].rgba[0] > 250);
+    try std.testing.expect(runs[0].rgba[1] < 5);
+    try std.testing.expect(runs[0].rgba[2] < 5);
 }
 
 test "reader decodes CalGray image xobject draw" {
@@ -18931,7 +19053,7 @@ test "reader decodes CalGray image xobject draw" {
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
         try std.fmt.allocPrint(
             alloc,
-            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace [/CalGray << /WhitePoint [1 1 1] >>] /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace [/CalGray << /WhitePoint [0.95047 1 1.08883] >>] /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
             .{ image_data.len, image_data },
         ),
     };
@@ -20335,7 +20457,7 @@ test "default device color spaces preserve native calibrated transforms" {
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 6 3] /Resources << /ColorSpace << /DefaultGray [/CalGray << /WhitePoint [0.95047 1 1.08883] /Gamma 2 >>] /DefaultRGB [/CalRGB << /WhitePoint [0.95047 1 1.08883] /Gamma [2 2 2] >>] >> >> /Contents 4 0 R >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 6 3] /Resources << /ColorSpace << /DefaultGray [/CalGray << /WhitePoint [0.95047 1 1.08883] /Gamma 2 >>] /DefaultRGB [/CalRGB << /WhitePoint [0.95047 1 1.08883] /Gamma [2 2 2] /Matrix [0.4124564 0.2126729 0.0193339 0.3575761 0.7151522 0.1191920 0.1804375 0.0721750 0.9503041] >>] >> >> /Contents 4 0 R >>\nendobj\n",
         content_object,
     };
     const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
@@ -20356,7 +20478,7 @@ test "default device color spaces preserve native calibrated transforms" {
     try std.testing.expect(runs[0].color[0] != grayColor(0.5)[0]);
 }
 
-test "declared unsupported default device color space fails closed" {
+test "declared unsupported default device color space preserves device fallback" {
     const alloc = std.testing.allocator;
     const content = "0.5 g 0 0 3 3 re f\n";
     const content_object = try std.fmt.allocPrint(
@@ -20368,15 +20490,22 @@ test "declared unsupported default device color space fails closed" {
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /ColorSpace << /DefaultGray [/Indexed /DeviceRGB 1 <000000ffffff>] >> >> /Contents 4 0 R >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /ColorSpace << /DefaultGray [/Separation /Spot /DeviceGray 5 0 R] >> >> /Contents 4 0 R >>\nendobj\n",
         content_object,
+        "5 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>\nendobj\n",
     };
     const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
     defer alloc.free(sample);
 
     var reader = try Reader.init(alloc, sample);
     defer reader.deinit();
-    try std.testing.expectError(error.UnsupportedPdfRendering, reader.extractPageShapeRunsAlloc(1));
+    const runs = try reader.extractPageShapeRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(grayColor(0.5), runs[0].color);
 }
 
 test "ICCBased graphics state honors range for initial and explicit colors" {
