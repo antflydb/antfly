@@ -15,6 +15,9 @@ comptime {
     _ = @import("backend_types.zig");
     _ = @import("background_runtime.zig");
     _ = @import("backup_codec.zig");
+    _ = @import("backup_bundle.zig");
+    _ = @import("backup_bundle_io.zig");
+    _ = @import("backup_repository.zig");
     _ = @import("coverage_identity.zig");
     _ = @import("db/aggregations.zig");
     _ = @import("db/algebraic/adaptive.zig");

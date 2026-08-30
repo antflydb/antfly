@@ -24,6 +24,19 @@ Storage engines:
 | `local` | Directory-based local shard and metadata storage. |
 | `object` | Object-store-backed durable data. |
 
+Backup representation is orthogonal to these engines. The canonical remote
+repository is `refs/` plus immutable `manifests/<sha256>` and
+`blobs/sha256/<sha256>` objects. A manifest names either a portable logical or
+native physical representation and always carries the complete materialized
+inventory for its snapshot. Parent links make incremental capture, accounting,
+and reachability GC efficient; restore does not replay a parent chain.
+
+`.afb` is the Antfly Backup Bundle transport envelope. AFB1 remains readable as
+the v0.2.0 portable stream. AFB2 identifies native versus portable and full
+versus delta in its manifest, stores digest-addressed blobs, and ends with a
+digest-to-offset index. A self-contained native AFB2 is therefore a transport
+for an already validated native generation, not a new storage engine.
+
 This gives the product names precise meanings:
 
 - **Antfly Lite** is the single-file engine and `.aflite` format.

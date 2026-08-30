@@ -16,6 +16,8 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const backup_codec = @import("../backup_codec.zig");
+const backup_bundle = @import("../backup_bundle.zig");
+const backup_bundle_io = @import("../backup_bundle_io.zig");
 const backups_api = @import("../../api/backups.zig");
 const connection = @import("connection.zig");
 const db_mod = @import("../db/db.zig");
@@ -125,11 +127,19 @@ pub fn stageInputRestoreBackup(
     backup_id: []const u8,
     location_uri: []const u8,
 ) !StagedRestore {
+    var owned_backup_id: ?[]u8 = null;
+    defer if (owned_backup_id) |value| allocator.free(value);
+    const resolved_backup_id = if (backup_id.len > 0)
+        backup_id
+    else blk: {
+        owned_backup_id = try defaultBackupIdAlloc(allocator, input_path);
+        break :blk owned_backup_id.?;
+    };
     if (std.mem.endsWith(u8, input_path, ".aflite")) {
-        return try stageAfliteRestoreBackup(allocator, input_path, table_name, backup_id, location_uri);
+        return try stageAfliteRestoreBackup(allocator, input_path, table_name, resolved_backup_id, location_uri);
     }
     if (std.mem.endsWith(u8, input_path, ".afb")) {
-        return try stageAfbRestoreBackup(allocator, input_path, table_name, backup_id, location_uri);
+        return try stageAfbRestoreBackup(allocator, input_path, table_name, backup_id, resolved_backup_id, location_uri);
     }
     return error.InvalidArguments;
 }
@@ -173,10 +183,52 @@ pub fn stageAfbRestoreBackup(
     allocator: Allocator,
     path: []const u8,
     table_name: []const u8,
-    backup_id: []const u8,
+    requested_backup_id: []const u8,
+    portable_backup_id: []const u8,
     location_uri: []const u8,
 ) !StagedRestore {
     if (!std.mem.endsWith(u8, path, ".afb")) return error.InvalidArguments;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var source = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer source.close(io);
+    const source_stat = try source.stat(io);
+    var framing = backup_codec.FileReader.init(io, source, source_stat.size);
+    const header = try framing.readHeader();
+    if (header.format_version != backup_codec.legacy_format_version and
+        header.format_version != backup_codec.format_version)
+        return error.BackupArtifactFormatMismatch;
+    if (header.format_version == backup_codec.legacy_format_version)
+        return try stagePortableAfbRestoreBackup(allocator, path, table_name, portable_backup_id, location_uri);
+    var root_manifest = try backup_bundle_io.readManifestFromFile(allocator, io, source, source_stat.size);
+    defer root_manifest.deinit();
+    if (root_manifest.value.representation == .native) {
+        return try stageNativeAfbRestoreBackup(
+            allocator,
+            io,
+            source,
+            source_stat.size,
+            table_name,
+            requested_backup_id,
+            location_uri,
+            root_manifest.value,
+        );
+    }
+
+    return try stagePortableAfbRestoreBackup(allocator, path, table_name, portable_backup_id, location_uri);
+}
+
+fn stagePortableAfbRestoreBackup(
+    allocator: Allocator,
+    path: []const u8,
+    table_name: []const u8,
+    portable_backup_id: []const u8,
+    location_uri: []const u8,
+) !StagedRestore {
     var location = try backups_api.openBackupLocation(allocator, location_uri);
     defer location.deinit(allocator);
 
@@ -184,19 +236,67 @@ pub fn stageAfbRestoreBackup(
     defer allocator.free(portable);
     try portable_backup.validatePortable(allocator, portable);
 
-    const snapshot_path = try std.fmt.allocPrint(allocator, "{s}.afb", .{backup_id});
+    const snapshot_path = try std.fmt.allocPrint(allocator, "{s}.afb", .{portable_backup_id});
     errdefer allocator.free(snapshot_path);
-    const manifest = try portableFileManifest(allocator, portable, table_name, backup_id, snapshot_path);
+    const manifest = try portableFileManifest(allocator, portable, table_name, portable_backup_id, snapshot_path);
     defer freeManifest(allocator, manifest);
 
     try backups_api.writeFileToLocation(allocator, &location, snapshot_path, portable, "application/vnd.antfly.backup");
     try backups_api.writeManifestToLocation(allocator, &location, &manifest);
 
     return .{
-        .backup_id = try allocator.dupe(u8, backup_id),
+        .backup_id = try allocator.dupe(u8, portable_backup_id),
         .location = try allocator.dupe(u8, location_uri),
         .snapshot_path = snapshot_path,
         .table_name = try allocator.dupe(u8, table_name),
+    };
+}
+
+fn stageNativeAfbRestoreBackup(
+    allocator: Allocator,
+    io: std.Io,
+    source: std.Io.File,
+    source_size: u64,
+    target_table_name: []const u8,
+    requested_backup_id: []const u8,
+    location_uri: []const u8,
+    root_manifest: backup_bundle.Manifest,
+) !StagedRestore {
+    if (root_manifest.mode != .full or root_manifest.backup_id.len == 0 or root_manifest.table_name.len == 0)
+        return error.BackupArtifactFormatMismatch;
+    if (requested_backup_id.len > 0 and !std.mem.eql(u8, requested_backup_id, root_manifest.backup_id))
+        return error.BackupIdentityMismatch;
+
+    var nonce: [16]u8 = undefined;
+    try io.randomSecure(&nonce);
+    const nonce_hex = std.fmt.bytesToHex(nonce, .lower);
+    const staging_root = try std.fmt.allocPrint(allocator, "/tmp/antfly-afb2-{s}", .{&nonce_hex});
+    defer allocator.free(staging_root);
+    defer std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
+    try backup_bundle_io.extractNativeFileToStagingDirectory(allocator, io, source, source_size, staging_root);
+
+    var manifest = try backups_api.readManifest(allocator, staging_root, root_manifest.backup_id);
+    defer manifest.deinit(allocator);
+    if (manifest.format != .native or !std.mem.eql(u8, manifest.table_name, root_manifest.table_name))
+        return error.BackupArtifactFormatMismatch;
+
+    var location = try backups_api.openBackupLocation(allocator, location_uri);
+    defer location.deinit(allocator);
+    for (manifest.shards) |shard| {
+        const canonical_path = try backups_api.shardSnapshotRelPath(allocator, manifest.backup_id, shard.group_id);
+        defer allocator.free(canonical_path);
+        if (!std.mem.eql(u8, canonical_path, shard.snapshot_path)) return error.InvalidBackupManifest;
+        const extracted_shard = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ staging_root, shard.snapshot_path });
+        defer allocator.free(extracted_shard);
+        try backups_api.copyDirectoryToLocation(allocator, &location, manifest.backup_id, shard.group_id, extracted_shard);
+    }
+    try backups_api.writeManifestToLocation(allocator, &location, &manifest);
+
+    return .{
+        .backup_id = try allocator.dupe(u8, manifest.backup_id),
+        .location = try allocator.dupe(u8, location_uri),
+        .snapshot_path = try allocator.dupe(u8, manifest.shards[0].snapshot_path),
+        .table_name = try allocator.dupe(u8, target_table_name),
     };
 }
 
@@ -238,28 +338,37 @@ fn portableManifestMetadataAlloc(allocator: Allocator, portable: []const u8) !Po
     var raw_enrichments_json: ?[]u8 = null;
     defer if (raw_enrichments_json) |value| allocator.free(value);
 
-    var reader = backup_codec.SliceReader.init(portable);
-    _ = try reader.readHeader();
-    while (reader.pos < reader.data.len) {
-        const block = try reader.readBlock(allocator);
-        defer allocator.free(block.payload);
-        if (block.block_type != .metadata_batch) continue;
+    const Visitor = struct {
+        allocator: Allocator,
+        schema_json: *[]u8,
+        raw_indexes_json: *?[]u8,
+        raw_enrichments_json: *?[]u8,
 
-        const entries = try backup_codec.decodeKeyValueBatch(allocator, block.payload);
-        defer freeKeyValueEntries(allocator, entries);
-        for (entries) |entry| {
-            if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema_json")) {
-                allocator.free(schema_json);
-                schema_json = try allocator.dupe(u8, entry.value);
-            } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:indexes")) {
-                if (raw_indexes_json) |value| allocator.free(value);
-                raw_indexes_json = try allocator.dupe(u8, entry.value);
-            } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:enrichments")) {
-                if (raw_enrichments_json) |value| allocator.free(value);
-                raw_enrichments_json = try allocator.dupe(u8, entry.value);
+        fn visit(self: *@This(), block_type: backup_codec.BlockType, payload: []const u8) !void {
+            if (block_type != .metadata_batch) return;
+            const entries = try backup_codec.decodeKeyValueBatch(self.allocator, payload);
+            defer freeKeyValueEntries(self.allocator, entries);
+            for (entries) |entry| {
+                if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema_json")) {
+                    self.allocator.free(self.schema_json.*);
+                    self.schema_json.* = try self.allocator.dupe(u8, entry.value);
+                } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:indexes")) {
+                    if (self.raw_indexes_json.*) |value| self.allocator.free(value);
+                    self.raw_indexes_json.* = try self.allocator.dupe(u8, entry.value);
+                } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:enrichments")) {
+                    if (self.raw_enrichments_json.*) |value| self.allocator.free(value);
+                    self.raw_enrichments_json.* = try self.allocator.dupe(u8, entry.value);
+                }
             }
         }
-    }
+    };
+    var visitor: Visitor = .{
+        .allocator = allocator,
+        .schema_json = &schema_json,
+        .raw_indexes_json = &raw_indexes_json,
+        .raw_enrichments_json = &raw_enrichments_json,
+    };
+    try portable_backup.visitPortableBlocks(allocator, portable, &visitor, Visitor.visit);
 
     const indexes_json = try tableIndexesJsonFromPortableMetadata(allocator, raw_indexes_json, raw_enrichments_json);
     errdefer allocator.free(indexes_json);
@@ -658,7 +767,7 @@ test "lite restore staging preserves portable afb schema index and enrichment me
         try file.sync(io);
     }
 
-    var staged = try stageAfbRestoreBackup(allocator, afb_path, "docs", "portable-metadata-test", location);
+    var staged = try stageAfbRestoreBackup(allocator, afb_path, "docs", "portable-metadata-test", "portable-metadata-test", location);
     defer staged.deinit(allocator);
 
     var backup_location = try backups_api.openBackupLocation(allocator, location);
@@ -725,11 +834,99 @@ test "lite restore staging preflights afb before publishing staged files" {
     }
 
     try std.testing.expectError(
-        error.Truncated,
-        stageAfbRestoreBackup(allocator, malformed_path, "docs", "bad-input", location),
+        error.InvalidBackupManifest,
+        stageAfbRestoreBackup(allocator, malformed_path, "docs", "bad-input", "bad-input", location),
     );
     try std.testing.expect(!fileExists(io, staged_afb_path));
     try std.testing.expect(!fileExists(io, staged_manifest_path));
+}
+
+test "lite restore staging expands a self-contained native AFB2 bundle" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const cwd_tmp = try std.Io.Dir.cwd().realPathFileAlloc(io, ".zig-cache/tmp", allocator);
+    defer allocator.free(cwd_tmp);
+    const source_root = try std.fmt.allocPrint(allocator, "{s}/{s}/native-source", .{ cwd_tmp, tmp.sub_path });
+    defer allocator.free(source_root);
+    const target_root = try std.fmt.allocPrint(allocator, "{s}/{s}/native-target", .{ cwd_tmp, tmp.sub_path });
+    defer allocator.free(target_root);
+    const target_location = try std.fmt.allocPrint(allocator, "file://{s}", .{target_root});
+    defer allocator.free(target_location);
+    const bundle_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/native-table.afb", .{tmp.sub_path});
+    defer allocator.free(bundle_path);
+    const backup_id = "native-bundle-test";
+    const snapshot_path = try backups_api.shardSnapshotRelPath(allocator, backup_id, 9);
+    defer allocator.free(snapshot_path);
+    const source_shard = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source_root, snapshot_path });
+    defer allocator.free(source_shard);
+    try @import("../../common/fs_paths.zig").createDirPathPortable(io, source_shard);
+    const payload_path = try std.fmt.allocPrint(allocator, "{s}/primary.bin", .{source_shard});
+    defer allocator.free(payload_path);
+    {
+        var payload = try std.Io.Dir.createFileAbsolute(io, payload_path, .{ .exclusive = true });
+        defer payload.close(io);
+        try payload.writePositionalAll(io, "native-generation-payload", 0);
+        try payload.sync(io);
+    }
+
+    var shard = backups_api.ShardSnapshot{
+        .group_id = 9,
+        .start_key = "",
+        .snapshot_path = snapshot_path,
+    };
+    try backups_api.populateShardArtifactIntegrity(allocator, io, .native, source_shard, &shard);
+    defer allocator.free(@constCast(shard.artifact_sha256));
+    const source_manifest = backups_api.TableBackupManifest{
+        .format = .native,
+        .backup_id = backup_id,
+        .table_name = "source_docs",
+        .description = "native bundle restore test",
+        .schema_json = "{}",
+        .read_schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .shards = &.{shard},
+    };
+    try backups_api.writeManifest(allocator, source_root, &source_manifest);
+
+    const metadata_path = try std.fmt.allocPrint(allocator, "{s}-metadata.json", .{backup_id});
+    defer allocator.free(metadata_path);
+    {
+        var output = try std.Io.Dir.cwd().createFile(io, bundle_path, .{ .exclusive = true });
+        defer output.close(io);
+        var buffer: [64 * 1024]u8 = undefined;
+        var writer = output.writer(io, &buffer);
+        try backup_bundle_io.packNativePathsToWriter(
+            allocator,
+            io,
+            source_root,
+            &.{ metadata_path, snapshot_path },
+            &writer.interface,
+            .{ .backup_id = backup_id, .table_name = "source_docs" },
+        );
+        try writer.end();
+        try output.sync(io);
+    }
+
+    var staged = try stageAfbRestoreBackup(allocator, bundle_path, "restored_docs", "", "ignored-portable-id", target_location);
+    defer staged.deinit(allocator);
+    try std.testing.expectEqualStrings(backup_id, staged.backup_id);
+    try std.testing.expectEqualStrings("restored_docs", staged.table_name);
+
+    var target = try backups_api.readManifest(allocator, target_root, backup_id);
+    defer target.deinit(allocator);
+    try std.testing.expectEqual(backups_api.BackupFormat.native, target.format);
+    try std.testing.expectEqualStrings("source_docs", target.table_name);
+    const restored_payload = try std.fmt.allocPrint(allocator, "{s}/{s}/primary.bin", .{ target_root, snapshot_path });
+    defer allocator.free(restored_payload);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, restored_payload, allocator, .limited(128));
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("native-generation-payload", bytes);
 }
 
 test "lite restore staging accepts aflite input for normal restore" {

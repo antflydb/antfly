@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 
 const backup_codec = @import("backup_codec.zig");
+const backup_bundle = @import("backup_bundle.zig");
 const internal_keys = @import("internal_keys.zig");
 const docstore_mod = @import("docstore.zig");
 const doc_identity = @import("db/doc_identity.zig");
@@ -46,18 +47,100 @@ const ResolutionArtifactRef = struct {
 // Export
 // ============================================================================
 
+const PortableObject = struct {
+    block_type: backup_codec.BlockType,
+    size_bytes: u64,
+    sha256: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    path_buffer: [48]u8,
+    path_len: u8,
+
+    fn logicalPath(self: *const @This()) []const u8 {
+        return self.path_buffer[0..self.path_len];
+    }
+};
+
+const PortableOutputMode = union(enum) {
+    inventory: *std.ArrayListUnmanaged(PortableObject),
+    bundle: struct {
+        expected: []const PortableObject,
+        next_ordinal: *usize,
+        footer: *std.ArrayListUnmanaged(backup_bundle.FooterIndexEntry),
+    },
+};
+
 const PortableOutput = struct {
-    writer: *std.Io.Writer,
+    alloc: Allocator,
+    writer: ?*std.Io.Writer = null,
+    mode: PortableOutputMode,
     bytes_written: u64 = 0,
+    bundle_offset: u64 = 0,
 
     fn writeHeader(self: *PortableOutput, header: backup_codec.FileHeader) !void {
-        try backup_codec.writeHeaderTo(self.writer, header);
+        _ = header;
+        // AFB2 owns the physical file header. Keep the logical AFB1 header in
+        // the byte count so portable file-footer accounting remains stable
+        // across the inventory and emission passes.
         self.bytes_written += backup_codec.header_size;
     }
 
     fn writeBlock(self: *PortableOutput, block_type: backup_codec.BlockType, payload: []const u8) !void {
-        try backup_codec.writeBlockTo(self.writer, block_type, payload);
         self.bytes_written += backup_codec.block_envelope_overhead + payload.len;
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+        switch (self.mode) {
+            .inventory => |objects| {
+                if (objects.items.len >= backup_bundle.max_objects) return error.BackupManifestTooLarge;
+                var object: PortableObject = .{
+                    .block_type = block_type,
+                    .size_bytes = payload.len,
+                    .sha256 = digest,
+                    .path_buffer = undefined,
+                    .path_len = 0,
+                };
+                const path = try std.fmt.bufPrint(&object.path_buffer, "portable/{d:0>8}.block", .{objects.items.len});
+                object.path_len = @intCast(path.len);
+                try objects.append(self.alloc, object);
+            },
+            .bundle => |state| {
+                if (state.next_ordinal.* >= state.expected.len) return error.NonDeterministicBackupCapture;
+                const ordinal = state.next_ordinal.*;
+                const expected = state.expected[ordinal];
+                if (expected.block_type != block_type or expected.size_bytes != payload.len or
+                    !std.crypto.timing_safe.eql(@TypeOf(digest), expected.sha256, digest))
+                    return error.NonDeterministicBackupCapture;
+                const sink = self.writer orelse return error.InvalidBackupWriter;
+                try state.footer.append(self.alloc, .{
+                    .sha256 = digest,
+                    .header_offset = self.bundle_offset,
+                    .stored_size_bytes = payload.len,
+                });
+                const header_payload = try backup_bundle.encodeBlobHeaderAlloc(self.alloc, .{
+                    .ordinal = @intCast(ordinal),
+                    .logical_path = expected.logicalPath(),
+                    .role = @tagName(block_type),
+                    .logical_size_bytes = payload.len,
+                    .stored_size_bytes = payload.len,
+                    .sha256 = digest,
+                });
+                defer self.alloc.free(header_payload);
+                try backup_codec.writeBlockTo(sink, .blob_header, header_payload);
+                self.bundle_offset += backup_codec.block_envelope_overhead + header_payload.len;
+                var offset: usize = 0;
+                while (offset < payload.len) {
+                    const end = @min(payload.len, offset + backup_bundle.native_chunk_target_bytes);
+                    const chunk_payload = try backup_bundle.encodeBlobChunkAlloc(self.alloc, .{
+                        .ordinal = @intCast(ordinal),
+                        .offset = offset,
+                        .bytes = payload[offset..end],
+                    });
+                    defer self.alloc.free(chunk_payload);
+                    try backup_codec.writeBlockTo(sink, .blob_chunk, chunk_payload);
+                    self.bundle_offset += backup_codec.block_envelope_overhead + chunk_payload.len;
+                    offset = end;
+                }
+                state.next_ordinal.* += 1;
+            },
+        }
     }
 };
 
@@ -71,14 +154,70 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
 }
 
 pub fn exportPortableToWriter(alloc: Allocator, store: *DocStore, sink_writer: *std.Io.Writer) !void {
-    var out: PortableOutput = .{ .writer = sink_writer };
     var scan = try store.beginReadTxn();
     defer scan.abort();
 
-    // Write file header
+    var objects = std.ArrayListUnmanaged(PortableObject).empty;
+    defer objects.deinit(alloc);
+    var inventory_out: PortableOutput = .{ .alloc = alloc, .mode = .{ .inventory = &objects } };
+    try exportPortableSnapshot(alloc, &scan, &inventory_out);
+
+    const descriptors = try alloc.alloc(backup_bundle.ObjectDescriptor, objects.items.len);
+    defer alloc.free(descriptors);
+    var digest_strings = try alloc.alloc([std.crypto.hash.sha2.Sha256.digest_length * 2]u8, objects.items.len);
+    defer alloc.free(digest_strings);
+    for (objects.items, 0..) |*object, index| {
+        digest_strings[index] = std.fmt.bytesToHex(object.sha256, .lower);
+        descriptors[index] = .{
+            .logical_path = object.logicalPath(),
+            .role = @tagName(object.block_type),
+            .size_bytes = object.size_bytes,
+            .sha256 = &digest_strings[index],
+        };
+    }
+    const manifest = try backup_bundle.encodeManifestAlloc(alloc, .{
+        .representation = .portable,
+        .mode = .full,
+        .compatibility = .{ .storage_engine = "logical" },
+        .objects = descriptors,
+    });
+    defer alloc.free(manifest);
+
+    const backup_id = [_]u8{0} ** 16;
+    try backup_codec.writeHeaderTo(sink_writer, .{
+        .format_version = backup_codec.format_version,
+        .flags = 0,
+        .created_at_ns = 0,
+        .backup_id = backup_id,
+        .table_count = 1,
+        .shard_count = 1,
+    });
+    try backup_codec.writeBlockTo(sink_writer, .bundle_manifest, manifest);
+
+    var footer = std.ArrayListUnmanaged(backup_bundle.FooterIndexEntry).empty;
+    defer footer.deinit(alloc);
+    var next_ordinal: usize = 0;
+    var bundle_out: PortableOutput = .{
+        .alloc = alloc,
+        .writer = sink_writer,
+        .mode = .{ .bundle = .{
+            .expected = objects.items,
+            .next_ordinal = &next_ordinal,
+            .footer = &footer,
+        } },
+        .bundle_offset = backup_codec.header_size + backup_codec.block_envelope_overhead + manifest.len,
+    };
+    try exportPortableSnapshot(alloc, &scan, &bundle_out);
+    if (next_ordinal != objects.items.len) return error.NonDeterministicBackupCapture;
+    const footer_payload = try backup_bundle.encodeFooterIndexAlloc(alloc, footer.items);
+    defer alloc.free(footer_payload);
+    try backup_codec.writeBlockTo(sink_writer, .footer_index, footer_payload);
+}
+
+fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutput) !void {
     const backup_id = [_]u8{0} ** 16; // zero UUID for now
     try out.writeHeader(.{
-        .format_version = backup_codec.format_version,
+        .format_version = backup_codec.legacy_format_version,
         .flags = 0,
         .created_at_ns = 0, // timestamp filled by caller if needed
         .backup_id = backup_id,
@@ -180,7 +319,7 @@ pub fn exportPortableToWriter(alloc: Allocator, store: *DocStore, sink_writer: *
             });
             metadata_batch_bytes += kv.key.len + kv.value.len;
             if (metadata_batch_bytes >= batch_target_bytes) {
-                try flushMetadataBatch(alloc, &out, &metadata_batch);
+                try flushMetadataBatch(alloc, out, &metadata_batch);
                 metadata_batch_bytes = 0;
             }
             continue;
@@ -193,7 +332,7 @@ pub fn exportPortableToWriter(alloc: Allocator, store: *DocStore, sink_writer: *
             });
             identity_batch_bytes += kv.key.len + kv.value.len;
             if (identity_batch_bytes >= batch_target_bytes) {
-                try flushIdentityBatch(alloc, &out, &identity_batch);
+                try flushIdentityBatch(alloc, out, &identity_batch);
                 identity_batch_bytes = 0;
             }
             continue;
@@ -231,14 +370,14 @@ pub fn exportPortableToWriter(alloc: Allocator, store: *DocStore, sink_writer: *
                 doc_batch_bytes += user_key.len + owned_value.len;
 
                 if (doc_batch_bytes >= batch_target_bytes) {
-                    try flushDocBatch(alloc, &out, &doc_batch, &counts);
+                    try flushDocBatch(alloc, out, &doc_batch, &counts);
                     doc_batch_bytes = 0;
                 }
             } else if (internal_keys.isChunkArtifactRecordKey(kv.key)) {
                 try appendChunkArtifactEntry(alloc, &chunk_batch, kv.key, kv.value);
                 chunk_batch_bytes += kv.key.len + kv.value.len;
                 if (chunk_batch_bytes >= batch_target_bytes) {
-                    try flushChunkBatch(alloc, &out, &chunk_batch);
+                    try flushChunkBatch(alloc, out, &chunk_batch);
                     chunk_batch_bytes = 0;
                 }
             } else if (internal_keys.isEmbeddingArtifactKey(kv.key)) {
@@ -254,18 +393,18 @@ pub fn exportPortableToWriter(alloc: Allocator, store: *DocStore, sink_writer: *
             } else if (try appendResolutionArtifactEntry(alloc, &resolution_batch, kv.key, kv.value)) {
                 resolution_batch_bytes += kv.key.len + kv.value.len;
                 if (resolution_batch_bytes >= batch_target_bytes) {
-                    try flushKeyValueBlock(alloc, &out, &resolution_batch, .resolution_batch);
+                    try flushKeyValueBlock(alloc, out, &resolution_batch, .resolution_batch);
                     resolution_batch_bytes = 0;
                 }
             } else if (try appendPortableArtifactEntry(alloc, &artifact_batch, kv.key, kv.value, .asset)) {
                 artifact_batch_bytes += kv.key.len + kv.value.len;
                 if (artifact_batch_bytes >= batch_target_bytes) {
-                    try flushKeyValueBlock(alloc, &out, &artifact_batch, .artifact_batch);
+                    try flushKeyValueBlock(alloc, out, &artifact_batch, .artifact_batch);
                     artifact_batch_bytes = 0;
                 }
             }
             if (derived_batch_bytes >= batch_target_bytes) {
-                try flushDerivedBatches(alloc, &out, &emb_batches, &sparse_batches, &edge_batches, &counts);
+                try flushDerivedBatches(alloc, out, &emb_batches, &sparse_batches, &edge_batches, &counts);
                 derived_batch_bytes = 0;
             }
             // Skip: TTL, summary, and derived embedding keys
@@ -280,7 +419,7 @@ pub fn exportPortableToWriter(alloc: Allocator, store: *DocStore, sink_writer: *
                 try appendEdgeBatchEntry(alloc, &edge_batches, parsed.index_name, parsed.source, parsed.target, parsed.edge_type, kv.value);
                 derived_batch_bytes += kv.key.len + kv.value.len;
                 if (derived_batch_bytes >= batch_target_bytes) {
-                    try flushDerivedBatches(alloc, &out, &emb_batches, &sparse_batches, &edge_batches, &counts);
+                    try flushDerivedBatches(alloc, out, &emb_batches, &sparse_batches, &edge_batches, &counts);
                     derived_batch_bytes = 0;
                 }
             }
@@ -291,25 +430,25 @@ pub fn exportPortableToWriter(alloc: Allocator, store: *DocStore, sink_writer: *
 
     // Flush remaining documents
     if (doc_batch.items.len > 0) {
-        try flushDocBatch(alloc, &out, &doc_batch, &counts);
+        try flushDocBatch(alloc, out, &doc_batch, &counts);
     }
     if (identity_batch.items.len > 0) {
-        try flushIdentityBatch(alloc, &out, &identity_batch);
+        try flushIdentityBatch(alloc, out, &identity_batch);
     }
     if (metadata_batch.items.len > 0) {
-        try flushMetadataBatch(alloc, &out, &metadata_batch);
+        try flushMetadataBatch(alloc, out, &metadata_batch);
     }
     if (chunk_batch.items.len > 0) {
-        try flushChunkBatch(alloc, &out, &chunk_batch);
+        try flushChunkBatch(alloc, out, &chunk_batch);
     }
     if (artifact_batch.items.len > 0) {
-        try flushKeyValueBlock(alloc, &out, &artifact_batch, .artifact_batch);
+        try flushKeyValueBlock(alloc, out, &artifact_batch, .artifact_batch);
     }
     if (resolution_batch.items.len > 0) {
-        try flushKeyValueBlock(alloc, &out, &resolution_batch, .resolution_batch);
+        try flushKeyValueBlock(alloc, out, &resolution_batch, .resolution_batch);
     }
 
-    try flushDerivedBatches(alloc, &out, &emb_batches, &sparse_batches, &edge_batches, &counts);
+    try flushDerivedBatches(alloc, out, &emb_batches, &sparse_batches, &edge_batches, &counts);
 
     // Shard footer
     const shard_footer = backup_codec.encodeShardFooter(.{
@@ -864,6 +1003,136 @@ fn appendEdgeBatchEntry(
 // Import
 // ============================================================================
 
+/// Presents both the released AFB1 typed stream and an AFB2 portable object
+/// bundle as the same logical sequence of portable blocks. AFB2 is verified
+/// object-by-object, so file restore retains the one-block memory bound.
+fn PortableArchiveReader(comptime RawReader: type) type {
+    return struct {
+        const Self = @This();
+
+        raw: *RawReader,
+        header: backup_codec.FileHeader,
+        manifest: ?backup_bundle.ParsedManifest = null,
+        manifest_pending: bool,
+        next_ordinal: u32 = 0,
+        done: bool = false,
+        observed_footer: std.ArrayListUnmanaged(backup_bundle.FooterIndexEntry) = .empty,
+
+        fn init(raw: *RawReader) !Self {
+            const header = try raw.readHeader();
+            return .{
+                .raw = raw,
+                .header = header,
+                .manifest_pending = header.format_version == backup_codec.format_version,
+            };
+        }
+
+        fn deinit(self: *Self, alloc: Allocator) void {
+            if (self.manifest) |*manifest| manifest.deinit();
+            self.observed_footer.deinit(alloc);
+            self.* = undefined;
+        }
+
+        pub fn readHeader(self: *Self) !backup_codec.FileHeader {
+            return self.header;
+        }
+
+        pub fn hasRemaining(self: *const Self) bool {
+            return if (self.header.format_version == backup_codec.legacy_format_version)
+                self.raw.hasRemaining()
+            else
+                !self.done;
+        }
+
+        pub fn readBlock(self: *Self, alloc: Allocator) !backup_codec.Block {
+            if (self.header.format_version == backup_codec.legacy_format_version)
+                return try self.raw.readBlock(alloc);
+            if (self.done) return error.EndOfStream;
+
+            if (self.manifest_pending) {
+                const manifest_block = try self.raw.readBlock(alloc);
+                errdefer alloc.free(manifest_block.payload);
+                if (manifest_block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
+                var manifest = try backup_bundle.parseManifest(alloc, manifest_block.payload);
+                errdefer manifest.deinit();
+                if (manifest.value.representation != .portable or manifest.value.mode != .full or
+                    manifest.value.objects.len == 0)
+                    return error.BackupArtifactFormatMismatch;
+                self.manifest = manifest;
+                self.manifest_pending = false;
+                return manifest_block;
+            }
+
+            const manifest = &(self.manifest orelse return error.InvalidBackupManifest).value;
+            if (self.next_ordinal >= manifest.objects.len) return error.IncompleteBackupInventory;
+            const header_offset = self.raw.pos;
+            const raw_header = try self.raw.readBlock(alloc);
+            defer alloc.free(raw_header.payload);
+            if (raw_header.block_type != .blob_header) return error.InvalidBackupManifest;
+            var blob_header = try backup_bundle.decodeBlobHeader(alloc, raw_header.payload);
+            defer blob_header.deinit(alloc);
+            if (blob_header.ordinal != self.next_ordinal or blob_header.compression != .none or
+                blob_header.logical_size_bytes != blob_header.stored_size_bytes or
+                blob_header.stored_size_bytes > backup_codec.max_block_payload_bytes)
+                return error.InvalidBackupManifest;
+
+            const descriptor = manifest.objects[self.next_ordinal];
+            const digest_hex = std.fmt.bytesToHex(blob_header.sha256, .lower);
+            if (!std.mem.eql(u8, descriptor.logical_path, blob_header.logical_path) or
+                !std.mem.eql(u8, descriptor.role, blob_header.role) or
+                descriptor.size_bytes != blob_header.logical_size_bytes or
+                !std.mem.eql(u8, descriptor.sha256, &digest_hex))
+                return error.BackupArtifactIntegrityMismatch;
+            const block_type = std.meta.stringToEnum(backup_codec.BlockType, blob_header.role) orelse
+                return error.InvalidBackupManifest;
+            switch (block_type) {
+                .bundle_manifest, .blob_header, .blob_chunk, .footer_index => return error.InvalidBackupManifest,
+                else => {},
+            }
+
+            const payload = try alloc.alloc(u8, @intCast(blob_header.stored_size_bytes));
+            errdefer alloc.free(payload);
+            var written: usize = 0;
+            while (written < payload.len) {
+                const raw_chunk = try self.raw.readBlock(alloc);
+                defer alloc.free(raw_chunk.payload);
+                if (raw_chunk.block_type != .blob_chunk) return error.InvalidBackupManifest;
+                const chunk = try backup_bundle.decodeBlobChunk(raw_chunk.payload);
+                if (chunk.ordinal != self.next_ordinal or chunk.offset != written or
+                    chunk.bytes.len > payload.len - written)
+                    return error.InvalidNativeFileChunk;
+                @memcpy(payload[written..][0..chunk.bytes.len], chunk.bytes);
+                written += chunk.bytes.len;
+            }
+            var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(payload, &actual, .{});
+            if (!std.crypto.timing_safe.eql(@TypeOf(actual), actual, blob_header.sha256))
+                return error.BackupArtifactIntegrityMismatch;
+            try self.observed_footer.append(alloc, .{
+                .sha256 = actual,
+                .header_offset = header_offset,
+                .stored_size_bytes = payload.len,
+            });
+            self.next_ordinal += 1;
+
+            if (self.next_ordinal == manifest.objects.len) {
+                const raw_footer = try self.raw.readBlock(alloc);
+                defer alloc.free(raw_footer.payload);
+                if (raw_footer.block_type != .footer_index) return error.InvalidBundleFooter;
+                const footer = try backup_bundle.decodeFooterIndexAlloc(alloc, raw_footer.payload);
+                defer alloc.free(footer);
+                if (footer.len != self.observed_footer.items.len) return error.InvalidBundleFooter;
+                for (footer, self.observed_footer.items) |declared, observed| {
+                    if (!std.meta.eql(declared, observed)) return error.InvalidBundleFooter;
+                }
+                if (self.raw.hasRemaining()) return error.InvalidBundleFooter;
+                self.done = true;
+            }
+            return .{ .block_type = block_type, .payload = payload };
+        }
+    };
+}
+
 pub const ImportOptions = struct {
     pub const EmbeddingSourceField = struct {
         index_name: []const u8,
@@ -885,16 +1154,43 @@ pub fn validatePortable(alloc: Allocator, data: []const u8) !void {
     try validatePortableImportBlocks(alloc, data, .{});
 }
 
+/// Visits the verified logical portable blocks of either AFB1 or AFB2. This is
+/// the single framing boundary for metadata inspection, import, and tooling;
+/// callers never need to know whether records were direct AFB1 blocks or AFB2
+/// digest-addressed objects.
+pub fn visitPortableBlocks(
+    alloc: Allocator,
+    data: []const u8,
+    context: anytype,
+    comptime visit: fn (@TypeOf(context), backup_codec.BlockType, []const u8) anyerror!void,
+) !void {
+    var raw = backup_codec.SliceReader.init(data);
+    var reader = try PortableArchiveReader(backup_codec.SliceReader).init(&raw);
+    defer reader.deinit(alloc);
+    _ = try reader.readHeader();
+    while (reader.hasRemaining()) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        try visit(context, block.block_type, block.payload);
+    }
+}
+
 pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []const u8, opts: ImportOptions) !void {
-    var validation_reader = backup_codec.SliceReader.init(data);
+    var validation_raw = backup_codec.SliceReader.init(data);
+    var validation_reader = try PortableArchiveReader(backup_codec.SliceReader).init(&validation_raw);
+    defer validation_reader.deinit(alloc);
     try validatePortableImportReader(alloc, &validation_reader, opts);
 
-    var reader = backup_codec.SliceReader.init(data);
+    var raw = backup_codec.SliceReader.init(data);
+    var reader = try PortableArchiveReader(backup_codec.SliceReader).init(&raw);
+    defer reader.deinit(alloc);
     const imported_identity = try importPortablePrimaryBlocks(alloc, store, &reader);
 
     try finishPortableIdentityImport(alloc, store, opts, imported_identity);
     if (opts.import_derived_indexes) {
-        var derived_reader = backup_codec.SliceReader.init(data);
+        var derived_raw = backup_codec.SliceReader.init(data);
+        var derived_reader = try PortableArchiveReader(backup_codec.SliceReader).init(&derived_raw);
+        defer derived_reader.deinit(alloc);
         try importPortableDerivedBlocks(alloc, store, &derived_reader, opts);
     }
 }
@@ -918,14 +1214,20 @@ pub fn importPortableFileWithOptions(
     const initial_stat = try file.stat(io);
     if (initial_stat.size != file_size) return error.SourceFileChanged;
 
-    var validation_reader = backup_codec.FileReader.init(io, file, file_size);
+    var validation_raw = backup_codec.FileReader.init(io, file, file_size);
+    var validation_reader = try PortableArchiveReader(backup_codec.FileReader).init(&validation_raw);
+    defer validation_reader.deinit(alloc);
     try validatePortableImportReader(alloc, &validation_reader, opts);
 
-    var reader = backup_codec.FileReader.init(io, file, file_size);
+    var raw = backup_codec.FileReader.init(io, file, file_size);
+    var reader = try PortableArchiveReader(backup_codec.FileReader).init(&raw);
+    defer reader.deinit(alloc);
     const imported_identity = try importPortablePrimaryBlocks(alloc, store, &reader);
     try finishPortableIdentityImport(alloc, store, opts, imported_identity);
     if (opts.import_derived_indexes) {
-        var derived_reader = backup_codec.FileReader.init(io, file, file_size);
+        var derived_raw = backup_codec.FileReader.init(io, file, file_size);
+        var derived_reader = try PortableArchiveReader(backup_codec.FileReader).init(&derived_raw);
+        defer derived_reader.deinit(alloc);
         try importPortableDerivedBlocks(alloc, store, &derived_reader, opts);
     }
     const final_stat = try file.stat(io);
@@ -986,17 +1288,33 @@ fn importPortableDerivedBlocks(alloc: Allocator, store: *DocStore, reader: anyty
 }
 
 fn validatePortableImportBlocks(alloc: Allocator, data: []const u8, opts: ImportOptions) !void {
-    var reader = backup_codec.SliceReader.init(data);
+    var raw = backup_codec.SliceReader.init(data);
+    var reader = try PortableArchiveReader(backup_codec.SliceReader).init(&raw);
+    defer reader.deinit(alloc);
     return try validatePortableImportReader(alloc, &reader, opts);
 }
 
 fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportOptions) !void {
-    _ = try reader.readHeader();
+    const header = try reader.readHeader();
+    var block_index: usize = 0;
+    var saw_bundle_manifest = false;
     while (reader.hasRemaining()) {
         const block = try reader.readBlock(alloc);
         defer alloc.free(block.payload);
+        if (header.format_version == backup_codec.format_version and block_index == 0 and
+            block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
+        if (block.block_type == .bundle_manifest) {
+            if (saw_bundle_manifest or block_index != 0) return error.InvalidBackupManifest;
+            var manifest = try backup_bundle.parseManifest(alloc, block.payload);
+            defer manifest.deinit();
+            if (manifest.value.representation != .portable) return error.BackupArtifactFormatMismatch;
+            saw_bundle_manifest = true;
+        }
         try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts);
+        block_index += 1;
     }
+    if (header.format_version == backup_codec.format_version and !saw_bundle_manifest)
+        return error.InvalidBackupManifest;
 }
 
 fn validatePortableImportBlockPayload(alloc: Allocator, block_type: backup_codec.BlockType, payload: []const u8, opts: ImportOptions) !void {
@@ -1018,7 +1336,7 @@ fn validatePortableImportBlockPayload(alloc: Allocator, block_type: backup_codec
         },
         .shard_footer => _ = try backup_codec.decodeShardFooter(payload),
         .file_footer => _ = try backup_codec.decodeFileFooter(payload),
-        .cluster_manifest, .table_manifest, .summary_batch, .transaction_batch => {},
+        .bundle_manifest, .cluster_manifest, .table_manifest, .summary_batch, .transaction_batch => {},
         else => {},
     }
 }
@@ -1834,7 +2152,7 @@ test "file import rejects oversized portable blocks before allocation" {
     var encoded: ArrayList(u8) = .empty;
     defer encoded.deinit(alloc);
     try backup_codec.writeHeader(&encoded, alloc, .{
-        .format_version = backup_codec.format_version,
+        .format_version = backup_codec.legacy_format_version,
         .flags = 0,
         .created_at_ns = 0,
         .backup_id = @splat(0),
@@ -1902,7 +2220,7 @@ test "import preflights logical block payloads before mutating destination" {
     var portable: ArrayList(u8) = .empty;
     defer portable.deinit(alloc);
     try backup_codec.writeHeader(&portable, alloc, .{
-        .format_version = backup_codec.format_version,
+        .format_version = backup_codec.legacy_format_version,
         .flags = 0,
         .created_at_ns = 0,
         .backup_id = [_]u8{0} ** 16,

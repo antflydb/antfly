@@ -20,6 +20,9 @@ const platform_time = antfly.platform_time;
 
 const lite_restore_staging = @import("../../standalone/restore_staging_bridge.zig");
 const portable_backup = antfly.portable_backup;
+const backup_bundle_io = antfly.backup_bundle_io;
+const backups_api = antfly.public_api.backups;
+const fs_paths = antfly.common.fs_paths;
 
 const default_restore_wait_timeout_ms: u64 = 30 * 60 * 1000;
 const restore_poll_interval_ms: u64 = 1000;
@@ -69,6 +72,7 @@ const BackupArgs = struct {
     format: ?[]const u8 = null,
     url: ?[]const u8 = null,
     output: ?[]const u8 = null,
+    bundle_out: ?[]const u8 = null,
     connection: ?[]const u8 = null,
     location_explicit: bool = false,
     list_backups: bool = false,
@@ -151,6 +155,8 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
         }
         const bid = opts.backup_id orelse cli.fatal("--backup-id is required", .{});
         try client.backupTable(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection, .format = selected_format });
+        if (opts.bundle_out) |output_path|
+            try writeBundleFromLocalBackup(allocator, io, opts.location, bid, tbl, output_path);
         std.debug.print("Backup command successful.\n", .{});
         return;
     }
@@ -197,6 +203,105 @@ fn validateClusterBackupResult(status: []const u8, tables: []const antfly_client
     const expected = if (completed == 0) "failed" else if (incomplete > 0) "partial" else "completed";
     if (!std.mem.eql(u8, status, expected)) return error.InvalidBackupResponse;
     if (!std.mem.eql(u8, expected, "completed")) return error.ClusterBackupIncomplete;
+}
+
+fn writeBundleFromLocalBackup(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    location_uri: []const u8,
+    backup_id: []const u8,
+    table_name: []const u8,
+    output_path: []const u8,
+) !void {
+    const backup_root = try backups_api.parseFileLocation(location_uri);
+    var manifest = try backups_api.readManifest(allocator, backup_root, backup_id);
+    defer manifest.deinit(allocator);
+    if (!std.mem.eql(u8, manifest.table_name, table_name))
+        return error.BackupArtifactFormatMismatch;
+
+    if (manifest.format == .portable) {
+        if (manifest.shards.len != 1) return error.UnsupportedMultiRangeTable;
+        const source_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ backup_root, manifest.shards[0].snapshot_path });
+        defer allocator.free(source_path);
+        try backups_api.verifyShardArtifactIntegrity(allocator, io, .portable, source_path, &manifest.shards[0]);
+        try publishCopiedBundleFile(allocator, io, source_path, output_path);
+        return;
+    }
+
+    var selected = std.ArrayListUnmanaged([]const u8).empty;
+    defer selected.deinit(allocator);
+    const metadata_path = try std.fmt.allocPrint(allocator, "{s}-metadata.json", .{backup_id});
+    defer allocator.free(metadata_path);
+    try selected.append(allocator, metadata_path);
+    for (manifest.shards) |shard| try selected.append(allocator, shard.snapshot_path);
+
+    if (std.fs.path.dirname(output_path)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    var nonce: [16]u8 = undefined;
+    try io.randomSecure(&nonce);
+    const nonce_hex = std.fmt.bytesToHex(nonce, .lower);
+    const temporary_path = try std.fmt.allocPrint(allocator, "{s}.partial-{s}", .{ output_path, &nonce_hex });
+    defer allocator.free(temporary_path);
+    var temporary_exists = true;
+    defer if (temporary_exists) deleteFile(io, temporary_path) catch {};
+    var file = try fs_paths.createFilePortable(io, temporary_path, .{ .truncate = true, .exclusive = true });
+    var file_open = true;
+    defer if (file_open) file.close(io);
+    var writer_buffer: [256 * 1024]u8 = undefined;
+    var writer = file.writer(io, &writer_buffer);
+    try backup_bundle_io.packNativePathsToWriter(
+        allocator,
+        io,
+        backup_root,
+        selected.items,
+        &writer.interface,
+        .{ .backup_id = backup_id, .table_name = table_name },
+    );
+    try writer.end();
+    try file.sync(io);
+    file.close(io);
+    file_open = false;
+    try publishTemporaryFileNoReplace(io, temporary_path, output_path);
+    temporary_exists = false;
+}
+
+fn publishCopiedBundleFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_path: []const u8,
+    output_path: []const u8,
+) !void {
+    if (std.fs.path.dirname(output_path)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    var nonce: [16]u8 = undefined;
+    try io.randomSecure(&nonce);
+    const nonce_hex = std.fmt.bytesToHex(nonce, .lower);
+    const temporary_path = try std.fmt.allocPrint(allocator, "{s}.partial-{s}", .{ output_path, &nonce_hex });
+    defer allocator.free(temporary_path);
+    var temporary_exists = true;
+    defer if (temporary_exists) deleteFile(io, temporary_path) catch {};
+    _ = try fs_paths.copyFileDurablePortable(io, source_path, temporary_path);
+    try publishTemporaryFileNoReplace(io, temporary_path, output_path);
+    temporary_exists = false;
+}
+
+/// Atomically publishes a fully synced temporary file without ever replacing
+/// an existing user artifact. Linking is the commit point: it is one metadata
+/// operation, fails if `output_path` already exists, and keeps the completed
+/// inode reachable if cleanup of the temporary name is interrupted.
+fn publishTemporaryFileNoReplace(io: std.Io, temporary_path: []const u8, output_path: []const u8) !void {
+    std.Io.Dir.hardLink(.cwd(), temporary_path, .cwd(), output_path, io, .{}) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.PathAlreadyExists,
+        else => return err,
+    };
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(output_path) orelse ".");
+    try deleteFile(io, temporary_path);
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(output_path) orelse ".");
+}
+
+fn deleteFile(io: std.Io, path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.deleteFileAbsolute(io, path)
+    else
+        try std.Io.Dir.cwd().deleteFile(io, path);
 }
 
 pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -327,14 +432,7 @@ fn prepareInputRestorePlan(
     location: []const u8,
     connection: []const u8,
 ) !InputRestorePlan {
-    var owned_backup_id: ?[]u8 = null;
-    defer if (owned_backup_id) |value| allocator.free(value);
-    const resolved_backup_id = backup_id orelse blk: {
-        owned_backup_id = try lite_restore_staging.defaultBackupIdAlloc(allocator, input_path);
-        break :blk owned_backup_id.?;
-    };
-
-    const staged = try lite_restore_staging.stageInputRestoreBackup(allocator, input_path, table_name, resolved_backup_id, location);
+    const staged = try lite_restore_staging.stageInputRestoreBackup(allocator, input_path, table_name, backup_id orelse "", location);
     errdefer {
         var owned_staged = staged;
         owned_staged.deinit(allocator);
@@ -372,6 +470,8 @@ fn parseBackupArgs(args: *std.process.Args.Iterator) !BackupArgs {
             out.url = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
             out.output = try nextRequired(args);
+        } else if (std.mem.eql(u8, arg, "--out")) {
+            out.bundle_out = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--list")) {
             out.list_backups = true;
         } else if (std.mem.eql(u8, arg, "--limit")) {
@@ -426,7 +526,7 @@ fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
 fn validateBackupArgs(opts: BackupArgs) !void {
     if (!opts.location_explicit) return error.BackupLocationRequired;
     if (opts.table_name != null and opts.tables_str != null) return error.ConflictingTableSelection;
-    if (opts.list_backups and (opts.table_name != null or opts.tables_str != null or opts.backup_id != null or opts.format != null))
+    if (opts.list_backups and (opts.table_name != null or opts.tables_str != null or opts.backup_id != null or opts.format != null or opts.bundle_out != null))
         return error.ConflictingBackupListArguments;
     if (!opts.list_backups and (opts.list_limit_explicit or opts.list_cursor != null)) return error.BackupPaginationRequiresList;
     if (opts.list_limit == 0 or opts.list_limit > max_backup_list_limit) return error.InvalidBackupListLimit;
@@ -434,6 +534,10 @@ fn validateBackupArgs(opts: BackupArgs) !void {
     if (opts.format) |format| {
         if (!std.mem.eql(u8, format, "native") and !std.mem.eql(u8, format, "portable")) return error.UnsupportedBackupFormat;
     }
+    if (opts.bundle_out != null and
+        (opts.table_name == null or opts.tables_str != null or
+            !std.mem.startsWith(u8, opts.location, "file://")))
+        return error.UnsupportedBundleOutput;
 }
 
 fn validateBackupCursor(cursor: []const u8) !void {
@@ -485,7 +589,7 @@ fn tableListFatal(err: anyerror) noreturn {
 fn printBackupUsage() void {
     std.debug.print(
         \\usage:
-        \\  antfly backup --table <name> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--url <url>]
+        \\  antfly backup --table <name> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--out <backup.afb>] [--url <url>]
         \\  antfly backup --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--url <url>]
         \\  antfly backup --list --connection <id> --location <uri> [--limit <1-1000>] [--cursor <cursor>] [--output json] [--url <url>]
         \\
@@ -493,7 +597,8 @@ fn printBackupUsage() void {
         \\  Network backups are written by the server through the named connection.
         \\  Table and cluster backups default to the portable format.
         \\  Backup listing returns one page and includes next_cursor when more results remain.
-        \\  Use `antfly lite backup <db.aflite> --out <backup.afb>` for a local AFB artifact.
+        \\  `--out` packages a native backup from a shared file:// location as a self-contained AFB2 artifact.
+        \\  Use `antfly lite backup <db.aflite> --out <backup.afb>` for a local portable AFB2 artifact.
         \\
     , .{});
 }
@@ -506,8 +611,8 @@ fn printRestoreUsage() void {
         \\  antfly restore --input <db.aflite|backup.afb> --table <name> --connection <id> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
         \\
         \\notes:
-        \\  `--input db.aflite` stages an Antfly Lite database as a portable backup,
-        \\  then restores it through the normal Antfly table restore path.
+        \\  `--input` auto-detects AFB1 portable, AFB2 portable, or AFB2 native.
+        \\  Native input must be a self-contained full bundle.
         \\  Input restore requires a location writable by this client and readable
         \\  by the target's named connection. These may use different credentials.
         \\
@@ -546,17 +651,21 @@ test "backup cli parser rejects unknown arguments" {
     try std.testing.expectError(error.UnknownArgument, parseBackupArgs(&iter));
 }
 
-test "backup cli parser rejects local out path" {
+test "backup cli accepts native AFB2 output from a shared local repository" {
     var argv = [_][*:0]const u8{
         "--table",
         "docs",
         "--format",
-        "portable",
+        "native",
+        "--location",
+        "file:///tmp/backups",
         "--out",
         "docs.afb",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    try std.testing.expectError(error.UnknownArgument, parseBackupArgs(&iter));
+    const opts = try parseBackupArgs(&iter);
+    try validateBackupArgs(opts);
+    try std.testing.expectEqualStrings("docs.afb", opts.bundle_out.?);
 }
 
 test "network backup requires explicit location" {

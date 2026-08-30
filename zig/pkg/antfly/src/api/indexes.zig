@@ -1627,6 +1627,16 @@ fn repairStateRank(state: []const u8) u8 {
     return 0;
 }
 
+fn embeddingActivityPhaseRank(phase: db_mod.types.EmbeddingActivityPhase) u8 {
+    return switch (phase) {
+        .idle => 0,
+        .preparing => 1,
+        .publishing => 2,
+        .embedding => 3,
+        .waiting_retry => 4,
+    };
+}
+
 test "index repair aggregation exposes a waiting shard over rebuilding shards" {
     try std.testing.expect(repairStateRank("waiting") > repairStateRank("rebuilding"));
     try std.testing.expect(repairStateRank("failed") > repairStateRank("waiting"));
@@ -2029,18 +2039,23 @@ fn aggregateIndexStatusIndexed(
         aggregate.node_count += item.node_count;
         aggregate.root_node = if (materialization_count == 1) item.root_node else 0;
         if (item.kind == .dense_vector or item.kind == .sparse_vector) {
-            var activity_hasher = std.hash.Wyhash.init(runtime.group_id);
-            activity_hasher.update(std.mem.asBytes(&item.embedding_activity.epoch));
-            aggregate.embedding_activity.epoch ^= activity_hasher.final();
-            aggregate.embedding_activity.chunks_created +|= item.embedding_activity.chunks_created;
-            aggregate.embedding_activity.embedding_batches_completed +|= item.embedding_activity.embedding_batches_completed;
-            aggregate.embedding_activity.embeddings_computed +|= item.embedding_activity.embeddings_computed;
-            aggregate.embedding_activity.active_batch_size +|= item.embedding_activity.active_batch_size;
-            aggregate.embedding_activity.retrying = aggregate.embedding_activity.retrying or item.embedding_activity.retrying;
-            aggregate.embedding_activity.last_progress_at_ms = @max(
-                aggregate.embedding_activity.last_progress_at_ms,
-                item.embedding_activity.last_progress_at_ms,
-            );
+            if (item.embedding_activity.epoch != 0) {
+                var activity_hasher = std.hash.Wyhash.init(runtime.group_id);
+                activity_hasher.update(std.mem.asBytes(&item.embedding_activity.epoch));
+                aggregate.embedding_activity.epoch ^= activity_hasher.final();
+                aggregate.embedding_activity.chunks_created +|= item.embedding_activity.chunks_created;
+                aggregate.embedding_activity.embedding_batches_completed +|= item.embedding_activity.embedding_batches_completed;
+                aggregate.embedding_activity.embeddings_computed +|= item.embedding_activity.embeddings_computed;
+                aggregate.embedding_activity.active_batch_size +|= item.embedding_activity.active_batch_size;
+                const candidate_phase = item.embedding_activity.effectivePhase();
+                if (embeddingActivityPhaseRank(candidate_phase) >
+                    embeddingActivityPhaseRank(aggregate.embedding_activity.effectivePhase()))
+                    aggregate.embedding_activity.phase_override = candidate_phase;
+                aggregate.embedding_activity.last_progress_at_ms = @max(
+                    aggregate.embedding_activity.last_progress_at_ms,
+                    item.embedding_activity.last_progress_at_ms,
+                );
+            }
         }
         aggregate.replay_applied_sequence += public_item.replay_applied_sequence;
         aggregate.replay_target_sequence += public_item.replay_target_sequence;
@@ -4641,17 +4656,8 @@ fn appendSingleIndexRuntimeStatus(
             item.embedding_activity
         else
             db_mod.types.EmbeddingActivityStats{};
-        const enrichment_enabled = if (visible_enrichment) |stats| stats.enabled else false;
-        const activity_phase = if (embedding_activity.retrying)
-            "retrying"
-        else if (embedding_activity.active_batch_size > 0 or !source_coverage_complete and enrichment_enabled)
-            "embedding"
-        else if (catch_up_active or replay_catch_up_required or artifact_publish_pending)
-            "publishing"
-        else if (!source_coverage_complete)
-            "preparing"
-        else
-            "idle";
+        const activity_present = embedding_activity.epoch != 0;
+        const activity_phase = @tagName(embedding_activity.effectivePhase());
         try out.appendSlice(alloc, ",\"searchable_vectors\":");
         try appendIntValue(alloc, out, visible_doc_count);
         try out.appendSlice(alloc, ",\"source_coverage\":{");
@@ -4685,29 +4691,34 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"degraded\":");
         try out.appendSlice(alloc, if (source_coverage.degraded) "true" else "false");
         try out.appendSlice(alloc, "}");
-        const activity_epoch = try std.fmt.allocPrint(alloc, "a-{x:0>16}", .{embedding_activity.epoch});
-        defer alloc.free(activity_epoch);
-        try out.appendSlice(alloc, ",\"activity\":{\"epoch\":");
-        try appendJsonString(alloc, out, activity_epoch);
-        try out.appendSlice(alloc, ",\"phase\":");
-        try appendJsonString(alloc, out, activity_phase);
-        try out.appendSlice(alloc, ",\"chunks_created\":");
-        try appendIntValue(alloc, out, embedding_activity.chunks_created);
-        try out.appendSlice(alloc, ",\"embedding_batches_completed\":");
-        try appendIntValue(alloc, out, embedding_activity.embedding_batches_completed);
-        try out.appendSlice(alloc, ",\"embeddings_computed\":");
-        try appendIntValue(alloc, out, embedding_activity.embeddings_computed);
-        try out.appendSlice(alloc, ",\"active_batch_size\":");
-        try appendIntValue(alloc, out, embedding_activity.active_batch_size);
-        try out.appendSlice(alloc, ",\"last_progress_at\":");
-        if (embedding_activity.last_progress_at_ms == 0) {
+        try out.appendSlice(alloc, ",\"activity\":");
+        if (!activity_present) {
             try out.appendSlice(alloc, "null");
         } else {
-            const last_progress_at = try formatUnixMillisTimestampOwned(alloc, embedding_activity.last_progress_at_ms);
-            defer alloc.free(last_progress_at);
-            try appendJsonString(alloc, out, last_progress_at);
+            const activity_epoch = try std.fmt.allocPrint(alloc, "a-{x:0>16}", .{embedding_activity.epoch});
+            defer alloc.free(activity_epoch);
+            try out.appendSlice(alloc, "{\"epoch\":");
+            try appendJsonString(alloc, out, activity_epoch);
+            try out.appendSlice(alloc, ",\"phase\":");
+            try appendJsonString(alloc, out, activity_phase);
+            try out.appendSlice(alloc, ",\"chunks_created\":");
+            try appendIntValue(alloc, out, embedding_activity.chunks_created);
+            try out.appendSlice(alloc, ",\"embedding_batches_completed\":");
+            try appendIntValue(alloc, out, embedding_activity.embedding_batches_completed);
+            try out.appendSlice(alloc, ",\"embeddings_computed\":");
+            try appendIntValue(alloc, out, embedding_activity.embeddings_computed);
+            try out.appendSlice(alloc, ",\"active_batch_size\":");
+            try appendIntValue(alloc, out, embedding_activity.active_batch_size);
+            try out.appendSlice(alloc, ",\"last_progress_at\":");
+            if (embedding_activity.last_progress_at_ms == 0) {
+                try out.appendSlice(alloc, "null");
+            } else {
+                const last_progress_at = try formatUnixMillisTimestampOwned(alloc, embedding_activity.last_progress_at_ms);
+                defer alloc.free(last_progress_at);
+                try appendJsonString(alloc, out, last_progress_at);
+            }
+            try out.append(alloc, '}');
         }
-        try out.append(alloc, '}');
         try out.appendSlice(alloc, ",\"query_visible_doc_count\":");
         try appendIntValue(alloc, out, visible_doc_count);
         try out.appendSlice(alloc, ",\"published_doc_count\":");
@@ -6838,7 +6849,7 @@ test "single embeddings index encoder exposes replay and enrichment runtime stat
         \\  },
         \\  "searchable_vectors": 1,
         \\  "activity": {
-        \\    "phase": "retrying",
+        \\    "phase": "waiting_retry",
         \\    "chunks_created": 9,
         \\    "embedding_batches_completed": 2,
         \\    "embeddings_computed": 8,

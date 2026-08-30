@@ -2154,6 +2154,14 @@ pub const EnrichmentStats = struct {
 /// counters never participate in readiness; they let status clients explain
 /// active generation between durable publication checkpoints. `epoch` changes
 /// whenever the owning enrichment runtime is recreated.
+pub const EmbeddingActivityPhase = enum {
+    idle,
+    preparing,
+    embedding,
+    publishing,
+    waiting_retry,
+};
+
 pub const EmbeddingActivityStats = struct {
     epoch: u64 = 0,
     // Internal incarnation fence. API encoders omit internal fence fields.
@@ -2162,12 +2170,27 @@ pub const EmbeddingActivityStats = struct {
     // its exact failure identity here; only the worker supervisor may promote
     // that candidate to the public `retrying` state.
     retry_fingerprint: u64 = 0,
+    // Exact, component-owned in-flight scopes. These are local aggregation
+    // inputs, not public counters: clients see only `effectivePhase()`.
+    active_preparations: u64 = 0,
+    active_publications: u64 = 0,
+    // Used only when aggregating already-derived shard phases. Runtime owners
+    // leave this null and publish the exact scopes above.
+    phase_override: ?EmbeddingActivityPhase = null,
     chunks_created: u64 = 0,
     embedding_batches_completed: u64 = 0,
     embeddings_computed: u64 = 0,
     active_batch_size: u64 = 0,
     retrying: bool = false,
     last_progress_at_ms: u64 = 0,
+
+    pub fn effectivePhase(self: @This()) EmbeddingActivityPhase {
+        if (self.retrying) return .waiting_retry;
+        if (self.active_batch_size != 0) return .embedding;
+        if (self.active_publications != 0) return .publishing;
+        if (self.active_preparations != 0) return .preparing;
+        return self.phase_override orelse .idle;
+    }
 };
 
 pub const ReplayStageStats = struct {

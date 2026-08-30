@@ -663,6 +663,10 @@ pub fn voterSetFingerprint(node_ids: []const u64, required_node_id: ?u64) VoterS
 
 pub const StoreStatusReport = struct {
     store_id: u64,
+    /// Version of the volatile owner-activity projection carried by this
+    /// heartbeat. Zero means absent/legacy; version 1 is the current schema.
+    /// This is intentionally not copied into StoreRecord or Raft state.
+    embedding_activity_protocol_version: u16 = 0,
     /// Must match the incarnation established by store registration. Zero is
     /// reserved for rolling-upgrade compatibility with legacy reporters.
     reporter_incarnation: u64 = 0,
@@ -829,12 +833,20 @@ pub const RuntimeDocSetPlanningStatusReport = struct {
 };
 
 pub const RuntimeEmbeddingActivityStatusReport = struct {
+    pub const Phase = enum {
+        idle,
+        preparing,
+        embedding,
+        publishing,
+        waiting_retry,
+    };
+
     epoch: u64 = 0,
+    phase: Phase = .idle,
     chunks_created: u64 = 0,
     embedding_batches_completed: u64 = 0,
     embeddings_computed: u64 = 0,
     active_batch_size: u64 = 0,
-    retrying: bool = false,
     last_progress_at_ms: u64 = 0,
 };
 

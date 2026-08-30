@@ -801,6 +801,9 @@ pub const ReplayProgressHook = *const fn (ctx: *anyopaque, index_name: []const u
 pub const QueryVisibilityChange = enum {
     invalidate,
     status,
+    /// High-frequency, readiness-neutral owner telemetry. Serving layers may
+    /// coalesce this independently from durable status and visibility edges.
+    activity,
     publish,
     publish_consistent,
     publish_blocking,
@@ -4524,6 +4527,7 @@ pub const DB = struct {
             runtime.setStatusHook(if (hook == null) null else .{
                 .ptr = self.async_context,
                 .on_change = notifyAsyncContextVisibilityHook,
+                .on_activity = notifyAsyncContextActivityHook,
             });
         }
     }
@@ -4548,6 +4552,11 @@ pub const DB = struct {
     fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
         const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
         notifyQueryVisibilityHook(ctx, .status);
+    }
+
+    fn notifyAsyncContextActivityHook(ptr: *anyopaque) void {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        notifyQueryVisibilityHook(ctx, .activity);
     }
 
     fn notifyDerivedAppliedSequenceAdvanced(ptr: *anyopaque, index_name: []const u8, applied_sequence: u64) void {
@@ -4775,6 +4784,7 @@ pub const DB = struct {
                 runtime.runtime.?.setStatusHook(.{
                     .ptr = self.async_context,
                     .on_change = notifyAsyncContextVisibilityHook,
+                    .on_activity = notifyAsyncContextActivityHook,
                 });
             }
         }
@@ -92779,7 +92789,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
                     }
                 },
                 .invalidate => self.invalidate_calls += 1,
-                .index_repair_pending, .index_repair_cleared, .index_repair_progress => {},
+                .activity, .index_repair_pending, .index_repair_cleared, .index_repair_progress => {},
             }
         }
     };

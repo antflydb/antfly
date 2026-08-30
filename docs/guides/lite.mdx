@@ -22,11 +22,13 @@ distributed operations.
 Antfly Lite uses two file types with different jobs:
 
 - `.aflite` is a live embedded Lite database.
-- `.afb` is a portable Antfly backup archive.
+- `.afb` is an Antfly Backup Bundle. Lite writes the portable logical
+  representation; normal Antfly can also package native physical generations.
 
 Do not use `.aflite` as an archival backup format. Create an `.afb` when you
 need a portable backup, a migration artifact, or a restore source for normal
-Antfly.
+Antfly. AFB1 portable archives remain readable; new bundles use AFB2 and declare
+their representation explicitly.
 
 <Callout type="info">
 Lite v1 does not include legacy fallback readers for pre-release directory or
@@ -235,7 +237,7 @@ configuring a non-loopback production listener.
 
 ## Back Up And Restore Lite
 
-Create a portable `.afb` backup:
+Create an AFB2 bundle with the portable representation:
 
 ```bash
 antfly lite backup app.aflite --out app.afb
@@ -253,7 +255,7 @@ Restore a backup into a new Lite database:
 antfly lite restore app.afb --out restored.aflite
 ```
 
-Import a portable `.afb` into an existing empty Lite database:
+Import a portable AFB1 or AFB2 bundle into an existing empty Lite database:
 
 ```bash
 antfly lite init empty.aflite
@@ -276,8 +278,9 @@ antfly lite snapshot app.aflite --out copy.aflite
 snapshot replacement, not a logical merge. It requires `--replace` when the
 target already exists.
 
-Use snapshots for local file copies. Use `.afb` for portable backups and
-migrations.
+Use snapshots for local file copies. Use portable `.afb` bundles for Lite and
+cross-engine migrations; normal Antfly can also package native generations in
+the same self-describing AFB2 envelope.
 
 ## Promote Lite To Normal Antfly
 

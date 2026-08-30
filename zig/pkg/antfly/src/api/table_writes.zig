@@ -6221,6 +6221,9 @@ pub const ProvisionedTableWriteSource = struct {
         /// A DB worker observed lifecycle progress. The runtime owner must
         /// publish from outside every DB/index executor.
         runtime_status,
+        /// Readiness-neutral owner telemetry. The data runtime refreshes its
+        /// local snapshot promptly but rate-limits metadata heartbeats.
+        runtime_activity,
         /// An in-place schema/index reconciliation published fresh runtime
         /// state without replacing the shard root generation.
         runtime_reconciled,
@@ -10158,7 +10161,7 @@ pub const ProvisionedTableWriteSource = struct {
             .status, .publish, .publish_consistent, .publish_blocking => if (self.captureRepairHandoffPublicationTokenBestEffort(table_name, group_id, true)) |token| {
                 _ = self.settleRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token);
             },
-            .index_repair_progress => {},
+            .activity, .index_repair_progress => {},
             else => {},
         };
         switch (event.change) {
@@ -10208,6 +10211,15 @@ pub const ProvisionedTableWriteSource = struct {
                 }
                 self.markWriteCacheDirty(table_name);
                 self.notifyLocalChange(table_name, .data);
+                return;
+            },
+            .activity => {
+                if (db) |managed_db| {
+                    _ = self.overlayCachedManagedRuntimeStatusBestEffort(table_name, group_id, managed_db);
+                } else {
+                    self.markWriteCacheDirty(table_name);
+                }
+                self.notifyLocalChange(table_name, .runtime_activity);
                 return;
             },
             .publish => {

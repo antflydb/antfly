@@ -365,6 +365,10 @@ physical chunks or vector records, not source documents, so they can exceed
 reports durable source outcomes, `searchable_vectors` reports query-visible
 physical entries, and `activity` reports incarnation-scoped chunk and embedding
 work. Activity explains current speed but never changes readiness.
+Its phase is reported by the worker that owns preparation, embedding,
+publication, or retry work; incomplete coverage alone never implies
+`embedding`. If the metadata leader has not received a fresh owner heartbeat,
+`activity` is `null` and the CLI reports activity as unavailable.
 `queryable_partial` means the active generation is safe to query but incomplete;
 `ready` means coverage is complete.
 </Callout>

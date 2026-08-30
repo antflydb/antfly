@@ -3011,7 +3011,7 @@ pub const EmbeddingIndexActivityPhase = enum {
     preparing,
     embedding,
     publishing,
-    retrying,
+    waiting_retry,
     idle,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -3019,7 +3019,7 @@ pub const EmbeddingIndexActivityPhase = enum {
             .preparing => "preparing",
             .embedding => "embedding",
             .publishing => "publishing",
-            .retrying => "retrying",
+            .waiting_retry => "waiting_retry",
             .idle => "idle",
         };
         try jw.write(s);
@@ -3034,7 +3034,7 @@ pub const EmbeddingIndexActivityPhase = enum {
             .{ "preparing", .preparing },
             .{ "embedding", .embedding },
             .{ "publishing", .publishing },
-            .{ "retrying", .retrying },
+            .{ "waiting_retry", .waiting_retry },
             .{ "idle", .idle },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -3139,6 +3139,7 @@ pub const EmbeddingsIndexStats = struct {
     source_coverage: ?EmbeddingSourceCoverageStatus = null,
     /// Physical vectors or sparse entries visible to queries; chunked indexes may exceed source coverage.
     searchable_vectors: ?i64 = null,
+    /// Fresh owner-reported activity, or null when no heartbeat for this index incarnation is available.
     activity: ?EmbeddingIndexActivity = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,

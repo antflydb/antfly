@@ -704,7 +704,7 @@ components:
         - preparing
         - embedding
         - publishing
-        - retrying
+        - waiting_retry
         - idle
     EmbeddingIndexActivity:
       type: object
@@ -1391,6 +1391,8 @@ components:
           description: "Physical vectors or sparse entries visible to queries; chunked indexes may exceed source coverage."
         activity:
           $ref: '#/components/schemas/EmbeddingIndexActivity'
+          nullable: true
+          description: "Fresh owner-reported activity, or null when no heartbeat for this index incarnation is available."
         error:
           x-go-type-skip-optional-pointer: true
           type: string

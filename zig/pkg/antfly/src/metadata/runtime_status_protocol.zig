@@ -13,20 +13,52 @@
 // limitations.
 
 /// Runtime-status records are embedded in unframed StoreRecord transitions.
-/// A writer must emit no newer than the highest payload version advertised by
-/// every metadata replica that can apply the transition. Feature payloads are
-/// independently downgraded to that negotiated version.
+/// Only released wire profiles are compatibility surfaces. V12 is the
+/// v0.2.0 profile; V15 is the current profile. The intervening development
+/// numbers were never released and must not be advertised, negotiated, read,
+/// or written.
 pub const legacy_record_version: u16 = 12;
-/// V13 is the first (unreleased) format carrying both compact repair state and
-/// the store reporter-incarnation fence.
-pub const repair_status_record_version: u16 = 13;
-/// V14 gates both metadata transitions whose trailing native-restore identity
-/// is mandatory and StoreRecord's data-plane native-generation capability.
-/// The only released predecessor we support is V12 from v0.2.0, so both parts
-/// of the new native-restore contract share one negotiated upgrade boundary.
-pub const native_restore_identity_record_version: u16 = 14;
-/// V15 carries volatile, per-index embeddings activity in owner heartbeats.
-/// Activity is an optional projection: writers strip it while any metadata
-/// voter has not advertised V15 support, without suppressing older facts.
-pub const embedding_activity_record_version: u16 = 15;
-pub const current_record_version: u16 = embedding_activity_record_version;
+pub const current_record_version: u16 = 15;
+
+/// These facts form one admission-safety profile. Keeping the semantic aliases
+/// makes call sites state why V15 is required without inventing intermediate
+/// compatibility levels.
+pub const repair_status_record_version: u16 = current_record_version;
+pub const native_restore_identity_record_version: u16 = current_record_version;
+
+pub fn isSupported(version: u16) bool {
+    return version >= 1 and version <= legacy_record_version or
+        version == current_record_version;
+}
+
+pub fn isNegotiable(version: u16) bool {
+    return version == legacy_record_version or version == current_record_version;
+}
+
+pub fn profileForAdvertisement(version: u16) ?u16 {
+    if (version == current_record_version) return current_record_version;
+    if (version >= 1 and version <= legacy_record_version) return legacy_record_version;
+    return null;
+}
+
+test "runtime status exposes only released compatibility profiles" {
+    const std = @import("std");
+    try std.testing.expect(isSupported(1));
+    try std.testing.expect(isSupported(legacy_record_version));
+    try std.testing.expect(isSupported(current_record_version));
+    try std.testing.expect(!isSupported(0));
+    try std.testing.expect(!isSupported(13));
+    try std.testing.expect(!isSupported(14));
+    try std.testing.expect(!isSupported(16));
+
+    try std.testing.expect(isNegotiable(legacy_record_version));
+    try std.testing.expect(isNegotiable(current_record_version));
+    try std.testing.expect(!isNegotiable(11));
+    try std.testing.expect(!isNegotiable(13));
+    try std.testing.expect(!isNegotiable(14));
+    try std.testing.expectEqual(legacy_record_version, profileForAdvertisement(1).?);
+    try std.testing.expectEqual(legacy_record_version, profileForAdvertisement(12).?);
+    try std.testing.expect(profileForAdvertisement(13) == null);
+    try std.testing.expect(profileForAdvertisement(14) == null);
+    try std.testing.expectEqual(current_record_version, profileForAdvertisement(15).?);
+}

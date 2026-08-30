@@ -55,6 +55,47 @@ such as store/operator flows beyond the public API.
 
 ## Design Rules
 
+### Canonical repository and bundle layers
+
+The canonical backup is not a tar/ZIP tree. It is a manifest DAG over immutable
+content-addressed blobs:
+
+```text
+refs/<backup-id>          -> root manifest SHA-256
+manifests/<sha256>        -> immutable canonical snapshot manifest
+blobs/sha256/<sha256>     -> immutable artifact bytes
+```
+
+Every manifest declares table/catalog identity, an explicit `portable` or
+`native` representation, shard ranges, capture/checkpoint revisions,
+compatibility requirements, compression/encryption metadata, and the complete
+materialized blob inventory. A delta writes only blobs absent from its parent,
+but its manifest still lists the complete current inventory. The parent digest
+is therefore lineage and reachability information, not a restore dependency
+chain.
+
+Refs are published with compare-and-swap semantics after all immutable objects
+are durable. Garbage collection marks manifests and blobs reachable from refs
+and active leases, then applies a grace period before deletion. Failed writers
+cannot expose partial snapshots, and concurrent writers cannot silently replace
+one another.
+
+`.afb` is the transport layer over that model:
+
+- AFB1 remains readable as the released v0.2.0 portable format.
+- AFB2 has a representation-neutral root manifest, digest-addressed blob
+  records, bounded chunks, and a footer index from digest to byte offset.
+- AFB2 `full` is self-contained and is the normal offline/superquickstart
+  artifact.
+- AFB2 `delta` declares a base manifest and carries only absent blobs.
+- Native and portable are manifest values, never inferred from file extension
+  or CLI flags during restore.
+
+Remote repositories stay unpacked for deduplication, range access, and
+incremental capture. Exporting one snapshot to a file packs its reachable
+manifest and blobs into AFB2; importing verifies the same hashes before
+publishing them into a repository or native restore staging generation.
+
 - The Go OpenAPI remains the public contract source.
 - Zig must use the same public request and response structure as the Go
   implementation.
@@ -67,7 +108,8 @@ such as store/operator flows beyond the public API.
   production contract asynchronous: restore requests validate and record durable
   restore intent quickly, while shard bootstrap and derived-index catch-up run
   outside the public HTTP request.
-- Use the existing DB snapshot/restore primitives instead of inventing a second
+- Use the existing DB snapshot/restore primitives. AFB2 packages their portable
+  logical stream or native physical generation; it does not invent another DB
   storage format.
 - Keep stateful Raft/control-plane as the canonical owner first.
 - Only bring backup/restore into serverless once the stateful public contract is

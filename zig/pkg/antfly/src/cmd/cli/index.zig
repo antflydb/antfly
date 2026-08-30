@@ -788,7 +788,10 @@ fn printWaitProgress(index_name: []const u8, target: WaitTarget, summary: IndexS
     writeSourceCoverage(&writer, summary) catch return;
     if (std.mem.eql(u8, summary.index_type, "embeddings")) {
         if (summary.visible) |visible| writer.print(" searchable_vectors={d}", .{visible}) catch return;
-        if (summary.activity_phase) |phase| writer.print(" activity={s}", .{phase}) catch return;
+        if (summary.activity_phase) |phase|
+            writer.print(" activity={s}", .{phase}) catch return
+        else
+            writer.writeAll(" activity=unavailable") catch return;
         if (summary.chunks_created) |chunks| writer.print(" chunks_created={d}", .{chunks}) catch return;
         if (summary.embeddings_computed) |computed| writer.print(" embeddings_computed={d}", .{computed}) catch return;
         if (embeddings_per_second) |rate| writer.print(" rate={d:.1}/s", .{rate}) catch return;
@@ -865,7 +868,10 @@ fn writeWaitSuccess(
     try writeSourceCoverage(writer, summary);
     if (std.mem.eql(u8, summary.index_type, "embeddings")) {
         if (summary.visible) |visible| try writer.print(" searchable_vectors={d}", .{visible});
-        if (summary.activity_phase) |phase| try writer.print(" activity={s}", .{phase});
+        if (summary.activity_phase) |phase|
+            try writer.print(" activity={s}", .{phase})
+        else
+            try writer.writeAll(" activity=unavailable");
         if (summary.chunks_created) |chunks| try writer.print(" chunks_created={d}", .{chunks});
         if (summary.embeddings_computed) |computed| try writer.print(" embeddings_computed={d}", .{computed});
         if (embeddings_per_second) |rate| try writer.print(" rate={d:.1}/s", .{rate});

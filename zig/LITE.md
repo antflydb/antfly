@@ -248,9 +248,10 @@ directory-backed standalone. `GET /db/v1/status` includes
 a safe storage summary with the engine, format, fsync policy, and typed
 maintenance capabilities; it does not expose the database path or credentials.
 
-Portable backup and restore remain normal `/db/v1` operations. A physical
-`.aflite` copy is a stable snapshot, not the portable archival contract; `.afb`
-remains the cross-engine backup format.
+Backup and restore remain normal `/db/v1` operations. A physical `.aflite`
+copy is a stable snapshot, not the archival contract. `.afb` is the common
+bundle envelope; Lite reads and writes its portable logical representation,
+while normal Antfly may also package an explicitly native representation.
 
 Once an artifact has been opened by standalone, the offline `antfly lite
 backup` command refuses to emit a misleading root-only archive. Use the
@@ -431,7 +432,9 @@ native open and then silently retry a bridge or prototype layout.
 The extension meanings should stay distinct:
 
 - `.aflite` is a live Antfly Lite single-file database.
-- `.afb` is the portable Antfly backup archive.
+- `.afb` is the representation-aware Antfly Backup Bundle. Lite emits and
+  consumes the portable logical representation; native bundles are restored by
+  normal Antfly.
 - `~/.antfly/lite/` may be used for CLI registry data, caches, temporary
   workspaces, and internal development databases, but not as the public database
   format.
@@ -874,7 +877,7 @@ query-visible results should match within documented index rebuild semantics.
 - Add `antfly lite promote` as a wrapper around portable backup and normal
   restore.
 - Add normal Antfly restore support for `.aflite` input by opening it read-only
-  and producing the same portable logical restore stream as `.afb`. The normal
+  and producing the portable logical representation used by AFB2. The normal
   CLI shape should be:
 
   ```sh

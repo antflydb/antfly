@@ -182,6 +182,21 @@ admin endpoints read cheap snapshots from that plane. Background workers perform
 repair and catch-up. Request handlers never repair state just to make status
 look current.
 
+### Durable safety and ephemeral activity are separate planes
+
+Admission-critical facts remain in the metadata Raft projection: reporter
+incarnation/fence, repair state, native-restore identity, and the durable
+coverage/checkpoint identities used by readiness. That codec negotiates only
+the released v12 profile or current v15; it decodes historical versions 1–12
+and rejects unreleased v13/v14 artifacts.
+
+Embedding work telemetry is a versioned, readiness-neutral heartbeat. The data
+owner publishes exact phase transitions and coalesced counter progress; the
+metadata leader retains matching store, group, index, generation, and config
+identities in a TTL cache. Activity expires to unavailable across missed
+heartbeats or leader changes. Status must never infer work from coverage debt,
+and activity must never authorize a query or lifecycle transition.
+
 ### Data Model
 
 Introduce a richer status record around the existing DB stats:
@@ -349,15 +364,15 @@ activity and its epoch without changing durable coverage or the queryable
 publication. This keeps status useful for UX while preserving fail-closed
 admission and bounded request-path performance.
 
-Distributed publication is codec-versioned by payload capability. Repair facts
-and reporter fences require runtime-status record v13, native-generation
-restore capability requires v14, and optional embedding activity requires v15.
-During rolling upgrades, metadata projects each heartbeat to the highest common
-version instead of suppressing the whole store record. Older ordinary and
-safety facts therefore continue publishing while volatile activity is omitted.
-Native restore identity remains mandatory and fail-closed at its v14 boundary.
-Capability proofs are scoped to the metadata incarnation, membership
-fingerprint, and required version.
+Distributed publication has two released profiles: v12 for v0.2.0 peers and
+v15 for current admission/restore safety facts. V13 and v14 were development
+artifacts and are rejected rather than negotiated. During rolling upgrades,
+writers emit v12 until every metadata voter advertises v15; repair state,
+reporter fences, and native-restore identity then activate together and remain
+mandatory/fail-closed. Embedding activity is not projected through this codec:
+its separately versioned TTL heartbeat remains optional. Capability proofs are
+scoped to the metadata incarnation, membership fingerprint, and required
+profile.
 
 ### Metrics
 

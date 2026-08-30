@@ -222,9 +222,14 @@ pub const NotifyFn = *const fn (ptr: *anyopaque, sequence: u64) void;
 pub const StatusHook = struct {
     ptr: *anyopaque,
     on_change: *const fn (ptr: *anyopaque) void,
+    on_activity: ?*const fn (ptr: *anyopaque) void = null,
 
     pub fn notify(self: @This()) void {
         self.on_change(self.ptr);
+    }
+
+    pub fn notifyActivity(self: @This()) void {
+        if (self.on_activity) |callback| callback(self.ptr);
     }
 };
 
@@ -305,6 +310,8 @@ const GeneratedReplayWindow = struct {
     sparse_embeddings: std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite) = .empty,
     coverage_transitions: std.ArrayListUnmanaged(CoverageOutcomeTransition) = .empty,
     coverage_transition_keys: std.StringHashMapUnmanaged(void) = .empty,
+    activity_runtime: ?*EnrichmentRuntime = null,
+    publishing_indexes: std.ArrayListUnmanaged([]u8) = .empty,
 
     fn hasDerivedItems(self: *const @This()) bool {
         return self.documents.items.len != 0 or
@@ -342,6 +349,7 @@ const GeneratedReplayWindow = struct {
     }
 
     fn deinit(self: *@This()) void {
+        completeWindowPublishing(self);
         for (self.documents.items) |doc| {
             self.alloc.free(@constCast(doc.key));
             if (doc.cleaned_value) |value| self.alloc.free(@constCast(value));
@@ -374,6 +382,9 @@ const GeneratedReplayWindow = struct {
         clearQueuedCoverageTransitions(self.alloc, &self.coverage_transitions, &self.coverage_transition_keys);
         self.coverage_transitions.deinit(self.alloc);
         self.coverage_transition_keys.deinit(self.alloc);
+
+        for (self.publishing_indexes.items) |index_name| self.alloc.free(index_name);
+        self.publishing_indexes.deinit(self.alloc);
     }
 };
 
@@ -578,7 +589,9 @@ fn noteIndexEmbedBatchFinishedAssumeLocked(
     for (index_names) |index_name| {
         const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
         activity.active_batch_size -|= @intCast(items);
-        if (!success) continue;
+        if (!success) {
+            continue;
+        }
         if (owner == .supervised_replay) activity.retry_fingerprint = 0;
         activity.embedding_batches_completed +|= 1;
         activity.embeddings_computed +|= @intCast(items);
@@ -603,27 +616,108 @@ fn clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime: *EnrichmentRuntime) 
     }
 }
 
-fn noteIndexChunksCreatedAssumeLocked(runtime: *EnrichmentRuntime, index_names: []const []const u8, count: usize) void {
+fn noteIndexPreparationStartedAssumeLocked(runtime: *EnrichmentRuntime, index_names: []const []const u8) void {
     for (index_names) |index_name| {
         const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
-        activity.chunks_created +|= @intCast(count);
+        activity.active_preparations +|= 1;
     }
 }
 
-pub fn noteIndexChunksCreated(runtime: *EnrichmentRuntime, index_names: []const []const u8, count: usize) void {
-    if (count == 0) return;
-    if (comptime builtin.os.tag == .freestanding) {
-        noteIndexChunksCreatedAssumeLocked(runtime, index_names, count);
-        return;
+fn noteIndexPreparationFinishedAssumeLocked(runtime: *EnrichmentRuntime, index_names: []const []const u8, chunks_created: usize) void {
+    for (index_names) |index_name| {
+        const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
+        activity.active_preparations -|= 1;
+        activity.chunks_created +|= @intCast(chunks_created);
     }
-    if (runtime.io_impl) |io_impl| {
+}
+
+fn updateIndexPreparation(runtime: *EnrichmentRuntime, index_names: []const []const u8, started: bool, chunks_created: usize) void {
+    if (comptime builtin.os.tag == .freestanding) {
+        if (started)
+            noteIndexPreparationStartedAssumeLocked(runtime, index_names)
+        else
+            noteIndexPreparationFinishedAssumeLocked(runtime, index_names, chunks_created);
+    } else if (runtime.io_impl) |io_impl| {
         const io = io_impl.io();
         runtime.mutex.lockUncancelable(io);
-        defer runtime.mutex.unlock(io);
-        noteIndexChunksCreatedAssumeLocked(runtime, index_names, count);
+        if (started)
+            noteIndexPreparationStartedAssumeLocked(runtime, index_names)
+        else
+            noteIndexPreparationFinishedAssumeLocked(runtime, index_names, chunks_created);
+        runtime.mutex.unlock(io);
     } else {
-        noteIndexChunksCreatedAssumeLocked(runtime, index_names, count);
+        if (started)
+            noteIndexPreparationStartedAssumeLocked(runtime, index_names)
+        else
+            noteIndexPreparationFinishedAssumeLocked(runtime, index_names, chunks_created);
     }
+    runtime.notifyActivityHook();
+}
+
+/// Records completed request-path chunk work. The synchronous caller does not
+/// expose a preparation lifetime, so this updates throughput counters without
+/// manufacturing an in-flight phase.
+pub fn noteIndexChunksCreated(runtime: *EnrichmentRuntime, index_names: []const []const u8, count: usize) void {
+    if (count == 0) return;
+    updateIndexPreparation(runtime, index_names, false, count);
+}
+
+fn updateIndexPublishing(runtime: *EnrichmentRuntime, index_names: []const []const u8, started: bool) void {
+    if (comptime builtin.os.tag == .freestanding) {
+        for (index_names) |index_name| {
+            const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
+            if (started) activity.active_publications +|= 1 else activity.active_publications -|= 1;
+        }
+    } else if (runtime.io_impl) |io_impl| {
+        const io = io_impl.io();
+        runtime.mutex.lockUncancelable(io);
+        for (index_names) |index_name| {
+            const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
+            if (started) activity.active_publications +|= 1 else activity.active_publications -|= 1;
+        }
+        runtime.mutex.unlock(io);
+    } else {
+        for (index_names) |index_name| {
+            const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
+            if (started) activity.active_publications +|= 1 else activity.active_publications -|= 1;
+        }
+    }
+    runtime.notifyActivityHook();
+}
+
+fn markWindowPublishing(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, index_names: []const []const u8) !void {
+    if (window.activity_runtime) |owner| {
+        if (owner != runtime) return error.EnrichmentActivityOwnerMismatch;
+    } else {
+        window.activity_runtime = runtime;
+    }
+    const first_new = window.publishing_indexes.items.len;
+    errdefer {
+        for (window.publishing_indexes.items[first_new..]) |name| window.alloc.free(name);
+        window.publishing_indexes.shrinkRetainingCapacity(first_new);
+    }
+    for (index_names) |index_name| {
+        var found = false;
+        for (window.publishing_indexes.items) |existing| {
+            if (std.mem.eql(u8, existing, index_name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            try window.publishing_indexes.ensureUnusedCapacity(window.alloc, 1);
+            const owned_name = try window.alloc.dupe(u8, index_name);
+            window.publishing_indexes.appendAssumeCapacity(owned_name);
+        }
+    }
+    updateIndexPublishing(runtime, window.publishing_indexes.items[first_new..], true);
+}
+
+fn completeWindowPublishing(window: *GeneratedReplayWindow) void {
+    if (window.activity_runtime) |runtime| updateIndexPublishing(runtime, window.publishing_indexes.items, false);
+    for (window.publishing_indexes.items) |name| window.alloc.free(name);
+    window.publishing_indexes.clearRetainingCapacity();
+    window.activity_runtime = null;
 }
 
 fn freeOwnedIndexNames(alloc: Allocator, names: [][]u8) void {
@@ -654,7 +748,6 @@ fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []con
     if (runtime.io_impl) |io_impl| {
         const io = io_impl.io();
         runtime.mutex.lockUncancelable(io);
-        defer runtime.mutex.unlock(io);
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
         runtime.active_embed_batch_items = @intCast(items);
@@ -662,6 +755,7 @@ fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []con
         runtime.active_embed_batch_max_bytes = @intCast(max_bytes);
         runtime.active_embed_batch_started_ms = now_ms;
         noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .supervised_replay);
+        runtime.mutex.unlock(io);
     } else {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
@@ -671,6 +765,7 @@ fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []con
         runtime.active_embed_batch_started_ms = now_ms;
         noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .supervised_replay);
     }
+    runtime.notifyActivityHook();
 }
 
 fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []const u8, items: usize, bytes: usize, max_bytes: usize, elapsed_ns: u64, success: bool) void {
@@ -696,7 +791,6 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
     if (runtime.io_impl) |io_impl| {
         const io = io_impl.io();
         runtime.mutex.lockUncancelable(io);
-        defer runtime.mutex.unlock(io);
         if (success) {
             runtime.embed_batches_completed += 1;
             runtime.embed_items_completed += @intCast(items);
@@ -712,6 +806,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
         runtime.active_embed_batch_max_bytes = 0;
         runtime.active_embed_batch_started_ms = 0;
         noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success, .supervised_replay);
+        runtime.mutex.unlock(io);
     } else {
         if (success) {
             runtime.embed_batches_completed += 1;
@@ -729,6 +824,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
         runtime.active_embed_batch_started_ms = 0;
         noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success, .supervised_replay);
     }
+    runtime.notifyActivityHook();
 }
 
 // Request-path embeddings can overlap each other and the single replay
@@ -747,15 +843,16 @@ fn noteTrackedRequestEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names:
     if (runtime.io_impl) |io_impl| {
         const io = io_impl.io();
         runtime.mutex.lockUncancelable(io);
-        defer runtime.mutex.unlock(io);
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
         noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .synchronous_request);
+        runtime.mutex.unlock(io);
     } else {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
         noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .synchronous_request);
     }
+    runtime.notifyActivityHook();
 }
 
 fn noteTrackedRequestEmbedBatchFinished(
@@ -773,11 +870,12 @@ fn noteTrackedRequestEmbedBatchFinished(
         } else if (runtime.io_impl) |io_impl| {
             const io = io_impl.io();
             runtime.mutex.lockUncancelable(io);
-            defer runtime.mutex.unlock(io);
             noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false, .synchronous_request);
+            runtime.mutex.unlock(io);
         } else {
             noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false, .synchronous_request);
         }
+        runtime.notifyActivityHook();
         return;
     }
 
@@ -797,7 +895,6 @@ fn noteTrackedRequestEmbedBatchFinished(
     if (runtime.io_impl) |io_impl| {
         const io = io_impl.io();
         runtime.mutex.lockUncancelable(io);
-        defer runtime.mutex.unlock(io);
         runtime.embed_batches_completed += 1;
         runtime.embed_items_completed += @intCast(items);
         runtime.last_embed_batch_items = @intCast(items);
@@ -807,6 +904,7 @@ fn noteTrackedRequestEmbedBatchFinished(
         runtime.last_embed_batch_ns = elapsed_ns;
         runtime.total_embed_ns += elapsed_ns;
         noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, true, .synchronous_request);
+        runtime.mutex.unlock(io);
     } else {
         runtime.embed_batches_completed += 1;
         runtime.embed_items_completed += @intCast(items);
@@ -818,6 +916,7 @@ fn noteTrackedRequestEmbedBatchFinished(
         runtime.total_embed_ns += elapsed_ns;
         noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, true, .synchronous_request);
     }
+    runtime.notifyActivityHook();
 }
 
 const TextBatchByteStats = struct {
@@ -1014,7 +1113,11 @@ test "enrichment runtime status scopes embedding activity to exact consumer inde
 
     noteEmbedBatchStarted(&runtime, &.{"semantic"}, 4, 400, 125);
     noteEmbedBatchFinished(&runtime, &.{"semantic"}, 4, 400, 125, 20, true);
-    noteIndexChunksCreated(&runtime, &.{"semantic"}, 9);
+    updateIndexPreparation(&runtime, &.{"semantic"}, true, 0);
+    updateIndexPreparation(&runtime, &.{"semantic"}, false, 9);
+    var publication_window = GeneratedReplayWindow{ .alloc = alloc };
+    defer publication_window.deinit();
+    try markWindowPublishing(&runtime, &publication_window, &.{"semantic"});
     runtime.active_failure_fingerprint = 41;
     noteEmbedBatchStarted(&runtime, &.{"visual"}, 3, 300, 100);
     noteEmbedBatchFinished(&runtime, &.{"visual"}, 3, 300, 100, 15, false);
@@ -1026,6 +1129,7 @@ test "enrichment runtime status scopes embedding activity to exact consumer inde
     try std.testing.expectEqual(@as(u64, 4), semantic.embeddings_computed);
     try std.testing.expectEqual(@as(u64, 0), semantic.active_batch_size);
     try std.testing.expect(!semantic.retrying);
+    try std.testing.expectEqual(types.EmbeddingActivityPhase.publishing, semantic.effectivePhase());
 
     const visual = runtime.indexEmbeddingActivity("visual");
     try std.testing.expect(visual.epoch != 0);
@@ -1038,6 +1142,7 @@ test "enrichment runtime status scopes embedding activity to exact consumer inde
     try std.testing.expect(!visual.retrying);
     markScheduledIndexEmbeddingRetryAssumeLocked(&runtime);
     try std.testing.expect(runtime.indexEmbeddingActivity("visual").retrying);
+    try std.testing.expectEqual(types.EmbeddingActivityPhase.waiting_retry, runtime.indexEmbeddingActivity("visual").effectivePhase());
     try std.testing.expect(!runtime.indexEmbeddingActivity("semantic").retrying);
 
     runtime.active_failure_fingerprint = 99;
@@ -1046,6 +1151,13 @@ test "enrichment runtime status scopes embedding activity to exact consumer inde
 
     noteEmbedBatchStarted(&runtime, &.{"visual"}, 3, 300, 100);
     try std.testing.expect(!runtime.indexEmbeddingActivity("visual").retrying);
+    try std.testing.expectEqual(types.EmbeddingActivityPhase.embedding, runtime.indexEmbeddingActivity("visual").effectivePhase());
+
+    noteEmbedBatchFinished(&runtime, &.{"visual"}, 3, 300, 100, 10, true);
+    try markWindowPublishing(&runtime, &publication_window, &.{"visual"});
+    completeWindowPublishing(&publication_window);
+    try std.testing.expectEqual(types.EmbeddingActivityPhase.idle, runtime.indexEmbeddingActivity("semantic").effectivePhase());
+    try std.testing.expectEqual(types.EmbeddingActivityPhase.idle, runtime.indexEmbeddingActivity("visual").effectivePhase());
 }
 
 test "request embedding failure never claims a supervised retry" {
@@ -2447,13 +2559,16 @@ fn getOrCreateRequestChunks(
     };
     defer runtime.alloc.free(source_text);
 
+    const activity_indexes = runtime.index_manager.vectorIndexesForChunk(runtime.alloc, requestArtifactName(request)) catch null;
+    defer if (activity_indexes) |names| freeOwnedIndexNames(runtime.alloc, names);
+    var chunks_created: usize = 0;
+    if (activity_indexes) |names| updateIndexPreparation(runtime, names, true, 0);
+    defer if (activity_indexes) |names| updateIndexPreparation(runtime, names, false, chunks_created);
     const chunks = if (request.chunker_json.len > 0)
         try chunker_mod.chunkTextWithConfigJson(runtime.alloc, source_text, request.chunker_json)
     else
         try chunker_mod.chunkText(runtime.alloc, source_text, request.chunk_size, request.chunk_overlap);
-    const activity_indexes = runtime.index_manager.vectorIndexesForChunk(runtime.alloc, requestArtifactName(request)) catch null;
-    defer if (activity_indexes) |names| freeOwnedIndexNames(runtime.alloc, names);
-    if (activity_indexes) |names| noteIndexChunksCreated(runtime, names, chunks.len);
+    chunks_created = chunks.len;
 
     try cache.append(runtime.alloc, .{
         .key = cache_key,
@@ -3077,6 +3192,17 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             break :blk self.status_hook;
         };
         if (hook) |value| value.notify();
+    }
+
+    fn notifyActivityHook(self: *EnrichmentRuntime) void {
+        const hook = blk: {
+            const io_impl = self.io_impl orelse break :blk self.status_hook;
+            const io = io_impl.io();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            break :blk self.status_hook;
+        };
+        if (hook) |value| value.notifyActivity();
     }
 
     pub fn notifySequence(self: *EnrichmentRuntime, sequence: u64) void {
@@ -9323,6 +9449,7 @@ fn flushGeneratedReplayWindow(
         try applyCoverageOutcomeTransitions(runtime, window.coverage_transitions.items);
         clearQueuedCoverageTransitions(runtime.alloc, &window.coverage_transitions, &window.coverage_transition_keys);
         try noteDurableRetryProgress(runtime, previous_failure_fingerprint);
+        completeWindowPublishing(window);
         succeeded = true;
         return;
     }
@@ -9338,6 +9465,7 @@ fn flushGeneratedReplayWindow(
     try rememberPublishedGeneratedBatch(runtime, batch);
     runtime.notify_fn(runtime.notify_ctx, sequence);
     try noteDurableRetryProgress(runtime, previous_failure_fingerprint);
+    completeWindowPublishing(window);
     succeeded = true;
 }
 
@@ -9410,6 +9538,7 @@ fn appendOwnedDenseEmbeddingsToWindow(
     embeddings: *[]derived_types.DerivedDenseEmbeddingWrite,
 ) !void {
     if (embeddings.*.len == 0) return;
+    for (embeddings.*) |embedding| try markWindowPublishing(runtime, window, &.{embedding.index_name});
     try window.dense_embeddings.appendSlice(runtime.alloc, embeddings.*);
     runtime.alloc.free(embeddings.*);
     embeddings.* = &.{};
@@ -9421,6 +9550,7 @@ fn appendOwnedSparseEmbeddingsToWindow(
     embeddings: *[]derived_types.DerivedSparseEmbeddingWrite,
 ) !void {
     if (embeddings.*.len == 0) return;
+    for (embeddings.*) |embedding| try markWindowPublishing(runtime, window, &.{embedding.index_name});
     try window.sparse_embeddings.appendSlice(runtime.alloc, embeddings.*);
     runtime.alloc.free(embeddings.*);
     embeddings.* = &.{};

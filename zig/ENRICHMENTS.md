@@ -149,9 +149,11 @@ collapsed into one generic progress percentage:
   `chunks_created`, `embedding_batches_completed`, `embeddings_computed`,
   `active_batch_size`, and `last_progress_at`. Its opaque `epoch` changes when
   the worker process or index incarnation changes. Rates are meaningful only
-  between samples carrying the same epoch. The `retrying` phase means the
+  between samples carrying the same epoch. The `waiting_retry` phase means the
   enrichment supervisor owns a scheduled retry for that exact index; a failed
   synchronous request or an unscheduled provider error does not imply it.
+  `activity` is `null` when no current-incarnation owner heartbeat exists; an
+  absent observation is never synthesized as idle or embedding.
 
 Readiness is expressed as explicit `queryable` and `complete` milestones with
 milestone-specific blockers. Only durable coverage, publication, repair,
@@ -160,19 +162,29 @@ Activity explains why counters are moving; it never proves readiness or
 failure, and losing volatile activity state on restart must not make an index
 less queryable.
 
-The runtime maintains activity counters while doing work, so operational status
-publication remains bounded and scan-free. Shared enrichment producers may fan
-one completed batch out to every exact consumer index, but activity from an
-unrelated index, table, or stale incarnation must never be attributed to the
-requested index.
+The work owner, rather than coverage debt, controls the activity phase:
+claim/preparation sets `preparing`, a provider batch sets `embedding`, durable
+artifact publication sets `publishing`, a supervised retry sets
+`waiting_retry`, and releasing the last owned operation sets `idle`. Aggregation
+uses `waiting_retry > embedding > publishing > preparing > idle` only across
+observed owners. Counters sum, timestamps take the maximum, and rates require a
+stable epoch.
 
-Native-generation restore identity is carried in runtime-status record v14;
-activity is an independent optional projection added in v15. Mixed-version
-metadata groups omit volatile activity until v15 support is proven by every
-current member, while continuing to publish ordinary status and any v13 repair
-or reporter-fence and v14 native-restore facts. This downgrade is safe because
-activity is explanatory only and is never an input to admission or lifecycle
-milestones; native restore identity remains mandatory and fail-closed.
+Activity heartbeat protocol v1 is separate from durable runtime status. Data
+nodes coalesce counter updates to at most once per second while reporting phase
+edges promptly. The metadata leader keeps matching store/index-incarnation
+observations in a five-second TTL cache; leadership changes therefore make
+activity temporarily unavailable without changing readiness. Shared enrichment
+producers may fan one completed batch out to every exact consumer index, but
+activity from an unrelated index, table, or stale incarnation must never be
+attributed to the requested index.
+
+The durable runtime-status codec has two negotiated profiles, not a numeric
+feature ladder. It reads the released v0.2.0 range 1–12, writes v12 to old
+peers, and reads/writes current v15. Versions 13 and 14 were unreleased and are
+rejected. Reporter fences, repair state, and native-generation restore identity
+are one mandatory v15 admission-safety profile and wait until every current
+metadata voter supports v15. Activity never enters that codec.
 
 ## Full-Text Routing From Enrichments
 

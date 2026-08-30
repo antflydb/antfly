@@ -108,6 +108,7 @@ pub fn applyObservationsOwnedWithRepairStatus(
         const next_group_statuses = try table_manager.cloneGroupStatuses(alloc, observation.group_statuses);
         errdefer table_manager.freeGroupStatuses(alloc, next_group_statuses);
         const next_runtime_statuses = try table_manager.cloneRuntimeGroupStatusReports(alloc, observation.runtime_statuses);
+        stripVolatileEmbeddingActivity(next_runtime_statuses);
         if (!include_repair_status) {
             preserveCommittedRuntimeRepairStatus(records[index].runtime_statuses, next_runtime_statuses);
         }
@@ -211,7 +212,7 @@ pub fn observationChangesRecordWithRepairStatus(
         return false;
     }
 
-    // Until the v13 codec is activated, absence or an incomplete replacement
+    // Until the current profile is activated, absence or an incomplete replacement
     // identity is not authoritative for an already-committed repair identity.
     // A legacy or transient heartbeat can omit an index (or its whole runtime
     // group), and replacing the owned snapshot in that case would erase the
@@ -465,7 +466,6 @@ fn runtimeStatusEqual(
             left.replay_applied_sequence != right.replay_applied_sequence or
             left.replay_target_sequence != right.replay_target_sequence or
             left.replay_catch_up_required != right.replay_catch_up_required or
-            !runtimeEmbeddingActivityStatusEqual(left.embedding_activity, right.embedding_activity) or
             (include_repair_status and (left.repair_status != right.repair_status or
                 left.repair_active_generation_serviceable != right.repair_active_generation_serviceable)))
         {
@@ -475,17 +475,10 @@ fn runtimeStatusEqual(
     return true;
 }
 
-fn runtimeEmbeddingActivityStatusEqual(
-    lhs: table_manager.RuntimeEmbeddingActivityStatusReport,
-    rhs: table_manager.RuntimeEmbeddingActivityStatusReport,
-) bool {
-    return lhs.epoch == rhs.epoch and
-        lhs.chunks_created == rhs.chunks_created and
-        lhs.embedding_batches_completed == rhs.embedding_batches_completed and
-        lhs.embeddings_computed == rhs.embeddings_computed and
-        lhs.active_batch_size == rhs.active_batch_size and
-        lhs.retrying == rhs.retrying and
-        lhs.last_progress_at_ms == rhs.last_progress_at_ms;
+fn stripVolatileEmbeddingActivity(statuses: []table_manager.RuntimeGroupStatusReport) void {
+    for (statuses) |*status| {
+        for (status.indexes) |*index| index.embedding_activity = .{};
+    }
 }
 
 fn optionalStringsEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {

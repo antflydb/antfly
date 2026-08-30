@@ -80,6 +80,8 @@ const setup_io_thread_stack_size = thread_config.minimum_partitioned_stack_size;
 const local_group_status_cache_ttl_ms: u64 = 60 * std.time.ms_per_s;
 const store_status_report_interval_ticks: usize = 40;
 const store_status_heartbeat_interval_ms: u64 = 30 * std.time.ms_per_s;
+const embedding_activity_report_interval_ms: u64 = 1 * std.time.ms_per_s;
+const embedding_activity_protocol_version: u16 = 1;
 const StoreStatusReportKind = enum { none, heartbeat, full };
 const metadata_head_cache_ttl_ms: u64 = std.time.ms_per_s;
 const metadata_snapshot_cache_ttl_ms: u64 = std.time.ms_per_s;
@@ -2928,6 +2930,7 @@ const CachedSplitKey = union(enum) {
 };
 
 const StoreStatusHeartbeatCache = struct {
+    embedding_activity_protocol_version: u16 = 0,
     reporter_incarnation: u64 = 0,
     status_generation: u64 = 0,
     live: bool = true,
@@ -4770,6 +4773,8 @@ pub const DataServer = struct {
     local_transition_runtime: ?antfly.raft.TransitionRuntime = null,
     store_status_ticks: std.atomic.Value(usize) = .init(0),
     store_status_dirty: std.atomic.Value(bool) = .init(true),
+    embedding_activity_status_dirty: std.atomic.Value(bool) = .init(false),
+    last_embedding_activity_report_at_ms: u64 = 0,
     store_capacity_probe_failures: std.atomic.Value(u64) = .init(0),
     last_store_status_report_at_ms: u64 = 0,
     last_data_raft_metadata_sync_at_ms: u64 = 0,
@@ -6762,6 +6767,13 @@ pub const DataServer = struct {
                     break :blk true;
                 };
                 if (registration_ready) {
+                    if (self.embedding_activity_status_dirty.load(.acquire) and
+                        (self.last_embedding_activity_report_at_ms == 0 or
+                            now_ms -| self.last_embedding_activity_report_at_ms >= embedding_activity_report_interval_ms))
+                    {
+                        self.store_status_dirty.store(true, .release);
+                        self.store_status_ticks.store(store_status_report_interval_ticks, .release);
+                    }
                     _ = self.store_status_ticks.fetchAdd(1, .monotonic);
                     const due_store_status_heartbeat = self.last_store_status_report_at_ms == 0 or
                         now_ms -| self.last_store_status_report_at_ms >= store_status_heartbeat_interval_ms;
@@ -8870,6 +8882,19 @@ pub const DataServer = struct {
         kind: antfly.public_api.ProvisionedTableWriteSource.LocalChangeKind,
     ) void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (kind == .runtime_activity) {
+            self.markRuntimeStatusDirty(table_name, kind);
+            self.embedding_activity_status_dirty.store(true, .release);
+            if (self.store_registration != null) {
+                self.requestRuntimeStatusRefresh() catch |err| switch (err) {
+                    error.ThreadQuotaExceeded,
+                    error.SystemResources,
+                    => std.log.warn("runtime activity refresh deferred table={s} err={s}", .{ table_name, @errorName(err) }),
+                    else => std.log.warn("runtime activity refresh failed table={s} err={s}", .{ table_name, @errorName(err) }),
+                };
+            }
+            return;
+        }
         if (kind == .runtime_status) {
             self.markRuntimeStatusDirty(table_name, kind);
             self.markStoreStatusDirtyImmediate();
@@ -8886,7 +8911,7 @@ pub const DataServer = struct {
         self.markLocalSplitKeyCacheDirty();
         switch (kind) {
             .data, .index_repair => self.markLocalGroupDataChanged(),
-            .runtime_status => unreachable,
+            .runtime_status, .runtime_activity => unreachable,
             .runtime_reconciled => {
                 // Reconciliation updates indexes inside the current root.
                 // Invalidate the status plane and report immediately, but do
@@ -9094,7 +9119,7 @@ pub const DataServer = struct {
         self.runtime_status_dirty.store(true, .release);
         switch (kind) {
             .data => self.provisioned_startup_catch_up_dirty.store(true, .release),
-            .index_repair, .runtime_reconciled, .runtime_status => {},
+            .index_repair, .runtime_reconciled, .runtime_status, .runtime_activity => {},
             .structural => {
                 self.clearProvisionedStartupCatchUpBackoffs();
                 self.provisioned_startup_catch_up_dirty.store(true, .release);
@@ -11489,6 +11514,8 @@ pub const DataServer = struct {
         // round; clearing at the end would lose that notification.
         _ = self.store_status_dirty.swap(false, .acq_rel);
         errdefer self.store_status_dirty.store(true, .release);
+        const claimed_activity = self.embedding_activity_status_dirty.swap(false, .acq_rel);
+        errdefer if (claimed_activity) self.embedding_activity_status_dirty.store(true, .release);
         const status_generation = self.store_status_generation.fetchAdd(1, .monotonic);
         var snapshot = try remote_metadata.fetchSnapshot();
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
@@ -11503,9 +11530,9 @@ pub const DataServer = struct {
                 registration.store_id,
             )))
         {
-            // A process that registered before the V14 native-restore boundary
-            // has an incomplete record. Re-register as soon as that mandatory
-            // boundary is safe; optional V15 activity must not delay it.
+            // A process that registered before the V15 safety-profile boundary
+            // has an incomplete record. Re-register once that mandatory
+            // profile is safe; optional activity heartbeats never gate it.
             self.store_registration_confirmed = false;
             try self.registerNodeIfConfigured();
         }
@@ -11579,6 +11606,7 @@ pub const DataServer = struct {
 
         const report: antfly.metadata.table_manager.StoreStatusReport = .{
             .store_id = registration.store_id,
+            .embedding_activity_protocol_version = embedding_activity_protocol_version,
             .reporter_incarnation = reporter_incarnation,
             .status_generation = status_generation,
             .live = true,
@@ -11606,6 +11634,7 @@ pub const DataServer = struct {
         );
         try self.storeStatusHeartbeatCacheReplace(report);
         self.last_store_status_report_at_ms = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        if (claimed_activity) self.last_embedding_activity_report_at_ms = self.last_store_status_report_at_ms;
         self.clearMetadataBootstrapRetry();
     }
 
@@ -11962,6 +11991,7 @@ pub const DataServer = struct {
         if (cache.group_statuses.len == 0 and cache.runtime_statuses.len == 0) return null;
         return .{
             .store_id = store_id,
+            .embedding_activity_protocol_version = cache.embedding_activity_protocol_version,
             .reporter_incarnation = cache.reporter_incarnation,
             .status_generation = cache.status_generation,
             .live = cache.live,
@@ -11991,6 +12021,7 @@ pub const DataServer = struct {
         errdefer if (runtime_statuses.len > 0)
             antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
         var next: StoreStatusHeartbeatCache = .{
+            .embedding_activity_protocol_version = report.embedding_activity_protocol_version,
             .reporter_incarnation = report.reporter_incarnation,
             .status_generation = report.status_generation,
             .live = report.live,
@@ -16816,11 +16847,17 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .replay_catch_up_required = index.replay_catch_up_required,
         .embedding_activity = .{
             .epoch = index.embedding_activity.epoch,
+            .phase = switch (index.embedding_activity.effectivePhase()) {
+                .idle => .idle,
+                .preparing => .preparing,
+                .embedding => .embedding,
+                .publishing => .publishing,
+                .waiting_retry => .waiting_retry,
+            },
             .chunks_created = index.embedding_activity.chunks_created,
             .embedding_batches_completed = index.embedding_activity.embedding_batches_completed,
             .embeddings_computed = index.embedding_activity.embeddings_computed,
             .active_batch_size = index.embedding_activity.active_batch_size,
-            .retrying = index.embedding_activity.retrying,
             .last_progress_at_ms = index.embedding_activity.last_progress_at_ms,
         },
         .repair_status = index.index_repair_status,
@@ -16854,7 +16891,7 @@ test "data runtime report preserves compact managed repair admission state" {
     defer alloc.free(encoded);
     try ant_json.testing.expectSubsetJsonText(
         alloc,
-        "{\"embedding_activity\":{\"epoch\":7,\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"retrying\":true,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
+        "{\"embedding_activity\":{\"epoch\":7,\"phase\":\"waiting_retry\",\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
         encoded,
     );
 }
@@ -17036,7 +17073,7 @@ fn storeRegistrationVisible(
         if (!std.mem.eql(u8, store.api_url, record.api_url)) continue;
         if (!std.mem.eql(u8, store.raft_url, record.raft_url)) continue;
         // A zero committed incarnation is a legacy rolling-upgrade record.
-        // Once v13 is active, registration visibility requires the exact
+        // Once the v15 safety profile is active, registration visibility requires the exact
         // process incarnation and stale processes lose report authority.
         if (store.reporter_incarnation != 0 and
             store.reporter_incarnation != record.reporter_incarnation) continue;
@@ -17092,7 +17129,7 @@ test "data store registration waits for native generation capability acknowledgm
     try std.testing.expect(storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
     try std.testing.expect(!runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.repair_status_record_version));
     try std.testing.expect(runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.native_restore_identity_record_version));
-    try std.testing.expect(runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.embedding_activity_record_version));
+    try std.testing.expect(runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.current_record_version));
 }
 
 fn findRangeByGroupId(
