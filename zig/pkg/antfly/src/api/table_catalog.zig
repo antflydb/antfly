@@ -106,6 +106,8 @@ pub const CatalogSource = struct {
             .vtable = &.{
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
+                .routing_snapshot = metadataServiceRoutingSnapshot,
+                .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = metadataServiceValidatePublication,
                 .validate_table_publication = metadataServiceValidateTablePublication,
@@ -698,6 +700,16 @@ fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Adm
     svc.freeAdminSnapshot(snapshot);
 }
 
+fn metadataServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.catalogRoutingSnapshot(deadline_ns);
+}
+
+fn metadataServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    svc.freeCatalogRoutingSnapshot(snapshot);
+}
+
 fn metadataServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     return try svc.validatePublication(contract);
@@ -780,6 +792,13 @@ fn rangeOverlapsSpan(range: metadata_table_manager.RangeRecord, from_key: []cons
         if (end_key.len > 0 and from_key.len > 0 and std.mem.order(u8, end_key, from_key) != .gt) return false;
     }
     return true;
+}
+
+test "metadata service catalog source uses compact routing snapshots" {
+    var svc: metadata_service.MetadataService = undefined;
+    const source = CatalogSource.fromMetadataService(&svc);
+    try std.testing.expect(source.vtable.routing_snapshot != null);
+    try std.testing.expect(source.vtable.free_routing_snapshot != null);
 }
 
 test "transaction topology fence rejects active split transitions" {
