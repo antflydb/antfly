@@ -209,42 +209,36 @@ pub fn remoteContentErrorIsPermanent(err: anyerror) bool {
 /// Stable pipeline stage used by terminal extraction manifests. Callers pass a
 /// route-level fallback for errors that are not specific to PDF internals.
 pub fn failureStage(err: anyerror, fallback: []const u8) []const u8 {
-    return switch (err) {
-        error.InvalidFlateStream,
-        error.MalformedLzw,
-        error.MalformedPredictorData,
-        error.MalformedRunLength,
-        error.MalformedAscii85,
-        error.MalformedAsciiHex,
-        error.UnsupportedStreamFilter,
-        error.UnsupportedPredictor,
-        error.DecodedStreamTooLarge,
-        error.PdfDecodeWorkingSetTooLarge,
-        => "pdf_stream_decode",
-        error.UnsupportedPdfRendering,
-        error.RenderedPageTooLarge,
-        error.InvalidPageBox,
-        => "pdf_page_render",
-        error.InvalidType1,
-        error.TruncatedType1,
-        error.UnsupportedType1,
-        => "pdf_font_outline",
-        error.InvalidPdfHeader,
-        error.MissingPdfEof,
-        error.MissingStartXref,
-        error.MissingTrailer,
-        error.InvalidStartXref,
-        error.InvalidXref,
-        error.CyclicXref,
-        error.UnsupportedXrefFormat,
-        error.ExpectedTrailerDict,
-        error.MalformedXrefStream,
-        error.MalformedXrefTable,
-        error.InvalidObjectStream,
-        error.InvalidPageTree,
-        => "pdf_structure",
-        else => fallback,
+    return failureStageFromErrorName(@errorName(err), fallback);
+}
+
+/// Resolve the same stable stage from an error identity received across a
+/// compiled boundary. Provider-private errors may map to `InternalFailure` for
+/// control flow while their bounded exact name remains available for durable
+/// diagnostics.
+pub fn failureStageFromErrorName(error_name: []const u8, fallback: []const u8) []const u8 {
+    const stream_decode_errors = [_][]const u8{
+        "InvalidFlateStream",          "MalformedLzw",         "MalformedPredictorData",
+        "MalformedRunLength",          "MalformedAscii85",     "MalformedAsciiHex",
+        "UnsupportedStreamFilter",     "UnsupportedPredictor", "DecodedStreamTooLarge",
+        "PdfDecodeWorkingSetTooLarge",
     };
+    inline for (stream_decode_errors) |name| if (std.mem.eql(u8, error_name, name)) return "pdf_stream_decode";
+
+    const page_render_errors = [_][]const u8{ "UnsupportedPdfRendering", "RenderedPageTooLarge", "InvalidPageBox" };
+    inline for (page_render_errors) |name| if (std.mem.eql(u8, error_name, name)) return "pdf_page_render";
+
+    const font_outline_errors = [_][]const u8{ "InvalidType1", "TruncatedType1", "UnsupportedType1" };
+    inline for (font_outline_errors) |name| if (std.mem.eql(u8, error_name, name)) return "pdf_font_outline";
+
+    const structure_errors = [_][]const u8{
+        "InvalidPdfHeader",    "MissingPdfEof",       "MissingStartXref",   "MissingTrailer",
+        "InvalidStartXref",    "InvalidXref",         "CyclicXref",         "UnsupportedXrefFormat",
+        "ExpectedTrailerDict", "MalformedXrefStream", "MalformedXrefTable", "InvalidObjectStream",
+        "InvalidPageTree",
+    };
+    inline for (structure_errors) |name| if (std.mem.eql(u8, error_name, name)) return "pdf_structure";
+    return fallback;
 }
 
 test "remote fetch classification retries only transient failures" {
@@ -265,6 +259,7 @@ test "remote fetch classification retries only transient failures" {
     try std.testing.expect(!remoteContentErrorIsPermanent(error.TimedOut));
 
     try std.testing.expectEqualStrings("pdf_structure", failureStage(error.InvalidPdfHeader, "document_extraction"));
+    try std.testing.expectEqualStrings("pdf_structure", failureStageFromErrorName("InvalidPdfHeader", "document_extraction"));
     try std.testing.expectEqualStrings("pdf_stream_decode", failureStage(error.InvalidFlateStream, "document_extraction"));
     try std.testing.expectEqualStrings("document_extraction", failureStage(error.InvalidDocumentExtractionConfig, "document_extraction"));
 }

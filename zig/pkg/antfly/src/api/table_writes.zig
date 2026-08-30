@@ -59,6 +59,8 @@ const table_reads = @import("table_reads.zig");
 const storage_snapshot_source = @import("storage_snapshot_source.zig");
 const storage_maintenance_source = @import("storage_maintenance_source.zig");
 const table_write_source = @import("table_write_source.zig");
+const http_routes = @import("http_routes.zig");
+const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const transaction_recovery_source = @import("transaction_recovery_source.zig");
 const table_index_config = @import("table_index_config.zig");
 const table_router = @import("table_router.zig");
@@ -69,8 +71,6 @@ const query_api = @import("query.zig");
 const public_table_http = @import("public_table_http.zig");
 const runtime_status = @import("runtime_status.zig");
 const stored_destination_authorization = @import("stored_destination_authorization.zig");
-
-const storage_kernel_experiment = control_only_storage_sources;
 
 fn nativeSnapshotAttemptTokenAlloc(
     alloc: std.mem.Allocator,
@@ -6689,7 +6689,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn groupLocalWriteSource(self: *ProvisionedTableWriteSource) ?TableWriteSource {
-        if (comptime storage_kernel_experiment) return self.local_write_source;
+        if (comptime control_only_storage_sources) return self.local_write_source;
         return self.local_write_source orelse self.localWriteOwnerSource();
     }
 
@@ -11270,7 +11270,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn runLsmMaintenanceRoundDetailed(self: *ProvisionedTableWriteSource) !LsmMaintenanceRoundResult {
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             const maintenance_source = self.storage_maintenance_source orelse return .{};
             const result = try maintenance_source.runLsmRound(false);
             return .{ .progressed = result.progressed, .group_id = result.group_id };
@@ -11324,7 +11324,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn runLsmMaintenanceRoundBestEffortDetailed(self: *ProvisionedTableWriteSource) !LsmMaintenanceRoundResult {
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             const maintenance_source = self.storage_maintenance_source orelse return .{};
             const result = try maintenance_source.runLsmRound(true);
             return .{ .progressed = result.progressed, .group_id = result.group_id };
@@ -11369,7 +11369,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             const maintenance_source = self.storage_maintenance_source orelse return 0;
             return try maintenance_source.runDensePostingRound();
         }
@@ -11405,7 +11405,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn tryFinishExpiredAutoBulkIngestAndPublishStatus(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) ?bool {
-        if (comptime storage_kernel_experiment) return false;
+        if (comptime control_only_storage_sources) return false;
         var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
         defer {
             for (leases.items) |*lease| {
@@ -11424,7 +11424,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn tryFinishExpiredAutoBulkIngest(self: *ProvisionedTableWriteSource) ?bool {
-        if (comptime storage_kernel_experiment) return false;
+        if (comptime control_only_storage_sources) return false;
         if (!self.local_db_mutex.tryLock()) return null;
         defer self.local_db_mutex.unlock();
 
@@ -11432,7 +11432,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn finishExpiredAutoBulkIngest(self: *ProvisionedTableWriteSource) bool {
-        if (comptime storage_kernel_experiment) return false;
+        if (comptime control_only_storage_sources) return false;
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
 
@@ -11448,7 +11448,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: []const u8,
     ) !void {
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
             if (self.findKernelBulkSessionLocked(table_name) != null) {
@@ -11693,7 +11693,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn lsmMaintenanceScore(self: *ProvisionedTableWriteSource) u64 {
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             const maintenance_source = self.storage_maintenance_source orelse return 0;
             return (maintenance_source.maintenanceSnapshot(false) catch return 0).maintenance_score;
         }
@@ -11706,7 +11706,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn lsmMaintenanceScoreBestEffort(self: *ProvisionedTableWriteSource) u64 {
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             const maintenance_source = self.storage_maintenance_source orelse return 0;
             return (maintenance_source.maintenanceSnapshot(true) catch return 0).maintenance_score;
         }
@@ -11719,7 +11719,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *ProvisionedTableWriteSource) ?u64 {
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             const maintenance_source = self.storage_maintenance_source orelse return null;
             return (maintenance_source.maintenanceSnapshot(true) catch return null).next_wake_delay_ns;
         }
@@ -11735,7 +11735,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn hasActiveBulkIngestSession(self: *ProvisionedTableWriteSource) bool {
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             if (!self.local_db_mutex.tryLock()) return true;
             defer self.local_db_mutex.unlock();
             return self.kernel_bulk_sessions.items.len != 0;
@@ -11866,7 +11866,7 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
     ) bool {
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             if (!self.local_db_mutex.tryLock()) return true;
             defer self.local_db_mutex.unlock();
             return self.findKernelBulkSessionLocked(table_name) != null;
@@ -12853,7 +12853,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn autoBulkIngestStatsBestEffort(self: *ProvisionedTableWriteSource) ProvisionedTableWriteCache.AutoBulkIngestStats {
-        if (comptime storage_kernel_experiment) return .{};
+        if (comptime control_only_storage_sources) return .{};
         if (!self.local_db_mutex.tryLock()) return .{};
         defer self.local_db_mutex.unlock();
         const now_ns = platform_time.monotonicNs();
@@ -14282,7 +14282,7 @@ pub const ProvisionedTableWriteSource = struct {
         metadata: StartupCatchUpMetadata,
         observations: *std.ArrayListUnmanaged(StructuralRuntimeObservation),
     ) !StructuralReconcileGroupOutcome {
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
             const result = (try local_source.reconcileTableGroupLocal(
@@ -14922,7 +14922,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             return try self.beginKernelBulkIngest(table_name);
         }
         if (self.localWriteOwnerSource()) |owner| return try owner.beginBulkIngest(alloc, table_name);
@@ -15059,7 +15059,7 @@ pub const ProvisionedTableWriteSource = struct {
         options: backend_types.BulkIngestFinishOptions,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             return try self.finishKernelBulkIngest(alloc, table_name, options);
         }
         if (self.localWriteOwnerSource()) |owner| return try owner.finishBulkIngest(alloc, table_name, options);
@@ -15141,7 +15141,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn abortBulkIngest(ptr: *anyopaque, table_name: []const u8) void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             self.abortKernelBulkIngest(table_name);
             return;
         }
@@ -15280,7 +15280,7 @@ pub const ProvisionedTableWriteSource = struct {
         enrichment_json: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             try self.enqueueTableStructuralReconcile(table_name);
             return {};
         }
@@ -15307,7 +15307,7 @@ pub const ProvisionedTableWriteSource = struct {
         artifact_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             try self.enqueueTableStructuralReconcile(table_name);
             return {};
         }
@@ -15334,8 +15334,27 @@ pub const ProvisionedTableWriteSource = struct {
         req: tables_api.CreateTableRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime storage_kernel_experiment) {
-            const reconciled = try self.reconcileTableGroupsImmediately(alloc, table_name, null);
+        if (comptime control_only_storage_sources) {
+            const reconciled = self.reconcileTableGroupsImmediately(
+                alloc,
+                table_name,
+                null,
+            ) catch |err| switch (err) {
+                // Catalog admission is already durable. A concurrent status,
+                // maintenance, or foreground lease can legitimately keep the
+                // current owner busy beyond the synchronous reconcile budget.
+                // Preserve create's atomic public contract by handing that
+                // exact catalog target to the durable structural queue instead
+                // of returning an error after metadata has committed.
+                error.StorageBusy,
+                error.StorageKernelOwnerTransitionRequired,
+                error.StorageKernelReconcilePending,
+                => blk: {
+                    try self.enqueueTableStructuralReconcile(table_name);
+                    break :blk {};
+                },
+                else => return err,
+            };
             if (reconciled != null) self.notifyLocalChange(table_name, .structural);
             return reconciled;
         }
@@ -15547,7 +15566,7 @@ pub const ProvisionedTableWriteSource = struct {
         schema_json: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             try self.enqueueTableStructuralReconcile(table_name);
             return {};
         }
@@ -15703,7 +15722,7 @@ pub const ProvisionedTableWriteSource = struct {
         index_json: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             try self.enqueueTableIndexStructuralReconcile(table_name, index_name);
             return {};
         }
@@ -15721,7 +15740,7 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             try self.enqueueTableIndexStructuralReconcile(table_name, index_name);
             return {};
         }
@@ -15747,7 +15766,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_ids: []const u64,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             try enforceHAWriteGateOptional(self.ha_write_gate);
             if (group_ids.len == 0) return null;
             const local_source = self.groupLocalWriteSource() orelse
@@ -16357,7 +16376,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         if (self.localWriteOwnerSource()) |owner| return try owner.backupTable(alloc, table_name, plan);
 
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
             return (try local_source.backupTableGroupLocal(
@@ -16562,7 +16581,7 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.restoreTableReserved(alloc, table_name, plan);
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        if (comptime storage_kernel_experiment)
+        if (comptime control_only_storage_sources)
             return try self.restoreTableKernel(alloc, table_name, plan);
         try backups_api.validateRestorableManifestLayout(plan.manifest);
         try backups_api.validateRestoreManifest(alloc, plan.manifest, plan.manifest.backup_id);
@@ -17426,7 +17445,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         encoded: []const u8,
     ) !void {
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             return try self.installRaftSnapshotGroupLocalKernel(alloc, group_id, encoded);
         }
         return try self.installRaftSnapshotGroupLocalLegacy(alloc, group_id, encoded);
@@ -18411,7 +18430,7 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
             return try corruptEmbeddingArtifactGroupLocal(
                 ptr,
@@ -18494,7 +18513,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
 
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
             _ = (try local_source.corruptEmbeddingArtifactGroupLocal(
@@ -18817,7 +18836,7 @@ pub const ProvisionedTableWriteSource = struct {
         artifact_name: []const u8,
     ) !?bool {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime !storage_kernel_experiment) {
+        if (comptime !control_only_storage_sources) {
             if (self.localWriteOwnerSource()) |owner| return try owner.reprocessDocumentArtifactGroupLocal(alloc, group_id, table_name, doc_key, artifact_name);
         }
         try enforceHAWriteGateOptional(self.ha_write_gate);
@@ -18831,7 +18850,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.markWriteCacheDirty(table_name);
         self.local_db_mutex.unlock();
 
-        const handled = if (comptime storage_kernel_experiment) owner_blk: {
+        const handled = if (comptime control_only_storage_sources) owner_blk: {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
             break :owner_blk (try local_source.reprocessDocumentArtifactGroupLocal(
@@ -18896,7 +18915,7 @@ pub const ProvisionedTableWriteSource = struct {
         update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
     ) !?bool {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime !storage_kernel_experiment) {
+        if (comptime !control_only_storage_sources) {
             if (self.localWriteOwnerSource()) |owner| return try owner.updateDocumentArtifactChildRangePlacementGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, update);
         }
         try enforceHAWriteGateOptional(self.ha_write_gate);
@@ -18910,7 +18929,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.markWriteCacheDirty(table_name);
         self.local_db_mutex.unlock();
 
-        const handled = if (comptime storage_kernel_experiment) owner_blk: {
+        const handled = if (comptime control_only_storage_sources) owner_blk: {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
             break :owner_blk (try local_source.updateDocumentArtifactChildRangePlacementGroupLocal(
@@ -18976,7 +18995,7 @@ pub const ProvisionedTableWriteSource = struct {
         child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
     ) !?u64 {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime !storage_kernel_experiment) {
+        if (comptime !control_only_storage_sources) {
             if (self.localWriteOwnerSource()) |owner| return try owner.applyDocumentArtifactChildRangeBatchGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, child_batch);
         }
         try enforceHAWriteGateOptional(self.ha_write_gate);
@@ -18990,7 +19009,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.markWriteCacheDirty(table_name);
         self.local_db_mutex.unlock();
 
-        const sequence = if (comptime storage_kernel_experiment) owner_blk: {
+        const sequence = if (comptime control_only_storage_sources) owner_blk: {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
             break :owner_blk (try local_source.applyDocumentArtifactChildRangeBatchGroupLocal(
@@ -19055,7 +19074,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.DocumentArtifactTableReprocessRequest,
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime !storage_kernel_experiment) {
+        if (comptime !control_only_storage_sources) {
             if (self.localWriteOwnerSource()) |owner| return try owner.reprocessDocumentArtifactRangeGroupLocal(alloc, group_id, table_name, artifact_name, req);
         }
         try enforceHAWriteGateOptional(self.ha_write_gate);
@@ -19069,7 +19088,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.markWriteCacheDirty(table_name);
         self.local_db_mutex.unlock();
 
-        var result = if (comptime storage_kernel_experiment) owner_blk: {
+        var result = if (comptime control_only_storage_sources) owner_blk: {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
             break :owner_blk (try local_source.reprocessDocumentArtifactRangeGroupLocal(
@@ -19133,7 +19152,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.ArtifactRepairListRequest,
     ) !?db_mod.types.ArtifactRepairListResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime !storage_kernel_experiment) {
+        if (comptime !control_only_storage_sources) {
             if (self.localWriteOwnerSource()) |owner| return try owner.listArtifactRepairIssuesGroupLocal(alloc, group_id, table_name, req);
         }
         self.beginTableRequest(table_name);
@@ -19141,7 +19160,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
 
-        return if (comptime storage_kernel_experiment) owner_blk: {
+        return if (comptime control_only_storage_sources) owner_blk: {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
             break :owner_blk (try local_source.listArtifactRepairIssuesGroupLocal(
@@ -19224,7 +19243,7 @@ pub const ProvisionedTableWriteSource = struct {
             // bounded metadata operation and cannot stall foreground writes.
             effective_options.defer_durable_index_repair_execution = true;
         }
-        if (comptime !storage_kernel_experiment) {
+        if (comptime !control_only_storage_sources) {
             if (self.localWriteOwnerSource()) |owner| return try owner.repairArtifactIssuesGroupLocalControlled(alloc, group_id, table_name, req, effective_options);
         }
         const notify_cancellation = req.target == .index and req.control == .pause_automatic;
@@ -19236,7 +19255,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
 
-        var result = if (comptime storage_kernel_experiment) owner_blk: {
+        var result = if (comptime control_only_storage_sources) owner_blk: {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
             break :owner_blk (try local_source.repairArtifactIssuesGroupLocalControlled(
@@ -19548,6 +19567,41 @@ pub const HostedProvisionedTableWriteSource = struct {
         var client = http_client.ApiHttpClient.init(alloc, self.executor);
         _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
         return client;
+    }
+
+    fn fetchRemoteGroupBatch(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !http_client.BatchResponse {
+        var client = self.httpClient(alloc);
+        return client.fetchGroupBatchWithForwarding(
+            base_uri,
+            group_id,
+            table_name,
+            body,
+            internal_batch_forwarding.max_remaining_ms,
+            .{
+                .remaining_ms = internal_batch_forwarding.max_remaining_ms,
+                .forwards_remaining = internal_batch_forwarding.max_forwards,
+                .campaign_allowed = true,
+            },
+            null,
+        ) catch |err| switch (err) {
+            // A mixed-version peer returns 404 before admission when it does
+            // not expose the routed endpoint. Only that proven pre-proposal
+            // response may fall back to the legacy direct-leader route.
+            error.RaftBatchForwardingUnsupported => try client.fetchGroupBatch(
+                base_uri,
+                group_id,
+                table_name,
+                body,
+            ),
+            else => return err,
+        };
     }
 
     pub fn withDestinationAuthorization(
@@ -20197,7 +20251,6 @@ pub const HostedProvisionedTableWriteSource = struct {
                         if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
                     },
                     .remote => |remote| {
-                        var client = self.httpClient(alloc);
                         const body = try encodeRemoteBatchRequest(alloc, .{
                             .writes = group.writes.items,
                             .deletes = group.deletes.items,
@@ -20209,7 +20262,13 @@ pub const HostedProvisionedTableWriteSource = struct {
                             .sync_level = req.sync_level,
                         });
                         defer alloc.free(body);
-                        var response = try client.fetchGroupBatch(remote.base_uri, group.group_id, table_name, body);
+                        var response = try self.fetchRemoteGroupBatch(
+                            alloc,
+                            remote.base_uri,
+                            group.group_id,
+                            table_name,
+                            body,
+                        );
                         response.deinit(alloc);
                     },
                 }
@@ -49614,4 +49673,127 @@ test "median key lookup reuses startup writer instead of reopening its root" {
     try std.testing.expectEqualStrings("doc:m", median);
     try std.testing.expectEqual(@as(usize, 0), foreground_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), startup_cache.entries.items.len);
+}
+
+test "hosted remote batch prefers routed Raft protocol with safe legacy fallback" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Router = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001) 2 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2 and group_id == 7001) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, allocator: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try allocator.dupe(u8, "http://data-node");
+        }
+    };
+
+    const Executor = struct {
+        reject_routed: bool = false,
+        requests: usize = 0,
+        routed_requests: usize = 0,
+        legacy_requests: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.requests += 1;
+            try std.testing.expect(std.mem.indexOf(u8, req.uri, "/internal/v1/groups/7001/tables/docs/") != null);
+            if (std.mem.endsWith(u8, req.uri, http_routes.Routes.routed_batch_suffix)) {
+                self.routed_requests += 1;
+                const forwarding = (try internal_batch_forwarding.parse(req)).?;
+                try std.testing.expectEqual(internal_batch_forwarding.max_remaining_ms, forwarding.remaining_ms);
+                try std.testing.expectEqual(internal_batch_forwarding.max_forwards, forwarding.forwards_remaining);
+                try std.testing.expect(forwarding.campaign_allowed);
+                if (self.reject_routed) return .{ .status = 404, .body = try allocator.dupe(u8, "not found") };
+            } else {
+                self.legacy_requests += 1;
+                try std.testing.expect(std.mem.endsWith(u8, req.uri, http_routes.Routes.batch_suffix));
+            }
+            return .{ .status = 201, .body = try allocator.dupe(u8, "{}") };
+        }
+    };
+
+    const req: db_mod.types.BatchRequest = .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+    };
+
+    var routed_executor = Executor{};
+    var routed_source = HostedProvisionedTableWriteSource.init("unused", Catalog.iface(), Router.iface(), routed_executor.iface());
+    _ = (try routed_source.source().batch(alloc, "docs", req)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), routed_executor.requests);
+    try std.testing.expectEqual(@as(usize, 1), routed_executor.routed_requests);
+    try std.testing.expectEqual(@as(usize, 0), routed_executor.legacy_requests);
+
+    var legacy_executor = Executor{ .reject_routed = true };
+    var legacy_source = HostedProvisionedTableWriteSource.init("unused", Catalog.iface(), Router.iface(), legacy_executor.iface());
+    _ = (try legacy_source.source().batch(alloc, "docs", req)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), legacy_executor.requests);
+    try std.testing.expectEqual(@as(usize, 1), legacy_executor.routed_requests);
+    try std.testing.expectEqual(@as(usize, 1), legacy_executor.legacy_requests);
 }

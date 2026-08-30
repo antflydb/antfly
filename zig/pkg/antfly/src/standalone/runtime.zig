@@ -1989,6 +1989,11 @@ pub fn runFromIterator(
         else
             linkedInferenceApiInfallible().destroy(antfly_node);
     };
+    // Attach before opening any context-backed auth/system stores. Those
+    // handles intentionally retain the storage context for their lifetime;
+    // attaching afterward is rejected as a live-owner configuration mutation.
+    if (comptime storage_kernel_experiment)
+        try storage_kernel_context.attachInferenceProvider(antfly_node);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -2428,8 +2433,6 @@ pub fn runFromIterator(
         )).configure(&configure_context);
         if (!configure_status.isOk()) return inference_bridge.errorFromStatus(configure_status);
     }
-    if (comptime storage_kernel_experiment)
-        try storage_kernel_context.attachInferenceProvider(antfly_node);
     data_server.setAntflyProvider(inferenceBoundaryProvider(antfly_node));
 
     // Initialize API server (wires caches + sources) without binding a listener.

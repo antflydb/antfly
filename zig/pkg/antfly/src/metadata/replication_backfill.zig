@@ -285,6 +285,23 @@ pub const SnapshotBackfillRunner = struct {
         var source = try self.registry.create(self.alloc, config);
         defer source.deinit(self.alloc);
 
+        const cutover_config_fingerprint = exactCutoverConfigFingerprint(
+            table.table_id,
+            source_ordinal,
+            parsed,
+        );
+        const existing_owns_config = if (existing_status) |status|
+            exactCutoverIntentOwnsConfig(
+                status,
+                parsed,
+                cutover_config_fingerprint,
+            )
+        else
+            false;
+        const exact_config_replaced = if (existing_status) |status|
+            exactCutoverConfigWasReplaced(status, existing_owns_config)
+        else
+            false;
         const stored_prepared_checkpoint = if (existing_status) |status|
             if (status.prepared_checkpoint.len > 0) status.prepared_checkpoint else null
         else
@@ -293,10 +310,11 @@ pub const SnapshotBackfillRunner = struct {
             if (status.cutover_mode.len > 0) status.cutover_mode else null
         else
             null;
-        const restart_exact_snapshot = exactSnapshotRequiresFreshExport(
-            parsed.require_exact_cutover,
-            existing_status,
-        );
+        const restart_exact_snapshot = exact_config_replaced or
+            exactSnapshotRequiresFreshExport(
+                parsed.require_exact_cutover,
+                existing_status,
+            );
         const snapshot_order_fields =
             try deriveSnapshotOrderFieldsAlloc(self.alloc, parsed.key_template);
         defer freeSnapshotOrderFieldsOwned(self.alloc, snapshot_order_fields);
@@ -350,19 +368,6 @@ pub const SnapshotBackfillRunner = struct {
             }
         }
 
-        const cutover_config_fingerprint = exactCutoverConfigFingerprint(
-            table.table_id,
-            source_ordinal,
-            parsed,
-        );
-        const existing_owns_config = if (existing_status) |status|
-            exactCutoverIntentOwnsConfig(
-                status,
-                parsed,
-                cutover_config_fingerprint,
-            )
-        else
-            false;
         const resume_pending_authority = existing_owns_config and
             stored_cutover_mode != null and
             std.mem.eql(
@@ -1162,18 +1167,52 @@ pub const SnapshotBackfillCoordinator = struct {
                 try self.runner.checkpointWork();
                 summary.sources_considered += 1;
                 const existing = findReplicationSourceStatus(statuses, table.table_id, @intCast(ordinal));
+                const exact_config_replaced = if (existing) |record| blk: {
+                    if (record.cutover_authority_id == 0) break :blk false;
+                    var parsed = try parseReplicationSourceConfig(
+                        self.alloc,
+                        table.name,
+                        table.replication_sources_json,
+                        @intCast(ordinal),
+                        self.runner.destination_authorizer,
+                    );
+                    defer parsed.deinit(self.alloc);
+                    break :blk exactCutoverConfigWasReplaced(
+                        record,
+                        exactCutoverIntentOwnsConfig(
+                            record,
+                            parsed,
+                            exactCutoverConfigFingerprint(
+                                table.table_id,
+                                @intCast(ordinal),
+                                parsed,
+                            ),
+                        ),
+                    );
+                } else false;
                 if (existing) |record| {
-                    if (std.mem.eql(u8, record.phase, "snapshot_complete") or phaseAllowsStreaming(record.phase)) {
+                    if (!exact_config_replaced and
+                        (std.mem.eql(u8, record.phase, "snapshot_complete") or
+                            phaseAllowsStreaming(record.phase)))
+                    {
                         summary.sources_skipped_complete += 1;
                         continue;
                     }
-                    if (std.mem.eql(u8, record.phase, "failed") and std.mem.eql(u8, record.failure_class, "terminal")) {
+                    if (!exact_config_replaced and
+                        std.mem.eql(u8, record.phase, "failed") and
+                        std.mem.eql(u8, record.failure_class, "terminal"))
+                    {
                         summary.sources_skipped_complete += 1;
                         continue;
                     }
                 }
 
-                const start_offset = if (existing) |record| snapshotOffsetForStatus(record) else 0;
+                const start_offset = if (exact_config_replaced)
+                    0
+                else if (existing) |record|
+                    snapshotOffsetForStatus(record)
+                else
+                    0;
                 if (start_offset > 0) {
                     summary.sources_resumed += 1;
                 } else {
@@ -2823,6 +2862,16 @@ fn exactSnapshotRequiresFreshExport(
             cutover_mode_exported_snapshot,
         ) and
         !phaseAllowsStreaming(status.phase);
+}
+
+fn exactCutoverConfigWasReplaced(
+    status: metadata_table_manager.ReplicationSourceStatusRecord,
+    owns_current_config: bool,
+) bool {
+    // Legacy/non-exact statuses have no authority-scoped provider resources.
+    // Exact statuses must be rebound whenever the catalog source definition no
+    // longer hashes to the authority that created their physical resources.
+    return status.cutover_authority_id != 0 and !owns_current_config;
 }
 
 fn hashCutoverConfigBytes(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {

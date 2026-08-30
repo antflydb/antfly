@@ -31864,7 +31864,8 @@ fn computeDocumentExtractionAssetRequestDerived(
     var extraction = extractDocumentDownloadedAlloc(alloc, downloaded_mut, source_url, config, config_json, doc_value, &extraction_failure) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, boundaryFailureErrorName(&extraction_failure, err), "document extraction failed", document_extraction_mod.failureStage(err, "document_extraction"), artifact_writes);
+            const exact_error_name = boundaryFailureErrorName(&extraction_failure, err);
+            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), artifact_writes);
             return;
         },
     };

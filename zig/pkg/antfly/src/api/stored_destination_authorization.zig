@@ -292,16 +292,21 @@ pub fn authorizeReplicationSourceValue(
     defer destinations.deinit(alloc);
     try collectRouteDestinations(alloc, source, &destinations);
     const grant = try validateGrant(source.object, destinations.items);
-    if (authorizer) |live| {
-        const payload = try grantSigningPayloadAlloc(
-            alloc,
-            source_table,
-            grant.principal,
-            destinations.items,
-            source.object,
-        );
-        defer alloc.free(payload);
-        try live.authorize(alloc, grant.principal, destinations.items, payload, grant.signature);
+    // A source without routes writes only to its own table. It intentionally
+    // has no grant envelope and therefore no delegated destination authority
+    // to revalidate when a background worker resumes it.
+    if (destinations.items.len > 0) {
+        if (authorizer) |live| {
+            const payload = try grantSigningPayloadAlloc(
+                alloc,
+                source_table,
+                grant.principal,
+                destinations.items,
+                source.object,
+            );
+            defer alloc.free(payload);
+            try live.authorize(alloc, grant.principal, destinations.items, payload, grant.signature);
+        }
     }
 }
 
@@ -651,4 +656,23 @@ test "stored destination envelopes cannot be forged and validate on resume" {
     defer alloc.free(fingerprint);
     try std.testing.expect(destinationConfigFingerprintMatches(raw, raw_indexes, fingerprint));
     try std.testing.expect(!destinationConfigFingerprintMatches(raw, "{}", fingerprint));
+}
+
+test "sink-free replication sources do not require destination credentials" {
+    const alloc = std.testing.allocator;
+    const source =
+        \\[{"type":"postgres","dsn":"postgres://localhost/db","postgres_table":"users"}]
+    ;
+    const live_authorizer: Authorizer = .{ .auth_enabled = true };
+
+    const sealed = try sealReplicationSourcesJsonForPrincipalAlloc(
+        alloc,
+        source,
+        "users",
+        catalog_service_principal,
+        live_authorizer,
+    );
+    defer alloc.free(sealed);
+    try authorizeReplicationSourcesJson(alloc, sealed, "users", live_authorizer);
+    try std.testing.expect(std.mem.indexOf(u8, sealed, grant_field) == null);
 }
