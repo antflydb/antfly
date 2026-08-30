@@ -1837,13 +1837,84 @@ fn colorSpaceSelectionForPattern(base: ?ColorSpaceValue) ColorSpaceSelection {
     return selection;
 }
 
+fn defaultColorSpaceName(kind: ColorSpaceKind) ?[]const u8 {
+    return switch (kind) {
+        .device_gray => "DefaultGray",
+        .device_rgb => "DefaultRGB",
+        .device_cmyk => "DefaultCMYK",
+        .pattern, .unsupported => null,
+    };
+}
+
+fn isDefaultDeviceColorSpaceName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "DefaultGray") or
+        std.mem.eql(u8, name, "DefaultRGB") or
+        std.mem.eql(u8, name, "DefaultCMYK");
+}
+
 fn colorSpaceSelectionFromName(color_spaces: []const PageColorSpace, name: []const u8) ColorSpaceSelection {
     const direct = colorSpaceKindFromName(name);
+    if (defaultColorSpaceName(direct)) |default_name| {
+        for (color_spaces) |color_space| {
+            if (std.mem.eql(u8, color_space.name, default_name) and
+                color_space.selection.kind != .pattern and
+                color_space.selection.kind != .unsupported and
+                colorSpaceComponentCount(color_space.selection.kind) == colorSpaceComponentCount(direct))
+                return color_space.selection;
+        }
+        return colorSpaceSelectionForKind(direct);
+    }
     if (direct != .unsupported) return colorSpaceSelectionForKind(direct);
     for (color_spaces) |color_space| {
         if (std.mem.eql(u8, color_space.name, name)) return color_space.selection;
     }
     return colorSpaceSelectionForKind(.unsupported);
+}
+
+fn initialGraphicsStateForColorSpaces(color_spaces: []const PageColorSpace) GraphicsState {
+    var state = GraphicsState{ .color_spaces = color_spaces };
+    const selection = colorSpaceSelectionFromName(color_spaces, "DeviceGray");
+    state.fill_color_space = selection;
+    state.stroke_color_space = selection;
+    state.fill_color = initialColorForColorSpace(selection.value);
+    state.stroke_color = state.fill_color;
+    return state;
+}
+
+fn initialTextRunStateForColorSpaces(color_spaces: []const PageColorSpace) TextRunState {
+    var state = TextRunState{ .color_spaces = color_spaces };
+    const selection = colorSpaceSelectionFromName(color_spaces, "DeviceGray");
+    state.fill_color_space = selection;
+    state.stroke_color_space = selection;
+    state.fill_color = initialColorForColorSpace(selection.value);
+    state.stroke_color = state.fill_color;
+    return state;
+}
+
+fn selectFillDeviceColorSpace(state: anytype, kind: ColorSpaceKind, components: [4]f64) void {
+    const name = switch (kind) {
+        .device_gray => "DeviceGray",
+        .device_rgb => "DeviceRGB",
+        .device_cmyk => "DeviceCMYK",
+        .pattern, .unsupported => unreachable,
+    };
+    const selection = colorSpaceSelectionFromName(state.color_spaces, name);
+    state.fill_color_space = selection;
+    state.fill_pattern_name = null;
+    state.fill_color = renderColorSpaceComponents(selection.value, components);
+}
+
+fn selectStrokeDeviceColorSpace(state: anytype, kind: ColorSpaceKind, components: [4]f64) void {
+    const name = switch (kind) {
+        .device_gray => "DeviceGray",
+        .device_rgb => "DeviceRGB",
+        .device_cmyk => "DeviceCMYK",
+        .pattern, .unsupported => unreachable,
+    };
+    const selection = colorSpaceSelectionFromName(state.color_spaces, name);
+    state.stroke_color_space = selection;
+    state.stroke_pattern_name = null;
+    state.stroke_color = renderColorSpaceComponents(selection.value, components);
 }
 
 fn clampColorComponent(value: f64, range: ColorComponentRange) f64 {
@@ -3264,49 +3335,47 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.dupe(u8, "");
+        var stream_ranges: ?[]ContentStreamRange = null;
+        const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
+        defer self.alloc.free(decoded_content);
+        defer self.alloc.free(stream_ranges.?);
 
         const fonts = try self.collectPageFontsAlloc(&page);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
-        const forms = try self.collectPageTextFormsAlloc(&page);
+        const forms = try self.collectPageTextFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
-        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
         defer {
             for (color_spaces) |*color_space| color_space.deinit(self.alloc);
             self.alloc.free(color_spaces);
         }
 
-        const contents = page.get("Contents") orelse return try self.alloc.dupe(u8, "");
         var canonical = std.ArrayList(u8).empty;
         defer canonical.deinit(self.alloc);
         var layout_runs = std.ArrayList(LayoutTextRun).empty;
         defer layout_runs.deinit(self.alloc);
         defer for (layout_runs.items) |*run| run.deinit(self.alloc);
-        var layout_parser = try PositionedTextParser.init(self.alloc, .{ .layout = &layout_runs }, .{ .color_spaces = color_spaces }, &.{}, .nonzero);
+        var layout_parser = try PositionedTextParser.init(self.alloc, .{ .layout = &layout_runs }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
         defer layout_parser.deinit();
         layout_parser.cancellation = self.cancellation;
 
-        const streams = try self.collectContentStreamsAlloc(contents);
-        defer {
-            for (streams) |*stream| stream.deinit(self.alloc);
-            self.alloc.free(streams);
-        }
-        for (streams) |*stream| {
-            const decoded = try self.readDecodedStreamData(stream);
-            defer self.alloc.free(decoded);
+        for (stream_ranges.?) |range| {
+            const stream_content = decoded_content[range.start..range.end];
             // Keep the pre-reconstruction extraction contract as the byte
             // preservation baseline. Real-world PDFs sometimes package
             // independently generated content streams whose inherited font
             // state would otherwise decode (and drop) different glyphs.
             var text_parser = TextContentParser.init(self.alloc, &canonical);
             defer text_parser.deinit();
-            try text_parser.consume(decoded, fonts, forms, 0);
-            try layout_parser.consume(decoded, fonts, &.{}, forms);
+            try text_parser.consume(stream_content, fonts, forms, 0);
+            try layout_parser.consume(stream_content, fonts, &.{}, forms);
         }
 
         var owned_text = try canonical.toOwnedSlice(self.alloc);
@@ -3338,28 +3407,32 @@ pub const Reader = struct {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
-        defer {
-            for (gstates) |*gstate| gstate.deinit(self.alloc);
-            self.alloc.free(gstates);
-        }
-        const forms = try self.collectPageFormsAlloc(&page);
-        defer {
-            for (forms) |*form| form.deinit(self.alloc);
-            self.alloc.free(forms);
-        }
-        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
-        defer {
-            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
-            self.alloc.free(color_spaces);
-        }
-
         const contents = page.get("Contents") orelse return .{
             .text = try self.alloc.dupe(u8, ""),
             .runs = try self.alloc.alloc(TextRun, 0),
             .outline_fallback = pageFontsUsedOutlineFallback(fonts),
         };
-        var analysis = try self.extractContentsTextAnalysisAlloc(contents, fonts, gstates, forms, color_spaces);
+        var stream_ranges: ?[]ContentStreamRange = null;
+        const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
+        defer self.alloc.free(decoded_content);
+        defer self.alloc.free(stream_ranges.?);
+        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        defer {
+            for (gstates) |*gstate| gstate.deinit(self.alloc);
+            self.alloc.free(gstates);
+        }
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
+        defer {
+            for (forms) |*form| form.deinit(self.alloc);
+            self.alloc.free(forms);
+        }
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
+
+        var analysis = try self.extractDecodedTextAnalysisAlloc(decoded_content, stream_ranges.?, fonts, gstates, forms, color_spaces);
         analysis.outline_fallback = pageFontsUsedOutlineFallback(fonts);
         return analysis;
     }
@@ -3369,6 +3442,11 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(TextRun, 0);
+        var stream_ranges: ?[]ContentStreamRange = null;
+        const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
+        defer self.alloc.free(decoded_content);
+        defer self.alloc.free(stream_ranges.?);
 
         const fonts = try self.collectPageFontsAlloc(&page);
         defer {
@@ -3380,19 +3458,18 @@ pub const Reader = struct {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
         }
-        const forms = try self.collectPageFormsAlloc(&page);
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
-        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
         defer {
             for (color_spaces) |*color_space| color_space.deinit(self.alloc);
             self.alloc.free(color_spaces);
         }
 
-        const contents = page.get("Contents") orelse return try self.alloc.alloc(TextRun, 0);
-        return try self.extractContentsTextRunsAlloc(contents, fonts, gstates, forms, color_spaces);
+        return try self.extractDecodedTextRunsAlloc(decoded_content, stream_ranges.?, fonts, gstates, forms, color_spaces);
     }
 
     pub fn extractPageImageRunsAlloc(self: *Reader, page_num: usize) ![]ImageRun {
@@ -3400,8 +3477,11 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(ImageRun, 0);
+        const decoded_content = try self.readCombinedContentStreamsAlloc(contents);
+        defer self.alloc.free(decoded_content);
 
-        const images = try self.collectPageImagesAlloc(&page);
+        const images = try self.collectPageImagesForContentAlloc(&page, decoded_content);
         defer {
             for (images) |*image| image.deinit(self.alloc);
             self.alloc.free(images);
@@ -3411,19 +3491,18 @@ pub const Reader = struct {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
         }
-        const forms = try self.collectPageFormsAlloc(&page);
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
-        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
         defer {
             for (color_spaces) |*color_space| color_space.deinit(self.alloc);
             self.alloc.free(color_spaces);
         }
 
-        const contents = page.get("Contents") orelse return try self.alloc.alloc(ImageRun, 0);
-        return try self.extractContentsImageRunsAlloc(contents, images, gstates, forms, color_spaces);
+        return try self.extractDecodedImageRunsAlloc(decoded_content, images, gstates, forms, color_spaces);
     }
 
     pub fn extractPageShadingRunsAlloc(self: *Reader, page_num: usize) ![]ShadingRun {
@@ -3431,6 +3510,9 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(ShadingRun, 0);
+        const decoded_content = try self.readCombinedContentStreamsAlloc(contents);
+        defer self.alloc.free(decoded_content);
 
         const shadings = try self.collectPageShadingsAlloc(&page);
         defer {
@@ -3442,19 +3524,18 @@ pub const Reader = struct {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
         }
-        const forms = try self.collectPageFormsAlloc(&page);
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
-        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
         defer {
             for (color_spaces) |*color_space| color_space.deinit(self.alloc);
             self.alloc.free(color_spaces);
         }
 
-        const contents = page.get("Contents") orelse return try self.alloc.alloc(ShadingRun, 0);
-        return try self.extractContentsShadingRunsAlloc(contents, shadings, gstates, forms, color_spaces);
+        return try self.extractDecodedShadingRunsAlloc(decoded_content, shadings, gstates, forms, color_spaces);
     }
 
     pub fn extractPagePatternRunsAlloc(self: *Reader, page_num: usize) ![]PatternRun {
@@ -3462,8 +3543,11 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(PatternRun, 0);
+        const decoded_content = try self.readCombinedContentStreamsAlloc(contents);
+        defer self.alloc.free(decoded_content);
 
-        const patterns = try self.collectPagePatternsAlloc(&page);
+        const patterns = try self.collectPagePatternsForContentAlloc(&page, decoded_content);
         defer {
             for (patterns) |*pattern| pattern.deinit(self.alloc);
             self.alloc.free(patterns);
@@ -3473,19 +3557,18 @@ pub const Reader = struct {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
         }
-        const forms = try self.collectPageFormsAlloc(&page);
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
-        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
         defer {
             for (color_spaces) |*color_space| color_space.deinit(self.alloc);
             self.alloc.free(color_spaces);
         }
 
-        const contents = page.get("Contents") orelse return try self.alloc.alloc(PatternRun, 0);
-        return try self.extractContentsPatternRunsAlloc(contents, patterns, gstates, forms, color_spaces);
+        return try self.extractDecodedPatternRunsAlloc(decoded_content, patterns, gstates, forms, color_spaces);
     }
 
     pub fn extractPageRenderRunsAlloc(self: *Reader, page_num: usize) !PageRenderRuns {
@@ -3569,7 +3652,7 @@ pub const Reader = struct {
         errdefer if (!pattern_transferred) for (pattern_out.items) |*run| run.deinit(self.alloc);
         errdefer if (!shape_transferred) for (shape_out.items) |*run| run.deinit(self.alloc);
 
-        var text_parser = try PositionedTextParser.init(self.alloc, .{ .render = &text_out }, .{ .color_spaces = color_spaces }, &.{}, .nonzero);
+        var text_parser = try PositionedTextParser.init(self.alloc, .{ .render = &text_out }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
         defer text_parser.deinit();
         text_parser.cancellation = self.cancellation;
 
@@ -3665,23 +3748,25 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(ShapeRun, 0);
+        const decoded_content = try self.readCombinedContentStreamsAlloc(contents);
+        defer self.alloc.free(decoded_content);
         const gstates = try self.collectPageExtGStatesAlloc(&page);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
         }
-        const forms = try self.collectPageFormsAlloc(&page);
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
-        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
         defer {
             for (color_spaces) |*color_space| color_space.deinit(self.alloc);
             self.alloc.free(color_spaces);
         }
-        const contents = page.get("Contents") orelse return try self.alloc.alloc(ShapeRun, 0);
-        return try self.extractContentsShapeRunsAlloc(contents, gstates, forms, color_spaces);
+        return try self.extractDecodedShapeRunsAlloc(decoded_content, gstates, forms, color_spaces);
     }
 
     pub fn extractPageType3TextShapeRunsAlloc(self: *Reader, page_num: usize) ![]ShapeRun {
@@ -3693,6 +3778,11 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(ShapeRun, 0);
+        var stream_ranges: ?[]ContentStreamRange = null;
+        const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
+        defer self.alloc.free(decoded_content);
+        defer self.alloc.free(stream_ranges.?);
 
         const fonts = try self.collectPageFontsAlloc(&page);
         defer {
@@ -3700,7 +3790,22 @@ pub const Reader = struct {
             self.alloc.free(fonts);
         }
 
-        const text_runs = try self.extractPageTextRunsAlloc(page_num);
+        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        defer {
+            for (gstates) |*gstate| gstate.deinit(self.alloc);
+            self.alloc.free(gstates);
+        }
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
+        defer {
+            for (forms) |*form| form.deinit(self.alloc);
+            self.alloc.free(forms);
+        }
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
+        const text_runs = try self.extractDecodedTextRunsAlloc(decoded_content, stream_ranges.?, fonts, gstates, forms, color_spaces);
         defer {
             for (text_runs) |*run| run.deinit(self.alloc);
             self.alloc.free(text_runs);
@@ -4148,18 +4253,38 @@ pub const Reader = struct {
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(PatternRun, 0);
+        var stream_ranges: ?[]ContentStreamRange = null;
+        const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
+        defer self.alloc.free(decoded_content);
+        defer self.alloc.free(stream_ranges.?);
 
         const fonts = try self.collectPageFontsAlloc(&page);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
-        const patterns = try self.collectPagePatternsAlloc(&page);
+        const patterns = try self.collectPagePatternsForContentAlloc(&page, decoded_content);
         defer {
             for (patterns) |*pattern| pattern.deinit(self.alloc);
             self.alloc.free(patterns);
         }
-        const text_runs = try self.extractPageTextRunsAlloc(page_num);
+        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        defer {
+            for (gstates) |*gstate| gstate.deinit(self.alloc);
+            self.alloc.free(gstates);
+        }
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
+        defer {
+            for (forms) |*form| form.deinit(self.alloc);
+            self.alloc.free(forms);
+        }
+        const color_spaces = try self.collectPageColorSpacesForContentAlloc(&page, decoded_content);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
+        const text_runs = try self.extractDecodedTextRunsAlloc(decoded_content, stream_ranges.?, fonts, gstates, forms, color_spaces);
         defer {
             for (text_runs) |*run| run.deinit(self.alloc);
             self.alloc.free(text_runs);
@@ -4241,80 +4366,64 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsTextRunsAlloc(self: *const Reader, contents: *const syntax.Object, fonts: []const PageFont, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]TextRun {
+    fn extractDecodedTextRunsAlloc(self: *const Reader, decoded: []const u8, ranges: []const ContentStreamRange, fonts: []const PageFont, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]TextRun {
         var out = std.ArrayList(TextRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
-        var parser = try PositionedTextParser.init(self.alloc, .{ .render = &out }, .{ .color_spaces = color_spaces }, &.{}, .nonzero);
+        var parser = try PositionedTextParser.init(self.alloc, .{ .render = &out }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
         defer parser.deinit();
         parser.cancellation = self.cancellation;
 
-        const streams = try self.collectContentStreamsAlloc(contents);
-        defer {
-            for (streams) |*stream| stream.deinit(self.alloc);
-            self.alloc.free(streams);
-        }
-        for (streams) |*stream| {
-            const decoded = try self.readDecodedStreamData(stream);
-            defer self.alloc.free(decoded);
-            try parser.consume(decoded, fonts, gstates, forms);
-        }
+        for (ranges) |range|
+            try parser.consume(decoded[range.start..range.end], fonts, gstates, forms);
 
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsImageRunsAlloc(self: *const Reader, contents: *const syntax.Object, images: []const PageImage, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]ImageRun {
+    fn extractDecodedImageRunsAlloc(self: *const Reader, decoded: []const u8, images: []const PageImage, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]ImageRun {
         var out = std.ArrayList(ImageRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
 
-        const decoded = try self.readCombinedContentStreamsAlloc(contents);
-        defer self.alloc.free(decoded);
         var paint_order: usize = 0;
         var next_group_id: u32 = 1;
-        try extractImageRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, images, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
+        try extractImageRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, images, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsShadingRunsAlloc(self: *const Reader, contents: *const syntax.Object, shadings: []const PageShading, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]ShadingRun {
+    fn extractDecodedShadingRunsAlloc(self: *const Reader, decoded: []const u8, shadings: []const PageShading, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]ShadingRun {
         var out = std.ArrayList(ShadingRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
 
-        const decoded = try self.readCombinedContentStreamsAlloc(contents);
-        defer self.alloc.free(decoded);
         var paint_order: usize = 0;
         var next_group_id: u32 = 1;
-        try extractShadingRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, shadings, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
+        try extractShadingRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, shadings, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsShapeRunsAlloc(self: *const Reader, contents: *const syntax.Object, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]ShapeRun {
+    fn extractDecodedShapeRunsAlloc(self: *const Reader, decoded: []const u8, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]ShapeRun {
         var out = std.ArrayList(ShapeRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
 
-        const decoded = try self.readCombinedContentStreamsAlloc(contents);
-        defer self.alloc.free(decoded);
         var paint_order: usize = 0;
         var next_group_id: u32 = 1;
-        try extractShapeRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
+        try extractShapeRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsPatternRunsAlloc(self: *const Reader, contents: *const syntax.Object, patterns: []const PagePattern, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]PatternRun {
+    fn extractDecodedPatternRunsAlloc(self: *const Reader, decoded: []const u8, patterns: []const PagePattern, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]PatternRun {
         var out = std.ArrayList(PatternRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
 
-        const decoded = try self.readCombinedContentStreamsAlloc(contents);
-        defer self.alloc.free(decoded);
         var paint_order: usize = 0;
         var next_group_id: u32 = 1;
-        try extractPatternRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, patterns, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
+        try extractPatternRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, patterns, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
@@ -4343,22 +4452,22 @@ pub const Reader = struct {
         if ((images.len > 0 or forms.len > 0) and has_do) {
             var paint_order: usize = 0;
             var next_group_id: u32 = 1;
-            try extractImageRunsFromContentAppendWithStateCancelable(self.alloc, image_out, decoded, images, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
+            try extractImageRunsFromContentAppendWithStateCancelable(self.alloc, image_out, decoded, images, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
         }
         if ((shadings.len > 0 and has_shading_paint) or (forms.len > 0 and has_do)) {
             var paint_order: usize = 0;
             var next_group_id: u32 = 1;
-            try extractShadingRunsFromContentAppendWithStateCancelable(self.alloc, shading_out, decoded, shadings, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
+            try extractShadingRunsFromContentAppendWithStateCancelable(self.alloc, shading_out, decoded, shadings, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
         }
         if ((patterns.len > 0 and has_shape_paint) or (forms.len > 0 and has_do)) {
             var paint_order: usize = 0;
             var next_group_id: u32 = 1;
-            try extractPatternRunsFromContentAppendWithStateCancelable(self.alloc, pattern_out, decoded, patterns, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
+            try extractPatternRunsFromContentAppendWithStateCancelable(self.alloc, pattern_out, decoded, patterns, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
         }
         if (has_shape_paint or (forms.len > 0 and has_do)) {
             var paint_order: usize = 0;
             var next_group_id: u32 = 1;
-            try extractShapeRunsFromContentAppendWithStateCancelable(self.alloc, shape_out, decoded, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
+            try extractShapeRunsFromContentAppendWithStateCancelable(self.alloc, shape_out, decoded, gstates, forms, initialGraphicsStateForColorSpaces(color_spaces), &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
         }
     }
 
@@ -4503,7 +4612,25 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    const ContentStreamRange = struct {
+        start: usize,
+        end: usize,
+    };
+
     fn readCombinedContentStreamsAlloc(self: *const Reader, contents: *const syntax.Object) ![]u8 {
+        return try self.readCombinedContentStreamsWithRangesAlloc(contents, null);
+    }
+
+    /// Decode a page's content streams once while retaining their logical
+    /// boundaries. The combined buffer is used for resource reachability and
+    /// stateful parsing; ranges let canonical text extraction preserve its
+    /// historical per-stream parser reset without decoding the streams again.
+    fn readCombinedContentStreamsWithRangesAlloc(
+        self: *const Reader,
+        contents: *const syntax.Object,
+        ranges_out: ?*?[]ContentStreamRange,
+    ) ![]u8 {
+        if (ranges_out) |out| out.* = null;
         try self.checkCancellation();
         const streams = try self.collectContentStreamsAlloc(contents);
         defer {
@@ -4514,8 +4641,16 @@ pub const Reader = struct {
         // The decoder already returns an owned buffer. Preserve that ownership
         // for the overwhelmingly common single-stream page instead of copying
         // it into a second equally sized aggregation buffer at peak memory.
-        if (streams.len == 1)
-            return try self.readDecodedStreamDataWithLimits(&streams[0], self.decode_limits);
+        if (streams.len == 1) {
+            const decoded = try self.readDecodedStreamDataWithLimits(&streams[0], self.decode_limits);
+            errdefer self.alloc.free(decoded);
+            if (ranges_out) |out| {
+                const ranges = try self.alloc.alloc(ContentStreamRange, 1);
+                ranges[0] = .{ .start = 0, .end = decoded.len };
+                out.* = ranges;
+            }
+            return decoded;
+        }
 
         const Part = struct {
             decoded_len: usize = 0,
@@ -4592,6 +4727,11 @@ pub const Reader = struct {
             return error.PdfDecodeWorkingSetTooLarge;
         const combined = try self.alloc.alloc(u8, total_len);
         errdefer self.alloc.free(combined);
+        const ranges: ?[]ContentStreamRange = if (ranges_out != null)
+            try self.alloc.alloc(ContentStreamRange, streams.len)
+        else
+            null;
+        errdefer if (ranges) |owned| self.alloc.free(owned);
         var cursor: usize = 0;
         for (streams, parts, 0..) |*stream, *part, stream_index| {
             try self.checkCancellation();
@@ -4610,10 +4750,13 @@ pub const Reader = struct {
             };
             defer if (part.retained == null) self.alloc.free(decoded);
             if (decoded.len != part.decoded_len) return error.InvalidContents;
+            if (ranges) |owned| owned[stream_index].start = cursor;
             @memcpy(combined[cursor .. cursor + decoded.len], decoded);
             cursor += decoded.len;
+            if (ranges) |owned| owned[stream_index].end = cursor;
         }
         std.debug.assert(cursor == combined.len);
+        if (ranges_out) |out| out.* = ranges.?;
         return combined;
     }
 
@@ -4634,9 +4777,10 @@ pub const Reader = struct {
         }
     }
 
-    fn extractContentsTextAnalysisAlloc(
+    fn extractDecodedTextAnalysisAlloc(
         self: *const Reader,
-        contents: *const syntax.Object,
+        decoded: []const u8,
+        ranges: []const ContentStreamRange,
         fonts: []const PageFont,
         gstates: []const PageExtGState,
         forms: []const PageForm,
@@ -4649,25 +4793,19 @@ pub const Reader = struct {
             for (runs.items) |*run| run.deinit(self.alloc);
             runs.deinit(self.alloc);
         }
-        var run_parser = try PositionedTextParser.init(self.alloc, .{ .render = &runs }, .{ .color_spaces = color_spaces }, &.{}, .nonzero);
+        var run_parser = try PositionedTextParser.init(self.alloc, .{ .render = &runs }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
         defer run_parser.deinit();
         run_parser.cancellation = self.cancellation;
 
-        const streams = try self.collectContentStreamsAlloc(contents);
-        defer {
-            for (streams) |*stream| stream.deinit(self.alloc);
-            self.alloc.free(streams);
-        }
-        for (streams) |*stream| {
-            const decoded = try self.readDecodedStreamData(stream);
-            defer self.alloc.free(decoded);
+        for (ranges) |range| {
+            const stream_content = decoded[range.start..range.end];
             // Runs retain cross-stream graphics/text state for geometry, while
             // canonical bytes retain the legacy per-stream decoding behavior.
             // Reconstruction is accepted only when it preserves those bytes.
             var text_parser = TextContentParser.init(self.alloc, &text);
             defer text_parser.deinit();
-            try text_parser.consume(decoded, fonts, forms, 0);
-            try run_parser.consume(decoded, fonts, gstates, forms);
+            try text_parser.consume(stream_content, fonts, forms, 0);
+            try run_parser.consume(stream_content, fonts, gstates, forms);
         }
 
         var owned_text = try text.toOwnedSlice(self.alloc);
@@ -5556,16 +5694,29 @@ pub const Reader = struct {
         value: *const syntax.Object,
         resource_entries: []const syntax.DictEntry,
         depth: u8,
+        allow_default_remap: bool,
     ) anyerror!ColorSpaceSelection {
         if (depth >= 8) return colorSpaceSelectionForKind(.unsupported);
         var resolved = try self.resolveValue(value);
         defer resolved.deinit(self.alloc);
         if (resolved.asName()) |name| {
             const direct = colorSpaceKindFromName(name);
-            if (direct != .unsupported) return colorSpaceSelectionForKind(direct);
+            if (direct != .unsupported) {
+                if (allow_default_remap) if (defaultColorSpaceName(direct)) |default_name| {
+                    for (resource_entries) |entry| {
+                        if (!std.mem.eql(u8, entry.key, default_name)) continue;
+                        const remapped = try self.classifyColorSpaceResource(&entry.value, resource_entries, depth + 1, false);
+                        if (remapped.kind != .pattern and remapped.kind != .unsupported and
+                            colorSpaceComponentCount(remapped.kind) == colorSpaceComponentCount(direct))
+                            return remapped;
+                        break;
+                    }
+                };
+                return colorSpaceSelectionForKind(direct);
+            }
             for (resource_entries) |entry| {
                 if (std.mem.eql(u8, entry.key, name))
-                    return try self.classifyColorSpaceResource(&entry.value, resource_entries, depth + 1);
+                    return try self.classifyColorSpaceResource(&entry.value, resource_entries, depth + 1, allow_default_remap);
             }
             return colorSpaceSelectionForKind(.unsupported);
         }
@@ -5573,7 +5724,7 @@ pub const Reader = struct {
         const family = resolved.array[0].asName() orelse return colorSpaceSelectionForKind(.unsupported);
         if (std.mem.eql(u8, family, "Pattern")) {
             if (resolved.array.len == 1) return colorSpaceSelectionForKind(.pattern);
-            const base = try self.classifyColorSpaceResource(&resolved.array[1], resource_entries, depth + 1);
+            const base = try self.classifyColorSpaceResource(&resolved.array[1], resource_entries, depth + 1, allow_default_remap);
             if (base.kind == .pattern or base.kind == .unsupported)
                 return colorSpaceSelectionForKind(.unsupported);
             return colorSpaceSelectionForPattern(base.value);
@@ -5591,7 +5742,7 @@ pub const Reader = struct {
             // an ICC profile omits Alternate. Honor that fallback without
             // introducing a platform color-management dependency.
             var selection = if (profile.get("Alternate")) |alternate|
-                try self.classifyColorSpaceResource(alternate, resource_entries, depth + 1)
+                try self.classifyColorSpaceResource(alternate, resource_entries, depth + 1, allow_default_remap)
             else
                 colorSpaceSelectionForKind(switch (components) {
                     1 => .device_gray,
@@ -5628,14 +5779,21 @@ pub const Reader = struct {
         return colorSpaceSelectionForKind(.unsupported);
     }
 
-    fn collectColorSpacesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, referenced_content: ?[]const u8) ![]PageColorSpace {
-        var references: ?ReferencedResourceNames = if (referenced_content) |content|
-            try collectReferencedResourceNamesAlloc(self.alloc, content, &.{ "cs", "CS" })
-        else
-            null;
-        defer if (references) |*owned| owned.deinit(self.alloc);
-        if (references) |*used| if (used.names.count() == 0)
-            return try self.alloc.alloc(PageColorSpace, 0);
+    fn collectColorSpacesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, referenced_content: []const u8) ![]PageColorSpace {
+        var references = try collectReferencedResourceNamesAlloc(self.alloc, referenced_content, &.{ "cs", "CS" });
+        defer references.deinit(self.alloc);
+        {
+            const content = referenced_content;
+            const used = &references;
+            // DeviceGray is the initial stroking and nonstroking space, so a
+            // nonempty stream makes its default reachable even without an
+            // explicit color operator. The other defaults are reachable only
+            // through their abbreviated or explicit selection operators.
+            if (content.len > 0) try used.add(self.alloc, "DefaultGray");
+            if (used.uses_device_rgb) try used.add(self.alloc, "DefaultRGB");
+            if (used.uses_device_cmyk) try used.add(self.alloc, "DefaultCMYK");
+        }
+        if (references.names.count() == 0) return try self.alloc.alloc(PageColorSpace, 0);
 
         const color_spaces_obj = resources.get("ColorSpace") orelse return try self.alloc.alloc(PageColorSpace, 0);
         var resolved_color_spaces = self.resolveValue(color_spaces_obj) catch |err| switch (err) {
@@ -5650,10 +5808,15 @@ pub const Reader = struct {
         errdefer for (out.items) |*color_space| color_space.deinit(self.alloc);
         for (resolved_color_spaces.dict) |entry| {
             try self.checkCancellation();
-            if (references) |*used| if (!used.contains(entry.key)) continue;
+            if (!references.contains(entry.key)) continue;
             var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
             errdefer if (name) |owned| self.alloc.free(owned);
-            const selection = self.classifyColorSpaceResource(&entry.value, resolved_color_spaces.dict, 0) catch |err| switch (err) {
+            const selection = self.classifyColorSpaceResource(
+                &entry.value,
+                resolved_color_spaces.dict,
+                0,
+                !isDefaultDeviceColorSpaceName(entry.key),
+            ) catch |err| switch (err) {
                 error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
                 else => colorSpaceSelectionForKind(.unsupported),
             };
@@ -5664,17 +5827,6 @@ pub const Reader = struct {
             name = null;
         }
         return try out.toOwnedSlice(self.alloc);
-    }
-
-    fn collectPageColorSpacesAlloc(self: *const Reader, page: *const syntax.Object) ![]PageColorSpace {
-        var resources = try self.findInheritedPageValue(page, "Resources");
-        if (resources == null) return try self.alloc.alloc(PageColorSpace, 0);
-        defer if (resources) |*obj| obj.deinit(self.alloc);
-        // Secondary extraction APIs decode their content inside their parser.
-        // Preserve that single-decode path while treating malformed unused
-        // resources as unavailable. The combined render path below already
-        // owns decoded content and performs exact reachability filtering.
-        return try self.collectColorSpacesFromResourcesAlloc(&resources.?, null);
     }
 
     fn collectPageColorSpacesForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageColorSpace {
@@ -5752,6 +5904,13 @@ pub const Reader = struct {
         defer if (resources) |*obj| obj.deinit(self.alloc);
         const content = try self.collectPageContentAlloc(page);
         defer self.alloc.free(content);
+        return try self.collectTextFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
+    }
+
+    fn collectPageTextFormsForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageForm {
+        var resources = try self.findInheritedPageValue(page, "Resources");
+        if (resources == null) return try self.alloc.alloc(PageForm, 0);
+        defer if (resources) |*obj| obj.deinit(self.alloc);
         return try self.collectTextFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
     }
 
@@ -11897,67 +12056,57 @@ fn applyTextRunOperator(
     }
     if (std.mem.eql(u8, op, "rg")) {
         if (operands.len >= 3) {
-            state.fill_color_space = colorSpaceSelectionForKind(.device_rgb);
-            state.fill_pattern_name = null;
-            state.fill_color = rgbColor(
+            selectFillDeviceColorSpace(state, .device_rgb, .{
                 numericObjectValue(&operands[operands.len - 3]) orelse 0,
                 numericObjectValue(&operands[operands.len - 2]) orelse 0,
                 numericObjectValue(&operands[operands.len - 1]) orelse 0,
-            );
+                0,
+            });
         }
         return;
     }
     if (std.mem.eql(u8, op, "RG")) {
         if (operands.len >= 3) {
-            state.stroke_color_space = colorSpaceSelectionForKind(.device_rgb);
-            state.stroke_pattern_name = null;
-            state.stroke_color = rgbColor(
+            selectStrokeDeviceColorSpace(state, .device_rgb, .{
                 numericObjectValue(&operands[operands.len - 3]) orelse 0,
                 numericObjectValue(&operands[operands.len - 2]) orelse 0,
                 numericObjectValue(&operands[operands.len - 1]) orelse 0,
-            );
+                0,
+            });
         }
         return;
     }
     if (std.mem.eql(u8, op, "g")) {
         if (operands.len >= 1) {
-            state.fill_color_space = colorSpaceSelectionForKind(.device_gray);
-            state.fill_pattern_name = null;
-            state.fill_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
+            selectFillDeviceColorSpace(state, .device_gray, .{ numericObjectValue(&operands[operands.len - 1]) orelse 0, 0, 0, 0 });
         }
         return;
     }
     if (std.mem.eql(u8, op, "G")) {
         if (operands.len >= 1) {
-            state.stroke_color_space = colorSpaceSelectionForKind(.device_gray);
-            state.stroke_pattern_name = null;
-            state.stroke_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
+            selectStrokeDeviceColorSpace(state, .device_gray, .{ numericObjectValue(&operands[operands.len - 1]) orelse 0, 0, 0, 0 });
         }
         return;
     }
     if (std.mem.eql(u8, op, "k")) {
         if (operands.len >= 4) {
-            state.fill_color_space = colorSpaceSelectionForKind(.device_cmyk);
-            state.fill_pattern_name = null;
-            state.fill_color = cmykColor(
+            selectFillDeviceColorSpace(state, .device_cmyk, .{
                 numericObjectValue(&operands[operands.len - 4]) orelse 0,
                 numericObjectValue(&operands[operands.len - 3]) orelse 0,
                 numericObjectValue(&operands[operands.len - 2]) orelse 0,
                 numericObjectValue(&operands[operands.len - 1]) orelse 0,
-            );
+            });
         }
         return;
     }
     if (std.mem.eql(u8, op, "K")) {
         if (operands.len >= 4) {
-            state.stroke_color_space = colorSpaceSelectionForKind(.device_cmyk);
-            state.stroke_pattern_name = null;
-            state.stroke_color = cmykColor(
+            selectStrokeDeviceColorSpace(state, .device_cmyk, .{
                 numericObjectValue(&operands[operands.len - 4]) orelse 0,
                 numericObjectValue(&operands[operands.len - 3]) orelse 0,
                 numericObjectValue(&operands[operands.len - 2]) orelse 0,
                 numericObjectValue(&operands[operands.len - 1]) orelse 0,
-            );
+            });
         }
         return;
     }
@@ -12187,30 +12336,25 @@ fn applyImageOperator(
         return;
     }
     if (std.mem.eql(u8, op, "rg") and operands.len >= 3) {
-        state.fill_color_space = colorSpaceSelectionForKind(.device_rgb);
-        state.fill_pattern_name = null;
-        state.fill_color = rgbColor(
+        selectFillDeviceColorSpace(state, .device_rgb, .{
             numericObjectValue(&operands[operands.len - 3]) orelse 0,
             numericObjectValue(&operands[operands.len - 2]) orelse 0,
             numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
+            0,
+        });
         return;
     }
     if (std.mem.eql(u8, op, "g") and operands.len >= 1) {
-        state.fill_color_space = colorSpaceSelectionForKind(.device_gray);
-        state.fill_pattern_name = null;
-        state.fill_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
+        selectFillDeviceColorSpace(state, .device_gray, .{ numericObjectValue(&operands[operands.len - 1]) orelse 0, 0, 0, 0 });
         return;
     }
     if (std.mem.eql(u8, op, "k") and operands.len >= 4) {
-        state.fill_color_space = colorSpaceSelectionForKind(.device_cmyk);
-        state.fill_pattern_name = null;
-        state.fill_color = cmykColor(
+        selectFillDeviceColorSpace(state, .device_cmyk, .{
             numericObjectValue(&operands[operands.len - 4]) orelse 0,
             numericObjectValue(&operands[operands.len - 3]) orelse 0,
             numericObjectValue(&operands[operands.len - 2]) orelse 0,
             numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
+        });
         return;
     }
     if (std.mem.eql(u8, op, "cs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
@@ -12469,57 +12613,47 @@ fn applyShapeOperator(
         return;
     }
     if (std.mem.eql(u8, op, "rg") and operands.len >= 3) {
-        state.fill_color_space = colorSpaceSelectionForKind(.device_rgb);
-        state.fill_pattern_name = null;
-        state.fill_color = rgbColor(
+        selectFillDeviceColorSpace(state, .device_rgb, .{
             numericObjectValue(&operands[operands.len - 3]) orelse 0,
             numericObjectValue(&operands[operands.len - 2]) orelse 0,
             numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
+            0,
+        });
         return;
     }
     if (std.mem.eql(u8, op, "RG") and operands.len >= 3) {
-        state.stroke_color_space = colorSpaceSelectionForKind(.device_rgb);
-        state.stroke_pattern_name = null;
-        state.stroke_color = rgbColor(
+        selectStrokeDeviceColorSpace(state, .device_rgb, .{
             numericObjectValue(&operands[operands.len - 3]) orelse 0,
             numericObjectValue(&operands[operands.len - 2]) orelse 0,
             numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
+            0,
+        });
         return;
     }
     if (std.mem.eql(u8, op, "g") and operands.len >= 1) {
-        state.fill_color_space = colorSpaceSelectionForKind(.device_gray);
-        state.fill_pattern_name = null;
-        state.fill_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
+        selectFillDeviceColorSpace(state, .device_gray, .{ numericObjectValue(&operands[operands.len - 1]) orelse 0, 0, 0, 0 });
         return;
     }
     if (std.mem.eql(u8, op, "G") and operands.len >= 1) {
-        state.stroke_color_space = colorSpaceSelectionForKind(.device_gray);
-        state.stroke_pattern_name = null;
-        state.stroke_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
+        selectStrokeDeviceColorSpace(state, .device_gray, .{ numericObjectValue(&operands[operands.len - 1]) orelse 0, 0, 0, 0 });
         return;
     }
     if (std.mem.eql(u8, op, "k") and operands.len >= 4) {
-        state.fill_color_space = colorSpaceSelectionForKind(.device_cmyk);
-        state.fill_pattern_name = null;
-        state.fill_color = cmykColor(
+        selectFillDeviceColorSpace(state, .device_cmyk, .{
             numericObjectValue(&operands[operands.len - 4]) orelse 0,
             numericObjectValue(&operands[operands.len - 3]) orelse 0,
             numericObjectValue(&operands[operands.len - 2]) orelse 0,
             numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
+        });
         return;
     }
     if (std.mem.eql(u8, op, "K") and operands.len >= 4) {
-        state.stroke_color_space = colorSpaceSelectionForKind(.device_cmyk);
-        state.stroke_pattern_name = null;
-        state.stroke_color = cmykColor(
+        selectStrokeDeviceColorSpace(state, .device_cmyk, .{
             numericObjectValue(&operands[operands.len - 4]) orelse 0,
             numericObjectValue(&operands[operands.len - 3]) orelse 0,
             numericObjectValue(&operands[operands.len - 2]) orelse 0,
             numericObjectValue(&operands[operands.len - 1]) orelse 0,
-        );
+        });
         return;
     }
     if (std.mem.eql(u8, op, "cs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
@@ -13044,33 +13178,47 @@ fn applyPatternOperator(
         return;
     }
     if (std.mem.eql(u8, op, "rg") and operands.len >= 3) {
-        state.fill_color_space = colorSpaceSelectionForKind(.device_rgb);
-        state.fill_pattern_name = null;
+        selectFillDeviceColorSpace(state, .device_rgb, .{
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+            0,
+        });
         return;
     }
     if (std.mem.eql(u8, op, "RG") and operands.len >= 3) {
-        state.stroke_color_space = colorSpaceSelectionForKind(.device_rgb);
-        state.stroke_pattern_name = null;
+        selectStrokeDeviceColorSpace(state, .device_rgb, .{
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+            0,
+        });
         return;
     }
     if (std.mem.eql(u8, op, "g") and operands.len >= 1) {
-        state.fill_color_space = colorSpaceSelectionForKind(.device_gray);
-        state.fill_pattern_name = null;
+        selectFillDeviceColorSpace(state, .device_gray, .{ numericObjectValue(&operands[operands.len - 1]) orelse 0, 0, 0, 0 });
         return;
     }
     if (std.mem.eql(u8, op, "G") and operands.len >= 1) {
-        state.stroke_color_space = colorSpaceSelectionForKind(.device_gray);
-        state.stroke_pattern_name = null;
+        selectStrokeDeviceColorSpace(state, .device_gray, .{ numericObjectValue(&operands[operands.len - 1]) orelse 0, 0, 0, 0 });
         return;
     }
     if (std.mem.eql(u8, op, "k") and operands.len >= 4) {
-        state.fill_color_space = colorSpaceSelectionForKind(.device_cmyk);
-        state.fill_pattern_name = null;
+        selectFillDeviceColorSpace(state, .device_cmyk, .{
+            numericObjectValue(&operands[operands.len - 4]) orelse 0,
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        });
         return;
     }
     if (std.mem.eql(u8, op, "K") and operands.len >= 4) {
-        state.stroke_color_space = colorSpaceSelectionForKind(.device_cmyk);
-        state.stroke_pattern_name = null;
+        selectStrokeDeviceColorSpace(state, .device_cmyk, .{
+            numericObjectValue(&operands[operands.len - 4]) orelse 0,
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        });
         return;
     }
     if (std.mem.eql(u8, op, "cs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
@@ -13992,6 +14140,9 @@ fn contentMayContainOperator(bytes: []const u8, operator: []const u8) bool {
 
 const ReferencedResourceNames = struct {
     names: std.StringHashMapUnmanaged(void) = .empty,
+    uses_device_gray: bool = false,
+    uses_device_rgb: bool = false,
+    uses_device_cmyk: bool = false,
 
     fn deinit(self: *ReferencedResourceNames, alloc: Allocator) void {
         var iterator = self.names.iterator();
@@ -14002,6 +14153,13 @@ const ReferencedResourceNames = struct {
 
     fn contains(self: *const ReferencedResourceNames, name: []const u8) bool {
         return self.names.contains(name);
+    }
+
+    fn add(self: *ReferencedResourceNames, alloc: Allocator, name: []const u8) !void {
+        if (self.names.contains(name)) return;
+        const owned = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned);
+        try self.names.put(alloc, owned, {});
     }
 };
 
@@ -14035,6 +14193,17 @@ fn collectReferencedResourceNamesAlloc(
                 previous_name = try alloc.dupe(u8, name);
             },
             .keyword => |keyword| {
+                if (std.mem.eql(u8, keyword, "g") or std.mem.eql(u8, keyword, "G")) result.uses_device_gray = true;
+                if (std.mem.eql(u8, keyword, "rg") or std.mem.eql(u8, keyword, "RG")) result.uses_device_rgb = true;
+                if (std.mem.eql(u8, keyword, "k") or std.mem.eql(u8, keyword, "K")) result.uses_device_cmyk = true;
+                if ((std.mem.eql(u8, keyword, "cs") or std.mem.eql(u8, keyword, "CS")) and previous_name != null) {
+                    switch (colorSpaceKindFromName(previous_name.?)) {
+                        .device_gray => result.uses_device_gray = true,
+                        .device_rgb => result.uses_device_rgb = true,
+                        .device_cmyk => result.uses_device_cmyk = true,
+                        .pattern, .unsupported => {},
+                    }
+                }
                 if (previous_name) |name| {
                     for (operators) |operator| {
                         if (!std.mem.eql(u8, keyword, operator)) continue;
@@ -19782,6 +19951,64 @@ test "unused dangling color space resources do not abort page rendering" {
         alloc.free(shape_runs);
     }
     try std.testing.expectEqual(@as(usize, 1), shape_runs.len);
+
+    const text = try reader.extractPageTextAlloc(1);
+    defer alloc.free(text);
+    try std.testing.expectEqual(@as(usize, 0), text.len);
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), analysis.runs.len);
+    const text_runs = try reader.extractPageTextRunsAlloc(1);
+    defer alloc.free(text_runs);
+    try std.testing.expectEqual(@as(usize, 0), text_runs.len);
+    const image_runs = try reader.extractPageImageRunsAlloc(1);
+    defer alloc.free(image_runs);
+    try std.testing.expectEqual(@as(usize, 0), image_runs.len);
+    const shading_runs = try reader.extractPageShadingRunsAlloc(1);
+    defer alloc.free(shading_runs);
+    try std.testing.expectEqual(@as(usize, 0), shading_runs.len);
+    const pattern_runs = try reader.extractPagePatternRunsAlloc(1);
+    defer alloc.free(pattern_runs);
+    try std.testing.expectEqual(@as(usize, 0), pattern_runs.len);
+}
+
+test "default device color spaces remap abbreviated explicit and initial selections" {
+    const alloc = std.testing.allocator;
+    const content =
+        "0 0 3 3 re f\n" ++
+        "0 0 1 rg 3 0 3 3 re f\n" ++
+        "/DeviceRGB cs 1 0 0 sc 6 0 3 3 re f\n" ++
+        "0 0 0 0 k 9 0 3 3 re f\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 12 3] /Resources << /ColorSpace << /DefaultGray [/ICCBased 5 0 R] /DefaultRGB [/ICCBased 6 0 R] /DefaultCMYK [/ICCBased 7 0 R] >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /N 1 /Alternate /DeviceGray /Range [0.25 0.75] /Length 0 >>\nstream\nendstream\nendobj\n",
+        "6 0 obj\n<< /N 3 /Alternate /DeviceRGB /Range [0.25 0.75 0.25 0.75 0.25 0.75] /Length 0 >>\nstream\nendstream\nendobj\n",
+        "7 0 obj\n<< /N 4 /Alternate /DeviceCMYK /Range [0.25 0.75 0.25 0.75 0.25 0.75 0.25 0.75] /Length 0 >>\nstream\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageShapeRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 4), runs.len);
+    try std.testing.expectEqual(grayColor(0.25), runs[0].color);
+    try std.testing.expectEqual(rgbColor(0.25, 0.25, 0.75), runs[1].color);
+    try std.testing.expectEqual(rgbColor(0.75, 0.25, 0.25), runs[2].color);
+    try std.testing.expectEqual(cmykColor(0.25, 0.25, 0.25, 0.25), runs[3].color);
 }
 
 test "ICCBased graphics state honors range for initial and explicit colors" {
@@ -23342,6 +23569,19 @@ test "content resource discovery requires the name as the immediate operand" {
     try std.testing.expect(!try contentReferencesXObjectNameAlloc(alloc, "/Huge 0 Do", "Huge"));
     try std.testing.expect(!try contentReferencesXObjectNameAlloc(alloc, "/Huge [] Do", "Huge"));
     try std.testing.expect(try contentReferencesPatternNameAlloc(alloc, "0.5 /Pattern scn", "Pattern"));
+}
+
+test "color resource discovery recognizes device operators but ignores strings and comments" {
+    const alloc = std.testing.allocator;
+    var references = try collectReferencedResourceNamesAlloc(
+        alloc,
+        "(rg k /DeviceCMYK cs) Tj % RG\n/DeviceRGB cs 0 G",
+        &.{ "cs", "CS" },
+    );
+    defer references.deinit(alloc);
+    try std.testing.expect(references.uses_device_gray);
+    try std.testing.expect(references.uses_device_rgb);
+    try std.testing.expect(!references.uses_device_cmyk);
 }
 
 test "content resource discovery is allocation-failure safe" {
