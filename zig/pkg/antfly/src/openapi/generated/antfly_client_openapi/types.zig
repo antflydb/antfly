@@ -21385,7 +21385,7 @@ pub const LinearMergePageStatus = enum {
 /// Linear merge operation for syncing sorted records from external sources. Use this to keep Antfly in sync with an external database or data source. Requests may be sent as plain JSON or gzip-compressed JSON (`Content-Encoding: gzip`). Request bodies are limited to 64 MiB after decompression. Requests that exceed this limit return HTTP 413. **How it works:** 1. Send sorted records from your external source 2. Server upserts records that exist in your batch 3. Server deletes Antfly records in the key range that are absent from your batch 4. If stopped at shard boundary, use next_cursor for next request **WARNING:** Not safe for concurrent operations with overlapping key ranges.
 pub const LinearMergeRequest = struct {
     /// Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}} Requirements: - The server processes keys in lexicographic order - Use consistent key naming (e.g., all start with same prefix) This format avoids duplicate IDs and matches Antfly's batch write interface.
-    records: std.json.ArrayHashMap(std.json.Value),
+    records: std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)),
     /// ID of last record from previous merge request. - First request: Use empty string "" - Subsequent requests: Use next_cursor from previous response - Defines lower bound of key range to process This enables pagination for large datasets.
     last_merged_id: ?[]const u8 = null,
     /// If true, returns what would be deleted without making changes. Use cases: - Validate sync behavior before committing - Check which records will be removed - Test key range boundaries Response includes deleted_ids array when dry_run=true.

@@ -903,7 +903,7 @@ pub const HttpHandler = struct {
             error.InvalidDocumentMutation => return try textResponse(
                 self.alloc,
                 400,
-                "upserts require a JSON object body and deletes must omit body",
+                "upserts require an object document and deletes must omit document",
             ),
             else => return try textResponse(self.alloc, 400, "invalid ingest request"),
         };
@@ -7094,10 +7094,14 @@ fn parseIngestBatchRequest(alloc: Allocator, namespace: []const u8, body: []cons
     }
 
     for (parsed.value.mutations, 0..) |mutation, idx| {
+        const doc_id = try alloc.dupe(u8, mutation.doc_id);
+        errdefer alloc.free(doc_id);
+        const mutation_body = if (mutation.body) |body_value| try alloc.dupe(u8, body_value) else null;
+        errdefer if (mutation_body) |owned| alloc.free(owned);
         mutations[idx] = .{
             .kind = try parseMutationKind(mutation.kind),
-            .doc_id = try alloc.dupe(u8, mutation.doc_id),
-            .body = if (mutation.body) |body_value| try alloc.dupe(u8, body_value) else null,
+            .doc_id = doc_id,
+            .body = mutation_body,
         };
         initialized += 1;
     }
@@ -7110,75 +7114,83 @@ fn parseIngestBatchRequest(alloc: Allocator, namespace: []const u8, body: []cons
 }
 
 fn parseTableIngestBatchRequest(alloc: Allocator, table_name: []const u8, body: []const u8) !api_types.TableIngestBatchRequest {
-    const req = try parseIngestBatchRequest(alloc, table_name, body);
-    errdefer freeDocumentMutations(alloc, req.mutations);
-    try validateCanonicalTableMutations(alloc, req.mutations);
-    return .{
-        .table_name = req.namespace,
-        .timestamp_ns = req.timestamp_ns,
-        .mutations = req.mutations,
+    const ParsedMutation = struct {
+        kind: []const u8,
+        doc_id: []const u8,
+        document: ?ant_json.RawValue = null,
     };
-}
-
-/// The public table bridge stores serialized document bytes in the Serverless
-/// WAL, but the current public document and QueryHit._source contracts are
-/// object-only. Validate one body at a time so malformed or scalar documents
-/// fail before persistence without retaining a second copy of the batch.
-fn validateCanonicalTableMutations(
-    alloc: Allocator,
-    mutations: []const api_types.DocumentMutation,
-) !void {
-    for (mutations) |mutation| switch (mutation.kind) {
-        .upsert => {
-            const body = mutation.body orelse return error.InvalidDocumentMutation;
-            var parsed = parseJsonObjectAlloc(alloc, body) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return error.InvalidDocumentMutation,
-            };
-            parsed.deinit();
-        },
-        .delete => if (mutation.body != null) return error.InvalidDocumentMutation,
+    const ParsedRequest = struct {
+        timestamp_ns: u64,
+        mutations: []ParsedMutation,
     };
-}
 
-test "serverless public table mutation admission enforces canonical document bodies" {
-    const valid = [_]api_types.DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-a", .body = "{\"body\":\"alpha\"}" },
-        .{ .kind = .delete, .doc_id = "doc-b", .body = null },
-    };
-    try validateCanonicalTableMutations(std.testing.allocator, &valid);
+    var parsed = try ant_json.parseFromSlice(ParsedRequest, alloc, body, .{});
+    defer parsed.deinit();
 
-    inline for (.{
-        "plain text",
-        "42",
-        "[1,2]",
-        "null",
-        "{malformed",
-    }) |body| {
-        const invalid = [_]api_types.DocumentMutation{
-            .{ .kind = .upsert, .doc_id = "doc-a", .body = body },
-        };
-        try std.testing.expectError(
-            error.InvalidDocumentMutation,
-            validateCanonicalTableMutations(std.testing.allocator, &invalid),
-        );
+    const mutations = try alloc.alloc(api_types.DocumentMutation, parsed.value.mutations.len);
+    errdefer alloc.free(mutations);
+    var initialized: usize = 0;
+    errdefer {
+        for (mutations[0..initialized]) |*mutation| mutation.deinit(alloc);
     }
 
-    const missing_upsert_body = [_]api_types.DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-a", .body = null },
-    };
-    try std.testing.expectError(
-        error.InvalidDocumentMutation,
-        validateCanonicalTableMutations(std.testing.allocator, &missing_upsert_body),
-    );
+    for (parsed.value.mutations, 0..) |mutation, idx| {
+        const kind = try parseMutationKind(mutation.kind);
+        const document = switch (kind) {
+            .upsert => blk: {
+                const raw = mutation.document orelse return error.InvalidDocumentMutation;
+                _ = ant_json.RawObject.init(raw.bytes) catch return error.InvalidDocumentMutation;
+                break :blk try alloc.dupe(u8, raw.bytes);
+            },
+            .delete => blk: {
+                if (mutation.document != null) return error.InvalidDocumentMutation;
+                break :blk null;
+            },
+        };
+        errdefer if (document) |owned| alloc.free(owned);
+        const doc_id = try alloc.dupe(u8, mutation.doc_id);
+        errdefer alloc.free(doc_id);
+        mutations[idx] = .{
+            .kind = kind,
+            .doc_id = doc_id,
+            .body = document,
+        };
+        initialized += 1;
+    }
 
-    const delete_with_body = [_]api_types.DocumentMutation{
-        .{ .kind = .delete, .doc_id = "doc-a", .body = "{}" },
+    return .{
+        .table_name = table_name,
+        .timestamp_ns = parsed.value.timestamp_ns,
+        .mutations = mutations,
     };
-    try std.testing.expectError(
-        error.InvalidDocumentMutation,
-        validateCanonicalTableMutations(std.testing.allocator, &delete_with_body),
+}
+
+test "serverless public table mutation admission owns embedded object documents" {
+    const alloc = std.testing.allocator;
+    const valid = try parseTableIngestBatchRequest(alloc, "docs",
+        \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":{"body":"alpha"}},{"kind":"delete","doc_id":"doc-b"}]}
     );
+    defer freeDocumentMutations(alloc, valid.mutations);
+    try std.testing.expectEqual(@as(usize, 2), valid.mutations.len);
+    try std.testing.expectEqualStrings("{\"body\":\"alpha\"}", valid.mutations[0].body.?);
+
+    inline for (.{
+        \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":"plain text"}]}
+        ,
+        \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":42}]}
+        ,
+        \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":[1,2]}]}
+        ,
+        \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a"}]}
+        ,
+        \\{"timestamp_ns":1,"mutations":[{"kind":"delete","doc_id":"doc-a","document":{}}]}
+        ,
+    }) |invalid| {
+        try std.testing.expectError(
+            error.InvalidDocumentMutation,
+            parseTableIngestBatchRequest(alloc, "docs", invalid),
+        );
+    }
 }
 
 fn parseEnsureNamespaceRequest(alloc: Allocator, body: []const u8) !api_types.EnsureNamespaceRequest {
@@ -10542,7 +10554,7 @@ test "http handler serves the table public lifecycle and consistency routes" {
         .method = .put,
         .path = "/tables/docs/ingest-batch",
         .body =
-        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","body":"{\"body\":\"alpha\",\"version\":1,\"embedding\":[1,0,0]}"}]}
+        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":{"body":"alpha","version":1,"embedding":[1,0,0]}}]}
         ,
     });
     defer ingest.deinit(alloc);
@@ -10779,7 +10791,7 @@ test "http handler serves the table public lifecycle and consistency routes" {
         .method = .put,
         .path = "/tables/docs/ingest-batch",
         .body =
-        \\{"timestamp_ns":600,"mutations":[{"kind":"upsert","doc_id":"doc-a","body":"{\"body\":\"bravo\",\"priority\":10,\"version\":1,\"embedding\":[1,0,0]}"}]}
+        \\{"timestamp_ns":600,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":{"body":"bravo","priority":10,"version":1,"embedding":[1,0,0]}}]}
         ,
     });
     defer text_only_update.deinit(alloc);
@@ -10833,7 +10845,7 @@ test "http handler serves the table public lifecycle and consistency routes" {
         .method = .put,
         .path = "/tables/docs/ingest-batch",
         .body =
-        \\{"timestamp_ns":789,"mutations":[{"kind":"upsert","doc_id":"doc-b","body":"{\"body\":\"beta\"}"}]}
+        \\{"timestamp_ns":789,"mutations":[{"kind":"upsert","doc_id":"doc-b","document":{"body":"beta"}}]}
         ,
     });
     defer next_ingest.deinit(alloc);
@@ -10987,7 +10999,7 @@ test "http handler accepts structured table updates for metadata-only republish 
         .method = .put,
         .path = "/tables/docs/ingest-batch",
         .body =
-        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","body":"{\"body\":\"alpha\",\"_embeddings\":{\"semantic_idx\":[1,0,0]}}"}]}
+        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":{"body":"alpha","_embeddings":{"semantic_idx":[1,0,0]}}}]}
         ,
     });
     defer ingest.deinit(alloc);
@@ -11124,10 +11136,10 @@ test "http handler query publication exposes vector compaction targets" {
 
     const ingest_body =
         \\{"timestamp_ns":456,"mutations":[
-        \\{"kind":"upsert","doc_id":"doc-a","body":"{\"body\":\"alpha\",\"embedding\":[0,0]}"},
-        \\{"kind":"upsert","doc_id":"doc-b","body":"{\"body\":\"bravo\",\"embedding\":[10,0]}"},
-        \\{"kind":"upsert","doc_id":"doc-c","body":"{\"body\":\"charlie\",\"embedding\":[0,10]}"},
-        \\{"kind":"upsert","doc_id":"doc-d","body":"{\"body\":\"delta\",\"embedding\":[10,10]}"}
+        \\{"kind":"upsert","doc_id":"doc-a","document":{"body":"alpha","embedding":[0,0]}},
+        \\{"kind":"upsert","doc_id":"doc-b","document":{"body":"bravo","embedding":[10,0]}},
+        \\{"kind":"upsert","doc_id":"doc-c","document":{"body":"charlie","embedding":[0,10]}},
+        \\{"kind":"upsert","doc_id":"doc-d","document":{"body":"delta","embedding":[10,10]}}
         \\]}
     ;
     var ingest = try handler.handle(.{
@@ -11259,13 +11271,13 @@ test "http handler resolves table routes through persisted serving namespace map
         .method = .put,
         .path = "/tables/docs/ingest-batch",
         .body =
-        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","body":"alpha"}]}
+        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":"alpha"}]}
         ,
     });
     defer invalid_ingest.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_ingest.status);
     try std.testing.expectEqualStrings(
-        "upserts require a JSON object body and deletes must omit body",
+        "upserts require an object document and deletes must omit document",
         invalid_ingest.body,
     );
 
@@ -11273,7 +11285,7 @@ test "http handler resolves table routes through persisted serving namespace map
         .method = .put,
         .path = "/tables/docs/ingest-batch",
         .body =
-        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","body":"{\"body\":\"alpha\"}"}]}
+        \\{"timestamp_ns":456,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":{"body":"alpha"}}]}
         ,
     });
     defer ingest.deinit(alloc);

@@ -7894,7 +7894,9 @@ export interface components {
              *     }
              */
             records: {
-                [key: string]: unknown;
+                [key: string]: {
+                    [key: string]: unknown;
+                };
             };
             /**
              * @description ID of last record from previous merge request.

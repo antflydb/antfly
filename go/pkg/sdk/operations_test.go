@@ -897,7 +897,7 @@ func TestLinearMergeSendsContentLengthRequestAndParsesResponse(t *testing.T) {
 	}
 
 	result, err := client.LinearMergeWithOptions(context.Background(), "files", LinearMergeRequest{
-		Records: map[string]any{"doc-1": map[string]any{"title": "hello"}},
+		Records: LinearMergeRecords{"doc-1": {"title": "hello"}},
 	}, WriteOptions{
 		MaxRequestBytes:  1024,
 		MaxResponseBytes: 1024,
@@ -932,7 +932,7 @@ func TestLinearMergeRejectsOversizedSuccessResponse(t *testing.T) {
 	}
 
 	_, err = client.LinearMergeWithOptions(context.Background(), "files", LinearMergeRequest{
-		Records: map[string]any{"doc-1": map[string]any{"title": "hello"}},
+		Records: LinearMergeRecords{"doc-1": {"title": "hello"}},
 	}, WriteOptions{
 		MaxRequestBytes:  1024,
 		MaxResponseBytes: 16,
@@ -956,8 +956,8 @@ func TestExecuteLinearMergeUsesWriteOptions(t *testing.T) {
 		t.Fatalf("NewAntflyClientWithOptions: %v", err)
 	}
 
-	_, err = client.ExecuteLinearMerge(context.Background(), "files", SortedPages(map[string]any{
-		"doc-1": map[string]any{"title": strings.Repeat("x", 128)},
+	_, err = client.ExecuteLinearMerge(context.Background(), "files", SortedPages(LinearMergeRecords{
+		"doc-1": {"title": strings.Repeat("x", 128)},
 	}, 1), ExecuteLinearMergeOptions{
 		WriteOptions: WriteOptions{
 			MaxRequestBytes:  64,
@@ -973,10 +973,10 @@ func TestExecuteLinearMergeUsesWriteOptions(t *testing.T) {
 }
 
 func TestSortedLinearMergePagesRespectsByteLimit(t *testing.T) {
-	records := map[string]any{
-		"a": map[string]any{"text": strings.Repeat("a", 24)},
-		"b": map[string]any{"text": strings.Repeat("b", 24)},
-		"c": map[string]any{"text": strings.Repeat("c", 24)},
+	records := LinearMergeRecords{
+		"a": {"text": strings.Repeat("a", 24)},
+		"b": {"text": strings.Repeat("b", 24)},
+		"c": {"text": strings.Repeat("c", 24)},
 	}
 	allPages, err := SortedLinearMergePages(records, LinearMergePageOptions{MaxRecords: 10})
 	if err != nil {
@@ -986,13 +986,13 @@ func TestSortedLinearMergePagesRespectsByteLimit(t *testing.T) {
 		t.Fatalf("pages without byte limit = %d, want 1", len(allPages))
 	}
 
-	oneRecordSize, err := linearMergeRequestSize(map[string]any{
+	oneRecordSize, err := linearMergeRequestSize(LinearMergeRecords{
 		"a": records["a"],
 	}, "x", false, "")
 	if err != nil {
 		t.Fatalf("linearMergeRequestSize one record: %v", err)
 	}
-	twoRecordSize, err := linearMergeRequestSize(map[string]any{
+	twoRecordSize, err := linearMergeRequestSize(LinearMergeRecords{
 		"a": records["a"],
 		"b": records["b"],
 	}, "x", false, "")
@@ -1017,8 +1017,8 @@ func TestSortedLinearMergePagesRespectsByteLimit(t *testing.T) {
 }
 
 func TestSortedLinearMergePagesRejectsSingleOversizedRecord(t *testing.T) {
-	records := map[string]any{
-		"a": map[string]any{"text": strings.Repeat("a", 128)},
+	records := LinearMergeRecords{
+		"a": {"text": strings.Repeat("a", 128)},
 	}
 	_, err := SortedLinearMergePages(records, LinearMergePageOptions{
 		MaxRecords:      10,
@@ -1030,9 +1030,9 @@ func TestSortedLinearMergePagesRejectsSingleOversizedRecord(t *testing.T) {
 }
 
 func TestLinearMergeRequestSizerMatchesEncodedSize(t *testing.T) {
-	records := map[string]any{
-		"a": map[string]any{"text": "alpha", "n": 1},
-		"b": map[string]any{"text": "bravo", "n": 2},
+	records := LinearMergeRecords{
+		"a": {"text": "alpha", "n": 1},
+		"b": {"text": "bravo", "n": 2},
 	}
 	sizer, err := newLinearMergeRequestSizer("cursor", true, SyncLevelFullIndex)
 	if err != nil {

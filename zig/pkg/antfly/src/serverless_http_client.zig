@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const transport_routes = @import("raft/transport/routes.zig");
 const http_common = @import("raft/transport/http_common.zig");
 const public_test_helpers = @import("public_test_helpers.zig");
@@ -575,7 +576,7 @@ pub const ServerlessHttpClient = struct {
         const JsonMutation = struct {
             kind: []const u8,
             doc_id: []const u8,
-            body: ?[]const u8 = null,
+            document: ?ant_json.RawObject = null,
         };
         const json_mutations = try self.alloc.alloc(JsonMutation, req.mutations.len);
         defer self.alloc.free(json_mutations);
@@ -584,7 +585,15 @@ pub const ServerlessHttpClient = struct {
             json_mutations[idx] = .{
                 .kind = mutationKindString(mutation.kind),
                 .doc_id = mutation.doc_id,
-                .body = mutation.body,
+                .document = switch (mutation.kind) {
+                    .upsert => ant_json.RawObject.init(
+                        mutation.body orelse return error.InvalidDocumentMutation,
+                    ) catch return error.InvalidDocumentMutation,
+                    .delete => blk: {
+                        if (mutation.body != null) return error.InvalidDocumentMutation;
+                        break :blk null;
+                    },
+                },
             };
         }
 

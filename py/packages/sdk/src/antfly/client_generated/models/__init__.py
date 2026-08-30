@@ -670,6 +670,7 @@ from .legacy_graph_search_result_kind import LegacyGraphSearchResultKind
 from .linear_merge_page_status import LinearMergePageStatus
 from .linear_merge_request import LinearMergeRequest
 from .linear_merge_request_records import LinearMergeRequestRecords
+from .linear_merge_request_records_additional_property import LinearMergeRequestRecordsAdditionalProperty
 from .linear_merge_result import LinearMergeResult
 from .linkup_search_config import LinkupSearchConfig
 from .linkup_search_config_depth import LinkupSearchConfigDepth
@@ -1642,6 +1643,7 @@ __all__ = (
     "LinearMergePageStatus",
     "LinearMergeRequest",
     "LinearMergeRequestRecords",
+    "LinearMergeRequestRecordsAdditionalProperty",
     "LinearMergeResult",
     "LinkupSearchConfig",
     "LinkupSearchConfigDepth",

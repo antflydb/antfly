@@ -16395,7 +16395,9 @@ components:
       properties:
         records:
           type: object
-          additionalProperties: true
+          additionalProperties:
+            type: object
+            additionalProperties: true
           description: >
             Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}}
 

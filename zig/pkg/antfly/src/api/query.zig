@@ -2181,14 +2181,12 @@ test "query parser accepts full text request subset" {
 
 test "query parser accepts generated query request shape" {
     const metadata_openapi = @import("antfly_metadata_openapi");
-
-    var full_text = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    const full_text = try ant_json.RawValue.init(
         \\{"match":{"field":"body","text":"alpha"}}
-    , .{});
-    defer full_text.deinit();
+    );
 
     const body = try jsonStringifyAlloc(std.testing.allocator, metadata_openapi.QueryRequest{
-        .full_text_search = full_text.value,
+        .full_text_search = full_text,
         .fields = &.{"title"},
         .limit = 5,
         .profile = false,
@@ -2212,15 +2210,15 @@ test "query parser defers ordinary stored projection to response encoding" {
     try std.testing.expect(owned.req.defer_stored_projection);
 }
 
-test "query parser defaults to key-only when fields are omitted" {
+test "query parser defaults to stored documents when fields are omitted" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"limit":5}
     );
     defer owned.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 0), owned.req.fields.len);
-    try std.testing.expectEqual(false, owned.req.include_all_fields);
-    try std.testing.expectEqual(false, owned.req.include_stored);
+    try std.testing.expectEqual(true, owned.req.include_all_fields);
+    try std.testing.expectEqual(true, owned.req.include_stored);
     try std.testing.expectEqual(false, owned.req.defer_stored_projection);
 }
 
@@ -2236,14 +2234,12 @@ test "query parser keeps special stored projection in db layer" {
 
 test "query parser accepts generated count and profile flags" {
     const metadata_openapi = @import("antfly_metadata_openapi");
-
-    var full_text = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    const full_text = try ant_json.RawValue.init(
         \\{"match":{"field":"body","text":"alpha"}}
-    , .{});
-    defer full_text.deinit();
+    );
 
     const body = try jsonStringifyAlloc(std.testing.allocator, metadata_openapi.QueryRequest{
-        .full_text_search = full_text.value,
+        .full_text_search = full_text,
         .count = true,
         .profile = true,
     });
@@ -2304,8 +2300,12 @@ test "query parser preserves filter and exclusion request JSON" {
     defer owned.deinit(std.testing.allocator);
     try std.testing.expect(owned.req.full_text != null);
     try std.testing.expect(owned.req.full_text.? == .match);
-    try std.testing.expect(std.mem.indexOf(u8, owned.req.filter_query_json, "\"term\":{\"status\":\"published\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, owned.req.exclusion_query_json, "\"term\":{\"status\":\"draft\"}") != null);
+    try ant_json.testing.expectEqualJsonText(std.testing.allocator,
+        \\{"term":{"path":"status","term":"published"}}
+    , owned.req.filter_query_json);
+    try ant_json.testing.expectEqualJsonText(std.testing.allocator,
+        \\{"term":{"path":"status","term":"draft"}}
+    , owned.req.exclusion_query_json);
 }
 
 test "query parser does not use dense fast path when public filters are present" {
@@ -2314,8 +2314,12 @@ test "query parser does not use dense fast path when public filters are present"
     );
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), owned.req.dense_queries.len);
-    try std.testing.expect(std.mem.indexOf(u8, owned.req.filter_query_json, "\"status\":\"published\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, owned.req.exclusion_query_json, "\"status\":\"draft\"") != null);
+    try ant_json.testing.expectEqualJsonText(std.testing.allocator,
+        \\{"term":{"path":"status","term":"published"}}
+    , owned.req.filter_query_json);
+    try ant_json.testing.expectEqualJsonText(std.testing.allocator,
+        \\{"term":{"path":"status","term":"draft"}}
+    , owned.req.exclusion_query_json);
 }
 
 test "query parser accepts typed bleve leaf queries through db full_text" {
@@ -2447,9 +2451,9 @@ test "query parser accepts bleve query string filters" {
 
     try std.testing.expect(owned.req.full_text != null);
     try std.testing.expect(owned.req.full_text.? == .match);
-    try std.testing.expect(std.mem.indexOf(u8, owned.req.filter_query_json, "\"bool\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, owned.req.filter_query_json, "\"status\":\"published\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, owned.req.filter_query_json, "\"status\":\"review\"") != null);
+    try ant_json.testing.expectEqualJsonText(std.testing.allocator,
+        \\{"bool":{"should":[{"match":{"path":"status","text":"published"}},{"match":{"path":"status","text":"review"}}],"minimum_should_match":1}}
+    , owned.req.filter_query_json);
 }
 
 test "query parser rejects invalid bleve date ranges" {
@@ -2566,14 +2570,10 @@ test "query parser accepts merge config reranker and pruner" {
     try std.testing.expect(owned.req.pruner.?.require_multi_index);
 }
 
-test "query parser keeps stored documents for dense reranking without fields" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+test "query parser rejects dense reranking without query text" {
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"embeddings":{"dense_idx":[1.0,0.0,0.0]},"indexes":["dense_idx"],"reranker":{"provider":"antfly","model":"cross-encoder/ms-marco-MiniLM-L-6-v2","field":"body","top_n":2},"limit":6}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expect(owned.req.reranker != null);
-    try std.testing.expect(owned.req.include_stored);
+    ));
 }
 
 test "query parser accepts graph queries" {
@@ -2878,8 +2878,9 @@ test "query encoder supports count-only and profile responses" {
         },
     }, result);
     defer encoded.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"total\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"hits\":[]") != null);
+    try ant_json.testing.expectSubsetJsonText(alloc,
+        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[]}}]}
+    , encoded.json);
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"profile\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"took\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"shards\":{\"total\":3,\"successful\":3,\"failed\":0}") != null);
@@ -2973,17 +2974,24 @@ test "query encoder emits graph results" {
     };
     defer result.deinit();
 
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .traverse,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .include_documents = true,
+        },
+    }};
     var encoded = try encodeQueryResponses(alloc, "docs", .{
-        .graph_queries = &.{
-            .{
-                .name = "neighbors",
-                .query = .{
-                    .query_type = .neighbors,
-                    .index_name = "graph_idx",
-                    .start_nodes = .{ .keys = &.{"doc:a"} },
-                    .include_documents = true,
-                },
-            },
+        .graph_queries = &graph_queries,
+        .graph_query_transport = .{
+            .dialect = .canonical,
+            .operations_json =
+            \\{"neighbors":{"traverse":{"index":"graph_idx","start":{"keys":["doc:a"]},"include_documents":true}}}
+            ,
+            .admitted_operations_ptr = @ptrCast(graph_queries[0..].ptr),
+            .admitted_operations_len = graph_queries.len,
         },
     }, .{ .took_ms = 4 }, result);
     defer encoded.deinit(alloc);
@@ -3001,7 +3009,7 @@ test "query encoder emits graph results" {
     try std.testing.expectEqual(@as(usize, 1), nodes.len);
     try std.testing.expectEqualStrings("doc:b", nodes[0].key);
     const document = nodes[0].document orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("beta", document.object.get("title").?.string);
+    try std.testing.expectEqualStrings("beta", document.map.get("title").?.string);
 }
 
 test "query merge applies global score ordering and offset" {
@@ -3675,8 +3683,8 @@ test "query merge rejects explicit score sort without score-bearing source" {
     const score_order = [_]db_mod.types.SortField{.{ .field = "_score", .desc = true }};
 
     var hits = try alloc.alloc(db_mod.types.SearchHit, 2);
-    hits[0] = try testScoreSortedQueryHitAlloc(alloc, "doc:a", 1.0);
-    hits[1] = try testScoreSortedQueryHitAlloc(alloc, "doc:b", 2.0);
+    hits[0] = try testScoreSortedQueryHitAlloc(alloc, "doc:b", 2.0);
+    hits[1] = try testScoreSortedQueryHitAlloc(alloc, "doc:a", 1.0);
     var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 2 };
     defer result.deinit();
 
@@ -3786,16 +3794,17 @@ test "query merge applies distributed typed sort ordering and cursor paging" {
 test "query merge applies default id cursor ordering without explicit order_by" {
     const alloc = std.testing.allocator;
 
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
-    left_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:a");
-    left_hits[1] = try testIdSortedQueryHitAlloc(alloc, "doc:c");
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
-    right_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:b");
-    right_hits[1] = try testIdSortedQueryHitAlloc(alloc, "doc:d");
+    // Distributed cursor shards must already have sought the cursor. The
+    // coordinator validates this invariant rather than silently filtering an
+    // incomplete per-shard window.
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    left_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:c");
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    right_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:d");
 
-    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 2 };
+    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
     defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 2 };
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
     defer right.deinit();
 
     const after_cursor = [_]std.json.Value{.{ .string = "doc:b" }};
@@ -3815,10 +3824,19 @@ test "query merge applies default id cursor ordering without explicit order_by" 
     try std.testing.expectEqualStrings("distributed_merge", after_profile.source);
 
     const before_cursor = [_]std.json.Value{.{ .string = "doc:d" }};
+    var before_left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    before_left_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:a");
+    before_left_hits[1] = try testIdSortedQueryHitAlloc(alloc, "doc:c");
+    var before_right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    before_right_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:b");
+    var before_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = before_left_hits, .total_hits = 2 };
+    defer before_left.deinit();
+    var before_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = before_right_hits, .total_hits = 1 };
+    defer before_right.deinit();
     var before_page = try mergeSearchResults(alloc, .{
         .search_before = &before_cursor,
         .limit = 2,
-    }, &.{ left, right }, 0, 2);
+    }, &.{ before_left, before_right }, 0, 2);
     defer before_page.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);

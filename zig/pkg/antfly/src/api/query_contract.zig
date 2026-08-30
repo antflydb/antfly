@@ -3410,21 +3410,18 @@ fn tryParseFastDensePublicQueryRequest(
 
     const dense_queries = try alloc.alloc(db_mod.types.NamedDenseQuery, index_names.len);
     var dense_queries_initialized: usize = 0;
-    errdefer freeNamedDenseQueries(alloc, dense_queries[0..dense_queries_initialized]);
+    errdefer {
+        for (dense_queries[0..dense_queries_initialized]) |item| {
+            alloc.free(item.name);
+            alloc.free(item.index_name);
+            alloc.free(item.query.vector);
+        }
+        alloc.free(dense_queries);
+    }
 
     for (index_names, 0..) |index_name, i| {
         const embedding = embeddings.map.get(index_name) orelse return error.UnsupportedQueryRequest;
-        dense_queries[i] = .{
-            .name = try alloc.dupe(u8, index_name),
-            .index_name = try alloc.dupe(u8, index_name),
-            .query = .{
-                .vector = switch (embedding) {
-                    .@"packed" => |encoded| vector_codec.decodePackedF32Base64Alloc(alloc, encoded) catch return error.InvalidQueryRequest,
-                    .dense => |dense| try alloc.dupe(f32, dense),
-                },
-                .k = req.limit,
-            },
-        };
+        dense_queries[i] = try cloneFastDenseQueryAlloc(alloc, index_name, embedding, req.limit);
         dense_queries_initialized += 1;
     }
     req.dense_queries = dense_queries;
@@ -3432,6 +3429,30 @@ fn tryParseFastDensePublicQueryRequest(
     return .{
         .fields = fields,
         .req = req,
+    };
+}
+
+fn cloneFastDenseQueryAlloc(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    embedding: anytype,
+    limit: u32,
+) !db_mod.types.NamedDenseQuery {
+    const name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(name);
+    const owned_index_name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(owned_index_name);
+    const vector = switch (embedding) {
+        .@"packed" => |encoded| vector_codec.decodePackedF32Base64Alloc(alloc, encoded) catch return error.InvalidQueryRequest,
+        .dense => |dense| try alloc.dupe(f32, dense),
+    };
+    return .{
+        .name = name,
+        .index_name = owned_index_name,
+        .query = .{
+            .vector = vector,
+            .k = limit,
+        },
     };
 }
 
