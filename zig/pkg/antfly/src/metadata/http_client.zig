@@ -123,6 +123,24 @@ pub const MetadataHttpClient = struct {
         return try self.fetchHeadWithBudget(base_uri, null);
     }
 
+    pub fn fetchCapabilities(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        budget: ?RequestBudget,
+    ) !metadata_api.MetadataCapabilities {
+        const uri = try join(self.alloc, base_uri, routes.Routes.capabilities);
+        defer self.alloc.free(uri);
+        var resp = try self.executeWithRetryBudget(.{
+            .method = .GET,
+            .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
+        }, budget);
+        defer resp.deinit(self.alloc);
+        if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
+        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        return try std.json.parseFromSliceLeaky(metadata_api.MetadataCapabilities, self.alloc, resp.body, .{ .ignore_unknown_fields = true });
+    }
+
     pub fn fetchHeadWithBudget(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -1099,6 +1117,44 @@ test "metadata routing client forwards relative deadline and preserves timeout" 
         }),
     );
     try std.testing.expect(executor.saw_budget);
+}
+
+test "metadata capability client distinguishes advertised routing from N-1 absence" {
+    const Executor = struct {
+        status: u16,
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.capabilities));
+            return .{
+                .status = self.status,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, if (self.status == 200)
+                    "{\"catalog_routing_protocol_min\":2,\"catalog_routing_protocol_max\":2}"
+                else
+                    "not found"),
+            };
+        }
+    };
+
+    var current_executor = Executor{ .status = 200 };
+    var current_client = MetadataHttpClient.init(std.testing.allocator, current_executor.executor());
+    const capabilities = try current_client.fetchCapabilities("http://127.0.0.1:9000", null);
+    try std.testing.expect(capabilities.supportsCatalogRouting(metadata_api.catalog_routing_protocol_current));
+
+    var legacy_executor = Executor{ .status = 404 };
+    var legacy_client = MetadataHttpClient.init(std.testing.allocator, legacy_executor.executor());
+    try std.testing.expectError(
+        error.UnsupportedOperation,
+        legacy_client.fetchCapabilities("http://127.0.0.1:9000", null),
+    );
 }
 
 test "metadata linearizable routing client uses compact internal endpoint" {

@@ -86,6 +86,7 @@ const metadata_snapshot_cache_ttl_ms: u64 = std.time.ms_per_s;
 const remote_metadata_http_executor_pool_size: usize = 4;
 const remote_metadata_linearizable_snapshot_timeout_ns: u64 = 12 * std.time.ns_per_s;
 const remote_metadata_linearizable_snapshot_capability_retry_ns: u64 = 5 * std.time.ns_per_s;
+const remote_metadata_routing_capability_retry_ns: u64 = 5 * std.time.ns_per_s;
 const provision_head_poll_startup_interval_ms: u64 = std.time.ms_per_s;
 const provision_head_poll_interval_ms: u64 = 5 * std.time.ms_per_s;
 const runtime_status_refresh_interval_ms: u64 = std.time.ms_per_s;
@@ -15386,6 +15387,13 @@ fn appendOwnedPeerRouteUpsert(
 }
 
 const RemoteMetadataSource = struct {
+    const RoutingProtocol = enum {
+        unknown,
+        legacy_v1,
+        compact_v2,
+        incompatible,
+    };
+
     const TestFaults = if (@import("builtin").is_test) struct {
         fetch_head_error: ?anyerror = null,
         force_snapshot_cache_miss: bool = false,
@@ -15417,6 +15425,8 @@ const RemoteMetadataSource = struct {
     next_linearizable_snapshot_sequence: u64 = 0,
     published_linearizable_snapshot_sequence: u64 = 0,
     linearizable_snapshot_unsupported_until_ns: []u64,
+    routing_protocols: []RoutingProtocol,
+    routing_protocol_checked_at_ns: []u64,
     http_executors: []antfly.raft.transport.std_http_executor.StdHttpExecutor,
     next_http_executor: std.atomic.Value(usize) = .init(0),
     internal_service_secret: ?[]const u8 = null,
@@ -15455,10 +15465,18 @@ const RemoteMetadataSource = struct {
         const unsupported_until = try alloc.alloc(u64, base_uris.len);
         errdefer alloc.free(unsupported_until);
         @memset(unsupported_until, 0);
+        const routing_protocols = try alloc.alloc(RoutingProtocol, base_uris.len);
+        errdefer alloc.free(routing_protocols);
+        @memset(routing_protocols, .unknown);
+        const routing_protocol_checked_at_ns = try alloc.alloc(u64, base_uris.len);
+        errdefer alloc.free(routing_protocol_checked_at_ns);
+        @memset(routing_protocol_checked_at_ns, 0);
         return .{
             .alloc = alloc,
             .base_uris = owned,
             .linearizable_snapshot_unsupported_until_ns = unsupported_until,
+            .routing_protocols = routing_protocols,
+            .routing_protocol_checked_at_ns = routing_protocol_checked_at_ns,
             .http_executors = http_executors,
         };
     }
@@ -15469,6 +15487,8 @@ const RemoteMetadataSource = struct {
         lockAtomic(&self.cache_mutex);
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         self.alloc.free(self.linearizable_snapshot_unsupported_until_ns);
+        self.alloc.free(self.routing_protocols);
+        self.alloc.free(self.routing_protocol_checked_at_ns);
         for (self.base_uris) |uri| self.alloc.free(uri);
         self.alloc.free(self.base_uris);
         self.cache_mutex.unlock();
@@ -15543,6 +15563,48 @@ const RemoteMetadataSource = struct {
             self.preferred_read_uri_index = (index + 1) % self.base_uris.len;
         }
         self.cache_mutex.unlock();
+    }
+
+    fn routingProtocolForEndpoint(
+        self: *RemoteMetadataSource,
+        index: usize,
+        client: *antfly.metadata_http_client.MetadataHttpClient,
+        budget: ?antfly.metadata_http_client.RequestBudget,
+    ) !RoutingProtocol {
+        const now_ns = platform_time.monotonicNs();
+        lockAtomic(&self.cache_mutex);
+        const cached = self.routing_protocols[index];
+        const checked_at_ns = self.routing_protocol_checked_at_ns[index];
+        self.cache_mutex.unlock();
+        if (cached == .compact_v2 or
+            (cached != .unknown and now_ns -| checked_at_ns < remote_metadata_routing_capability_retry_ns))
+        {
+            if (cached == .incompatible) return error.MetadataRoutingProtocolIncompatible;
+            return cached;
+        }
+
+        const capabilities = client.fetchCapabilities(self.base_uris[index], budget) catch |err| switch (err) {
+            // N-1 metadata predates capability advertisement and is adapted
+            // through its admin and linearizable-admin snapshot endpoints.
+            error.UnsupportedOperation => antfly.metadata_api.MetadataCapabilities{
+                .catalog_routing_protocol_min = 1,
+                .catalog_routing_protocol_max = 1,
+            },
+            else => return err,
+        };
+        const protocol: RoutingProtocol = if (capabilities.supportsCatalogRouting(antfly.metadata_api.catalog_routing_protocol_current))
+            .compact_v2
+        else if (capabilities.supportsCatalogRouting(1))
+            .legacy_v1
+        else
+            .incompatible;
+        lockAtomic(&self.cache_mutex);
+        self.routing_protocols[index] = protocol;
+        self.routing_protocol_checked_at_ns[index] = now_ns;
+        const selected = protocol;
+        self.cache_mutex.unlock();
+        if (selected == .incompatible) return error.MetadataRoutingProtocolIncompatible;
+        return selected;
     }
 
     const LinearizableSnapshotTicket = struct {
@@ -16130,45 +16192,93 @@ const RemoteMetadataSource = struct {
             defer arena.deinit();
             const scratch = arena.allocator();
             var metadata_client = self.metadataClient(scratch);
-            var parsed = (if (linearizable)
-                metadata_client.fetchLinearizableRoutingSnapshot(self.base_uris[index], attempt_budget)
-            else
-                metadata_client.fetchRoutingSnapshotWithBudget(self.base_uris[index], attempt_budget)) catch |err| {
-                if (err == error.Timeout or err == error.DeadlineExceeded or err == error.Cancelled) {
-                    last_err = error.CatalogRoutingSnapshotTimeout;
-                    continue;
-                }
+            const protocol = self.routingProtocolForEndpoint(index, &metadata_client, attempt_budget) catch |err| {
                 last_err = err;
                 continue;
             };
-            defer parsed.deinit();
-            self.acceptMetadataIdentity(
-                parsed.value.metadata_group_id,
-                parsed.value.metadata_incarnation,
-            ) catch |err| {
-                last_err = err;
-                continue;
+            const snapshot = switch (protocol) {
+                .compact_v2 => compact: {
+                    var parsed = (if (linearizable)
+                        metadata_client.fetchLinearizableRoutingSnapshot(self.base_uris[index], attempt_budget)
+                    else
+                        metadata_client.fetchRoutingSnapshotWithBudget(self.base_uris[index], attempt_budget)) catch |err| {
+                        if (err == error.Timeout or err == error.DeadlineExceeded or err == error.Cancelled) {
+                            last_err = error.CatalogRoutingSnapshotTimeout;
+                            continue;
+                        }
+                        last_err = err;
+                        continue;
+                    };
+                    defer parsed.deinit();
+                    break :compact self.ownedRoutingSnapshot(
+                        parsed.value.metadata_group_id,
+                        parsed.value.metadata_incarnation,
+                        parsed.value.catalog_revision,
+                        parsed.value.tables,
+                        parsed.value.ranges,
+                    ) catch |err| {
+                        last_err = err;
+                        continue;
+                    };
+                },
+                .legacy_v1 => legacy: {
+                    var parsed = (if (linearizable)
+                        metadata_client.fetchLinearizableSnapshot(self.base_uris[index], attempt_budget)
+                    else
+                        metadata_client.fetchSnapshotWithBudget(self.base_uris[index], attempt_budget)) catch |err| {
+                        if (err == error.Timeout or err == error.DeadlineExceeded or err == error.Cancelled) {
+                            last_err = error.CatalogRoutingSnapshotTimeout;
+                            continue;
+                        }
+                        last_err = err;
+                        continue;
+                    };
+                    defer parsed.deinit();
+                    break :legacy self.ownedRoutingSnapshot(
+                        parsed.value.status.metadata_group_id,
+                        parsed.value.status.metadata_incarnation,
+                        0,
+                        parsed.value.tables,
+                        parsed.value.ranges,
+                    ) catch |err| {
+                        last_err = err;
+                        continue;
+                    };
+                },
+                .unknown, .incompatible => unreachable,
             };
             self.noteMetadataReadSuccess(index);
-            const tables = try cloneTablesOwned(self.alloc, parsed.value.tables);
-            errdefer freeTablesOwned(self.alloc, tables);
-            return .{
-                .metadata_group_id = parsed.value.metadata_group_id,
-                .metadata_incarnation = parsed.value.metadata_incarnation,
-                .catalog_revision = parsed.value.catalog_revision,
-                .change_token = .{
-                    .metadata_group_id = parsed.value.metadata_group_id,
-                    .metadata_incarnation = parsed.value.metadata_incarnation,
-                    .revision = parsed.value.catalog_revision,
-                },
-                .tables = tables,
-                .ranges = try cloneRangesOwned(self.alloc, parsed.value.ranges),
-            };
+            return snapshot;
         }
         if (deadline_ns) |deadline| {
             if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
         return last_err;
+    }
+
+    fn ownedRoutingSnapshot(
+        self: *RemoteMetadataSource,
+        metadata_group_id: u64,
+        metadata_incarnation: ?antfly.metadata_api.MetadataClusterIncarnation,
+        catalog_revision: u64,
+        source_tables: []const antfly.metadata.table_manager.TableRecord,
+        source_ranges: []const antfly.metadata.table_manager.RangeRecord,
+    ) !antfly.metadata_api.CatalogRoutingSnapshot {
+        try self.acceptMetadataIdentity(metadata_group_id, metadata_incarnation);
+        const tables = try cloneTablesOwned(self.alloc, source_tables);
+        errdefer freeTablesOwned(self.alloc, tables);
+        return .{
+            .metadata_group_id = metadata_group_id,
+            .metadata_incarnation = metadata_incarnation,
+            .catalog_revision = catalog_revision,
+            .change_token = .{
+                .metadata_group_id = metadata_group_id,
+                .metadata_incarnation = metadata_incarnation,
+                .revision = catalog_revision,
+            },
+            .tables = tables,
+            .ranges = try cloneRangesOwned(self.alloc, source_ranges),
+        };
     }
 
     fn remoteFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *antfly.metadata_api.CatalogRoutingSnapshot) void {
@@ -16235,7 +16345,8 @@ const RemoteMetadataSource = struct {
     ) !antfly.public_api.table_catalog.AwaitRouteResult {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         const request = antfly.metadata_api.CatalogRouteResolveRequest{ .query = routeQueryForWire(table_name, query) };
-        var unsupported_count: usize = 0;
+        var legacy_count: usize = 0;
+        var incompatible_count: usize = 0;
         for (0..self.base_uris.len) |attempt| {
             const now_ns = platform_time.monotonicNs();
             if (now_ns >= deadline_ns) return .timed_out;
@@ -16246,9 +16357,18 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             var metadata_client = self.metadataClient(arena.allocator());
+            const protocol = self.routingProtocolForEndpoint(index, &metadata_client, budget) catch |err| {
+                self.noteMetadataReadProbeMiss(index);
+                if (err == error.MetadataRoutingProtocolIncompatible) incompatible_count += 1;
+                continue;
+            };
+            if (protocol == .legacy_v1) {
+                legacy_count += 1;
+                continue;
+            }
             var parsed = metadata_client.awaitCatalogRoute(self.base_uris[index], request, budget) catch |err| {
                 self.noteMetadataReadProbeMiss(index);
-                if (err == error.UnsupportedOperation) unsupported_count += 1;
+                if (err == error.UnsupportedOperation) incompatible_count += 1;
                 continue;
             };
             defer parsed.deinit();
@@ -16273,31 +16393,46 @@ const RemoteMetadataSource = struct {
                 },
             }
         }
-        if (unsupported_count == self.base_uris.len) {
-            var fallback = try self.catalogSource().routingSource();
-            fallback.authority.await_route = null;
-            fallback.authority.wait_for_change = remoteLegacyRoutingRetryWait;
-            return try antfly.public_api.table_catalog.awaitRoute(
-                alloc,
-                fallback,
-                table_name,
-                query,
-                deadline_ns,
-                probe_interval_ns,
-            );
-        }
+        if (legacy_count > 0) return try self.remoteLegacyAwaitRoute(alloc, table_name, query, deadline_ns, probe_interval_ns);
+        if (incompatible_count == self.base_uris.len) return error.MetadataRoutingProtocolIncompatible;
         return .timed_out;
     }
 
-    /// Rolling-upgrade fallback for replicas that predate the route-authority
-    /// endpoint. Eventual snapshots can still observe publication, but they
-    /// must never turn an unchanged follower into a terminal negative.
-    fn remoteLegacyRoutingRetryWait(_: *anyopaque, _: antfly.metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, probe_interval_ns: u64) !antfly.public_api.table_catalog.CatalogChangeWaitResult {
-        const now_ns = platform_time.monotonicNs();
-        if (now_ns >= deadline_ns) return .retry;
-        const wait_ns = @min(deadline_ns - now_ns, @max(probe_interval_ns, std.time.ns_per_ms));
-        platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
-        return .retry;
+    /// N-1 adapter: follower admin snapshots may establish only a positive.
+    /// A terminal miss is returned exclusively after the legacy linearizable
+    /// admin endpoint has captured the same query as absent.
+    fn remoteLegacyAwaitRoute(
+        self: *RemoteMetadataSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        query: antfly.public_api.table_catalog.RouteQuery,
+        deadline_ns: u64,
+        probe_interval_ns: u64,
+    ) !antfly.public_api.table_catalog.AwaitRouteResult {
+        while (platform_time.monotonicNs() < deadline_ns) {
+            var snapshot = self.remoteRoutingSnapshotWithMode(deadline_ns, false) catch |err| switch (err) {
+                error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => break,
+                else => return err,
+            };
+            defer remoteFreeRoutingSnapshot(self, &snapshot);
+            if (try antfly.public_api.table_catalog.routePlanFromSnapshot(alloc, snapshot, table_name, query)) |plan| {
+                return .{ .found = plan };
+            }
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= deadline_ns or deadline_ns - now_ns <= probe_interval_ns) break;
+            const wait_ns = @min(deadline_ns - now_ns, @max(probe_interval_ns, std.time.ns_per_ms));
+            platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
+        }
+        if (platform_time.monotonicNs() >= deadline_ns) return .timed_out;
+        var authoritative = self.remoteRoutingSnapshotWithMode(deadline_ns, true) catch |err| switch (err) {
+            error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return .timed_out,
+            else => return err,
+        };
+        defer remoteFreeRoutingSnapshot(self, &authoritative);
+        if (try antfly.public_api.table_catalog.routePlanFromSnapshot(alloc, authoritative, table_name, query)) |plan| {
+            return .{ .found = plan };
+        }
+        return .publication_not_observed;
     }
 
     fn remoteCachedAdminSnapshot(ptr: *anyopaque) !?antfly.metadata_api.AdminSnapshot {
@@ -31732,6 +31867,70 @@ test "data raft batch forwarding bounds routing campaigns deadlines and determin
 test "remote metadata catalog source provides compact routing" {
     var metadata: RemoteMetadataSource = undefined;
     _ = try metadata.catalogSource().routingSource();
+}
+
+test "remote metadata routing negotiation upgrades the N-1 adapter" {
+    const Executor = struct {
+        status: u16 = 404,
+        protocol: u16 = 2,
+        calls: usize = 0,
+
+        fn executor(self: *@This()) antfly.raft.transport.http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: antfly.raft.transport.http_common.HttpRequest) !antfly.raft.transport.http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, antfly.metadata_http_routes.Routes.capabilities));
+            return .{
+                .status = self.status,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = if (self.status == 200)
+                    try std.fmt.allocPrint(alloc, "{{\"catalog_routing_protocol_min\":{d},\"catalog_routing_protocol_max\":{d}}}", .{ self.protocol, self.protocol })
+                else
+                    try alloc.dupe(u8, "not found"),
+            };
+        }
+    };
+
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    var executor = Executor{};
+    var client = antfly.metadata_http_client.MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectEqual(
+        RemoteMetadataSource.RoutingProtocol.legacy_v1,
+        try source.routingProtocolForEndpoint(0, &client, null),
+    );
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    try std.testing.expectEqual(
+        RemoteMetadataSource.RoutingProtocol.legacy_v1,
+        try source.routingProtocolForEndpoint(0, &client, null),
+    );
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+
+    source.routing_protocol_checked_at_ns[0] = 0;
+    executor.status = 200;
+    try std.testing.expectEqual(
+        RemoteMetadataSource.RoutingProtocol.compact_v2,
+        try source.routingProtocolForEndpoint(0, &client, null),
+    );
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+
+    source.routing_protocols[0] = .unknown;
+    executor.protocol = 3;
+    try std.testing.expectError(
+        error.MetadataRoutingProtocolIncompatible,
+        source.routingProtocolForEndpoint(0, &client, null),
+    );
+    try std.testing.expectEqual(@as(usize, 3), executor.calls);
 }
 
 test "remote catalog watches reserve the outer deadline for replica failover" {

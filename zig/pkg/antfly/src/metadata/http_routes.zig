@@ -21,6 +21,7 @@ pub const routing_remaining_ms_header = "X-Antfly-Routing-Remaining-Ms";
 pub const Routes = struct {
     pub const health = "/metadata/v1/health";
     pub const head = "/metadata/v1/head";
+    pub const capabilities = "/metadata/v1/capabilities";
     pub const internal_linearizable_head = "/internal/v1/catalog/linearizable-head";
     pub const internal_linearizable_snapshot = "/internal/v1/catalog/linearizable-snapshot";
     pub const internal_linearizable_routing_snapshot = "/internal/v1/catalog/linearizable-routing-snapshot";

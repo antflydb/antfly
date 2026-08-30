@@ -43,6 +43,10 @@ pub const CatalogSource = struct {
         /// is only required to confirm an eventual negative routing result.
         linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
+        /// Request-scoped route capabilities may pin DB identity through this
+        /// callback. When present, consumers must not re-derive identity from
+        /// an admin snapshot.
+        route_identity: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64) anyerror!?metadata_api.CatalogIdentityNamespace = null,
         wait_for_routing_change: *const fn (ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, probe_interval_ns: u64) anyerror!CatalogChangeWaitResult = defaultWaitForRoutingChange,
         await_route: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, deadline_ns: u64, probe_interval_ns: u64) anyerror!AwaitRouteResult = null,
         /// Production sources must fail closed when either linearizable
@@ -383,7 +387,8 @@ pub fn resolveGroupForKeyUntil(
 }
 
 pub const RoutedGroupSnapshot = struct {
-    group_id: ?u64,
+    route: ?CatalogGroupRoute,
+    catalog_revision: u64,
     topology_epoch: u64,
 };
 
@@ -411,10 +416,11 @@ pub fn routedGroupSnapshotUntil(
     defer result.deinit(alloc);
     return switch (result) {
         .found => |plan| .{
-            .group_id = plan.groups[0].group_id,
+            .route = plan.groups[0],
+            .catalog_revision = plan.catalog_revision,
             .topology_epoch = plan.topology_epoch,
         },
-        .not_found => .{ .group_id = null, .topology_epoch = 0 },
+        .not_found => .{ .route = null, .catalog_revision = 0, .topology_epoch = 0 },
         .timed_out => error.CatalogRoutingSnapshotTimeout,
     };
 }
@@ -545,6 +551,11 @@ fn topologyEpochFromSortedRanges(
     hasher.update(std.mem.asBytes(&@as(u64, @intCast(ranges.len))));
     for (ranges) |range| {
         hasher.update(std.mem.asBytes(&range.group_id));
+        hasher.update(std.mem.asBytes(&range.range_id));
+        const identity_shard_id = metadata_table_manager.rangeDocIdentityShardId(range.*);
+        const identity_range_id = metadata_table_manager.rangeDocIdentityRangeId(range.*);
+        hasher.update(std.mem.asBytes(&identity_shard_id));
+        hasher.update(std.mem.asBytes(&identity_range_id));
         hasher.update(range.start_key);
         if (range.end_key) |end_key| {
             hasher.update(&[_]u8{1});
@@ -554,6 +565,25 @@ fn topologyEpochFromSortedRanges(
         }
     }
     return hasher.final();
+}
+
+test "routing topology epoch fences identity-only changes" {
+    const table = metadata_table_manager.TableRecord{ .table_id = 7, .name = "docs" };
+    var before = metadata_table_manager.RangeRecord{
+        .group_id = 7001,
+        .range_id = 11,
+        .table_id = 7,
+        .start_key = "",
+        .doc_identity_shard_id = 7001,
+        .doc_identity_range_id = 11,
+    };
+    var after = before;
+    after.doc_identity_shard_id = 9001;
+    after.doc_identity_range_id = 12;
+    const before_ranges = [_]*const metadata_table_manager.RangeRecord{&before};
+    const after_ranges = [_]*const metadata_table_manager.RangeRecord{&after};
+    try std.testing.expect(topologyEpochFromSortedRanges(table, &before_ranges) !=
+        topologyEpochFromSortedRanges(table, &after_ranges));
 }
 
 pub fn transactionTopologyEpoch(
@@ -1162,8 +1192,16 @@ pub fn routePlanFromSnapshot(
 }
 
 pub const RoutedSpanSnapshot = struct {
+    routes: []CatalogGroupRoute,
     group_ids: []u64,
+    catalog_revision: u64,
     topology_epoch: u64,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.routes);
+        alloc.free(self.group_ids);
+        self.* = undefined;
+    }
 };
 
 /// Resolve a span and compute the routing epoch from one catalog snapshot.
@@ -1191,13 +1229,25 @@ pub fn routedSpanSnapshotUntil(
     } }, deadline_ns);
     defer result.deinit(alloc);
     return switch (result) {
-        .found => |plan| .{
-            .group_ids = try plan.groupIdsAlloc(alloc),
-            .topology_epoch = plan.topology_epoch,
+        .found => |plan| blk: {
+            const routes = try alloc.dupe(CatalogGroupRoute, plan.groups);
+            errdefer alloc.free(routes);
+            break :blk .{
+                .routes = routes,
+                .group_ids = try plan.groupIdsAlloc(alloc),
+                .catalog_revision = plan.catalog_revision,
+                .topology_epoch = plan.topology_epoch,
+            };
         },
-        .not_found => .{
-            .group_ids = try alloc.alloc(u64, 0),
-            .topology_epoch = 0,
+        .not_found => blk: {
+            const routes = try alloc.alloc(CatalogGroupRoute, 0);
+            errdefer alloc.free(routes);
+            break :blk .{
+                .routes = routes,
+                .group_ids = try alloc.alloc(u64, 0),
+                .catalog_revision = 0,
+                .topology_epoch = 0,
+            };
         },
         .timed_out => error.CatalogRoutingSnapshotTimeout,
     };

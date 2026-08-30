@@ -1282,6 +1282,7 @@ pub const MetadataHttpServer = struct {
     pub fn registerRoutes(self: *MetadataHttpServer, server: *httpx.Server) !void {
         try server.get(routes.Routes.health, httpx.Handler.bind(self, metadataHealth));
         try server.get(routes.Routes.head, httpx.Handler.bind(self, metadataHead));
+        try server.get(routes.Routes.capabilities, httpx.Handler.bind(self, metadataCapabilities));
         // POST prevents intermediary GET caches from bypassing the read-index
         // barrier that gives this endpoint its meaning.
         try server.post(routes.Routes.internal_linearizable_head, httpx.Handler.bind(self, metadataLinearizableHead));
@@ -1464,6 +1465,10 @@ pub const MetadataHttpServer = struct {
     fn metadataHead(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const result = self.readOperations().head(requestContext(ctx)) catch |err| return metadataReadError(ctx, err);
         return self.trackedJson(ctx, result);
+    }
+
+    fn metadataCapabilities(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        return self.trackedJson(ctx, metadata_api.MetadataCapabilities{});
     }
 
     fn metadataLinearizableHead(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {

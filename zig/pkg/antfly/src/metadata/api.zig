@@ -154,6 +154,20 @@ pub const MetadataHead = struct {
     metadata_epoch: u64 = 0,
 };
 
+pub const catalog_routing_protocol_current: u16 = 2;
+
+/// Wire capabilities are negotiated before a data node chooses its routing
+/// adapter. Absence of this document identifies the N-1 legacy protocol.
+pub const MetadataCapabilities = struct {
+    catalog_routing_protocol_min: u16 = catalog_routing_protocol_current,
+    catalog_routing_protocol_max: u16 = catalog_routing_protocol_current,
+
+    pub fn supportsCatalogRouting(self: @This(), version: u16) bool {
+        return version >= self.catalog_routing_protocol_min and
+            version <= self.catalog_routing_protocol_max;
+    }
+};
+
 /// Compact, constant-size runtime topology consumed by safety monitors.
 /// Keep this separate from MetadataStatus so frequent topology probes never
 /// walk or clone the projected catalog.
