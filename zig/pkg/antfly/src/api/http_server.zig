@@ -35587,7 +35587,17 @@ test "api http server drop table resolves ambiguous completion without deleting 
 
     const FakeSource = struct {
         created: bool = true,
-        table_id: u64 = 1,
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 1,
+            .name = "docs",
+            .placement_role = "data",
+        },
+        range: metadata_table_manager.RangeRecord = .{
+            .group_id = 10,
+            .table_id = 1,
+            .start_key = "",
+            .end_key = null,
+        },
         expected_drop_calls: std.atomic.Value(u32) = .init(0),
         admin_snapshot_calls: std.atomic.Value(u32) = .init(0),
 
@@ -35613,20 +35623,11 @@ test "api http server drop table resolves ambiguous completion without deleting 
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = if (self.created)
-                    @constCast((&[_]metadata_table_manager.TableRecord{.{
-                        .table_id = self.table_id,
-                        .name = "docs",
-                        .placement_role = "data",
-                    }})[0..])
+                    (&self.table)[0..1]
                 else
                     @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
                 .ranges = if (self.created)
-                    @constCast((&[_]metadata_table_manager.RangeRecord{.{
-                        .group_id = 10,
-                        .table_id = self.table_id,
-                        .start_key = "",
-                        .end_key = null,
-                    }})[0..])
+                    (&self.range)[0..1]
                 else
                     @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
@@ -35660,7 +35661,8 @@ test "api http server drop table resolves ambiguous completion without deleting 
             _ = self.expected_drop_calls.fetchAdd(1, .monotonic);
             // The old identity committed its delete, but the response was
             // lost and another creator immediately reused the name.
-            self.table_id = 2;
+            self.table.table_id = 2;
+            self.range.table_id = 2;
             return error.Timeout;
         }
     };
@@ -35695,7 +35697,7 @@ test "api http server drop table resolves ambiguous completion without deleting 
     });
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), resp.status);
-    try std.testing.expectEqual(@as(u64, 2), source.table_id);
+    try std.testing.expectEqual(@as(u64, 2), source.table.table_id);
     try std.testing.expectEqual(@as(u32, 1), source.expected_drop_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), source.admin_snapshot_calls.load(.monotonic));
 }
