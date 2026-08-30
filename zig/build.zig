@@ -1417,6 +1417,11 @@ pub fn build(b: *std.Build) void {
         "storage-kernel-sections",
         "Emit per-function and per-data sections for the shared storage kernel",
     ) orelse true;
+    const storage_kernel_max_rss_gib = b.option(
+        u8,
+        "storage-kernel-max-rss-gib",
+        "Override the storage-kernel scheduler reservation in GiB",
+    );
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -10503,7 +10508,10 @@ pub fn build(b: *std.Build) void {
                 // storage codegen reached 17.42 GB (16.23 GiB). Keep the old
                 // conservative reservations until both release runners have
                 // measured the smaller storage-only closure.
-                .distributed => @as(usize, if (target.result.os.tag == .macos) 18 else 8) * 1024 * 1024 * 1024,
+                .distributed => @as(
+                    usize,
+                    storage_kernel_max_rss_gib orelse if (target.result.os.tag == .macos) 18 else 8,
+                ) * 1024 * 1024 * 1024,
                 // This is deliberately a separate non-PIC product unit. The
                 // Its cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
                 // the 10 GiB reservation keeps it serialized with the macOS

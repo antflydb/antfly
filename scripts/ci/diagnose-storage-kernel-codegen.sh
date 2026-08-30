@@ -31,7 +31,7 @@ summary="${report_root}/${label}.summary.txt"
 trace_prefix="${report_root}/${label}.alloc.trace"
 
 mkdir -p "$report_root" "$local_cache" "$global_cache"
-printf 'elapsed_s\tcgroup_current_bytes\tcompiler_pid\tcompiler_rss_kib\n' > "$timeline"
+printf 'elapsed_s\tcgroup_current_bytes\tcompiler_pid\tcompiler_rss_kib\tcompiler_vma_count\n' > "$timeline"
 
 command=(
   python3 tools/run_bounded_zig_build.py
@@ -51,6 +51,7 @@ command=(
   -Dpjrt=true
   -Dsystem-blas=false
   -Dstorage-kernel-sections="$storage_kernel_sections"
+  -Dstorage-kernel-max-rss-gib=16
   --cache-dir "$local_cache"
   --global-cache-dir "$global_cache"
 )
@@ -66,12 +67,13 @@ if [ "${STORAGE_KERNEL_TRACE_ALLOCATIONS:-0}" = "1" ]; then
 fi
 
 find_storage_compiler_pid() {
-  pgrep -f 'zig build-lib.*--name antfly-storage-kernel' | head -1 || true
+  pgrep -f 'zig build-lib.*--name antfly-storage-kernel' 2>/dev/null | head -1 || true
 }
 
 start_epoch="$(date +%s)"
 max_compiler_rss_kib=0
 max_cgroup_current_bytes=0
+max_compiler_vma_count=0
 
 set +e
 (
@@ -91,9 +93,14 @@ while kill -0 "$build_pid" 2>/dev/null; do
   fi
   compiler_pid="$(find_storage_compiler_pid)"
   compiler_rss_kib=0
+  compiler_vma_count=0
   if [ -n "$compiler_pid" ]; then
     compiler_rss_kib="$(ps -o rss= -p "$compiler_pid" 2>/dev/null | tr -d ' ' || true)"
     compiler_rss_kib="${compiler_rss_kib:-0}"
+    if [ -r "/proc/${compiler_pid}/maps" ]; then
+      compiler_vma_count="$(wc -l < "/proc/${compiler_pid}/maps")"
+      compiler_vma_count="${compiler_vma_count//[[:space:]]/}"
+    fi
   fi
   if [ "$compiler_rss_kib" -gt "$max_compiler_rss_kib" ]; then
     max_compiler_rss_kib="$compiler_rss_kib"
@@ -101,8 +108,11 @@ while kill -0 "$build_pid" 2>/dev/null; do
   if [ "$cgroup_current" -gt "$max_cgroup_current_bytes" ]; then
     max_cgroup_current_bytes="$cgroup_current"
   fi
-  printf '%s\t%s\t%s\t%s\n' \
-    "$elapsed" "$cgroup_current" "${compiler_pid:-}" "$compiler_rss_kib" >> "$timeline"
+  if [ "$compiler_vma_count" -gt "$max_compiler_vma_count" ]; then
+    max_compiler_vma_count="$compiler_vma_count"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$elapsed" "$cgroup_current" "${compiler_pid:-}" "$compiler_rss_kib" "$compiler_vma_count" >> "$timeline"
   sleep 1
 done
 
@@ -119,7 +129,11 @@ elapsed="$(( $(date +%s) - start_epoch ))"
   echo "storage_kernel_sections=$storage_kernel_sections"
   echo "elapsed_s=$elapsed"
   echo "max_compiler_rss_kib=$max_compiler_rss_kib"
+  echo "max_compiler_vma_count=$max_compiler_vma_count"
   echo "max_cgroup_current_bytes=$max_cgroup_current_bytes"
+  if [ -r /proc/sys/vm/max_map_count ]; then
+    echo "host_max_map_count=$(cat /proc/sys/vm/max_map_count)"
+  fi
   if [ -r /sys/fs/cgroup/memory.peak ]; then
     echo "pod_cgroup_peak_bytes=$(cat /sys/fs/cgroup/memory.peak)"
   fi

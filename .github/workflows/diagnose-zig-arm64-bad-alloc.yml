@@ -29,6 +29,7 @@ jobs:
           sed -n '1,20p' /sys/fs/cgroup/memory.current || true
           sed -n '1,20p' /sys/fs/cgroup/memory.peak || true
           sed -n '1,20p' /sys/fs/cgroup/memory.max || true
+          cat /proc/sys/vm/max_map_count
           sed -n '1,20p' /proc/meminfo
 
       - name: Install diagnostic dependencies
@@ -53,30 +54,36 @@ jobs:
             | grep -E 'llvm::(allocate_buffer|report_bad_alloc_error)' \
             | tee "$RUNNER_TEMP/zig-allocation-symbols.txt" || true
 
-      - name: Run matched cold storage-kernel probes
+      - name: Raise the per-process VMA ceiling
+        run: |
+          echo "original=$(cat /proc/sys/vm/max_map_count)"
+          sudo sysctl -w vm.max_map_count=4194304
+          test "$(cat /proc/sys/vm/max_map_count)" -ge 4194304
+
+      - name: Run ReleaseFast storage-kernel confirmation probe
         env:
           STORAGE_KERNEL_REPORT_ROOT: ${{ runner.temp }}/storage-kernel-reports
         run: |
           mkdir -p "$STORAGE_KERNEL_REPORT_ROOT"
-          STORAGE_KERNEL_TRACE_ALLOCATIONS=1 \
-            scripts/ci/diagnose-storage-kernel-codegen.sh \
-              release-fast-sections ReleaseFast true
           scripts/ci/diagnose-storage-kernel-codegen.sh \
-            release-fast-monolithic ReleaseFast false
-          scripts/ci/diagnose-storage-kernel-codegen.sh \
-            release-small-sections ReleaseSmall true
+            release-fast-raised-map-count ReleaseFast true
 
       - name: Summarize probe results
         if: ${{ always() }}
         run: |
+          shopt -s nullglob
           for summary in "$RUNNER_TEMP"/storage-kernel-reports/*.summary.txt; do
             echo "===== $summary"
             cat "$summary"
           done
           echo '===== failed allocation syscalls'
-          cat "$RUNNER_TEMP"/storage-kernel-reports/*.failed-allocations.txt || true
+          failed_allocations=("$RUNNER_TEMP"/storage-kernel-reports/*.failed-allocations.txt)
+          if (( ${#failed_allocations[@]} > 0 )); then
+            cat "${failed_allocations[@]}"
+          fi
           echo '===== crash backtraces'
-          for backtrace in "$RUNNER_TEMP"/storage-kernel-reports/*.gdb.txt; do
+          backtraces=("$RUNNER_TEMP"/storage-kernel-reports/*.gdb.txt)
+          for backtrace in "${backtraces[@]}"; do
             echo "===== $backtrace"
             sed -n '1,240p' "$backtrace"
           done
