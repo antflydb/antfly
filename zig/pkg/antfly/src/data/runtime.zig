@@ -1789,6 +1789,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_raft_membership_waiting_for_pending_change_groups", "gauge", "Local replica intents awaiting an in-flight configuration change", raft_metrics.membership_waiting_for_pending_change);
         try health_metrics.appendPromMetric(writer, "antfly_raft_membership_waiting_for_policy_groups", "gauge", "Local replica intents fenced by membership policy", raft_metrics.membership_waiting_for_policy);
         try health_metrics.appendPromMetric(writer, "antfly_raft_route_retrying_groups", "gauge", "Local Raft groups retrying peer endpoint convergence", raft_metrics.route_retrying_groups);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_reconcile_failed_groups", "gauge", "Local Raft groups with a failed reconciliation phase", raft_metrics.reconcile_failed_groups);
         try health_metrics.appendPromMetric(writer, "antfly_raft_quarantined_inbound_messages_dropped_total", "counter", "Inbound Raft messages isolated to quarantined groups", raft_metrics.quarantined_inbound_message_drops);
         try health_metrics.appendPromMetric(writer, "antfly_raft_quarantine_resume_attempts_total", "counter", "Fenced operator attempts to resume quarantined Raft groups", raft_metrics.runtime_quarantine_resume_attempts);
         try health_metrics.appendPromMetric(writer, "antfly_raft_quarantine_resume_successes_total", "counter", "Successful fenced resumes of quarantined Raft groups", raft_metrics.runtime_quarantine_resume_successes);
@@ -12087,9 +12088,13 @@ pub const DataServer = struct {
         {
             lockAtomic(&self.data_raft_mutex);
             defer self.data_raft_mutex.unlock();
-            _ = reconcile.commit() catch |err| {
+            const reconcile_result: ?antfly.raft.ReconcileResult = reconcile.commit() catch |err| failed: {
                 reconcile_commit_error = err;
+                break :failed null;
             };
+            if (reconcile_result) |result| {
+                if (result.hasPlacementFailures()) reconcile_commit_error = error.ReplicaReconcileIncomplete;
+            }
             if (reconcile_commit_error == null) {
                 if (apply_group_transition) |*transition| transition.commit();
                 if (updates.items.len > 0) raft.host.applyBatch(updates.items) catch |err| {

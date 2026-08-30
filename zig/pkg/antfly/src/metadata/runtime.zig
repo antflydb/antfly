@@ -261,6 +261,7 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_membership_waiting_for_pending_change_groups", "gauge", "Local replica intents awaiting an in-flight configuration change", host_metrics.membership_waiting_for_pending_change);
         try append(writer, "antfly_raft_membership_waiting_for_policy_groups", "gauge", "Local replica intents fenced by membership policy", host_metrics.membership_waiting_for_policy);
         try append(writer, "antfly_raft_route_retrying_groups", "gauge", "Local Raft groups retrying peer endpoint convergence", host_metrics.route_retrying_groups);
+        try append(writer, "antfly_raft_reconcile_failed_groups", "gauge", "Local Raft groups with a failed reconciliation phase", host_metrics.reconcile_failed_groups);
         try append(writer, "antfly_raft_quarantined_inbound_messages_dropped_total", "counter", "Inbound Raft messages isolated to quarantined groups", host_metrics.quarantined_inbound_message_drops);
         try append(writer, "antfly_raft_quarantine_resume_attempts_total", "counter", "Fenced operator attempts to resume quarantined Raft groups", host_metrics.runtime_quarantine_resume_attempts);
         try append(writer, "antfly_raft_quarantine_resume_successes_total", "counter", "Successful fenced resumes of quarantined Raft groups", host_metrics.runtime_quarantine_resume_successes);

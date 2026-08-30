@@ -276,6 +276,10 @@ pub const ManagedHost = struct {
         return self.reconciler_loop.routeDiagnostics(group_id);
     }
 
+    pub fn failureDiagnostics(self: *const ManagedHost, group_id: u64) ?reconciler.ReconcileFailure {
+        return self.reconciler_loop.failureDiagnostics(group_id);
+    }
+
     pub fn replicaAdmissionConflict(
         self: *ManagedHost,
         group_id: u64,
@@ -593,6 +597,10 @@ pub const ManagedHttpHost = struct {
         group_id: u64,
     ) ?reconciler.RouteConvergenceDiagnostics {
         return self.reconciler_loop.routeDiagnostics(group_id);
+    }
+
+    pub fn failureDiagnostics(self: *const ManagedHttpHost, group_id: u64) ?reconciler.ReconcileFailure {
+        return self.reconciler_loop.failureDiagnostics(group_id);
     }
 
     pub fn replicaAdmissionConflict(

@@ -219,6 +219,7 @@ pub const HostMetrics = struct {
     membership_waiting_for_pending_change: usize = 0,
     membership_waiting_for_policy: usize = 0,
     route_retrying_groups: usize = 0,
+    reconcile_failed_groups: usize = 0,
     inbound_message_enqueues: usize = 0,
     inbound_message_drains: usize = 0,
     quarantined_inbound_message_drops: usize = 0,
@@ -489,16 +490,12 @@ pub const Host = struct {
         errdefer factory.freeDescriptor(self.alloc, &descriptor);
         descriptor.group.raft_config.trace_logger = self.cfg.trace_logger orelse
             if (comptime build_options.with_tla) tracing.stderrRaftTraceLogger() else null;
-        // This check must precede the durable catalog mutation: overwriting
-        // desired state and then rejecting a conflicting live descriptor would
-        // leave restart behavior different from the running process.
         descriptor.validateForAdmission() catch |err| return err;
-        if (try self.observeReplicaAdmissionConflict(record, descriptor)) |conflict| {
-            return switch (conflict) {
-                .local_node_id => error.LocalNodeIdMismatch,
-                .runtime_policy => error.ReplicaRuntimePolicyMismatch,
-            };
-        }
+        // Unpublished descriptors are prepared outside the single-owner Raft
+        // lock. They must remain completely independent from live runtime
+        // state; the reconciler classifies them after re-entering the owner.
+        if (persist_catalog)
+            try self.requirePreparedReplicaAdmission(record, descriptor);
 
         // Persist admission before publication. A crash between these steps
         // leaves a recoverable catalog entry instead of an untracked live group.
@@ -510,6 +507,30 @@ pub const Host = struct {
             .descriptor = descriptor,
             .bootstrap_prepared = should_prepare_bootstrap,
         };
+    }
+
+    fn requirePreparedReplicaAdmission(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        descriptor: raft_engine.runtime.ReplicaDescriptor,
+    ) !void {
+        if (try self.observeReplicaAdmissionConflict(record, descriptor)) |conflict| {
+            return switch (conflict) {
+                .local_node_id => error.LocalNodeIdMismatch,
+                .runtime_policy => error.ReplicaRuntimePolicyMismatch,
+            };
+        }
+    }
+
+    /// Classifies an immutable prepared descriptor against the current live
+    /// owner. Callers must hold the same serialization lock used for Raft
+    /// progress and topology mutation.
+    pub fn classifyPreparedReplicaAdmission(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        prepared: *const PreparedReplica,
+    ) !?raft_engine.runtime.group.ReplicaAdmissionConflict {
+        return try self.observeReplicaAdmissionConflict(record, prepared.descriptor);
     }
 
     pub fn replicaAdmissionConflict(
@@ -700,6 +721,7 @@ pub const Host = struct {
                 return err;
             };
             defer prepared.deinit(self.alloc);
+            try self.requirePreparedReplicaAdmission(record, prepared.descriptor);
             const result = try self.installPreparedReplica(record, &prepared);
             if (result.created or result.resumed or result.fetched_snapshot) restored += 1;
         }

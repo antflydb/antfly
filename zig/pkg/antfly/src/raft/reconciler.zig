@@ -283,6 +283,34 @@ pub const MetadataPlacementState = struct {
     }
 };
 
+pub const ReconcileFailurePhase = enum {
+    admission_prepare,
+    admission_classify,
+    catalog_admission,
+    live_install,
+    routes,
+    membership,
+    catalog_retirement,
+    live_retirement,
+};
+
+pub const ReconcileFailureClassification = enum {
+    retryable,
+    permanent,
+    restart_required,
+};
+
+pub const ReconcileFailure = struct {
+    group_id: u64,
+    phase: ReconcileFailurePhase,
+    classification: ReconcileFailureClassification,
+    err: anyerror,
+    attempts: u32 = 1,
+    next_retry_ns: u64 = 0,
+};
+
+pub const max_reconcile_failure_details: usize = 32;
+
 pub const ReconcileResult = struct {
     ensured: usize = 0,
     removed: usize = 0,
@@ -297,6 +325,39 @@ pub const ReconcileResult = struct {
     membership_waiting_for_policy: usize = 0,
     membership_leader_transfers: usize = 0,
     route_retrying_groups: usize = 0,
+    failed_groups: usize = 0,
+    placement_incomplete: bool = false,
+    omitted_failure_details: usize = 0,
+    failure_detail_count: usize = 0,
+    failure_details: [max_reconcile_failure_details]ReconcileFailure = undefined,
+
+    pub fn hasFailures(self: *const ReconcileResult) bool {
+        return self.failed_groups != 0;
+    }
+
+    pub fn hasPlacementFailures(self: *const ReconcileResult) bool {
+        return self.placement_incomplete;
+    }
+
+    pub fn failures(self: *const ReconcileResult) []const ReconcileFailure {
+        return self.failure_details[0..self.failure_detail_count];
+    }
+
+    fn recordFailure(self: *ReconcileResult, failure: ReconcileFailure) void {
+        self.placement_incomplete = self.placement_incomplete or failure.phase != .routes;
+        for (self.failure_details[0..self.failure_detail_count]) |*existing| {
+            if (existing.group_id != failure.group_id) continue;
+            existing.* = failure;
+            return;
+        }
+        self.failed_groups += 1;
+        if (self.failure_detail_count == self.failure_details.len) {
+            self.omitted_failure_details += 1;
+            return;
+        }
+        self.failure_details[self.failure_detail_count] = failure;
+        self.failure_detail_count += 1;
+    }
 
     fn recordMembership(self: *ReconcileResult, outcome: MembershipConvergence) void {
         switch (outcome) {
@@ -341,6 +402,14 @@ const RouteRetryState = struct {
     next_retry_ns: u64 = 0,
 };
 
+const FailureRetryState = struct {
+    phase: ReconcileFailurePhase,
+    classification: ReconcileFailureClassification,
+    err: anyerror,
+    attempts: u32,
+    next_retry_ns: u64,
+};
+
 const route_retry_initial_ns: u64 = 50 * std.time.ns_per_ms;
 const route_retry_max_ns: u64 = 5 * std.time.ns_per_s;
 const policy_recheck_ns: u64 = std.time.ns_per_s;
@@ -353,6 +422,7 @@ const PreparedEnsure = struct {
     catalog_upsert_index: ?usize = null,
     replica: ?host_mod.PreparedReplica = null,
     prepare_error: ?anyerror = null,
+    failure_phase: ReconcileFailurePhase = .admission_prepare,
     restart_policy_blocked: bool = false,
 };
 
@@ -456,19 +526,27 @@ pub const PreparedLiveConvergence = struct {
             }
             result.refreshed_peers += refreshed;
             self.owner.recordRouteRefreshResult(intent.record.group_id, last_error);
+            if (last_error) |err| {
+                self.owner.recordGroupFailure(result, intent.record.group_id, .routes, err);
+            } else {
+                self.owner.clearGroupFailure(intent.record.group_id, .routes);
+            }
         }
         for (self.policies) |*policy| {
             const intent = self.intents[policy.intent_index];
             if (policy.prepare_error) |err| {
                 self.owner.recordPolicyValidationResult(intent.record.group_id, null, err);
+                self.owner.recordGroupFailure(result, intent.record.group_id, .admission_classify, err);
                 continue;
             }
             const prepared = if (policy.prepared) |*value| value else continue;
             const conflict = self.owner.host.commitReplicaAdmissionValidation(prepared) catch |err| {
                 self.owner.recordPolicyValidationResult(intent.record.group_id, null, err);
+                self.owner.recordGroupFailure(result, intent.record.group_id, .admission_classify, err);
                 continue;
             };
             self.owner.recordPolicyValidationResult(intent.record.group_id, conflict != null, null);
+            self.owner.clearGroupFailure(intent.record.group_id, .admission_classify);
         }
         result.admission_blocked = self.owner.countAdmissionBlocked(self.intents);
         result.route_retrying_groups = self.owner.countRouteRetrying(self.intents);
@@ -491,10 +569,10 @@ pub const PreparedReconcile = struct {
     catalog_upsert_count: usize,
     catalog_revision: ?u64,
     live: PreparedLiveConvergence,
-    /// Set immediately after the atomic replica-catalog batch is durable.
-    /// Callers that stage sidecar cleanup intents use this to distinguish a
-    /// retryable pre-commit failure from a committed removal whose live host
-    /// teardown still needs recovery.
+    /// Set only after the retirement half of the catalog transition is
+    /// durable (or when there are no retirements). Callers that stage sidecar
+    /// cleanup use this to distinguish a safely retained old owner from a
+    /// committed removal whose live teardown still needs recovery.
     catalog_commit_complete: bool = false,
     durability_complete: bool = false,
     committed: bool = false,
@@ -525,23 +603,19 @@ pub const PreparedReconcile = struct {
         for (self.ensures) |*entry| {
             const record = self.intents[entry.intent_index].record;
             entry.replica = self.owner.host.prepareReplicaUnpublished(record, entry.prepare_bootstrap) catch |err| {
-                if (err == error.ReplicaRuntimePolicyMismatch) {
-                    // The live group remains safe and can continue membership
-                    // convergence. Record desired catalog state and expose the
-                    // restart-scoped conflict instead of failing the process's
-                    // entire control round.
-                    entry.restart_policy_blocked = true;
-                    continue;
-                }
                 entry.prepare_error = err;
                 if (entry.catalog_upsert_index) |catalog_index|
                     self.catalog_upsert_enabled[catalog_index] = false;
                 continue;
             };
         }
-        // Compact enabled candidates in place. The allocation retains its
-        // original length for correct deallocation; catalog_upsert_count is the
-        // publication view used by commit.
+        try self.live.prepare();
+        self.durability_complete = true;
+    }
+
+    fn compactCatalogUpserts(self: *PreparedReconcile) void {
+        // Classification can reject additional candidates only after the
+        // caller re-enters the runtime owner. Compact exactly once at commit.
         var write_index: usize = 0;
         for (self.catalog_upserts, self.catalog_upsert_enabled) |record, enabled| {
             if (!enabled) continue;
@@ -549,8 +623,6 @@ pub const PreparedReconcile = struct {
             write_index += 1;
         }
         self.catalog_upsert_count = write_index;
-        try self.live.prepare();
-        self.durability_complete = true;
     }
 
     pub fn notePreparationFailure(self: *PreparedReconcile, err: anyerror) void {
@@ -571,22 +643,61 @@ pub const PreparedReconcile = struct {
     pub fn commit(self: *PreparedReconcile) !ReconcileResult {
         if (!self.durability_complete or self.committed or self.aborted) return error.InvalidReconcilePhase;
 
-        if (self.catalog_upsert_count > 0 or self.removals.len > 0) {
-            try self.owner.host.commitReplicaCatalog(
+        var result: ReconcileResult = .{};
+        var retirement_blocked = false;
+
+        // Descriptor construction is deliberately independent from live
+        // runtime state. Classify it only after the caller re-enters the Raft
+        // owner's serialization lock.
+        for (self.ensures) |*entry| {
+            if (entry.prepare_error != null) {
+                retirement_blocked = true;
+                continue;
+            }
+            const intent = self.intents[entry.intent_index];
+            const prepared = if (entry.replica) |*replica| replica else return error.InvalidReconcilePhase;
+            const conflict = self.owner.host.classifyPreparedReplicaAdmission(intent.record, prepared) catch |err| {
+                entry.prepare_error = err;
+                entry.failure_phase = .admission_classify;
+                if (entry.catalog_upsert_index) |catalog_index|
+                    self.catalog_upsert_enabled[catalog_index] = false;
+                retirement_blocked = true;
+                continue;
+            };
+            if (conflict) |value| switch (value) {
+                .runtime_policy => entry.restart_policy_blocked = true,
+                .local_node_id => {
+                    entry.prepare_error = error.LocalNodeIdMismatch;
+                    entry.failure_phase = .admission_classify;
+                    if (entry.catalog_upsert_index) |catalog_index|
+                        self.catalog_upsert_enabled[catalog_index] = false;
+                    retirement_blocked = true;
+                },
+            };
+        }
+        self.compactCatalogUpserts();
+
+        // Make additions durable before publishing them. Removals are a
+        // second transaction after every replacement admission succeeds, so
+        // old ownership survives crashes and partial failures.
+        if (self.catalog_upsert_count > 0) {
+            self.owner.host.commitReplicaCatalog(
                 self.catalog_revision,
                 self.catalog_upserts[0..self.catalog_upsert_count],
-                self.removals,
-            );
+                &.{},
+            ) catch |err| {
+                for (self.catalog_upserts[0..self.catalog_upsert_count]) |record|
+                    self.owner.recordGroupFailure(&result, record.group_id, .catalog_admission, err);
+                return err;
+            };
         }
-        self.catalog_commit_complete = true;
-        var result: ReconcileResult = .{};
-        var first_error: ?anyerror = null;
+
         for (self.ensures) |*entry| {
             const intent = self.intents[entry.intent_index];
             if (entry.prepare_error) |err| {
                 if (entry.prepare_bootstrap)
                     self.owner.host.noteReplicaBootstrapPreparationFailure(intent.record, err);
-                first_error = first_error orelse err;
+                self.owner.recordGroupFailure(&result, intent.record.group_id, entry.failure_phase, err);
                 continue;
             }
             if (entry.restart_policy_blocked) {
@@ -598,11 +709,13 @@ pub const PreparedReconcile = struct {
                     intent.record.group_id,
                     entry.intent_hash,
                 );
+                self.owner.clearAdmissionFailure(intent.record.group_id);
                 continue;
             }
             const prepared = if (entry.replica) |*replica| replica else return error.InvalidReconcilePhase;
             _ = self.owner.host.installPreparedReplica(intent.record, prepared) catch |err| {
-                first_error = first_error orelse err;
+                retirement_blocked = true;
+                self.owner.recordGroupFailure(&result, intent.record.group_id, .live_install, err);
                 continue;
             };
             result.ensured += 1;
@@ -610,23 +723,57 @@ pub const PreparedReconcile = struct {
                 intent.record.group_id,
                 entry.intent_hash,
             );
+            self.owner.clearAdmissionFailure(intent.record.group_id);
         }
-        self.live.commit(&result) catch |err| {
-            first_error = first_error orelse err;
-        };
+        try self.live.commit(&result);
         for (self.intents) |intent| {
             if (!self.owner.host.hasReplica(intent.record.group_id)) continue;
             const outcome = self.owner.reconcileRaftMembership(intent) catch |err| {
-                first_error = first_error orelse err;
+                self.owner.recordGroupFailure(&result, intent.record.group_id, .membership, err);
                 continue;
             };
             self.owner.membership_convergence.putAssumeCapacity(intent.record.group_id, outcome);
             result.recordMembership(outcome);
+            self.owner.clearGroupFailure(intent.record.group_id, .membership);
         }
+
+        if (self.removals.len > 0 and (retirement_blocked or result.hasPlacementFailures())) {
+            for (self.removals) |group_id| {
+                self.owner.recordGroupFailure(
+                    &result,
+                    group_id,
+                    .catalog_retirement,
+                    error.RetirementPrerequisitePending,
+                );
+            }
+        } else if (self.removals.len > 0) {
+            self.owner.host.commitReplicaCatalog(
+                self.owner.host.replicaCatalogRevision(),
+                &.{},
+                self.removals,
+            ) catch |err| {
+                for (self.removals) |group_id|
+                    self.owner.recordGroupFailure(&result, group_id, .catalog_retirement, err);
+                return err;
+            };
+            self.catalog_commit_complete = true;
+        } else {
+            self.catalog_commit_complete = true;
+        }
+
+        if (!self.catalog_commit_complete) {
+            result.admission_blocked = self.owner.countAdmissionBlocked(self.intents);
+            result.route_retrying_groups = self.owner.countRouteRetrying(self.intents);
+            self.owner.host.metrics.reconcile_rounds += 1;
+            self.owner.publishConvergenceMetrics(result);
+            self.committed = true;
+            return result;
+        }
+
         for (self.removals) |group_id| {
             if (self.owner.host.hasReplica(group_id)) {
                 self.owner.host.removePreparedReplica(group_id) catch |err| {
-                    first_error = first_error orelse err;
+                    self.owner.recordGroupFailure(&result, group_id, .live_retirement, err);
                     continue;
                 };
             }
@@ -635,12 +782,12 @@ pub const PreparedReconcile = struct {
             _ = self.owner.route_convergence.remove(group_id);
             _ = self.owner.route_retries.remove(group_id);
             _ = self.owner.policy_retries.remove(group_id);
+            _ = self.owner.failure_retries.remove(group_id);
             result.removed += 1;
         }
         self.owner.host.metrics.reconcile_rounds += 1;
         self.owner.publishConvergenceMetrics(result);
         self.committed = true;
-        if (first_error) |err| return err;
         return result;
     }
 
@@ -667,6 +814,7 @@ pub const Reconciler = struct {
     route_convergence: std.AutoHashMapUnmanaged(u64, RouteConvergence) = .empty,
     route_retries: std.AutoHashMapUnmanaged(u64, RouteRetryState) = .empty,
     policy_retries: std.AutoHashMapUnmanaged(u64, RouteRetryState) = .empty,
+    failure_retries: std.AutoHashMapUnmanaged(u64, FailureRetryState) = .empty,
     live_retry_cursor: usize = 0,
 
     pub fn deinit(self: *Reconciler) void {
@@ -680,6 +828,8 @@ pub const Reconciler = struct {
         self.route_retries = .empty;
         self.policy_retries.deinit(self.alloc);
         self.policy_retries = .empty;
+        self.failure_retries.deinit(self.alloc);
+        self.failure_retries = .empty;
     }
 
     pub fn membershipStatus(self: *const Reconciler, group_id: u64) ?MembershipConvergence {
@@ -697,6 +847,18 @@ pub const Reconciler = struct {
             .status = status,
             .attempts = retry.attempts,
             .next_retry_ns = retry.next_retry_ns,
+        };
+    }
+
+    pub fn failureDiagnostics(self: *const Reconciler, group_id: u64) ?ReconcileFailure {
+        const state = self.failure_retries.get(group_id) orelse return null;
+        return .{
+            .group_id = group_id,
+            .phase = state.phase,
+            .classification = state.classification,
+            .err = state.err,
+            .attempts = state.attempts,
+            .next_retry_ns = state.next_retry_ns,
         };
     }
 
@@ -729,6 +891,11 @@ pub const Reconciler = struct {
             @as(usize, self.policy_retries.count()) +| intent_count,
         ) orelse return error.TooManyPlacementIntents;
         try self.policy_retries.ensureTotalCapacity(self.alloc, policy_retry_capacity);
+        const failure_retry_capacity = std.math.cast(
+            u32,
+            @as(usize, self.failure_retries.count()) +| intent_count,
+        ) orelse return error.TooManyPlacementIntents;
+        try self.failure_retries.ensureTotalCapacity(self.alloc, failure_retry_capacity);
     }
 
     fn appendRouteGroup(
@@ -760,6 +927,9 @@ pub const Reconciler = struct {
         intents: []const PlacementIntent,
         force_routes: ?[]const bool,
     ) !PreparedLiveConvergence {
+        if (force_routes) |flags| {
+            if (flags.len != intents.len) return error.InvalidReconcilePlan;
+        }
         var route_groups = std.ArrayListUnmanaged(PreparedRouteGroup).empty;
         errdefer route_groups.deinit(self.alloc);
         var route_peers = std.ArrayListUnmanaged(PreparedRoutePeer).empty;
@@ -768,16 +938,11 @@ pub const Reconciler = struct {
         errdefer policies.deinit(self.alloc);
         const now_ns = platform_time.monotonicNs();
 
-        if (force_routes) |flags| {
-            for (flags, 0..) |forced, intent_index| {
-                if (forced) try self.appendRouteGroup(&route_groups, &route_peers, intents, intent_index);
-            }
-        }
-
         var scanned: usize = 0;
         var scheduled: usize = 0;
         var cursor = if (intents.len == 0) 0 else self.live_retry_cursor % intents.len;
-        while (scanned < intents.len and scheduled < max_live_retry_groups_per_round) : (scanned += 1) {
+        var next_cursor = cursor;
+        while (scanned < intents.len) : (scanned += 1) {
             const intent_index = cursor;
             cursor = (cursor + 1) % intents.len;
             const intent = intents[intent_index];
@@ -788,12 +953,20 @@ pub const Reconciler = struct {
             const has_policy_conflict = self.host.replicaAdmissionConflict(intent.record.group_id) != null;
             const policy_due = has_policy_conflict and
                 now_ns >= (self.policy_retries.get(intent.record.group_id) orelse RouteRetryState{}).next_retry_ns;
-            if (!route_due and !policy_due) continue;
-            if (route_due) try self.appendRouteGroup(&route_groups, &route_peers, intents, intent_index);
+            if (!forced and !route_due and !policy_due) continue;
+            if (scheduled == max_live_retry_groups_per_round) {
+                // A newly admitted group must remain visibly retrying when its
+                // forced route publication is deferred by the shared budget.
+                if (forced) self.deferRouteRefresh(intent.record.group_id);
+                continue;
+            }
+            if (forced or route_due)
+                try self.appendRouteGroup(&route_groups, &route_peers, intents, intent_index);
             if (policy_due) try policies.append(self.alloc, .{ .intent_index = intent_index });
             scheduled += 1;
+            next_cursor = cursor;
         }
-        if (intents.len > 0) self.live_retry_cursor = cursor;
+        if (intents.len > 0) self.live_retry_cursor = next_cursor;
         const owned_route_groups = try route_groups.toOwnedSlice(self.alloc);
         errdefer self.alloc.free(owned_route_groups);
         const owned_route_peers = try route_peers.toOwnedSlice(self.alloc);
@@ -901,7 +1074,7 @@ pub const Reconciler = struct {
         errdefer self.alloc.free(catalog_upsert_enabled);
         @memset(catalog_upsert_enabled, true);
         const catalog_revision = if (catalog_snapshot) |snapshot| snapshot.revision else null;
-        try self.ensureConvergenceCapacity(intents.len);
+        try self.ensureConvergenceCapacity(intents.len +| owned_removals.len);
         const intent_hash_capacity = std.math.cast(
             u32,
             @as(usize, self.last_intent_hashes.count()) +| owned_ensures.len,
@@ -935,6 +1108,59 @@ pub const Reconciler = struct {
             return err;
         };
         return try prepared.commit();
+    }
+
+    fn recordGroupFailure(
+        self: *Reconciler,
+        result: *ReconcileResult,
+        group_id: u64,
+        phase: ReconcileFailurePhase,
+        err: anyerror,
+    ) void {
+        const classification = classifyReconcileFailure(phase, err);
+        const previous = self.failure_retries.get(group_id);
+        const attempts: u32 = if (previous) |state|
+            if (state.phase == phase and state.err == err) state.attempts +| 1 else 1
+        else
+            1;
+        const next_retry_ns = if (classification == .retryable)
+            platform_time.monotonicNs() +| routeRetryDelayNs(group_id ^ @intFromEnum(phase), attempts)
+        else
+            0;
+        self.failure_retries.putAssumeCapacity(group_id, .{
+            .phase = phase,
+            .classification = classification,
+            .err = err,
+            .attempts = attempts,
+            .next_retry_ns = next_retry_ns,
+        });
+        result.recordFailure(.{
+            .group_id = group_id,
+            .phase = phase,
+            .classification = classification,
+            .err = err,
+            .attempts = attempts,
+            .next_retry_ns = next_retry_ns,
+        });
+        if (attempts == 1 or (attempts & (attempts - 1)) == 0) {
+            std.log.warn(
+                "raft reconciliation deferred group_id={d} phase={s} classification={s} attempts={d} err={s}",
+                .{ group_id, @tagName(phase), @tagName(classification), attempts, @errorName(err) },
+            );
+        }
+    }
+
+    fn clearGroupFailure(self: *Reconciler, group_id: u64, phase: ReconcileFailurePhase) void {
+        const state = self.failure_retries.get(group_id) orelse return;
+        if (state.phase == phase) _ = self.failure_retries.remove(group_id);
+    }
+
+    fn clearAdmissionFailure(self: *Reconciler, group_id: u64) void {
+        const state = self.failure_retries.get(group_id) orelse return;
+        switch (state.phase) {
+            .admission_prepare, .admission_classify, .catalog_admission, .live_install => _ = self.failure_retries.remove(group_id),
+            else => {},
+        }
     }
 
     /// Advances only mutable Raft membership. It performs no descriptor
@@ -985,6 +1211,13 @@ pub const Reconciler = struct {
                 .{ group_id, @errorName(last_error.?) },
             ),
         };
+    }
+
+    fn deferRouteRefresh(self: *Reconciler, group_id: u64) void {
+        self.route_convergence.putAssumeCapacity(group_id, .retrying);
+        if (!self.route_retries.contains(group_id)) {
+            self.route_retries.putAssumeCapacity(group_id, .{ .next_retry_ns = 0 });
+        }
     }
 
     fn recordPolicyValidationResult(
@@ -1042,6 +1275,7 @@ pub const Reconciler = struct {
         self.host.metrics.membership_waiting_for_pending_change = result.membership_waiting_for_pending_change;
         self.host.metrics.membership_waiting_for_policy = result.membership_waiting_for_policy;
         self.host.metrics.route_retrying_groups = result.route_retrying_groups;
+        self.host.metrics.reconcile_failed_groups = result.failed_groups;
     }
 
     fn reconcileRaftMembership(self: *Reconciler, intent: PlacementIntent) !MembershipConvergence {
@@ -1124,6 +1358,48 @@ fn routeRetryDelayNs(group_id: u64, attempts: u32) u64 {
     const jitter_window = @max(@as(u64, 1), exponential / 4);
     const jitter = std.hash.Wyhash.hash(0x726f7574655f7274, std.mem.asBytes(&seed)) % jitter_window;
     return @min(exponential +| jitter, route_retry_max_ns);
+}
+
+fn classifyReconcileFailure(
+    phase: ReconcileFailurePhase,
+    err: anyerror,
+) ReconcileFailureClassification {
+    _ = phase;
+    return switch (err) {
+        error.ReplicaRuntimePolicyMismatch => .restart_required,
+        error.ReplicaAdmissionRejected,
+        error.LocalNodeIdMismatch,
+        error.InvalidSnapshotSourceNodeId,
+        error.InvalidSnapshotId,
+        error.MissingReplicaDescriptorFactory,
+        error.MissingBackupRestoreBootstrapHandler,
+        => .permanent,
+        else => .retryable,
+    };
+}
+
+test "reconcile result bounds failure details while preserving failure count" {
+    var result: ReconcileResult = .{};
+    for (0..max_reconcile_failure_details + 1) |index| {
+        result.recordFailure(.{
+            .group_id = @intCast(index + 1),
+            .phase = .live_install,
+            .classification = .retryable,
+            .err = error.InjectedFailure,
+        });
+    }
+    try std.testing.expectEqual(max_reconcile_failure_details + 1, result.failed_groups);
+    try std.testing.expectEqual(max_reconcile_failure_details, result.failures().len);
+    try std.testing.expectEqual(@as(usize, 1), result.omitted_failure_details);
+
+    result.recordFailure(.{
+        .group_id = 1,
+        .phase = .routes,
+        .classification = .retryable,
+        .err = error.UpdatedFailure,
+    });
+    try std.testing.expectEqual(max_reconcile_failure_details + 1, result.failed_groups);
+    try std.testing.expectEqual(ReconcileFailurePhase.routes, result.failures()[0].phase);
 }
 
 fn retirementLeaderTransferTarget(
@@ -1690,6 +1966,11 @@ test "reconciler isolates live install failures and retries without replaying du
     var replica_catalog = catalog.MemoryReplicaCatalog.init(std.testing.allocator);
     defer replica_catalog.deinit();
     const catalog_iface = replica_catalog.catalog();
+    try catalog_iface.upsertReplica(.{
+        .group_id = 512,
+        .replica_id = 3,
+        .local_node_id = 1,
+    });
     var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
         .descriptor_factory = factory.iface(),
         .replica_catalog = catalog_iface,
@@ -1709,13 +1990,20 @@ test "reconciler isolates live install failures and retries without replaying du
     };
     defer owner.deinit();
 
-    try std.testing.expectError(error.InjectedInstallFailure, owner.reconcileOnce());
+    const failed = try owner.reconcileOnce();
+    try std.testing.expect(failed.hasFailures());
+    try std.testing.expectEqual(@as(usize, 2), failed.failed_groups);
+    try std.testing.expectEqual(@as(u64, 511), failed.failures()[0].group_id);
+    try std.testing.expectEqual(ReconcileFailurePhase.live_install, failed.failures()[0].phase);
+    try std.testing.expectEqual(error.InjectedInstallFailure, failed.failures()[0].err);
     try std.testing.expect(host.hasReplica(510));
     try std.testing.expect(!host.hasReplica(511));
     try std.testing.expectEqual(RouteConvergence.converged, owner.routeStatus(510).?);
     try std.testing.expectEqual(RouteConvergence.retrying, owner.routeStatus(511).?);
     try std.testing.expect(catalog_iface.containsReplica(510));
     try std.testing.expect(catalog_iface.containsReplica(511));
+    try std.testing.expect(catalog_iface.containsReplica(512));
+    try std.testing.expect(owner.failureDiagnostics(511).?.next_retry_ns != 0);
     const durable_revision = catalog_iface.revision();
 
     transport.fail_group_id = 0;
@@ -1723,7 +2011,8 @@ test "reconciler isolates live install failures and retries without replaying du
     try std.testing.expectEqual(@as(usize, 1), recovered.ensured);
     try std.testing.expect(host.hasReplica(511));
     try std.testing.expectEqual(RouteConvergence.converged, owner.routeStatus(511).?);
-    try std.testing.expectEqual(durable_revision, catalog_iface.revision());
+    try std.testing.expect(!catalog_iface.containsReplica(512));
+    try std.testing.expectEqual(durable_revision + 1, catalog_iface.revision());
 }
 
 test "prepared reconcile rejects catalog races without clobbering concurrent admissions" {
@@ -1849,7 +2138,14 @@ test "restart-scoped policy conflicts are isolated and durably deduplicated" {
         },
         .peer_node_ids = &.{1},
     }});
-    const blocked = try owner.reconcileOnce();
+    var blocked_prepared = try owner.prepare();
+    defer blocked_prepared.deinit();
+    blocked_prepared.beginPreparation();
+    try blocked_prepared.prepareDurable();
+    // The blocking descriptor-build phase is pure: only owner-locked commit
+    // may inspect or mutate live admission state.
+    try std.testing.expect(host.replicaAdmissionConflict(504) == null);
+    const blocked = try blocked_prepared.commit();
     try std.testing.expectEqual(@as(usize, 0), blocked.ensured);
     try std.testing.expectEqual(@as(usize, 1), blocked.admission_blocked);
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.active, host.status(504));
@@ -2008,6 +2304,20 @@ test "live convergence retry work is bounded and rotates fairly" {
     defer second.deinit();
     try std.testing.expectEqual(max_live_retry_groups_per_round, second.route_groups.len);
     try std.testing.expectEqual(max_live_retry_groups_per_round, second.route_groups[0].intent_index);
+
+    const force_routes = try std.testing.allocator.alloc(bool, intents.len);
+    defer std.testing.allocator.free(force_routes);
+    @memset(force_routes, true);
+    owner.live_retry_cursor = 0;
+    var forced_first = try owner.buildLiveConvergence(intents, force_routes);
+    defer forced_first.deinit();
+    try std.testing.expectEqual(max_live_retry_groups_per_round, forced_first.route_groups.len);
+    try std.testing.expectEqual(RouteConvergence.retrying, owner.routeStatus(intent_count).?);
+
+    var forced_second = try owner.buildLiveConvergence(intents, force_routes);
+    defer forced_second.deinit();
+    try std.testing.expectEqual(max_live_retry_groups_per_round, forced_second.route_groups.len);
+    try std.testing.expectEqual(max_live_retry_groups_per_round, forced_second.route_groups[0].intent_index);
 }
 
 test "prepared reconcile failure never publishes an unprepared replica" {
@@ -2053,7 +2363,16 @@ test "prepared reconcile failure never publishes an unprepared replica" {
     defer prepared.deinit();
     prepared.beginPreparation();
     try prepared.prepareDurable();
-    try std.testing.expectError(error.MissingBackupRestoreBootstrapHandler, prepared.commit());
+    const result = try prepared.commit();
+    try std.testing.expect(result.hasFailures());
+    try std.testing.expectEqual(@as(usize, 1), result.failed_groups);
+    try std.testing.expectEqual(@as(u64, 503), result.failures()[0].group_id);
+    try std.testing.expectEqual(ReconcileFailurePhase.admission_prepare, result.failures()[0].phase);
+    try std.testing.expectEqual(
+        ReconcileFailureClassification.permanent,
+        result.failures()[0].classification,
+    );
+    try std.testing.expectEqual(error.MissingBackupRestoreBootstrapHandler, result.failures()[0].err);
 
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.failed, host.status(503));
     try std.testing.expect(!host.hasReplica(503));

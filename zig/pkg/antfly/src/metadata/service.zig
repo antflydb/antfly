@@ -4518,7 +4518,8 @@ pub const MetadataService = struct {
             return;
         }
         defer self.unlockRuntime();
-        _ = try reconcile.commit();
+        const reconcile_result = try reconcile.commit();
+        if (reconcile_result.hasPlacementFailures()) return error.ReplicaReconcileIncomplete;
         self.local_placement_epoch = current_epoch;
         self.last_local_placement_refresh_at_ms = nowMs();
     }
@@ -8233,7 +8234,8 @@ pub const MetadataHttpService = struct {
             return;
         }
         defer self.unlockRuntime();
-        _ = try reconcile.commit();
+        const reconcile_result = try reconcile.commit();
+        if (reconcile_result.hasPlacementFailures()) return error.ReplicaReconcileIncomplete;
         self.local_placement_epoch = current_epoch;
         self.last_local_placement_refresh_at_ms = nowMs();
     }
