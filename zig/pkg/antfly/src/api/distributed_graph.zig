@@ -7965,6 +7965,8 @@ pub fn testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(alloc: std.mem.
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = routingSnapshot,
+                    .free_routing_snapshot = freeRoutingSnapshot,
                 },
             };
         }
@@ -7983,6 +7985,15 @@ pub fn testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(alloc: std.mem.
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn routingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
     };
 
     const FakeWorker = struct {
@@ -9179,6 +9190,8 @@ test "distributed graph edge reader carries identity generation" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = routingSnapshot,
+                    .free_routing_snapshot = freeRoutingSnapshot,
                 },
             };
         }
@@ -9196,6 +9209,15 @@ test "distributed graph edge reader carries identity generation" {
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn routingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
     };
 
     const TestState = struct {

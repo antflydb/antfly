@@ -84,6 +84,8 @@ pub const AdminSource = struct {
         runtime_topology: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataRuntimeTopology = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
+        routing_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = unsupportedRoutingSnapshot,
+        free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
         validate_table_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) anyerror!bool = null,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
@@ -156,6 +158,14 @@ pub const AdminSource = struct {
 
     pub fn adminSnapshot(self: AdminSource) !metadata_api.AdminSnapshot {
         return try self.vtable.admin_snapshot(self.ptr);
+    }
+
+    pub fn routingSnapshot(self: AdminSource, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        return try self.vtable.routing_snapshot(self.ptr, deadline_ns);
+    }
+
+    pub fn freeRoutingSnapshot(self: AdminSource, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        self.vtable.free_routing_snapshot(self.ptr, snapshot);
     }
 
     pub fn validatePublication(self: AdminSource, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -336,6 +346,8 @@ pub const AdminSource = struct {
                 .runtime_topology = metadataServiceRuntimeTopology,
                 .status = metadataServiceStatus,
                 .admin_snapshot = metadataServiceAdminSnapshot,
+                .routing_snapshot = metadataServiceRoutingSnapshot,
+                .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .validate_publication = metadataServiceValidatePublication,
                 .validate_table_publication = metadataServiceValidateTablePublication,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
@@ -381,6 +393,8 @@ pub const AdminSource = struct {
                 .runtime_topology = metadataHttpServiceRuntimeTopology,
                 .status = metadataHttpServiceStatus,
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
+                .routing_snapshot = metadataHttpServiceRoutingSnapshot,
+                .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
                 .validate_publication = metadataHttpServiceValidatePublication,
                 .validate_table_publication = metadataHttpServiceValidateTablePublication,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
@@ -414,6 +428,14 @@ pub const AdminSource = struct {
                 .record_json_response_allocation = metadataHttpServiceRecordJsonResponseAllocation,
             },
         };
+    }
+
+    fn unsupportedRoutingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        return error.CatalogRoutingUnavailable;
+    }
+
+    fn unsupportedFreeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {
+        unreachable;
     }
 
     fn metadataServiceHead(ptr: *anyopaque) !metadata_api.MetadataHead {
@@ -462,6 +484,16 @@ pub const AdminSource = struct {
     fn metadataServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         return try svc.adminSnapshot();
+    }
+
+    fn metadataServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        return try svc.catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn metadataServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        svc.freeCatalogRoutingSnapshot(snapshot);
     }
 
     fn metadataServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -827,6 +859,16 @@ pub const AdminSource = struct {
         return try svc.adminSnapshot();
     }
 
+    fn metadataHttpServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try svc.catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn metadataHttpServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        svc.freeCatalogRoutingSnapshot(snapshot);
+    }
+
     fn metadataHttpServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         // Followers use Raft's built-in ReadIndex forwarding and wait until
@@ -1171,6 +1213,7 @@ pub const MetadataHttpServer = struct {
         try server.get(routes.Routes.runtime_topology, httpx.Handler.bind(self, metadataRuntimeTopology));
         try server.get(routes.Routes.status, httpx.Handler.bind(self, metadataStatus));
         try server.get(routes.Routes.admin_snapshot, httpx.Handler.bind(self, metadataSnapshot));
+        try server.get(routes.Routes.routing_snapshot, httpx.Handler.bind(self, metadataRoutingSnapshot));
         try server.get(routes.Routes.active_transitions, httpx.Handler.bind(self, metadataActiveTransitions));
         try server.get(
             routes.Routes.table_ranges_prefix ++ ":table_id" ++ routes.Routes.table_ranges_suffix,
@@ -1376,6 +1419,12 @@ pub const MetadataHttpServer = struct {
         const operations = self.readOperations();
         var result = operations.snapshot(requestContext(ctx)) catch |err| return metadataReadError(ctx, err);
         defer operations.freeSnapshot(&result);
+        return self.trackedJson(ctx, result);
+    }
+
+    fn metadataRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        var result = self.source.routingSnapshot(ctx.application_deadline_ns) catch |err| return metadataReadError(ctx, err);
+        defer self.source.freeRoutingSnapshot(&result);
         return self.trackedJson(ctx, result);
     }
 

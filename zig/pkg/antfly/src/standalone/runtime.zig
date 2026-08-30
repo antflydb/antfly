@@ -817,6 +817,8 @@ const LocalStandaloneMetadata = struct {
             .vtable = &.{
                 .admin_snapshot = catalogAdminSnapshot,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
+                .routing_snapshot = catalogRoutingSnapshot,
+                .free_routing_snapshot = catalogFreeRoutingSnapshot,
             },
         };
     }
@@ -830,6 +832,8 @@ const LocalStandaloneMetadata = struct {
                 .cached_admin_snapshot = cachedAdminSnapshot,
                 .linearizable_snapshot = linearizableSnapshot,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
+                .routing_snapshot = catalogRoutingSnapshot,
+                .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .create_table = createTable,
                 .replace_table_definition = replaceTableDefinition,
                 .restore_table = restoreTable,
@@ -965,6 +969,31 @@ const LocalStandaloneMetadata = struct {
             .split_transitions = try self.alloc.alloc(antfly.metadata.SplitTransitionRecord, 0),
             .merge_transitions = try self.alloc.alloc(antfly.metadata.MergeTransitionRecord, 0),
         };
+    }
+
+    fn catalogRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        defer self.mutex.unlock();
+
+        const tables = try self.manager.listTables(self.alloc);
+        errdefer self.manager.freeTables(self.alloc, tables);
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
+        const ranges = try self.manager.listRanges(self.alloc);
+        errdefer self.manager.freeRanges(self.alloc, ranges);
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
+        return .{ .tables = tables, .ranges = ranges };
+    }
+
+    fn catalogFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *antfly.metadata_api.CatalogRoutingSnapshot) void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        self.manager.freeTables(self.alloc, snapshot.tables);
+        self.manager.freeRanges(self.alloc, snapshot.ranges);
+        snapshot.* = undefined;
     }
 
     fn catalogFreeAdminSnapshot(ptr: *anyopaque, snapshot: *antfly.metadata_api.AdminSnapshot) void {
@@ -3429,6 +3458,18 @@ fn runLocalReplicaRootReconcilePermitHook(ptr: *anyopaque) bool {
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
+}
+
+fn lockAtomicUntil(mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
+    const deadline = deadline_ns orelse {
+        lockAtomic(mutex);
+        return true;
+    };
+    while (true) {
+        if (platform_time.monotonicNs() >= deadline) return false;
+        if (mutex.tryLock()) return true;
+        std.Thread.yield() catch {};
+    }
 }
 
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -7661,6 +7702,11 @@ test "standalone unified server lifecycle propagates startup failure" {
         ),
     );
     try std.testing.expectEqual(error.AddressInUse, lifecycle.runtimeFailure().?);
+}
+
+test "standalone metadata catalog source provides compact routing" {
+    var metadata: LocalStandaloneMetadata = undefined;
+    try std.testing.expect(metadata.catalogSource().hasRoutingCapability());
 }
 
 test "runtime lease watchdog fetch and validation failures publish no bootstrap capability" {

@@ -181,6 +181,19 @@ pub const MetadataHttpClient = struct {
         return try self.getJsonWithBudget(metadata_api.AdminSnapshot, base_uri, routes.Routes.admin_snapshot, budget);
     }
 
+    pub fn fetchRoutingSnapshotWithBudget(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        budget: ?RequestBudget,
+    ) !std.json.Parsed(metadata_api.CatalogRoutingSnapshot) {
+        return try self.getJsonWithBudget(
+            metadata_api.CatalogRoutingSnapshot,
+            base_uri,
+            routes.Routes.routing_snapshot,
+            budget,
+        );
+    }
+
     pub fn validateCatalogPublication(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -1598,6 +1611,8 @@ test "metadata http client round-trips server endpoints" {
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = routingSnapshot,
+                    .free_routing_snapshot = freeRoutingSnapshot,
                     .create_table = createTable,
                     .drop_table = dropTable,
                     .update_schema = updateSchema,
@@ -1647,6 +1662,17 @@ test "metadata http client round-trips server endpoints" {
         }
 
         fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn routingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
             snapshot.* = undefined;
         }
 
@@ -1786,6 +1812,11 @@ test "metadata http client round-trips server endpoints" {
     try std.testing.expectEqualStrings("slot_resumed", snapshot.value.replication_source_statuses[0].cutover_mode);
     try std.testing.expectEqual(@as(usize, 1), snapshot.value.replication_source_action_hints.len);
     try std.testing.expectEqualStrings("reseed_exact_cutover", snapshot.value.replication_source_action_hints[0].action);
+
+    var routing_snapshot = try client.fetchRoutingSnapshotWithBudget(base_uri, null);
+    defer routing_snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 1), routing_snapshot.value.tables.len);
+    try std.testing.expectEqual(@as(usize, 2), routing_snapshot.value.ranges.len);
 
     var ranges = try client.listTableRanges(base_uri, 1);
     defer ranges.deinit();

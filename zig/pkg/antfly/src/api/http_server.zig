@@ -1001,6 +1001,8 @@ pub const StatusSource = struct {
         cached_admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!?metadata_api.AdminSnapshot = null,
         linearizable_snapshot: ?*const fn (ptr: *anyopaque, request: api_operation.RequestContext) anyerror!?metadata_api.AdminSnapshot = null,
         free_admin_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void = null,
+        routing_snapshot: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
+        free_routing_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
         restore_table: ?*const fn (
@@ -1058,6 +1060,16 @@ pub const StatusSource = struct {
 
     pub fn freeAdminSnapshot(self: StatusSource, snapshot: *metadata_api.AdminSnapshot) void {
         const fn_ptr = self.vtable.free_admin_snapshot orelse return;
+        fn_ptr(self.ptr, snapshot);
+    }
+
+    pub fn routingSnapshot(self: StatusSource, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const fn_ptr = self.vtable.routing_snapshot orelse return error.CatalogRoutingUnavailable;
+        return try BoundaryAbi.call("routing_snapshot", self.boundary_dispatch, fn_ptr, .{ self.ptr, deadline_ns });
+    }
+
+    pub fn freeRoutingSnapshot(self: StatusSource, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        const fn_ptr = self.vtable.free_routing_snapshot orelse unreachable;
         fn_ptr(self.ptr, snapshot);
     }
 
@@ -1223,6 +1235,14 @@ pub const StatusSource = struct {
                 cast(ptr).freeAdminSnapshot(snapshot);
             }
 
+            fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot {
+                return try cast(ptr).catalogRoutingSnapshot(deadline_ns);
+            }
+
+            fn freeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+                cast(ptr).freeCatalogRoutingSnapshot(snapshot);
+            }
+
             fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void {
                 return try createTableOnService(cast(ptr), alloc, table_name, req);
             }
@@ -1342,6 +1362,8 @@ pub const StatusSource = struct {
             .cached_admin_snapshot = Gen.cachedAdminSnapshot,
             .linearizable_snapshot = Gen.linearizableSnapshot,
             .free_admin_snapshot = Gen.freeAdminSnapshot,
+            .routing_snapshot = Gen.routingSnapshot,
+            .free_routing_snapshot = Gen.freeRoutingSnapshot,
             .create_table = Gen.createTable,
             .replace_table_definition = Gen.replaceTableDefinition,
             .restore_table = Gen.restoreTable,
@@ -4197,6 +4219,8 @@ pub const ApiHttpServer = struct {
             .vtable = &.{
                 .admin_snapshot = apiHttpServerCatalogAdminSnapshot,
                 .free_admin_snapshot = apiHttpServerCatalogFreeAdminSnapshot,
+                .routing_snapshot = apiHttpServerCatalogRoutingSnapshot,
+                .free_routing_snapshot = apiHttpServerCatalogFreeRoutingSnapshot,
             },
         };
     }
@@ -6671,6 +6695,16 @@ pub const ApiHttpServer = struct {
     fn apiHttpServerCatalogFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         self.source.freeAdminSnapshot(snapshot);
+    }
+
+    fn apiHttpServerCatalogRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        return try self.source.routingSnapshot(deadline_ns);
+    }
+
+    fn apiHttpServerCatalogFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        self.source.freeRoutingSnapshot(snapshot);
     }
 
     fn waitForTableMetadata(
