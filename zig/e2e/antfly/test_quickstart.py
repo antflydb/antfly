@@ -958,7 +958,13 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     documents = {
         f"doc:{i:03d}": {
             "title": f"Alpha {i}",
-            "body": f"alpha concept progressive publication document {i}",
+            "body": (
+                f"retrieval semantic progressive publication document {i}"
+                if i < 10
+                else f"alpha concept progressive publication document {i}"
+                if i == 10
+                else f"beta progressive publication document {i}"
+            ),
         }
         for i in range(100)
     }
@@ -1004,19 +1010,23 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     assert 0 < coverage["covered"] < coverage["source_total"] == 100
     assert coverage["complete"] is False
 
-    progressive_openai_embedder.allow_rate_limited_requests()
     result = backup_api.query_table(
         table_name,
         {
-            "semantic_search": "alpha concept",
+            # The first page embeds to [0.8, 0.2, 0.0], while doc:010 in the
+            # unpublished remainder is the exact [1.0, 0.0, 0.0] match. This
+            # proves the public query was served by the partial generation
+            # while later enrichment remains throttled.
+            "embeddings": {index_name: [1.0, 0.0, 0.0]},
             "indexes": [index_name],
             "limit": 5,
         },
     )
     hits = result["responses"][0]["hits"]["hits"]
     assert hits
-    assert hits[0]["_id"].startswith("doc:")
+    assert int(hits[0]["_id"].removeprefix("doc:")) < 10
 
+    progressive_openai_embedder.allow_rate_limited_requests()
     complete = backup_api.wait_index_ready(
         table_name,
         index_name,

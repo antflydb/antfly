@@ -25514,8 +25514,24 @@ fn catchUpManagedDb(
                 }
                 return err;
             };
-            db.runUntilIdle() catch |err| {
+            const idle_result = if (owner == .live_writer)
+                db.runUntilIdleWithoutWaitingForEnrichmentRetries()
+            else
+                db.runUntilIdle();
+            idle_result catch |err| {
                 std.log.warn("managed startup catch-up replay idle drain failed table={s} err={}", .{ table_name, err });
+                if (owner == .live_writer and err == error.EnrichmentRetryInProgress) {
+                    // The resident asynchronous worker owns provider retry.
+                    // Yield this bounded repair pass so partial generations
+                    // remain queryable while that external dependency recovers.
+                    return .{
+                        .had_debt = true,
+                        .cleared_debt = false,
+                        .made_progress = made_progress,
+                        .busy = true,
+                        .index_repair_pending = advance_index_repairs,
+                    };
+                }
                 if (err == error.ArtifactRepairRequired and initial_index_repair_debt) {
                     if (mode == .broad_debt_only) return err;
                     break;
@@ -25558,8 +25574,21 @@ fn catchUpManagedDb(
         };
         made_progress = made_progress or repaired_dense_artifacts;
         if (repaired_dense_artifacts) {
-            db.runUntilIdle() catch |err| {
+            const idle_result = if (owner == .live_writer)
+                db.runUntilIdleWithoutWaitingForEnrichmentRetries()
+            else
+                db.runUntilIdle();
+            idle_result catch |err| {
                 std.log.warn("managed startup catch-up dense rebuild idle drain failed table={s} err={}", .{ table_name, err });
+                if (owner == .live_writer and err == error.EnrichmentRetryInProgress) {
+                    return .{
+                        .had_debt = true,
+                        .cleared_debt = false,
+                        .made_progress = true,
+                        .busy = true,
+                        .index_repair_pending = advance_index_repairs,
+                    };
+                }
                 return err;
             };
             try db.core.index_manager.syncAll(true);
