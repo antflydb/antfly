@@ -3017,6 +3017,7 @@ pub fn build(b: *std.Build) void {
             "repository manifest parsing is bounded before allocation",
             "repository ref publication is compare and swap",
             "incremental plan uploads only blobs absent from complete parent",
+            "repository incremental upload streams only blobs absent from exact parent",
             "repository publishes resolves and materializes one complete deduplicated snapshot",
         },
         .test_runner = .{

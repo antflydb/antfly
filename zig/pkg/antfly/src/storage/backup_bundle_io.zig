@@ -68,9 +68,9 @@ pub const PackOptions = struct {
     storage_engine: []const u8 = "antfly-native",
     mode: bundle.SnapshotMode = .full,
     parent_manifest_sha256: ?[]const u8 = null,
-    /// Digest-sorted complete base inventory. In delta mode, matching objects
+    /// Digest-sorted complete base inventory. In delta mode, matching blobs
     /// remain in the new complete manifest but their bytes are omitted.
-    base_object_sha256: []const []const u8 = &.{},
+    base_blob_sha256: []const []const u8 = &.{},
 };
 
 pub fn readManifestFromFile(
@@ -122,12 +122,12 @@ pub fn packNativePathsToWriter(
     options: PackOptions,
 ) !void {
     switch (options.mode) {
-        .full => if (options.parent_manifest_sha256 != null or options.base_object_sha256.len != 0)
+        .full => if (options.parent_manifest_sha256 != null or options.base_blob_sha256.len != 0)
             return error.InvalidBackupManifest,
         .delta => {
             try bundle.validateSha256(options.parent_manifest_sha256 orelse return error.InvalidBackupManifest);
             var previous: ?[]const u8 = null;
-            for (options.base_object_sha256) |digest| {
+            for (options.base_blob_sha256) |digest| {
                 try bundle.validateSha256(digest);
                 if (previous) |value| if (std.mem.order(u8, value, digest) != .lt)
                     return error.NonCanonicalBackupManifest;
@@ -169,7 +169,7 @@ pub fn packNativePathsToWriter(
             .sha256 = file.sha256,
             .size_bytes = file.size_bytes,
             .source_index = source_index,
-            .included = !digestInSortedSet(options.base_object_sha256, &digest_strings[source_index]),
+            .included = !digestInSortedSet(options.base_blob_sha256, &digest_strings[source_index]),
         });
     }
     std.mem.sort(SourceBlob, source_blobs.items, {}, struct {
@@ -776,7 +776,7 @@ test "AFB2 native delta requires and resolves the exact parent manifest" {
     try packNativeDirectoryToWriter(alloc, io, child_root, &delta_writer.writer, .{
         .mode = .delta,
         .parent_manifest_sha256 = &parent_digest,
-        .base_object_sha256 = base_digests,
+        .base_blob_sha256 = base_digests,
     });
     delta_archive = delta_writer.toArrayList();
     const delta_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/delta.afb", .{tmp.sub_path});

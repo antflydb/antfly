@@ -312,25 +312,55 @@ pub fn uploadSnapshotBlobsFromDirectory(
 ) !void {
     try validateManifest(manifest);
     if (manifest.encryption != null) return error.UnsupportedBackupEncryption;
-    for (manifest.blobs) |blob| {
-        if (blob.compression != .none or blob.encryption_key_id != null)
-            return error.UnsupportedBackupCompression;
-        const object = findObjectForBlob(manifest.objects, blob.sha256) orelse
-            return error.IncompleteBackupInventory;
-        const source_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ source_root, object.logical_path });
-        defer alloc.free(source_path);
-        try verifyFileDigest(io, source_path, blob.logical_size_bytes, blob.sha256);
-        const repository_path = try blobPathAlloc(alloc, blob.sha256);
-        defer alloc.free(repository_path);
-        try backend.put_blob_from_file(
-            backend.context,
-            io,
-            repository_path,
-            source_path,
-            blob.logical_size_bytes,
-            blob.sha256,
-        );
-    }
+    for (manifest.blobs, 0..) |_, blob_index|
+        try uploadSnapshotBlobFromDirectory(alloc, io, backend, manifest, source_root, blob_index);
+}
+
+/// Streams only content absent from the exact complete parent inventory. The
+/// child manifest remains complete and independently restorable; this narrows
+/// capture I/O without turning restore into parent-chain replay.
+pub fn uploadIncrementalSnapshotBlobsFromDirectory(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    backend: Backend,
+    child: Manifest,
+    parent_manifest_sha256: []const u8,
+    parent: Manifest,
+    source_root: []const u8,
+) !void {
+    const changed = try incrementalBlobIndicesAlloc(alloc, child, parent_manifest_sha256, parent);
+    defer alloc.free(changed);
+    for (changed) |blob_index|
+        try uploadSnapshotBlobFromDirectory(alloc, io, backend, child, source_root, blob_index);
+}
+
+fn uploadSnapshotBlobFromDirectory(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    backend: Backend,
+    manifest: Manifest,
+    source_root: []const u8,
+    blob_index: usize,
+) !void {
+    if (blob_index >= manifest.blobs.len) return error.InvalidBackupManifest;
+    const blob = manifest.blobs[blob_index];
+    if (blob.compression != .none or blob.encryption_key_id != null)
+        return error.UnsupportedBackupCompression;
+    const object = findObjectForBlob(manifest.objects, blob.sha256) orelse
+        return error.IncompleteBackupInventory;
+    const source_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ source_root, object.logical_path });
+    defer alloc.free(source_path);
+    try verifyFileDigest(io, source_path, blob.logical_size_bytes, blob.sha256);
+    const repository_path = try blobPathAlloc(alloc, blob.sha256);
+    defer alloc.free(repository_path);
+    try backend.put_blob_from_file(
+        backend.context,
+        io,
+        repository_path,
+        source_path,
+        blob.logical_size_bytes,
+        blob.sha256,
+    );
 }
 
 /// Materializes one complete immutable manifest into a caller-owned staging
@@ -518,16 +548,23 @@ pub fn validateManifest(manifest: Manifest) !void {
 /// objects, while the child manifest remains independently restorable.
 pub fn incrementalBlobIndicesAlloc(
     alloc: std.mem.Allocator,
-    child_manifest_sha256: []const u8,
     child: Manifest,
     parent_manifest_sha256: []const u8,
     parent: Manifest,
 ) ![]usize {
-    try bundle.validateSha256(child_manifest_sha256);
     try bundle.validateSha256(parent_manifest_sha256);
     try validateManifest(child);
     try validateManifest(parent);
-    if (child.mode != .delta or child.parent_manifest_sha256 == null or
+    const parent_encoded = try encodeManifestCanonicalAlloc(alloc, parent);
+    defer alloc.free(parent_encoded);
+    const actual_parent_sha256 = try manifestDigestHexAlloc(alloc, parent_encoded);
+    defer alloc.free(actual_parent_sha256);
+    const child_encoded = try encodeManifestCanonicalAlloc(alloc, child);
+    defer alloc.free(child_encoded);
+    const child_manifest_sha256 = try manifestDigestHexAlloc(alloc, child_encoded);
+    defer alloc.free(child_manifest_sha256);
+    if (!std.mem.eql(u8, actual_parent_sha256, parent_manifest_sha256) or
+        child.mode != .delta or child.parent_manifest_sha256 == null or
         !std.mem.eql(u8, child.parent_manifest_sha256.?, parent_manifest_sha256) or
         child.table_id != parent.table_id or
         !std.mem.eql(u8, child.table_name, parent.table_name) or
@@ -862,7 +899,6 @@ test "repository ref publication is compare and swap" {
 
 test "incremental plan uploads only blobs absent from complete parent" {
     const digest_a = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const digest_b = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
     const digest_child = "1111111111111111111111111111111111111111111111111111111111111111";
     const parent: Manifest = .{
         .backup_id = "daily",
@@ -881,6 +917,10 @@ test "incremental plan uploads only blobs absent from complete parent" {
         .objects = &.{.{ .logical_path = "catalog/table.json", .role = "catalog", .blob_sha256 = digest_a, .logical_size_bytes = 10 }},
         .blobs = &.{.{ .sha256 = digest_a, .logical_size_bytes = 10, .stored_size_bytes = 10 }},
     };
+    const parent_encoded = try encodeManifestCanonicalAlloc(std.testing.allocator, parent);
+    defer std.testing.allocator.free(parent_encoded);
+    const parent_sha256 = try manifestDigestHexAlloc(std.testing.allocator, parent_encoded);
+    defer std.testing.allocator.free(parent_sha256);
     const child: Manifest = .{
         .backup_id = "daily",
         .table_id = 7,
@@ -888,7 +928,7 @@ test "incremental plan uploads only blobs absent from complete parent" {
         .catalog_sha256 = digest_a,
         .representation = .native,
         .mode = .delta,
-        .parent_manifest_sha256 = digest_b,
+        .parent_manifest_sha256 = parent_sha256,
         .created_at_unix_ns = 2,
         .shards = &.{.{
             .group_id = 9,
@@ -906,7 +946,7 @@ test "incremental plan uploads only blobs absent from complete parent" {
             .{ .sha256 = digest_child, .logical_size_bytes = 20, .stored_size_bytes = 20 },
         },
     };
-    const changed = try incrementalBlobIndicesAlloc(std.testing.allocator, digest_child, child, digest_b, parent);
+    const changed = try incrementalBlobIndicesAlloc(std.testing.allocator, child, parent_sha256, parent);
     defer std.testing.allocator.free(changed);
     try std.testing.expectEqualSlices(usize, &.{1}, changed);
 }
@@ -1056,6 +1096,115 @@ fn writeTestFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
     defer file.close(io);
     try file.writePositionalAll(io, bytes, 0);
     try file.sync(io);
+}
+
+test "repository incremental upload streams only blobs absent from exact parent" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const catalog_bytes = "catalog-v1";
+    const changed_bytes = "segment-v2";
+    var catalog_digest_bytes: [Sha256.digest_length]u8 = undefined;
+    var changed_digest_bytes: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(catalog_bytes, &catalog_digest_bytes, .{});
+    Sha256.hash(changed_bytes, &changed_digest_bytes, .{});
+    const catalog_sha256 = std.fmt.bytesToHex(catalog_digest_bytes, .lower);
+    const changed_sha256 = std.fmt.bytesToHex(changed_digest_bytes, .lower);
+
+    const parent: Manifest = .{
+        .backup_id = "incremental",
+        .table_id = 7,
+        .table_name = "docs",
+        .catalog_sha256 = &catalog_sha256,
+        .representation = .native,
+        .created_at_unix_ns = 1,
+        .shards = &.{.{
+            .group_id = 9,
+            .start_key_base64 = "",
+            .object_paths = &.{"catalog/table.json"},
+            .capture_revision = 1,
+            .checkpoint_revision = 1,
+        }},
+        .objects = &.{.{
+            .logical_path = "catalog/table.json",
+            .role = "catalog",
+            .blob_sha256 = &catalog_sha256,
+            .logical_size_bytes = catalog_bytes.len,
+        }},
+        .blobs = &.{.{
+            .sha256 = &catalog_sha256,
+            .logical_size_bytes = catalog_bytes.len,
+            .stored_size_bytes = catalog_bytes.len,
+        }},
+    };
+    const parent_encoded = try encodeManifestCanonicalAlloc(alloc, parent);
+    defer alloc.free(parent_encoded);
+    const parent_sha256 = try manifestDigestHexAlloc(alloc, parent_encoded);
+    defer alloc.free(parent_sha256);
+
+    var child_blobs = [_]BlobRef{
+        .{ .sha256 = &catalog_sha256, .logical_size_bytes = catalog_bytes.len, .stored_size_bytes = catalog_bytes.len },
+        .{ .sha256 = &changed_sha256, .logical_size_bytes = changed_bytes.len, .stored_size_bytes = changed_bytes.len },
+    };
+    std.mem.sort(BlobRef, &child_blobs, {}, struct {
+        fn lessThan(_: void, lhs: BlobRef, rhs: BlobRef) bool {
+            return std.mem.order(u8, lhs.sha256, rhs.sha256) == .lt;
+        }
+    }.lessThan);
+    const child: Manifest = .{
+        .backup_id = "incremental",
+        .table_id = 7,
+        .table_name = "docs",
+        .catalog_sha256 = &catalog_sha256,
+        .representation = .native,
+        .mode = .delta,
+        .parent_manifest_sha256 = parent_sha256,
+        .created_at_unix_ns = 2,
+        .shards = &.{.{
+            .group_id = 9,
+            .start_key_base64 = "",
+            .object_paths = &.{"shards/9/segment"},
+            .capture_revision = 2,
+            .checkpoint_revision = 2,
+        }},
+        .objects = &.{
+            .{ .logical_path = "catalog/table.json", .role = "catalog", .blob_sha256 = &catalog_sha256, .logical_size_bytes = catalog_bytes.len },
+            .{ .logical_path = "shards/9/segment", .role = "native_file", .blob_sha256 = &changed_sha256, .logical_size_bytes = changed_bytes.len },
+        },
+        .blobs = &child_blobs,
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/incremental-source", .{tmp.sub_path});
+    defer alloc.free(source_root);
+    const repository_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/incremental-repository", .{tmp.sub_path});
+    defer alloc.free(repository_root);
+    const catalog_path = try std.fmt.allocPrint(alloc, "{s}/catalog/table.json", .{source_root});
+    defer alloc.free(catalog_path);
+    const changed_path = try std.fmt.allocPrint(alloc, "{s}/shards/9/segment", .{source_root});
+    defer alloc.free(changed_path);
+    try writeTestFile(io, catalog_path, catalog_bytes);
+    try writeTestFile(io, changed_path, changed_bytes);
+    try fs_paths.createDirPathPortable(io, repository_root);
+
+    var filesystem = TestFilesystemBackend{ .alloc = alloc, .io = io, .root = repository_root };
+    const backend = filesystem.backend();
+    try uploadSnapshotBlobsFromDirectory(alloc, io, backend, parent, source_root);
+    try std.testing.expectEqual(@as(usize, 1), filesystem.put_blob_calls);
+    filesystem.put_blob_calls = 0;
+    try uploadIncrementalSnapshotBlobsFromDirectory(
+        alloc,
+        io,
+        backend,
+        child,
+        parent_sha256,
+        parent,
+        source_root,
+    );
+    try std.testing.expectEqual(@as(usize, 1), filesystem.put_blob_calls);
+    const changed_repository_path = try blobPathAlloc(alloc, &changed_sha256);
+    defer alloc.free(changed_repository_path);
+    try std.testing.expect(try backend.contains(backend.context, changed_repository_path));
 }
 
 test "repository publishes resolves and materializes one complete deduplicated snapshot" {
