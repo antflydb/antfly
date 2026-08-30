@@ -3554,10 +3554,42 @@ pub const Reader = struct {
     }
 
     fn readDecodedStreamDataWithLimits(self: *const Reader, obj: *const syntax.Object, decode_limits: DecodeLimits) ![]u8 {
+        return try self.readDecodedStreamDataWithLimitsAndFinalLimit(obj, decode_limits, null);
+    }
+
+    fn readDecodedStreamDataWithLimitsAndFinalLimit(
+        self: *const Reader,
+        obj: *const syntax.Object,
+        decode_limits: DecodeLimits,
+        final_output_limit: ?usize,
+    ) ![]u8 {
         try self.checkCancellation();
         if (obj.* != .stream) return error.NotAStream;
-        const raw = try self.readRawStreamDataWithLimit(obj, decode_limits.max_working_set_bytes);
-        const decoded = try decodeStreamFiltersOwnedAlloc(self.alloc, raw, obj.get("Filter"), obj.get("DecodeParms"), decode_limits, self.cancellation);
+        const filter_obj = obj.get("Filter");
+        const bounded_final_limit = if (final_output_limit) |limit|
+            @min(limit, decode_limits.max_decoded_stream_bytes)
+        else
+            null;
+        // An unfiltered stream's encoded and decoded representations are the
+        // same. Reject an oversized terminal value before duplicating it.
+        if (filter_obj == null) if (bounded_final_limit) |limit| {
+            if (try self.resolvedStreamDataLength(obj) > limit)
+                return error.DecodedStreamTooLarge;
+        };
+        const raw_limit = if (filter_obj == null and bounded_final_limit != null)
+            @min(decode_limits.max_working_set_bytes, bounded_final_limit.?)
+        else
+            decode_limits.max_working_set_bytes;
+        const raw = try self.readRawStreamDataWithLimit(obj, raw_limit);
+        const decoded = try decodeStreamFiltersOwnedAllocWithFinalLimit(
+            self.alloc,
+            raw,
+            filter_obj,
+            obj.get("DecodeParms"),
+            decode_limits,
+            bounded_final_limit,
+            self.cancellation,
+        );
         errdefer self.alloc.free(decoded);
         try self.checkCancellation();
         return decoded;
@@ -7466,10 +7498,12 @@ pub const Reader = struct {
                 if (decoded_u16.width != width or decoded_u16.height != height) return error.UnsupportedPdfRendering;
                 const sample_bytes = std.math.mul(usize, decoded_u16.pixels.len, @sizeOf(u16)) catch return error.PdfDecodeWorkingSetTooLarge;
                 const normalized_len = if (indexed_color_space) 0 else decoded_u16.pixels.len;
-                const renderer_scratch_len = if (decoded_u16.jp2_color.alphaLayout(decoded_u16.components)) |alpha_layout|
-                    std.math.mul(usize, pixel_count, alpha_layout.color_count) catch return error.PdfDecodeWorkingSetTooLarge
-                else
-                    0;
+                const renderer_scratch_len = try jpeg2000RendererScratchLen(
+                    pixel_count,
+                    decoded_u16.jp2_color,
+                    decoded_u16.components,
+                    indexed_color_space,
+                );
                 try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ encoded.len, sample_bytes, normalized_len, rgba_len, renderer_scratch_len });
                 const layout = try self.jpeg2000SourceLayout(obj, decoded_u16.components, decoded_u16.jp2_color);
                 const source_view = ImageSourceSamples{
@@ -7554,10 +7588,12 @@ pub const Reader = struct {
                 return error.UnsupportedPdfRendering;
             const decoded_pixel_count = std.math.mul(usize, decoded_u8.width, decoded_u8.height) catch return error.PdfDecodeWorkingSetTooLarge;
             const decoded_rgba_len = std.math.mul(usize, decoded_pixel_count, 4) catch return error.PdfDecodeWorkingSetTooLarge;
-            const renderer_scratch_len = if (decoded_u8.jp2_color.alphaLayout(decoded_u8.components)) |alpha_layout|
-                std.math.mul(usize, decoded_pixel_count, alpha_layout.color_count) catch return error.PdfDecodeWorkingSetTooLarge
-            else
-                0;
+            const renderer_scratch_len = try jpeg2000RendererScratchLen(
+                decoded_pixel_count,
+                decoded_u8.jp2_color,
+                decoded_u8.components,
+                indexed_color_space,
+            );
             try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ encoded.len, decoded_u8.pixels.len, decoded_rgba_len, renderer_scratch_len });
             const transparency_live_bytes = try decodeWorkingSetTotal(
                 self.decode_limits.max_working_set_bytes,
@@ -8495,10 +8531,10 @@ pub const Reader = struct {
             .stream => blk: {
                 if (retained_live_bytes >= self.decode_limits.max_working_set_bytes)
                     return error.PdfDecodeWorkingSetTooLarge;
-                result.decoded_lookup = try self.readDecodedStreamDataWithLimits(lookup_obj, .{
-                    .max_decoded_stream_bytes = @min(self.decode_limits.max_decoded_stream_bytes, lookup_len),
+                result.decoded_lookup = try self.readDecodedStreamDataWithLimitsAndFinalLimit(lookup_obj, .{
+                    .max_decoded_stream_bytes = self.decode_limits.max_decoded_stream_bytes,
                     .max_working_set_bytes = self.decode_limits.max_working_set_bytes - retained_live_bytes,
-                });
+                }, lookup_len);
                 break :blk result.decoded_lookup.?;
             },
             else => return error.UnsupportedPdfRendering,
@@ -11256,6 +11292,26 @@ fn decodeStreamFiltersOwnedAlloc(
     decode_limits: DecodeLimits,
     cancellation: CancellationProbe,
 ) ![]u8 {
+    return try decodeStreamFiltersOwnedAllocWithFinalLimit(
+        alloc,
+        raw,
+        filter_obj,
+        decode_parms_obj,
+        decode_limits,
+        null,
+        cancellation,
+    );
+}
+
+fn decodeStreamFiltersOwnedAllocWithFinalLimit(
+    alloc: Allocator,
+    raw: []u8,
+    filter_obj: ?*const syntax.Object,
+    decode_parms_obj: ?*const syntax.Object,
+    decode_limits: DecodeLimits,
+    final_output_limit: ?usize,
+    cancellation: CancellationProbe,
+) ![]u8 {
     decode_limits.validate() catch |err| {
         alloc.free(raw);
         return err;
@@ -11273,6 +11329,7 @@ fn decodeStreamFiltersOwnedAlloc(
         filter_obj,
         decode_parms_obj,
         decode_limits.max_decoded_stream_bytes,
+        final_output_limit,
         cancellation,
     ) catch |err| {
         if (err == error.OutOfMemory and budget.limit_exceeded)
@@ -11287,21 +11344,42 @@ fn decodeStreamFiltersOwnedBudgetAlloc(
     filter_obj: ?*const syntax.Object,
     decode_parms_obj: ?*const syntax.Object,
     max_decoded_stream_bytes: usize,
+    final_output_limit: ?usize,
     cancellation: CancellationProbe,
 ) ![]u8 {
     try cancellation.check();
-    if (filter_obj == null) return raw;
+    const terminal_limit = if (final_output_limit) |limit|
+        @min(limit, max_decoded_stream_bytes)
+    else
+        max_decoded_stream_bytes;
+    if (filter_obj == null) return if (final_output_limit != null)
+        try enforceDecodedStreamLimit(alloc, raw, terminal_limit)
+    else
+        raw;
 
     var current = raw;
     errdefer alloc.free(current);
 
     switch (filter_obj.?.*) {
         .name => |name| {
-            const next = try applyStreamFilterAlloc(alloc, current, name, decode_parms_obj, max_decoded_stream_bytes, cancellation);
+            const next = try applyStreamFilterAlloc(
+                alloc,
+                current,
+                name,
+                decode_parms_obj,
+                max_decoded_stream_bytes,
+                terminal_limit,
+                cancellation,
+            );
             alloc.free(current);
             return next;
         },
         .array => |items| {
+            if (items.len == 0) {
+                if (final_output_limit != null and current.len > terminal_limit)
+                    return error.DecodedStreamTooLarge;
+                return current;
+            }
             for (items, 0..) |item, i| {
                 const name = item.asName() orelse return error.UnsupportedStreamFilter;
                 const param = if (decode_parms_obj) |parms|
@@ -11312,7 +11390,16 @@ fn decodeStreamFiltersOwnedBudgetAlloc(
                     }
                 else
                     null;
-                const next = try applyStreamFilterAlloc(alloc, current, name, param, max_decoded_stream_bytes, cancellation);
+                const output_limit = if (i + 1 == items.len) terminal_limit else max_decoded_stream_bytes;
+                const next = try applyStreamFilterAlloc(
+                    alloc,
+                    current,
+                    name,
+                    param,
+                    max_decoded_stream_bytes,
+                    output_limit,
+                    cancellation,
+                );
                 alloc.free(current);
                 current = next;
             }
@@ -11406,7 +11493,15 @@ fn decodeStreamFiltersBeforeOwnedBudgetAlloc(
                     }
                 else
                     null;
-                const next = try applyStreamFilterAlloc(alloc, current, name, param, max_decoded_stream_bytes, cancellation);
+                const next = try applyStreamFilterAlloc(
+                    alloc,
+                    current,
+                    name,
+                    param,
+                    max_decoded_stream_bytes,
+                    max_decoded_stream_bytes,
+                    cancellation,
+                );
                 alloc.free(current);
                 current = next;
             }
@@ -11421,7 +11516,8 @@ fn applyStreamFilterAlloc(
     input: []const u8,
     name: []const u8,
     param: ?*const syntax.Object,
-    max_decoded_stream_bytes: usize,
+    max_intermediate_bytes: usize,
+    max_output_bytes: usize,
     cancellation: CancellationProbe,
 ) ![]u8 {
     try cancellation.check();
@@ -11439,26 +11535,26 @@ fn applyStreamFilterAlloc(
                 return error.InvalidFlateStream;
             };
             if (n == 0) break;
-            if (inflated_list.items.len > max_decoded_stream_bytes -| n) return error.DecodedStreamTooLarge;
+            if (inflated_list.items.len > max_intermediate_bytes -| n) return error.DecodedStreamTooLarge;
             try inflated_list.appendSlice(alloc, read_buf[0..n]);
         }
         const inflated = try inflated_list.toOwnedSlice(alloc);
         defer alloc.free(inflated);
-        const decoded = try applyPredictorAlloc(alloc, inflated, param, max_decoded_stream_bytes, cancellation);
-        return try enforceDecodedStreamLimit(alloc, decoded, max_decoded_stream_bytes);
+        const decoded = try applyPredictorAlloc(alloc, inflated, param, max_output_bytes, cancellation);
+        return try enforceDecodedStreamLimit(alloc, decoded, max_output_bytes);
     }
     if (std.mem.eql(u8, name, "ASCIIHexDecode")) {
         const decoded = try asciiHexDecodeAlloc(alloc, input, cancellation);
-        return try enforceDecodedStreamLimit(alloc, decoded, max_decoded_stream_bytes);
+        return try enforceDecodedStreamLimit(alloc, decoded, max_output_bytes);
     }
     if (std.mem.eql(u8, name, "ASCII85Decode")) {
-        return try ascii85DecodeAlloc(alloc, input, max_decoded_stream_bytes, cancellation);
+        return try ascii85DecodeAlloc(alloc, input, max_output_bytes, cancellation);
     }
     if (std.mem.eql(u8, name, "LZWDecode")) {
-        return try lzwDecodeAlloc(alloc, input, param, max_decoded_stream_bytes, cancellation);
+        return try lzwDecodeAlloc(alloc, input, param, max_intermediate_bytes, max_output_bytes, cancellation);
     }
     if (std.mem.eql(u8, name, "RunLengthDecode")) {
-        return try runLengthDecodeAlloc(alloc, input, max_decoded_stream_bytes, cancellation);
+        return try runLengthDecodeAlloc(alloc, input, max_output_bytes, cancellation);
     }
     return error.UnsupportedStreamFilter;
 }
@@ -11533,7 +11629,14 @@ fn ascii85DecodeAlloc(alloc: Allocator, input: []const u8, max_bytes: usize, can
     return try out.toOwnedSlice(alloc);
 }
 
-fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Object, max_bytes: usize, cancellation: CancellationProbe) ![]u8 {
+fn lzwDecodeAlloc(
+    alloc: Allocator,
+    input: []const u8,
+    param: ?*const syntax.Object,
+    max_intermediate_bytes: usize,
+    max_output_bytes: usize,
+    cancellation: CancellationProbe,
+) ![]u8 {
     const early_change: u16 = blk: {
         if (param) |obj| {
             if (obj.* == .dict) {
@@ -11595,7 +11698,8 @@ fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Obj
         } else return error.MalformedLzw;
         defer alloc.free(entry);
 
-        if (out.items.len > max_bytes or entry.len > max_bytes - out.items.len) return error.DecodedStreamTooLarge;
+        if (out.items.len > max_intermediate_bytes or entry.len > max_intermediate_bytes - out.items.len)
+            return error.DecodedStreamTooLarge;
         try out.appendSlice(alloc, entry);
 
         if (prev_code) |prev| {
@@ -11617,8 +11721,8 @@ fn lzwDecodeAlloc(alloc: Allocator, input: []const u8, param: ?*const syntax.Obj
 
     const decoded = try out.toOwnedSlice(alloc);
     defer alloc.free(decoded);
-    const predicted = try applyPredictorAlloc(alloc, decoded, param, max_bytes, cancellation);
-    return try enforceDecodedStreamLimit(alloc, predicted, max_bytes);
+    const predicted = try applyPredictorAlloc(alloc, decoded, param, max_output_bytes, cancellation);
+    return try enforceDecodedStreamLimit(alloc, predicted, max_output_bytes);
 }
 
 fn runLengthDecodeAlloc(alloc: Allocator, input: []const u8, max_bytes: usize, cancellation: CancellationProbe) ![]u8 {
@@ -11745,10 +11849,22 @@ fn applyPredictorAlloc(
     cancellation: CancellationProbe,
 ) ![]u8 {
     try cancellation.check();
-    if (param == null or param.?.* != .dict) return try alloc.dupe(u8, decoded);
-    const predictor_obj = param.?.get("Predictor") orelse return try alloc.dupe(u8, decoded);
-    const predictor = predictor_obj.asInteger() orelse return try alloc.dupe(u8, decoded);
-    if (predictor <= 1) return try alloc.dupe(u8, decoded);
+    if (param == null or param.?.* != .dict) {
+        if (decoded.len > max_bytes) return error.DecodedStreamTooLarge;
+        return try alloc.dupe(u8, decoded);
+    }
+    const predictor_obj = param.?.get("Predictor") orelse {
+        if (decoded.len > max_bytes) return error.DecodedStreamTooLarge;
+        return try alloc.dupe(u8, decoded);
+    };
+    const predictor = predictor_obj.asInteger() orelse {
+        if (decoded.len > max_bytes) return error.DecodedStreamTooLarge;
+        return try alloc.dupe(u8, decoded);
+    };
+    if (predictor <= 1) {
+        if (decoded.len > max_bytes) return error.DecodedStreamTooLarge;
+        return try alloc.dupe(u8, decoded);
+    }
 
     const columns_i = if (param.?.get("Columns")) |obj| obj.asInteger() orelse 1 else 1;
     const colors_i = if (param.?.get("Colors")) |obj| obj.asInteger() orelse 1 else 1;
@@ -11776,6 +11892,7 @@ fn applyPredictorAlloc(
         // corresponding sample in the preceding pixel. PDF image streams in
         // the wild commonly use this with 8-bit RGB and grayscale data.
         if (bits != 8 or decoded.len % row_len != 0) return error.UnsupportedPredictor;
+        if (decoded.len > max_bytes) return error.DecodedStreamTooLarge;
         const out = try alloc.dupe(u8, decoded);
         var row_start: usize = 0;
         while (row_start < out.len) : (row_start += row_len) {
@@ -11791,9 +11908,14 @@ fn applyPredictorAlloc(
     if (predictor < 10 or predictor > 15) return error.UnsupportedPredictor;
     const encoded_row_len = std.math.add(usize, row_len, 1) catch return error.UnsupportedPredictor;
     if (decoded.len % encoded_row_len != 0) return error.MalformedPredictorData;
+    const row_count = decoded.len / encoded_row_len;
+    const output_len = std.math.mul(usize, row_count, row_len) catch
+        return error.DecodedStreamTooLarge;
+    if (output_len > max_bytes) return error.DecodedStreamTooLarge;
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, output_len);
     const prev = try alloc.alloc(u8, row_len);
     defer alloc.free(prev);
     @memset(prev, 0);
@@ -16777,6 +16899,21 @@ fn readIccS15Fixed16(bytes: []const u8, offset: usize) f64 {
     return @as(f64, @floatFromInt(raw)) / 65536.0;
 }
 
+fn jpeg2000RendererScratchLen(
+    pixel_count: usize,
+    metadata: image_lib.jpeg2000.Jp2ColorMetadata,
+    components: u8,
+    indexed_color_space: bool,
+) !usize {
+    // Direct Indexed rendering consumes the native index channel in place and
+    // reads embedded alpha from that same sample view. Only continuous-color
+    // rendering compacts alpha-interleaved samples into a separate buffer.
+    if (indexed_color_space) return 0;
+    const alpha_layout = metadata.alphaLayout(components) orelse return 0;
+    return std.math.mul(usize, pixel_count, alpha_layout.color_count) catch
+        return error.PdfDecodeWorkingSetTooLarge;
+}
+
 fn jpeg2000InferredColorSpace(metadata: image_lib.jpeg2000.Jp2ColorMetadata, components: u8) !Jpeg2000ColorSpace {
     if (metadata.has_icc_profile) return error.UnsupportedPdfRendering;
     if (metadata.enumerated_color_space) |color_space| return switch (color_space) {
@@ -17732,6 +17869,7 @@ test "lzw cancellation polling is amortized across short code sequences" {
         &.{ 0x80, 0x0b, 0x60, 0x50, 0x22, 0x0c, 0x0c, 0x85, 0x01 },
         null,
         64,
+        64,
         .{ .context = &probe_state, .is_cancelled_fn = ProbeState.isCancelled },
     );
     defer std.testing.allocator.free(decoded);
@@ -17768,7 +17906,7 @@ test "stream decoders enforce the decoded byte budget before growth" {
     try std.testing.expectError(error.DecodedStreamTooLarge, ascii85DecodeAlloc(alloc, "zz~>", 7, .{}));
 
     const lzw = &.{ 0x80, 0x0b, 0x60, 0x50, 0x22, 0x0c, 0x0c, 0x85, 0x01 };
-    try std.testing.expectError(error.DecodedStreamTooLarge, lzwDecodeAlloc(alloc, lzw, null, 5, .{}));
+    try std.testing.expectError(error.DecodedStreamTooLarge, lzwDecodeAlloc(alloc, lzw, null, 5, 5, .{}));
 
     const run_length = &.{ 2, 'A', 'B', 'C', 254, 'Z', 128 };
     try std.testing.expectError(error.DecodedStreamTooLarge, runLengthDecodeAlloc(alloc, run_length, 5, .{}));
@@ -21151,6 +21289,15 @@ test "reader preserves native JPX samples for Indexed color spaces" {
     }, decoded.rgba);
 }
 
+test "Indexed JPX rendering does not reserve continuous alpha scratch" {
+    var metadata = image_lib.jpeg2000.Jp2ColorMetadata{};
+    metadata.channel_definitions[0] = .{ .channel = 0, .kind = .color, .association = 1 };
+    metadata.channel_definitions[1] = .{ .channel = 1, .kind = .opacity, .association = 0 };
+
+    try std.testing.expectEqual(@as(usize, 0), try jpeg2000RendererScratchLen(4096, metadata, 2, true));
+    try std.testing.expectEqual(@as(usize, 4096), try jpeg2000RendererScratchLen(4096, metadata, 2, false));
+}
+
 test "reader bounds full-resolution JPX fallback when reduced multi-tile decode is unsupported" {
     const alloc = std.testing.allocator;
     const width: u32 = 128;
@@ -22242,6 +22389,78 @@ test "Indexed palette stream decode reserves retained image working set" {
     try std.testing.expectError(
         error.PdfDecodeWorkingSetTooLarge,
         reader.resolveIndexedPaletteAlloc(color_space.array, 28, .palette_rgba),
+    );
+}
+
+test "Indexed palette terminal limit permits larger intermediate filters" {
+    const alloc = std.testing.allocator;
+    const lookup = [_]u8{ 0x12, 0x34, 0x56 };
+    const predicted = [_]u8{ 0, lookup[0], lookup[1], lookup[2] };
+    var compressed_storage: [256]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&compressed_storage);
+    var history: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&output, history[0..], .zlib, .default);
+    try compressor.writer.writeAll(&predicted);
+    try compressor.finish();
+    const compressed = output.buffered();
+    try std.testing.expect(compressed.len > lookup.len);
+
+    const encoded_len = try std.math.add(usize, try std.math.mul(usize, compressed.len, 2), 1);
+    const ascii_hex = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(ascii_hex);
+    const digits = "0123456789ABCDEF";
+    for (compressed, 0..) |byte, index| {
+        ascii_hex[index * 2] = digits[byte >> 4];
+        ascii_hex[index * 2 + 1] = digits[byte & 0x0f];
+    }
+    ascii_hex[ascii_hex.len - 1] = '>';
+
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        try std.fmt.allocPrint(
+            alloc,
+            "3 0 obj\n<< /Length {d} /Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms [null << /Predictor 12 /Colors 3 /BitsPerComponent 8 /Columns 1 >>] >>\nstream\n{s}\nendstream\nendobj\n",
+            .{ ascii_hex.len, ascii_hex },
+        ),
+    };
+    defer alloc.free(objects[2]);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.initWithDecodeLimits(alloc, sample, .{
+        .max_decoded_stream_bytes = 64,
+        .max_working_set_bytes = 1024,
+    });
+    defer reader.deinit();
+    var scanner = syntax.Scanner.init(alloc, "[/Indexed /DeviceRGB 0 3 0 R]");
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    var palette = try reader.resolveIndexedPaletteAlloc(color_space.array, 0, .palette_rgba);
+    defer palette.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &lookup, palette.lookup);
+}
+
+test "Indexed unfiltered palette is rejected before copying excess data" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        "3 0 obj\n<< /Length 6 >>\nstream\nabcdef\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var scanner = syntax.Scanner.init(alloc, "[/Indexed /DeviceRGB 0 3 0 R]");
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    try std.testing.expectError(
+        error.DecodedStreamTooLarge,
+        reader.resolveIndexedPaletteAlloc(color_space.array, 0, .palette_rgba),
     );
 }
 
