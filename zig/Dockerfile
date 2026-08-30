@@ -1,16 +1,19 @@
 FROM --platform=$BUILDPLATFORM alpine:3.21 AS zig
 
 ARG ZIG_VERSION=0.17.0-dev.1933+e19a73c2d
+ARG ZIG_X86_64_LINUX_SHA256=122e91695d3dd7a7b640dac7f901a09a900614ef01e936c9f517dae8299b4368
+ARG ZIG_AARCH64_LINUX_SHA256=af999865a348703ed7496ff3c4a8a83a4c4a2b50097b19f99eb1f9f7e1791e4a
 ARG BUILDARCH
 
 RUN apk add --no-cache curl xz
 
 RUN case "${BUILDARCH}" in \
-        amd64) zig_arch="x86_64" ;; \
-        arm64) zig_arch="aarch64" ;; \
+        amd64) zig_arch="x86_64"; zig_sha256="${ZIG_X86_64_LINUX_SHA256}" ;; \
+        arm64) zig_arch="aarch64"; zig_sha256="${ZIG_AARCH64_LINUX_SHA256}" ;; \
         *) echo "unsupported BUILDARCH=${BUILDARCH}" >&2; exit 1 ;; \
     esac && \
-    curl -L "https://ziglang.org/builds/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz && \
+    curl --fail --location --retry 3 "https://ziglang.org/builds/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz && \
+    echo "${zig_sha256}  /tmp/zig.tar.xz" | sha256sum -c - && \
     mkdir -p /opt && \
     tar -xJf /tmp/zig.tar.xz -C /opt && \
     mv /opt/zig-${zig_arch}-linux-${ZIG_VERSION} /opt/zig

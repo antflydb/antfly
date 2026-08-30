@@ -14,6 +14,7 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   ZIG_VERSION: 0.17.0-dev.1933+e19a73c2d
+  ZIG_X86_64_LINUX_SHA256: 122e91695d3dd7a7b640dac7f901a09a900614ef01e936c9f517dae8299b4368
   MACOS_SDK_VERSION: "15.5"
   MACOS_SDK_SHA256: c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
 
@@ -51,11 +52,13 @@ jobs:
 
       - name: Install Zig
         run: |
+          zig_archive="$RUNNER_TEMP/zig.tar.xz"
           curl --fail --location --retry 3 \
             "https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
-            -o "$RUNNER_TEMP/zig.tar.xz"
+            -o "$zig_archive"
+          echo "$ZIG_X86_64_LINUX_SHA256  $zig_archive" | sha256sum --check --strict
           mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          tar -xJf "$zig_archive" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
       - name: Install pinned macOS cross-compilation SDK

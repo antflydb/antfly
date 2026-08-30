@@ -22,6 +22,7 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   ZIG_VERSION: 0.17.0-dev.1933+e19a73c2d
+  ZIG_X86_64_LINUX_SHA256: 122e91695d3dd7a7b640dac7f901a09a900614ef01e936c9f517dae8299b4368
 
 jobs:
   package:
@@ -76,11 +77,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xz-utils
+          zig_archive="$RUNNER_TEMP/zig.tar.xz"
           curl --fail --location --retry 3 \
             "https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
-            -o "$RUNNER_TEMP/zig.tar.xz"
+            -o "$zig_archive"
+          echo "$ZIG_X86_64_LINUX_SHA256  $zig_archive" | sha256sum --check --strict
           mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          tar -xJf "$zig_archive" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
       - name: Test Antfly C ABI packaging

@@ -258,6 +258,7 @@ jobs:
     timeout-minutes: 20
     env:
       ZIG_VERSION: "0.17.0-dev.1933+e19a73c2d"
+      ZIG_AARCH64_LINUX_SHA256: af999865a348703ed7496ff3c4a8a83a4c4a2b50097b19f99eb1f9f7e1791e4a
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-arm64-codec
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-arm64-codec
     steps:
@@ -275,11 +276,13 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y ca-certificates curl xz-utils
+          zig_archive="$RUNNER_TEMP/zig.tar.xz"
           curl -fsSL \
             "https://ziglang.org/builds/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
-            -o "$RUNNER_TEMP/zig.tar.xz"
+            -o "$zig_archive"
+          echo "$ZIG_AARCH64_LINUX_SHA256  $zig_archive" | sha256sum --check --strict
           mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" \
+          tar -xJf "$zig_archive" \
             -C "$RUNNER_TEMP/zig" \
             --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
