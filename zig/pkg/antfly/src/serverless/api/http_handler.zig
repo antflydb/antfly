@@ -898,23 +898,25 @@ pub const HttpHandler = struct {
             return try textResponse(self.alloc, 429, "table backpressured");
         }
 
-        const req = parseTableIngestBatchRequest(self.alloc, table_name, body) catch |err| switch (err) {
+        var parsed = ant_json.parseFromSlice(api_types.TableIngestBatchBody, self.alloc, body, .{}) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            error.InvalidDocumentMutation => return try textResponse(
+            error.UnexpectedToken => return try textResponse(
                 self.alloc,
                 400,
                 "upserts require an object document and deletes must omit document",
             ),
             else => return try textResponse(self.alloc, 400, "invalid ingest request"),
         };
-        defer freeDocumentMutations(self.alloc, req.mutations);
+        defer parsed.deinit();
+        const mutations = try lowerTableIngestMutationsAlloc(self.alloc, parsed.value.mutations);
+        defer self.alloc.free(mutations);
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
 
         var result = self.api.ingestBatch(.{
             .namespace = namespace,
-            .timestamp_ns = req.timestamp_ns,
-            .mutations = req.mutations,
+            .timestamp_ns = parsed.value.timestamp_ns,
+            .mutations = mutations,
         }) catch return try textResponse(self.alloc, 500, "ingest failed");
         defer result.deinit(self.alloc);
 
@@ -7113,66 +7115,38 @@ fn parseIngestBatchRequest(alloc: Allocator, namespace: []const u8, body: []cons
     };
 }
 
-fn parseTableIngestBatchRequest(alloc: Allocator, table_name: []const u8, body: []const u8) !api_types.TableIngestBatchRequest {
-    const ParsedMutation = struct {
-        kind: []const u8,
-        doc_id: []const u8,
-        document: ?ant_json.RawValue = null,
-    };
-    const ParsedRequest = struct {
-        timestamp_ns: u64,
-        mutations: []ParsedMutation,
-    };
-
-    var parsed = try ant_json.parseFromSlice(ParsedRequest, alloc, body, .{});
-    defer parsed.deinit();
-
-    const mutations = try alloc.alloc(api_types.DocumentMutation, parsed.value.mutations.len);
-    errdefer alloc.free(mutations);
-    var initialized: usize = 0;
-    errdefer {
-        for (mutations[0..initialized]) |*mutation| mutation.deinit(alloc);
-    }
-
-    for (parsed.value.mutations, 0..) |mutation, idx| {
-        const kind = try parseMutationKind(mutation.kind);
-        const document = switch (kind) {
-            .upsert => blk: {
-                const raw = mutation.document orelse return error.InvalidDocumentMutation;
-                _ = ant_json.RawObject.init(raw.bytes) catch return error.InvalidDocumentMutation;
-                break :blk try alloc.dupe(u8, raw.bytes);
+fn lowerTableIngestMutationsAlloc(
+    alloc: Allocator,
+    public_mutations: []const api_types.TableIngestMutation,
+) ![]api_types.DocumentMutation {
+    const mutations = try alloc.alloc(api_types.DocumentMutation, public_mutations.len);
+    for (public_mutations, 0..) |mutation, idx| {
+        mutations[idx] = switch (mutation) {
+            .upsert => |upsert| .{
+                .kind = .upsert,
+                .doc_id = upsert.doc_id,
+                .body = upsert.document.bytes,
             },
-            .delete => blk: {
-                if (mutation.document != null) return error.InvalidDocumentMutation;
-                break :blk null;
+            .delete => |delete| .{
+                .kind = .delete,
+                .doc_id = delete.doc_id,
             },
         };
-        errdefer if (document) |owned| alloc.free(owned);
-        const doc_id = try alloc.dupe(u8, mutation.doc_id);
-        errdefer alloc.free(doc_id);
-        mutations[idx] = .{
-            .kind = kind,
-            .doc_id = doc_id,
-            .body = document,
-        };
-        initialized += 1;
     }
-
-    return .{
-        .table_name = table_name,
-        .timestamp_ns = parsed.value.timestamp_ns,
-        .mutations = mutations,
-    };
+    return mutations;
 }
 
-test "serverless public table mutation admission owns embedded object documents" {
+test "serverless public table mutation admission lowers embedded object documents without copying" {
     const alloc = std.testing.allocator;
-    const valid = try parseTableIngestBatchRequest(alloc, "docs",
+    var valid = try ant_json.parseFromSlice(api_types.TableIngestBatchBody, alloc,
         \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":{"body":"alpha"}},{"kind":"delete","doc_id":"doc-b"}]}
-    );
-    defer freeDocumentMutations(alloc, valid.mutations);
-    try std.testing.expectEqual(@as(usize, 2), valid.mutations.len);
-    try std.testing.expectEqualStrings("{\"body\":\"alpha\"}", valid.mutations[0].body.?);
+    , .{});
+    defer valid.deinit();
+    const mutations = try lowerTableIngestMutationsAlloc(alloc, valid.value.mutations);
+    defer alloc.free(mutations);
+    try std.testing.expectEqual(@as(usize, 2), mutations.len);
+    try std.testing.expectEqualStrings("{\"body\":\"alpha\"}", mutations[0].body.?);
+    try std.testing.expect(mutations[0].body.?.ptr == valid.value.mutations[0].upsert.document.bytes.ptr);
 
     inline for (.{
         \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":"plain text"}]}
@@ -7183,12 +7157,14 @@ test "serverless public table mutation admission owns embedded object documents"
         ,
         \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a"}]}
         ,
+        \\{"timestamp_ns":1,"mutations":[{"kind":"delete","doc_id":"doc-a","document":null}]}
+        ,
         \\{"timestamp_ns":1,"mutations":[{"kind":"delete","doc_id":"doc-a","document":{}}]}
         ,
     }) |invalid| {
         try std.testing.expectError(
-            error.InvalidDocumentMutation,
-            parseTableIngestBatchRequest(alloc, "docs", invalid),
+            error.UnexpectedToken,
+            ant_json.parseFromSlice(api_types.TableIngestBatchBody, alloc, invalid, .{}),
         );
     }
 }

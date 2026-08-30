@@ -573,34 +573,10 @@ pub const ServerlessHttpClient = struct {
         const path = try std.fmt.allocPrint(self.alloc, "/tables/{s}/ingest-batch", .{req.table_name});
         defer self.alloc.free(path);
 
-        const JsonMutation = struct {
-            kind: []const u8,
-            doc_id: []const u8,
-            document: ?ant_json.RawObject = null,
-        };
-        const json_mutations = try self.alloc.alloc(JsonMutation, req.mutations.len);
-        defer self.alloc.free(json_mutations);
-
-        for (req.mutations, 0..) |mutation, idx| {
-            json_mutations[idx] = .{
-                .kind = mutationKindString(mutation.kind),
-                .doc_id = mutation.doc_id,
-                .document = switch (mutation.kind) {
-                    .upsert => ant_json.RawObject.init(
-                        mutation.body orelse return error.InvalidDocumentMutation,
-                    ) catch return error.InvalidDocumentMutation,
-                    .delete => blk: {
-                        if (mutation.body != null) return error.InvalidDocumentMutation;
-                        break :blk null;
-                    },
-                },
-            };
-        }
-
-        const body = try std.json.Stringify.valueAlloc(self.alloc, .{
+        const body = try self.stringifyRequestAlloc(serverless.TableIngestBatchBody{
             .timestamp_ns = req.timestamp_ns,
-            .mutations = json_mutations,
-        }, .{});
+            .mutations = req.mutations,
+        });
         defer self.alloc.free(body);
 
         return try self.requestJsonValue(TableIngestBatchResult, .PUT, base_uri, path, body);
@@ -1165,6 +1141,28 @@ test "serverless http client round-trips serverless http server" {
     try std.testing.expectEqual(@as(?u64, 1), publish_head.current_head);
 }
 
+test "serverless http client serializes canonical table mutation variants" {
+    const alloc = std.testing.allocator;
+    var client = ServerlessHttpClient.init(alloc, undefined);
+    const mutations = [_]serverless.TableIngestMutation{
+        try serverless.TableIngestMutation.initUpsert("doc-a", "{\"body\":\"alpha\"}"),
+        serverless.TableIngestMutation.initDelete("doc-b"),
+    };
+    const body = try client.stringifyRequestAlloc(serverless.TableIngestBatchBody{
+        .timestamp_ns = 1,
+        .mutations = &mutations,
+    });
+    defer alloc.free(body);
+
+    try ant_json.testing.expectEqualJsonText(alloc,
+        \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":{"body":"alpha"}},{"kind":"delete","doc_id":"doc-b"}]}
+    , body);
+    try std.testing.expectError(
+        error.InvalidDocumentMutation,
+        serverless.TableIngestMutation.initUpsert("doc-c", "plain text"),
+    );
+}
+
 test "serverless http client round-trips the table public API routes" {
     const alloc = std.testing.allocator;
 
@@ -1245,8 +1243,8 @@ test "serverless http client round-trips the table public API routes" {
     try std.testing.expectEqualStrings("docs", table_policy.table_name);
     try std.testing.expectEqual(serverless.DefaultQueryView.latest, table_policy.policy.default_query_view);
 
-    const mutations = [_]serverless.DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-a", .body = "{\"body\":\"alpha\"}" },
+    const mutations = [_]serverless.TableIngestMutation{
+        try serverless.TableIngestMutation.initUpsert("doc-a", "{\"body\":\"alpha\"}"),
     };
     var ingest = try tables_api.ingest("", .{
         .table_name = "docs",
@@ -1280,8 +1278,8 @@ test "serverless http client round-trips the table public API routes" {
     try std.testing.expectEqualStrings("docs", search.value.table_name);
     try std.testing.expectEqual(@as(usize, 1), search.value.hits.len);
 
-    const next_mutations = [_]serverless.DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-b", .body = "{\"body\":\"beta\"}" },
+    const next_mutations = [_]serverless.TableIngestMutation{
+        try serverless.TableIngestMutation.initUpsert("doc-b", "{\"body\":\"beta\"}"),
     };
     var next_ingest = try tables_api.ingest("", .{
         .table_name = "docs",

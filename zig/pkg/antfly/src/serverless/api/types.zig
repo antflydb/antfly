@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const Allocator = std.mem.Allocator;
 const catalog_types = @import("../catalog/types.zig");
 const search_sources = @import("../search_sources.zig");
@@ -41,7 +42,138 @@ pub const IngestBatchRequest = struct {
     mutations: []const DocumentMutation,
 };
 
+pub const TableUpsertMutation = struct {
+    doc_id: []const u8,
+    document: ant_json.RawObject,
+};
+
+pub const TableDeleteMutation = struct {
+    doc_id: []const u8,
+};
+
+/// Canonical public table mutation. The structural union keeps invalid states
+/// out of client code: upserts always carry an object document and deletes
+/// cannot carry one. Internal WAL/domain mutations deliberately remain the
+/// byte-oriented `DocumentMutation` above.
+pub const TableIngestMutation = union(enum) {
+    upsert: TableUpsertMutation,
+    delete: TableDeleteMutation,
+
+    pub fn initUpsert(doc_id: []const u8, document_json: []const u8) error{InvalidDocumentMutation}!@This() {
+        return .{ .upsert = .{
+            .doc_id = doc_id,
+            .document = ant_json.RawObject.init(document_json) catch return error.InvalidDocumentMutation,
+        } };
+    }
+
+    pub fn initDelete(doc_id: []const u8) @This() {
+        return .{ .delete = .{ .doc_id = doc_id } };
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        switch (self) {
+            .upsert => |mutation| {
+                try jw.objectField("kind");
+                try jw.write("upsert");
+                try jw.objectField("doc_id");
+                try jw.write(mutation.doc_id);
+                try jw.objectField("document");
+                try jw.write(mutation.document);
+            },
+            .delete => |mutation| {
+                try jw.objectField("kind");
+                try jw.write("delete");
+                try jw.objectField("doc_id");
+                try jw.write(mutation.doc_id);
+            },
+        }
+        try jw.endObject();
+    }
+
+    pub fn jsonParse(
+        allocator: Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        const parsed = try std.json.innerParse(TableIngestMutationInput, allocator, source, options);
+        return try fromInput(parsed);
+    }
+
+    pub fn jsonParseFromValue(
+        allocator: Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        const parsed = try std.json.innerParseFromValue(TableIngestMutationInput, allocator, source, options);
+        return try fromInput(parsed);
+    }
+
+    fn fromInput(input: TableIngestMutationInput) error{UnexpectedToken}!@This() {
+        return switch (input.kind) {
+            .upsert => switch (input.document) {
+                .value => |document| .{ .upsert = .{
+                    .doc_id = input.doc_id,
+                    .document = document,
+                } },
+                .absent, .null_value => error.UnexpectedToken,
+            },
+            .delete => switch (input.document) {
+                .absent => .{ .delete = .{ .doc_id = input.doc_id } },
+                .null_value, .value => error.UnexpectedToken,
+            },
+        };
+    }
+};
+
+const TableMutationDocumentPresence = union(enum) {
+    absent,
+    null_value,
+    value: ant_json.RawObject,
+
+    pub fn jsonParse(
+        allocator: Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        if (try source.peekNextTokenType() == .null) {
+            _ = try source.next();
+            return .null_value;
+        }
+        return .{ .value = try std.json.innerParse(ant_json.RawObject, allocator, source, options) };
+    }
+
+    pub fn jsonParseFromValue(
+        allocator: Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        if (source == .null) return .null_value;
+        return .{ .value = try std.json.innerParseFromValue(ant_json.RawObject, allocator, source, options) };
+    }
+};
+
+const TableIngestMutationInput = struct {
+    kind: MutationKind,
+    doc_id: []const u8,
+    document: TableMutationDocumentPresence = .absent,
+};
+
+pub const TableIngestBatchBody = struct {
+    timestamp_ns: u64,
+    mutations: []const TableIngestMutation,
+};
+
 pub const TableIngestBatchRequest = struct {
+    table_name: []const u8,
+    timestamp_ns: u64,
+    mutations: []const TableIngestMutation,
+};
+
+/// Internal service request after the public table wire has been admitted.
+/// Its raw byte payload is also used by WAL replay and other trusted runtime
+/// paths, so it intentionally does not carry public JSON shape semantics.
+pub const TableIngestBatchDomainRequest = struct {
     table_name: []const u8,
     timestamp_ns: u64,
     mutations: []const DocumentMutation,
