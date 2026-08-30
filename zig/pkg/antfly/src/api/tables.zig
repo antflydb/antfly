@@ -76,6 +76,12 @@ fn normalizeRawCreateTableIndexesAlloc(alloc: std.mem.Allocator, value: std.json
         const config = entry.value_ptr.*;
         const is_catalog_metadata = std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
         if (!is_catalog_metadata) {
+            if (config == .object) {
+                if (config.object.get("name")) |inline_name| {
+                    if (inline_name != .string or !std.mem.eql(u8, inline_name.string, name))
+                        return error.InvalidCreateTableRequest;
+                }
+            }
             const index_type = if (config == .object) config.object.get("type") else null;
             const is_full_text = index_type == null or
                 (index_type.? == .string and std.mem.eql(u8, index_type.?.string, "full_text"));
@@ -87,9 +93,17 @@ fn normalizeRawCreateTableIndexesAlloc(alloc: std.mem.Allocator, value: std.json
                 continue;
             }
             if (std.mem.startsWith(u8, name, "full_text_index")) return error.InvalidCreateTableRequest;
-            const artifact_backed_full_text = is_full_text and config == .object and
-                (config.object.contains("artifact_name") or config.object.contains("enrichments"));
-            if (is_full_text and !artifact_backed_full_text) continue;
+            // `default` is the released compatibility alias for the canonical
+            // system index. Other named full-text indexes are caller-owned and
+            // must survive create-table normalization like every other kind.
+            if (is_full_text and std.mem.eql(u8, name, "default")) {
+                if (config == .object and
+                    (config.object.contains("artifact_name") or
+                        config.object.contains("sources") or
+                        config.object.contains("enrichments")))
+                    return error.InvalidCreateTableRequest;
+                continue;
+            }
         }
 
         // Replace the closing brace, append the caller-owned entry, then close
@@ -517,7 +531,7 @@ const IndexRuntimeSchemaDebug = struct {
 pub const TableStatusWithRuntimeSchemaDebug = struct {
     name: []const u8,
     description: ?[]const u8 = null,
-    indexes: std.json.ArrayHashMap(indexes_openapi.IndexConfig),
+    indexes: std.json.ArrayHashMap(indexes_openapi.CreatedIndex),
     shards: std.json.ArrayHashMap(metadata_openapi.ShardConfig),
     schema: ?schema_openapi.TableSchema = null,
     migration: ?metadata_openapi.TableMigration = null,
@@ -723,9 +737,9 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
             const normalized_indexes_json = try normalizeRawCreateTableIndexesAlloc(alloc, value);
             defer alloc.free(normalized_indexes_json);
             req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, normalized_indexes_json);
-        } else req.indexes_json = try alloc.dupe(u8, default_indexes_json);
+        } else req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, default_indexes_json);
     } else {
-        req.indexes_json = try alloc.dupe(u8, default_indexes_json);
+        req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, default_indexes_json);
     }
     if (root.get("schema")) |value| {
         if (value != .null) {
@@ -1207,6 +1221,7 @@ pub fn routeQueryRequestToActiveReadIndex(
     table: *const metadata_table_manager.TableRecord,
     req: *db_mod.types.SearchRequest,
 ) !void {
+    try validateNamedFullTextQueryIndexes(alloc, table.indexes_json, req.full_text_queries);
     if (!queryNeedsPrimaryTextIndex(req.*)) return;
 
     const active_name = (try selectActiveFullTextIndexName(alloc, table)) orelse return;
@@ -1219,6 +1234,26 @@ pub fn routeQueryRequestToActiveReadIndex(
         req.index_name = active_name;
     } else {
         alloc.free(active_name);
+    }
+}
+
+fn validateNamedFullTextQueryIndexes(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    queries: []const db_mod.types.NamedFullTextQuery,
+) !void {
+    if (queries.len == 0) return;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    const indexes = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    for (queries) |query| {
+        if (query.index_name.len == 0) return error.InvalidQueryRequest;
+        const config = indexes.get(query.index_name) orelse return error.InvalidQueryRequest;
+        const index_type = inferIndexType(query.index_name, config) orelse return error.InvalidQueryRequest;
+        if (index_type != .full_text) return error.InvalidQueryRequest;
     }
 }
 
@@ -1739,10 +1774,10 @@ fn parseTableSchema(alloc: std.mem.Allocator, schema_json: []const u8) !schema_o
 fn parseTableIndexes(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
-) !std.json.ArrayHashMap(indexes_openapi.IndexConfig) {
+) !std.json.ArrayHashMap(indexes_openapi.CreatedIndex) {
     const canonical_json = try encodeTableIndexesObject(alloc, indexes_json);
     defer alloc.free(canonical_json);
-    return try std.json.parseFromSliceLeaky(std.json.ArrayHashMap(indexes_openapi.IndexConfig), alloc, canonical_json, .{
+    return try std.json.parseFromSliceLeaky(std.json.ArrayHashMap(indexes_openapi.CreatedIndex), alloc, canonical_json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
@@ -3210,22 +3245,25 @@ fn upsertVersionedFullTextIndex(
         else => return error.InvalidTableIndexMetadata,
     };
 
-    const stale_name = try std.fmt.allocPrint(alloc, "full_text_index_v{d}", .{current_version});
-    defer alloc.free(stale_name);
     const next_name = try std.fmt.allocPrint(alloc, "full_text_index_v{d}", .{next_version});
     defer alloc.free(next_name);
+
+    // A table may contain any number of named full-text indexes with artifact
+    // or field-selective sources. Only the index selected for the current read
+    // schema is the primary document index and may seed the next schema
+    // version. Picking the first full-text config silently promotes an
+    // unrelated named index when catalog insertion order changes.
+    const active_name = try selectFullTextIndexNameForVersion(alloc, current_indexes_json, current_version);
+    defer if (active_name) |name| alloc.free(name);
+    const active_config = if (active_name) |name| root.get(name) else null;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.append(alloc, '{');
 
-    var full_text_config: ?std.json.Value = null;
     var first = true;
     var it = root.iterator();
     while (it.next()) |entry| {
-        if (full_text_config == null and isFullTextIndexConfig(entry.value_ptr.*)) {
-            full_text_config = entry.value_ptr.*;
-        }
         if (std.mem.eql(u8, entry.key_ptr.*, next_name)) continue;
 
         if (!first) try out.append(alloc, ',');
@@ -3237,15 +3275,37 @@ fn upsertVersionedFullTextIndex(
         try out.appendSlice(alloc, encoded);
     }
 
-    if (full_text_config) |config| {
+    if (active_config) |config| {
+        var next_config = try buildCanonicalIndexConfigValue(alloc, next_name, config);
+        defer deinitJsonValue(alloc, &next_config);
+        // A versioned index is a distinct desired incarnation. Retaining the
+        // previous private token would let stale runtime observations satisfy
+        // readiness for the newly built index.
+        removeOwnedJsonObjectField(alloc, &next_config.object, coverage_policy_mod.incarnation_field);
+        removeOwnedJsonObjectField(alloc, &next_config.object, coverage_policy_mod.legacy_coverage_incarnation_field);
+        const encoded_next_config = try coverage_policy_mod.withFreshIncarnationAlloc(alloc, next_config);
+        defer alloc.free(encoded_next_config);
+
         if (!first) try out.append(alloc, ',');
         try appendJsonString(alloc, &out, next_name);
         try out.append(alloc, ':');
-        try appendCanonicalIndexConfig(alloc, &out, next_name, config);
+        try out.appendSlice(alloc, encoded_next_config);
     }
 
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn removeOwnedJsonObjectField(
+    alloc: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    field: []const u8,
+) void {
+    if (object.fetchOrderedRemove(field)) |removed| {
+        alloc.free(@constCast(removed.key));
+        var removed_value = removed.value;
+        deinitJsonValue(alloc, &removed_value);
+    }
 }
 
 fn selectActiveFullTextIndexName(
@@ -4262,7 +4322,10 @@ test "create table parser preserves supported metadata fields" {
     try std.testing.expectEqual(@as(?u32, 1), parsed.num_shards);
     try std.testing.expectEqualStrings("docs table", parsed.description.?);
     try std.testing.expectEqualStrings("{\"version\":0,\"kind\":\"demo\"}", parsed.schema_json.?);
-    try std.testing.expectEqualStrings(default_indexes_json, parsed.indexes_json.?);
+    var stored_indexes = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, parsed.indexes_json.?, .{});
+    defer stored_indexes.deinit();
+    const default_index = stored_indexes.value.object.get("full_text_index_v0") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(coverage_policy_mod.incarnation(default_index) != null);
     try std.testing.expectEqualStrings("[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]", parsed.replication_sources_json.?);
 }
 
@@ -4284,7 +4347,10 @@ test "create table rejects caller-managed schema versions" {
     );
     defer stored.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("{\"version\":0}", stored.schema_json.?);
-    try std.testing.expectEqualStrings(default_indexes_json, stored.indexes_json.?);
+    var stored_indexes = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, stored.indexes_json.?, .{});
+    defer stored_indexes.deinit();
+    const default_index = stored_indexes.value.object.get("full_text_index_v0") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(coverage_policy_mod.incarnation(default_index) != null);
 }
 
 test "create table raw parser merges default full text with quickstart embedding index" {
@@ -4302,9 +4368,38 @@ test "create table raw parser merges default full text with quickstart embedding
     );
     defer parsed.deinit(std.testing.allocator);
 
-    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"title_body\":{") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"_coverage_incarnation\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"_index_incarnation\":") != null);
+}
+
+test "create table raw parser preserves named field full text index" {
+    var parsed = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"indexes\":{\"body_search\":{\"type\":\"full_text\",\"field\":\"body\"}}}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"full_text_index_v0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"body_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"field\":\"body\"") != null);
+}
+
+test "create table raw parser rejects ambiguous index identities" {
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"body_search\":{\"name\":\"other\",\"type\":\"full_text\",\"field\":\"body\"}}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"default\":{\"type\":\"full_text\",\"artifact_name\":\"chunks_v1\"}}}",
+        ),
+    );
 }
 
 test "create table raw parser preserves artifact backed full text index" {
@@ -4318,6 +4413,17 @@ test "create table raw parser preserves artifact backed full text index" {
     try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"document_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"artifact_name\":\"document_chunks_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"enrichments\"") != null);
+}
+
+test "create table raw parser preserves source-only artifact full text index" {
+    var parsed = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"indexes\":{\"document_vectors\":{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_dense_v1\"}],\"enrichments\":[{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512},{\"name\":\"document_dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3}]},\"document_text_union\":{\"type\":\"full_text\",\"field\":\"text\",\"sources\":[{\"artifact\":\"document_chunks_v1\"}]}}}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"document_text_union\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"sources\":[{\"artifact\":\"document_chunks_v1\"}]") != null);
 }
 
 test "create table raw parser accepts its canonical full text output" {
@@ -4640,7 +4746,7 @@ test "metadata.schema update preserves read schema and adds versioned full-text 
     try std.testing.expect(std.mem.indexOf(u8, updated.read_schema_json, "\"document_schemas\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v0\":{\"type\":\"full_text\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v1\":{\"name\":\"full_text_index_v1\",\"type\":\"full_text\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v1\":{\"name\":\"full_text_index_v1\",\"type\":\"full_text\"") != null);
 }
 
 test "metadata.schema update versions template-only changes" {
@@ -4664,7 +4770,38 @@ test "metadata.schema update versions template-only changes" {
     try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":3") != null);
     try std.testing.expectEqualStrings(table.read_schema_json, updated.read_schema_json);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v2\":{\"type\":\"full_text\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\":{\"name\":\"full_text_index_v3\",\"type\":\"full_text\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\":{\"name\":\"full_text_index_v3\",\"type\":\"full_text\"") != null);
+}
+
+test "metadata.schema update versions only the active primary full-text index with a fresh incarnation" {
+    const alloc = std.testing.allocator;
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":2,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\"}}}}",
+        .read_schema_json = "{\"version\":1}",
+        // Put a named artifact index first and an older version before the
+        // current primary to prove neither insertion order nor history wins.
+        .indexes_json = "{\"chunks\":{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"document_chunks_v1\"}],\"_index_incarnation\":11},\"full_text_index_v1\":{\"type\":\"full_text\",\"field\":\"old_body\",\"_index_incarnation\":12},\"full_text_index_v2\":{\"type\":\"full_text\",\"field\":\"body\",\"_index_incarnation\":13}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const updated = try applySchemaUpdateRecord(
+        alloc,
+        &table,
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"}}}}}}",
+    );
+    defer metadata_table_manager.freeTable(alloc, updated);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, updated.indexes_json, .{});
+    defer parsed.deinit();
+    const next = parsed.value.object.get("full_text_index_v3") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("body", next.object.get("field").?.string);
+    try std.testing.expect(next.object.get("sources") == null);
+    const next_incarnation = coverage_policy_mod.incarnation(next) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(next_incarnation != 13);
+    try std.testing.expectEqual(@as(u64, 13), coverage_policy_mod.incarnation(parsed.value.object.get("full_text_index_v2").?).?);
 }
 
 test "metadata.schema update avoids a generation for semantically identical JSON" {
@@ -5076,6 +5213,42 @@ test "metadata.query routing selects read schema full text index" {
     try routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req);
     try std.testing.expectEqualStrings("full_text_index_v0", req.index_name.?);
     try std.testing.expectEqualStrings("full_text_index_v0", req.primary_text_index_name.?);
+}
+
+test "metadata.query routing validates named full text retrieval and keeps schema filters separate" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":0}",
+        .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"document_text\":{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks_v1\"}]},\"dense_idx\":{\"type\":\"embeddings\",\"dimension\":3}}",
+        .placement_role = "data",
+    };
+    var queries = [_]db_mod.types.NamedFullTextQuery{.{
+        .name = "$full_text_results",
+        .index_name = "document_text",
+        .query = .{ .match_all = {} },
+    }};
+    var req: db_mod.types.SearchRequest = .{
+        .full_text_queries = &queries,
+        .filter_query_json = "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}",
+    };
+    defer if (req.index_name) |index_name| std.testing.allocator.free(index_name);
+    defer if (req.primary_text_index_name) |index_name| std.testing.allocator.free(index_name);
+
+    try routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req);
+    try std.testing.expectEqualStrings("full_text_index_v0", req.index_name.?);
+    try std.testing.expectEqualStrings("full_text_index_v0", req.primary_text_index_name.?);
+
+    queries[0].index_name = "dense_idx";
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req),
+    );
+    queries[0].index_name = "missing_text";
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req),
+    );
 }
 
 test "metadata.query routing leaves hierarchy child traversal index free" {

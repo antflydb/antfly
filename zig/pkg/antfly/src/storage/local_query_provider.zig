@@ -84,6 +84,7 @@ fn executeSearch(
             .parent_with_chunks => .parent_with_chunks,
             .unit => .unit,
             .unit_with_chunks => .unit_with_chunks,
+            .member => .member,
         };
         owned.req.max_chunks_per_parent = request.execution_options.max_chunks_per_parent;
         if (request.execution_options.dense_k != 0) {

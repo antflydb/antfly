@@ -58,6 +58,11 @@ pub const MaintenanceStats = struct {
     bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
 };
 
+pub const CatalogProjectionSnapshot = struct {
+    tables: []metadata.TableRecord,
+    ranges: []metadata.RangeRecord,
+};
+
 const ListenerRegistration = struct {
     projection: ?ProjectionListener = null,
     committed_key: ?CommittedKeyListener = null,
@@ -300,6 +305,22 @@ pub const RaftApplyStore = struct {
 
     pub fn listTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.TableRecord {
         return try self.projectionWithAllocator([]metadata.TableRecord, alloc, .{ .kind = .tables, .group_id = group_id });
+    }
+
+    pub fn captureCatalogProjection(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        deadline_ns: ?u64,
+    ) !CatalogProjectionSnapshot {
+        return self.projectionWithAllocator(CatalogProjectionSnapshot, alloc, .{
+            .kind = .catalog_projection,
+            .group_id = group_id,
+            .arg0 = deadline_ns orelse 0,
+        }) catch |err| switch (err) {
+            error.Timeout => error.CatalogRoutingSnapshotTimeout,
+            else => err,
+        };
     }
 
     pub fn freeTables(_: *RaftApplyStore, alloc: std.mem.Allocator, values: []metadata.TableRecord) void {

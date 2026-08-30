@@ -31,9 +31,9 @@ const internal_service_auth = @import("../api/internal_service_auth.zig");
 const runtime_http_abi = @import("../runtime_http_abi.zig");
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
 const storage_source_options = @import("storage_source_options");
-const storage_kernel_experiment = storage_source_options.control_only;
-const LegacyLiteHandle = if (storage_kernel_experiment) struct {} else antfly.lite.backend.Handle;
-const LegacyAuthBackend = if (storage_kernel_experiment) struct {} else antfly.lsm_backend.BackendHandle;
+const control_only_storage_sources = storage_source_options.control_only;
+const LegacyLiteHandle = if (control_only_storage_sources) struct {} else antfly.lite.backend.Handle;
+const LegacyAuthBackend = if (control_only_storage_sources) struct {} else antfly.lsm_backend.BackendHandle;
 const inline_inference_codegen = builtin.is_test;
 const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
 
@@ -1193,6 +1193,7 @@ const LocalStandaloneMetadata = struct {
         var updated = table.*;
         updated.indexes_json = try antfly.public_api.indexes.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
+        try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try self.manager.upsertTable(updated);
@@ -1467,7 +1468,7 @@ const LocalStandaloneMetadata = struct {
             // live data-server adapter is not installed yet, retain the
             // migration and retry on the next metadata round instead of
             // terminating the standalone runtime.
-            if (comptime storage_kernel_experiment) {
+            if (comptime control_only_storage_sources) {
                 if (shard_db_adapter == null) return;
             }
             filesystem_progress = try antfly.metadata.table_provisioner.collectLocalSchemaProgressWithOptions(
@@ -1789,7 +1790,7 @@ pub fn runFromIterator(
 
     const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
     var storage_kernel_context = kernel_owner_client.Context{};
-    if (comptime storage_kernel_experiment) {
+    if (comptime control_only_storage_sources) {
         try storage_kernel_context.ensureWith(.{
             .storage_kind = if (lite_path != null) .lite else .directory,
             .no_sync = @intFromBool(!lite_fsync),
@@ -1797,7 +1798,7 @@ pub fn runFromIterator(
             .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
         });
     }
-    defer if (storage_kernel_experiment) storage_kernel_context.deinit();
+    defer if (control_only_storage_sources) storage_kernel_context.deinit();
 
     var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer node_backend_runtime.deinit();
@@ -1807,15 +1808,15 @@ pub fn runFromIterator(
     defer inference_lane_lease.release();
     const inference_io = inference_lane_lease.io();
     var lite_backend: ?LegacyLiteHandle = null;
-    if (comptime !storage_kernel_experiment) {
+    if (comptime !control_only_storage_sources) {
         if (lite_path) |path| lite_backend = try antfly.lite.backend.Handle.openOrCreate(
             alloc,
             path,
             .{ .no_sync = !lite_fsync },
         );
     }
-    defer if (comptime !storage_kernel_experiment) if (lite_backend) |*backend| backend.deinit();
-    if (comptime !storage_kernel_experiment) {
+    defer if (comptime !control_only_storage_sources) if (lite_backend) |*backend| backend.deinit();
+    if (comptime !control_only_storage_sources) {
         if (lite_backend) |*backend| node_backend_runtime.ptr().db_open_configurator = backend.dbOpenConfigurator();
     }
 
@@ -1839,15 +1840,39 @@ pub fn runFromIterator(
         null;
     defer if (local_restore_job_store) |*store| store.deinit();
     var restore_job_store: ?*antfly.storage_backend_erased.Store = null;
-    if (comptime !storage_kernel_experiment) {
+    if (comptime !control_only_storage_sources) {
         restore_job_store = if (lite_backend) |*backend|
             try backend.runtimeStoreForNamespace("system/api-restore-jobs")
         else
             &local_restore_job_store.?;
     }
+    // Incoming reverse-route observations are an exact, fenced directory, not
+    // disposable cache state: retain one latest generation per logical graph
+    // key so restarts and L1 eviction do not reintroduce all-shard probes.
+    const incoming_graph_route_root = if (lite_backend == null)
+        try std.fmt.allocPrint(alloc, "{s}/incoming-graph-routes", .{resolved.replica_root_dir})
+    else
+        null;
+    defer if (incoming_graph_route_root) |path| alloc.free(path);
+    var incoming_graph_route_backend: ?antfly.lsm_backend.BackendHandle = if (incoming_graph_route_root) |path|
+        try antfly.lsm_backend.BackendHandle.open(alloc, path, .{})
+    else
+        null;
+    defer if (incoming_graph_route_backend) |*backend| backend.close();
+    var local_incoming_graph_route_store: ?antfly.storage_backend_erased.Store = if (incoming_graph_route_backend) |*backend|
+        try backend.backend.runtimeStore(alloc, .{ .name = "system/incoming-graph-routes" })
+    else
+        null;
+    defer if (local_incoming_graph_route_store) |*store| store.deinit();
+    const incoming_graph_route_store = if (comptime control_only_storage_sources)
+        &local_incoming_graph_route_store.?
+    else if (lite_backend) |*backend|
+        try backend.runtimeStoreForNamespace("system/incoming-graph-routes")
+    else
+        &local_incoming_graph_route_store.?;
     var storage_maintenance = try antfly.storage_maintenance.Coordinator.init(
         alloc,
-        if (comptime storage_kernel_experiment)
+        if (comptime control_only_storage_sources)
             storage_kernel_context.maintenanceSource()
         else if (lite_backend) |*backend|
             backend.maintenanceSource()
@@ -1992,7 +2017,7 @@ pub fn runFromIterator(
     // Attach before opening any context-backed auth/system stores. Those
     // handles intentionally retain the storage context for their lifetime;
     // attaching afterward is rejected as a live-owner configuration mutation.
-    if (comptime storage_kernel_experiment)
+    if (comptime control_only_storage_sources)
         try storage_kernel_context.attachInferenceProvider(antfly_node);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
@@ -2035,7 +2060,7 @@ pub fn runFromIterator(
     var auth_casbin_store: ?antfly.usermgr.StorageCasbinAdapter = null;
     var user_manager: ?antfly.usermgr.UserManager = null;
     if (auth_enabled) {
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             kernel_auth_users_store = try storage_kernel_context.systemStore(alloc, "system/auth-users");
             errdefer kernel_auth_users_store.?.deinit();
             kernel_auth_casbin_store = try storage_kernel_context.systemStore(alloc, "system/auth-casbin");
@@ -2078,7 +2103,7 @@ pub fn runFromIterator(
     }
     defer if (user_manager) |*manager| manager.deinit();
     defer if (auth_runtime) |*runtime| runtime.deinit();
-    defer if (comptime !storage_kernel_experiment) if (auth_backend) |*backend| backend.close();
+    defer if (comptime !control_only_storage_sources) if (auth_backend) |*backend| backend.close();
     defer if (kernel_auth_users_store) |*store| store.deinit();
     defer if (kernel_auth_casbin_store) |*store| store.deinit();
     defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
@@ -2094,7 +2119,7 @@ pub fn runFromIterator(
     defer alloc.free(public_api_url);
 
     var kernel_catalog_store: ?antfly.storage_backend_erased.Store = null;
-    if (comptime storage_kernel_experiment) {
+    if (comptime control_only_storage_sources) {
         if (lite_path != null) kernel_catalog_store = try storage_kernel_context.systemStore(alloc, "system/metadata");
     }
     defer if (kernel_catalog_store) |*store| store.deinit();
@@ -2107,7 +2132,7 @@ pub fn runFromIterator(
         resolved.replica_root_dir,
         resolved.local_metadata_catalog_path,
         node_backend_runtime.ptr(),
-        if (comptime storage_kernel_experiment)
+        if (comptime control_only_storage_sources)
             if (kernel_catalog_store) |*store| store else null
         else if (lite_backend) |*backend|
             try backend.runtimeStoreForNamespace("system/metadata")
@@ -2120,7 +2145,7 @@ pub fn runFromIterator(
     };
     defer local_metadata.deinit();
     if (lite_path != null) {
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             try local_metadata.adoptEmbeddedLiteRootFromKernelIfNeeded(&storage_kernel_context);
             try storage_kernel_context.liteMarkStandalone();
         } else if (lite_backend) |*backend| {
@@ -2133,7 +2158,7 @@ pub fn runFromIterator(
     // complete database and preserves staged multi-request transactions.
     var kernel_session_backend: ?antfly.storage_backend_erased.Store = null;
     var kernel_restore_job_backend: ?antfly.storage_backend_erased.Store = null;
-    if (comptime storage_kernel_experiment) {
+    if (comptime control_only_storage_sources) {
         if (lite_path != null) {
             kernel_session_backend = try storage_kernel_context.systemStore(alloc, "system/api-transaction-sessions");
             kernel_restore_job_backend = try storage_kernel_context.systemStore(alloc, "system/api-restore-jobs");
@@ -2141,7 +2166,7 @@ pub fn runFromIterator(
     }
     defer if (kernel_session_backend) |*store| store.deinit();
     defer if (kernel_restore_job_backend) |*store| store.deinit();
-    if (comptime storage_kernel_experiment) {
+    if (comptime control_only_storage_sources) {
         restore_job_store = if (kernel_restore_job_backend) |*store|
             store
         else if (local_restore_job_store) |*store|
@@ -2149,7 +2174,7 @@ pub fn runFromIterator(
         else
             null;
     }
-    var lite_session_store = if (comptime storage_kernel_experiment)
+    var lite_session_store = if (comptime control_only_storage_sources)
         if (kernel_session_backend) |*store|
             antfly.public_api.transactions.DurableSessionStore.initRuntime(alloc, store)
         else
@@ -2175,7 +2200,7 @@ pub fn runFromIterator(
     try validateHAPathsUnderRoot(cli, data_dir);
     const ha_startup_expectation = try haStartupExpectationFromCli(cli);
     const ha_startup_checkpoint_lsn = if (ha_startup_expectation) |expectation| blk: {
-        if (comptime storage_kernel_experiment) {
+        if (comptime control_only_storage_sources) {
             const request_json = try std.json.Stringify.valueAlloc(alloc, expectation, .{});
             defer alloc.free(request_json);
             break :blk kernel_owner_client.haSeedValidateActivatedGeneration(request_json) catch |err| {
@@ -2267,7 +2292,7 @@ pub fn runFromIterator(
         .replica_root_dir = resolved.replica_root_dir,
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
-        .storage_kernel_context_handle = if (storage_kernel_experiment) storage_kernel_context.handle else null,
+        .storage_kernel_context_handle = if (control_only_storage_sources) storage_kernel_context.handle else null,
         .process_memory_limit_bytes = process_memory_limit_bytes,
         .process_memory_limit_source = storageMemoryLimitSource(process_memory_resolution.effective_source),
         .store_registration = .{
@@ -2313,6 +2338,7 @@ pub fn runFromIterator(
             .user_manager = if (user_manager) |*manager| manager else null,
             .session_store = if (lite_session_store) |*store| store else null,
             .restore_job_store = restore_job_store,
+            .incoming_graph_route_store = incoming_graph_route_store,
             .session_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.ttl_seconds * std.time.ns_per_s else standalone_session_ttl_ns,
             .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,
             .session_max_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_count else standalone_session_max_count,

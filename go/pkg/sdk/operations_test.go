@@ -169,6 +169,69 @@ func TestReadSSEEventsEarlyTermination(t *testing.T) {
 	}
 }
 
+func TestQueryAcceptsExplicitEmbeddingIndexes(t *testing.T) {
+	var gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll request body: %v", err)
+			return
+		}
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"responses":[]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	var sparse Embedding
+	if err := sparse.FromEmbedding1(oapi.Embedding1{
+		Indices: []uint32{1, 5},
+		Values:  []float32{0.5, 0.75},
+	}); err != nil {
+		t.Fatalf("FromEmbedding1: %v", err)
+	}
+
+	if _, err := client.Query(context.Background(), QueryRequest{
+		Table:      "docs",
+		Embeddings: map[string]Embedding{"sparse_idx": sparse},
+		Indexes:    []string{"sparse_idx"},
+	}); err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if !strings.Contains(gotBody, `"indexes":["sparse_idx"]`) ||
+		!strings.Contains(gotBody, `"embeddings":{"sparse_idx":{"indices":[1,5],"values":[0.5,0.75]}}`) {
+		t.Fatalf("unexpected query body: %s", gotBody)
+	}
+}
+
+func TestQueryEmbeddingValidationMatchesServerContract(t *testing.T) {
+	client, err := NewAntflyClient("http://127.0.0.1:1", nil)
+	if err != nil {
+		t.Fatalf("NewAntflyClient: %v", err)
+	}
+
+	if _, err := client.Query(context.Background(), QueryRequest{
+		Indexes: []string{"dense_idx"},
+	}); err == nil || !strings.Contains(err.Error(), "semantic_search or embeddings required") {
+		t.Fatalf("indexes-only error = %v", err)
+	}
+
+	var dense Embedding
+	if err := dense.FromEmbedding0(oapi.Embedding0{1, 0, 0}); err != nil {
+		t.Fatalf("FromEmbedding0: %v", err)
+	}
+	if _, err := client.Query(context.Background(), QueryRequest{
+		Embeddings: map[string]Embedding{"dense_idx": dense},
+		Offset:     1,
+	}); err == nil || !strings.Contains(err.Error(), "offset not available") {
+		t.Fatalf("embedding offset error = %v", err)
+	}
+}
+
 func TestCreateIndexReturnsNormalizedConfigAndUsesPathIdentity(t *testing.T) {
 	var gotPath string
 	var gotBody string
@@ -216,6 +279,35 @@ func TestCreateIndexReturnsNormalizedConfigAndUsesPathIdentity(t *testing.T) {
 	}
 	if strings.Contains(gotBody, `"name"`) {
 		t.Fatalf("request duplicated path identity: %s", gotBody)
+	}
+}
+
+func TestCreateIndexRejectsInvalidDirectUnionBeforeNetwork(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	var request CreateIndexRequest
+	if err := request.FromCreateFullTextIndexRequest(CreateFullTextIndexRequest{
+		ArtifactName: "chunks_v1",
+		Sources:      []FullTextArtifactIndexSource{{Artifact: "chunks_v2"}},
+	}); err != nil {
+		t.Fatalf("FromCreateFullTextIndexRequest: %v", err)
+	}
+
+	if _, err := client.CreateIndex(context.Background(), "docs", "text", request); err == nil ||
+		!strings.Contains(err.Error(), "sources cannot be combined with artifact_name") {
+		t.Fatalf("CreateIndex error = %v, want relationship validation", err)
+	}
+	if requests != 0 {
+		t.Fatalf("server received %d requests, want 0", requests)
 	}
 }
 
@@ -273,6 +365,34 @@ func TestCreateIndexPreservesStorageAdmissionRetry(t *testing.T) {
 	if exhausted.StatusCode != http.StatusTooManyRequests || exhausted.Code != "storage_resource_exhausted" ||
 		!exhausted.Retryable || exhausted.RetryAfterMS != 1250 || exhausted.RetryAfterSeconds != 2 {
 		t.Fatalf("StorageResourceExhaustedError = %#v", exhausted)
+	}
+}
+
+func TestCreateIndexPreservesTemporaryMutationRetry(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "4")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"index_probe_unavailable","message":"model probe is temporarily unavailable","retryable":true}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	request, err := NewCreateIndexRequest(EmbeddingsIndexConfig{Dimension: 512})
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest: %v", err)
+	}
+	_, err = client.CreateIndex(context.Background(), "docs", "vectors", *request)
+	var unavailable *IndexMutationTemporarilyUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("CreateIndex error = %T %[1]v, want IndexMutationTemporarilyUnavailableError", err)
+	}
+	if unavailable.StatusCode != http.StatusServiceUnavailable || unavailable.Code != "index_probe_unavailable" ||
+		!unavailable.Retryable || unavailable.RetryAfterSeconds != 4 {
+		t.Fatalf("IndexMutationTemporarilyUnavailableError = %#v", unavailable)
 	}
 }
 

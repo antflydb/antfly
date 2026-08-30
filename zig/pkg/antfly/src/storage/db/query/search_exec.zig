@@ -118,6 +118,10 @@ pub const SearchTextQueryExecutor = struct {
         alloc: Allocator,
         index_name: ?[]const u8,
     ) anyerror!bool,
+    text_index_supports_unit_grouping: ?*const fn (
+        ctx: ?*anyopaque,
+        index_name: ?[]const u8,
+    ) bool = null,
     search_match_all: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -228,6 +232,12 @@ pub const DenseSearchExecutor = struct {
         index_name: []const u8,
         vector_id: u64,
     ) anyerror!?[]u8,
+    resolve_hit_key: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+        key: []const u8,
+    ) anyerror![]u8 = null,
     lookup_vector_id: *const fn (
         ctx: ?*anyopaque,
         index_name: []const u8,
@@ -10786,7 +10796,11 @@ fn compareU64(expected: u64, item: u64) std.math.Order {
 }
 
 pub fn shouldGroupChunkParents(req: types.SearchRequest, is_chunk_backed: bool) bool {
-    return is_chunk_backed and req.return_mode != .chunk;
+    return is_chunk_backed and req.return_mode != .member and req.return_mode != .chunk;
+}
+
+fn returnModeRequiresUnitGrouping(return_mode: types.ReturnMode) bool {
+    return return_mode == .unit or return_mode == .unit_with_chunks;
 }
 
 pub fn searchText(
@@ -11232,6 +11246,13 @@ pub fn searchTextQuery(
     if (effective_req.index_name == null) effective_req.index_name = text_entry.config.name;
     const text_index = &text_entry.persistent;
     const chunk_backed = try executor.text_index_is_chunk_backed(executor.ctx, alloc, effective_req.index_name);
+    if (returnModeRequiresUnitGrouping(effective_req.return_mode)) {
+        const supports_unit_grouping = if (executor.text_index_supports_unit_grouping) |supports|
+            supports(executor.ctx, effective_req.index_name)
+        else
+            false;
+        if (!supports_unit_grouping) return error.UnsupportedHierarchyGrouping;
+    }
     const group_chunk_parents = shouldGroupChunkParents(effective_req, chunk_backed);
     const paging = componentPaging(effective_req);
     effective_req.full_text = text_query;
@@ -11554,6 +11575,9 @@ pub fn searchTextQuery(
                 };
                 var assigned = false;
                 errdefer if (!assigned) materialized.deinit(alloc);
+                if (chunk_backed and returnModeRequiresUnitGrouping(effective_req.return_mode)) {
+                    materialized.artifact_ref = try artifact_ids.decodeArtifactRefAlloc(alloc, stored.id);
+                }
                 materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
                 hits[i] = materialized;
                 assigned = true;
@@ -11570,6 +11594,9 @@ pub fn searchTextQuery(
             };
             var assigned = false;
             errdefer if (!assigned) materialized.deinit(alloc);
+            if (chunk_backed and returnModeRequiresUnitGrouping(effective_req.return_mode)) {
+                materialized.artifact_ref = try artifact_ids.decodeArtifactRefAlloc(alloc, id);
+            }
             materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
             materialized.stored_data = if (load_stored_in_search_engine and hit.stored_data != null)
                 try executor.project_stored_search(executor.ctx, alloc, effective_req, id, hit.stored_data.?)
@@ -12715,9 +12742,12 @@ fn searchDenseInternal(
     const index_lookup_start = total_start;
     const entry = (try executor.dense_index(executor.ctx, req.index_name)) orelse return error.IndexNotFound;
     profile.index_lookup_ns = platform_time.monotonicNs() - index_lookup_start;
+    if (returnModeRequiresUnitGrouping(req.return_mode) and !entry.supports_unit_grouping)
+        return error.UnsupportedHierarchyGrouping;
 
     const chunk_backed = entry.chunk_name != null;
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
+    const multi_source_members = entry.embedding_names.len > 0;
     const paging = componentPaging(req);
     const index_stats = entry.index.stats();
     const constraint_start = platform_time.monotonicNs();
@@ -12732,7 +12762,13 @@ fn searchDenseInternal(
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
     );
-    const full_candidate_window = group_chunk_parents or unresolved_stored_filters;
+    const expansive_postprocessing = group_chunk_parents or unresolved_stored_filters;
+    // Multi-source members need visibility filtering and identity translation,
+    // but raw member modes do not collapse unrelated `(artifact, key)` values.
+    // Start at the requested score-order window and grow from observed losses
+    // instead of imposing document-grouping overfetch on the common raw path.
+    const raw_member_mode = req.return_mode == .member or req.return_mode == .chunk;
+    const full_candidate_window = expansive_postprocessing or multi_source_members;
     const page_candidate_window = pagingCandidateWindow(paging);
     const score_order_k = scoreOrderCandidateWindowK(dense.k, paging);
     const effort = resolvedSearchEffort(req.search_effort);
@@ -12790,8 +12826,10 @@ fn searchDenseInternal(
         @min(bounded_full_candidate_count, groupedCandidateBudget())
     else
         bounded_full_candidate_count;
-    var candidate_window: u32 = if (full_candidate_window)
+    var candidate_window: u32 = if (expansive_postprocessing)
         initialAdaptiveCandidateWindow(candidate_ceiling, paging)
+    else if (multi_source_members)
+        initialMultiSourceCandidateWindow(candidate_ceiling, paging, score_order_k, raw_member_mode)
     else
         score_order_k;
 
@@ -12812,7 +12850,10 @@ fn searchDenseInternal(
             .query = dense.vector,
             .k = hbc_effective_k,
             .rerank_k = if (full_candidate_window)
-                @as(usize, @intCast(@min(paging.offset +| paging.limit, hbc_effective_k)))
+                @as(usize, @intCast(if (multi_source_members)
+                    hbc_effective_k
+                else
+                    @min(paging.offset +| paging.limit, hbc_effective_k)))
             else if (exhaustive_broad_live_window)
                 @as(usize, @intCast(bounded_full_candidate_count))
             else
@@ -13005,7 +13046,11 @@ fn searchDenseInternal(
             vector_mod.similarityFromDistance(raw_hits[raw_hits.len - 1].distance, entry.metric)
         else
             null;
-        const candidate_window_incomplete = candidateWindowIncomplete(hbc_effective_k, bounded_full_candidate_count);
+        const candidate_window_incomplete = denseCandidateWindowIncomplete(
+            results.candidate_coverage,
+            hbc_effective_k,
+            bounded_full_candidate_count,
+        );
         const candidate_ceiling_reached = candidate_window >= candidate_ceiling;
         if (!candidate_window_incomplete and exhaustive_broad_live_window) {
             score_exactness = .exact;
@@ -13024,7 +13069,7 @@ fn searchDenseInternal(
         for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
             const result_index: usize = @as(usize, @intCast(start)) + i;
             const resolve_start = platform_time.monotonicNs();
-            const doc_key = if (results.takeMetadata(result_index)) |metadata| blk: {
+            var doc_key = if (results.takeMetadata(result_index)) |metadata| blk: {
                 profile.inline_metadata_hits += 1;
                 break :blk metadata;
             } else blk: {
@@ -13043,6 +13088,19 @@ fn searchDenseInternal(
                 profile.lookup_doc_key_hits += 1;
                 break :blk looked_up;
             };
+            var source_artifact_ref = if (entry.embedding_names.len > 0)
+                try artifact_ids.decodeArtifactRefAlloc(alloc, doc_key)
+            else
+                null;
+            var source_artifact_ref_owned = source_artifact_ref != null;
+            errdefer if (source_artifact_ref_owned) {
+                if (source_artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
+            };
+            if (executor.resolve_hit_key) |resolve_hit_key| {
+                const resolved = try resolve_hit_key(executor.ctx, alloc, entry, doc_key);
+                alloc.free(doc_key);
+                doc_key = resolved;
+            }
             profile.doc_key_resolve_ns += platform_time.monotonicNs() - resolve_start;
             var doc_key_owned = true;
             errdefer if (doc_key_owned) alloc.free(doc_key);
@@ -13068,9 +13126,11 @@ fn searchDenseInternal(
                 .score = vector_mod.similarityFromDistance(hit.distance, entry.metric),
                 .distance = hit.distance,
                 .stored_data = stored_data,
+                .artifact_ref = source_artifact_ref,
             });
             doc_key_owned = false;
             stored_data_owned = false;
+            source_artifact_ref_owned = false;
         }
         const ordinal_lookup_start = platform_time.monotonicNs();
         try lookupDenseHitDocOrdinals(alloc, postprocess_req, executor, hit_vector_ids.items, hits.items);
@@ -13101,13 +13161,17 @@ fn searchDenseInternal(
             !candidate_window_incomplete,
         );
         const needs_more_visible_candidates = unresolved_stored_filters and visible_candidate_count < page_candidate_window;
+        const needs_more_multi_source_candidates = multi_source_members and visible_candidate_count < page_candidate_window;
         if (full_candidate_window and
             candidate_window_incomplete and
             !candidate_ceiling_reached and
-            (needs_more_grouped_candidates or needs_more_visible_candidates))
+            (needs_more_grouped_candidates or needs_more_visible_candidates or needs_more_multi_source_candidates))
         {
             result.deinit();
-            const grown_window = growAdaptiveCandidateWindow(candidate_window, candidate_ceiling, page_candidate_window);
+            const grown_window = if (needs_more_multi_source_candidates and raw_member_mode)
+                growVisibleCandidateWindow(candidate_window, candidate_ceiling, page_candidate_window, visible_candidate_count)
+            else
+                growAdaptiveCandidateWindow(candidate_window, candidate_ceiling, page_candidate_window);
             if (grown_window == candidate_window) return error.InvalidQueryRequest;
             candidate_window = grown_window;
             continue;
@@ -13471,6 +13535,44 @@ fn initialAdaptiveCandidateWindow(candidate_ceiling: u32, paging: ComponentPagin
     return @min(candidate_ceiling, @max(overfetch_window, pagingCandidateWindow(paging)));
 }
 
+/// Multi-source indexes need post-processing to translate internal member IDs
+/// to public `(artifact, key)` identities. Raw member modes start at the exact
+/// score-order window; document modes retain page-proportional overfetch for
+/// identity collapse. Both use adaptive growth when discarded or duplicate
+/// members leave the requested page short.
+fn initialMultiSourceCandidateWindow(
+    candidate_ceiling: u32,
+    paging: ComponentPaging,
+    score_order_k: u32,
+    raw_member_mode: bool,
+) u32 {
+    if (candidate_ceiling == 0) return 0;
+    if (raw_member_mode) return @min(candidate_ceiling, @max(score_order_k, pagingCandidateWindow(paging)));
+    const overfetch_window = paging.limit *| 32;
+    return @min(candidate_ceiling, @max(score_order_k, @max(overfetch_window, pagingCandidateWindow(paging))));
+}
+
+/// Grow a raw-member candidate window from measured post-processing yield.
+/// The estimate avoids a long sequence of small retries under heavy visibility
+/// loss, while 25% headroom amortizes estimation noise. Geometric growth
+/// remains the minimum progress so retries stay O(log(candidate_ceiling)).
+fn growVisibleCandidateWindow(
+    current: u32,
+    candidate_ceiling: u32,
+    requested_visible_end: u32,
+    observed_visible: u32,
+) u32 {
+    if (current >= candidate_ceiling) return current;
+    if (observed_visible == 0) return growAdaptiveCandidateWindow(current, candidate_ceiling, requested_visible_end);
+
+    const estimated_numerator = @as(u128, current) * @as(u128, requested_visible_end) * 5;
+    const estimated_denominator = @as(u128, observed_visible) * 4;
+    const estimated = (estimated_numerator + estimated_denominator - 1) / estimated_denominator;
+    const geometric_growth = (@as(u128, current) * 3 + 1) / 2;
+    const grown = @max(geometric_growth, estimated);
+    return @intCast(@min(@as(u128, candidate_ceiling), grown));
+}
+
 fn growAdaptiveCandidateWindow(current: u32, candidate_ceiling: u32, requested_visible_end: u32) u32 {
     if (current >= candidate_ceiling) return current;
     const grown = @max(current +| 1, @max(current *| 2, requested_visible_end));
@@ -13479,6 +13581,18 @@ fn growAdaptiveCandidateWindow(current: u32, candidate_ceiling: u32, requested_v
 
 fn candidateWindowIncomplete(candidate_window: u32, bounded_full_candidate_count: u32) bool {
     return candidate_window < bounded_full_candidate_count;
+}
+
+fn denseCandidateWindowIncomplete(
+    coverage: vectorindex_mod.CandidateCoverage,
+    candidate_window: u32,
+    bounded_full_candidate_count: u32,
+) bool {
+    return switch (coverage) {
+        .exhausted => false,
+        .more => true,
+        .unknown => candidateWindowIncomplete(candidate_window, bounded_full_candidate_count),
+    };
 }
 
 /// Return whether adaptive collection has discovered the requested component
@@ -13546,6 +13660,9 @@ test "adaptive candidate window covers requested offset page and grows bounded" 
     try std.testing.expectEqual(@as(u32, 2000), growAdaptiveCandidateWindow(1025, 2000, 1025));
     try std.testing.expect(candidateWindowIncomplete(1025, 2000));
     try std.testing.expect(!candidateWindowIncomplete(2000, 2000));
+    try std.testing.expect(!denseCandidateWindowIncomplete(.exhausted, 10, 1_000_000));
+    try std.testing.expect(denseCandidateWindowIncomplete(.more, 10, 10));
+    try std.testing.expect(denseCandidateWindowIncomplete(.unknown, 10, 1_000_000));
     try std.testing.expectEqual(@as(u32, 7), initialAdaptiveCandidateWindow(7, paging));
 
     // Group collection starts with an overfetch window and may grow it again.
@@ -13559,6 +13676,197 @@ test "adaptive candidate window covers requested offset page and grows bounded" 
     const grown_width = resolveSearchWidth(grown_k, 0.0, stats);
     try std.testing.expect(page_width < initial_width);
     try std.testing.expect(initial_width < grown_width);
+}
+
+test "multi-source candidate window is page proportional and bounded" {
+    try std.testing.expectEqual(
+        @as(u32, 32),
+        initialMultiSourceCandidateWindow(10_000, .{ .offset = 0, .limit = 1 }, 1, false),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 320),
+        initialMultiSourceCandidateWindow(10_000, .{ .offset = 0, .limit = 10 }, 10, false),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 1_025),
+        initialMultiSourceCandidateWindow(10_000, .{ .offset = 1_024, .limit = 1 }, 10, false),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 4_096),
+        initialMultiSourceCandidateWindow(10_000, .{ .offset = 0, .limit = 10 }, 4_096, false),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 7),
+        initialMultiSourceCandidateWindow(7, .{ .offset = 0, .limit = 10 }, 10, false),
+    );
+
+    // Raw member modes preserve complete artifact identity, so their common
+    // path performs exactly one requested-size search.
+    try std.testing.expectEqual(
+        @as(u32, 1_000),
+        initialMultiSourceCandidateWindow(100_000, .{ .offset = 0, .limit = 1_000 }, 1_000, true),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 1_025),
+        initialMultiSourceCandidateWindow(100_000, .{ .offset = 1_024, .limit = 1 }, 10, true),
+    );
+    try std.testing.expectEqual(@as(u32, 1_500), growVisibleCandidateWindow(1_000, 100_000, 1_000, 900));
+    try std.testing.expectEqual(@as(u32, 12_500), growVisibleCandidateWindow(1_000, 100_000, 1_000, 100));
+    try std.testing.expectEqual(@as(u32, 2_000), growVisibleCandidateWindow(1_000, 100_000, 1_000, 0));
+    try std.testing.expectEqual(
+        std.math.maxInt(u32),
+        growVisibleCandidateWindow(std.math.maxInt(u32) - 1, std.math.maxInt(u32), std.math.maxInt(u32), 1),
+    );
+}
+
+test "raw multi-source member search avoids fixed-factor reranking" {
+    const alloc = std.testing.allocator;
+    const active_count: usize = 512;
+    const requested: usize = 10;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/multi-source-member-window", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
+        .dims = 2,
+        .leaf_size = 32,
+        .branching_factor = 8,
+    });
+    var index_owned = true;
+    defer if (index_owned) index.close();
+
+    const vectors = try alloc.alloc(f32, active_count * 2);
+    defer alloc.free(vectors);
+    @memset(vectors, 0);
+    const items = try alloc.alloc(hbc_mod.BatchInsertItem, active_count);
+    defer alloc.free(items);
+    for (items, 0..) |*item, i| {
+        const vector = vectors[i * 2 ..][0..2];
+        vector[0] = @floatFromInt(i);
+        item.* = .{ .vector_id = @intCast(i + 1), .vector = vector };
+    }
+    try index.bulkBuildWithMetadata(items);
+
+    var metadata_keys: [requested][]u8 = undefined;
+    for (&metadata_keys, 0..) |*key, i| {
+        var doc_key_buf: [32]u8 = undefined;
+        const doc_key = try std.fmt.bufPrint(&doc_key_buf, "doc:{d}", .{i});
+        key.* = try internal_keys.embeddingArtifactKeyForDocumentAlloc(
+            alloc,
+            doc_key,
+            if (i % 2 == 0) "title_dense_v1" else "body_dense_v1",
+        );
+    }
+    defer for (metadata_keys) |key| alloc.free(key);
+
+    var embedding_names = [_][]u8{ @constCast("title_dense_v1"), @constCast("body_dense_v1") };
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var entry = index_manager_mod.IndexManager.DenseIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "document_vectors", .kind = .dense_vector, .config_json = "{}" },
+        .field_name = @constCast("embedding"),
+        .dims = 2,
+        .metric = .l2_squared,
+        .external = false,
+        .chunk_name = null,
+        .embedding_name = null,
+        .embedding_names = &embedding_names,
+        .index = index,
+    };
+    index_owned = false;
+    defer entry.index.close();
+
+    const Harness = struct {
+        alloc: Allocator,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+        metadata_keys: []const []const u8,
+        calls: usize = 0,
+        requested_k: usize = 0,
+        requested_rerank_k: ?usize = null,
+
+        fn self(ctx: ?*anyopaque) *@This() {
+            return @ptrCast(@alignCast(ctx.?));
+        }
+
+        fn textIndex(_: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            return null;
+        }
+
+        fn denseIndex(ctx: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.DenseIndex {
+            return self(ctx).entry;
+        }
+
+        fn unexpectedDocKey(_: ?*anyopaque, _: []const u8, _: u64) anyerror!?[]u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn unexpectedVectorId(_: ?*anyopaque, _: []const u8, _: []const u8) anyerror!?u64 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn unexpectedLoad(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror![]u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn hbcSearch(ctx: ?*anyopaque, _: *index_manager_mod.IndexManager.DenseIndex, req: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.SearchResults {
+            const harness = self(ctx);
+            harness.calls += 1;
+            harness.requested_k = req.k;
+            harness.requested_rerank_k = req.rerank_k;
+            const count = @min(req.k, harness.metadata_keys.len);
+            var results = try vectorindex_mod.SearchResults.initCapacity(harness.alloc, req.k, req.k, count);
+            errdefer results.deinit();
+            for (harness.metadata_keys[0..count], 0..) |key, i| {
+                results.addResultWithOwnedMetadata(
+                    @intCast(i + 1),
+                    @floatFromInt(i),
+                    0,
+                    try harness.alloc.dupe(u8, key),
+                );
+            }
+            results.sort();
+            return results;
+        }
+
+        fn unexpectedHbcProfiled(_: ?*anyopaque, _: *index_manager_mod.IndexManager.DenseIndex, _: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.ProfiledSearchResults {
+            return error.UnexpectedTestCall;
+        }
+
+        fn postprocess(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, raw: types.SearchResult, _: bool) anyerror!types.SearchResult {
+            return raw;
+        }
+    };
+    var harness = Harness{ .alloc = alloc, .entry = &entry, .metadata_keys = &metadata_keys };
+    const executor = DenseSearchExecutor{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndex,
+        .dense_index = Harness.denseIndex,
+        .lookup_doc_key = Harness.unexpectedDocKey,
+        .lookup_vector_id = Harness.unexpectedVectorId,
+        .load_projected_document = Harness.unexpectedLoad,
+        .hbc_search = Harness.hbcSearch,
+        .hbc_search_profiled = Harness.unexpectedHbcProfiled,
+        .postprocess = Harness.postprocess,
+    };
+
+    var result = try searchDense(alloc, .{
+        .index_name = "document_vectors",
+        .return_mode = .member,
+        .limit = requested,
+        .include_stored = false,
+    }, .{
+        .vector = &.{ 0, 0 },
+        .k = requested,
+    }, executor);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+    try std.testing.expectEqual(requested, harness.requested_k);
+    try std.testing.expectEqual(@as(?usize, requested), harness.requested_rerank_k);
+    try std.testing.expectEqual(requested, result.hits.len);
 }
 
 test "grouped result page satisfaction treats nested match count as a maximum" {
@@ -13660,6 +13968,7 @@ fn exactScoreNativeDenseFilter(
     defer alloc.free(vector_scratch);
     const query_measure = vector_mod.norm(req.query);
     var vectors_scored: u64 = 0;
+    var matching_vectors: u64 = 0;
 
     for (unique_candidate_ids, 0..) |vector_id, i| {
         if (i % exact_native_filter_cancellation_stride == 0) try checkVectorSearchCancelled(req);
@@ -13687,9 +13996,11 @@ fn exactScoreNativeDenseFilter(
         if (req.distance_under) |threshold| {
             if (distance >= threshold) continue;
         }
+        matching_vectors += 1;
         results.addResult(vector_id, distance, 0);
     }
     results.sort();
+    results.candidate_coverage = if (matching_vectors > @as(u64, @intCast(results.getHits().len))) .more else .exhausted;
     return .{
         .results = results,
         .vectors_scored = vectors_scored,
@@ -14423,8 +14734,11 @@ pub fn searchSparse(
     var page_ns: u64 = 0;
     var projected_source_profile = ProjectedSourceLoadProfile{};
     const entry = (try executor.sparse_index(executor.ctx, req.index_name)) orelse return error.IndexNotFound;
+    if (returnModeRequiresUnitGrouping(req.return_mode) and !entry.supports_unit_grouping)
+        return error.UnsupportedHierarchyGrouping;
     const chunk_backed = entry.chunk_name != null;
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
+    const multi_source_members = entry.embedding_names.len > 0;
     const paging = componentPaging(req);
     const constraint_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, req, .{
@@ -14450,7 +14764,9 @@ pub fn searchSparse(
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
     );
-    const full_candidate_window = group_chunk_parents or unresolved_stored_filters;
+    const expansive_postprocessing = group_chunk_parents or unresolved_stored_filters;
+    const raw_member_mode = req.return_mode == .member or req.return_mode == .chunk;
+    const full_candidate_window = expansive_postprocessing or multi_source_members;
     const bounded_sparse_candidate_count: u64 = if (native_constraints.positive_filter)
         @as(u64, native_constraints.filter_doc_ids.len) +| @as(u64, native_constraints.filter_doc_nums.len)
     else
@@ -14460,10 +14776,13 @@ pub fn searchSparse(
         @min(bounded_candidate_count, groupedCandidateBudget())
     else
         bounded_candidate_count;
-    var candidate_window: u32 = if (full_candidate_window)
+    const score_order_k = scoreOrderCandidateWindowK(sparse.k, paging);
+    var candidate_window: u32 = if (expansive_postprocessing)
         initialAdaptiveCandidateWindow(candidate_ceiling, paging)
+    else if (multi_source_members)
+        initialMultiSourceCandidateWindow(candidate_ceiling, paging, score_order_k, raw_member_mode)
     else
-        scoreOrderCandidateWindowK(sparse.k, paging);
+        score_order_k;
     const query = sparse_mod.SparseVector{
         .indices = sparse.indices,
         .values = sparse.values,
@@ -14480,6 +14799,7 @@ pub fn searchSparse(
     }
     const sparse_doc_nums_are_ordinals =
         !chunk_backed and
+        !multi_source_members and
         native_constraints.positive_filter and
         native_constraints.filter_doc_nums.len > 0 and
         native_constraints.filter_doc_ids.len == 0;
@@ -14520,7 +14840,7 @@ pub fn searchSparse(
 
         var batch_doc_ordinals: []?doc_set.DocOrdinal = &.{};
         defer if (batch_doc_ordinals.len > 0) alloc.free(batch_doc_ordinals);
-        if (!chunk_backed and !sparse_doc_nums_are_ordinals) {
+        if (!chunk_backed and !multi_source_members and !sparse_doc_nums_are_ordinals) {
             if (executor.lookup_doc_ordinals) |lookup_many| {
                 const selected = raw_hits[@intCast(start)..@intCast(end)];
                 if (selected.len > 0) {
@@ -14535,10 +14855,29 @@ pub fn searchSparse(
 
         const hit_build_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
         for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
+            var source_artifact_ref = if (multi_source_members)
+                try artifact_ids.decodeArtifactRefAlloc(alloc, hit.doc_id)
+            else
+                null;
+            var source_artifact_ref_owned = source_artifact_ref != null;
+            errdefer if (source_artifact_ref_owned) {
+                if (source_artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
+            };
+            const hit_id = if (multi_source_members) blk: {
+                var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, hit.doc_id)) orelse return error.InvalidInternalUserKey;
+                defer identity.deinit(alloc);
+                break :blk try alloc.dupe(u8, identity.doc_key);
+            } else try alloc.dupe(u8, hit.doc_id);
+            errdefer alloc.free(hit_id);
             hits[i] = .{
-                .id = try alloc.dupe(u8, hit.doc_id),
-                .doc_ordinal = if (chunk_backed)
-                    try sparseHitParentOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation)
+                .id = hit_id,
+                .doc_ordinal = if (multi_source_members)
+                    if (internal_keys.isChunkArtifactRecordKey(hit_id))
+                        try sparseHitParentOrdinal(alloc, executor, hit_id, req.identity_read_generation)
+                    else
+                        try sparseHitOrdinal(alloc, executor, hit_id, req.identity_read_generation)
+                else if (chunk_backed)
+                    try sparseHitParentOrdinal(alloc, executor, hit_id, req.identity_read_generation)
                 else if (sparse_doc_nums_are_ordinals and hit.doc_num != null)
                     hit.doc_num.?
                 else if (batch_doc_ordinals.len > 0)
@@ -14547,7 +14886,9 @@ pub fn searchSparse(
                     try sparseHitOrdinal(alloc, executor, hit.doc_id, req.identity_read_generation),
                 .score = hit.score,
                 .stored_data = null,
+                .artifact_ref = source_artifact_ref,
             };
+            source_artifact_ref_owned = false;
             initialized += 1;
         }
         if (bench_query_profile) hit_build_ns += platform_time.monotonicNs() - hit_build_start_ns;
@@ -14577,13 +14918,17 @@ pub fn searchSparse(
             !candidate_window_incomplete,
         );
         const needs_more_visible_candidates = unresolved_stored_filters and visible_candidate_count < pagingCandidateWindow(paging);
+        const needs_more_multi_source_candidates = multi_source_members and visible_candidate_count < pagingCandidateWindow(paging);
         if (full_candidate_window and
             candidate_window_incomplete and
             !candidate_ceiling_reached and
-            (needs_more_grouped_candidates or needs_more_visible_candidates))
+            (needs_more_grouped_candidates or needs_more_visible_candidates or needs_more_multi_source_candidates))
         {
             result.deinit();
-            const grown_window = growAdaptiveCandidateWindow(candidate_window, candidate_ceiling, pagingCandidateWindow(paging));
+            const grown_window = if (needs_more_multi_source_candidates and raw_member_mode)
+                growVisibleCandidateWindow(candidate_window, candidate_ceiling, pagingCandidateWindow(paging), visible_candidate_count)
+            else
+                growAdaptiveCandidateWindow(candidate_window, candidate_ceiling, pagingCandidateWindow(paging));
             if (grown_window == candidate_window) return error.InvalidQueryRequest;
             candidate_window = grown_window;
             continue;

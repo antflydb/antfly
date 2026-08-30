@@ -517,6 +517,7 @@ fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_mod.
                     .parent_with_chunks => .parent_with_chunks,
                     .unit => .unit,
                     .unit_with_chunks => .unit_with_chunks,
+                    .member => .member,
                 },
                 .max_chunks_per_parent = req.max_chunks_per_parent,
                 .dense_k = if (req.dense) |query| query.k else 0,
@@ -2794,6 +2795,19 @@ pub fn metadataApplyStoreProjection(
             const value = handle.store.listTables(alloc, request.group_id) catch |err|
                 break :blk storageOwnerStatusFromError(err);
             defer handle.store.freeTables(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .catalog_projection => blk: {
+            const value = handle.store.captureCatalogProjection(
+                alloc,
+                request.group_id,
+                if (request.arg0 == 0) null else request.arg0,
+            ) catch |err| break :blk if (err == error.CatalogRoutingSnapshotTimeout)
+                .timeout
+            else
+                storageOwnerStatusFromError(err);
+            defer handle.store.freeTables(alloc, value.tables);
+            defer handle.store.freeRanges(alloc, value.ranges);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
         .table => blk: {
@@ -8160,7 +8174,9 @@ pub export fn antfly_db_search_json(
     defer query_arena.deinit();
     const query_alloc = query_arena.allocator();
 
-    const return_mode: db_mod.types.ReturnMode = if (std.mem.eql(u8, parsed.value.return_mode, "chunk"))
+    const return_mode: db_mod.types.ReturnMode = if (std.mem.eql(u8, parsed.value.return_mode, "member"))
+        .member
+    else if (std.mem.eql(u8, parsed.value.return_mode, "chunk"))
         .chunk
     else if (std.mem.eql(u8, parsed.value.return_mode, "parent_with_chunks"))
         .parent_with_chunks

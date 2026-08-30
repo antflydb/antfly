@@ -1297,6 +1297,29 @@ test "opaque metadata apply owner preserves semantic error identity" {
     defer store.deinit();
     const snapshots = store.snapshotBuilder();
 
+    var catalog_json: abi.OwnedBytes = .{};
+    defer abi.antfly_storage_owner_buffer_destroy(&catalog_json);
+    try std.testing.expectEqual(
+        abi.Status.ok,
+        abi.antfly_metadata_apply_store_projection(
+            store.handle,
+            &.{ .kind = .catalog_projection, .group_id = 91 },
+            &catalog_json,
+        ),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, catalog_json.slice(), "\"tables\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog_json.slice(), "\"ranges\":[]") != null);
+    var timeout_json: abi.OwnedBytes = .{};
+    defer abi.antfly_storage_owner_buffer_destroy(&timeout_json);
+    try std.testing.expectEqual(
+        abi.Status.timeout,
+        abi.antfly_metadata_apply_store_projection(
+            store.handle,
+            &.{ .kind = .catalog_projection, .group_id = 91, .arg0 = 1 },
+            &timeout_json,
+        ),
+    );
+
     try std.testing.expectError(
         error.InvalidMetadataSnapshot,
         snapshots.installSnapshot(std.testing.allocator, 91, 7, "not-a-metadata-snapshot"),

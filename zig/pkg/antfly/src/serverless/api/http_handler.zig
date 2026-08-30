@@ -393,7 +393,12 @@ pub const HttpHandler = struct {
     }
 
     fn handleStatus(self: *HttpHandler) !HttpResponse {
-        return try jsonResponse(self.alloc, 200, self.runtime_status.*);
+        var status = self.runtime_status.*;
+        // A runtime that has not validated readiness must not advertise the
+        // optimistic default as authoritative health. Preserve any explicit
+        // failure state supplied by the runtime owner.
+        if (!status.validated and status.health == .healthy) status.health = .unknown;
+        return try jsonResponse(self.alloc, 200, status);
     }
 
     fn handleMetrics(self: *HttpHandler) !HttpResponse {
@@ -715,6 +720,7 @@ pub const HttpHandler = struct {
             else => return err,
         };
         validateServerlessIndexCatalog(self.alloc, indexes_json) catch |err| switch (err) {
+            error.UnsupportedServerlessArtifactIndexSources => return try unsupportedArtifactIndexSourcesResponse(self.alloc),
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
             else => return err,
         };
@@ -813,6 +819,7 @@ pub const HttpHandler = struct {
         const next_indexes_json = try indexes_api.addIndexToTableIndexesJson(self.alloc, table.indexes_json, index_name, expanded_index_json);
         defer self.alloc.free(next_indexes_json);
         validateServerlessIndexCatalog(self.alloc, next_indexes_json) catch |err| switch (err) {
+            error.UnsupportedServerlessArtifactIndexSources => return try unsupportedArtifactIndexSourcesResponse(self.alloc),
             error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
             error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "invalid index configuration"),
             else => return err,
@@ -837,11 +844,6 @@ pub const HttpHandler = struct {
             return try textResponse(self.alloc, 404, "not found");
         };
         defer self.alloc.free(next_indexes_json);
-        validateServerlessIndexCatalog(self.alloc, next_indexes_json) catch |err| switch (err) {
-            error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
-            error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "invalid index configuration"),
-            else => return err,
-        };
 
         const updated = try self.catalog.setTableDefinition(
             table_name,
@@ -1574,6 +1576,7 @@ pub const HttpHandler = struct {
             if (response.status == 200) return try self.alloc.dupe(u8, response.body);
             return switch (response.status) {
                 400 => error.InvalidQueryRequest,
+                422 => error.UnsupportedHierarchyGrouping,
                 404 => error.FileNotFound,
                 else => error.InternalQueryFailure,
             };
@@ -1582,7 +1585,6 @@ pub const HttpHandler = struct {
         var execution = self.executePublishedSearch(namespace, table_name, body, cancellation) catch |err| {
             switch (err) {
                 error.InvalidQueryRequest,
-                error.UnsupportedQueryRequest,
                 error.EmbeddingIndexNotFound,
                 error.InvalidEmbeddingDimensions,
                 error.PermanentPromptFailure,
@@ -1594,6 +1596,8 @@ pub const HttpHandler = struct {
                     std.log.warn("serverless public table search rejected table={s} err={}", .{ table_name, err });
                     return error.InvalidQueryRequest;
                 },
+                error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
+                error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
                 error.FileNotFound,
                 error.VectorSegmentNotFound,
                 error.SparseSegmentNotFound,
@@ -2680,10 +2684,7 @@ pub const HttpHandler = struct {
         );
         defer resp.deinit(self.alloc);
         try cancellation.check();
-        return switch (resp.status) {
-            200 => try typedJsonResponse(metadata_openapi.QueryResponses, self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
+        return try adaptPublicTableQueryResponse(self.alloc, resp);
     }
 
     fn handleTablePublicGraphQueryRequest(
@@ -2753,7 +2754,6 @@ pub const HttpHandler = struct {
 
             var execution = self.executePublishedSearch(namespace, table_name, search_body, cancellation) catch |err| switch (err) {
                 error.InvalidQueryRequest,
-                error.UnsupportedQueryRequest,
                 error.EmbeddingIndexNotFound,
                 error.InvalidEmbeddingDimensions,
                 error.PermanentPromptFailure,
@@ -2762,6 +2762,8 @@ pub const HttpHandler = struct {
                 error.VectorDimsMismatch,
                 error.SparseQueryRequired,
                 => return error.InvalidQueryRequest,
+                error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
+                error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
                 else => return err,
             };
             defer execution.deinit(self.alloc);
@@ -2842,7 +2844,6 @@ pub const HttpHandler = struct {
         var execution = self.executePublishedSearch(namespace, null, body, cancellation) catch |err| {
             switch (err) {
                 error.InvalidQueryRequest,
-                error.UnsupportedQueryRequest,
                 error.EmbeddingIndexNotFound,
                 error.InvalidEmbeddingDimensions,
                 error.PermanentPromptFailure,
@@ -2854,6 +2855,8 @@ pub const HttpHandler = struct {
                     std.log.err("serverless query invalid namespace={s} err={}", .{ namespace, err });
                     return try textResponse(self.alloc, 400, "invalid query request");
                 },
+                error.UnsupportedQueryRequest => return try unsupportedQueryResponse(self.alloc),
+                error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
                 error.FileNotFound => {
                     std.log.err("serverless query missing namespace={s} err={}", .{ namespace, err });
                     return try textResponse(self.alloc, 404, "not found");
@@ -2934,7 +2937,6 @@ pub const HttpHandler = struct {
         defer self.alloc.free(namespace);
         var execution = self.executePublishedSearch(namespace, table_name, body, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest,
-            error.UnsupportedQueryRequest,
             error.EmbeddingIndexNotFound,
             error.InvalidEmbeddingDimensions,
             error.PermanentPromptFailure,
@@ -2943,6 +2945,8 @@ pub const HttpHandler = struct {
             error.VectorDimsMismatch,
             error.SparseQueryRequired,
             => return try textResponse(self.alloc, 400, "invalid query request"),
+            error.UnsupportedQueryRequest => return try unsupportedQueryResponse(self.alloc),
+            error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.VectorSegmentNotFound => return try textResponse(self.alloc, 404, "vector segment not found"),
             error.SparseSegmentNotFound => return try textResponse(self.alloc, 404, "sparse segment not found"),
@@ -2962,6 +2966,7 @@ pub const HttpHandler = struct {
                 error.UnsupportedAggregation,
                 error.InvalidAggregation,
                 => return try textResponse(self.alloc, 400, "invalid query request"),
+                error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
                 else => {
                     std.log.err("table aggregations failed table={s} err={}", .{ table_name, err });
                     return try textResponse(self.alloc, 500, "query failed");
@@ -4653,6 +4658,8 @@ pub const HttpHandler = struct {
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
+            error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
+            error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -4716,13 +4723,21 @@ pub const HttpHandler = struct {
         table_name: []const u8,
         _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteListIndexesError![]u8 {
-        _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch return error.InternalFailure) orelse return error.NotFound;
+        var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch |err| {
+            std.log.err("serverless public table index list lookup failed table={s} err={}", .{ table_name, err });
+            return error.InternalFailure;
+        }) orelse return error.NotFound;
         defer table.deinit(self.alloc);
-        var status = self.catalog.tableBuildStatus(table_name) catch return error.InternalFailure;
+        var status = self.catalog.tableBuildStatus(table_name) catch |err| {
+            std.log.err("serverless public table index list status failed table={s} err={}", .{ table_name, err });
+            return error.InternalFailure;
+        };
         defer status.deinit(self.alloc);
-        return encodeServerlessIndexListAlloc(self.alloc, table.indexes_json, status) catch return error.InternalFailure;
+        return encodeServerlessIndexListAlloc(alloc, table.indexes_json, status) catch |err| {
+            std.log.err("serverless public table index list encode failed table={s} err={}", .{ table_name, err });
+            return error.InternalFailure;
+        };
     }
 
     fn executePublicTableGetIndex(
@@ -4732,13 +4747,21 @@ pub const HttpHandler = struct {
         index_name: []const u8,
         _: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
-        _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch return error.InternalFailure) orelse return error.NotFound;
+        var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch |err| {
+            std.log.err("serverless public table index lookup failed table={s} index={s} err={}", .{ table_name, index_name, err });
+            return error.InternalFailure;
+        }) orelse return error.NotFound;
         defer table.deinit(self.alloc);
-        var status = self.catalog.tableBuildStatus(table_name) catch return error.InternalFailure;
+        var status = self.catalog.tableBuildStatus(table_name) catch |err| {
+            std.log.err("serverless public table index status failed table={s} index={s} err={}", .{ table_name, index_name, err });
+            return error.InternalFailure;
+        };
         defer status.deinit(self.alloc);
-        return (encodeServerlessSingleIndexAlloc(self.alloc, table.indexes_json, index_name, status) catch return error.InternalFailure) orelse error.NotFound;
+        return (encodeServerlessSingleIndexAlloc(alloc, table.indexes_json, index_name, status) catch |err| {
+            std.log.err("serverless public table index encode failed table={s} index={s} err={}", .{ table_name, index_name, err });
+            return error.InternalFailure;
+        }) orelse error.NotFound;
     }
 
     fn executePublicTableCreateIndex(
@@ -4798,6 +4821,7 @@ pub const HttpHandler = struct {
         const response_body = indexes_api.encodeCreatedIndexConfig(alloc, index_name, normalized_index_json) catch return error.InternalFailure;
         errdefer alloc.free(response_body);
         validateServerlessIndexCatalog(alloc, next_indexes_json) catch |err| switch (err) {
+            error.UnsupportedServerlessArtifactIndexSources => return error.UnsupportedArtifactIndexSources,
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
@@ -4832,7 +4856,6 @@ pub const HttpHandler = struct {
             return error.NotFound;
         };
         defer alloc.free(next_indexes_json);
-        validateServerlessIndexCatalog(alloc, next_indexes_json) catch return error.InternalFailure;
         request.ensureActive() catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
@@ -5689,8 +5712,6 @@ fn parseEnsureTableRequest(alloc: Allocator, body: []const u8) !api_types.Ensure
 const ServerlessIndexStatus = struct {
     readiness_ready: bool,
     readiness_incarnation: ?u64,
-    readiness_target_revision: u64,
-    readiness_published_revision: ?u64,
     rebuilding: bool,
     backfill_active: bool,
     doc_count: u64,
@@ -5788,15 +5809,11 @@ fn appendServerlessIndexStatusJson(
     if (status.readiness_incarnation) |incarnation| {
         try out.print(alloc, ",\"incarnation\":\"g-{x:0>16}\"", .{incarnation});
     }
-    try out.print(alloc, ",\"target_revision\":{}", .{status.readiness_target_revision});
-    if (status.readiness_published_revision) |published_revision| {
-        try out.print(alloc, ",\"published_revision\":{}", .{published_revision});
-    }
     try out.appendSlice(alloc, ",\"pending_reasons\":");
     if (status.readiness_ready) {
         try out.appendSlice(alloc, "[]}");
     } else if (status.materialization_blocked) {
-        try out.appendSlice(alloc, "[\"materialization\",\"publication\"]}");
+        try out.appendSlice(alloc, "[\"runtime_unavailable\",\"publication\"]}");
     } else {
         try out.appendSlice(alloc, "[\"publication\"]}");
     }
@@ -6007,8 +6024,6 @@ fn serverlessIndexStatus(
     return .{
         .readiness_ready = readiness_ready,
         .readiness_incarnation = if (config_action) |action| action.incarnation else null,
-        .readiness_target_revision = if (readiness_ready) status.head_version else status.next_version,
-        .readiness_published_revision = if (config_published and status.head_version != 0) status.head_version else null,
         .rebuilding = !built and has_documents,
         .backfill_active = !built and has_documents,
         .doc_count = doc_count,
@@ -6125,8 +6140,6 @@ test "serverless readiness serializes durable incarnation as an opaque token" {
     try appendServerlessIndexStatusJson(alloc, &encoded, .{
         .readiness_ready = true,
         .readiness_incarnation = 42,
-        .readiness_target_revision = 7,
-        .readiness_published_revision = 7,
         .rebuilding = false,
         .backfill_active = false,
         .doc_count = 0,
@@ -6148,8 +6161,6 @@ test "serverless pending readiness is explicitly non-queryable and incomplete" {
     try appendServerlessIndexStatusJson(alloc, &encoded, .{
         .readiness_ready = false,
         .readiness_incarnation = null,
-        .readiness_target_revision = 7,
-        .readiness_published_revision = null,
         .rebuilding = true,
         .backfill_active = true,
         .doc_count = 0,
@@ -6170,8 +6181,6 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
     var parsed = try std.json.parseFromSlice(JsonValueMap, alloc, indexes_json, .{});
     defer parsed.deinit();
 
-    var full_text_count: usize = 0;
-    var versioned_full_text_count: usize = 0;
     var graph_count: usize = 0;
     var it = parsed.value.map.iterator();
     while (it.next()) |entry| {
@@ -6184,11 +6193,11 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
         else
             "full_text";
 
+        if (try serverlessIndexUsesArtifactSources(kind, entry.value_ptr.*)) {
+            return error.UnsupportedServerlessArtifactIndexSources;
+        }
+
         if (std.mem.eql(u8, kind, "full_text")) {
-            full_text_count += 1;
-            if (std.mem.startsWith(u8, entry.key_ptr.*, "full_text_index_v")) {
-                versioned_full_text_count += 1;
-            }
             continue;
         }
         if (std.mem.eql(u8, kind, "embeddings")) {
@@ -6210,9 +6219,27 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
         return error.UnsupportedCreateTableRequest;
     }
 
-    if ((full_text_count > 1 and versioned_full_text_count != full_text_count) or graph_count > 1) {
+    if (graph_count > 1) {
         return error.UnsupportedCreateTableRequest;
     }
+}
+
+fn serverlessIndexUsesArtifactSources(kind: []const u8, config: std.json.Value) !bool {
+    if (config != .object) return error.InvalidTableIndexMetadata;
+    if (config.object.get("sources")) |sources| {
+        if (sources != .array or sources.array.items.len == 0) return error.InvalidTableIndexMetadata;
+        return true;
+    }
+    if (std.mem.eql(u8, kind, "full_text")) {
+        return config.object.get("artifact_name") != null or config.object.get("chunk_name") != null;
+    }
+    if (std.mem.eql(u8, kind, "embeddings")) {
+        return config.object.get("embedding_name") != null or config.object.get("source_artifact_name") != null;
+    }
+    if (std.mem.eql(u8, kind, "graph")) {
+        return config.object.get("source") != null;
+    }
+    return false;
 }
 
 fn validateServerlessAlgebraicIndexConfig(alloc: Allocator, value: std.json.Value) !void {
@@ -6541,6 +6568,16 @@ fn typedJsonResponse(comptime T: type, alloc: Allocator, status: u16, body: []co
     return try jsonResponse(alloc, status, parsed);
 }
 
+fn adaptPublicTableQueryResponse(alloc: Allocator, response: public_table_http.OwnedResponse) !HttpResponse {
+    if (response.status == 200) {
+        return try typedJsonResponse(metadata_openapi.QueryResponses, alloc, response.status, response.body);
+    }
+    return if (response.json)
+        try jsonSliceResponse(alloc, response.status, response.body)
+    else
+        try textResponse(alloc, response.status, response.body);
+}
+
 test "typed index status response rejects extended variant fields but raw json preserves them" {
     const alloc = std.testing.allocator;
     const body =
@@ -6656,8 +6693,6 @@ const ServerlessIndexStatusTestResponse = struct {
         readiness: ?struct {
             state: []const u8,
             incarnation: ?[]const u8 = null,
-            target_revision: ?u64 = null,
-            published_revision: ?u64 = null,
             pending_reasons: []const []const u8,
         } = null,
         rebuilding: ?bool = null,
@@ -6744,6 +6779,102 @@ fn textResponse(alloc: Allocator, status: u16, body: []const u8) !HttpResponse {
     };
 }
 
+fn unsupportedHierarchyGroupingResponse(alloc: Allocator) !HttpResponse {
+    return jsonResponse(alloc, 422, public_table_http.UnsupportedHierarchyGroupingError{});
+}
+
+fn unsupportedQueryResponse(alloc: Allocator) !HttpResponse {
+    return jsonResponse(alloc, 422, public_table_http.UnsupportedQueryError{});
+}
+
+const UnsupportedArtifactIndexSourcesError = struct {
+    @"error": []const u8 = "unsupported_index_capability",
+    message: []const u8 = "artifact-backed index sources are not supported by this deployment",
+    retryable: bool = false,
+};
+
+fn unsupportedArtifactIndexSourcesResponse(alloc: Allocator) !HttpResponse {
+    return jsonResponse(alloc, 400, UnsupportedArtifactIndexSourcesError{});
+}
+
+test "serverless artifact index capability response is structured and actionable" {
+    const alloc = std.testing.allocator;
+    var response = try unsupportedArtifactIndexSourcesResponse(alloc);
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 400), response.status);
+    try std.testing.expectEqualStrings("application/json", response.content_type);
+    var parsed = try std.json.parseFromSlice(UnsupportedArtifactIndexSourcesError, alloc, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("unsupported_index_capability", parsed.value.@"error");
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "artifact-backed index sources") != null);
+    try std.testing.expect(!parsed.value.retryable);
+}
+
+test "serverless unsupported hierarchy grouping response uses the public contract" {
+    const alloc = std.testing.allocator;
+    var response = try unsupportedHierarchyGroupingResponse(alloc);
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), response.status);
+    try std.testing.expectEqualStrings("application/json", response.content_type);
+    var parsed = try std.json.parseFromSlice(
+        public_table_http.UnsupportedHierarchyGroupingError,
+        alloc,
+        response.body,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("unsupported_hierarchy_grouping", parsed.value.@"error");
+    try std.testing.expectEqualStrings("use_source_grouping_or_direct_members", parsed.value.action);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "return_mode") == null);
+}
+
+test "serverless unsupported query response uses the public contract" {
+    const alloc = std.testing.allocator;
+    var response = try unsupportedQueryResponse(alloc);
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), response.status);
+    try std.testing.expectEqualStrings("application/json", response.content_type);
+    var parsed = try std.json.parseFromSlice(
+        public_table_http.UnsupportedQueryError,
+        alloc,
+        response.body,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("unsupported_query_request", parsed.value.@"error");
+    try std.testing.expect(!parsed.value.retryable);
+}
+
+test "serverless public table query adapter preserves structured error content type" {
+    const alloc = std.testing.allocator;
+    var public_response = public_table_http.OwnedResponse{
+        .status = 422,
+        .body = try public_table_http.unsupportedQueryBody(alloc),
+        .json = true,
+    };
+    defer public_response.deinit(alloc);
+
+    var response = try adaptPublicTableQueryResponse(alloc, public_response);
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), response.status);
+    try std.testing.expectEqualStrings("application/json", response.content_type);
+    var parsed = try std.json.parseFromSlice(public_table_http.UnsupportedQueryError, alloc, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("unsupported_query_request", parsed.value.@"error");
+
+    var public_text_response = public_table_http.OwnedResponse{
+        .status = 400,
+        .body = try alloc.dupe(u8, "invalid query request"),
+    };
+    defer public_text_response.deinit(alloc);
+    var text_response = try adaptPublicTableQueryResponse(alloc, public_text_response);
+    defer text_response.deinit(alloc);
+    try std.testing.expectEqualStrings("text/plain", text_response.content_type);
+}
+
 test "serverless http handler serves internal namespace lifecycle, admission, and query head" {
     const alloc = std.testing.allocator;
 
@@ -6808,6 +6939,14 @@ test "serverless http handler serves internal namespace lifecycle, admission, an
     try std.testing.expectEqual(@as(u64, 1), parsed_status.value.tick_interval_ms);
     try std.testing.expectEqual(@as(usize, 0), parsed_status.value.targets.len);
 
+    // Serverless diagnostics are additive to the public status schema so every
+    // generated SDK can discover the capability before attempting a mutation.
+    var public_status = try parseJsonTestBody(metadata_openapi.ClusterStatus, alloc, status.body);
+    defer public_status.deinit();
+    try std.testing.expectEqual(metadata_openapi.ClusterHealth.healthy, public_status.value.health);
+    try std.testing.expectEqualStrings("serverless", public_status.value.deployment_mode.?);
+    try std.testing.expect(!public_status.value.index_capabilities.?.artifact_sources);
+
     var health = try handler.handle(.{
         .method = .get,
         .path = "/health",
@@ -6847,6 +6986,26 @@ test "serverless http handler serves internal namespace lifecycle, admission, an
     defer not_readyz.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 503), not_readyz.status);
     try std.testing.expect(std.mem.indexOf(u8, not_readyz.body, "\"status\":\"not_ready\"") != null);
+
+    var not_ready_status = try handler.handle(.{
+        .method = .get,
+        .path = "/status",
+    });
+    defer not_ready_status.deinit(alloc);
+    var parsed_not_ready_status = try parseJsonTestBody(api_types.RuntimeStatusResult, alloc, not_ready_status.body);
+    defer parsed_not_ready_status.deinit();
+    try std.testing.expectEqual(api_types.RuntimeHealth.unknown, parsed_not_ready_status.value.health);
+
+    runtime_status.health = .degraded;
+    var degraded_status = try handler.handle(.{
+        .method = .get,
+        .path = "/status",
+    });
+    defer degraded_status.deinit(alloc);
+    var parsed_degraded_status = try parseJsonTestBody(api_types.RuntimeStatusResult, alloc, degraded_status.body);
+    defer parsed_degraded_status.deinit();
+    try std.testing.expectEqual(api_types.RuntimeHealth.degraded, parsed_degraded_status.value.health);
+    runtime_status.health = .healthy;
     runtime_status.validated = true;
 
     var metrics = try handler.handle(.{
@@ -8365,8 +8524,8 @@ test "serverless http handler index status exposes graph publication actions" {
     // Graph indexes do not yet persist a private incarnation. Omitting the
     // optional token is safer than deriving one from redacted response JSON.
     try std.testing.expectEqual(@as(?[]const u8, null), parsed_planned.value.status.readiness.?.incarnation);
-    try std.testing.expectEqual(@as(?u64, 2), parsed_planned.value.status.readiness.?.target_revision);
-    try std.testing.expectEqual(@as(?u64, null), parsed_planned.value.status.readiness.?.published_revision);
+    try std.testing.expect(std.mem.indexOf(u8, planned.body, "target_revision") == null);
+    try std.testing.expect(std.mem.indexOf(u8, planned.body, "published_revision") == null);
 
     var rebuild = try catalog.buildTable("docs");
     defer rebuild.deinit(alloc);
@@ -8384,10 +8543,8 @@ test "serverless http handler index status exposes graph publication actions" {
     try std.testing.expectEqualStrings("ready", parsed_head.value.status.readiness.?.state);
     try std.testing.expectEqual(@as(usize, 0), parsed_head.value.status.readiness.?.pending_reasons.len);
     try std.testing.expectEqual(@as(?[]const u8, null), parsed_head.value.status.readiness.?.incarnation);
-    try std.testing.expectEqual(
-        parsed_head.value.status.readiness.?.target_revision,
-        parsed_head.value.status.readiness.?.published_revision,
-    );
+    try std.testing.expect(std.mem.indexOf(u8, head.body, "target_revision") == null);
+    try std.testing.expect(std.mem.indexOf(u8, head.body, "published_revision") == null);
 }
 
 test "http handler index status predicts graph reuse and rebuild before publish" {
@@ -8597,9 +8754,10 @@ test "serverless http handler create index expands schema-derived algebraic conf
     defer parsed_detail.deinit();
     try std.testing.expectEqualStrings("rebuild", parsed_detail.value.status.planned_publication_action.?);
     try std.testing.expectEqualStrings("pending", parsed_detail.value.status.readiness.?.state);
-    try std.testing.expectEqual(@as(?[]const u8, null), parsed_detail.value.status.readiness.?.incarnation);
-    try std.testing.expectEqual(@as(?u64, 2), parsed_detail.value.status.readiness.?.target_revision);
-    try std.testing.expectEqual(@as(?u64, null), parsed_detail.value.status.readiness.?.published_revision);
+    const planned_incarnation = parsed_detail.value.status.readiness.?.incarnation.?;
+    try std.testing.expect(std.mem.startsWith(u8, planned_incarnation, "g-"));
+    try std.testing.expect(std.mem.indexOf(u8, detail.body, "target_revision") == null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.body, "published_revision") == null);
 
     var algebraic_build = try catalog.buildTable("docs");
     defer algebraic_build.deinit(alloc);
@@ -8614,11 +8772,9 @@ test "serverless http handler create index expands schema-derived algebraic conf
     var parsed_published = try parseServerlessIndexStatusTestResponse(alloc, published_detail.body, "sales_rollup");
     defer parsed_published.deinit();
     try std.testing.expectEqualStrings("ready", parsed_published.value.status.readiness.?.state);
-    try std.testing.expectEqual(@as(?[]const u8, null), parsed_published.value.status.readiness.?.incarnation);
-    try std.testing.expectEqual(
-        parsed_published.value.status.readiness.?.target_revision,
-        parsed_published.value.status.readiness.?.published_revision,
-    );
+    try std.testing.expectEqualStrings(planned_incarnation, parsed_published.value.status.readiness.?.incarnation.?);
+    try std.testing.expect(std.mem.indexOf(u8, published_detail.body, "target_revision") == null);
+    try std.testing.expect(std.mem.indexOf(u8, published_detail.body, "published_revision") == null);
 }
 
 test "serverless create index normalization resolves and persists one probed embedding dimension" {
@@ -8711,8 +8867,33 @@ test "serverless index catalog validation rejects malformed configs" {
     ));
 
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
-        \\{"relations":{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[0]"}}}
+        \\{"relations":{"type":"graph","source":{"artifact":"relations_v1","path":"$.relations[0]"}}}
     ));
+}
+
+test "serverless index catalog rejects artifact-backed sources before publication" {
+    const alloc = std.testing.allocator;
+    const unsupported = [_][]const u8{
+        "{\"chunks\":{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"document_chunks_v1\"}]}}",
+        "{\"chunks\":{\"type\":\"full_text\",\"artifact_name\":\"document_chunks_v1\"}}",
+        "{\"vectors\":{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_dense_v1\"}]}}",
+        "{\"vectors\":{\"type\":\"embeddings\",\"dimension\":3,\"embedding_name\":\"document_dense_v1\",\"source_artifact_name\":\"document_chunks_v1\"}}",
+        "{\"relations\":{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\"}]}}",
+        "{\"relations\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"}}}",
+    };
+    for (unsupported) |indexes_json| {
+        try std.testing.expectError(
+            error.UnsupportedServerlessArtifactIndexSources,
+            validateServerlessIndexCatalog(alloc, indexes_json),
+        );
+    }
+
+    try validateServerlessIndexCatalog(alloc,
+        \\{"text":{"type":"full_text","field":"body"},"vectors":{"type":"embeddings","field":"body","dimension":3},"relations":{"type":"graph","edge_types":[{"name":"related","field":"related_ids"}]}}
+    );
+    try validateServerlessIndexCatalog(alloc,
+        \\{"full_text_index_v0":{"type":"full_text"},"body_search":{"type":"full_text","field":"body"}}
+    );
 }
 
 test "http handler serves the table public lifecycle and consistency routes" {

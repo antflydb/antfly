@@ -179,6 +179,24 @@ type APIError struct {
 	Message string
 }
 
+// IndexMutationTemporarilyUnavailableError reports a retryable index creation
+// or restore admission failure. RetryAfterSeconds is zero when the server did
+// not provide a valid positive Retry-After value.
+type IndexMutationTemporarilyUnavailableError struct {
+	StatusCode        int
+	Code              string
+	Message           string
+	Retryable         bool
+	RetryAfterSeconds int
+}
+
+func (e *IndexMutationTemporarilyUnavailableError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return e.Code
+}
+
 func (e *APIError) Error() string {
 	return e.Message
 }
@@ -293,6 +311,15 @@ func isQueryTemporarilyUnavailableCode(code string) bool {
 	}
 }
 
+func isIndexMutationTemporarilyUnavailableCode(code string) bool {
+	switch code {
+	case "index_capability_upgrade_pending", "index_probe_unavailable":
+		return true
+	default:
+		return false
+	}
+}
+
 func readLimitedBody(r io.Reader, maxBytes int64) ([]byte, bool, error) {
 	if maxBytes <= 0 {
 		body, err := io.ReadAll(r)
@@ -371,6 +398,17 @@ func readErrorResponse(resp *http.Response) error {
 			return &QueryTemporarilyUnavailableError{
 				StatusCode:        resp.StatusCode,
 				Code:              errResp.Code,
+				Message:           errResp.Message,
+				Retryable:         true,
+				RetryAfterSeconds: queryRetryAfterSeconds(resp.Header),
+			}
+		}
+		if resp.StatusCode == http.StatusServiceUnavailable &&
+			errResp.Retryable != nil && *errResp.Retryable &&
+			isIndexMutationTemporarilyUnavailableCode(errResp.Error) {
+			return &IndexMutationTemporarilyUnavailableError{
+				StatusCode:        resp.StatusCode,
+				Code:              errResp.Error,
 				Message:           errResp.Message,
 				Retryable:         true,
 				RetryAfterSeconds: queryRetryAfterSeconds(resp.Header),

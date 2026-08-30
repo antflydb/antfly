@@ -322,8 +322,10 @@ pub const IndexConfig = struct {
     coverage_config_fingerprint: ?u64 = null,
 
     pub fn clone(alloc: Allocator, cfg: IndexConfig) !IndexConfig {
+        const name = try alloc.dupe(u8, cfg.name);
+        errdefer alloc.free(name);
         return .{
-            .name = try alloc.dupe(u8, cfg.name),
+            .name = name,
             .kind = cfg.kind,
             .config_json = try alloc.dupe(u8, cfg.config_json),
             .coverage_generation = cfg.coverage_generation,
@@ -445,6 +447,7 @@ pub const EnrichmentConfig = struct {
     template: []const u8 = "",
     source_artifact_name: []const u8 = "",
     expected_dims: u32 = 0,
+    vector_space: []const u8 = "",
     chunk_size: u32 = 0,
     chunk_overlap: u32 = 0,
     chunker_json: []const u8 = "",
@@ -461,6 +464,7 @@ pub const EnrichmentConfig = struct {
             .template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
             .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
             .expected_dims = cfg.expected_dims,
+            .vector_space = if (cfg.vector_space.len > 0) try alloc.dupe(u8, cfg.vector_space) else "",
             .chunk_size = cfg.chunk_size,
             .chunk_overlap = cfg.chunk_overlap,
             .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
@@ -476,6 +480,7 @@ pub const EnrichmentConfig = struct {
         if (self.field.len > 0) alloc.free(self.field);
         if (self.template.len > 0) alloc.free(self.template);
         if (self.source_artifact_name.len > 0) alloc.free(self.source_artifact_name);
+        if (self.vector_space.len > 0) alloc.free(self.vector_space);
         if (self.chunker_json.len > 0) alloc.free(self.chunker_json);
         if (self.content_type.len > 0) alloc.free(self.content_type);
         if (self.producer_json.len > 0) alloc.free(self.producer_json);
@@ -496,6 +501,7 @@ pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {
     hashLengthPrefixedBytes(&hasher, cfg.template);
     hashLengthPrefixedBytes(&hasher, cfg.source_artifact_name);
     hashU32(&hasher, cfg.expected_dims);
+    hashLengthPrefixedBytes(&hasher, cfg.vector_space);
     hashU32(&hasher, cfg.chunk_size);
     hashU32(&hasher, cfg.chunk_overlap);
     hashLengthPrefixedBytes(&hasher, cfg.chunker_json);
@@ -1672,10 +1678,15 @@ pub const NamedGraphInputSet = struct {
 
 pub const ReturnMode = enum {
     parent,
+    /// Compatibility spelling for raw chunk/member results.
     chunk,
     parent_with_chunks,
     unit,
     unit_with_chunks,
+    /// Return each indexed source member without hierarchy grouping. This is
+    /// the precise name for raw results from heterogeneous artifact unions.
+    /// Appended to preserve the numeric ABI of the established modes.
+    member,
 };
 
 pub const HierarchyGroupLevel = enum {
@@ -2407,6 +2418,7 @@ pub const ArtifactRepairReason = enum {
     corrupt_artifact,
     unreadable_artifact,
     enrichment_failed,
+    resource_limit_exceeded,
 };
 
 /// Policy-independent coverage health shared by status and repair reporting.
@@ -2530,6 +2542,10 @@ pub const ArtifactRepairIssue = struct {
     doc_key: []const u8 = "",
     parent_doc_key: []const u8 = "",
     unit_id: []const u8 = "",
+    /// Canonical artifact stream configured on the affected index. This is
+    /// deliberately distinct from `source_artifact_name` (the producer input)
+    /// and `artifact_name` (the unreadable derived value).
+    index_source_artifact_name: []const u8 = "",
     source_artifact_name: []const u8 = "",
     artifact_name: []const u8 = "",
     artifact_key: []const u8 = "",
@@ -2552,6 +2568,7 @@ pub const ArtifactRepairIssue = struct {
         if (self.doc_key.len > 0) alloc.free(@constCast(self.doc_key));
         if (self.parent_doc_key.len > 0) alloc.free(@constCast(self.parent_doc_key));
         if (self.unit_id.len > 0) alloc.free(@constCast(self.unit_id));
+        if (self.index_source_artifact_name.len > 0) alloc.free(@constCast(self.index_source_artifact_name));
         if (self.source_artifact_name.len > 0) alloc.free(@constCast(self.source_artifact_name));
         if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
         if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
@@ -2823,7 +2840,7 @@ pub const EmbeddingArtifactRepairResult = ArtifactRepairResult;
 pub fn embeddingArtifactRepairReasonFromArtifact(reason: ArtifactRepairReason) EmbeddingArtifactRepairReason {
     return switch (reason) {
         .missing_artifact => .missing_embedding_artifact,
-        .corrupt_artifact, .unreadable_artifact, .enrichment_failed => .corrupt_embedding_artifact,
+        .corrupt_artifact, .unreadable_artifact, .enrichment_failed, .resource_limit_exceeded => .corrupt_embedding_artifact,
     };
 }
 
@@ -2899,6 +2916,27 @@ pub const AlgebraicProgressStatus = struct {
     target_rows: u64 = 0,
 };
 
+/// Source-specific replay watermarks for an artifact-backed index. The
+/// published watermark is the index's durable applied cursor: it proves that
+/// every configured source has been processed through that revision. The
+/// target is maintained transactionally per artifact stream by the writer.
+pub const IndexSourceReplayStatus = struct {
+    artifact_name: []const u8,
+    published_sequence: u64 = 0,
+    target_sequence: u64 = 0,
+    /// A terminal request failure isolated to this configured artifact stream.
+    /// Global worker/index failures remain index-level readiness facts.
+    failed: bool = false,
+    /// Durable repair debt scoped to this source. Runtime failure maps may add
+    /// diagnostics, but never replace this authoritative count.
+    repair_issue_count: u64 = 0,
+    /// False while the bounded repair-ledger summary is rebuilding. Readiness
+    /// must remain pending until absence of source-local debt is proven.
+    repair_summary_ready: bool = true,
+    // Internal distributed-status proof; not part of the public contract.
+    observation_count: u64 = 1,
+};
+
 pub const DBIndexStats = struct {
     name: []const u8,
     kind: IndexKind,
@@ -2971,6 +3009,7 @@ pub const DBIndexStats = struct {
     projection_checkpoint_config_hash: u64 = 0,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
+    source_replay: []IndexSourceReplayStatus = &.{},
     checkpoint_replay_tail_sequence_count: u64 = 0,
     replay_catch_up_required: bool = false,
     catch_up_active: bool = false,
@@ -3571,6 +3610,8 @@ pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
     freeResolverReplayDiagnostics(alloc, stats.resolver_replay);
     for (stats.indexes) |item| {
         alloc.free(item.name);
+        for (item.source_replay) |source| alloc.free(source.artifact_name);
+        if (item.source_replay.len > 0) alloc.free(item.source_replay);
         if (item.load_error) |value| alloc.free(value);
         if (item.index_repair_last_error) |value| alloc.free(value);
         if (item.algebraic_last_error_doc_key) |value| alloc.free(value);

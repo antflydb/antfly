@@ -277,6 +277,9 @@ pub const LocalQueryReturnMode = enum(u32) {
     parent_with_chunks = 2,
     unit = 3,
     unit_with_chunks = 4,
+    /// Return each indexed source member without hierarchy grouping.
+    /// Appended to preserve the established numeric ABI.
+    member = 5,
 };
 
 /// Scalar execution details that are not losslessly represented by the
@@ -521,6 +524,8 @@ pub const MetadataProjectionKind = enum(u32) {
     maintenance_stats = 26,
     runtime_status_protocol_activation_version = 27,
     placement_version_fences = 28,
+    /// Tables and ranges captured from one committed storage snapshot.
+    catalog_projection = 29,
 };
 
 pub const MetadataProjectionRequest = extern struct {

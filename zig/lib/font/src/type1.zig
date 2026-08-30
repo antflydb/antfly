@@ -30,6 +30,8 @@ const ParseError = Error || std.mem.Allocator.Error;
 
 pub const OutlineLimits = struct {
     max_operations: usize = std.math.maxInt(usize),
+    /// Optional caller-owned page/request meter shared across glyphs.
+    remaining_operations: ?*usize = null,
 };
 
 const FlexState = struct {
@@ -144,7 +146,12 @@ pub fn glyphOutlineAllocLimited(alloc: std.mem.Allocator, charstring: []const u8
     var x: f64 = 0;
     var y: f64 = 0;
     var width_seen = false;
-    var remaining_operations = limits.max_operations;
+    const shared_limit = if (limits.remaining_operations) |remaining| remaining.* else std.math.maxInt(usize);
+    var remaining_operations = @min(limits.max_operations, shared_limit);
+    const initial_operations = remaining_operations;
+    defer if (limits.remaining_operations) |remaining| {
+        remaining.* -|= initial_operations - remaining_operations;
+    };
     try executeCharStringAlloc(alloc, charstring, local_subrs, &stack, &othersubr_results, &flex, &current, &contours, &x, &y, &width_seen, null, &remaining_operations, 0);
 
     if (contours.items.len == 0) return null;
@@ -180,7 +187,12 @@ pub fn seacComponentsAllocLimited(alloc: std.mem.Allocator, charstring: []const 
     var y: f64 = 0;
     var width_seen = false;
     var out: ?SeacComponents = null;
-    var remaining_operations = limits.max_operations;
+    const shared_limit = if (limits.remaining_operations) |remaining| remaining.* else std.math.maxInt(usize);
+    var remaining_operations = @min(limits.max_operations, shared_limit);
+    const initial_operations = remaining_operations;
+    defer if (limits.remaining_operations) |remaining| {
+        remaining.* -|= initial_operations - remaining_operations;
+    };
     try executeCharStringAlloc(
         alloc,
         charstring,
@@ -655,6 +667,21 @@ test "type1 rejects custom OtherSubrs that require PostScript execution" {
 test "type1 enforces a shared charstring operation limit" {
     const charstring = [_]u8{ 139, 139, 21, 149, 139, 5, 14 };
     try std.testing.expectError(error.GlyphOutlineTooComplex, glyphOutlineAllocLimited(std.testing.allocator, &charstring, null, .{ .max_operations = 3 }));
+}
+
+test "type1 charges caller-owned operation meter across glyphs" {
+    const alloc = std.testing.allocator;
+    const charstring = [_]u8{ 139, 139, 21, 149, 139, 5, 14 };
+    var remaining: usize = 8;
+    if (try glyphOutlineAllocLimited(alloc, &charstring, null, .{ .remaining_operations = &remaining })) |outline_value| {
+        var outline = outline_value;
+        outline.deinit(alloc);
+    }
+    try std.testing.expect(remaining < 8);
+    try std.testing.expectError(error.GlyphOutlineTooComplex, glyphOutlineAllocLimited(alloc, &charstring, null, .{
+        .remaining_operations = &remaining,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), remaining);
 }
 
 test "type1 rejects empty OtherSubr pop" {

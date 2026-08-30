@@ -396,6 +396,10 @@ pub const TableReadSource = struct {
             doc_key: []const u8,
             consistency: read_gate.ReadConsistency,
         ) anyerror!?db_types.DocumentArtifactManifestList = null,
+        bind_incoming_graph_routes: ?*const fn (
+            ptr: *anyopaque,
+            cache: *distributed_graph.IncomingSourceGroupCache,
+        ) void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -817,5 +821,13 @@ pub const TableReadSource = struct {
     /// shard validates coverage again before executing an exact sort.
     pub fn supportsObservedDynamicFieldCapabilitySets(self: TableReadSource) bool {
         return self.vtable.observed_dynamic_field_capability_sets != null;
+    }
+
+    pub fn bindIncomingGraphRoutes(
+        self: TableReadSource,
+        cache: *distributed_graph.IncomingSourceGroupCache,
+    ) void {
+        const bind = self.vtable.bind_incoming_graph_routes orelse return;
+        bind(self.ptr, cache);
     }
 };
