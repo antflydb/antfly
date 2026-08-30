@@ -10,18 +10,18 @@ pub const AntflyRerankerConfig = struct {
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
 
-    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
-    pub const antflyOpenApiFieldMetadata = .{
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
         .{ "url", "url", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -47,8 +47,8 @@ pub const CohereRerankerConfig = struct {
     /// Maximum number of chunks per document for long document handling.
     max_chunks_per_doc: ?i64 = null,
 
-    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
-    pub const antflyOpenApiFieldMetadata = .{
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
         .{ "api_key", "api_key", true },
         .{ "top_n", "top_n", true },
@@ -56,11 +56,11 @@ pub const CohereRerankerConfig = struct {
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -90,18 +90,18 @@ pub const OllamaRerankerConfig = struct {
     /// The URL of the Ollama API endpoint.
     url: ?[]const u8 = null,
 
-    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
-    pub const antflyOpenApiFieldMetadata = .{
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
         .{ "url", "url", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -138,8 +138,8 @@ pub const RerankerConfig = struct {
     /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
     credentials_path: ?[]const u8 = null,
 
-    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
-    pub const antflyOpenApiFieldMetadata = .{
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
         .{ "field", "field", true },
         .{ "template", "template", true },
@@ -153,11 +153,11 @@ pub const RerankerConfig = struct {
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -247,8 +247,8 @@ pub const VertexRerankerConfig = struct {
     /// Maximum number of records to return. If not specified, returns all documents with scores.
     top_n: ?i64 = null,
 
-    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
-    pub const antflyOpenApiFieldMetadata = .{
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
         .{ "project_id", "project_id", true },
         .{ "credentials_path", "credentials_path", true },
@@ -256,11 +256,11 @@ pub const VertexRerankerConfig = struct {
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {

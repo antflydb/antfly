@@ -19,8 +19,8 @@ pub const CORSConfig = struct {
     /// How long (in seconds) the results of a preflight request can be cached
     max_age: ?i64 = null,
 
-    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
-    pub const antflyOpenApiFieldMetadata = .{
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
         .{ "enabled", "enabled", true },
         .{ "allowed_origins", "allowed_origins", true },
         .{ "allowed_methods", "allowed_methods", true },
@@ -31,11 +31,11 @@ pub const CORSConfig = struct {
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {

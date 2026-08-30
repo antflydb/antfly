@@ -22,8 +22,8 @@ pub const ContentSecurityConfig = struct {
     /// User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
     user_agent: ?[]const u8 = null,
 
-    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
-    pub const antflyOpenApiFieldMetadata = .{
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
         .{ "allowed_hosts", "allowed_hosts", true },
         .{ "block_private_ips", "block_private_ips", true },
         .{ "nat64_prefixes", "nat64_prefixes", true },
@@ -35,11 +35,11 @@ pub const ContentSecurityConfig = struct {
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -89,19 +89,19 @@ pub const HTTPCredentialConfig = struct {
     /// Security overrides for this credential.
     security: ?ContentSecurityConfig = null,
 
-    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
-    pub const antflyOpenApiFieldMetadata = .{
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
         .{ "base_url", "base_url", true },
         .{ "headers", "headers", true },
         .{ "security", "security", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -133,8 +133,8 @@ pub const RemoteContentConfig = struct {
     /// Named HTTP credentials for authenticated endpoints.
     http: ?std.json.ArrayHashMap(HTTPCredentialConfig) = null,
 
-    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
-    pub const antflyOpenApiFieldMetadata = .{
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
         .{ "security", "security", true },
         .{ "default_s3", "default_s3", true },
         .{ "s3", "s3", true },
@@ -142,11 +142,11 @@ pub const RemoteContentConfig = struct {
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -178,18 +178,18 @@ pub const S3CredentialConfig = struct {
     /// Security overrides for this credential.
     security: ?ContentSecurityConfig = null,
 
-    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
-    pub const antflyOpenApiFieldMetadata = .{
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
         .{ "buckets", "buckets", true },
         .{ "security", "security", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {

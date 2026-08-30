@@ -11,18 +11,18 @@ pub const AntflyChunkerConfig = struct {
     /// The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
     model: ?[]const u8 = null,
 
-    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
-    pub const antflyOpenApiFieldMetadata = .{
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
         .{ "api_url", "api_url", true },
         .{ "model", "model", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -59,8 +59,8 @@ pub const ChunkerConfig = struct {
     text: ?antfly_chunking_api_openapi.TextChunkOptions = null,
     audio: ?antfly_chunking_api_openapi.AudioChunkOptions = null,
 
-    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
-    pub const antflyOpenApiFieldMetadata = .{
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
         .{ "api_url", "api_url", true },
         .{ "model", "model", true },
         .{ "provider", "provider", false },
@@ -73,11 +73,11 @@ pub const ChunkerConfig = struct {
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {

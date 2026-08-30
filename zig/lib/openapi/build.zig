@@ -95,6 +95,19 @@ pub fn build(b: *std.Build) void {
 //   api_mod.addImport("schema", schema_mod);
 //   api_mod.addImport("embeddings", embeddings_mod);
 //   api_mod.addImport("httpx", httpx_mod);
+//
+//   // Application-specific x-zig-type values are mapped and wired explicitly:
+//   const raw_api_mod = openapi_dep.builder.addOpenApiModule(b, .{
+//       .spec = b.path("src/raw-api.json"),
+//       .package_name = "raw_api",
+//       .zig_type_mappings = &.{.{ "raw_json_object", "@import(\"json-runtime\").RawObject" }},
+//       .module_imports = &.{.{ .name = "json-runtime", .module = json_runtime_mod }},
+//   });
+
+pub const ModuleImport = struct {
+    name: []const u8,
+    module: *std.Build.Module,
+};
 
 pub const OpenApiModuleOptions = struct {
     spec: std.Build.LazyPath,
@@ -105,6 +118,8 @@ pub const OpenApiModuleOptions = struct {
         server: bool = false,
     } = .{},
     import_mappings: []const struct { []const u8, []const u8 } = &.{},
+    zig_type_mappings: []const struct { []const u8, []const u8 } = &.{},
+    module_imports: []const ModuleImport = &.{},
 };
 
 /// Create a Zig module from an OpenAPI spec using the openapi-zig code generator.
@@ -112,9 +127,8 @@ pub const OpenApiModuleOptions = struct {
 /// This runs the openapi-zig CLI as a build step, captures the generated output
 /// directory, and creates a module rooted at the generated root.zig.
 ///
-/// The shared antfly-json runtime is wired automatically for x-zig-type raw_json
-/// overrides. The caller remains responsible for httpx and external type modules
-/// referenced via import_mappings.
+/// The caller is responsible for httpx, external type modules referenced via
+/// import_mappings, and runtime modules referenced by zig_type_mappings.
 pub fn addOpenApiModule(dep: *std.Build.Dependency, b: *std.Build, opts: OpenApiModuleOptions) *std.Build.Module {
     const codegen = b.addRunArtifact(dep.artifact("openapi-zig"));
 
@@ -147,6 +161,10 @@ pub fn addOpenApiModule(dep: *std.Build.Dependency, b: *std.Build, opts: OpenApi
         const arg = std.fmt.allocPrint(b.allocator, "{s}={s}", .{ mapping[0], mapping[1] }) catch @panic("OOM");
         codegen.addArgs(&.{ "--import-mapping", arg });
     }
+    for (opts.zig_type_mappings) |mapping| {
+        const arg = std.fmt.allocPrint(b.allocator, "{s}={s}", .{ mapping[0], mapping[1] }) catch @panic("OOM");
+        codegen.addArgs(&.{ "--zig-type-mapping", arg });
+    }
 
     codegen.addArgs(&.{"--output"});
     const gen_dir = codegen.addOutputDirectoryArg(opts.package_name);
@@ -154,6 +172,7 @@ pub fn addOpenApiModule(dep: *std.Build.Dependency, b: *std.Build, opts: OpenApi
     const module = b.addModule(opts.package_name, .{
         .root_source_file = gen_dir.path(b, "root.zig"),
     });
-    module.addImport("antfly-json", dep.builder.dependency("antfly_json", .{}).module("antfly-json"));
+    for (opts.module_imports) |module_import|
+        module.addImport(module_import.name, module_import.module);
     return module;
 }

@@ -12843,10 +12843,10 @@ export interface components {
         GraphResultStats: {
             /**
              * Format: uint64
-             * @description Number of primary result items returned (nodes, paths, rows, or aggregates).
+             * @description Number of primary result items returned (nodes or rows).
              */
             returned_items: number;
-            /** @description True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input. */
+            /** @description True when bounded enumeration stopped before exhaustive completion. */
             truncated: boolean;
         };
         /** @description A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive. */
@@ -12875,11 +12875,6 @@ export interface components {
              * @description Number of primary result items returned (paths or aggregates).
              */
             returned_items: number;
-            /**
-             * @description Always false. Exact graph operations fail instead of returning partial output.
-             * @enum {boolean}
-             */
-            truncated: false;
         };
         /** @description Complete exact aggregates from a canonical graph MATCH query. */
         GraphAggregatesResult: {

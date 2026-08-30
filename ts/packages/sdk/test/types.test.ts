@@ -259,7 +259,7 @@ describe("Antfly Query Type Integration", () => {
       const aggregates: GraphAggregatesResult = {
         kind: "aggregates",
         aggregates: { count: { value: "0", exact: true } },
-        stats: { returned_items: 1, truncated: false },
+        stats: { returned_items: 1 },
         took: 0,
       };
       const nodes: GraphNodesResult = {

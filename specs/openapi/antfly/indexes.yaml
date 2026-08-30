@@ -3933,14 +3933,14 @@ components:
           format: uint64
           minimum: 0
           maximum: 10000
-          description: Number of primary result items returned (nodes, paths, rows, or aggregates).
+          description: Number of primary result items returned (nodes or rows).
         truncated:
           type: boolean
-          description: True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input.
+          description: True when bounded enumeration stopped before exhaustive completion.
     GraphExactResultStats:
       type: object
       additionalProperties: false
-      required: [returned_items, truncated]
+      required: [returned_items]
       description: Completion statistics for a graph result that is exact or fails without producing a result.
       properties:
         returned_items:
@@ -3949,10 +3949,6 @@ components:
           minimum: 0
           maximum: 10000
           description: Number of primary result items returned (paths or aggregates).
-        truncated:
-          type: boolean
-          enum: [false]
-          description: Always false. Exact graph operations fail instead of returning partial output.
     GraphBindingsResult:
       x-go-type-skip-optional-pointer: true
       type: object

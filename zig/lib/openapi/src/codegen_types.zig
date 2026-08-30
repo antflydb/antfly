@@ -27,6 +27,9 @@ pub const TypeGenerator = struct {
     resolver: *Resolver,
     /// Maps external $ref file paths → Zig import module names.
     import_mapping: std.StringArrayHashMapUnmanaged([]const u8) = .{},
+    /// Maps semantic x-zig-type values to caller-provided Zig type expressions.
+    /// The generator deliberately does not know which runtime provides them.
+    zig_type_mapping: std.StringArrayHashMapUnmanaged([]const u8) = .{},
     /// Tracks which import modules were actually used during generation.
     used_imports: std.StringArrayHashMapUnmanaged(void) = .{},
     /// Extra top-level helper types emitted while generating named schema types.
@@ -499,11 +502,10 @@ pub const TypeGenerator = struct {
         };
     }
 
-    fn zigTypeOverride(_: *TypeGenerator, schema: types.Schema) error{InvalidOpenApiSchema}!?[]const u8 {
+    fn zigTypeOverride(self: *TypeGenerator, schema: types.Schema) error{InvalidOpenApiSchema}!?[]const u8 {
         const override = schema.extensions.get("x-zig-type") orelse return null;
         if (std.mem.eql(u8, override, "std.json.Value")) return override;
-        if (std.mem.eql(u8, override, "raw_json")) return "@import(\"antfly-json\").RawValue";
-        if (std.mem.eql(u8, override, "raw_json_object")) return "@import(\"antfly-json\").RawObject";
+        if (self.zig_type_mapping.get(override)) |zig_type| return zig_type;
         return error.InvalidOpenApiSchema;
     }
 
@@ -887,8 +889,8 @@ pub const TypeGenerator = struct {
         self.uses_presence_aware_object = true;
 
         try self.w.blank();
-        try self.w.line("/// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.", .{});
-        try self.w.line("pub const antflyOpenApiFieldMetadata = .{{", .{});
+        try self.w.line("/// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.", .{});
+        try self.w.line("pub const openApiFieldMetadata = .{{", .{});
         self.w.indent();
         try self.emitOpenApiObjectFieldMetadata(property_names, strict_optional_fields);
         self.w.dedent();
@@ -896,13 +898,13 @@ pub const TypeGenerator = struct {
         try self.w.blank();
         try self.w.line("pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {{", .{});
         self.w.indent();
-        try self.w.line("return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);", .{});
+        try self.w.line("return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
         try self.w.blank();
         try self.w.line("pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {{", .{});
         self.w.indent();
-        try self.w.line("return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);", .{});
+        try self.w.line("return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
     }
@@ -2053,7 +2055,7 @@ test "explicit Zig raw JSON override wins over nested structural unions" {
     try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), "pub const RawQuery = union(enum) {") == null);
 }
 
-test "raw_json_object override uses the shared validated JSON runtime" {
+test "semantic Zig type override uses a caller-provided runtime mapping" {
     const alloc = std.testing.allocator;
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
@@ -2075,15 +2077,39 @@ test "raw_json_object override uses the shared validated JSON runtime" {
     var resolver = Resolver.init(arena, &doc);
     var w = SourceWriter.init(arena);
     var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.zig_type_mapping.put(arena, "raw_json_object", "@import(\"json-runtime\").RawObject");
     try gen.generateAll(&doc);
     const output = w.toSlice();
 
     try std.testing.expect(std.mem.indexOf(
         u8,
         output,
-        "pub const RawQuery = @import(\"antfly-json\").RawObject;",
+        "pub const RawQuery = @import(\"json-runtime\").RawObject;",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "pub const OpenApiRawJson") == null);
+}
+
+test "unmapped semantic Zig type override fails closed" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var override_extensions = std.StringArrayHashMapUnmanaged([]const u8){};
+    try override_extensions.put(arena, "x-zig-type", "application_raw_value");
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "RawValue", .{ .schema = .{
+        .extensions = override_extensions,
+    } });
+    const doc = types.OpenApiDoc{
+        .openapi = "3.1.0",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try std.testing.expectError(error.InvalidOpenApiSchema, gen.generateAll(&doc));
 }
 
 test "nullable raw JSON override distinguishes required null from optional absence" {

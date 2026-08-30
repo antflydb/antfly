@@ -40,6 +40,9 @@ pub const GenerateOptions = struct {
     /// When a $ref points to a mapped file, the generated code will emit
     /// `@import("schema").TypeName` instead of generating the type inline.
     import_mapping: std.StringArrayHashMapUnmanaged([]const u8) = .{},
+    /// Maps semantic x-zig-type values to Zig type expressions supplied by the
+    /// application integrating the generated module.
+    zig_type_mapping: std.StringArrayHashMapUnmanaged([]const u8) = .{},
 };
 
 pub const GeneratedFiles = struct {
@@ -61,6 +64,7 @@ pub fn generate(arena: Allocator, doc: *const types.OpenApiDoc, opts: GenerateOp
         var type_w = SourceWriter.init(arena);
         var type_gen = TypeGenerator.init(arena, &type_w, &resolver);
         type_gen.import_mapping = opts.import_mapping;
+        type_gen.zig_type_mapping = opts.zig_type_mapping;
         try type_gen.generateAll(doc);
         extra_type_reexports = try type_gen.extra_type_reexports.toOwnedSlice(arena);
         result.types = try buildModule(arena, opts.package_name, &.{}, type_gen.used_imports, type_w.toSlice());
@@ -71,6 +75,7 @@ pub fn generate(arena: Allocator, doc: *const types.OpenApiDoc, opts: GenerateOp
         var body_w = SourceWriter.init(arena);
         var type_gen = TypeGenerator.init(arena, &body_w, &resolver);
         type_gen.import_mapping = opts.import_mapping;
+        type_gen.zig_type_mapping = opts.zig_type_mapping;
         var client_gen = ClientGenerator.init(arena, &body_w, &resolver, &type_gen);
         try client_gen.generate(doc);
         result.client = try buildModule(arena, opts.package_name, &.{ .{ "httpx", "httpx" }, .{ "types", "types.zig" } }, type_gen.used_imports, body_w.toSlice());
@@ -81,6 +86,7 @@ pub fn generate(arena: Allocator, doc: *const types.OpenApiDoc, opts: GenerateOp
         var body_w = SourceWriter.init(arena);
         var type_gen = TypeGenerator.init(arena, &body_w, &resolver);
         type_gen.import_mapping = opts.import_mapping;
+        type_gen.zig_type_mapping = opts.zig_type_mapping;
         var server_gen = ServerGenerator.init(arena, &body_w, &resolver, &type_gen);
         if (opts.generate_server) {
             try server_gen.generate(doc);
@@ -374,11 +380,11 @@ test "generate 3.1 types with nullable and ref siblings" {
     try std.testing.expect(std.mem.indexOf(u8, out, "status: ?PetStatus = null,") != null);
     // Optional non-nullable properties keep ergonomic `?T` fields while their
     // generated object parser rejects explicit JSON null according to OpenAPI.
-    try std.testing.expect(std.mem.indexOf(u8, out, "pub const antflyOpenApiFieldMetadata = .{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub const openApiFieldMetadata = .{") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, ".{ \"status\", \"status\", true }") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, ".{ \"audit.event\", \"audit_event\", true }") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, ".{ \"type\", \"type\", true }") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "return try openApiParseObject(@This(), antflyOpenApiFieldMetadata") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "return try openApiParseObject(@This(), openApiFieldMetadata") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "fn openApiParseObject(") != null);
 }
 

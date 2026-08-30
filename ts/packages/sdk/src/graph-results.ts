@@ -428,17 +428,16 @@ function validateResultNodeContract(
   }
 }
 
-function stats(value: unknown, path: string, expectedItems: number, allowTruncated: boolean): void {
+function stats(value: unknown, path: string, expectedItems: number, bounded: boolean): void {
   const result = object(value, path);
-  exactKeys(result, path, ["returned_items", "truncated"]);
+  exactKeys(result, path, bounded ? ["returned_items", "truncated"] : ["returned_items"]);
   if (
     boundedInteger(result.returned_items, `${path}.returned_items`, 0, MAX_ITEMS) !== expectedItems
   ) {
     invalid(`${path}.returned_items`, "does not match the result payload");
   }
-  if (typeof result.truncated !== "boolean") invalid(`${path}.truncated`, "must be a boolean");
-  if (!allowTruncated && result.truncated)
-    invalid(`${path}.truncated`, "must be false for an exact result");
+  if (bounded && typeof result.truncated !== "boolean")
+    invalid(`${path}.truncated`, "must be a boolean");
 }
 
 function sameNameSet(actual: readonly string[], expected: Set<string>): boolean {

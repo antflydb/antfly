@@ -499,7 +499,7 @@ class TestAntflyClient:
                             "count_rows": {
                                 "kind": "aggregates",
                                 "aggregates": {"rows": {"value": "0", "exact": True}},
-                                "stats": {"returned_items": 1, "truncated": False},
+                                "stats": {"returned_items": 1},
                             }
                         },
                     }
@@ -765,7 +765,10 @@ class TestAntflyClient:
                                 "walk": {
                                     "kind": "nodes" if operation == "traverse" else "paths",
                                     **({"nodes": []} if operation == "traverse" else {"paths": []}),
-                                    "stats": {"returned_items": 0, "truncated": False},
+                                    "stats": {
+                                        "returned_items": 0,
+                                        **({"truncated": False} if operation == "traverse" else {}),
+                                    },
                                 }
                             },
                         }

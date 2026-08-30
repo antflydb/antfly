@@ -119,7 +119,7 @@ def test_canonical_path_does_not_compute_unused_overflowing_product() -> None:
                         },
                     }
                 ],
-                "stats": {"returned_items": 1, "truncated": False},
+                "stats": {"returned_items": 1},
             },
             operation="path",
         ),
@@ -159,7 +159,7 @@ def test_canonical_query_decoder_binds_result_shape_to_request() -> None:
                 {
                     "kind": "aggregates",
                     "aggregates": {"count": {"value": "1", "exact": True}},
-                    "stats": {"returned_items": 1, "truncated": False},
+                    "stats": {"returned_items": 1},
                 },
                 operation="path",
             ),
@@ -204,7 +204,7 @@ def test_canonical_query_decoder_binds_result_shape_to_request() -> None:
                 {
                     "kind": "aggregates",
                     "aggregates": {"other": {"value": "1", "exact": True}},
-                    "stats": {"returned_items": 1, "truncated": False},
+                    "stats": {"returned_items": 1},
                 },
                 operation="counted",
             ),
@@ -233,7 +233,7 @@ def test_canonical_query_decoder_enforces_cardinality_and_path_ownership() -> No
             {
                 "kind": "paths",
                 "paths": [{"path": zero_hop_path}, {"path": zero_hop_path}],
-                "stats": {"returned_items": 2, "truncated": False},
+                "stats": {"returned_items": 2},
             },
             "exceeds the requested result limit",
         ),
@@ -243,13 +243,13 @@ def test_canonical_query_decoder_enforces_cardinality_and_path_ownership() -> No
                 "paths": [],
                 "stats": {"returned_items": 0, "truncated": True},
             },
-            "must be false for an exact result",
+            "contains unknown member",
         ),
         (
             {
                 "kind": "paths",
                 "paths": [{"path": zero_hop_path, "unexpected": True}],
-                "stats": {"returned_items": 1, "truncated": False},
+                "stats": {"returned_items": 1},
             },
             "contains unknown member",
         ),
@@ -314,7 +314,7 @@ def test_public_query_decoder_accepts_valid_canonical_results() -> None:
             {
                 "kind": "aggregates",
                 "aggregates": {"count": {"value": "340282366920938463463374607431768211455", "exact": True}},
-                "stats": {"returned_items": 1, "truncated": False},
+                "stats": {"returned_items": 1},
             }
         )
     )
@@ -346,7 +346,7 @@ def test_public_query_decoder_accepts_valid_canonical_results() -> None:
                         },
                     }
                 ],
-                "stats": {"returned_items": 1, "truncated": False},
+                "stats": {"returned_items": 1},
             }
         )
     )
@@ -390,7 +390,7 @@ def test_canonical_query_decoder_rejects_unrequested_documents_but_allows_sparse
                     },
                 }
             ],
-            "stats": {"returned_items": 1, "truncated": False},
+            "stats": {"returned_items": 1},
         }
 
     with pytest.raises(AntflyException, match="was returned without being requested"):
@@ -439,22 +439,22 @@ def test_canonical_query_decoder_rejects_unrequested_documents_but_allows_sparse
         {
             "kind": "bindings",
             "rows": [{}],
-            "stats": {"returned_items": 1, "truncated": False},
+            "stats": {"returned_items": 1},
         },
         {
             "kind": "bindings",
             "rows": [{"person": {}}],
-            "stats": {"returned_items": 1, "truncated": False},
+            "stats": {"returned_items": 1},
         },
         {
             "kind": "bindings",
             "rows": [{"person": {"key": ""}}],
-            "stats": {"returned_items": 1, "truncated": False},
+            "stats": {"returned_items": 1},
         },
         {
             "kind": "bindings",
             "rows": [{"*": {"key": "person:1"}}],
-            "stats": {"returned_items": 1, "truncated": False},
+            "stats": {"returned_items": 1},
         },
         {
             "kind": "bindings",
@@ -475,12 +475,12 @@ def test_canonical_query_decoder_rejects_unrequested_documents_but_allows_sparse
         {
             "kind": "aggregates",
             "aggregates": {"count": {"value": "1", "exact": False}},
-            "stats": {"returned_items": 1, "truncated": False},
+            "stats": {"returned_items": 1},
         },
         {
             "kind": "aggregates",
             "aggregates": {"count": {"value": "1.0", "exact": True}},
-            "stats": {"returned_items": 1, "truncated": False},
+            "stats": {"returned_items": 1},
         },
         {
             "kind": "aggregates",
@@ -630,7 +630,7 @@ def test_query_decoder_enforces_observable_path_and_traversal_semantics() -> Non
             {
                 "kind": "paths",
                 "paths": [{"path": graph_path}],
-                "stats": {"returned_items": 1, "truncated": False},
+                "stats": {"returned_items": 1},
             },
             operation="path",
         )
@@ -722,7 +722,7 @@ def test_query_decoder_enforces_observable_path_and_traversal_semantics() -> Non
     duplicate_result = {
         "kind": "paths",
         "paths": [{"path": direct}, {"path": direct}],
-        "stats": {"returned_items": 2, "truncated": False},
+        "stats": {"returned_items": 2},
     }
     with pytest.raises(AntflyException, match="duplicates an earlier path"):
         decode_query_responses(

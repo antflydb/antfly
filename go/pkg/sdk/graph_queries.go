@@ -381,7 +381,7 @@ func canonicalGraphResultEnvelope(result graphResultEnvelopeDecoder) (graphQuery
 	if err := json.Unmarshal(envelope.Kind, &kind); err != nil || kind == nil {
 		return graphQueryResultEnvelope{}, "", fmt.Errorf("antfly: graph result has an invalid discriminator")
 	}
-	if envelope.Stats == nil || envelope.Stats.ReturnedItems == nil || envelope.Stats.Truncated == nil {
+	if envelope.Stats == nil || envelope.Stats.ReturnedItems == nil {
 		return graphQueryResultEnvelope{}, "", fmt.Errorf("antfly: canonical graph result requires complete stats")
 	}
 	return envelope, *kind, nil
@@ -1182,14 +1182,18 @@ func decodeCanonicalGraphResult(
 }
 
 func validateDecodedGraphStats(envelope graphQueryResultEnvelope, itemCount int, allowTruncated bool) error {
-	if envelope.Stats == nil || envelope.Stats.ReturnedItems == nil || envelope.Stats.Truncated == nil {
+	if envelope.Stats == nil || envelope.Stats.ReturnedItems == nil {
 		return fmt.Errorf("antfly: canonical graph result requires complete stats")
 	}
 	if *envelope.Stats.ReturnedItems != uint64(itemCount) {
 		return fmt.Errorf("antfly: graph result stats returned_items does not match the payload")
 	}
-	if !allowTruncated && *envelope.Stats.Truncated {
-		return fmt.Errorf("antfly: exact graph results cannot be truncated")
+	if allowTruncated {
+		if envelope.Stats.Truncated == nil {
+			return fmt.Errorf("antfly: bounded graph result stats require truncated")
+		}
+	} else if envelope.Stats.Truncated != nil {
+		return fmt.Errorf("antfly: exact graph result stats must not contain truncated")
 	}
 	return nil
 }

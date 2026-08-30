@@ -289,7 +289,7 @@ test "generated OpenAPI object metadata preserves automatic SIMD admission" {
         required_nullable: ?u32,
         optional_value: ?u32 = null,
 
-        pub const antflyOpenApiFieldMetadata = .{
+        pub const openApiFieldMetadata = .{
             .{ "required_nullable", "required_nullable", false },
             .{ "optional_value", "optional_value", true },
         };

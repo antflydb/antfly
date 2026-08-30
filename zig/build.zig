@@ -1021,6 +1021,18 @@ fn addSnowballCheckStep(b: *std.Build) void {
     check_step.dependOn(&compare.step);
 }
 
+const antfly_zig_type_mapping_args = [_][]const u8{
+    "raw_json=@import(\"antfly-json\").RawValue",
+    "raw_json_object=@import(\"antfly-json\").RawObject",
+};
+
+fn addAntflyZigTypeMappings(codegen: *std.Build.Step.Run) void {
+    for (antfly_zig_type_mapping_args) |mapping| {
+        codegen.addArgs(&.{"--zig-type-mapping"});
+        codegen.addArg(mapping);
+    }
+}
+
 fn addOpenApiModuleFromYamlPath(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -1048,6 +1060,7 @@ fn addOpenApiModuleFromYamlPath(
         codegen.addArgs(&.{"--import-mapping"});
         codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
     }
+    addAntflyZigTypeMappings(codegen);
     codegen.addArgs(&.{"--output"});
     const gen_dir = codegen.addOutputDirectoryArg(output_dir_name);
 
@@ -1186,6 +1199,7 @@ fn addOpenApiModuleWithHttpxFromYamlPath(
         codegen.addArgs(&.{"--import-mapping"});
         codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
     }
+    addAntflyZigTypeMappings(codegen);
     codegen.addArgs(&.{"--output"});
     const gen_dir = codegen.addOutputDirectoryArg(output_dir_name);
 
@@ -1271,6 +1285,7 @@ fn addOpenApiRegenRun(
         codegen.addArgs(&.{"--import-mapping"});
         codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
     }
+    addAntflyZigTypeMappings(codegen);
     codegen.addArgs(&.{ "--output", generated_dir });
     return codegen;
 }

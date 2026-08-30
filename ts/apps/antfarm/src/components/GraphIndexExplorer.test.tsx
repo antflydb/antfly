@@ -155,7 +155,7 @@ describe("GraphIndexExplorer", () => {
               },
             },
           ],
-          stats: { returned_items: 1, truncated: false },
+          stats: { returned_items: 1 },
         }}
       />
     );

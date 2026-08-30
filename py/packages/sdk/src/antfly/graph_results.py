@@ -435,16 +435,15 @@ def _validate_result_node_contract(
         )
 
 
-def _validate_stats(value: object, path: str, expected_items: int, *, allow_truncated: bool) -> None:
+def _validate_stats(value: object, path: str, expected_items: int, *, bounded: bool) -> None:
     stats = _object(value, path)
-    _exact_keys(stats, path, required=frozenset({"returned_items", "truncated"}))
+    required = frozenset({"returned_items", "truncated"}) if bounded else frozenset({"returned_items"})
+    _exact_keys(stats, path, required=required)
     returned_items = _bounded_integer(stats["returned_items"], f"{path}.returned_items", 0, _MAX_GRAPH_ITEMS)
     if returned_items != expected_items:
         _invalid(f"{path}.returned_items", "does not match the result payload")
-    if type(stats["truncated"]) is not bool:
+    if bounded and type(stats["truncated"]) is not bool:
         _invalid(f"{path}.truncated", "must be a boolean")
-    if not allow_truncated and stats["truncated"]:
-        _invalid(f"{path}.truncated", "must be false for an exact result")
 
 
 def _validate_bindings_result(value: Mapping[str, Any], path: str) -> None:
@@ -475,7 +474,7 @@ def _validate_bindings_result(value: Mapping[str, Any], path: str) -> None:
                 _nonempty_string(binding["table"], f"{binding_path}.table")
             if "document" in binding:
                 _object(binding["document"], f"{binding_path}.document")
-    _validate_stats(value["stats"], f"{path}.stats", len(rows), allow_truncated=True)
+    _validate_stats(value["stats"], f"{path}.stats", len(rows), bounded=True)
 
 
 def _validate_aggregates_result(value: Mapping[str, Any], path: str) -> None:
@@ -494,7 +493,7 @@ def _validate_aggregates_result(value: Mapping[str, Any], path: str) -> None:
             _invalid(f"{aggregate_path}.value", "must be an unsigned decimal string")
         if aggregate["exact"] is not True:
             _invalid(f"{aggregate_path}.exact", "must be true")
-    _validate_stats(value["stats"], f"{path}.stats", len(aggregates), allow_truncated=False)
+    _validate_stats(value["stats"], f"{path}.stats", len(aggregates), bounded=False)
 
 
 def _validate_nodes_result(value: Mapping[str, Any], path: str) -> None:
@@ -503,7 +502,7 @@ def _validate_nodes_result(value: Mapping[str, Any], path: str) -> None:
     if len(raw_nodes) > _MAX_GRAPH_ITEMS:
         _invalid(path, f"nodes must contain at most {_MAX_GRAPH_ITEMS} items")
     [_validate_result_node(node, f"{path}.nodes[{index}]") for index, node in enumerate(raw_nodes)]
-    _validate_stats(value["stats"], f"{path}.stats", len(raw_nodes), allow_truncated=True)
+    _validate_stats(value["stats"], f"{path}.stats", len(raw_nodes), bounded=True)
 
 
 def _validate_paths_result(value: Mapping[str, Any], path: str) -> None:
@@ -518,7 +517,7 @@ def _validate_paths_result(value: Mapping[str, Any], path: str) -> None:
         _validate_path(item["path"], f"{item_path}.path")
         if "document" in item:
             _object(item["document"], f"{item_path}.document")
-    _validate_stats(value["stats"], f"{path}.stats", len(raw_paths), allow_truncated=False)
+    _validate_stats(value["stats"], f"{path}.stats", len(raw_paths), bounded=False)
 
 
 def _canonical_result_contract(

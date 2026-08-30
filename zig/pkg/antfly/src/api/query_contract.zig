@@ -5690,7 +5690,6 @@ fn toOpenApiStatefulGraphResultWithFormat(
             .aggregates = aggregates,
             .stats = .{
                 .returned_items = @intCast(aggregates.map.count()),
-                .truncated = graph_result.truncated,
             },
         };
         return .{ .graph_aggregates_result = response };
@@ -5734,7 +5733,6 @@ fn toOpenApiStatefulGraphResultWithFormat(
             .paths = path_results,
             .stats = .{
                 .returned_items = @intCast(path_results.len),
-                .truncated = false,
             },
         };
         return .{ .graph_paths_result = response };

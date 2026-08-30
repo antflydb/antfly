@@ -18111,7 +18111,6 @@ fn appendOptionalTextQueryBoostField(
 fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
     return parseRemoteSearchResultInner(alloc, body) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.QueryCandidateBudgetExceeded => error.QueryCandidateBudgetExceeded,
         else => error.InvalidRemoteResponse,
     };
 }
@@ -18371,7 +18370,7 @@ test "parseRemoteSearchResult preserves typed graph rows and hydrated documents"
 test "parseRemoteSearchResult preserves canonical graph path table identities" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"paths","paths":[{"path":{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"direction":"in","type":"external","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"paths","paths":[{"path":{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"direction":"in","type":"external","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":1}}},"took":1,"status":200,"table":"docs"}]}
     );
     defer result.deinit();
 
@@ -18425,7 +18424,7 @@ fn parseRemoteGraphResults(
                 };
             },
             .graph_paths_result => |result| blk: {
-                if (result.paths.len > public_limits.max_graph_result_items or result.stats.truncated or
+                if (result.paths.len > public_limits.max_graph_result_items or
                     !remoteGraphReturnedItemsMatch(result.stats.returned_items, result.paths.len))
                     return error.InvalidRemoteResponse;
                 break :blk .{ .canonical_path_results = result.paths };
@@ -18440,7 +18439,6 @@ fn parseRemoteGraphResults(
                 };
             },
             .graph_aggregates_result => |result| blk: {
-                if (result.stats.truncated) return error.QueryCandidateBudgetExceeded;
                 if (result.aggregates.map.count() == 0 or
                     result.aggregates.map.count() > graph_pattern_mod.max_count_aggregates or
                     !remoteGraphReturnedItemsMatch(result.stats.returned_items, result.aggregates.map.count()))
@@ -19184,14 +19182,14 @@ test "remote canonical graph result stats and aggregate exactness fail closed" {
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
         \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"walk":{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
     ));
-    try std.testing.expectError(error.QueryCandidateBudgetExceeded, parseRemoteSearchResult(alloc,
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
         \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"counted":{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":true}}},"took":0,"status":200,"table":"docs"}]}
     ));
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"}],"edges":[],"objective":"min_hops","weight_sum":0,"objective_value":0,"length":0}}],"stats":{"returned_items":2,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"}],"edges":[],"objective":"min_hops","weight_sum":0,"objective_value":0,"length":0}}],"stats":{"returned_items":2}}},"took":0,"status":200,"table":"docs"}]}
     ));
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b","table":"entities"}],"edges":[{"from":{"key":"a"},"to":{"key":"wrong","table":"entities"},"direction":"out","type":"related","weight":1}],"objective":"min_hops","weight_sum":1,"objective_value":1,"length":1}}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b","table":"entities"}],"edges":[{"from":{"key":"a"},"to":{"key":"wrong","table":"entities"},"direction":"out","type":"related","weight":1}],"objective":"min_hops","weight_sum":1,"objective_value":1,"length":1}}],"stats":{"returned_items":1}}},"took":0,"status":200,"table":"docs"}]}
     ));
 }
 

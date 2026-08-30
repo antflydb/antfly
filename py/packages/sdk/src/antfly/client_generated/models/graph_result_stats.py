@@ -13,9 +13,8 @@ class GraphResultStats:
     """Completion statistics for a bounded graph result.
 
     Attributes:
-        returned_items (int): Number of primary result items returned (nodes, paths, rows, or aggregates).
-        truncated (bool): True when execution stopped before exhaustive enumeration; an unbounded result reference
-            rejects truncated input.
+        returned_items (int): Number of primary result items returned (nodes or rows).
+        truncated (bool): True when bounded enumeration stopped before exhaustive completion.
     """
 
     returned_items: int

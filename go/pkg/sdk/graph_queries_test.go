@@ -729,7 +729,7 @@ func TestQueryGraphResponsesHonorRequestedOperations(t *testing.T) {
 			name:     "operation result kind must match",
 			requests: canonicalRequest,
 			responses: QueryResponses{Responses: []QueryResult{{
-				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":false}}`)},
+				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":true}},"stats":{"returned_items":1}}`)},
 			}}},
 			contains: `requires result kind "nodes", got "aggregates"`,
 		},
@@ -739,7 +739,7 @@ func TestQueryGraphResponsesHonorRequestedOperations(t *testing.T) {
 			responses: QueryResponses{Responses: []QueryResult{{
 				GraphResults: map[string]GraphResult{"count": decode(`{"kind":"aggregates","aggregates":{"rows":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":true}}`)},
 			}}},
-			contains: "exact graph results cannot be truncated",
+			contains: `unknown field "truncated"`,
 		},
 		{
 			name:     "canonical payload requires all structural fields",
@@ -785,7 +785,7 @@ func TestQueryGraphResponsesHonorRequestedOperations(t *testing.T) {
 			name:     "canonical payload binds aggregate names to projection",
 			requests: []QueryRequest{{GraphQueries: map[string]GraphQuery{"count": aggregation}}},
 			responses: QueryResponses{Responses: []QueryResult{{
-				GraphResults: map[string]GraphResult{"count": decode(`{"kind":"aggregates","aggregates":{"other":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":false}}`)},
+				GraphResults: map[string]GraphResult{"count": decode(`{"kind":"aggregates","aggregates":{"other":{"value":"1","exact":true}},"stats":{"returned_items":1}}`)},
 			}}},
 			contains: "do not match requested names",
 		},
@@ -878,7 +878,7 @@ func TestDecodeGraphResultForQueryValidatesRequestedProjection(t *testing.T) {
 	}
 
 	aggregatesQuery := decodeQuery(`{"index":"graph","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"rows":{"count":"*"}}}}`)
-	wrongAggregates := decodeResult(`{"kind":"aggregates","aggregates":{"other":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":false}}`)
+	wrongAggregates := decodeResult(`{"kind":"aggregates","aggregates":{"other":{"value":"1","exact":true}},"stats":{"returned_items":1}}`)
 	if _, err := DecodeGraphResultForQuery(aggregatesQuery, wrongAggregates); err == nil || !strings.Contains(err.Error(), "do not match requested names") {
 		t.Fatalf("expected aggregate name mismatch, got %v", err)
 	}
@@ -917,25 +917,25 @@ func TestDecodeGraphResultForQueryEnforcesOperationCardinalityAndPathOwnership(t
 		{
 			name:     "shortest path returns at most one path",
 			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"a"}}}`,
-			result:   `{"kind":"paths","paths":[{"path":` + zeroHopPath + `},{"path":` + zeroHopPath + `}],"stats":{"returned_items":2,"truncated":false}}`,
+			result:   `{"kind":"paths","paths":[{"path":` + zeroHopPath + `},{"path":` + zeroHopPath + `}],"stats":{"returned_items":2}}`,
 			contains: "requested limit of 1 items",
 		},
 		{
 			name:     "exact paths cannot be truncated",
 			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"a"}}}`,
 			result:   `{"kind":"paths","paths":[],"stats":{"returned_items":0,"truncated":true}}`,
-			contains: "exact graph results cannot be truncated",
+			contains: `unknown field "truncated"`,
 		},
 		{
 			name:     "path item rejects unknown fields",
 			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"a"}}}`,
-			result:   `{"kind":"paths","paths":[{"path":` + zeroHopPath + `,"unexpected":true}],"stats":{"returned_items":1,"truncated":false}}`,
+			result:   `{"kind":"paths","paths":[{"path":` + zeroHopPath + `,"unexpected":true}],"stats":{"returned_items":1}}`,
 			contains: "unknown field",
 		},
 		{
 			name:     "path shape is validated",
 			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"a"}}}`,
-			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"}],"edges":[],"length":1,"objective":"min_hops","weight_sum":0,"objective_value":1}}],"stats":{"returned_items":1,"truncated":false}}`,
+			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"}],"edges":[],"length":1,"objective":"min_hops","weight_sum":0,"objective_value":1}}],"stats":{"returned_items":1}}`,
 			contains: "length, nodes, and edges do not align",
 		},
 		{
@@ -994,7 +994,7 @@ func TestDecodeGraphResultForQueryEnforcesObservableQuerySemantics(t *testing.T)
 	path := func(nodes, edges, objective string, objectiveValue float64) string {
 		t.Helper()
 		return fmt.Sprintf(
-			`{"kind":"paths","paths":[{"path":{"nodes":%s,"edges":%s,"length":%d,"objective":%q,"weight_sum":%g,"objective_value":%g}}],"stats":{"returned_items":1,"truncated":false}}`,
+			`{"kind":"paths","paths":[{"path":{"nodes":%s,"edges":%s,"length":%d,"objective":%q,"weight_sum":%g,"objective_value":%g}}],"stats":{"returned_items":1}}`,
 			nodes,
 			edges,
 			strings.Count(edges, `"from"`),
@@ -1044,7 +1044,7 @@ func TestDecodeGraphResultForQueryEnforcesObservableQuerySemantics(t *testing.T)
 		{
 			name:     "path max depth",
 			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"b"},"max_depth":1}}`,
-			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"x"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"x"},"direction":"out","type":"links","weight":1},{"from":{"key":"x"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":2,"objective":"min_hops","weight_sum":2,"objective_value":2}}],"stats":{"returned_items":1,"truncated":false}}`,
+			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"x"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"x"},"direction":"out","type":"links","weight":1},{"from":{"key":"x"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":2,"objective":"min_hops","weight_sum":2,"objective_value":2}}],"stats":{"returned_items":1}}`,
 			contains: "requested max_depth",
 		},
 		{
@@ -1062,19 +1062,19 @@ func TestDecodeGraphResultForQueryEnforcesObservableQuerySemantics(t *testing.T)
 		{
 			name:     "k path loop",
 			query:    `{"index":"graph","k_shortest_paths":{"from":{"key":"a"},"to":{"key":"b"},"k":2}}`,
-			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"x"},{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"x"},"direction":"out","type":"links","weight":1},{"from":{"key":"x"},"to":{"key":"a"},"direction":"out","type":"links","weight":1},{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":3,"objective":"min_hops","weight_sum":3,"objective_value":3}}],"stats":{"returned_items":1,"truncated":false}}`,
+			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"x"},{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"x"},"direction":"out","type":"links","weight":1},{"from":{"key":"x"},"to":{"key":"a"},"direction":"out","type":"links","weight":1},{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":3,"objective":"min_hops","weight_sum":3,"objective_value":3}}],"stats":{"returned_items":1}}`,
 			contains: "loopless",
 		},
 		{
 			name:     "duplicate k path",
 			query:    `{"index":"graph","k_shortest_paths":{"from":{"key":"a"},"to":{"key":"b"},"k":2}}`,
-			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}},{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":2,"truncated":false}}`,
+			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}},{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":2}}`,
 			contains: "duplicate paths",
 		},
 		{
 			name:     "unordered k paths",
 			query:    `{"index":"graph","k_shortest_paths":{"from":{"key":"a"},"to":{"key":"b"},"k":2}}`,
-			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"x"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"x"},"direction":"out","type":"links","weight":1},{"from":{"key":"x"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":2,"objective":"min_hops","weight_sum":2,"objective_value":2}},{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":2,"truncated":false}}`,
+			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"x"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"x"},"direction":"out","type":"links","weight":1},{"from":{"key":"x"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":2,"objective":"min_hops","weight_sum":2,"objective_value":2}},{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"links","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":2}}`,
 			contains: "not ordered",
 		},
 	}
@@ -1171,24 +1171,24 @@ func TestCanonicalGraphResultDecodersFailClosed(t *testing.T) {
 		`{"kind":"bindings","rows":[{"a":{"key":"a","table":""}}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[{"a":{"key":"a","table":null}}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[{"a":{"key":"a","document":null}}],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"}],"edges":[],"objective":"min_hops"}}],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a","table":""}],"edges":[],"length":0,"objective":"min_hops","weight_sum":0,"objective_value":0}}],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"}],"edges":[],"length":0,"objective":"min_hops","weight_sum":0,"objective_value":0},"document":null}],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"}],"edges":[],"objective":"min_hops"}}],"stats":{"returned_items":1}}`,
+		`{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a","table":""}],"edges":[],"length":0,"objective":"min_hops","weight_sum":0,"objective_value":0}}],"stats":{"returned_items":1}}`,
+		`{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"}],"edges":[],"length":0,"objective":"min_hops","weight_sum":0,"objective_value":0},"document":null}],"stats":{"returned_items":1}}`,
 		`{"kind":"nodes","nodes":[{"key":"b","depth":0,"path":[{"key":"a"},{"key":"b"}]}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"b","depth":1,"path":[{"key":"a","table":null},{"key":"b"}],"path_edges":[{"from":{"key":"a"},"to":{"key":"b"},"type":"edge","weight":1}]}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"b","depth":1,"path":[{"key":"a"},{"key":"b"}],"path_edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"sideways","type":"edge","weight":1}]}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"wrong","depth":1,"path":[{"key":"a"},{"key":"b"}]}],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"edge"}],"length":1,"objective":"min_hops","weight_sum":0,"objective_value":1}}],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a","table":null},"to":{"key":"b"},"direction":"out","type":"edge","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":1,"truncated":false}}`,
-		fmt.Sprintf(`{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":%q,"weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":1,"truncated":false}}`, strings.Repeat("é", maxGraphEdgeTypeBytes/2+1)),
+		`{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"edge"}],"length":1,"objective":"min_hops","weight_sum":0,"objective_value":1}}],"stats":{"returned_items":1}}`,
+		`{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a","table":null},"to":{"key":"b"},"direction":"out","type":"edge","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":1}}`,
+		fmt.Sprintf(`{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":%q,"weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":1}}`, strings.Repeat("é", maxGraphEdgeTypeBytes/2+1)),
 		`{"kind":"nodes","nodes":[],"stats":{"returned_items":0,"truncated":false},"unexpected":true}`,
 		`{"kind":"nodes","nodes":[],"stats":{"returned_items":0,"truncated":false,"unexpected":true}}`,
 		`{"kind":"nodes","nodes":[{"key":"a","depth":0,"unexpected":true}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[{}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[{"a":{}}],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":false}},"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"aggregates","aggregates":{"count":{"value":"1.0","exact":true}},"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":false}},"stats":{"returned_items":1}}`,
+		`{"kind":"aggregates","aggregates":{"count":{"value":"1.0","exact":true}},"stats":{"returned_items":1}}`,
 		`{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":true}}`,
 	}
 

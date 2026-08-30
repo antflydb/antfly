@@ -29,28 +29,27 @@ const RootKind = enum {
     object,
 };
 
-/// Compact, owned JSON bytes with parsing and serialization hooks for
-/// std.json. `bytes` remains public for ordinary Zig ergonomics, so
-/// jsonStringify performs a final allocation-free validation pass before raw
-/// emission. This makes direct struct initialization safe at the wire boundary.
+/// A borrowed view of valid JSON bytes with parsing and serialization hooks
+/// for std.json. The bytes are owned by the containing value (normally a
+/// `std.json.Parsed`) or by the caller that constructed the view. Keeping
+/// ownership outside this wire type makes literals, arena-backed requests, and
+/// independently allocated buffers equally safe.
+///
+/// `bytes` remains public for ordinary Zig ergonomics, so jsonStringify performs
+/// a final allocation-free validation pass before raw emission. Call validate()
+/// before serialization when the caller needs a precise InvalidRawJson error.
 fn Raw(comptime root_kind: RootKind) type {
     return struct {
         bytes: []const u8,
 
         const Self = @This();
 
-        pub fn parseOwned(allocator: Allocator, input: []const u8) !Self {
-            var scanner = std.json.Scanner.initCompleteInput(allocator, input);
-            defer scanner.deinit();
-            var result = try jsonParse(allocator, &scanner, .{ .max_value_len = input.len });
-            errdefer result.deinit(allocator);
-            if (try scanner.next() != .end_of_document) return error.UnexpectedToken;
+        /// Creates a validated borrowed view without allocating or copying.
+        /// The caller must keep `bytes` alive for the lifetime of the result.
+        pub fn init(bytes: []const u8) error{InvalidRawJson}!Self {
+            const result: Self = .{ .bytes = bytes };
+            try result.validate();
             return result;
-        }
-
-        pub fn deinit(self: *Self, allocator: Allocator) void {
-            allocator.free(self.bytes);
-            self.* = undefined;
         }
 
         pub fn jsonParse(
@@ -211,10 +210,11 @@ fn writeNumber(jw: *std.json.Stringify, value: []const u8) !void {
     jw.endWriteRaw();
 }
 
-test "raw object streams compact owned bytes" {
+test "raw object streams compact bytes owned by parsed container" {
     const alloc = std.testing.allocator;
-    var raw = try RawObject.parseOwned(alloc, " { \"query\" : [1, true, null] } ");
-    defer raw.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(RawObject, alloc, " { \"query\" : [1, true, null] } ", .{});
+    defer parsed.deinit();
+    const raw = parsed.value;
     try std.testing.expectEqualStrings("{\"query\":[1,true,null]}", raw.bytes);
 
     const encoded = try std.json.Stringify.valueAlloc(alloc, raw, .{});
@@ -224,7 +224,11 @@ test "raw object streams compact owned bytes" {
 
 test "raw object rejects non-object roots and invalid direct construction" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.UnexpectedToken, RawObject.parseOwned(alloc, "[1,2,3]"));
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(RawObject, alloc, "[1,2,3]", .{}));
+    const borrowed = try RawObject.init("{\"ok\":true}");
+    try std.testing.expectEqualStrings("{\"ok\":true}", borrowed.bytes);
+    try std.testing.expectError(error.InvalidRawJson, RawObject.init("[1]"));
+
     const malformed = RawObject{ .bytes = "{" };
     try std.testing.expectError(error.InvalidRawJson, malformed.validate());
     // valueAlloc collapses its writer error set to OutOfMemory; the important
@@ -243,8 +247,9 @@ test "raw object rejects non-object roots and invalid direct construction" {
 
 test "raw value accepts scalar roots but validates direct construction" {
     const alloc = std.testing.allocator;
-    var raw = try RawValue.parseOwned(alloc, " 42 ");
-    defer raw.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(RawValue, alloc, " 42 ", .{});
+    defer parsed.deinit();
+    const raw = parsed.value;
     try std.testing.expectEqualStrings("42", raw.bytes);
 
     const malformed = RawValue{ .bytes = "true false" };
@@ -260,15 +265,15 @@ test "raw JSON nesting is bounded during parsing and final validation" {
     at_limit[max_raw_nesting] = '0';
     @memset(at_limit[max_raw_nesting + 1 ..], ']');
 
-    var parsed = try RawValue.parseOwned(alloc, at_limit);
-    defer parsed.deinit(alloc);
-    try parsed.validate();
+    var parsed = try std.json.parseFromSlice(RawValue, alloc, at_limit, .{});
+    defer parsed.deinit();
+    try parsed.value.validate();
 
     const over_limit = try alloc.alloc(u8, (max_raw_nesting + 1) * 2 + 1);
     defer alloc.free(over_limit);
     @memset(over_limit[0 .. max_raw_nesting + 1], '[');
     over_limit[max_raw_nesting + 1] = '0';
     @memset(over_limit[max_raw_nesting + 2 ..], ']');
-    try std.testing.expectError(error.UnexpectedToken, RawValue.parseOwned(alloc, over_limit));
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(RawValue, alloc, over_limit, .{}));
     try std.testing.expectError(error.InvalidRawJson, (RawValue{ .bytes = over_limit }).validate());
 }

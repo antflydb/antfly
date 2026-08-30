@@ -49,7 +49,7 @@ describe("graph result admission", () => {
               },
             },
           ],
-          stats: { returned_items: 1, truncated: false },
+          stats: { returned_items: 1 },
         }),
         [canonicalRequest]
       )
@@ -88,7 +88,7 @@ describe("graph result admission", () => {
               },
             },
           ],
-          stats: { returned_items: 1, truncated: false },
+          stats: { returned_items: 1 },
         }),
         [canonicalRequest]
       )
@@ -112,7 +112,7 @@ describe("graph result admission", () => {
           {
             kind: "paths",
             paths: [],
-            stats: { returned_items: 0, truncated: false },
+            stats: { returned_items: 0 },
           },
           "other"
         ),
@@ -134,7 +134,7 @@ describe("graph result admission", () => {
           },
         },
       ],
-      stats: { returned_items: 1, truncated: false },
+      stats: { returned_items: 1 },
     });
     expect(() => validateGraphQueryResponses(malformed, [canonicalRequest])).toThrow(
       'is missing required member "direction"'
@@ -147,7 +147,7 @@ describe("graph result admission", () => {
         responses({
           kind: "aggregates",
           aggregates: { count: { value: "1", exact: true } },
-          stats: { returned_items: 1, truncated: false },
+          stats: { returned_items: 1 },
         }),
         [canonicalRequest]
       )
@@ -172,7 +172,7 @@ describe("graph result admission", () => {
           {
             kind: "bindings",
             rows: [{ a: { key: "a" }, c: null }],
-            stats: { returned_items: 1, truncated: false },
+            stats: { returned_items: 1 },
           },
           "matched"
         ),
@@ -195,7 +195,7 @@ describe("graph result admission", () => {
           {
             kind: "aggregates",
             aggregates: { other: { value: "1", exact: true } },
-            stats: { returned_items: 1, truncated: false },
+            stats: { returned_items: 1 },
           },
           "counted"
         ),
@@ -228,7 +228,7 @@ describe("graph result admission", () => {
           },
         },
       ],
-      stats: { returned_items: 1, truncated: false },
+      stats: { returned_items: 1 },
     });
     expect(() =>
       validateGraphQueryResponses(responses(nodeResult({ private: true })), [canonicalRequest])
@@ -285,10 +285,12 @@ describe("graph result admission", () => {
       weight_sum: 0,
       objective_value: 0,
     };
-    const pathResult = (paths: unknown[], truncated = false) => ({
+    const pathResult = (paths: unknown[], includeInvalidTruncated = false) => ({
       kind: "paths",
       paths: paths.map((path) => ({ path })),
-      stats: { returned_items: paths.length, truncated },
+      stats: includeInvalidTruncated
+        ? { returned_items: paths.length, truncated: true }
+        : { returned_items: paths.length },
     });
 
     expect(() =>
@@ -299,7 +301,7 @@ describe("graph result admission", () => {
 
     expect(() =>
       validateGraphQueryResponses(responses(pathResult([], true)), [canonicalRequest])
-    ).toThrow("must be false for an exact result");
+    ).toThrow('contains unknown member "truncated"');
 
     expect(() =>
       validateGraphQueryResponses(
@@ -389,7 +391,7 @@ describe("graph result admission", () => {
     const result = (path: unknown) => ({
       kind: "paths",
       paths: [{ path }],
-      stats: { returned_items: 1, truncated: false },
+      stats: { returned_items: 1 },
     });
 
     expect(() =>
@@ -502,7 +504,7 @@ describe("graph result admission", () => {
         responses({
           kind: "paths",
           paths: [{ path: direct }, { path: direct }],
-          stats: { returned_items: 2, truncated: false },
+          stats: { returned_items: 2 },
         }),
         [kRequest]
       )

@@ -24,7 +24,7 @@ const json = std.json;
 /// parsers, so supported typed responses stay on the SIMD path.
 fn hasOpenApiFieldMetadata(comptime T: type) bool {
     return switch (@typeInfo(T)) {
-        .@"struct" => @hasDecl(T, "antflyOpenApiFieldMetadata"),
+        .@"struct" => @hasDecl(T, "openApiFieldMetadata"),
         else => false,
     };
 }
@@ -381,7 +381,7 @@ const Parser = struct {
 
     fn structFieldJsonName(comptime T: type, comptime zig_name: []const u8, comptime field_index: usize) []const u8 {
         if (!hasOpenApiFieldMetadata(T)) return zig_name;
-        const metadata = T.antflyOpenApiFieldMetadata;
+        const metadata = T.openApiFieldMetadata;
         const fields = @typeInfo(T).@"struct".fields;
         if (metadata.len != fields.len)
             @compileError("OpenAPI field metadata must match the generated struct");
@@ -393,7 +393,7 @@ const Parser = struct {
     fn structFieldRejectsNull(comptime T: type, comptime zig_name: []const u8, comptime field_index: usize) bool {
         if (!hasOpenApiFieldMetadata(T)) return false;
         _ = structFieldJsonName(T, zig_name, field_index);
-        return T.antflyOpenApiFieldMetadata[field_index][2];
+        return T.openApiFieldMetadata[field_index][2];
     }
 
     fn cachedStructFieldIndex(self: *const Parser, comptime T: type, field_name: []const u8) ?usize {
@@ -1365,7 +1365,7 @@ test "simd typed parser consumes generated OpenAPI field metadata without custom
         required_nullable: ?u32,
         optional_value: ?u32 = null,
 
-        pub const antflyOpenApiFieldMetadata = .{
+        pub const openApiFieldMetadata = .{
             .{ "required_nullable", "required_nullable", false },
             .{ "wire.value", "optional_value", true },
         };
