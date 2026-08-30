@@ -1606,12 +1606,13 @@ test "std http listener and executor round-trip snapshot routes" {
     var executor: std_http_executor.StdHttpExecutor = undefined;
     executor.initInPlace(std.testing.allocator, .{});
     defer executor.deinit();
-    var transport = http_snapshot.HttpSnapshotTransport.init(
+    var transport = try http_snapshot.HttpSnapshotTransport.init(
         std.testing.allocator,
         .{ .root_dir = "/tmp" },
         executor.executor(),
         null,
     );
+    defer transport.deinit();
 
     const upload_path = try routes.Routes.snapshotUploadPath(std.testing.allocator, "snap-1");
     defer std.testing.allocator.free(upload_path);

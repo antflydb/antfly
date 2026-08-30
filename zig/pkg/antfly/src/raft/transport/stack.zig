@@ -18,7 +18,6 @@ const http_common = @import("http_common.zig");
 const http_driver = @import("http_driver.zig");
 const http_server = @import("http_server.zig");
 const http_snapshot = @import("http_snapshot.zig");
-const snapshot_transfer = @import("snapshot_transfer.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 
 pub const HttpTransportStackConfig = struct {
@@ -41,13 +40,7 @@ pub const HttpTransportStack = struct {
         io: ?std.Io,
         snapshot_resolver: ?http_snapshot.SnapshotTargetResolver,
     ) !HttpTransportStack {
-        if (cfg.snapshot.chunk_size < snapshot_transfer.min_chunk_bytes or
-            cfg.snapshot.chunk_size > snapshot_transfer.max_chunk_bytes or
-            cfg.snapshot.max_parallel_chunks == 0 or
-            cfg.snapshot.max_parallel_chunks > 32 or
-            cfg.snapshot.max_snapshot_bytes == 0 or
-            cfg.snapshot.legacy_fallback_max_request_bytes == 0)
-            return error.InvalidSnapshotTransferLimits;
+        try http_snapshot.HttpSnapshotTransport.validateConfig(cfg.snapshot);
         var owned_io_impl: ?*std.Io.Threaded = null;
         errdefer if (owned_io_impl) |io_impl| {
             io_impl.deinit();
@@ -79,11 +72,12 @@ pub const HttpTransportStack = struct {
                 driver.frameDriver(),
                 cfg.retry_policy,
             ),
-            .snapshot_transport = http_snapshot.HttpSnapshotTransport.init(
+            .snapshot_transport = try http_snapshot.HttpSnapshotTransport.initShared(
                 alloc,
                 cfg.snapshot,
                 executor,
                 snapshot_resolver,
+                driver_io,
             ),
             .owned_io_impl = owned_io_impl,
         };
@@ -91,6 +85,7 @@ pub const HttpTransportStack = struct {
 
     pub fn deinit(self: *HttpTransportStack) void {
         self.transport_host.deinit();
+        self.snapshot_transport.deinit();
         self.driver.deinit();
         self.alloc.destroy(self.driver);
         if (self.owned_io_impl) |io_impl| {

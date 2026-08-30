@@ -221,6 +221,27 @@ const RecoveryPermit = struct {
     expires_after_round: u64,
 };
 
+/// Attempt-scoped capability for crossing an irreversible Ready boundary.
+/// Admission and allocation failures leave the underlying incident permits
+/// intact; the first state mutation atomically spends every permit involved in
+/// this Ready so no later error path can accidentally reuse authorization.
+const ReadyRecoveryAttempt = struct {
+    host: *MultiRaft,
+    group_id: core.types.GroupId,
+    outbound: bool,
+    apply: bool,
+    spent: bool = false,
+
+    fn crossIrreversibleBoundary(self: *@This()) void {
+        std.debug.assert(!self.spent);
+        if (self.outbound)
+            self.host.consumeRecoveryPermit(self.group_id, .outbound_ready_too_large);
+        if (self.apply)
+            self.host.consumeRecoveryPermit(self.group_id, .apply_ready_too_large);
+        self.spent = true;
+    }
+};
+
 const PendingApplyTask = struct {
     group_id: core.types.GroupId,
     snapshot: ?core.types.Snapshot,
@@ -1489,6 +1510,13 @@ pub const MultiRaft = struct {
         }
         if (diagnostics) |diag| diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
 
+        var recovery_attempt = ReadyRecoveryAttempt{
+            .host = self,
+            .group_id = group_id,
+            .outbound = outbound_recovery_permit,
+            .apply = apply_recovery_permit,
+        };
+
         const snapshot_throttle_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         const snapshot_started = blk: {
             if (ready.snapshot == null) break :blk false;
@@ -1533,10 +1561,7 @@ pub const MultiRaft = struct {
         // first of them. A transient failure consequently re-quarantines the
         // still-oversized Ready and requires an explicit, newly fenced retry
         // instead of silently reusing an old operator authorization.
-        if (outbound_recovery_permit)
-            self.consumeRecoveryPermit(group_id, .outbound_ready_too_large);
-        if (apply_recovery_permit)
-            self.consumeRecoveryPermit(group_id, .apply_ready_too_large);
+        recovery_attempt.crossIrreversibleBoundary();
 
         if (try grp.applyCommittedConfChanges(ready.committed_entries)) {
             ready.conf_state = grp.status().conf_state;

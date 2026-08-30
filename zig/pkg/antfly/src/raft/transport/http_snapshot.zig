@@ -19,6 +19,7 @@ const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
 const common_http = @import("../../common/http/mod.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const common = @import("http_common.zig");
 const http_server = @import("http_server.zig");
 const routes = @import("routes.zig");
@@ -30,25 +31,115 @@ pub const HttpSnapshotConfig = struct {
     /// Bounded request fan-out for v2 payload chunks. Executors that do not
     /// explicitly advertise concurrent safety remain serialized.
     max_parallel_chunks: usize = 8,
+    /// Per-request idle/transport ceiling. The complete transfer is also
+    /// fenced by transfer_timeout_ms so successful chunks cannot reset the
+    /// operation budget indefinitely.
+    request_timeout_ms: u32 = 30_000,
+    transfer_timeout_ms: u32 = 5 * 60_000,
     legacy_max_snapshot_bytes: usize = 8 * 1024 * 1024,
     /// Common request/response ceiling for the non-streaming v1 envelope. The
     /// default matches StdHttpExecutorConfig.max_response_bytes so a snapshot
     /// accepted by a default host is fetchable by another default host.
     legacy_fallback_max_request_bytes: usize = 4 * 1024 * 1024,
     max_snapshot_bytes: usize = 1 << 30,
+    /// Aggregate logical bytes reserved by local download artifacts. This is
+    /// separate from Raft's retained-snapshot admission because a verified
+    /// read-only mapping continues to consume filesystem capacity until its
+    /// final Raft reference is released.
+    max_staging_bytes: usize = 2 << 30,
 };
 
+pub const max_parallel_chunk_workers: usize = 32;
+
 var snapshot_fetch_sequence = std.atomic.Value(u64).init(1);
+const snapshot_fetch_staging_prefix = ".antfly-snapshot-fetch-";
+const snapshot_fetch_staging_suffix = ".part";
+
+/// The snapshot root is an exclusive host resource. On construction no local
+/// transfer can still own one of these private artifacts, so every matching
+/// file is crash residue and may be removed before new admissions begin.
+fn scavengeFetchArtifacts(
+    io: std.Io,
+    root_dir: []const u8,
+) !void {
+    try fs_paths.createDirPathPortable(io, root_dir);
+    var dir = try std.Io.Dir.cwd().openDir(io, root_dir, .{ .iterate = true });
+    defer dir.close(io);
+    var deleted = false;
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file or
+            !std.mem.startsWith(u8, entry.name, snapshot_fetch_staging_prefix) or
+            !std.mem.endsWith(u8, entry.name, snapshot_fetch_staging_suffix))
+            continue;
+        dir.deleteFile(io, entry.name) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        deleted = true;
+    }
+    if (deleted) try fs_paths.syncDirPortable(io, root_dir);
+}
 
 const MappedFetchOwner = struct {
     alloc: std.mem.Allocator,
     mapped: []align(std.heap.page_size_min) u8,
+    staging_budget: *SnapshotStagingBudget,
+    reserved_bytes: usize,
 
     fn release(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         std.posix.munmap(self.mapped);
+        self.staging_budget.release(self.reserved_bytes);
+        self.staging_budget.releaseRef();
         const alloc = self.alloc;
         alloc.destroy(self);
+    }
+};
+
+const SnapshotStagingBudget = struct {
+    alloc: std.mem.Allocator,
+    limit: usize,
+    references: std.atomic.Value(usize) = .init(1),
+    reserved: std.atomic.Value(usize) = .init(0),
+
+    fn retain(self: *@This()) void {
+        const previous = self.references.fetchAdd(1, .monotonic);
+        if (previous == std.math.maxInt(usize))
+            @panic("snapshot staging budget reference count overflow");
+    }
+
+    fn releaseRef(self: *@This()) void {
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous != 1) return;
+        std.debug.assert(self.reserved.load(.acquire) == 0);
+        self.alloc.destroy(self);
+    }
+
+    fn reserve(self: *@This(), bytes: usize) !void {
+        if (bytes > self.limit) return error.SnapshotStagingBackpressure;
+        var current = self.reserved.load(.acquire);
+        while (true) {
+            if (current > self.limit - bytes)
+                return error.SnapshotStagingBackpressure;
+            if (self.reserved.cmpxchgWeak(
+                current,
+                current + bytes,
+                .acq_rel,
+                .acquire,
+            )) |observed| {
+                current = observed;
+                continue;
+            }
+            return;
+        }
+    }
+
+    fn release(self: *@This(), bytes: usize) void {
+        if (bytes == 0) return;
+        const previous = self.reserved.fetchSub(bytes, .acq_rel);
+        std.debug.assert(previous >= bytes);
     }
 };
 
@@ -104,19 +195,89 @@ pub const HttpSnapshotTransport = struct {
     cfg: HttpSnapshotConfig,
     executor: common.RequestExecutor,
     resolver: ?SnapshotTargetResolver = null,
+    artifact_io: std.Io,
+    owned_artifact_io: ?*std.Io.Threaded = null,
+    staging_budget: *SnapshotStagingBudget,
 
     pub fn init(
         alloc: std.mem.Allocator,
         cfg: HttpSnapshotConfig,
         executor: common.RequestExecutor,
         resolver: ?SnapshotTargetResolver,
-    ) HttpSnapshotTransport {
+    ) !HttpSnapshotTransport {
+        try validateConfig(cfg);
+        const io_impl = try alloc.create(std.Io.Threaded);
+        errdefer alloc.destroy(io_impl);
+        io_impl.* = threaded_io_limits.initService(alloc);
+        errdefer io_impl.deinit();
+        var snapshot_transport = try initShared(alloc, cfg, executor, resolver, io_impl.io());
+        snapshot_transport.owned_artifact_io = io_impl;
+        return snapshot_transport;
+    }
+
+    pub fn initShared(
+        alloc: std.mem.Allocator,
+        cfg: HttpSnapshotConfig,
+        executor: common.RequestExecutor,
+        resolver: ?SnapshotTargetResolver,
+        artifact_io: std.Io,
+    ) !HttpSnapshotTransport {
+        try validateConfig(cfg);
+        const staging_budget = try alloc.create(SnapshotStagingBudget);
+        errdefer alloc.destroy(staging_budget);
+        staging_budget.* = .{ .alloc = alloc, .limit = cfg.max_staging_bytes };
+        try scavengeFetchArtifacts(artifact_io, cfg.root_dir);
         return .{
             .alloc = alloc,
             .cfg = cfg,
             .executor = executor,
             .resolver = resolver,
+            .artifact_io = artifact_io,
+            .staging_budget = staging_budget,
         };
+    }
+
+    pub fn deinit(self: *HttpSnapshotTransport) void {
+        // Mapped snapshots may outlive a standalone transport. Their owner
+        // retains this control block until the final mapping and reservation
+        // are released, avoiding a shutdown-order UAF in embedders.
+        self.staging_budget.releaseRef();
+        if (self.owned_artifact_io) |io_impl| {
+            io_impl.deinit();
+            self.alloc.destroy(io_impl);
+        }
+        self.* = undefined;
+    }
+
+    pub fn validateConfig(cfg: HttpSnapshotConfig) !void {
+        if (cfg.root_dir.len == 0 or
+            cfg.chunk_size < snapshot_transfer.min_chunk_bytes or
+            cfg.chunk_size > snapshot_transfer.max_chunk_bytes or
+            cfg.max_parallel_chunks == 0 or
+            cfg.max_parallel_chunks > max_parallel_chunk_workers or
+            cfg.request_timeout_ms == 0 or
+            cfg.transfer_timeout_ms < cfg.request_timeout_ms or
+            cfg.max_snapshot_bytes == 0 or
+            cfg.max_staging_bytes < cfg.max_snapshot_bytes or
+            cfg.legacy_fallback_max_request_bytes == 0)
+            return error.InvalidSnapshotTransferLimits;
+    }
+
+    fn transferDeadlineNs(self: *const HttpSnapshotTransport) u64 {
+        return platform_time.monotonicNs() +|
+            @as(u64, self.cfg.transfer_timeout_ms) * std.time.ns_per_ms;
+    }
+
+    fn requestTimeoutUntil(self: *const HttpSnapshotTransport, deadline_ns: u64) !u32 {
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= deadline_ns) return error.SnapshotTransferTimeout;
+        const remaining_ns = deadline_ns - now_ns;
+        const remaining_ms_u64 = @max(
+            @as(u64, 1),
+            @divTrunc(remaining_ns +| (std.time.ns_per_ms - 1), std.time.ns_per_ms),
+        );
+        const remaining_ms = std.math.cast(u32, remaining_ms_u64) orelse std.math.maxInt(u32);
+        return @min(self.cfg.request_timeout_ms, remaining_ms);
     }
 
     pub fn transport(self: *HttpSnapshotTransport) raft_engine.runtime.SnapshotTransport {
@@ -133,6 +294,7 @@ pub const HttpSnapshotTransport = struct {
         var resp = try self.executor.execute(self.alloc, .{
             .method = .GET,
             .uri = req.uri,
+            .timeout_ms = self.cfg.request_timeout_ms,
         });
         errdefer resp.deinit(self.alloc);
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
@@ -308,6 +470,7 @@ pub const HttpSnapshotTransport = struct {
             .method = .GET,
             .uri = capabilities_uri,
             .source_node_id = if (source_node_id == 0) null else source_node_id,
+            .timeout_ms = self.cfg.request_timeout_ms,
         }) catch return null;
         defer resp.deinit(self.alloc);
         if (resp.status < 200 or resp.status >= 300) return null;
@@ -342,6 +505,7 @@ pub const HttpSnapshotTransport = struct {
             .source_node_id = if (req.from == 0) null else req.from,
             .content_type = "application/x-antflydb-raft-snapshot",
             .body = body,
+            .timeout_ms = self.cfg.request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
@@ -361,6 +525,8 @@ pub const HttpSnapshotTransport = struct {
             peer_max_chunk_bytes > snapshot_transfer.max_chunk_bytes)
             return error.InvalidSnapshotChunkSize;
         const transfer_chunk_size = @min(self.cfg.chunk_size, peer_max_chunk_bytes);
+        const deadline_ns = self.transferDeadlineNs();
+        var cancellation: common.RequestCancellation = .{};
         const manifest: snapshot_transfer.Manifest = .{
             .group_id = req.group_id,
             .from = req.from,
@@ -384,6 +550,8 @@ pub const HttpSnapshotTransport = struct {
             .source_node_id = if (req.from == 0) null else req.from,
             .content_type = "application/x-antflydb-raft-snapshot-manifest-v2",
             .body = encoded_manifest,
+            .timeout_ms = try self.requestTimeoutUntil(deadline_ns),
+            .cancellation = &cancellation,
         });
         errdefer {
             var abort_headers: [7]common.RequestHeader = undefined;
@@ -393,6 +561,9 @@ pub const HttpSnapshotTransport = struct {
                 .uri = uri,
                 .headers = abort_headers[0..abort_count],
                 .source_node_id = if (req.from == 0) null else req.from,
+                // Cleanup gets its own bounded attempt even when the transfer
+                // context was canceled by a failed chunk.
+                .timeout_ms = self.cfg.request_timeout_ms,
             }) catch |err| std.log.warn("snapshot upload abort deferred uri={s} err={s}", .{
                 uri,
                 @errorName(err),
@@ -405,6 +576,8 @@ pub const HttpSnapshotTransport = struct {
             identity_headers,
             encoded_generation,
             transfer_chunk_size,
+            deadline_ns,
+            &cancellation,
         );
 
         var commit_headers: [7]common.RequestHeader = undefined;
@@ -414,6 +587,8 @@ pub const HttpSnapshotTransport = struct {
             .uri = uri,
             .headers = commit_headers[0..commit_count],
             .source_node_id = if (req.from == 0) null else req.from,
+            .timeout_ms = try self.requestTimeoutUntil(deadline_ns),
+            .cancellation = &cancellation,
         });
     }
 
@@ -424,6 +599,8 @@ pub const HttpSnapshotTransport = struct {
         identity_headers: []const common.RequestHeader,
         encoded_generation: [snapshot_transfer.generation_hex_len]u8,
         chunk_size: usize,
+        deadline_ns: u64,
+        cancellation: *common.RequestCancellation,
     ) !void {
         if (req.snapshot.data.len == 0) return;
         const chunk_count = std.math.divCeil(usize, req.snapshot.data.len, chunk_size) catch unreachable;
@@ -438,6 +615,8 @@ pub const HttpSnapshotTransport = struct {
             identity_headers: []const common.RequestHeader,
             generation: [snapshot_transfer.generation_hex_len]u8,
             chunk_size: usize,
+            deadline_ns: u64,
+            cancellation: *common.RequestCancellation,
             next_offset: std.atomic.Value(usize) = .init(0),
             failed: std.atomic.Value(bool) = .init(false),
             error_mutex: std.atomic.Mutex = .unlocked,
@@ -446,8 +625,11 @@ pub const HttpSnapshotTransport = struct {
             fn recordFailure(ctx: *@This(), err: anyerror) void {
                 ctx.failed.store(true, .release);
                 platform_sync.lockYielding(&ctx.error_mutex);
-                defer ctx.error_mutex.unlock();
                 if (ctx.first_error == null) ctx.first_error = err;
+                ctx.error_mutex.unlock();
+                // Publish the causal error before waking sibling requests;
+                // otherwise a canceled sibling can obscure it with Cancelled.
+                ctx.cancellation.cancel();
             }
 
             fn run(ctx: *@This()) void {
@@ -476,6 +658,11 @@ pub const HttpSnapshotTransport = struct {
                         .source_node_id = if (ctx.req.from == 0) null else ctx.req.from,
                         .content_type = "application/x-antflydb-raft-snapshot-chunk-v2",
                         .body = ctx.req.snapshot.data[offset..end],
+                        .timeout_ms = ctx.transport.requestTimeoutUntil(ctx.deadline_ns) catch |err| {
+                            ctx.recordFailure(err);
+                            return;
+                        },
+                        .cancellation = ctx.cancellation,
                     }) catch |err| {
                         ctx.recordFailure(err);
                         return;
@@ -490,18 +677,15 @@ pub const HttpSnapshotTransport = struct {
             .identity_headers = identity_headers,
             .generation = encoded_generation,
             .chunk_size = chunk_size,
+            .deadline_ns = deadline_ns,
+            .cancellation = cancellation,
         };
         if (worker_count == 1) {
             Context.run(&ctx);
         } else {
-            const threads = try self.alloc.alloc(std.Thread, worker_count);
-            defer self.alloc.free(threads);
-            var started: usize = 0;
-            errdefer for (threads[0..started]) |thread| thread.join();
-            while (started < threads.len) : (started += 1) {
-                threads[started] = try std.Thread.spawn(.{}, Context.run, .{&ctx});
-            }
-            for (threads) |thread| thread.join();
+            var group: std.Io.Group = .init;
+            for (0..worker_count) |_| group.async(self.artifact_io, Context.run, .{&ctx});
+            group.await(self.artifact_io) catch |err| ctx.recordFailure(err);
         }
         if (ctx.first_error) |err| return err;
     }
@@ -551,6 +735,7 @@ pub const HttpSnapshotTransport = struct {
         var legacy = try self.executor.execute(self.alloc, .{
             .method = .GET,
             .uri = req.locator.uri,
+            .timeout_ms = self.cfg.request_timeout_ms,
         });
         defer legacy.deinit(self.alloc);
         try mapSnapshotFetchStatus(legacy.status);
@@ -573,6 +758,7 @@ pub const HttpSnapshotTransport = struct {
         var release = self.executor.execute(self.alloc, .{
             .method = .DELETE,
             .uri = req.locator.uri,
+            .timeout_ms = self.cfg.request_timeout_ms,
         }) catch |err| {
             // Release was added after the v1 transfer. Consumption succeeded,
             // so an older server must not turn it into a failed restore; its
@@ -688,6 +874,8 @@ pub const HttpSnapshotTransport = struct {
             peer_max_chunk_bytes > snapshot_transfer.max_chunk_bytes)
             return error.InvalidSnapshotChunkSize;
         const transfer_chunk_size = @min(self.cfg.chunk_size, peer_max_chunk_bytes);
+        const deadline_ns = self.transferDeadlineNs();
+        var cancellation: common.RequestCancellation = .{};
         const manifest_headers = [_]common.RequestHeader{
             .{ .name = "x-antfly-raft-snapshot-protocol", .value = "2" },
             .{ .name = "x-antfly-raft-snapshot-operation", .value = "manifest" },
@@ -696,6 +884,8 @@ pub const HttpSnapshotTransport = struct {
             .method = .GET,
             .uri = fetch_uri,
             .headers = &manifest_headers,
+            .timeout_ms = try self.requestTimeoutUntil(deadline_ns),
+            .cancellation = &cancellation,
         });
         defer resp.deinit(self.alloc);
         try mapSnapshotFetchStatus(resp.status);
@@ -725,6 +915,8 @@ pub const HttpSnapshotTransport = struct {
             transfer_chunk_size,
             data_len,
             manifest.digest,
+            deadline_ns,
+            &cancellation,
         );
         var snapshot_owned = true;
         defer if (snapshot_owned) snapshot.deinit(self.alloc);
@@ -750,6 +942,7 @@ pub const HttpSnapshotTransport = struct {
             .method = .DELETE,
             .uri = fetch_uri,
             .headers = &release_headers,
+            .timeout_ms = self.cfg.request_timeout_ms,
         }) catch |err| std.log.warn("snapshot fetch artifact release deferred snapshot_id={s} err={s}", .{
             req.locator.snapshot_id,
             @errorName(err),
@@ -764,6 +957,8 @@ pub const HttpSnapshotTransport = struct {
         chunk_size: usize,
         data_len: usize,
         expected_digest: [snapshot_transfer.digest_len]u8,
+        deadline_ns: u64,
+        cancellation: *common.RequestCancellation,
     ) !raft_engine.core.types.Snapshot {
         if (data_len == 0) {
             const actual = snapshot_transfer.digest("");
@@ -771,15 +966,23 @@ pub const HttpSnapshotTransport = struct {
                 return error.SnapshotChecksumMismatch;
             return .{};
         }
-        var io_impl = std.Io.Threaded.init(self.alloc, .{});
-        defer io_impl.deinit();
-        const file_io = io_impl.io();
+        try self.staging_budget.reserve(data_len);
+        var staging_reservation_owned = true;
+        defer if (staging_reservation_owned) self.staging_budget.release(data_len);
+        const file_io = self.artifact_io;
         try fs_paths.createDirPathPortable(file_io, self.cfg.root_dir);
         const sequence = snapshot_fetch_sequence.fetchAdd(1, .monotonic);
         const staging_path = try std.fmt.allocPrint(
             self.alloc,
-            "{s}/.antfly-snapshot-fetch-{d}-{d}-{d}.part",
-            .{ self.cfg.root_dir, req.group_id, platform_time.monotonicNs(), sequence },
+            "{s}/{s}{d}-{d}-{d}{s}",
+            .{
+                self.cfg.root_dir,
+                snapshot_fetch_staging_prefix,
+                req.group_id,
+                platform_time.monotonicNs(),
+                sequence,
+                snapshot_fetch_staging_suffix,
+            },
         );
         defer self.alloc.free(staging_path);
         var staging_exists = true;
@@ -797,10 +1000,13 @@ pub const HttpSnapshotTransport = struct {
             data_len,
             staging_path,
             file_io,
+            deadline_ns,
+            cancellation,
         );
 
         var staging = try std.Io.Dir.cwd().openFile(file_io, staging_path, .{ .mode = .read_write });
-        defer staging.close(file_io);
+        var staging_open = true;
+        defer if (staging_open) staging.close(file_io);
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         var hash_buffer: [256 * 1024]u8 = undefined;
         var hash_offset: u64 = 0;
@@ -831,14 +1037,33 @@ pub const HttpSnapshotTransport = struct {
             );
             errdefer std.posix.munmap(mapped);
             std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
+            staging.close(file_io);
+            staging_open = false;
+            // POSIX keeps the verified inode alive through the mapping. Finish
+            // every fallible namespace operation before transferring mapping
+            // ownership into Snapshot, leaving no post-transfer error window.
+            try std.Io.Dir.cwd().deleteFile(file_io, staging_path);
+            try fs_paths.syncDirPortable(file_io, self.cfg.root_dir);
+            staging_exists = false;
             const owner = try self.alloc.create(MappedFetchOwner);
             errdefer self.alloc.destroy(owner);
-            owner.* = .{ .alloc = self.alloc, .mapped = mapped };
+            self.staging_budget.retain();
+            var budget_ref_owned = true;
+            errdefer if (budget_ref_owned) self.staging_budget.releaseRef();
+            owner.* = .{
+                .alloc = self.alloc,
+                .mapped = mapped,
+                .staging_budget = self.staging_budget,
+                .reserved_bytes = data_len,
+            };
             snapshot.data = mapped;
             try snapshot.shareExternalData(self.alloc, .{
                 .ptr = owner,
                 .release = MappedFetchOwner.release,
             }, null);
+            budget_ref_owned = false;
+            staging_reservation_owned = false;
+            return snapshot;
         } else {
             // Compatibility targets without a native mapping API retain a
             // finite copy; supported POSIX production targets remain fully
@@ -847,6 +1072,8 @@ pub const HttpSnapshotTransport = struct {
             errdefer self.alloc.free(snapshot.data);
             const read = try staging.readPositionalAll(file_io, snapshot.data, 0);
             if (read != data_len) return error.SnapshotArtifactTruncated;
+            staging.close(file_io);
+            staging_open = false;
         }
         try std.Io.Dir.cwd().deleteFile(file_io, staging_path);
         try fs_paths.syncDirPortable(file_io, self.cfg.root_dir);
@@ -862,6 +1089,8 @@ pub const HttpSnapshotTransport = struct {
         data_len: usize,
         staging_path: []const u8,
         file_io: std.Io,
+        deadline_ns: u64,
+        cancellation: *common.RequestCancellation,
     ) !void {
         const chunk_count = std.math.divCeil(usize, data_len, chunk_size) catch unreachable;
         const worker_count = if (self.executor.supportsConcurrentRequests())
@@ -876,6 +1105,8 @@ pub const HttpSnapshotTransport = struct {
             data_len: usize,
             path: []const u8,
             file_io: std.Io,
+            deadline_ns: u64,
+            cancellation: *common.RequestCancellation,
             next_offset: std.atomic.Value(usize) = .init(0),
             failed: std.atomic.Value(bool) = .init(false),
             error_mutex: std.atomic.Mutex = .unlocked,
@@ -884,8 +1115,11 @@ pub const HttpSnapshotTransport = struct {
             fn recordFailure(ctx: *@This(), err: anyerror) void {
                 ctx.failed.store(true, .release);
                 platform_sync.lockYielding(&ctx.error_mutex);
-                defer ctx.error_mutex.unlock();
                 if (ctx.first_error == null) ctx.first_error = err;
+                ctx.error_mutex.unlock();
+                // Publish the causal error before waking sibling requests;
+                // otherwise a canceled sibling can obscure it with Cancelled.
+                ctx.cancellation.cancel();
             }
 
             fn run(ctx: *@This()) void {
@@ -920,6 +1154,11 @@ pub const HttpSnapshotTransport = struct {
                         .method = .GET,
                         .uri = ctx.fetch_uri,
                         .headers = &headers,
+                        .timeout_ms = ctx.transport.requestTimeoutUntil(ctx.deadline_ns) catch |err| {
+                            ctx.recordFailure(err);
+                            return;
+                        },
+                        .cancellation = ctx.cancellation,
                     }) catch |err| {
                         ctx.recordFailure(err);
                         return;
@@ -951,18 +1190,15 @@ pub const HttpSnapshotTransport = struct {
             .data_len = data_len,
             .path = staging_path,
             .file_io = file_io,
+            .deadline_ns = deadline_ns,
+            .cancellation = cancellation,
         };
         if (worker_count == 1) {
             Context.run(&ctx);
         } else {
-            const threads = try self.alloc.alloc(std.Thread, worker_count);
-            defer self.alloc.free(threads);
-            var started: usize = 0;
-            errdefer for (threads[0..started]) |thread| thread.join();
-            while (started < threads.len) : (started += 1) {
-                threads[started] = try std.Thread.spawn(.{}, Context.run, .{&ctx});
-            }
-            for (threads) |thread| thread.join();
+            var group: std.Io.Group = .init;
+            for (0..worker_count) |_| group.async(self.artifact_io, Context.run, .{&ctx});
+            group.await(self.artifact_io) catch |err| ctx.recordFailure(err);
         }
         if (ctx.first_error) |err| return err;
     }
@@ -1171,6 +1407,79 @@ test "http snapshot transport module compiles" {
     _ = HttpSnapshotTransport;
 }
 
+test "snapshot transport validates direct-construction resource limits" {
+    try std.testing.expectError(
+        error.InvalidSnapshotTransferLimits,
+        HttpSnapshotTransport.validateConfig(.{ .root_dir = "/tmp", .max_parallel_chunks = 0 }),
+    );
+    try std.testing.expectError(
+        error.InvalidSnapshotTransferLimits,
+        HttpSnapshotTransport.validateConfig(.{
+            .root_dir = "/tmp",
+            .max_parallel_chunks = max_parallel_chunk_workers + 1,
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidSnapshotTransferLimits,
+        HttpSnapshotTransport.validateConfig(.{ .root_dir = "/tmp", .request_timeout_ms = 0 }),
+    );
+    try std.testing.expectError(
+        error.InvalidSnapshotTransferLimits,
+        HttpSnapshotTransport.validateConfig(.{
+            .root_dir = "/tmp",
+            .request_timeout_ms = 10,
+            .transfer_timeout_ms = 9,
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidSnapshotTransferLimits,
+        HttpSnapshotTransport.validateConfig(.{
+            .root_dir = "/tmp",
+            .max_snapshot_bytes = 1024,
+            .max_staging_bytes = 1023,
+        }),
+    );
+}
+
+test "snapshot staging budget rejects aggregate overcommit and is reusable" {
+    var budget = SnapshotStagingBudget{ .alloc = std.testing.allocator, .limit = 10 };
+    try budget.reserve(6);
+    try std.testing.expectError(error.SnapshotStagingBackpressure, budget.reserve(5));
+    try std.testing.expectEqual(@as(usize, 6), budget.reserved.load(.acquire));
+    budget.release(6);
+    try budget.reserve(10);
+    budget.release(10);
+    try std.testing.expectEqual(@as(usize, 0), budget.reserved.load(.acquire));
+}
+
+test "snapshot transport scavenges only private crash artifacts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/snapshot-scavenge", .{tmp.sub_path});
+    defer alloc.free(root_dir);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try fs_paths.createDirPathPortable(io, root_dir);
+    const orphan_path = try std.fmt.allocPrint(alloc, "{s}/{s}42{s}", .{
+        root_dir,
+        snapshot_fetch_staging_prefix,
+        snapshot_fetch_staging_suffix,
+    });
+    defer alloc.free(orphan_path);
+    const unrelated_path = try std.fmt.allocPrint(alloc, "{s}/retained.snapshot", .{root_dir});
+    defer alloc.free(unrelated_path);
+    var orphan = try fs_paths.createFilePortable(io, orphan_path, .{});
+    orphan.close(io);
+    var unrelated = try fs_paths.createFilePortable(io, unrelated_path, .{});
+    unrelated.close(io);
+
+    try scavengeFetchArtifacts(io, root_dir);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, orphan_path, .{}));
+    try std.Io.Dir.cwd().access(io, unrelated_path, .{});
+}
+
 test "legacy snapshot envelope rejects unbounded and non-canonical frames" {
     const snapshot: raft_engine.core.types.Snapshot = .{
         .metadata = .{ .index = 7, .term = 3 },
@@ -1271,7 +1580,8 @@ test "unknown locator fetches legacy first while v2 locator is deterministic" {
     };
 
     var executor = Executor{};
-    var transport = HttpSnapshotTransport.init(std.testing.allocator, .{ .root_dir = "/tmp" }, executor.iface(), null);
+    var transport = try HttpSnapshotTransport.init(std.testing.allocator, .{ .root_dir = "/tmp" }, executor.iface(), null);
+    defer transport.deinit();
     const base_req: raft_engine.runtime.snapshot_transport_iface.SnapshotFetchRequest = .{
         .group_id = 7,
         .from = 2,
@@ -1346,7 +1656,8 @@ test "v2 bootstrap artifact validates its owner instead of a Raft sender" {
     const encoded = try snapshot_transfer.encode(std.testing.allocator, manifest);
     defer std.testing.allocator.free(encoded);
     var executor = Executor{ .manifest = encoded };
-    var transport = HttpSnapshotTransport.init(std.testing.allocator, .{ .root_dir = "/tmp" }, executor.iface(), null);
+    var transport = try HttpSnapshotTransport.init(std.testing.allocator, .{ .root_dir = "/tmp" }, executor.iface(), null);
+    defer transport.deinit();
     var receiver = Receiver{};
     try transport.transport().fetchSnapshot(.{
         .group_id = 91,
@@ -1375,6 +1686,10 @@ test "v2 fetch transfers snapshot ownership before receiver errors" {
                 .body = try alloc.dupe(u8, "{\"snapshot_transfer_protocol_version\":2,\"snapshot_transfer_route_version\":2,\"snapshot_max_chunk_bytes\":65536}"),
             };
             const operation = req.header("x-antfly-raft-snapshot-operation") orelse "";
+            if (std.mem.eql(u8, operation, "manifest") or std.mem.eql(u8, operation, "chunk")) {
+                if (req.timeout_ms == null) return error.TestExpectedTimeout;
+                if (req.cancellation == null) return error.TestExpectedCancellation;
+            }
             if (std.mem.eql(u8, operation, "manifest")) return .{
                 .status = 200,
                 .content_type = try alloc.dupe(u8, "application/x-antflydb-raft-snapshot-manifest-v2"),
@@ -1416,7 +1731,8 @@ test "v2 fetch transfers snapshot ownership before receiver errors" {
     const encoded = try snapshot_transfer.encode(std.testing.allocator, manifest);
     defer std.testing.allocator.free(encoded);
     var executor = Executor{ .manifest = encoded };
-    var transport = HttpSnapshotTransport.init(std.testing.allocator, .{ .root_dir = "/tmp" }, executor.iface(), null);
+    var transport = try HttpSnapshotTransport.init(std.testing.allocator, .{ .root_dir = "/tmp" }, executor.iface(), null);
+    defer transport.deinit();
     try std.testing.expectError(
         error.TestReceiverRejected,
         transport.transport().fetchSnapshot(.{
@@ -1447,6 +1763,10 @@ test "v2 fetch applies receiver admission before allocating or requesting chunks
                 .body = try alloc.dupe(u8, "{\"snapshot_transfer_protocol_version\":2,\"snapshot_transfer_route_version\":2,\"snapshot_max_chunk_bytes\":65536}"),
             };
             const operation = req.header("x-antfly-raft-snapshot-operation") orelse "";
+            if (std.mem.eql(u8, operation, "manifest") or std.mem.eql(u8, operation, "chunk")) {
+                if (req.timeout_ms == null) return error.TestExpectedTimeout;
+                if (req.cancellation == null) return error.TestExpectedCancellation;
+            }
             if (std.mem.eql(u8, operation, "manifest")) return .{
                 .status = 200,
                 .content_type = try alloc.dupe(u8, "application/x-antflydb-raft-snapshot-manifest-v2"),
@@ -1499,7 +1819,8 @@ test "v2 fetch applies receiver admission before allocating or requesting chunks
     const encoded = try snapshot_transfer.encode(std.testing.allocator, manifest);
     defer std.testing.allocator.free(encoded);
     var executor = Executor{ .manifest = encoded };
-    var transport = HttpSnapshotTransport.init(std.testing.allocator, .{ .root_dir = "/tmp" }, executor.iface(), null);
+    var transport = try HttpSnapshotTransport.init(std.testing.allocator, .{ .root_dir = "/tmp" }, executor.iface(), null);
+    defer transport.deinit();
     try std.testing.expectError(error.SnapshotAdmissionBackpressure, transport.transport().fetchSnapshot(.{
         .group_id = 93,
         .from = 8,
@@ -1565,6 +1886,10 @@ test "v2 fetch uses bounded parallel artifact-backed transfer" {
                 .body = try alloc.dupe(u8, "{\"snapshot_transfer_protocol_version\":2,\"snapshot_transfer_route_version\":2,\"snapshot_max_chunk_bytes\":65536}"),
             };
             const operation = req.header("x-antfly-raft-snapshot-operation") orelse "";
+            if (std.mem.eql(u8, operation, "manifest") or std.mem.eql(u8, operation, "chunk")) {
+                if (req.timeout_ms == null) return error.TestExpectedTimeout;
+                if (req.cancellation == null) return error.TestExpectedCancellation;
+            }
             if (std.mem.eql(u8, operation, "manifest")) return .{
                 .status = 200,
                 .content_type = try alloc.dupe(u8, "application/x-antflydb-raft-snapshot-manifest-v2"),
@@ -1595,6 +1920,7 @@ test "v2 fetch uses bounded parallel artifact-backed transfer" {
     const Receiver = struct {
         expected: []const u8,
         received: bool = false,
+        owned_snapshot: ?raft_engine.core.types.Snapshot = null,
 
         fn iface(self: *@This()) raft_engine.runtime.snapshot_transport_iface.SnapshotReceiver {
             return .{ .ptr = self, .vtable = &.{ .receive_snapshot = receive } };
@@ -1606,10 +1932,9 @@ test "v2 fetch uses bounded parallel artifact-backed transfer" {
             input_snapshot: raft_engine.core.types.Snapshot,
         ) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            var snapshot = input_snapshot;
-            defer snapshot.deinit(std.testing.allocator);
-            try std.testing.expect(snapshot.shared_data != null);
-            try std.testing.expectEqualSlices(u8, self.expected, snapshot.data);
+            try std.testing.expect(input_snapshot.shared_data != null);
+            try std.testing.expectEqualSlices(u8, self.expected, input_snapshot.data);
+            self.owned_snapshot = input_snapshot;
             self.received = true;
         }
     };
@@ -1620,11 +1945,14 @@ test "v2 fetch uses bounded parallel artifact-backed transfer" {
     defer std.testing.allocator.free(root_dir);
     var executor = Executor{ .manifest = encoded_manifest, .payload = payload };
     var receiver = Receiver{ .expected = payload };
-    var transport = HttpSnapshotTransport.init(std.testing.allocator, .{
+    var transport = try HttpSnapshotTransport.init(std.testing.allocator, .{
         .root_dir = root_dir,
         .chunk_size = chunk_size,
         .max_parallel_chunks = 4,
     }, executor.iface(), null);
+    var transport_live = true;
+    defer if (transport_live) transport.deinit();
+    defer if (receiver.owned_snapshot) |*snapshot| snapshot.deinit(std.testing.allocator);
     try transport.transport().fetchSnapshot(.{
         .group_id = 94,
         .from = 8,
@@ -1637,6 +1965,10 @@ test "v2 fetch uses bounded parallel artifact-backed transfer" {
     try std.testing.expect(receiver.received);
     try std.testing.expect(executor.peak_in_flight.load(.acquire) > 1);
     try std.testing.expect(executor.peak_in_flight.load(.acquire) <= 4);
+    // The mapped snapshot's quota/control lifetime is independent from the
+    // standalone transport and remains valid during orderly host teardown.
+    transport.deinit();
+    transport_live = false;
 }
 
 test "http snapshot transport posts and fetches serialized snapshots" {
@@ -1755,11 +2087,12 @@ test "http snapshot transport posts and fetches serialized snapshots" {
         null,
     );
     var executor = RecordingExecutor{ .server = &server };
-    var transport = HttpSnapshotTransport.init(std.testing.allocator, .{
+    var transport = try HttpSnapshotTransport.init(std.testing.allocator, .{
         .root_dir = "/tmp",
         // Exercise rolling-upgrade fallback through a v1-only store.
         .legacy_max_snapshot_bytes = 1,
     }, executor.iface(), null);
+    defer transport.deinit();
 
     var voters = [_]u64{ 1, 2 };
     const snapshot_bytes = try std.testing.allocator.dupe(u8, "snapshot-bytes");
@@ -1876,9 +2209,10 @@ test "http snapshot transport resolves upload uri when locator is absent" {
     defer resolver.deinit();
     var executor = Executor{};
     defer executor.deinit();
-    var transport = HttpSnapshotTransport.init(std.testing.allocator, .{
+    var transport = try HttpSnapshotTransport.init(std.testing.allocator, .{
         .root_dir = "/tmp",
     }, executor.iface(), resolver.iface());
+    defer transport.deinit();
 
     var voters = [_]u64{ 1, 2, 3 };
     try transport.transport().sendSnapshot(.{
@@ -1937,9 +2271,10 @@ test "http snapshot transport omits live upload headers for store-only locator u
     };
 
     var executor = Executor{};
-    var transport = HttpSnapshotTransport.init(std.testing.allocator, .{
+    var transport = try HttpSnapshotTransport.init(std.testing.allocator, .{
         .root_dir = "/tmp",
     }, executor.iface(), null);
+    defer transport.deinit();
 
     var voters = [_]u64{ 1, 2 };
     try transport.transport().sendSnapshot(.{
@@ -2003,9 +2338,10 @@ test "versioned v2 store-only upload uses its locator and artifact purpose" {
     };
 
     var executor = Executor{};
-    var transport = HttpSnapshotTransport.init(std.testing.allocator, .{
+    var transport = try HttpSnapshotTransport.init(std.testing.allocator, .{
         .root_dir = "/tmp",
     }, executor.iface(), null);
+    defer transport.deinit();
     const body = try std.testing.allocator.alloc(u8, snapshot_transfer.min_chunk_bytes + 1);
     defer std.testing.allocator.free(body);
     @memset(body, 's');

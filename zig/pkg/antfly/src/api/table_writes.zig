@@ -949,6 +949,24 @@ const max_replica_retirement_batch_bytes: usize = 16 * 1024 * 1024;
 const max_dropped_table_repair_bytes: usize = 256 * 1024 * 1024;
 const max_dropped_table_repair_name_bytes: usize = 16 * 1024;
 
+const replica_retirement_batch_base_encoded_len: usize =
+    replica_retirement_batch_magic.len + 1 + 4 + std.crypto.hash.sha2.Sha256.digest_length;
+
+fn addReplicaRetirementBatchEncodedEntry(current: usize, table_name: ?[]const u8) !usize {
+    const name_len = if (table_name) |name| blk: {
+        if (name.len == 0 or name.len > max_replica_retirement_table_name_bytes)
+            return error.InvalidReplicaRetirementTableName;
+        break :blk name.len;
+    } else 0;
+    var encoded_len = std.math.add(usize, current, 8 + 4) catch
+        return error.ReplicaRetirementBatchTooLarge;
+    encoded_len = std.math.add(usize, encoded_len, name_len) catch
+        return error.ReplicaRetirementBatchTooLarge;
+    if (encoded_len > max_replica_retirement_batch_bytes)
+        return error.ReplicaRetirementBatchTooLarge;
+    return encoded_len;
+}
+
 fn accumulateTextMemoryAttributionStats(dst: *db_mod.TextMemoryAttributionStats, src: db_mod.TextMemoryAttributionStats) void {
     dst.text_indexes +|= src.text_indexes;
     dst.text_segments +|= src.text_segments;
@@ -1615,22 +1633,13 @@ fn writeReplicaRetirementBatch(
 ) !void {
     if (intents.len == 0 or intents.len > max_replica_retirement_batch_entries)
         return error.ReplicaRetirementBatchTooLarge;
-    var encoded_len: usize = replica_retirement_batch_magic.len + 1 + 4 + std.crypto.hash.sha2.Sha256.digest_length;
+    var encoded_len: usize = replica_retirement_batch_base_encoded_len;
     var previous_group_id: ?u64 = null;
     for (intents) |intent| {
         if (previous_group_id != null and previous_group_id.? >= intent.group_id)
             return error.InvalidReplicaRetirementIntent;
         previous_group_id = intent.group_id;
-        if (intent.table_name) |name| {
-            if (name.len == 0 or name.len > max_replica_retirement_table_name_bytes)
-                return error.InvalidReplicaRetirementTableName;
-            encoded_len = std.math.add(usize, encoded_len, name.len) catch
-                return error.ReplicaRetirementBatchTooLarge;
-        }
-        encoded_len = std.math.add(usize, encoded_len, 8 + 4) catch
-            return error.ReplicaRetirementBatchTooLarge;
-        if (encoded_len > max_replica_retirement_batch_bytes)
-            return error.ReplicaRetirementBatchTooLarge;
+        encoded_len = try addReplicaRetirementBatchEncodedEntry(encoded_len, intent.table_name);
     }
 
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
@@ -7128,6 +7137,17 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: ?[]const u8 = null,
     };
 
+    fn preflightReplicaRetirementBatch(targets: []const ReplicaRetirementTarget) !void {
+        if (targets.len == 0) return;
+        if (targets.len > max_replica_retirement_batch_entries)
+            return error.ReplicaRetirementBatchTooLarge;
+
+        var encoded_len: usize = replica_retirement_batch_base_encoded_len;
+        for (targets) |target| {
+            encoded_len = try addReplicaRetirementBatchEncodedEntry(encoded_len, target.table_name);
+        }
+    }
+
     const StructuralReconcileRequest = struct {
         table_name: []u8,
         index_name: ?[]u8 = null,
@@ -8664,14 +8684,15 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         targets: []const ReplicaRetirementTarget,
     ) !PreparedReplicaRetirements {
+        // Reject malformed or unpersistable batches before taking the global
+        // retirement lock, growing registries, or cloning caller-owned names.
+        try preflightReplicaRetirementBatch(targets);
         lockAtomic(&self.replica_retirement_intent_mutex);
         defer self.replica_retirement_intent_mutex.unlock();
         if (targets.len == 0) return .{
             .alloc = alloc,
             .intents = try alloc.alloc(PersistedReplicaRetirementIntent, 0),
         };
-        if (targets.len > max_replica_retirement_batch_entries)
-            return error.ReplicaRetirementBatchTooLarge;
         for (targets) |target| {
             if (self.recovering_replica_retirement_intents.contains(target.group_id))
                 return error.ReplicaRetirementRecoveryInProgress;
@@ -8699,10 +8720,6 @@ pub const ProvisionedTableWriteSource = struct {
             if (batch_path) |path| alloc.free(path);
         }
         for (targets, intents) |target, *intent| {
-            if (target.table_name) |name| {
-                if (name.len == 0 or name.len > max_replica_retirement_table_name_bytes)
-                    return error.InvalidReplicaRetirementTableName;
-            }
             const name = if (target.table_name) |value| try alloc.dupe(u8, value) else null;
             errdefer if (name) |value| alloc.free(value);
             intent.* = .{
@@ -47148,6 +47165,28 @@ test "replica retirement journal batches preserve every group phase" {
     ownership.state = .retired;
     try std.testing.expect(!try source.recoverReplicaRetirementIntents(alloc));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), prepared.batch_path.?, .{}));
+}
+
+test "replica retirement batch size is rejected before target cloning" {
+    const alloc = std.testing.allocator;
+    const table_name = try alloc.alloc(u8, max_replica_retirement_table_name_bytes);
+    defer alloc.free(table_name);
+    @memset(table_name, 'x');
+    const target_count = max_replica_retirement_batch_bytes /
+        (max_replica_retirement_table_name_bytes + 8 + 4) + 1;
+    const targets = try alloc.alloc(ProvisionedTableWriteSource.ReplicaRetirementTarget, target_count);
+    defer alloc.free(targets);
+    for (targets, 0..) |*target, index| target.* = .{
+        .group_id = index + 1,
+        // Every target aliases one caller-owned buffer. The preflight must
+        // reject this without cloning roughly 16 MiB under the journal lock.
+        .table_name = table_name,
+    };
+
+    try std.testing.expectError(
+        error.ReplicaRetirementBatchTooLarge,
+        ProvisionedTableWriteSource.preflightReplicaRetirementBatch(targets),
+    );
 }
 
 test "replica retirement batch identity is canonical and rejects duplicate groups" {

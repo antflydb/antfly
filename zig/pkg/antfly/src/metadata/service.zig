@@ -722,20 +722,40 @@ const MetadataProposalProgressDriver = struct {
 const TableTopologyProtocolProbeCoordinator = struct {
     lane: std.atomic.Mutex = .unlocked,
     wake_epoch: std.atomic.Value(u32) = .init(0),
-    cached: ?TableTopologyProtocolReadiness = null,
+    cached: ?CompletedProbe = null,
+
+    const CompletedProbe = struct {
+        completion_epoch: u32,
+        readiness: TableTopologyProtocolReadiness,
+    };
 
     const Lease = struct {
         coordinator: *TableTopologyProtocolProbeCoordinator,
+        /// Only the caller that actually performed a probe publishes a
+        /// completion epoch. Cohort members that merely consume its result
+        /// unlock silently, so a caller arriving behind a consumer cannot
+        /// mistake that handoff for a new network observation.
+        publishes_completion: bool = false,
+
+        fn completionEpoch(self: *const Lease) u32 {
+            return self.coordinator.wake_epoch.load(.acquire) +% 1;
+        }
+
+        fn publishCompletion(self: *Lease) void {
+            self.publishes_completion = true;
+        }
 
         fn deinit(self: *Lease) void {
             self.coordinator.lane.unlock();
-            _ = self.coordinator.wake_epoch.fetchAdd(1, .release);
-            std.Io.futexWake(
-                std.Options.debug_io,
-                u32,
-                &self.coordinator.wake_epoch.raw,
-                std.math.maxInt(u32),
-            );
+            if (self.publishes_completion) {
+                _ = self.coordinator.wake_epoch.fetchAdd(1, .release);
+                std.Io.futexWake(
+                    std.Options.debug_io,
+                    u32,
+                    &self.coordinator.wake_epoch.raw,
+                    std.math.maxInt(u32),
+                );
+            }
             self.* = undefined;
         }
     };
@@ -787,17 +807,25 @@ test "table topology protocol probes share only matching in-flight readiness" {
         .protected_member_count = 2,
         .protected_membership_fingerprint = [_]u8{7} ** std.crypto.hash.sha2.Sha256.digest_length,
     };
-    coordinator.cached = readiness;
+    coordinator.cached = .{
+        .completion_epoch = first.completionEpoch(),
+        .readiness = readiness,
+    };
+    first.publishCompletion();
     const observed = coordinator.currentEpoch();
     first.deinit();
     try std.testing.expect(coordinator.currentEpoch() != observed);
 
     var second = coordinator.tryAcquire() orelse return error.TestExpectedEqual;
-    defer second.deinit();
-    try std.testing.expect(tableTopologyReadinessEqual(coordinator.cached.?, readiness));
+    try std.testing.expect(tableTopologyReadinessEqual(coordinator.cached.?.readiness, readiness));
+    // Consuming a completed probe is not itself a probe completion. A new
+    // caller blocked behind this consumer must not join the older cohort.
+    const after_probe = coordinator.currentEpoch();
+    second.deinit();
+    try std.testing.expectEqual(after_probe, coordinator.currentEpoch());
     var changed = readiness;
     changed.term += 1;
-    try std.testing.expect(!tableTopologyReadinessEqual(coordinator.cached.?, changed));
+    try std.testing.expect(!tableTopologyReadinessEqual(coordinator.cached.?.readiness, changed));
 }
 
 const LifecycleSignal = struct {
@@ -6283,23 +6311,34 @@ pub const MetadataHttpService = struct {
             required_node_ids,
         );
 
-        var joined_in_flight_probe = false;
+        var joined_completion_epoch: ?u32 = null;
         var probe_lease = while (true) {
             try request.ensureActive();
             const observed_epoch = self.table_topology_protocol_probe.currentEpoch();
             if (self.table_topology_protocol_probe.tryAcquire()) |lease| break lease;
-            joined_in_flight_probe = true;
             self.table_topology_protocol_probe.waitForHandoff(
                 observed_epoch,
                 table_topology_protocol_probe_wait_ns,
             );
+            const completed_epoch = self.table_topology_protocol_probe.currentEpoch();
+            if (completed_epoch != observed_epoch) {
+                // This caller is a member of the exact probe cohort that
+                // published completed_epoch. Preserve that identity even if
+                // another cohort member briefly owns the lane before us.
+                joined_completion_epoch = completed_epoch;
+            }
         };
         defer probe_lease.deinit();
-        if (joined_in_flight_probe) {
+        if (joined_completion_epoch) |joined_epoch| {
             if (self.table_topology_protocol_probe.cached) |cached| {
-                if (tableTopologyReadinessEqual(cached, expected_readiness)) return expected_readiness;
+                if (cached.completion_epoch == joined_epoch and
+                    tableTopologyReadinessEqual(cached.readiness, expected_readiness))
+                    return expected_readiness;
             }
         }
+        // Every path below performs a real network observation (including a
+        // failed one), so its lease publishes exactly one new cohort epoch.
+        probe_lease.publishCompletion();
         // A caller that acquired the lane without waiting must never reuse an
         // older peer-process observation. Clear it before the fresh fanout so
         // failures cannot be consumed by concurrent waiters as success.
@@ -6403,7 +6442,10 @@ pub const MetadataHttpService = struct {
                 return error.TableTopologyProtocolUpgradeRequired;
             }
         }
-        self.table_topology_protocol_probe.cached = expected_readiness;
+        self.table_topology_protocol_probe.cached = .{
+            .completion_epoch = probe_lease.completionEpoch(),
+            .readiness = expected_readiness,
+        };
         return expected_readiness;
     }
 
