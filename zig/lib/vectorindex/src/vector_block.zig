@@ -6,7 +6,7 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-//! Immutable, mmap-friendly exact-vector blocks.
+//! Immutable, mmap-friendly vector projection blocks.
 //!
 //! Blocks are table-level projections keyed by the authoritative embedding
 //! artifact key, rather than by an index-local vector id. A block may retain
@@ -23,10 +23,12 @@ const checked_region = @import("checked_region.zig");
 const magic: [8]u8 = .{ 'A', 'F', 'V', 'B', 'L', 'K', 0, 0 };
 const legacy_version: u16 = 1;
 const unscaled_encoding_version: u16 = 2;
-const version: u16 = 3;
+const scaled_encoding_version: u16 = 3;
+const version: u16 = 4;
 const header_size: usize = 40;
 const legacy_index_entry_size: usize = 60;
-const index_entry_size: usize = 64;
+const scaled_index_entry_size: usize = 64;
+const index_entry_size: usize = 88;
 const footer_size: usize = 60;
 const tombstone_flag: u32 = 1;
 
@@ -54,10 +56,268 @@ pub fn encodedVectorBytesLen(encoding: Encoding, dims: usize) !usize {
     return std.math.mul(usize, dims, encoding.componentBytes()) catch error.VectorBlockTooLarge;
 }
 
+const residual_code_bits: usize = 13;
+const residual_escape_code: u16 = (1 << residual_code_bits) - 1;
+const residual_inline_max: u16 = residual_escape_code - 1;
+
+fn residualPackedBytesLen(dims: usize) !usize {
+    const bits = std.math.mul(usize, dims, residual_code_bits) catch return error.VectorBlockTooLarge;
+    const rounded = std.math.add(usize, bits, 7) catch return error.VectorBlockTooLarge;
+    return rounded / 8;
+}
+
+/// Maximum scratch space required by `encodeExactResidualInto`. Ordinary
+/// normalized embeddings use only 13 bits/component plus the count word; the
+/// remaining space is reserved for uncommon values whose IEEE-754 bit delta
+/// cannot be represented inline.
+pub fn exactResidualMaxBytes(dims: usize) !usize {
+    const packed_bytes = try residualPackedBytesLen(dims);
+    const exceptions = std.math.mul(usize, dims, 8) catch return error.VectorBlockTooLarge;
+    return std.math.add(usize, std.math.add(usize, packed_bytes, 4) catch return error.VectorBlockTooLarge, exceptions) catch
+        return error.VectorBlockTooLarge;
+}
+
+fn writeResidualCode(packed_bytes: []u8, index: usize, code: u16) void {
+    const bit_offset = index * residual_code_bits;
+    const byte_offset = bit_offset / 8;
+    const shift: u5 = @intCast(bit_offset & 7);
+    const wide: u32 = @as(u32, code) << shift;
+    packed_bytes[byte_offset] |= @truncate(wide);
+    if (byte_offset + 1 < packed_bytes.len) packed_bytes[byte_offset + 1] |= @truncate(wide >> 8);
+    if (byte_offset + 2 < packed_bytes.len) packed_bytes[byte_offset + 2] |= @truncate(wide >> 16);
+}
+
+fn readResidualCode(packed_bytes: []const u8, index: usize) u16 {
+    const bit_offset = index * residual_code_bits;
+    const byte_offset = bit_offset / 8;
+    const shift: u5 = @intCast(bit_offset & 7);
+    var wide: u32 = packed_bytes[byte_offset];
+    if (byte_offset + 1 < packed_bytes.len) wide |= @as(u32, packed_bytes[byte_offset + 1]) << 8;
+    if (byte_offset + 2 < packed_bytes.len) wide |= @as(u32, packed_bytes[byte_offset + 2]) << 16;
+    return @truncate((wide >> shift) & residual_escape_code);
+}
+
+fn zigZagEncode(value: i64) u64 {
+    return if (value >= 0)
+        @as(u64, @intCast(value)) * 2
+    else
+        @as(u64, @intCast(-value)) * 2 - 1;
+}
+
+fn zigZagDecode(value: u16) i64 {
+    return if ((value & 1) == 0)
+        @intCast(value / 2)
+    else
+        -@as(i64, @intCast(value / 2)) - 1;
+}
+
+fn decodedComponentBits(encoded: []const u8, index: usize, scale: f32) u32 {
+    const offset = index * @sizeOf(f16);
+    const component: f16 = @bitCast(std.mem.readInt(u16, encoded[offset..][0..2], .little));
+    const decoded: f32 = @as(f32, @floatCast(component)) * scale;
+    return @bitCast(decoded);
+}
+
+/// Encodes the exact difference between a float16 projection and its original
+/// float32 vector. Decoding reconstructs every source IEEE-754 bit exactly.
+pub fn encodeExactResidualInto(
+    source: []const f32,
+    encoded: []const u8,
+    scale: f32,
+    out: []u8,
+) !usize {
+    try validateEncodedVector(.float16, source.len, encoded, scale);
+    const packed_len = try residualPackedBytesLen(source.len);
+    const minimum = std.math.add(usize, packed_len, 4) catch return error.VectorBlockTooLarge;
+    if (out.len < minimum) return error.BufferTooSmall;
+    @memset(out[0..packed_len], 0);
+    var exception_count: usize = 0;
+    var exception_offset = minimum;
+    for (source, 0..) |value, i| {
+        if (!std.math.isFinite(value)) return error.InvalidVectorComponent;
+        const source_bits: u32 = @bitCast(value);
+        const decoded_bits = decodedComponentBits(encoded, i, scale);
+        const delta = @as(i64, source_bits) - @as(i64, decoded_bits);
+        const code = zigZagEncode(delta);
+        if (code <= residual_inline_max) {
+            writeResidualCode(out[0..packed_len], i, @intCast(code));
+        } else {
+            writeResidualCode(out[0..packed_len], i, residual_escape_code);
+            if (out.len - exception_offset < 8) return error.BufferTooSmall;
+            writeU32(out[exception_offset..][0..4], @intCast(i));
+            writeU32(out[exception_offset + 4 ..][0..4], source_bits);
+            exception_offset += 8;
+            exception_count += 1;
+        }
+    }
+    writeU32(out[packed_len..][0..4], std.math.cast(u32, exception_count) orelse return error.VectorBlockTooLarge);
+    return exception_offset;
+}
+
+fn validateExactResidual(encoded: []const u8, dims: usize, scale: f32, residual: []const u8) !void {
+    const packed_len = try residualPackedBytesLen(dims);
+    if (residual.len < packed_len + 4) return error.InvalidExactVectorResidual;
+    const exception_count = readU32(residual[packed_len..][0..4]);
+    const expected = std.math.add(usize, packed_len + 4, std.math.mul(usize, exception_count, 8) catch
+        return error.InvalidExactVectorResidual) catch return error.InvalidExactVectorResidual;
+    if (residual.len != expected) return error.InvalidExactVectorResidual;
+    var exception_index: usize = 0;
+    for (0..dims) |i| {
+        const code = readResidualCode(residual[0..packed_len], i);
+        var source_bits: u32 = undefined;
+        if (code == residual_escape_code) {
+            if (exception_index >= exception_count) return error.InvalidExactVectorResidual;
+            const offset = packed_len + 4 + exception_index * 8;
+            if (readU32(residual[offset..][0..4]) != i) return error.InvalidExactVectorResidual;
+            source_bits = readU32(residual[offset + 4 ..][0..4]);
+            exception_index += 1;
+        } else {
+            const source_bits_signed = @as(i64, decodedComponentBits(encoded, i, scale)) + zigZagDecode(code);
+            if (source_bits_signed < 0 or source_bits_signed > std.math.maxInt(u32)) return error.InvalidExactVectorResidual;
+            source_bits = @intCast(source_bits_signed);
+        }
+        const value: f32 = @bitCast(source_bits);
+        if (!std.math.isFinite(value)) return error.InvalidExactVectorResidual;
+    }
+    if (exception_index != exception_count) return error.InvalidExactVectorResidual;
+}
+
+pub fn decodeExactResidualInto(
+    encoded: []const u8,
+    dims: usize,
+    scale: f32,
+    residual: []const u8,
+    out: []f32,
+) ![]const f32 {
+    if (out.len < dims) return error.BufferTooSmall;
+    if (encoded.len != try encodedVectorBytesLen(.float16, dims)) return error.InvalidEncodedVectorLength;
+    if (!std.math.isFinite(scale) or scale <= 0) return error.InvalidVectorScale;
+    const packed_len = try residualPackedBytesLen(dims);
+    if (residual.len < packed_len + 4) return error.InvalidExactVectorResidual;
+    const exception_count = readU32(residual[packed_len..][0..4]);
+    const expected = std.math.add(usize, packed_len + 4, std.math.mul(usize, exception_count, 8) catch
+        return error.InvalidExactVectorResidual) catch return error.InvalidExactVectorResidual;
+    if (residual.len != expected) return error.InvalidExactVectorResidual;
+    var exception_index: usize = 0;
+    for (out[0..dims], 0..) |*value, i| {
+        const code = readResidualCode(residual[0..packed_len], i);
+        const source_bits: u32 = if (code == residual_escape_code) blk: {
+            if (exception_index >= exception_count) return error.InvalidExactVectorResidual;
+            const offset = packed_len + 4 + exception_index * 8;
+            if (readU32(residual[offset..][0..4]) != i) return error.InvalidExactVectorResidual;
+            exception_index += 1;
+            break :blk readU32(residual[offset + 4 ..][0..4]);
+        } else blk: {
+            const source_bits_signed = @as(i64, decodedComponentBits(encoded, i, scale)) + zigZagDecode(code);
+            if (source_bits_signed < 0 or source_bits_signed > std.math.maxInt(u32)) return error.InvalidExactVectorResidual;
+            break :blk @intCast(source_bits_signed);
+        };
+        value.* = @bitCast(source_bits);
+        if (!std.math.isFinite(value.*)) return error.InvalidExactVectorResidual;
+    }
+    if (exception_index != exception_count) return error.InvalidExactVectorResidual;
+    return out[0..dims];
+}
+
 /// Encodes one exact-vector payload in the same representation stored by a
 /// block. The returned scale must be persisted beside `out`; float16 blocks
 /// use it to retain vectors whose components exceed the native f16 range.
-pub fn encodeVectorInto(encoding: Encoding, vector: []const f32, out: []u8) !f32 {
+pub const QuantizationStats = struct {
+    /// Conservative upper bound on ||source_f32 - decoded_projection||₂.
+    error_norm: f32,
+    /// Conservative lower bound on ||decoded_projection||₂.
+    decoded_norm_lower_bound: f32,
+};
+
+pub const EncodedVectorStats = struct {
+    scale: f32,
+    quantization: QuantizationStats,
+};
+
+fn upperRoundedNorm(sum_squared: f64) f32 {
+    const value: f32 = @floatCast(@sqrt(sum_squared));
+    return value + 8.0 * std.math.floatEps(f32) * (value + 1.0);
+}
+
+fn lowerRoundedNorm(sum_squared: f64) f32 {
+    const value: f32 = @floatCast(@sqrt(sum_squared));
+    return @max(0, value - 8.0 * std.math.floatEps(f32) * (value + 1.0));
+}
+
+fn upperRoundedNormF32(sum_squared: f32, dims: usize) f32 {
+    const value = @sqrt(sum_squared);
+    // Each component contributes one rounded multiply and one rounded add.
+    // Inflate beyond the standard positive-sum gamma bound, then take the
+    // square root. Supported vector dimensions keep this well below 1.
+    const relative_slop = @min(0.25, 16.0 * std.math.floatEps(f32) * @as(f32, @floatFromInt(dims)));
+    return value * (1.0 + relative_slop);
+}
+
+fn lowerRoundedNormF32(sum_squared: f32, dims: usize) f32 {
+    const value = @sqrt(sum_squared);
+    const relative_slop = @min(0.25, 16.0 * std.math.floatEps(f32) * @as(f32, @floatFromInt(dims)));
+    return value * (1.0 - relative_slop);
+}
+
+fn sourceNormSquaredF32(values: []const f32) f32 {
+    const Simd = @Vector(8, f32);
+    var sum0: Simd = @splat(0);
+    var sum1: Simd = @splat(0);
+    var sum2: Simd = @splat(0);
+    var sum3: Simd = @splat(0);
+    var i: usize = 0;
+    while (i + 32 <= values.len) : (i += 32) {
+        const v0: Simd = values[i..][0..8].*;
+        const v1: Simd = values[i + 8 ..][0..8].*;
+        const v2: Simd = values[i + 16 ..][0..8].*;
+        const v3: Simd = values[i + 24 ..][0..8].*;
+        sum0 += v0 * v0;
+        sum1 += v1 * v1;
+        sum2 += v2 * v2;
+        sum3 += v3 * v3;
+    }
+    var sum = @reduce(.Add, sum0 + sum1 + sum2 + sum3);
+    while (i < values.len) : (i += 1) sum += values[i] * values[i];
+    return sum;
+}
+
+pub fn encodedQuantizationStats(
+    encoding: Encoding,
+    bytes: []const u8,
+    dims: usize,
+    scale: f32,
+) !QuantizationStats {
+    try validateEncodedVector(encoding, dims, bytes, scale);
+    var error_norm_squared: f64 = 0;
+    var decoded_norm_squared: f64 = 0;
+    var pos: usize = 0;
+    for (0..dims) |_| switch (encoding) {
+        .float32 => {
+            const decoded: f32 = @bitCast(std.mem.readInt(u32, bytes[pos..][0..4], .little));
+            decoded_norm_squared += @as(f64, decoded) * decoded;
+            pos += 4;
+        },
+        .float16 => {
+            const component_f16: f16 = @bitCast(std.mem.readInt(u16, bytes[pos..][0..2], .little));
+            const component: f32 = @floatCast(component_f16);
+            const decoded = component * scale;
+            // A full f16 ULP also covers the f32 divide/multiply round trips
+            // used by the encoder. This path is used for legacy/compacted
+            // encoded input whose original f32 values are unavailable.
+            const component_error = scale *
+                (@abs(component) * (1.0 / 1024.0) + 1.0 / 8_388_608.0);
+            error_norm_squared += @as(f64, component_error) * component_error;
+            decoded_norm_squared += @as(f64, decoded) * decoded;
+            pos += 2;
+        },
+    };
+    return .{
+        .error_norm = upperRoundedNorm(error_norm_squared),
+        .decoded_norm_lower_bound = lowerRoundedNorm(decoded_norm_squared),
+    };
+}
+
+pub fn encodeVectorIntoWithStats(encoding: Encoding, vector: []const f32, out: []u8) !EncodedVectorStats {
     const expected = try encodedVectorBytesLen(encoding, vector.len);
     if (out.len != expected) return error.InvalidEncodedVectorLength;
 
@@ -88,7 +348,41 @@ pub fn encodeVectorInto(encoding: Encoding, vector: []const f32, out: []u8) !f32
             pos += 2;
         },
     };
-    return scale;
+    const source_norm_squared = sourceNormSquaredF32(vector);
+    const quantization: QuantizationStats = switch (encoding) {
+        .float32 => QuantizationStats{
+            .error_norm = 0,
+            .decoded_norm_lower_bound = if (std.math.isFinite(source_norm_squared))
+                lowerRoundedNormF32(source_norm_squared, vector.len)
+            else
+                std.math.floatMax(f32),
+        },
+        .float16 => blk: {
+            // Round-to-nearest f16 error is bounded from the source norm
+            // without revisiting the encoded payload. The 1/1023 factor is
+            // the conservative solution of e <= decoded/1024 + subnormal
+            // allowance with decoded <= source + e.
+            if (!std.math.isFinite(source_norm_squared))
+                break :blk try encodedQuantizationStats(encoding, out, vector.len, scale);
+            const source_norm_upper = upperRoundedNormF32(source_norm_squared, vector.len);
+            const source_norm_lower = lowerRoundedNormF32(source_norm_squared, vector.len);
+            const subnormal_error = @sqrt(@as(f32, @floatFromInt(vector.len))) * scale *
+                (1024.0 / 1023.0) * (1.0 / 8_388_608.0);
+            const error_norm = source_norm_upper / 1023.0 + subnormal_error;
+            break :blk .{
+                .error_norm = error_norm,
+                .decoded_norm_lower_bound = @max(0, source_norm_lower - error_norm),
+            };
+        },
+    };
+    return .{
+        .scale = scale,
+        .quantization = quantization,
+    };
+}
+
+pub fn encodeVectorInto(encoding: Encoding, vector: []const f32, out: []u8) !f32 {
+    return (try encodeVectorIntoWithStats(encoding, vector, out)).scale;
 }
 
 fn validateEncodedVector(encoding: Encoding, dims: usize, bytes: []const u8, scale: f32) !void {
@@ -107,6 +401,14 @@ fn validateEncodedVector(encoding: Encoding, dims: usize, bytes: []const u8, sca
             pos += 2;
         },
     };
+}
+
+fn validateQuantizationStats(encoding: Encoding, stats: QuantizationStats) !void {
+    if (!std.math.isFinite(stats.error_norm) or stats.error_norm < 0 or
+        !std.math.isFinite(stats.decoded_norm_lower_bound) or stats.decoded_norm_lower_bound < 0)
+        return error.InvalidVectorQuantizationStats;
+    if (encoding == .float32 and stats.error_norm != 0)
+        return error.InvalidVectorQuantizationStats;
 }
 
 pub fn keyHash(key: []const u8) u64 {
@@ -128,6 +430,7 @@ pub const Writer = struct {
     // build() fixes their relative offsets after publishing the aligned vector
     // arena. The on-disk reader contract remains compatible with older blocks.
     vector_data: std.ArrayListUnmanaged(u8) = .empty,
+    residual_data: std.ArrayListUnmanaged(u8) = .empty,
     data: std.ArrayListUnmanaged(u8) = .empty,
     index: std.ArrayListUnmanaged(u8) = .empty,
     generation: u64,
@@ -151,6 +454,8 @@ pub const Writer = struct {
         encoded: struct {
             bytes: []const u8,
             scale: f32,
+            quantization: ?QuantizationStats = null,
+            exact_residual: ?[]const u8 = null,
         },
     };
 
@@ -197,6 +502,7 @@ pub const Writer = struct {
 
     pub fn deinit(self: *Writer) void {
         self.vector_data.deinit(self.alloc);
+        self.residual_data.deinit(self.alloc);
         self.data.deinit(self.alloc);
         self.index.deinit(self.alloc);
         self.* = undefined;
@@ -231,6 +537,51 @@ pub const Writer = struct {
         try self.append(key, source_sequence, revision, dims, .{ .encoded = .{
             .bytes = bytes,
             .scale = scale,
+            .quantization = null,
+            .exact_residual = null,
+        } }, false);
+    }
+
+    pub fn appendEncodedVectorWithStats(
+        self: *Writer,
+        key: []const u8,
+        source_sequence: u64,
+        revision: u64,
+        dims: u32,
+        bytes: []const u8,
+        scale: f32,
+        quantization: QuantizationStats,
+    ) !void {
+        try validateEncodedVector(self.encoding, dims, bytes, scale);
+        try validateQuantizationStats(self.encoding, quantization);
+        try self.append(key, source_sequence, revision, dims, .{ .encoded = .{
+            .bytes = bytes,
+            .scale = scale,
+            .quantization = quantization,
+            .exact_residual = null,
+        } }, false);
+    }
+
+    pub fn appendEncodedVectorWithStatsAndResidual(
+        self: *Writer,
+        key: []const u8,
+        source_sequence: u64,
+        revision: u64,
+        dims: u32,
+        bytes: []const u8,
+        scale: f32,
+        quantization: QuantizationStats,
+        exact_residual: []const u8,
+    ) !void {
+        try validateEncodedVector(self.encoding, dims, bytes, scale);
+        try validateQuantizationStats(self.encoding, quantization);
+        if (self.encoding != .float16) return error.UnexpectedExactVectorResidual;
+        try validateExactResidual(bytes, dims, scale, exact_residual);
+        try self.append(key, source_sequence, revision, dims, .{ .encoded = .{
+            .bytes = bytes,
+            .scale = scale,
+            .quantization = quantization,
+            .exact_residual = exact_residual,
         } }, false);
     }
 
@@ -238,6 +589,8 @@ pub const Writer = struct {
         try self.append(key, source_sequence, revision, 0, .{ .encoded = .{
             .bytes = &.{},
             .scale = 0,
+            .quantization = null,
+            .exact_residual = null,
         } }, true);
     }
 
@@ -271,6 +624,13 @@ pub const Writer = struct {
         var vector_offset: usize = 0;
         var vector_checksum: u32 = 0;
         var vector_scale: f32 = 1;
+        var residual_offset: usize = 0;
+        var residual_len: usize = 0;
+        var residual_checksum: u32 = 0;
+        var quantization: QuantizationStats = .{
+            .error_norm = 0,
+            .decoded_norm_lower_bound = 0,
+        };
         if (!tombstone) {
             const padding = std.mem.alignForward(usize, self.vector_data.items.len, self.encoding.alignment()) - self.vector_data.items.len;
             try self.vector_data.appendNTimes(self.alloc, 0, padding);
@@ -282,11 +642,42 @@ pub const Writer = struct {
             try self.vector_data.resize(self.alloc, std.math.add(usize, old_len, vector_bytes) catch return error.VectorBlockTooLarge);
             const destination = self.vector_data.items[old_len..][0..vector_bytes];
             switch (payload) {
-                .decoded => |vector| vector_scale = try encodeVectorInto(self.encoding, vector, destination),
+                .decoded => |vector| {
+                    const encoded = try encodeVectorIntoWithStats(self.encoding, vector, destination);
+                    vector_scale = encoded.scale;
+                    quantization = encoded.quantization;
+                    if (self.encoding == .float16) {
+                        residual_offset = self.residual_data.items.len;
+                        const max_len = try exactResidualMaxBytes(dims);
+                        try self.residual_data.resize(self.alloc, std.math.add(usize, residual_offset, max_len) catch return error.VectorBlockTooLarge);
+                        residual_len = try encodeExactResidualInto(
+                            vector,
+                            destination,
+                            vector_scale,
+                            self.residual_data.items[residual_offset..][0..max_len],
+                        );
+                        self.residual_data.shrinkRetainingCapacity(residual_offset + residual_len);
+                        residual_checksum = std.hash.Crc32.hash(self.residual_data.items[residual_offset..][0..residual_len]);
+                    }
+                },
                 .encoded => |encoded| {
                     try validateEncodedVector(self.encoding, dims, encoded.bytes, encoded.scale);
                     @memcpy(destination, encoded.bytes);
                     vector_scale = encoded.scale;
+                    quantization = encoded.quantization orelse try encodedQuantizationStats(
+                        self.encoding,
+                        encoded.bytes,
+                        dims,
+                        encoded.scale,
+                    );
+                    if (encoded.exact_residual) |residual| {
+                        if (self.encoding != .float16) return error.UnexpectedExactVectorResidual;
+                        try validateExactResidual(destination, dims, vector_scale, residual);
+                        residual_offset = self.residual_data.items.len;
+                        try self.residual_data.appendSlice(self.alloc, residual);
+                        residual_len = residual.len;
+                        residual_checksum = std.hash.Crc32.hash(residual);
+                    }
                 },
             }
             vector_checksum = std.hash.Crc32.hash(destination);
@@ -303,6 +694,11 @@ pub const Writer = struct {
         try appendU32(self.alloc, &self.index, if (tombstone) tombstone_flag else 0);
         try appendU32(self.alloc, &self.index, vector_checksum);
         try appendU32(self.alloc, &self.index, if (tombstone) 0 else @bitCast(vector_scale));
+        try appendU32(self.alloc, &self.index, if (tombstone) 0 else @bitCast(quantization.error_norm));
+        try appendU32(self.alloc, &self.index, if (tombstone) 0 else @bitCast(quantization.decoded_norm_lower_bound));
+        try appendU64(self.alloc, &self.index, @intCast(residual_offset));
+        try appendU32(self.alloc, &self.index, @intCast(residual_len));
+        try appendU32(self.alloc, &self.index, residual_checksum);
         self.previous = ordering;
         self.count += 1;
     }
@@ -315,6 +711,9 @@ pub const Writer = struct {
         try self.data.appendNTimes(self.alloc, 0, vector_arena_offset - self.data.items.len);
         try self.data.appendSlice(self.alloc, self.vector_data.items);
 
+        const residual_arena_offset = self.data.items.len;
+        try self.data.appendSlice(self.alloc, self.residual_data.items);
+
         // Index vector offsets were recorded relative to vector_data so keys
         // could remain contiguous. Convert only live entries; tombstones keep
         // the required all-zero vector tuple.
@@ -325,6 +724,12 @@ pub const Writer = struct {
             const relative = std.math.cast(usize, readU64(self.index.items[entry_offset + 40 ..][0..8])) orelse return error.VectorBlockTooLarge;
             const absolute = std.math.add(usize, vector_arena_offset, relative) catch return error.VectorBlockTooLarge;
             writeU64(self.index.items[entry_offset + 40 ..][0..8], absolute);
+            const residual_len = readU32(self.index.items[entry_offset + 80 ..][0..4]);
+            if (residual_len != 0) {
+                const residual_relative = std.math.cast(usize, readU64(self.index.items[entry_offset + 72 ..][0..8])) orelse return error.VectorBlockTooLarge;
+                const residual_absolute = std.math.add(usize, residual_arena_offset, residual_relative) catch return error.VectorBlockTooLarge;
+                writeU64(self.index.items[entry_offset + 72 ..][0..8], residual_absolute);
+            }
         }
 
         const index_offset = self.data.items.len;
@@ -342,6 +747,7 @@ pub const Writer = struct {
         try appendU32(self.alloc, &self.data, std.hash.Crc32.hash(self.data.items[footer_start..][0..48]));
         try self.data.appendSlice(self.alloc, &magic);
         self.vector_data.clearAndFree(self.alloc);
+        self.residual_data.clearAndFree(self.alloc);
         self.index.clearAndFree(self.alloc);
         return try self.data.toOwnedSlice(self.alloc);
     }
@@ -354,6 +760,9 @@ pub const Value = struct {
     bytes: []const u8,
     encoding: Encoding = .float32,
     scale: f32 = 1,
+    quantization_error_norm: ?f32 = null,
+    decoded_norm_lower_bound: ?f32 = null,
+    exact_residual: ?[]const u8 = null,
 
     pub fn vectorView(self: Value) ?[]const f32 {
         if (self.encoding != .float32 or self.scale != 1) return null;
@@ -385,6 +794,88 @@ pub const Value = struct {
         }
         return out[0..self.dims];
     }
+
+    /// Reconstructs the authoritative source float32 vector. Float32 blocks
+    /// already contain that plane; float16 blocks require a complete lossless
+    /// residual published in the same immutable generation.
+    pub fn decodeExactInto(self: Value, out: []f32) ![]const f32 {
+        if (self.encoding == .float32) return self.decodeInto(out);
+        const residual = self.exact_residual orelse return error.ExactVectorResidualMissing;
+        return decodeExactResidualInto(self.bytes, self.dims, self.scale, residual, out);
+    }
+};
+
+/// Immutable coordinates and scoring metadata for one vector payload. This
+/// lets storage owners binary-search mmap metadata while fetching the large
+/// vector/residual planes with bounded positional I/O.
+pub const ValueLocation = struct {
+    source_sequence: u64,
+    revision: u64,
+    dims: u32,
+    encoding: Encoding,
+    scale: f32,
+    quantization_error_norm: ?f32,
+    decoded_norm_lower_bound: ?f32,
+    vector_offset: usize,
+    vector_len: usize,
+    vector_checksum: u32,
+    residual_offset: usize,
+    residual_len: usize,
+    residual_checksum: u32,
+
+    pub fn scratchBytes(self: ValueLocation) !usize {
+        return std.math.add(usize, self.vector_len, self.residual_len) catch error.VectorBlockTooLarge;
+    }
+
+    /// Validates and exposes only the compact candidate plane. The exact
+    /// residual deliberately remains unread so bounded scoring does not turn
+    /// every RaBitQ boundary candidate into an exact-vector I/O operation.
+    pub fn projectionValueFromPayload(self: ValueLocation, vector_bytes: []const u8) !Value {
+        if (vector_bytes.len != self.vector_len) return error.CorruptedVectorBlock;
+        if (std.hash.Crc32.hash(vector_bytes) != self.vector_checksum)
+            return error.VectorBlockPayloadChecksumMismatch;
+        return .{
+            .source_sequence = self.source_sequence,
+            .revision = self.revision,
+            .dims = self.dims,
+            .bytes = vector_bytes,
+            .encoding = self.encoding,
+            .scale = self.scale,
+            .quantization_error_norm = self.quantization_error_norm,
+            .decoded_norm_lower_bound = self.decoded_norm_lower_bound,
+            .exact_residual = null,
+        };
+    }
+
+    pub fn valueFromPayload(self: ValueLocation, vector_bytes: []const u8, residual_bytes: []const u8) !Value {
+        const value = try self.projectionValueFromPayload(vector_bytes);
+        return try self.completeProjection(value, residual_bytes);
+    }
+
+    /// Attaches the lossless plane to a projection that this location already
+    /// validated. Query rerank keeps the compact bytes generation-leased after
+    /// candidate scoring, so exact boundary completion should validate and
+    /// touch only the residual rather than hashing the projection twice.
+    pub fn completeProjection(self: ValueLocation, projection: Value, residual_bytes: []const u8) !Value {
+        if (projection.source_sequence != self.source_sequence or
+            projection.revision != self.revision or
+            projection.dims != self.dims or
+            projection.encoding != self.encoding or
+            @as(u32, @bitCast(projection.scale)) != @as(u32, @bitCast(self.scale)) or
+            projection.quantization_error_norm != self.quantization_error_norm or
+            projection.decoded_norm_lower_bound != self.decoded_norm_lower_bound or
+            projection.bytes.len != self.vector_len or
+            projection.exact_residual != null)
+        {
+            return error.VectorBlockProjectionLocationMismatch;
+        }
+        if (residual_bytes.len != self.residual_len) return error.CorruptedVectorBlock;
+        if (self.residual_len != 0 and std.hash.Crc32.hash(residual_bytes) != self.residual_checksum)
+            return error.VectorBlockResidualChecksumMismatch;
+        var value = projection;
+        value.exact_residual = if (residual_bytes.len == 0) null else residual_bytes;
+        return value;
+    }
 };
 
 pub const Tombstone = struct {
@@ -396,6 +887,12 @@ pub const Lookup = union(enum) {
     missing,
     tombstone: Tombstone,
     vector: Value,
+};
+
+pub const LocatedLookup = union(enum) {
+    missing,
+    tombstone: Tombstone,
+    vector: ValueLocation,
 };
 
 /// Borrowed, checksum-verified view used by bounded generation compaction.
@@ -428,6 +925,11 @@ pub const Reader = struct {
         flags: u32,
         vector_checksum: u32,
         vector_scale: f32,
+        quantization_error_norm: ?f32,
+        decoded_norm_lower_bound: ?f32,
+        residual_offset: usize,
+        residual_len: usize,
+        residual_checksum: u32,
     };
 
     pub fn init(data: []const u8) !Reader {
@@ -436,14 +938,19 @@ pub const Reader = struct {
         const block_version = readU16(data[8..10]);
         const encoding: Encoding = switch (block_version) {
             legacy_version => if (readU16(data[10..12]) == 0) .float32 else return error.UnsupportedVectorBlockVersion,
-            unscaled_encoding_version, version => switch (readU16(data[10..12])) {
+            unscaled_encoding_version, scaled_encoding_version, version => switch (readU16(data[10..12])) {
                 @intFromEnum(Encoding.float32) => .float32,
                 @intFromEnum(Encoding.float16) => .float16,
                 else => return error.UnsupportedVectorBlockEncoding,
             },
             else => return error.UnsupportedVectorBlockVersion,
         };
-        const entry_size = if (block_version == version) index_entry_size else legacy_index_entry_size;
+        const entry_size = switch (block_version) {
+            version => index_entry_size,
+            scaled_encoding_version => scaled_index_entry_size,
+            legacy_version, unscaled_encoding_version => legacy_index_entry_size,
+            else => unreachable,
+        };
         if (readU32(data[36..40]) != std.hash.Crc32.hash(data[0..36])) return error.VectorBlockHeaderChecksumMismatch;
 
         const generation = readU64(data[12..20]);
@@ -505,6 +1012,22 @@ pub const Reader = struct {
     /// and every key checksum. Query lookups can therefore trust those regions
     /// for the lifetime of the mmap lease while payload CRCs remain lazy.
     pub fn getHashed(self: Reader, key: []const u8, hash: u64, max_source_sequence: u64, expected_revision: ?u64) !Lookup {
+        return switch (try self.locateHashed(key, hash, max_source_sequence, expected_revision)) {
+            .missing => .missing,
+            .tombstone => |value| .{ .tombstone = value },
+            .vector => |location| .{ .vector = try location.valueFromPayload(
+                self.data[location.vector_offset..][0..location.vector_len],
+                if (location.residual_len == 0)
+                    &.{}
+                else
+                    self.data[location.residual_offset..][0..location.residual_len],
+            ) },
+        };
+    }
+
+    /// Performs the complete checked key/revision lookup without touching the
+    /// vector arena. Storage layers can use the returned offsets with pread.
+    pub fn locateHashed(self: Reader, key: []const u8, hash: u64, max_source_sequence: u64, expected_revision: ?u64) !LocatedLookup {
         if ((hash & (@as(u64, self.shard_count) - 1)) != self.shard_id) return .missing;
         var lo: usize = 0;
         var hi = self.count;
@@ -526,7 +1049,27 @@ pub const Reader = struct {
         if (expected_revision) |expected| {
             if (found.revision != expected) return error.VectorBlockRevisionMismatch;
         }
-        return try self.lookupFromEntry(found);
+        if ((found.flags & tombstone_flag) != 0) return .{ .tombstone = .{
+            .source_sequence = found.source_sequence,
+            .revision = found.revision,
+        } };
+        const vector_len = std.math.mul(usize, found.dims, self.encoding.componentBytes()) catch
+            return error.CorruptedVectorBlock;
+        return .{ .vector = .{
+            .source_sequence = found.source_sequence,
+            .revision = found.revision,
+            .dims = found.dims,
+            .encoding = self.encoding,
+            .scale = found.vector_scale,
+            .quantization_error_norm = found.quantization_error_norm,
+            .decoded_norm_lower_bound = found.decoded_norm_lower_bound,
+            .vector_offset = found.vector_offset,
+            .vector_len = vector_len,
+            .vector_checksum = found.vector_checksum,
+            .residual_offset = found.residual_offset,
+            .residual_len = found.residual_len,
+            .residual_checksum = found.residual_checksum,
+        } };
     }
 
     /// Returns one physical entry in block sort order. This deliberately does
@@ -556,6 +1099,16 @@ pub const Reader = struct {
             .bytes = bytes,
             .encoding = self.encoding,
             .scale = found.vector_scale,
+            .quantization_error_norm = found.quantization_error_norm,
+            .decoded_norm_lower_bound = found.decoded_norm_lower_bound,
+            .exact_residual = if (found.residual_len == 0)
+                null
+            else blk: {
+                const residual = self.data[found.residual_offset..][0..found.residual_len];
+                if (std.hash.Crc32.hash(residual) != found.residual_checksum)
+                    return error.VectorBlockResidualChecksumMismatch;
+                break :blk residual;
+            },
         } };
     }
 
@@ -573,24 +1126,56 @@ pub const Reader = struct {
             .dims = readU32(raw[48..52]),
             .flags = readU32(raw[52..56]),
             .vector_checksum = readU32(raw[56..60]),
-            .vector_scale = if (self.index_entry_size == index_entry_size)
+            .vector_scale = if (self.index_entry_size >= scaled_index_entry_size)
                 @bitCast(readU32(raw[60..64]))
             else if ((readU32(raw[52..56]) & tombstone_flag) != 0)
                 0
             else
                 1,
+            .quantization_error_norm = if (self.index_entry_size == index_entry_size)
+                @bitCast(readU32(raw[64..68]))
+            else
+                null,
+            .decoded_norm_lower_bound = if (self.index_entry_size == index_entry_size)
+                @bitCast(readU32(raw[68..72]))
+            else
+                null,
+            .residual_offset = if (self.index_entry_size == index_entry_size)
+                std.math.cast(usize, readU64(raw[72..80])) orelse return error.CorruptedVectorBlock
+            else
+                0,
+            .residual_len = if (self.index_entry_size == index_entry_size) readU32(raw[80..84]) else 0,
+            .residual_checksum = if (self.index_entry_size == index_entry_size) readU32(raw[84..88]) else 0,
         };
         if (entry_value.key_offset < header_size or entry_value.key_offset > self.index_offset or entry_value.key_len > self.index_offset - entry_value.key_offset) return error.CorruptedVectorBlock;
         if (entry_value.source_sequence > self.covered_source_sequence) return error.CorruptedVectorBlock;
         if ((entry_value.flags & ~tombstone_flag) != 0) return error.CorruptedVectorBlock;
         const tombstone = (entry_value.flags & tombstone_flag) != 0;
         if (tombstone) {
-            if (entry_value.vector_offset != 0 or entry_value.dims != 0 or entry_value.vector_checksum != 0 or entry_value.vector_scale != 0) return error.CorruptedVectorBlock;
+            if (entry_value.vector_offset != 0 or entry_value.dims != 0 or entry_value.vector_checksum != 0 or entry_value.vector_scale != 0 or
+                entry_value.quantization_error_norm != null and entry_value.quantization_error_norm.? != 0 or
+                entry_value.decoded_norm_lower_bound != null and entry_value.decoded_norm_lower_bound.? != 0 or
+                entry_value.residual_offset != 0 or entry_value.residual_len != 0 or entry_value.residual_checksum != 0)
+                return error.CorruptedVectorBlock;
         } else {
             if (!std.math.isFinite(entry_value.vector_scale) or entry_value.vector_scale <= 0) return error.CorruptedVectorBlock;
+            if (entry_value.quantization_error_norm) |error_norm| {
+                const decoded_norm = entry_value.decoded_norm_lower_bound orelse return error.CorruptedVectorBlock;
+                validateQuantizationStats(self.encoding, .{
+                    .error_norm = error_norm,
+                    .decoded_norm_lower_bound = decoded_norm,
+                }) catch return error.CorruptedVectorBlock;
+            } else if (entry_value.decoded_norm_lower_bound != null) return error.CorruptedVectorBlock;
             if (entry_value.dims == 0 or entry_value.vector_offset < header_size or entry_value.vector_offset % self.encoding.alignment() != 0) return error.CorruptedVectorBlock;
             const byte_len = std.math.mul(usize, entry_value.dims, self.encoding.componentBytes()) catch return error.CorruptedVectorBlock;
             if (entry_value.vector_offset > self.index_offset or byte_len > self.index_offset - entry_value.vector_offset) return error.CorruptedVectorBlock;
+            if (entry_value.residual_len == 0) {
+                if (entry_value.residual_offset != 0 or entry_value.residual_checksum != 0) return error.CorruptedVectorBlock;
+            } else {
+                if (self.encoding != .float16 or entry_value.residual_offset < header_size or
+                    entry_value.residual_offset > self.index_offset or entry_value.residual_len > self.index_offset - entry_value.residual_offset)
+                    return error.CorruptedVectorBlock;
+            }
         }
         return entry_value;
     }
@@ -609,12 +1194,23 @@ pub const Reader = struct {
             .dims = readU32(raw[48..52]),
             .flags = readU32(raw[52..56]),
             .vector_checksum = readU32(raw[56..60]),
-            .vector_scale = if (self.index_entry_size == index_entry_size)
+            .vector_scale = if (self.index_entry_size >= scaled_index_entry_size)
                 @bitCast(readU32(raw[60..64]))
             else if ((readU32(raw[52..56]) & tombstone_flag) != 0)
                 0
             else
                 1,
+            .quantization_error_norm = if (self.index_entry_size == index_entry_size)
+                @bitCast(readU32(raw[64..68]))
+            else
+                null,
+            .decoded_norm_lower_bound = if (self.index_entry_size == index_entry_size)
+                @bitCast(readU32(raw[68..72]))
+            else
+                null,
+            .residual_offset = if (self.index_entry_size == index_entry_size) @intCast(readU64(raw[72..80])) else 0,
+            .residual_len = if (self.index_entry_size == index_entry_size) readU32(raw[80..84]) else 0,
+            .residual_checksum = if (self.index_entry_size == index_entry_size) readU32(raw[84..88]) else 0,
         };
     }
 
@@ -646,6 +1242,17 @@ pub const Reader = struct {
             if (previous) |old| if (compareOrdering(old, ordering) != .lt) return error.CorruptedVectorBlock;
             previous = ordering;
         }
+    }
+
+    /// True when every live float16 entry can reconstruct its authoritative
+    /// float32 source without consulting primary artifact storage.
+    pub fn hasExactResiduals(self: Reader) bool {
+        if (self.encoding == .float32) return true;
+        for (0..self.count) |i| {
+            const current = self.entryAssumeValidated(i);
+            if ((current.flags & tombstone_flag) == 0 and current.residual_len == 0) return false;
+        }
+        return true;
     }
 };
 
@@ -767,6 +1374,118 @@ test "vector block float16 projection round trips through explicit encoding" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.125), view[0], 0.0005);
     try std.testing.expectApproxEqAbs(@as(f32, -0.33325), view[1], 0.0005);
     try std.testing.expectApproxEqAbs(@as(f32, 4.5), view[2], 0.0005);
+    const error_norm = value.quantization_error_norm orelse return error.TestExpectedQuantizationMetadata;
+    const decoded_norm_lower = value.decoded_norm_lower_bound orelse return error.TestExpectedQuantizationMetadata;
+    var actual_error_squared: f64 = 0;
+    var actual_decoded_norm_squared: f64 = 0;
+    for (view, [_]f32{ 0.125, -0.33325, 4.5 }) |decoded_value, source_value| {
+        const component_error = source_value - decoded_value;
+        actual_error_squared += @as(f64, component_error) * component_error;
+        actual_decoded_norm_squared += @as(f64, decoded_value) * decoded_value;
+    }
+    try std.testing.expect(@sqrt(actual_error_squared) <= error_norm);
+    try std.testing.expect(decoded_norm_lower <= @sqrt(actual_decoded_norm_squared));
+    try std.testing.expect(reader.hasExactResiduals());
+    var exact: [3]f32 = undefined;
+    const exact_view = try value.decodeExactInto(&exact);
+    for (exact_view, [_]f32{ 0.125, -0.33325, 4.5 }) |found, expected| {
+        try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(found)));
+    }
+}
+
+test "vector block residual reconstructs adversarial float32 bits exactly" {
+    const alloc = std.testing.allocator;
+    const source = [_]f32{
+        0.0,
+        @bitCast(@as(u32, 0x80000000)),
+        @bitCast(@as(u32, 1)),
+        @bitCast(@as(u32, 0x80000001)),
+        0.33333334,
+        -12_345.678,
+        100_000.0,
+        -250_000.0,
+        std.math.floatMax(f32),
+    };
+    var writer = try Writer.initWithEncoding(alloc, 1, 0, 1, 1, .float16);
+    defer writer.deinit();
+    try writer.appendVector("artifact-a", 1, 1, &source);
+    const block = try writer.build();
+    defer alloc.free(block);
+
+    const reader = try Reader.init(block);
+    try std.testing.expect(reader.hasExactResiduals());
+    const value = (try reader.get("artifact-a", 1, 1)).vector;
+    try std.testing.expect(value.exact_residual != null);
+    var exact: [source.len]f32 = undefined;
+    const decoded = try value.decodeExactInto(&exact);
+    for (source, decoded) |expected, found| {
+        try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(found)));
+    }
+}
+
+test "vector block keeps pre-encoded float16 bounded until residual is supplied" {
+    const alloc = std.testing.allocator;
+    const source = [_]f32{ 0.1, -0.2, 0.3 };
+    var payload: [source.len * @sizeOf(f16)]u8 = undefined;
+    const encoded = try encodeVectorIntoWithStats(.float16, &source, &payload);
+    var writer = try Writer.initWithEncoding(alloc, 1, 0, 1, 1, .float16);
+    defer writer.deinit();
+    try writer.appendEncodedVectorWithStats("artifact-a", 1, 1, source.len, &payload, encoded.scale, encoded.quantization);
+    const block = try writer.build();
+    defer alloc.free(block);
+    const reader = try Reader.init(block);
+    try std.testing.expect(!reader.hasExactResiduals());
+    var scratch: [source.len]f32 = undefined;
+    try std.testing.expectError(
+        error.ExactVectorResidualMissing,
+        (try reader.get("artifact-a", 1, 1)).vector.decodeExactInto(&scratch),
+    );
+}
+
+test "vector block reader keeps v3 scaled blocks compatible without projection metadata" {
+    const alloc = std.testing.allocator;
+    var writer = try Writer.initWithEncoding(alloc, 9, 0, 1, 1, .float16);
+    defer writer.deinit();
+    try writer.appendVector("artifact-a", 1, 7, &.{ 0.125, -0.33325, 4.5 });
+    const current = try writer.build();
+    defer alloc.free(current);
+    const current_reader = try Reader.init(current);
+
+    // A v3 entry ends after vector_scale. Reframe the committed current block
+    // as the exact bytes an older writer emitted, including both checksums.
+    const old = try alloc.alloc(u8, current.len - (index_entry_size - scaled_index_entry_size));
+    defer alloc.free(old);
+    const old_footer_start = old.len - footer_size;
+    @memcpy(old[0 .. current_reader.index_offset + scaled_index_entry_size], current[0 .. current_reader.index_offset + scaled_index_entry_size]);
+    @memcpy(old[old_footer_start..], current[current.len - footer_size ..]);
+    writeU16(old[8..10], scaled_encoding_version);
+    writeU32(old[36..40], std.hash.Crc32.hash(old[0..36]));
+    const footer = old[old_footer_start..];
+    writeU32(footer[32..36], std.hash.Crc32.hash(old[current_reader.index_offset..old_footer_start]));
+    writeU16(footer[36..38], scaled_encoding_version);
+    writeU32(footer[48..52], std.hash.Crc32.hash(footer[0..48]));
+
+    const reader = try Reader.init(old);
+    const value = (try reader.get("artifact-a", 1, 7)).vector;
+    try std.testing.expect(value.quantization_error_norm == null);
+    try std.testing.expect(value.decoded_norm_lower_bound == null);
+    var decoded: [3]f32 = undefined;
+    try std.testing.expectApproxEqAbs(@as(f32, -0.33325), (try value.decodeInto(&decoded))[1], 0.0005);
+}
+
+test "vector block admission rejects invalid projection metadata" {
+    const alloc = std.testing.allocator;
+    var writer = try Writer.initWithEncoding(alloc, 1, 0, 1, 1, .float16);
+    defer writer.deinit();
+    try writer.appendVector("artifact-a", 1, 1, &.{ 1.0, 2.0 });
+    const encoded = try writer.build();
+    defer alloc.free(encoded);
+    const reader = try Reader.init(encoded);
+    writeU32(encoded[reader.index_offset + 64 ..][0..4], @bitCast(std.math.nan(f32)));
+    const footer = encoded[encoded.len - footer_size ..];
+    writeU32(footer[32..36], std.hash.Crc32.hash(encoded[reader.index_offset .. encoded.len - footer_size]));
+    writeU32(footer[48..52], std.hash.Crc32.hash(footer[0..48]));
+    try std.testing.expectError(error.CorruptedVectorBlock, Reader.init(encoded));
 }
 
 test "vector block float16 projection scales values outside its native finite domain" {
@@ -779,6 +1498,8 @@ test "vector block float16 projection scales values outside its native finite do
     const reader = try Reader.init(encoded);
     const value = (try reader.get("artifact-a", 1, 1)).vector;
     try std.testing.expect(value.scale > 1);
+    try std.testing.expect(value.quantization_error_norm != null);
+    try std.testing.expect(value.decoded_norm_lower_bound != null);
     var decoded: [2]f32 = undefined;
     const view = try value.decodeInto(&decoded);
     try std.testing.expectApproxEqRel(@as(f32, 100_000.0), view[0], 0.001);
@@ -800,6 +1521,8 @@ test "vector block accepts validated pre-encoded payload without changing repres
     const value = (try (try Reader.init(block)).get("artifact-a", 1, 1)).vector;
     try std.testing.expectEqual(scale, value.scale);
     try std.testing.expectEqualSlices(u8, &payload, value.bytes);
+    try std.testing.expect(value.quantization_error_norm != null);
+    try std.testing.expect(value.decoded_norm_lower_bound != null);
     var decoded: [source.len]f32 = undefined;
     const actual = try value.decodeInto(&decoded);
     for (source, actual) |expected, found| try std.testing.expectApproxEqRel(expected, found, 0.001);
@@ -865,4 +1588,18 @@ test "vector block detects lazy vector corruption" {
     encoded[@intFromPtr(value.bytes.ptr) - @intFromPtr(encoded.ptr)] ^= 0xff;
     const reader = try Reader.init(encoded);
     try std.testing.expectError(error.VectorBlockPayloadChecksumMismatch, reader.get("artifact-a", 1, null));
+}
+
+test "vector block detects residual corruption lazily" {
+    const alloc = std.testing.allocator;
+    var writer = try Writer.initWithEncoding(alloc, 1, 0, 1, 1, .float16);
+    defer writer.deinit();
+    try writer.appendVector("artifact-a", 1, 1, &.{ 0.1, -0.2, 0.3 });
+    const encoded = try writer.build();
+    defer alloc.free(encoded);
+    const pristine = try Reader.init(encoded);
+    const residual = (try pristine.get("artifact-a", 1, null)).vector.exact_residual.?;
+    encoded[@intFromPtr(residual.ptr) - @intFromPtr(encoded.ptr)] ^= 0xff;
+    const reader = try Reader.init(encoded);
+    try std.testing.expectError(error.VectorBlockResidualChecksumMismatch, reader.get("artifact-a", 1, null));
 }

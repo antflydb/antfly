@@ -5785,6 +5785,24 @@ fn appendRuntimeIndexStatusRecord(
     record: metadata.RuntimeIndexStatusReport,
     version: u16,
 ) !void {
+    if (version >= runtime_status_protocol.framed_index_status_record_version) {
+        var payload = std.ArrayListUnmanaged(u8).empty;
+        defer payload.deinit(alloc);
+        try appendRuntimeIndexStatusRecordBody(alloc, &payload, record, version);
+        try appendInt(alloc, out, u32, std.math.cast(u32, payload.items.len) orelse
+            return error.MetadataTransitionEncodingTooLarge);
+        try out.appendSlice(alloc, payload.items);
+        return;
+    }
+    try appendRuntimeIndexStatusRecordBody(alloc, out, record, version);
+}
+
+fn appendRuntimeIndexStatusRecordBody(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    record: metadata.RuntimeIndexStatusReport,
+    version: u16,
+) !void {
     try appendRequiredString(alloc, out, record.name);
     try appendRequiredString(alloc, out, record.kind);
     try appendInt(alloc, out, u64, record.doc_count);
@@ -5818,9 +5836,38 @@ fn appendRuntimeIndexStatusRecord(
     if (version >= runtime_status_protocol.dense_native_storage_record_version) {
         try out.append(alloc, @intFromEnum(record.dense_native_storage_phase));
     }
+    if (version >= runtime_status_protocol.framed_index_status_record_version) {
+        // Extension payload is a sequence of {field_id:u16, length:u32,
+        // value:[length]u8}. No extensions are emitted yet; reserving the
+        // framed area now makes subsequent additions independently skippable.
+        try appendInt(alloc, out, u32, 0);
+    }
 }
 
 fn readRuntimeIndexStatusRecord(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+    version: u16,
+) !metadata.RuntimeIndexStatusReport {
+    if (version >= runtime_status_protocol.framed_index_status_record_version) {
+        const record_len = try readInt(encoded, pos, u32);
+        const end = std.math.add(usize, pos.*, record_len) catch
+            return error.InvalidMetadataTransitionEncoding;
+        if (end > encoded.len) return error.InvalidMetadataTransitionEncoding;
+        var body_pos = pos.*;
+        const record = try readRuntimeIndexStatusRecordBody(alloc, encoded[0..end], &body_pos, version);
+        if (body_pos != end) {
+            metadata_table_manager.freeRuntimeIndexStatusReport(alloc, record);
+            return error.InvalidMetadataTransitionEncoding;
+        }
+        pos.* = end;
+        return record;
+    }
+    return try readRuntimeIndexStatusRecordBody(alloc, encoded, pos, version);
+}
+
+fn readRuntimeIndexStatusRecordBody(
     alloc: std.mem.Allocator,
     encoded: []const u8,
     pos: *usize,
@@ -5897,6 +5944,24 @@ fn readRuntimeIndexStatusRecord(
         break :blk std.enums.fromInt(metadata.DenseNativeStoragePhase, value) orelse
             return error.InvalidMetadataTransitionEncoding;
     } else .legacy;
+    if (version >= runtime_status_protocol.framed_index_status_record_version) {
+        const extensions_len = try readInt(encoded, pos, u32);
+        const extensions_end = std.math.add(usize, pos.*, extensions_len) catch
+            return error.InvalidMetadataTransitionEncoding;
+        if (extensions_end > encoded.len) return error.InvalidMetadataTransitionEncoding;
+        var seen = std.AutoHashMapUnmanaged(u16, void).empty;
+        defer seen.deinit(alloc);
+        while (pos.* < extensions_end) {
+            const field_id = try readInt(encoded[0..extensions_end], pos, u16);
+            const field_len = try readInt(encoded[0..extensions_end], pos, u32);
+            const field_end = std.math.add(usize, pos.*, field_len) catch
+                return error.InvalidMetadataTransitionEncoding;
+            if (field_id == 0 or field_end > extensions_end or seen.contains(field_id))
+                return error.InvalidMetadataTransitionEncoding;
+            try seen.put(alloc, field_id, {});
+            pos.* = field_end;
+        }
+    }
     return .{
         .name = name,
         .kind = kind,
@@ -11259,13 +11324,11 @@ test "metadata runtime index status decoder accepts version ten records" {
         .replay_applied_sequence = 9,
         .replay_target_sequence = 11,
         .replay_catch_up_required = true,
-    }, runtime_status_protocol.current_record_version);
+    }, 10);
 
-    // Version 10 ended immediately after replay_catch_up_required. Remove the
-    // version-11 optional load-error tag, the two version-13 repair bytes,
-    // and the version-14 vector projection byte.
-    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, encoded.items[encoded.items.len - 4 ..]);
-    encoded.items.len -= 4;
+    // Compatibility fixtures are encoded at their declared protocol version.
+    // Trimming the current record's tail made every new optional field change
+    // the byte arithmetic of unrelated historical tests.
 
     var pos: usize = 0;
     const decoded = try readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, 10);

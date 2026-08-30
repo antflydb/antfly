@@ -18,7 +18,8 @@ const Allocator = std.mem.Allocator;
 
 const magic: [8]u8 = .{ 'A', 'F', 'V', 'B', 'M', 'A', 'N', 0 };
 const legacy_version: u16 = 1;
-const version: u16 = 2;
+const coverage_version: u16 = 2;
+const version: u16 = 3;
 const legacy_header_size: usize = 68;
 const header_size: usize = 72;
 const segment_size: usize = 40;
@@ -62,6 +63,19 @@ pub const Coverage = struct {
     key_hash_sum: u64,
 };
 
+pub const ScorePrecision = enum(u32) {
+    /// Older manifests did not declare whether their blocks could certify an
+    /// exact public score. Readers may inspect block encoding for migration,
+    /// but must not infer exact readiness from this value.
+    unspecified = 0,
+    authoritative_float32 = 1,
+    bounded_float16 = 2,
+    /// Candidate scores use the compact float16 plane, while a co-published
+    /// lossless residual reconstructs authoritative float32 values for exact
+    /// completion without primary-storage reads.
+    authoritative_float32_with_bounded_float16 = 3,
+};
+
 pub const Manifest = struct {
     base_generation: u64,
     latest_generation: u64,
@@ -71,6 +85,7 @@ pub const Manifest = struct {
     shard_count: u32,
     segments: []const Segment,
     coverages: []const Coverage = &.{},
+    score_precision: ScorePrecision = .authoritative_float32,
 
     pub fn encodeAlloc(self: Manifest, alloc: Allocator) ![]u8 {
         try self.validate();
@@ -91,7 +106,8 @@ pub const Manifest = struct {
         writeU32(out[52..56], self.shard_count);
         writeU32(out[56..60], @intCast(self.segments.len));
         writeU32(out[60..64], @intCast(self.coverages.len));
-        writeU32(out[64..68], 0);
+        if (self.score_precision == .unspecified) return error.InvalidVectorBlockManifest;
+        writeU32(out[64..68], @intFromEnum(self.score_precision));
         writeU32(out[68..72], std.hash.Crc32.hash(out[0..68]));
         var pos = header_size;
         for (self.segments) |segment| {
@@ -174,7 +190,8 @@ pub const Decoded = struct {
 pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !Decoded {
     if (bytes.len < legacy_header_size + footer_size or !std.mem.eql(u8, bytes[0..8], &magic)) return error.InvalidVectorBlockManifest;
     const decoded_version = readU16(bytes[8..10]);
-    if (decoded_version != legacy_version and decoded_version != version) return error.UnsupportedVectorBlockManifestVersion;
+    if (decoded_version != legacy_version and decoded_version != coverage_version and decoded_version != version)
+        return error.UnsupportedVectorBlockManifestVersion;
     if (readU16(bytes[10..12]) != 0) return error.UnsupportedVectorBlockManifestFlags;
     const decoded_header_size = if (decoded_version == legacy_version) legacy_header_size else header_size;
     if (bytes.len < decoded_header_size + footer_size) return error.InvalidVectorBlockManifest;
@@ -182,7 +199,8 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !Decoded {
         if (readU32(bytes[60..64]) != 0) return error.UnsupportedVectorBlockManifestFlags;
         if (readU32(bytes[64..68]) != std.hash.Crc32.hash(bytes[0..64])) return error.VectorBlockManifestChecksumMismatch;
     } else {
-        if (readU32(bytes[64..68]) != 0) return error.UnsupportedVectorBlockManifestFlags;
+        if (decoded_version == coverage_version and readU32(bytes[64..68]) != 0)
+            return error.UnsupportedVectorBlockManifestFlags;
         if (readU32(bytes[68..72]) != std.hash.Crc32.hash(bytes[0..68])) return error.VectorBlockManifestChecksumMismatch;
     }
     const segment_count: usize = @intCast(readU32(bytes[56..60]));
@@ -232,6 +250,11 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !Decoded {
         .shard_count = readU32(bytes[52..56]),
         .segments = segments,
         .coverages = coverages,
+        .score_precision = if (decoded_version >= version)
+            std.enums.fromInt(ScorePrecision, readU32(bytes[64..68])) orelse
+                return error.UnsupportedVectorBlockScorePrecision
+        else
+            .unspecified,
     };
     try manifest.validate();
     return .{ .manifest = manifest, .owned_segments = segments, .owned_coverages = coverages };

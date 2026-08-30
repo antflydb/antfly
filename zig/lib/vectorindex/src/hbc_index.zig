@@ -3681,13 +3681,124 @@ fn rerankResultsWithCachePolicy(
     const rerank_count = rerank_selection.rerank_candidate_count;
     if (rerank_count > 0) {
         const select_start = now_fn_u64();
-        const rerank_positions = selectedRerankCandidatePositionsInto(ranked_items, rerank_selection.flags, scratch.positions[0..rerank_count]);
+        var rerank_positions = selectedRerankCandidatePositionsInto(ranked_items, rerank_selection.flags, scratch.positions[0..rerank_count]);
         profile.rerank_select_positions_ns += elapsed_fn_u64(select_start);
-        const vector_views = scratch.vector_views[0..rerank_count];
-        const exact_distances = scratch.distances[0..rerank_count];
+        // The bounded pass can prove that candidates outside the original
+        // quantized rerank window overlap the exact top-k boundary. Reserve
+        // the full result shell so expanding the completion set remains
+        // allocation-free and cannot overrun a rerank-sized view.
+        const vector_views = scratch.vector_views[0..ranked_items.len];
+        const exact_distances = scratch.distances[0..ranked_items.len];
 
         var external_scored = false;
         const Index = comptime childType(@TypeOf(self));
+        if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalRerankCandidatesSortedWithScratch")) bounded: {
+            const max_external_rerank_batch = externalRerankBatchSize(self.config.dims, rerank_positions.len);
+            var offset: usize = 0;
+            while (offset < rerank_positions.len) {
+                const batch_end = @min(offset + max_external_rerank_batch, rerank_positions.len);
+                const batch_positions = rerank_positions[offset..batch_end];
+                const batch_distances = exact_distances[0..batch_positions.len];
+                const batch_bounds = scratch.error_bounds[0..batch_positions.len];
+                const handled = if (!use_search_cache and comptime @hasDecl(Index, "scoreExternalRerankCandidatesSortedWithScratchUncached"))
+                    try self.scoreExternalRerankCandidatesSortedWithScratchUncached(
+                        txn,
+                        ranked_items,
+                        batch_positions,
+                        query,
+                        query_measure,
+                        batch_distances,
+                        batch_bounds,
+                        scratch.vector_ids,
+                        scratch.metadata,
+                        scratch.vector_views,
+                        scratch.lookups,
+                        scratch.key_views,
+                        scratch.values,
+                        scratch.vector_batch,
+                        scratch.score_bounds[0..batch_positions.len],
+                        scratch.score_bounds[batch_positions.len .. 2 * batch_positions.len],
+                        profile,
+                    )
+                else
+                    try self.scoreExternalRerankCandidatesSortedWithScratch(
+                        txn,
+                        ranked_items,
+                        batch_positions,
+                        query,
+                        query_measure,
+                        batch_distances,
+                        batch_bounds,
+                        scratch.vector_ids,
+                        scratch.metadata,
+                        scratch.vector_views,
+                        scratch.lookups,
+                        scratch.key_views,
+                        scratch.values,
+                        scratch.vector_batch,
+                        scratch.score_bounds[0..batch_positions.len],
+                        scratch.score_bounds[batch_positions.len .. 2 * batch_positions.len],
+                        profile,
+                    );
+                if (!handled) break :bounded;
+                var batch_is_authoritative = true;
+                for (batch_positions, 0..) |index, slot| {
+                    const item = &ranked_items[index];
+                    item.distance = batch_distances[slot];
+                    item.error_bound = batch_bounds[slot];
+                    if (!std.math.isFinite(item.distance)) {
+                        if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
+                        item.distance = std.math.inf(f32);
+                        item.error_bound = 0;
+                        continue;
+                    }
+                    if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(
+                        self,
+                        txn,
+                        item.vector_id,
+                        item.distance,
+                        item.error_bound,
+                        req,
+                        filter_state,
+                        item.error_bound > 0,
+                        use_search_cache,
+                    )) {
+                        item.distance = std.math.inf(f32);
+                        item.error_bound = 0;
+                        continue;
+                    }
+                    if (item.error_bound == 0) {
+                        profile.exact_vectors_scored += 1;
+                        profile.reranked_vectors += 1;
+                    } else {
+                        batch_is_authoritative = false;
+                    }
+                }
+                // A primary/cache-backed candidate batch has already done the
+                // complete exact rerank. Preserve the established profiling
+                // semantics without counting a float16 candidate-plane scan
+                // as an authoritative completion batch.
+                if (batch_is_authoritative) {
+                    profile.rerank_batches += 1;
+                    profile.rerank_max_batch_size = @max(profile.rerank_max_batch_size, batch_positions.len);
+                }
+                offset = batch_end;
+            }
+            external_scored = true;
+            search_mod.sortApproxResultsByDistance(ranked_items);
+            const completion_count = markAuthoritativeCompletionCandidates(
+                rerank_selection.flags,
+                ranked_items,
+                rerank_selection.top_k_count,
+                req,
+                scratch.score_bounds,
+            );
+            rerank_positions = selectedRerankCandidatePositionsInto(
+                ranked_items,
+                rerank_selection.flags,
+                scratch.positions[0..completion_count],
+            );
+        }
         if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalRerankVectorsSortedWithScratch")) {
             // Most exact rerank sets fit in a small, already-reserved scratch
             // window. Score those as one physical-read unit so the external
@@ -3742,6 +3853,10 @@ fn rerankResultsWithCachePolicy(
                 profile.rerank_vector_load_ns += score_elapsed;
                 if (!handled) {
                     if (offset != 0) return error.ExternalRerankCapabilityChanged;
+                    // A generation may change between bounded and exact
+                    // scoring. Fall back to the authoritative source loader
+                    // for this completion set instead of exposing f16 scores.
+                    external_scored = false;
                     break;
                 }
                 external_scored = true;
@@ -4086,6 +4201,82 @@ fn countSelectedRerankCandidates(flags: []const bool) usize {
         if (selected) count += 1;
     }
     return count;
+}
+
+/// Selects the minimal provably sufficient float32 completion set after a
+/// bounded candidate plane has scored the corpus shell. The kth-smallest
+/// upper endpoint is an upper bound on the true kth score; therefore every
+/// non-exact candidate whose lower endpoint can cross it is completed. Once
+/// those candidates are exact, every omitted interval starts strictly beyond
+/// a known top-k witness and cannot change membership or public ordering.
+fn markAuthoritativeCompletionCandidates(
+    flags: []bool,
+    ranked_items: []const search_results.ApproxSearchResult,
+    top_k: usize,
+    req: search_types.SearchRequest,
+    upper_storage: []f32,
+) usize {
+    @memset(flags, false);
+    if (top_k == 0 or ranked_items.len == 0 or upper_storage.len < ranked_items.len) return 0;
+    var upper_count: usize = 0;
+    for (ranked_items) |item| {
+        const upper = item.distance + item.error_bound;
+        if (!std.math.isFinite(upper)) continue;
+        upper_storage[upper_count] = upper;
+        upper_count += 1;
+    }
+    if (upper_count < @min(top_k, ranked_items.len)) {
+        var count: usize = 0;
+        for (ranked_items, flags) |item, *selected| {
+            selected.* = item.error_bound > 0;
+            if (selected.*) count += 1;
+        }
+        return count;
+    }
+    std.mem.sort(f32, upper_storage[0..upper_count], {}, struct {
+        fn lessThan(_: void, lhs: f32, rhs: f32) bool {
+            return lhs < rhs;
+        }
+    }.lessThan);
+    const kth_upper = upper_storage[@min(top_k, upper_count) - 1];
+    var count: usize = 0;
+    for (ranked_items, flags) |item, *selected| {
+        if (item.error_bound <= 0) continue;
+        const crosses_membership = item.distance - item.error_bound <= kth_upper;
+        const crosses_over = if (req.distance_over) |threshold|
+            item.distance - item.error_bound <= threshold and
+                item.distance + item.error_bound >= threshold
+        else
+            false;
+        const crosses_under = if (req.distance_under) |threshold|
+            item.distance - item.error_bound <= threshold and
+                item.distance + item.error_bound >= threshold
+        else
+            false;
+        selected.* = crosses_membership or crosses_over or crosses_under;
+        if (selected.*) count += 1;
+    }
+    return count;
+}
+
+test "bounded candidate completion selects every possible top-k crossover" {
+    var items = [_]search_results.ApproxSearchResult{
+        .{ .vector_id = 1, .distance = 1.0, .error_bound = 0.01 },
+        .{ .vector_id = 2, .distance = 2.0, .error_bound = 0.05 },
+        .{ .vector_id = 3, .distance = 2.08, .error_bound = 0.08 },
+        .{ .vector_id = 4, .distance = 9.0, .error_bound = 0.1 },
+    };
+    var flags: [items.len]bool = undefined;
+    var upper: [items.len]f32 = undefined;
+    const count = markAuthoritativeCompletionCandidates(&flags, &items, 2, .{ .query = &.{}, .k = 2 }, &upper);
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true, false }, &flags);
+
+    // Once the first three values are authoritative, the far bounded tail is
+    // still omitted and every public top-k score is exact.
+    for (items[0..3]) |*item| item.error_bound = 0;
+    const complete = markAuthoritativeCompletionCandidates(&flags, &items, 2, .{ .query = &.{}, .k = 2 }, &upper);
+    try std.testing.expectEqual(@as(usize, 0), complete);
 }
 
 /// Returns true only when `top_k` already-scored/permanently-retained

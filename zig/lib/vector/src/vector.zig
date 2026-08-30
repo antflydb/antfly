@@ -422,6 +422,169 @@ pub fn distanceToQueryF16(
     };
 }
 
+pub const BoundedDistance = struct {
+    distance: f32,
+    error_bound: f32,
+};
+
+/// Scores a scaled IEEE-f16 projection and returns a conservative interval
+/// containing the source-f32 score. The encoder rounds each scaled component
+/// once; using a full f16 ULP (rather than the ideal half-ULP) also covers the
+/// f32 divide/multiply round trips and subnormal transition. Callers must fall
+/// back to authoritative f32 when the cosine normalization denominator cannot
+/// be bounded away from zero.
+pub fn distanceToQueryF16Bounded(
+    query: []const f32,
+    query_measure: f32,
+    candidate: []const f16,
+    candidate_scale: f32,
+    metric: DistanceMetric,
+) BoundedDistance {
+    const query_norm = switch (metric) {
+        .inner_product => norm(query),
+        .cosine => query_measure,
+        .l2_squared => 0,
+    };
+    return distanceToQueryF16BoundedWithQueryNorm(
+        query,
+        query_measure,
+        query_norm,
+        candidate,
+        candidate_scale,
+        metric,
+    );
+}
+
+/// Batch-oriented form of distanceToQueryF16Bounded. The caller computes the
+/// query norm once and reuses it across every candidate, avoiding a second
+/// query traversal per inner-product candidate.
+pub fn distanceToQueryF16BoundedWithQueryNorm(
+    query: []const f32,
+    query_measure: f32,
+    query_norm: f32,
+    candidate: []const f16,
+    candidate_scale: f32,
+    metric: DistanceMetric,
+) BoundedDistance {
+    const score_distance = distanceToQueryF16(query, query_measure, candidate, candidate_scale, metric);
+    var error_norm_squared: f64 = 0;
+    var candidate_norm_squared: f64 = 0;
+    for (candidate) |component_f16| {
+        const component: f32 = @floatCast(component_f16);
+        const decoded = component * candidate_scale;
+        const component_error = candidate_scale *
+            (@abs(component) * (1.0 / 1024.0) + 1.0 / 8_388_608.0);
+        error_norm_squared += @as(f64, component_error) * component_error;
+        candidate_norm_squared += @as(f64, decoded) * decoded;
+    }
+    const error_norm_raw: f32 = @floatCast(@sqrt(error_norm_squared));
+    const error_norm = error_norm_raw + 8.0 * std.math.floatEps(f32) * (error_norm_raw + 1.0);
+    const candidate_norm_raw: f32 = @floatCast(@sqrt(candidate_norm_squared));
+    const candidate_norm = @max(0, candidate_norm_raw - 8.0 * std.math.floatEps(f32) * (candidate_norm_raw + 1.0));
+    return boundedDistanceFromProjectionMetadata(
+        score_distance,
+        query_norm,
+        error_norm,
+        candidate_norm,
+        metric,
+    );
+}
+
+/// Completes a float16 candidate score using quantization metadata persisted
+/// beside the immutable vector. `decoded_norm_lower_bound` must be a lower
+/// bound, while `error_norm` must upper-bound the source-to-projection error.
+/// This keeps the query path to one SIMD vector traversal.
+pub fn boundedDistanceFromProjectionMetadata(
+    score_distance: f32,
+    query_norm: f32,
+    error_norm: f32,
+    decoded_norm_lower_bound: f32,
+    metric: DistanceMetric,
+) BoundedDistance {
+    const arithmetic_slop = 64.0 * std.math.floatEps(f32) * (@abs(score_distance) + 1.0);
+    const query_norm_upper = query_norm + 8.0 * std.math.floatEps(f32) * (query_norm + 1.0);
+    const approximate_norm = @sqrt(@max(score_distance, 0.0));
+    const approximate_norm_upper = approximate_norm + 8.0 * std.math.floatEps(f32) * (approximate_norm + 1.0);
+    const bound = switch (metric) {
+        .inner_product => query_norm_upper * error_norm,
+        .l2_squared => 2.0 * approximate_norm_upper * error_norm + error_norm * error_norm,
+        .cosine => blk: {
+            if (query_norm == 0 or decoded_norm_lower_bound <= error_norm)
+                break :blk std.math.inf(f32);
+            // The normalized-vector perturbation is at most
+            // 2||e||/(||v_hat||-||e||); cosine distance has the same bound.
+            break :blk @min(2.0, 2.0 * error_norm / (decoded_norm_lower_bound - error_norm));
+        },
+    };
+    return .{ .distance = score_distance, .error_bound = bound + arithmetic_slop };
+}
+
+test "float16 bounded distances contain authoritative float32 scores" {
+    const query = [_]f32{ 0.03125, -0.7, 3.1415927, 12.5, -64.125 };
+    const source = [_]f32{ 0.03091, -0.6991, 3.1401, 12.493, -64.09 };
+    var encoded: [source.len]f16 = undefined;
+    for (source, &encoded) |value, *out| out.* = @floatCast(value);
+    for ([_]DistanceMetric{ .l2_squared, .inner_product, .cosine }) |metric| {
+        const query_measure = switch (metric) {
+            .l2_squared => dot(&query, &query),
+            .inner_product => 0,
+            .cosine => norm(&query),
+        };
+        const bounded = distanceToQueryF16Bounded(&query, query_measure, &encoded, 1, metric);
+        const exact = distanceToQuery(&query, query_measure, &source, metric);
+        try std.testing.expect(@abs(exact - bounded.distance) <= bounded.error_bound);
+    }
+}
+
+test "persisted float16 projection metadata bounds adversarial scores" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_f16_b0a0d);
+    const random = prng.random();
+    var query: [37]f32 = undefined;
+    var source: [37]f32 = undefined;
+    var encoded: [37]f16 = undefined;
+    var decoded: [37]f32 = undefined;
+    for (0..128) |round| {
+        const magnitude: f32 = if (round % 4 == 0) 100_000 else if (round % 4 == 1) 0.00001 else 100;
+        var max_abs: f32 = 0;
+        for (&query, &source) |*q, *s| {
+            q.* = (random.float(f32) * 2 - 1) * magnitude;
+            s.* = (random.float(f32) * 2 - 1) * magnitude;
+            max_abs = @max(max_abs, @abs(s.*));
+        }
+        const candidate_scale = if (max_abs > 65_000) max_abs / 65_000 else 1;
+        var error_squared: f64 = 0;
+        var decoded_norm_squared: f64 = 0;
+        for (source, &encoded, &decoded) |source_value, *encoded_value, *decoded_value| {
+            encoded_value.* = @floatCast(source_value / candidate_scale);
+            decoded_value.* = @as(f32, @floatCast(encoded_value.*)) * candidate_scale;
+            const component_error = source_value - decoded_value.*;
+            error_squared += @as(f64, component_error) * component_error;
+            decoded_norm_squared += @as(f64, decoded_value.*) * decoded_value.*;
+        }
+        const raw_error: f32 = @floatCast(@sqrt(error_squared));
+        const error_upper = raw_error + 8.0 * std.math.floatEps(f32) * (raw_error + 1.0);
+        const raw_decoded_norm: f32 = @floatCast(@sqrt(decoded_norm_squared));
+        const decoded_norm_lower = @max(0, raw_decoded_norm - 8.0 * std.math.floatEps(f32) * (raw_decoded_norm + 1.0));
+        for ([_]DistanceMetric{ .l2_squared, .inner_product, .cosine }) |metric| {
+            const query_measure = switch (metric) {
+                .l2_squared => dot(&query, &query),
+                .inner_product => 0,
+                .cosine => norm(&query),
+            };
+            const approximate = distanceToQueryF16(&query, query_measure, &encoded, candidate_scale, metric);
+            const bounded = boundedDistanceFromProjectionMetadata(
+                approximate,
+                norm(&query),
+                error_upper,
+                decoded_norm_lower,
+                metric,
+            );
+            const exact = distanceToQuery(&query, query_measure, &source, metric);
+            try std.testing.expect(@abs(exact - bounded.distance) <= bounded.error_bound);
+        }
+    }
+}
+
 fn distanceToQueryF16Metric(
     query: []const f32,
     query_measure: f32,

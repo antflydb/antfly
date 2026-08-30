@@ -69,6 +69,11 @@ COUNT_PROFILE_FIELDS = (
     "hbc_rerank_vector_block_hits",
     "hbc_rerank_vector_block_misses",
     "hbc_rerank_vector_block_fallbacks",
+    "hbc_rerank_vector_projection_reads",
+    "hbc_rerank_vector_projection_bytes",
+    "hbc_rerank_vector_residual_reads",
+    "hbc_rerank_vector_residual_bytes",
+    "hbc_rerank_vector_location_reuses",
     "hbc_rerank_artifact_cache_hits",
     "hbc_rerank_artifact_vectors_loaded",
 )

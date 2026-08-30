@@ -51,6 +51,7 @@ pub const SearchScratch = struct {
     vector_views: [][]const f32,
     distances: []f32,
     error_bounds: []f32,
+    score_bounds: []f32,
     flat_probes: []search_types.FlatCentroidProbe,
     flat_probe_merge: []search_types.FlatCentroidProbe,
     coverage_members: []CoverageMember,
@@ -94,6 +95,8 @@ pub const SearchScratch = struct {
         errdefer alloc.free(distances);
         const error_bounds = try alloc.alloc(f32, max_candidates);
         errdefer alloc.free(error_bounds);
+        const score_bounds = try alloc.alloc(f32, max_candidates * 2);
+        errdefer alloc.free(score_bounds);
         const flat_probes = try alloc.alloc(search_types.FlatCentroidProbe, 0);
         errdefer alloc.free(flat_probes);
         const flat_probe_merge = try alloc.alloc(search_types.FlatCentroidProbe, 0);
@@ -119,6 +122,7 @@ pub const SearchScratch = struct {
             .vector_views = vector_views,
             .distances = distances,
             .error_bounds = error_bounds,
+            .score_bounds = score_bounds,
             .flat_probes = flat_probes,
             .flat_probe_merge = flat_probe_merge,
             .coverage_members = coverage_members,
@@ -141,6 +145,8 @@ pub const SearchScratch = struct {
         if (self.vector_views.len < needed) self.vector_views = try alloc.realloc(self.vector_views, needed);
         if (self.distances.len < needed) self.distances = try alloc.realloc(self.distances, needed);
         if (self.error_bounds.len < needed) self.error_bounds = try alloc.realloc(self.error_bounds, needed);
+        const score_scratch_needed = std.math.mul(usize, needed, 2) catch return error.OutOfMemory;
+        if (self.score_bounds.len < score_scratch_needed) self.score_bounds = try alloc.realloc(self.score_bounds, score_scratch_needed);
         if (self.vector_batch.len < vector_value_count) self.vector_batch = try alloc.realloc(self.vector_batch, vector_value_count);
     }
 
@@ -188,6 +194,7 @@ pub const SearchScratch = struct {
         projected = try addSliceGrowthBytes([]const f32, projected, self.vector_views.len, vector_fetch_needed);
         projected = try addSliceGrowthBytes(f32, projected, self.distances.len, vector_fetch_needed);
         projected = try addSliceGrowthBytes(f32, projected, self.error_bounds.len, vector_fetch_needed);
+        projected = try addSliceGrowthBytes(f32, projected, self.score_bounds.len, try std.math.mul(usize, vector_fetch_needed, 2));
         const vector_value_count = std.math.mul(usize, self.dims, vector_fetch_needed) catch return error.OutOfMemory;
         projected = try addSliceGrowthBytes(f32, projected, self.vector_batch.len, vector_value_count);
         return projected;
@@ -233,6 +240,7 @@ pub const SearchScratch = struct {
         reclaimed +|= freeSliceAboveRetainedCapacity(f32, alloc, &self.distances, max_candidates);
         if (reclaimed >= target_bytes) return reclaimed;
         reclaimed +|= freeSliceAboveRetainedCapacity(f32, alloc, &self.error_bounds, max_candidates);
+        reclaimed +|= freeSliceAboveRetainedCapacity(f32, alloc, &self.score_bounds, max_candidates * 2);
         return reclaimed;
     }
 
@@ -313,6 +321,7 @@ pub const SearchScratch = struct {
             byteLen(self.vector_views) +
             byteLen(self.distances) +
             byteLen(self.error_bounds) +
+            byteLen(self.score_bounds) +
             byteLen(self.flat_probes) +
             byteLen(self.flat_probe_merge) +
             byteLen(self.coverage_members) +
@@ -336,6 +345,7 @@ pub const SearchScratch = struct {
         alloc.free(self.vector_views);
         alloc.free(self.distances);
         alloc.free(self.error_bounds);
+        alloc.free(self.score_bounds);
         alloc.free(self.flat_probes);
         alloc.free(self.flat_probe_merge);
         alloc.free(self.coverage_members);

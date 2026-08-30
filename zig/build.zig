@@ -9486,6 +9486,24 @@ pub fn build(b: *std.Build) void {
     const hbc_read_bench_step = b.step("hbc-read-bench", "Benchmark HBC query read paths with storage and search-profile counters");
     hbc_read_bench_step.dependOn(&run_hbc_read_bench.step);
 
+    const vector_projection_bounds_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/vectors/vector_projection_bounds_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    vector_projection_bounds_bench_mod.addImport("antfly-zig", lib_mod);
+    const vector_projection_bounds_bench = b.addExecutable(.{
+        .name = "vector_projection_bounds_bench",
+        .root_module = vector_projection_bounds_bench_mod,
+    });
+    const run_vector_projection_bounds_bench = b.addRunArtifact(vector_projection_bounds_bench);
+    if (b.args) |args| run_vector_projection_bounds_bench.addArgs(args);
+    const vector_projection_bounds_bench_step = b.step(
+        "vector-projection-bounds-bench",
+        "Benchmark persisted float16 projection bounds against legacy query-time scans",
+    );
+    vector_projection_bounds_bench_step.dependOn(&run_vector_projection_bounds_bench.step);
+
     const hbc_isolate_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/tools/hbc_isolate.zig"),
         .target = target,

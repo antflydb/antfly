@@ -26,4 +26,8 @@ pub const vector_projection_record_version: u16 = 14;
 /// V15 carries the durable native dense-storage rollout phase. Enum ordinals
 /// are fixed by common/dense_native_storage_phase.zig.
 pub const dense_native_storage_record_version: u16 = 15;
-pub const current_record_version: u16 = dense_native_storage_record_version;
+/// V16 frames every index status and terminates its stable core with a
+/// length-delimited TLV extension area. Unknown extensions can be skipped
+/// during rolling upgrades without positional tail arithmetic.
+pub const framed_index_status_record_version: u16 = 16;
+pub const current_record_version: u16 = framed_index_status_record_version;

@@ -428,7 +428,7 @@ start_server() {
     --port "$port" \
     --health-port "$health_port" \
     --auth false \
-    "${memory_args[@]}" \
+    ${memory_args[@]+"${memory_args[@]}"} \
     --data-dir "$run_root/data" \
     >"$run_root/$log_name" 2>&1 &
   server_pid=$!

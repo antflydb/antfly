@@ -1397,11 +1397,13 @@ const BatchExecutionContext = struct {
 const ReplayApplyContext = struct {
     db: *DB,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
+    dense_capture_lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease = null,
 };
 
 const ReplayApplyContextBatch = struct {
     batch: *const BatchExecutionContext,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
+    dense_capture_lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease = null,
 };
 
 const TtlCleanupContext = struct {
@@ -37907,6 +37909,7 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
         saw_entries = saw_entries or stats.scanned_entries > 0;
         if (stats.appliedSequenceAdvance(applied)) |sequence| {
             try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
+            try finishReplayCaptureContext(&replay_ctx, index_ref, sequence);
             try updates.append(ctx.alloc, .{
                 .index_name = index_ref.name,
                 .sequence = sequence,
@@ -37915,11 +37918,12 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
             try canAdvanceDerivedReplayTargetContext(ctx, index_ref, applied, target_sequence))
         {
             try ctx.index_manager.checkpointLsmWalForManagedIndex(index_ref);
+            try finishReplayCaptureContext(&replay_ctx, index_ref, target_sequence);
             try updates.append(ctx.alloc, .{
                 .index_name = index_ref.name,
                 .sequence = target_sequence,
             });
-        }
+        } else try abortReplayCaptureContext(&replay_ctx, index_ref);
     }
     try saveAppliedSequencesBatchContext(ctx, updates.items);
     try truncateReplayJournalIfSafeContext(ctx);
@@ -38494,13 +38498,15 @@ fn replayPendingDerivedBatches(
         saw_entries = saw_entries or stats.scanned_entries > 0;
         if (stats.appliedSequenceAdvance(applied)) |sequence| {
             try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
+            try finishReplayCapture(&replay_ctx, index_ref, sequence);
             try self.core.saveAppliedSequence(index_ref.name, sequence);
         } else if (stats.shouldTryTargetAdvance(applied, target_sequence) and
             try canAdvanceDerivedToTargetAsync(self.async_context, index_ref, applied, target_sequence))
         {
             try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
+            try finishReplayCapture(&replay_ctx, index_ref, target_sequence);
             try self.core.saveAppliedSequence(index_ref.name, target_sequence);
-        }
+        } else try abortReplayCapture(&replay_ctx, index_ref);
     }
     if (options.truncate_replay) try truncateReplayJournalIfSafe(self);
 }
@@ -40053,11 +40059,23 @@ fn applyDerivedBatchToIndexContextProfiled(
             const dense_apply_start_ns = monotonicTimeNs();
             const dense_finish_options = denseCatchUpFinishOptions();
             const borrow_source_capture = borrow_active_source_capture;
-            var posting_capture_started = try ctx.index_manager.beginDensePostingSidecarCaptureByNameWithOptions(
+            const posting_capture = try ctx.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(
                 index_ref.name,
                 .{ .borrow_active_source = borrow_source_capture },
             );
-            errdefer if (posting_capture_started) ctx.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
+            var posting_capture_owned = if (posting_capture) |lease| lease.ownsLifecycle() else false;
+            errdefer if (posting_capture_owned) if (posting_capture) |lease| {
+                ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch |err| {
+                    if (err != error.PostingWalCaptureSuperseded and
+                        err != error.ExperimentalPostingCaptureNotActive)
+                    {
+                        std.log.err("dense posting capture abort failed index={s} err={s}", .{ index_ref.name, @errorName(err) });
+                    }
+                };
+            };
+            if (posting_capture) |lease| {
+                try ctx.index_manager.recordDensePostingCaptureMutationSequence(index_ref.name, lease, batch.sequence);
+            }
             // A borrowed source capture already owns the HBC streaming
             // session even when this apply uses a short-lived context whose
             // counters are empty. Never nest a local session inside it.
@@ -40141,9 +40159,13 @@ fn applyDerivedBatchToIndexContextProfiled(
                 // can neither join it nor make progress. Catch-up and external
                 // bulk windows own their capture outside this batch and take
                 // the `posting_capture_started == false` path.
-                if (posting_capture_started) {
-                    try ctx.index_manager.finishDensePostingSidecarCaptureByName(index_ref.name, batch.sequence);
-                    posting_capture_started = false;
+                if (posting_capture_owned) {
+                    try ctx.index_manager.finishDensePostingSidecarCaptureLeaseByName(
+                        index_ref.name,
+                        posting_capture.?,
+                        batch.sequence,
+                    );
+                    posting_capture_owned = false;
                 }
             }
             try clearPublishedEmbeddingArtifactRepairIssuesContext(ctx, index_ref.name, dense_embeddings.writes, batch.sequence);
@@ -42780,6 +42802,56 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
     return true;
 }
 
+fn finishReplayCapture(
+    replay_ctx: *ReplayApplyContext,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    sequence: u64,
+) !void {
+    const lease = replay_ctx.dense_capture_lease orelse return;
+    if (!lease.ownsLifecycle()) return error.PostingWalCaptureBorrowerCannotFinish;
+    const manager = replay_ctx.db.core.batchExecutionResources().index_manager;
+    try manager.finishDensePostingSidecarCaptureLeaseByName(index_ref.name, lease, sequence);
+    replay_ctx.dense_capture_lease = null;
+}
+
+fn abortReplayCapture(
+    replay_ctx: *ReplayApplyContext,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) !void {
+    const lease = replay_ctx.dense_capture_lease orelse return;
+    defer replay_ctx.dense_capture_lease = null;
+    if (!lease.ownsLifecycle()) return error.PostingWalCaptureBorrowerCannotFinish;
+    const manager = replay_ctx.db.core.batchExecutionResources().index_manager;
+    manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch |err| switch (err) {
+        error.PostingWalCaptureSuperseded, error.ExperimentalPostingCaptureNotActive => {},
+        else => return err,
+    };
+}
+
+fn finishReplayCaptureContext(
+    replay_ctx: *ReplayApplyContextBatch,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    sequence: u64,
+) !void {
+    const lease = replay_ctx.dense_capture_lease orelse return;
+    if (!lease.ownsLifecycle()) return error.PostingWalCaptureBorrowerCannotFinish;
+    try replay_ctx.batch.index_manager.finishDensePostingSidecarCaptureLeaseByName(index_ref.name, lease, sequence);
+    replay_ctx.dense_capture_lease = null;
+}
+
+fn abortReplayCaptureContext(
+    replay_ctx: *ReplayApplyContextBatch,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) !void {
+    const lease = replay_ctx.dense_capture_lease orelse return;
+    defer replay_ctx.dense_capture_lease = null;
+    if (!lease.ownsLifecycle()) return error.PostingWalCaptureBorrowerCannotFinish;
+    replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch |err| switch (err) {
+        error.PostingWalCaptureSuperseded, error.ExperimentalPostingCaptureNotActive => {},
+        else => return err,
+    };
+}
+
 fn beginDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
     if (index_ref.kind != .dense_vector) return;
     const replay_ctx: *ReplayApplyContext = @ptrCast(@alignCast(ctx_ptr));
@@ -42791,8 +42863,12 @@ fn beginDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.M
     // WAL transaction boundary.
     var index_apply_guard = try resources.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
-    const started_capture = try resources.index_manager.beginDensePostingSidecarCaptureByName(index_ref.name);
-    errdefer if (started_capture) resources.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
+    const capture = try resources.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(index_ref.name, .{});
+    replay_ctx.dense_capture_lease = capture;
+    errdefer if (capture) |lease| if (lease.ownsLifecycle()) {
+        resources.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
+        replay_ctx.dense_capture_lease = null;
+    };
     try resources.index_manager.beginDenseStreamingReplaySessionByName(index_ref.name);
 }
 
@@ -42801,11 +42877,16 @@ fn finishDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.
     const replay_ctx: *ReplayApplyContext = @ptrCast(@alignCast(ctx_ptr));
     const resources = replay_ctx.db.core.batchExecutionResources();
     if (!success) {
-        resources.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
+        if (replay_ctx.dense_capture_lease) |lease| if (lease.ownsLifecycle())
+            resources.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch |err| {
+                if (err != error.PostingWalCaptureSuperseded and err != error.ExperimentalPostingCaptureNotActive) return err;
+            };
+        replay_ctx.dense_capture_lease = null;
         resources.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
         return;
     }
-    errdefer resources.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
+    errdefer if (replay_ctx.dense_capture_lease) |lease| if (lease.ownsLifecycle())
+        resources.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
     errdefer resources.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
     try resources.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, denseCatchUpFinishOptions());
@@ -42820,8 +42901,12 @@ fn beginDerivedCatchUpWindowContext(ctx_ptr: *anyopaque, index_ref: index_manage
     const replay_ctx: *ReplayApplyContextBatch = @ptrCast(@alignCast(ctx_ptr));
     var index_apply_guard = try replay_ctx.batch.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
-    const started_capture = try replay_ctx.batch.index_manager.beginDensePostingSidecarCaptureByName(index_ref.name);
-    errdefer if (started_capture) replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
+    const capture = try replay_ctx.batch.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(index_ref.name, .{});
+    replay_ctx.dense_capture_lease = capture;
+    errdefer if (capture) |lease| if (lease.ownsLifecycle()) {
+        replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
+        replay_ctx.dense_capture_lease = null;
+    };
     try replay_ctx.batch.index_manager.beginDenseStreamingReplaySessionByName(index_ref.name);
 }
 
@@ -42829,11 +42914,16 @@ fn finishDerivedCatchUpWindowContext(ctx_ptr: *anyopaque, index_ref: index_manag
     if (index_ref.kind != .dense_vector) return;
     const replay_ctx: *ReplayApplyContextBatch = @ptrCast(@alignCast(ctx_ptr));
     if (!success) {
-        replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
+        if (replay_ctx.dense_capture_lease) |lease| if (lease.ownsLifecycle())
+            replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch |err| {
+                if (err != error.PostingWalCaptureSuperseded and err != error.ExperimentalPostingCaptureNotActive) return err;
+            };
+        replay_ctx.dense_capture_lease = null;
         replay_ctx.batch.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
         return;
     }
-    errdefer replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureByName(index_ref.name);
+    errdefer if (replay_ctx.dense_capture_lease) |lease| if (lease.ownsLifecycle())
+        replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
     errdefer replay_ctx.batch.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
     try replay_ctx.batch.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, denseCatchUpFinishOptions());

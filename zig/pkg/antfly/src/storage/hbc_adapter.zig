@@ -3122,6 +3122,11 @@ pub const ExperimentalPostingCaptureOwner = enum {
     maintenance,
 };
 
+pub const ExperimentalPostingCaptureLease = struct {
+    epoch: u64,
+    base_coverage: u64,
+};
+
 pub const HBCIndex = struct {
     alloc: Allocator,
     env_owner: EnvOwner,
@@ -3146,6 +3151,16 @@ pub const HBCIndex = struct {
     experimental_posting_mutation_base_generation: ?*ExperimentalPostingReadGeneration = null,
     experimental_posting_capture_enabled: bool = false,
     experimental_posting_capture_owner: ExperimentalPostingCaptureOwner = .none,
+    /// Durable source boundary observed when the active capture was opened.
+    /// The capture may only be published at a strictly newer source boundary
+    /// once it contains mutations. This makes delayed applied-watermark
+    /// callbacks observers of already-covered work instead of capabilities
+    /// that can consume and relabel a newer source transaction.
+    experimental_posting_capture_base_source_sequence: u64 = 0,
+    /// Monotonic diagnostic identity for the active capture. Epochs are never
+    /// reused within an index instance, including after cancellation.
+    experimental_posting_capture_epoch: u64 = 0,
+    experimental_posting_capture_max_mutation_sequence: u64 = 0,
     // A maintenance capture spans both its durable WAL append and any
     // immediate checkpoint maintenance. Keep the compatibility owner alive
     // for that whole logical transaction; the append may activate a native
@@ -3278,6 +3293,9 @@ pub const HBCIndex = struct {
     external_vector_batch_scratch_loader: ?ExternalVectorBatchScratchLoader = null,
     external_vector_batch_transformed_matrix_loader: ?ExternalVectorBatchTransformedMatrixLoader = null,
     external_vector_batch_distance_loader: ?ExternalVectorBatchDistanceLoader = null,
+    external_vector_batch_bounded_distance_loader: ?ExternalVectorBatchBoundedDistanceLoader = null,
+    external_vector_batch_located_distance_loader: ?ExternalVectorBatchLocatedDistanceLoader = null,
+    external_vector_bounded_distance_available: ?ExternalVectorBoundedDistanceAvailable = null,
 
     const EnvOwner = hbc_backend.OpenedBackend;
     pub const ExternalVectorLoader = *const fn (ctx: *anyopaque, alloc: Allocator, vector_id: u64, metadata: []const u8) anyerror![]f32;
@@ -3307,6 +3325,39 @@ pub const HBCIndex = struct {
         scratch: ExternalVectorBatchDistanceScratch,
         profile: ?*vectorindex_search_types.SearchProfile,
     ) anyerror!void;
+    pub const ExternalVectorBatchBoundedDistanceLoader = *const fn (
+        ctx: *anyopaque,
+        vector_ids: []const u64,
+        metadata: []const ?[]const u8,
+        query: []const f32,
+        query_measure: f32,
+        metric: vec.DistanceMetric,
+        distances: []f32,
+        error_bounds: []f32,
+        batch_scratch: []f32,
+        dims: usize,
+        scratch: ExternalVectorBatchDistanceScratch,
+        profile: ?*vectorindex_search_types.SearchProfile,
+    ) anyerror!void;
+    /// Completes exact scores from generation-pinned locations established by
+    /// a prior bounded pass. Misses remain +inf and continue through ordinary
+    /// metadata/artifact resolution.
+    pub const ExternalVectorBatchLocatedDistanceLoader = *const fn (
+        ctx: *anyopaque,
+        vector_ids: []const u64,
+        query: []const f32,
+        query_measure: f32,
+        metric: vec.DistanceMetric,
+        distances: []f32,
+        batch_scratch: []f32,
+        dims: usize,
+        source_sequence: ?u64,
+        profile: ?*vectorindex_search_types.SearchProfile,
+    ) anyerror!void;
+    pub const ExternalVectorBoundedDistanceAvailable = *const fn (
+        ctx: *anyopaque,
+        source_sequence: ?u64,
+    ) bool;
     pub const BorrowedNode = BorrowedNodeLease;
     pub const BorrowedQuantized = BorrowedQuantizedLease;
     pub const BorrowedVector = BorrowedVectorLease;
@@ -4722,12 +4773,22 @@ pub const HBCIndex = struct {
             self.flat_centroid_build_bytes_accounted,
             reservation.transient_bytes,
         ) catch {
+            const current_bytes = self.flat_centroid_build_bytes_accounted;
             self.flat_centroid_build_accounting_mu.unlock();
+            std.log.warn("flat centroid transient reservation overflow current_bytes={d} requested_bytes={d}", .{
+                current_bytes,
+                reservation.transient_bytes,
+            });
             return error.ResourceBudgetExceeded;
         };
         if (self.resource_manager) |manager| {
             manager.adjustUsage(.dense_search_working_set, &self.flat_centroid_build_bytes_accounted, transient_next) catch |err| {
                 self.flat_centroid_build_accounting_mu.unlock();
+                std.log.warn("flat centroid transient reservation denied current_bytes={d} target_bytes={d} err={s}", .{
+                    transient_next - reservation.transient_bytes,
+                    transient_next,
+                    @errorName(err),
+                });
                 return err;
             };
         } else {
@@ -4744,12 +4805,22 @@ pub const HBCIndex = struct {
             self.flat_centroid_retained_reservation_bytes_accounted,
             reservation.retained_bytes,
         ) catch {
+            const current_bytes = self.flat_centroid_retained_reservation_bytes_accounted;
             self.flat_centroid_build_accounting_mu.unlock();
+            std.log.warn("flat centroid retained reservation overflow current_bytes={d} requested_bytes={d}", .{
+                current_bytes,
+                reservation.retained_bytes,
+            });
             return error.ResourceBudgetExceeded;
         };
         if (self.resource_manager) |manager| {
             manager.adjustUsage(.hbc_node_metadata_cache, &self.flat_centroid_retained_reservation_bytes_accounted, retained_next) catch |err| {
                 self.flat_centroid_build_accounting_mu.unlock();
+                std.log.warn("flat centroid retained reservation denied current_bytes={d} target_bytes={d} err={s}", .{
+                    retained_next - reservation.retained_bytes,
+                    retained_next,
+                    @errorName(err),
+                });
                 return err;
             };
         } else {
@@ -4794,7 +4865,16 @@ pub const HBCIndex = struct {
         build_reservation: vectorindex_spfresh_index.FlatCentroidBuildReservation,
     ) !void {
         const bytes = directory.bytes();
-        if (bytes > build_reservation.retained_bytes) return error.ResourceBudgetExceeded;
+        if (bytes > build_reservation.retained_bytes) {
+            std.log.warn("flat centroid directory exceeded retained reservation actual_bytes={d} reserved_bytes={d} blocks={d} postings={d} shadow_words={d}", .{
+                bytes,
+                build_reservation.retained_bytes,
+                directory.blocks.len,
+                directory.posting_count,
+                directory.owned_shadowed_posting_bits.len,
+            });
+            return error.ResourceBudgetExceeded;
+        }
         lockAtomic(&self.flat_centroid_build_accounting_mu);
         lockAtomic(&self.flat_centroid_accounting_mu);
         errdefer self.flat_centroid_accounting_mu.unlock();
@@ -5112,10 +5192,24 @@ pub const HBCIndex = struct {
         defer self.scratch_mu.unlock();
 
         const delta = target_bytes - handle.accounted_bytes;
-        const next_total = std.math.add(u64, self.search_workspace_bytes_accounted, delta) catch
+        const next_total = std.math.add(u64, self.search_workspace_bytes_accounted, delta) catch {
+            std.log.warn("dense search scratch reservation overflow current_bytes={d} requested_target_bytes={d} handle_bytes={d}", .{
+                self.search_workspace_bytes_accounted,
+                target_bytes,
+                handle.accounted_bytes,
+            });
             return error.ResourceBudgetExceeded;
+        };
         if (self.resource_manager) |manager| {
-            try manager.adjustUsage(.dense_search_working_set, &self.search_workspace_bytes_accounted, next_total);
+            manager.adjustUsage(.dense_search_working_set, &self.search_workspace_bytes_accounted, next_total) catch |err| {
+                std.log.warn("dense search scratch reservation denied current_bytes={d} target_bytes={d} handle_bytes={d} err={s}", .{
+                    self.search_workspace_bytes_accounted,
+                    next_total,
+                    handle.accounted_bytes,
+                    @errorName(err),
+                });
+                return err;
+            };
         } else {
             self.search_workspace_bytes_accounted = next_total;
         }
@@ -5415,9 +5509,24 @@ pub const HBCIndex = struct {
         self.external_vector_batch_distance_loader = loader;
     }
 
+    pub fn setExternalVectorBatchBoundedDistanceLoader(self: *HBCIndex, ctx: *anyopaque, loader: ExternalVectorBatchBoundedDistanceLoader) void {
+        self.external_vector_ctx = ctx;
+        self.external_vector_batch_bounded_distance_loader = loader;
+    }
+
+    pub fn setExternalVectorBatchLocatedDistanceLoader(self: *HBCIndex, ctx: *anyopaque, loader: ExternalVectorBatchLocatedDistanceLoader) void {
+        self.external_vector_ctx = ctx;
+        self.external_vector_batch_located_distance_loader = loader;
+    }
+
+    pub fn setExternalVectorBoundedDistanceAvailable(self: *HBCIndex, ctx: *anyopaque, available: ExternalVectorBoundedDistanceAvailable) void {
+        self.external_vector_ctx = ctx;
+        self.external_vector_bounded_distance_available = available;
+    }
+
     pub fn hasExternalVectorLoader(self: *const HBCIndex) bool {
         return self.external_vector_ctx != null and
-            (self.external_vector_loader != null or self.external_vector_scratch_loader != null or self.external_vector_batch_scratch_loader != null or self.external_vector_batch_transformed_matrix_loader != null or self.external_vector_batch_distance_loader != null);
+            (self.external_vector_loader != null or self.external_vector_scratch_loader != null or self.external_vector_batch_scratch_loader != null or self.external_vector_batch_transformed_matrix_loader != null or self.external_vector_batch_distance_loader != null or self.external_vector_batch_bounded_distance_loader != null);
     }
 
     pub fn refreshHbcCacheUsage(self: *HBCIndex) void {
@@ -6979,6 +7088,8 @@ pub const HBCIndex = struct {
         self.experimental_posting_overlay_collapsed_wal_bytes = 0;
         self.experimental_posting_capture_enabled = false;
         self.experimental_posting_capture_owner = .none;
+        self.experimental_posting_capture_base_source_sequence = 0;
+        self.experimental_posting_capture_max_mutation_sequence = 0;
         self.clearExperimentalPostingMutationBase();
         self.clearExperimentalPostingCapturedValues();
         self.clearExperimentalExactVectorMutations();
@@ -6997,7 +7108,21 @@ pub const HBCIndex = struct {
         applied_sequence: u64,
         options: ExperimentalPostingWalAppendOptions,
     ) !void {
+        return try self.persistExperimentalPostingSidecarAtAppliedSequenceWithLease(
+            applied_sequence,
+            options,
+            null,
+        );
+    }
+
+    pub fn persistExperimentalPostingSidecarAtAppliedSequenceWithLease(
+        self: *HBCIndex,
+        applied_sequence: u64,
+        options: ExperimentalPostingWalAppendOptions,
+        lease: ?ExperimentalPostingCaptureLease,
+    ) !void {
         if (!self.experimental_posting_sidecar_managed) return;
+        if (lease) |expected| try self.validateExperimentalPostingCaptureLease(expected);
         if (self.write_session_depth != 0) return error.ActiveWriteSession;
         if (self.experimental_posting_write_store == null) {
             self.experimental_posting_write_store = try self.openExperimentalPostingStore();
@@ -7012,16 +7137,15 @@ pub const HBCIndex = struct {
             _ = try self.publishExperimentalPostingCheckpoint(applied_sequence);
             return;
         }
-        // Applied-sequence persistence is coalesced independently from dense
-        // replay. A delayed callback may therefore carry a watermark below a
-        // sidecar generation already published by a later callback. Never
-        // regress source coverage or discard captured posting changes: record
-        // those changes as another derived batch at the current source epoch.
-        const publication_sequence = @max(posting_store.covered_source_sequence, applied_sequence);
         if (self.experimental_posting_capture_enabled) {
+            if (applied_sequence < self.experimental_posting_capture_base_source_sequence and
+                self.experimentalPostingCaptureHasMutations())
+            {
+                return error.PostingWalCaptureSequenceOutsideLease;
+            }
             _ = try self.finishExperimentalPostingMutationCapture(
                 try posting_store.nextBatchId(),
-                publication_sequence,
+                applied_sequence,
                 options,
             );
         } else if (posting_store.covered_source_sequence < applied_sequence) {
@@ -7088,6 +7212,16 @@ pub const HBCIndex = struct {
             }
         }
         self.experimental_posting_sidecar_managed = true;
+        self.experimental_posting_capture_epoch = std.math.add(
+            u64,
+            self.experimental_posting_capture_epoch,
+            1,
+        ) catch return error.ExperimentalPostingCaptureEpochOverflow;
+        self.experimental_posting_capture_base_source_sequence = if (self.experimental_posting_write_store) |*store|
+            store.covered_source_sequence
+        else
+            self.experimentalPostingDurableAppliedSequence() orelse 0;
+        self.experimental_posting_capture_max_mutation_sequence = self.experimental_posting_capture_base_source_sequence;
         self.experimental_posting_capture_enabled = true;
         self.experimental_posting_capture_owner = owner;
     }
@@ -7116,6 +7250,57 @@ pub const HBCIndex = struct {
         return self.experimental_posting_capture_owner;
     }
 
+    pub fn experimentalPostingMutationCaptureBaseSourceSequence(self: *const HBCIndex) ?u64 {
+        if (!self.experimental_posting_capture_enabled) return null;
+        return self.experimental_posting_capture_base_source_sequence;
+    }
+
+    pub fn experimentalPostingMutationCaptureEpoch(self: *const HBCIndex) ?u64 {
+        if (!self.experimental_posting_capture_enabled) return null;
+        return self.experimental_posting_capture_epoch;
+    }
+
+    pub fn experimentalPostingMutationCaptureLease(self: *const HBCIndex) ?ExperimentalPostingCaptureLease {
+        if (!self.experimental_posting_capture_enabled) return null;
+        return .{
+            .epoch = self.experimental_posting_capture_epoch,
+            .base_coverage = self.experimental_posting_capture_base_source_sequence,
+        };
+    }
+
+    fn validateExperimentalPostingCaptureLease(
+        self: *const HBCIndex,
+        lease: ExperimentalPostingCaptureLease,
+    ) !void {
+        if (!self.experimental_posting_capture_enabled) return error.ExperimentalPostingCaptureNotActive;
+        if (lease.epoch != self.experimental_posting_capture_epoch or
+            lease.base_coverage != self.experimental_posting_capture_base_source_sequence)
+        {
+            return error.PostingWalCaptureSuperseded;
+        }
+    }
+
+    pub fn recordExperimentalPostingCaptureMutationSequence(
+        self: *HBCIndex,
+        lease: ExperimentalPostingCaptureLease,
+        mutation_sequence: u64,
+    ) !void {
+        try self.validateExperimentalPostingCaptureLease(lease);
+        if (mutation_sequence < lease.base_coverage) return error.PostingWalMutationSequenceBeforeCapture;
+        self.experimental_posting_capture_max_mutation_sequence = @max(
+            self.experimental_posting_capture_max_mutation_sequence,
+            mutation_sequence,
+        );
+    }
+
+    pub fn cancelExperimentalPostingMutationCaptureWithLease(
+        self: *HBCIndex,
+        lease: ExperimentalPostingCaptureLease,
+    ) !void {
+        try self.validateExperimentalPostingCaptureLease(lease);
+        self.cancelExperimentalPostingMutationCapture();
+    }
+
     /// Routes query-facing HBC mutations through the committed posting WAL
     /// once an immutable base generation is available. Bootstrap and rebuild
     /// still use the general store until the first complete checkpoint exists.
@@ -7130,6 +7315,8 @@ pub const HBCIndex = struct {
     pub fn cancelExperimentalPostingMutationCapture(self: *HBCIndex) void {
         self.experimental_posting_capture_enabled = false;
         self.experimental_posting_capture_owner = .none;
+        self.experimental_posting_capture_base_source_sequence = 0;
+        self.experimental_posting_capture_max_mutation_sequence = 0;
         var mutation_base_restored = true;
         if (self.experimental_posting_wal_authoritative.load(.acquire) and
             self.experimental_posting_mutation_base_generation != null)
@@ -7239,8 +7426,15 @@ pub const HBCIndex = struct {
         options: ExperimentalPostingWalAppendOptions,
     ) !PostingWalAppendStats {
         if (!self.experimental_posting_capture_enabled) return error.ExperimentalPostingCaptureNotActive;
+        if (covered_source_sequence < self.experimental_posting_capture_max_mutation_sequence)
+            return error.PostingWalMutationSequenceBeyondCoverage;
+        if (covered_source_sequence < self.experimental_posting_capture_base_source_sequence) {
+            return error.PostingWalCaptureSequenceOutsideLease;
+        }
         self.experimental_posting_capture_enabled = false;
         self.experimental_posting_capture_owner = .none;
+        self.experimental_posting_capture_base_source_sequence = 0;
+        self.experimental_posting_capture_max_mutation_sequence = 0;
         defer self.clearExperimentalPostingMutationBase();
         defer self.clearExperimentalPostingCapturedValues();
         defer self.clearExperimentalExactVectorMutations();
@@ -11529,6 +11723,8 @@ pub const HBCIndex = struct {
             values_storage,
             batch_scratch,
             miss_distance_storage,
+            null,
+            null,
             profile,
             true,
         );
@@ -11567,6 +11763,92 @@ pub const HBCIndex = struct {
             values_storage,
             batch_scratch,
             miss_distance_storage,
+            null,
+            null,
+            profile,
+            false,
+        );
+    }
+
+    pub fn scoreExternalRerankCandidatesSortedWithScratch(
+        self: *HBCIndex,
+        txn: anytype,
+        ranked_items: []const ApproxSearchResult,
+        rerank_positions: []const usize,
+        query: []const f32,
+        query_measure: f32,
+        distances: []f32,
+        error_bounds: []f32,
+        vector_id_storage: []u64,
+        metadata_storage: []?[]const u8,
+        vector_view_storage: [][]const f32,
+        lookup_storage: []FixedKeyLookup,
+        key_views_storage: [][]const u8,
+        values_storage: []?[]const u8,
+        batch_scratch: []f32,
+        miss_distance_storage: []f32,
+        miss_bound_storage: []f32,
+        profile: ?*SearchProfile,
+    ) !bool {
+        return self.scoreExternalRerankVectorsSortedWithScratchCachePolicy(
+            txn,
+            ranked_items,
+            rerank_positions,
+            query,
+            query_measure,
+            distances,
+            vector_id_storage,
+            metadata_storage,
+            vector_view_storage,
+            lookup_storage,
+            key_views_storage,
+            values_storage,
+            batch_scratch,
+            miss_distance_storage,
+            error_bounds,
+            miss_bound_storage,
+            profile,
+            true,
+        );
+    }
+
+    pub fn scoreExternalRerankCandidatesSortedWithScratchUncached(
+        self: *HBCIndex,
+        txn: anytype,
+        ranked_items: []const ApproxSearchResult,
+        rerank_positions: []const usize,
+        query: []const f32,
+        query_measure: f32,
+        distances: []f32,
+        error_bounds: []f32,
+        vector_id_storage: []u64,
+        metadata_storage: []?[]const u8,
+        vector_view_storage: [][]const f32,
+        lookup_storage: []FixedKeyLookup,
+        key_views_storage: [][]const u8,
+        values_storage: []?[]const u8,
+        batch_scratch: []f32,
+        miss_distance_storage: []f32,
+        miss_bound_storage: []f32,
+        profile: ?*SearchProfile,
+    ) !bool {
+        return self.scoreExternalRerankVectorsSortedWithScratchCachePolicy(
+            txn,
+            ranked_items,
+            rerank_positions,
+            query,
+            query_measure,
+            distances,
+            vector_id_storage,
+            metadata_storage,
+            vector_view_storage,
+            lookup_storage,
+            key_views_storage,
+            values_storage,
+            batch_scratch,
+            miss_distance_storage,
+            error_bounds,
+            miss_bound_storage,
             profile,
             false,
         );
@@ -11588,16 +11870,30 @@ pub const HBCIndex = struct {
         values_storage: []?[]const u8,
         batch_scratch: []f32,
         miss_distance_storage: []f32,
+        bounded_error_bounds: ?[]f32,
+        miss_bound_storage: ?[]f32,
         profile: ?*SearchProfile,
         comptime use_cache: bool,
     ) !bool {
-        const loader = self.external_vector_batch_distance_loader orelse return false;
+        const exact_loader = self.external_vector_batch_distance_loader;
+        const bounded_loader = self.external_vector_batch_bounded_distance_loader;
+        if (bounded_error_bounds == null and exact_loader == null) return false;
+        if (bounded_error_bounds != null and bounded_loader == null) return false;
         const ctx = self.external_vector_ctx orelse return false;
+        if (bounded_error_bounds != null) {
+            const available = self.external_vector_bounded_distance_available orelse return false;
+            if (!available(ctx, experimentalPostingSourceSequenceFromTxn(txn))) return false;
+        }
         if (distances.len < rerank_positions.len) return error.InvalidArgument;
         if (vector_id_storage.len < rerank_positions.len) return error.InvalidArgument;
         if (metadata_storage.len < rerank_positions.len) return error.InvalidArgument;
         if (vector_view_storage.len < rerank_positions.len) return error.InvalidArgument;
         if (miss_distance_storage.len < rerank_positions.len) return error.InvalidArgument;
+        if (bounded_error_bounds) |bounds| {
+            if (bounds.len < rerank_positions.len) return error.InvalidArgument;
+            if (miss_bound_storage == null or miss_bound_storage.?.len < rerank_positions.len) return error.InvalidArgument;
+            @memset(bounds[0..rerank_positions.len], 0);
+        }
         if (rerank_positions.len == 0) return true;
 
         // Probe governed decoded residency before loading vector-to-document
@@ -11635,6 +11931,41 @@ pub const HBCIndex = struct {
         }
         if (miss_count == 0) return true;
 
+        if (bounded_error_bounds == null) {
+            if (self.external_vector_batch_located_distance_loader) |located_loader| {
+                const location_ids = vector_id_storage[0..miss_count];
+                const location_distances = miss_distance_storage[0..miss_count];
+                @memset(location_distances, std.math.inf(f32));
+                try located_loader(
+                    ctx,
+                    location_ids,
+                    query,
+                    query_measure,
+                    self.config.metric,
+                    location_distances,
+                    batch_scratch,
+                    @intCast(self.config.dims),
+                    experimentalPostingSourceSequenceFromTxn(txn),
+                    profile,
+                );
+                for (location_ids, location_distances) |vector_id, distance| {
+                    if (!std.math.isFinite(distance)) continue;
+                    for (rerank_positions, 0..) |index, slot| {
+                        if (ranked_items[index].vector_id != vector_id) continue;
+                        distances[slot] = distance;
+                        break;
+                    }
+                }
+                miss_count = 0;
+                for (rerank_positions, 0..) |index, slot| {
+                    if (std.math.isFinite(distances[slot])) continue;
+                    vector_id_storage[miss_count] = ranked_items[index].vector_id;
+                    miss_count += 1;
+                }
+                if (miss_count == 0) return true;
+            }
+        }
+
         const vector_ids = vector_id_storage[0..miss_count];
         const metadata = metadata_storage[0..miss_count];
         if (profile) |p| p.rerank_metadata_vectors_loaded +|= @intCast(miss_count);
@@ -11660,7 +11991,31 @@ pub const HBCIndex = struct {
         }
         if (profile) |p| p.rerank_metadata_lookup_ns += platform_time.monotonicNs() - metadata_start;
         const miss_distances = miss_distance_storage[0..miss_count];
-        loader(
+        const distance_scratch: ExternalVectorBatchDistanceScratch = .{
+            .artifact_keys = key_views_storage,
+            .raw_values = values_storage,
+            .vector_views = vector_view_storage,
+            .source_sequence = experimentalPostingSourceSequenceFromTxn(txn),
+        };
+        if (bounded_error_bounds) |_| {
+            bounded_loader.?(
+                ctx,
+                vector_ids,
+                metadata,
+                query,
+                query_measure,
+                self.config.metric,
+                miss_distances,
+                miss_bound_storage.?[0..miss_count],
+                batch_scratch,
+                @intCast(self.config.dims),
+                distance_scratch,
+                profile,
+            ) catch |err| switch (err) {
+                error.Unsupported => return false,
+                else => return err,
+            };
+        } else exact_loader.?(
             ctx,
             vector_ids,
             metadata,
@@ -11670,12 +12025,7 @@ pub const HBCIndex = struct {
             miss_distances,
             batch_scratch,
             @intCast(self.config.dims),
-            .{
-                .artifact_keys = key_views_storage,
-                .raw_values = values_storage,
-                .vector_views = vector_view_storage,
-                .source_sequence = experimentalPostingSourceSequenceFromTxn(txn),
-            },
+            distance_scratch,
             profile,
         ) catch |err| switch (err) {
             error.Unsupported => return false,
@@ -11686,10 +12036,11 @@ pub const HBCIndex = struct {
         // results contain unique vector ids. Re-deriving each output slot here
         // avoids another request-sized positions allocation while preserving
         // the approximate-distance ordering used by the early-stop proof.
-        for (vector_ids, miss_distances) |vector_id, distance| {
+        for (vector_ids, miss_distances, 0..) |vector_id, distance, miss_index| {
             for (rerank_positions, 0..) |index, slot| {
                 if (ranked_items[index].vector_id != vector_id) continue;
                 distances[slot] = distance;
+                if (bounded_error_bounds) |bounds| bounds[slot] = miss_bound_storage.?[miss_index];
                 break;
             }
         }
@@ -16012,6 +16363,108 @@ test "hbc external rerank loads metadata only for decoded vector misses" {
     try std.testing.expectEqual(@as(f32, 7), distances[1]);
     try std.testing.expectEqual(@as(u64, 1), profile.vector_cache_hits);
     try std.testing.expectEqual(@as(u64, 1), profile.rerank_artifact_cache_hits);
+    try std.testing.expectEqual(@as(u64, 1), profile.rerank_metadata_vectors_loaded);
+}
+
+test "hbc external rerank completes saved locations before metadata fallback" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .metric = .l2_squared,
+        .max_cached_vectors = 0,
+    });
+    defer idx.close();
+    try idx.insertWithMetadata(1, &.{ 1, 0 }, "doc:located");
+    try idx.insertWithMetadata(2, &.{ 0, 1 }, "doc:fallback");
+
+    const Loader = struct {
+        located_calls: usize = 0,
+        fallback_calls: usize = 0,
+
+        fn scoreLocated(
+            context: *anyopaque,
+            vector_ids: []const u64,
+            _: []const f32,
+            _: f32,
+            _: vec.DistanceMetric,
+            distances: []f32,
+            _: []f32,
+            _: usize,
+            _: ?u64,
+            _: ?*SearchProfile,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.located_calls += 1;
+            try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, vector_ids);
+            distances[0] = 3;
+            distances[1] = std.math.inf(f32);
+        }
+
+        fn scoreFallback(
+            context: *anyopaque,
+            vector_ids: []const u64,
+            metadata: []const ?[]const u8,
+            _: []const f32,
+            _: f32,
+            _: vec.DistanceMetric,
+            distances: []f32,
+            _: []f32,
+            _: usize,
+            _: HBCIndex.ExternalVectorBatchDistanceScratch,
+            _: ?*SearchProfile,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.fallback_calls += 1;
+            try std.testing.expectEqualSlices(u64, &.{2}, vector_ids);
+            try std.testing.expectEqualStrings("doc:fallback", metadata[0] orelse return error.TestUnexpectedResult);
+            distances[0] = 7;
+        }
+    };
+    var loader = Loader{};
+    idx.setExternalVectorBatchLocatedDistanceLoader(&loader, Loader.scoreLocated);
+    idx.setExternalVectorBatchDistanceLoader(&loader, Loader.scoreFallback);
+
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+    const ranked = [_]ApproxSearchResult{
+        .{ .vector_id = 1, .distance = 0.1 },
+        .{ .vector_id = 2, .distance = 0.2 },
+    };
+    var distances: [2]f32 = undefined;
+    var vector_ids: [2]u64 = undefined;
+    var metadata: [2]?[]const u8 = undefined;
+    var vector_views: [2][]const f32 = undefined;
+    var lookups: [2]FixedKeyLookup = undefined;
+    var key_views: [2][]const u8 = undefined;
+    var values: [2]?[]const u8 = undefined;
+    var batch_scratch: [4]f32 = undefined;
+    var miss_distances: [2]f32 = undefined;
+    var profile: SearchProfile = .{};
+    try std.testing.expect(try idx.scoreExternalRerankVectorsSortedWithScratch(
+        &txn,
+        &ranked,
+        &.{ 0, 1 },
+        &.{ 1, 0 },
+        1,
+        &distances,
+        &vector_ids,
+        &metadata,
+        &vector_views,
+        &lookups,
+        &key_views,
+        &values,
+        &batch_scratch,
+        &miss_distances,
+        &profile,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), loader.located_calls);
+    try std.testing.expectEqual(@as(usize, 1), loader.fallback_calls);
+    try std.testing.expectEqual(@as(f32, 3), distances[0]);
+    try std.testing.expectEqual(@as(f32, 7), distances[1]);
     try std.testing.expectEqual(@as(u64, 1), profile.rerank_metadata_vectors_loaded);
 }
 

@@ -518,6 +518,11 @@ const QueryBenchStats = struct {
     profile_rerank_artifact_distance_ns: u64 = 0,
     profile_rerank_lsm_cache_hits: u64 = 0,
     profile_rerank_lsm_cache_misses: u64 = 0,
+    profile_rerank_vector_projection_reads: u64 = 0,
+    profile_rerank_vector_projection_bytes: u64 = 0,
+    profile_rerank_vector_residual_reads: u64 = 0,
+    profile_rerank_vector_residual_bytes: u64 = 0,
+    profile_rerank_vector_location_reuses: u64 = 0,
     profile_rerank_artifact_cache_hits: u64 = 0,
     profile_rerank_artifact_vectors_loaded: u64 = 0,
     profile_rerank_distance_ns: u64 = 0,
@@ -778,6 +783,11 @@ const QueryResponseWire = struct {
                 hbc_rerank_artifact_distance_ns: u64 = 0,
                 hbc_rerank_lsm_cache_hits: u64 = 0,
                 hbc_rerank_lsm_cache_misses: u64 = 0,
+                hbc_rerank_vector_projection_reads: u64 = 0,
+                hbc_rerank_vector_projection_bytes: u64 = 0,
+                hbc_rerank_vector_residual_reads: u64 = 0,
+                hbc_rerank_vector_residual_bytes: u64 = 0,
+                hbc_rerank_vector_location_reuses: u64 = 0,
                 hbc_rerank_artifact_cache_hits: u64 = 0,
                 hbc_rerank_artifact_vectors_loaded: u64 = 0,
                 hbc_rerank_distance_ns: u64 = 0,
@@ -1212,7 +1222,7 @@ pub fn main(init: std.process.Init) !void {
         if (cfg.mode != .standalone) return error.InvalidArgument;
         const cwd = try std.process.currentPathAlloc(init.io, alloc);
         defer alloc.free(cwd);
-        try runStandaloneBench(alloc, init.io, cwd, cfg, dataset, query_bodies);
+        try runStandaloneBench(alloc, init.io, init.minimal.environ, cwd, cfg, dataset, query_bodies);
     } else {
         switch (cfg.mode) {
             .handler => try runHandlerBench(alloc, init.io, cfg, dataset, queries, query_bodies),
@@ -1220,7 +1230,7 @@ pub fn main(init: std.process.Init) !void {
             .standalone => {
                 const cwd = try std.process.currentPathAlloc(init.io, alloc);
                 defer alloc.free(cwd);
-                try runStandaloneBench(alloc, init.io, cwd, cfg, dataset, query_bodies);
+                try runStandaloneBench(alloc, init.io, init.minimal.environ, cwd, cfg, dataset, query_bodies);
             },
         }
     }
@@ -2601,6 +2611,11 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
             stats.profile_rerank_artifact_distance_ns += dense.hbc_rerank_artifact_distance_ns;
             stats.profile_rerank_lsm_cache_hits += dense.hbc_rerank_lsm_cache_hits;
             stats.profile_rerank_lsm_cache_misses += dense.hbc_rerank_lsm_cache_misses;
+            stats.profile_rerank_vector_projection_reads += dense.hbc_rerank_vector_projection_reads;
+            stats.profile_rerank_vector_projection_bytes += dense.hbc_rerank_vector_projection_bytes;
+            stats.profile_rerank_vector_residual_reads += dense.hbc_rerank_vector_residual_reads;
+            stats.profile_rerank_vector_residual_bytes += dense.hbc_rerank_vector_residual_bytes;
+            stats.profile_rerank_vector_location_reuses += dense.hbc_rerank_vector_location_reuses;
             stats.profile_rerank_artifact_cache_hits += dense.hbc_rerank_artifact_cache_hits;
             stats.profile_rerank_artifact_vectors_loaded += dense.hbc_rerank_artifact_vectors_loaded;
             stats.profile_rerank_distance_ns += dense.hbc_rerank_distance_ns;
@@ -2904,6 +2919,11 @@ fn accumulateDenseProfile(stats: *QueryBenchStats, dense: anytype, raw_body: []c
     stats.profile_rerank_artifact_distance_ns += dense.hbc_rerank_artifact_distance_ns;
     stats.profile_rerank_lsm_cache_hits += dense.hbc_rerank_lsm_cache_hits;
     stats.profile_rerank_lsm_cache_misses += dense.hbc_rerank_lsm_cache_misses;
+    stats.profile_rerank_vector_projection_reads += dense.hbc_rerank_vector_projection_reads;
+    stats.profile_rerank_vector_projection_bytes += dense.hbc_rerank_vector_projection_bytes;
+    stats.profile_rerank_vector_residual_reads += dense.hbc_rerank_vector_residual_reads;
+    stats.profile_rerank_vector_residual_bytes += dense.hbc_rerank_vector_residual_bytes;
+    stats.profile_rerank_vector_location_reuses += dense.hbc_rerank_vector_location_reuses;
     stats.profile_rerank_artifact_cache_hits += dense.hbc_rerank_artifact_cache_hits;
     stats.profile_rerank_artifact_vectors_loaded += dense.hbc_rerank_artifact_vectors_loaded;
     stats.profile_rerank_distance_ns += dense.hbc_rerank_distance_ns;
@@ -4717,7 +4737,7 @@ fn printPublicQueryGuardrailSummaryJson(
         },
     );
     std.debug.print(
-        ",\"load_health_max_ms\":{d:.3},\"load_metrics_max_ms\":{d:.3},\"load_status_max_ms\":{d:.3},\"search_health_max_ms\":{d:.3},\"search_metrics_max_ms\":{d:.3},\"search_status_max_ms\":{d:.3},\"source_recall_at_k\":{d:.6},\"source_top1_recall\":{d:.6},\"exact_recall_at_k\":{d:.6},\"exact_recall_samples\":{d},\"exact_recall_strata\":{d},\"exact_recall_lane\":\"{s}\",\"exact_artifact_cache_hits_avg\":{d:.3},\"exact_artifact_vectors_loaded_avg\":{d:.3},\"rerank_metadata_vectors_loaded_avg\":{d:.3},\"rerank_artifact_cache_hits_avg\":{d:.3},\"rerank_artifact_vectors_loaded_avg\":{d:.3}",
+        ",\"load_health_max_ms\":{d:.3},\"load_metrics_max_ms\":{d:.3},\"load_status_max_ms\":{d:.3},\"search_health_max_ms\":{d:.3},\"search_metrics_max_ms\":{d:.3},\"search_status_max_ms\":{d:.3},\"source_recall_at_k\":{d:.6},\"source_top1_recall\":{d:.6},\"exact_recall_at_k\":{d:.6},\"exact_recall_samples\":{d},\"exact_recall_strata\":{d},\"exact_recall_lane\":\"{s}\",\"exact_artifact_cache_hits_avg\":{d:.3},\"exact_artifact_vectors_loaded_avg\":{d:.3},\"rerank_metadata_vectors_loaded_avg\":{d:.3},\"rerank_artifact_cache_hits_avg\":{d:.3},\"rerank_artifact_vectors_loaded_avg\":{d:.3},\"rerank_vector_projection_reads_avg\":{d:.3},\"rerank_vector_projection_bytes_avg\":{d:.3},\"rerank_vector_residual_reads_avg\":{d:.3},\"rerank_vector_residual_bytes_avg\":{d:.3},\"rerank_vector_location_reuses_avg\":{d:.3}",
         .{
             nsToMs(load.polls.health_max_latency_ns),
             nsToMs(load.polls.metrics_max_latency_ns),
@@ -4736,6 +4756,11 @@ fn printPublicQueryGuardrailSummaryJson(
             avgPerQuery(profile_stats, profile_stats.profile_rerank_metadata_vectors_loaded),
             avgPerQuery(profile_stats, profile_stats.profile_rerank_artifact_cache_hits),
             avgPerQuery(profile_stats, profile_stats.profile_rerank_artifact_vectors_loaded),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_vector_projection_reads),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_vector_projection_bytes),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_vector_residual_reads),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_vector_residual_bytes),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_vector_location_reuses),
         },
     );
     std.debug.print(

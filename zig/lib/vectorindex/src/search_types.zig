@@ -148,9 +148,20 @@ pub const SearchProfile = struct {
     rerank_artifact_distance_ns: u64 = 0,
     rerank_lsm_cache_hits: u64 = 0,
     rerank_lsm_cache_misses: u64 = 0,
-    /// Exact candidates served directly from the table-level immutable vector
-    /// block generation.
+    /// Candidate or exact-completion scores served directly from the
+    /// table-level immutable vector block generation.
     rerank_vector_block_hits: u64 = 0,
+    /// Physical compact-plane reads. The bounded pass retains the validated
+    /// generation-leased view so exact completion does not read it twice.
+    rerank_vector_projection_reads: u64 = 0,
+    rerank_vector_projection_bytes: u64 = 0,
+    /// Physical lossless-residual reads, which must track authoritative
+    /// completions rather than the wider bounded candidate shell.
+    rerank_vector_residual_reads: u64 = 0,
+    rerank_vector_residual_bytes: u64 = 0,
+    /// Exact completions that reused a generation-pinned location discovered
+    /// by the bounded pass instead of repeating key/index lookup.
+    rerank_vector_location_reuses: u64 = 0,
     /// Candidates for which the matching immutable generation was installed
     /// but did not contain a usable exact vector.
     rerank_vector_block_misses: u64 = 0,

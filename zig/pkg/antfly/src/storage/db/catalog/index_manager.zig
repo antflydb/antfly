@@ -44,6 +44,7 @@ const persistent_mod = @import("../../persistent.zig");
 const lsm_backend_mod = @import("../../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const vector_block_store_mod = @import("../../vector_block_store.zig");
+const vector_block_mod = @import("antfly_vectorindex").vector_block;
 const background_runtime_mod = @import("../../background_runtime.zig");
 const docstore_mod = @import("../../docstore.zig");
 const schema_mod = @import("../../schema.zig");
@@ -1313,6 +1314,7 @@ pub const IndexManager = struct {
     // shared text-merge resource budget.
     text_backfill_active: std.atomic.Value(u32) = .init(0),
     next_text_index_instance_id: std.atomic.Value(u64) = .init(1),
+    next_dense_capture_incarnation: std.atomic.Value(u64) = .init(1),
     load_parallelism: ?usize = null,
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
@@ -1846,6 +1848,7 @@ pub const IndexManager = struct {
 
     pub const DenseIndex = struct {
         apply_mutex: *std.atomic.Mutex,
+        capture_incarnation: u64 = 0,
         config: types.IndexConfig,
         field_name: []u8,
         dims: u32,
@@ -1871,6 +1874,12 @@ pub const IndexManager = struct {
     };
 
     const DenseVectorLoadSession = struct {
+        const CachedNativeProjection = struct {
+            location: vector_block_store_mod.LocatedValue,
+            byte_offset: usize,
+            byte_len: usize,
+        };
+
         const ReadTxnKind = enum {
             probe,
             snapshot,
@@ -1882,6 +1891,19 @@ pub const IndexManager = struct {
         txn_override: ?docstore_mod.DocStore.Batch.BatchTxn = null,
         raw_cache: std.StringHashMapUnmanaged([]const u8) = .empty,
         vector_cache: std.AutoHashMapUnmanaged(u64, []f32) = .empty,
+        /// Query-pinned immutable generation, locations, and compact bytes
+        /// discovered by the bounded projection pass. Exact completion avoids
+        /// both a second lookup and a second projection read, while residuals
+        /// remain untouched until the top-k boundary proof selects a vector.
+        native_vector_generation: ?*SharedVectorBlockGeneration = null,
+        native_vector_source_sequence: ?u64 = null,
+        native_vector_locations: std.AutoHashMapUnmanaged(u64, CachedNativeProjection) = .empty,
+        native_vector_projection_bytes: std.ArrayListUnmanaged(u8) = .empty,
+        /// Bounded payload destinations and request descriptors owned only
+        /// while one native positional-read wave is active. This makes the
+        /// concurrency experiment visible to the same dense-search resource
+        /// envelope as retained query projections.
+        native_vector_io_bytes: u64 = 0,
         raw_cache_hits: u64 = 0,
         raw_cache_misses: u64 = 0,
         raw_batch_reads: u64 = 0,
@@ -1903,7 +1925,6 @@ pub const IndexManager = struct {
         const MaxRawReadLimitBytes: u64 = 64 * 1024 * 1024;
 
         fn deinit(self: *@This()) void {
-            self.context.manager.observeDenseWorkingBytes(self.working_slice, &self.working_bytes_current, 0);
             if (getenv("ANTFLY_DEBUG_DENSE_VECTOR_LOAD_SESSION") != null and self.raw_cache_hits + self.raw_cache_misses + self.vector_cache_hits + self.vector_cache_misses >= 128) {
                 std.log.debug(
                     "dense vector load session raw_hits={} raw_misses={} vector_hits={} vector_misses={} cached_keys={} cached_vectors={} raw_key_bytes={} raw_value_bytes={} cached_vector_bytes={} index={s}",
@@ -1926,9 +1947,78 @@ pub const IndexManager = struct {
             var vector_it = self.vector_cache.iterator();
             while (vector_it.next()) |entry| self.context.manager.alloc.free(entry.value_ptr.*);
             self.vector_cache.deinit(self.context.manager.alloc);
+            self.clearNativeVectorLocations();
+            self.native_vector_locations.deinit(self.context.manager.alloc);
+            self.native_vector_projection_bytes.deinit(self.context.manager.alloc);
+            self.context.manager.observeDenseWorkingBytes(self.working_slice, &self.working_bytes_current, 0);
             if (self.read_txn) |*txn| txn.abort();
             if (self.decoded_residency_lease) |*lease| lease.deinit();
             self.* = undefined;
+        }
+
+        fn clearNativeVectorLocations(self: *@This()) void {
+            self.native_vector_locations.clearRetainingCapacity();
+            self.native_vector_projection_bytes.clearRetainingCapacity();
+            if (self.native_vector_generation) |generation| generation.release();
+            self.native_vector_generation = null;
+            self.native_vector_source_sequence = null;
+            self.observeWorkingBytes();
+        }
+
+        fn pinNativeVectorGeneration(
+            self: *@This(),
+            generation: *SharedVectorBlockGeneration,
+            source_sequence: u64,
+        ) void {
+            if (self.native_vector_generation == generation and
+                self.native_vector_source_sequence == source_sequence) return;
+            self.clearNativeVectorLocations();
+            self.native_vector_generation = generation;
+            self.native_vector_source_sequence = source_sequence;
+        }
+
+        fn cacheNativeVectorLocation(
+            self: *@This(),
+            vector_id: u64,
+            projection: vector_block_store_mod.LoadedProjection,
+        ) void {
+            if (self.native_vector_locations.contains(vector_id)) return;
+            const old_len = self.native_vector_projection_bytes.items.len;
+            self.native_vector_projection_bytes.appendSlice(
+                self.context.manager.alloc,
+                projection.value.bytes,
+            ) catch return;
+            self.native_vector_locations.put(self.context.manager.alloc, vector_id, .{
+                .location = projection.located,
+                .byte_offset = old_len,
+                .byte_len = projection.value.bytes.len,
+            }) catch {
+                self.native_vector_projection_bytes.shrinkRetainingCapacity(old_len);
+                self.observeWorkingBytes();
+                return;
+            };
+            self.observeWorkingBytes();
+        }
+
+        fn nativeVectorLocation(
+            self: *@This(),
+            vector_id: u64,
+            source_sequence: u64,
+        ) ?vector_block_store_mod.LoadedProjection {
+            if (self.native_vector_generation == null or self.native_vector_source_sequence != source_sequence)
+                return null;
+            const cached = self.native_vector_locations.get(vector_id) orelse return null;
+            if (cached.byte_offset > self.native_vector_projection_bytes.items.len or
+                cached.byte_len > self.native_vector_projection_bytes.items.len - cached.byte_offset)
+            {
+                return null;
+            }
+            const bytes = self.native_vector_projection_bytes.items[cached.byte_offset..][0..cached.byte_len];
+            const value = switch (cached.location) {
+                .wal => |wal| wal,
+                .block => |block| block.location.projectionValueFromPayload(bytes) catch return null,
+            };
+            return .{ .located = cached.location, .value = value };
         }
 
         fn cacheDecodedVector(self: *@This(), index: *hbc_mod.HBCIndex, vector_id: u64, vector: []const f32) void {
@@ -1964,7 +2054,13 @@ pub const IndexManager = struct {
         }
 
         fn rawWorkingBytes(self: *const @This()) u64 {
-            return self.vector_cache_bytes +| self.raw_cache_key_bytes +| self.raw_read_value_bytes;
+            return self.vector_cache_bytes +| self.raw_cache_key_bytes +| self.raw_read_value_bytes +|
+                @as(u64, @intCast(self.native_vector_projection_bytes.capacity)) +| self.native_vector_io_bytes;
+        }
+
+        fn setNativeVectorIoBytes(self: *@This(), bytes: u64) void {
+            self.native_vector_io_bytes = bytes;
+            self.observeWorkingBytes();
         }
 
         fn observeWorkingBytes(self: *@This()) void {
@@ -2626,6 +2722,15 @@ pub const IndexManager = struct {
         index.setBypassExternalVectorCache(true);
     }
 
+    fn allocateDenseCaptureIncarnation(self: *IndexManager) u64 {
+        const incarnation = self.next_dense_capture_incarnation.fetchAdd(1, .monotonic);
+        // Reaching this after 2^64 index replacements would make an old token
+        // theoretically reusable. Refuse the ABA state loudly instead.
+        if (incarnation == 0 or incarnation == std.math.maxInt(u64))
+            @panic("dense capture incarnation exhausted");
+        return incarnation;
+    }
+
     fn vectorBlockReadyAtSequence(self: *IndexManager, source_sequence: u64) bool {
         // Environment flags are process bootstrap inputs, not mutable runtime
         // truth. Once storage is attached, every mutation/readiness decision
@@ -2637,13 +2742,28 @@ pub const IndexManager = struct {
         return vectorBlockGenerationReadyAtSequence(generation, source_sequence);
     }
 
+    fn vectorBlockGenerationExactAtSequence(
+        generation: *const SharedVectorBlockGeneration,
+        source_sequence: u64,
+    ) bool {
+        if (generation.opened.store.covered_source_sequence != source_sequence or
+            !generation.opened.usesBaseEncoding(denseVectorBlockPreferredEncoding())) return false;
+        const score_precision = generation.opened.scorePrecision();
+        return score_precision == .authoritative_float32 or
+            score_precision == .authoritative_float32_with_bounded_float16;
+    }
+
     fn vectorBlockGenerationReadyAtSequence(
         generation: *const SharedVectorBlockGeneration,
         source_sequence: u64,
     ) bool {
-        return generation.opened.store.covered_source_sequence == source_sequence and
-            generation.opened.usesBaseEncoding(denseVectorBlockPreferredEncoding()) and
-            generation.opened.store.manifest.?.shard_count == (vector_block_store_mod.BaseBuildOptions{}).shard_count;
+        if (!vectorBlockGenerationExactAtSequence(generation, source_sequence)) return false;
+        const manifest = generation.opened.store.manifest.?;
+        if (manifest.shard_count == (vector_block_store_mod.BaseBuildOptions{}).shard_count) return true;
+        // Empty native authority is deliberately one physical shard. Its
+        // cardinality certificate, not a pile of empty files, proves that it
+        // represents every configured artifact scope.
+        return manifest.shard_count == 1 and generation.opened.baseOnlyVectorCount() == 0;
     }
 
     fn vectorBlockReadyAtSequenceAndCount(
@@ -3291,10 +3411,11 @@ pub const IndexManager = struct {
         }
         _ = try self.finalizeNativePostingGenerationAtStableTipLocked(entry, applied_sequence, .{
             .validate_payloads = true,
-            // Query fan-out is already bounded by the native manifest. Leave
-            // consolidation to the background checkpoint lane instead of
-            // turning public readiness into a corpus rewrite.
-            .flatten = false,
+            // This caller owns an explicit stable source boundary. Publish one
+            // mmap-friendly base so the first query does not have to compose
+            // every shadowed centroid into a heap overlay. Ordinary online
+            // checkpoints remain incremental and amortized.
+            .flatten = true,
         });
     }
 
@@ -3312,7 +3433,7 @@ pub const IndexManager = struct {
         try self.ensureVectorBlockBaseAtAppliedSequence(entry.config.name, applied_sequence);
         _ = try self.finalizeNativePostingGenerationAtStableTipLocked(entry, applied_sequence, .{
             .validate_payloads = true,
-            .flatten = false,
+            .flatten = true,
         });
     }
 
@@ -3415,6 +3536,32 @@ pub const IndexManager = struct {
         return stats.active_immutable_logical_bytes == 0 and maintenance_score <= 1;
     }
 
+    fn projectionRequiresSettledPrimaryWritePlane(
+        immediate_initial_bootstrap: bool,
+        native_generation_requires_initial_flatten: bool,
+    ) bool {
+        // An empty native base plus a sequence-complete WAL already captures
+        // every source mutation. Its one-time primary scan changes only the
+        // physical shard layout and can safely preserve any concurrent suffix.
+        // Requiring zero mutable primary rows here deadlocks finite loads on
+        // idle control/status writes that never reach the flush threshold.
+        return !immediate_initial_bootstrap and !native_generation_requires_initial_flatten;
+    }
+
+    fn exactNativeGenerationRequiresInitialFlatten(
+        exact_at_source_sequence: bool,
+        preferred_layout_ready: bool,
+        active_vector_count: u64,
+    ) bool {
+        // Sequence-complete native mutation state is a correctness fence even
+        // before it has a cardinality-certified preferred base. Its one-time
+        // pinned primary scan may bypass the opportunistic settled-LSM gate;
+        // otherwise an idle mutable control tail can make finite bulk ingest
+        // wait forever. Legacy/lossy or sequence-mismatched generations do not
+        // receive this privilege.
+        return exact_at_source_sequence and !preferred_layout_ready and active_vector_count != 0;
+    }
+
     /// Observe an idle, fully-covered source tip twice before starting the
     /// snapshot bootstrap. This runs on the normal dense maintenance lane, so
     /// it is neither a benchmark-specific optimize hook nor a first-query
@@ -3446,11 +3593,20 @@ pub const IndexManager = struct {
             const generation = self.acquireVectorBlockGeneration() orelse break :blk false;
             defer generation.release();
             has_native_generation = true;
-            if (!vectorBlockGenerationReadyAtSequence(generation, source_sequence)) break :blk false;
+            const exact_at_source_sequence = vectorBlockGenerationExactAtSequence(generation, source_sequence);
+            const preferred_layout_ready = exact_at_source_sequence and
+                vectorBlockGenerationReadyAtSequence(generation, source_sequence);
+            native_generation_requires_initial_flatten = exactNativeGenerationRequiresInitialFlatten(
+                exact_at_source_sequence,
+                preferred_layout_ready,
+                active_vector_count,
+            );
+            if (!preferred_layout_ready) break :blk false;
             const base_only_count = generation.opened.baseOnlyVectorCount();
             if (base_only_count == null) {
-                native_generation_requires_initial_flatten = active_vector_count != 0 and
-                    (generation.opened.baseVectorCount() orelse 0) == 0;
+                native_generation_requires_initial_flatten = native_generation_requires_initial_flatten or
+                    active_vector_count != 0 and
+                        (generation.opened.baseVectorCount() orelse 0) == 0;
                 break :blk true;
             }
             const coverage = generation.opened.baseOnlyCoverage(denseVectorArtifactScopeHash(entry)) orelse break :blk false;
@@ -3488,7 +3644,10 @@ pub const IndexManager = struct {
         // quiet source sequence can be an LSM backpressure pause rather than
         // an idle workload, so opportunistic source scans require a completely
         // settled write plane. Explicit lifecycle barriers bypass this gate.
-        if (!immediate_initial_bootstrap) if (self.primary_lsm_backend) |backend| {
+        if (projectionRequiresSettledPrimaryWritePlane(
+            immediate_initial_bootstrap,
+            native_generation_requires_initial_flatten,
+        )) if (self.primary_lsm_backend) |backend| {
             const primary_stats = backend.snapshotMaintenanceStats();
             if (!primaryWritePlaneSafeForProjection(primary_stats, backend.maintenanceScore())) {
                 self.vector_block_candidate_since_ns.store(now, .release);
@@ -3848,10 +4007,14 @@ pub const IndexManager = struct {
         index.setExternalVectorBatchScratchLoader(vector_loader_context, loadDenseVectorsForHbcBatch);
         index.setExternalVectorBatchTransformedMatrixLoader(vector_loader_context, loadDenseVectorsForHbcBatchIntoTransformedMatrix);
         index.setExternalVectorBatchDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatch);
+        index.setExternalVectorBatchBoundedDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatchBounded);
+        index.setExternalVectorBatchLocatedDistanceLoader(vector_loader_context, scoreDenseVectorsFromNativeLocations);
+        index.setExternalVectorBoundedDistanceAvailable(vector_loader_context, denseVectorBoundedProjectionAvailable);
         self.attachVectorBlockResidencyPolicy(&index);
 
         entry.index = index;
         entry.vector_loader_context = vector_loader_context;
+        entry.capture_incarnation = self.allocateDenseCaptureIncarnation();
     }
 
     pub fn resetDenseIndexForArtifactRebuild(self: *IndexManager, index_name: []const u8) !void {
@@ -5612,13 +5775,16 @@ pub const IndexManager = struct {
             lockAtomicWithBackoff(entry.apply_mutex);
             defer entry.apply_mutex.unlock();
             const source_sequence = primary.lastReplaySequence(0);
-            var changed = false;
-            if (entry.index.experimentalPostingDurableAppliedSequence() == null) {
-                changed = try self.finalizeNativePostingGenerationAtStableTipLocked(entry, source_sequence, .{
-                    .validate_payloads = true,
-                    .flatten = true,
-                });
-            }
+            const posting_sequence_before = entry.index.experimentalPostingDurableAppliedSequence();
+            // A recovered sequence-complete index can still carry a maximum
+            // delta chain or WAL tail. Stable-tip publication is the explicit
+            // lifecycle fence that retires that query-time merge debt; do not
+            // infer physical readiness merely from logical source coverage.
+            _ = try self.finalizeNativePostingGenerationAtStableTipLocked(entry, source_sequence, .{
+                .validate_payloads = true,
+                .flatten = true,
+            });
+            var changed = posting_sequence_before == null;
             const posting_sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
             if (posting_sequence != source_sequence) continue;
             if (!self.vectorBlockReadyAtSequenceAndCount(
@@ -9163,6 +9329,8 @@ pub const IndexManager = struct {
     }
 
     fn denseVectorBlockPreferredEncoding() vector_block_store_mod.Encoding {
+        // Float16 is the compact candidate plane. Exact public reranking must
+        // complete against authoritative float32 values before publication.
         const raw_z = getenv("ANTFLY_HBC_VECTOR_BLOCK_ENCODING") orelse return .float16;
         const raw = std.mem.span(raw_z);
         return if (std.ascii.eqlIgnoreCase(raw, "float16") or std.ascii.eqlIgnoreCase(raw, "f16"))
@@ -9179,38 +9347,42 @@ pub const IndexManager = struct {
         borrow_active_source: bool = false,
     };
 
+    pub const DensePostingCaptureRights = enum {
+        owner,
+        borrower,
+    };
+
+    pub const DensePostingCaptureLease = struct {
+        index_incarnation: u64,
+        capture: hbc_mod.ExperimentalPostingCaptureLease,
+        rights: DensePostingCaptureRights,
+
+        pub fn ownsLifecycle(self: @This()) bool {
+            return self.rights == .owner;
+        }
+    };
+
     pub fn beginDensePostingSidecarCaptureByName(self: *IndexManager, name: []const u8) !bool {
         return try self.beginDensePostingSidecarCaptureByNameWithOptions(name, .{});
     }
 
-    pub fn beginDensePostingSidecarCaptureByNameWithOptions(
+    pub fn beginDensePostingSidecarCaptureLeaseByNameWithOptions(
         self: *IndexManager,
         name: []const u8,
         options: DensePostingCaptureOptions,
-    ) !bool {
+    ) !?DensePostingCaptureLease {
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
-        // The durable authority marker is sticky. Once an index has moved its
-        // query-facing state to segment+WAL, every later process must preserve
-        // that transaction boundary even if the rollout environment flag is
-        // removed. Treating the flag as the sole gate would make restart
-        // silently skip capture and then reject the first derived mutation.
-        if (!densePostingSidecarEnabled() and !entry.index.experimentalPostingWalAuthoritative()) return false;
+        if (!densePostingSidecarEnabled() and !entry.index.experimentalPostingWalAuthoritative()) return null;
         if (entry.index.experimentalPostingMutationCaptureActive()) {
             switch (entry.index.experimentalPostingMutationCaptureOwner()) {
-                // An already-open streaming session identifies the one
-                // supported nesting case only when the active transaction is
-                // itself source-owned. Session state alone cannot authorize a
-                // replay batch to borrow maintenance or handoff mutations.
-                .source => if (options.borrow_active_source and entry.index.lsmSessionBatchingActive())
-                    return false
-                else
-                    return error.PostingWalCaptureOwnershipConflict,
-                // The preceding source window has durably closed its HBC
-                // session and is publishing the same capture before its
-                // applied watermark. An empty handoff owns no derived changes
-                // and may be canceled atomically; its later watermark callback
-                // records ordinary coverage. A mutated handoff must publish
-                // before another source transaction can begin.
+                .source => if (options.borrow_active_source and entry.index.lsmSessionBatchingActive()) {
+                    return .{
+                        .index_incarnation = entry.capture_incarnation,
+                        .capture = entry.index.experimentalPostingMutationCaptureLease() orelse
+                            return error.ExperimentalPostingCaptureOwnershipInvalid,
+                        .rights = .borrower,
+                    };
+                } else return error.PostingWalCaptureOwnershipConflict,
                 .source_handoff => if (entry.index.experimentalPostingCaptureHasMutations())
                     return error.ReplayDocumentNotVisible
                 else
@@ -9231,7 +9403,70 @@ pub const IndexManager = struct {
         entry.index.enableExperimentalExactVectorCapture(capture_exact_vectors);
         errdefer entry.index.enableExperimentalExactVectorCapture(false);
         try entry.index.beginExperimentalPostingMutationCapture();
-        return true;
+        return .{
+            .index_incarnation = entry.capture_incarnation,
+            .capture = entry.index.experimentalPostingMutationCaptureLease() orelse
+                return error.ExperimentalPostingCaptureOwnershipInvalid,
+            .rights = .owner,
+        };
+    }
+
+    pub fn beginDensePostingSidecarCaptureByNameWithOptions(
+        self: *IndexManager,
+        name: []const u8,
+        options: DensePostingCaptureOptions,
+    ) !bool {
+        const lease = try self.beginDensePostingSidecarCaptureLeaseByNameWithOptions(name, options);
+        return if (lease) |value| value.ownsLifecycle() else false;
+    }
+
+    fn validateDensePostingCaptureLease(
+        self: *IndexManager,
+        name: []const u8,
+        lease: DensePostingCaptureLease,
+    ) !*DenseIndex {
+        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        if (entry.capture_incarnation != lease.index_incarnation) return error.PostingWalCaptureSuperseded;
+        const current = entry.index.experimentalPostingMutationCaptureLease() orelse
+            return error.ExperimentalPostingCaptureNotActive;
+        if (current.epoch != lease.capture.epoch or current.base_coverage != lease.capture.base_coverage)
+            return error.PostingWalCaptureSuperseded;
+        return entry;
+    }
+
+    pub fn recordDensePostingCaptureMutationSequence(
+        self: *IndexManager,
+        name: []const u8,
+        lease: DensePostingCaptureLease,
+        mutation_sequence: u64,
+    ) !void {
+        const entry = try self.validateDensePostingCaptureLease(name, lease);
+        try entry.index.recordExperimentalPostingCaptureMutationSequence(lease.capture, mutation_sequence);
+    }
+
+    pub fn cancelDensePostingSidecarCaptureLeaseByName(
+        self: *IndexManager,
+        name: []const u8,
+        lease: DensePostingCaptureLease,
+    ) !void {
+        if (!lease.ownsLifecycle()) return error.PostingWalCaptureBorrowerCannotFinish;
+        const entry = try self.validateDensePostingCaptureLease(name, lease);
+        try entry.index.cancelExperimentalPostingMutationCaptureWithLease(lease.capture);
+    }
+
+    pub fn finishDensePostingSidecarCaptureLeaseByName(
+        self: *IndexManager,
+        name: []const u8,
+        lease: DensePostingCaptureLease,
+        applied_sequence: u64,
+    ) !void {
+        if (!lease.ownsLifecycle()) return error.PostingWalCaptureBorrowerCannotFinish;
+        const entry = try self.validateDensePostingCaptureLease(name, lease);
+        if (!densePostingSidecarEnabled() and !entry.index.experimentalPostingWalAuthoritative()) return;
+        try self.persistDensePostingSidecarByNameWithOptions(name, applied_sequence, .{
+            .consume_owned_source_capture = true,
+            .capture_lease = lease.capture,
+        });
     }
 
     /// Whether mutations for this index must own or join a native posting-WAL
@@ -9269,6 +9504,7 @@ pub const IndexManager = struct {
 
     const DensePostingPersistOptions = struct {
         consume_owned_source_capture: bool = false,
+        capture_lease: ?hbc_mod.ExperimentalPostingCaptureLease = null,
     };
 
     fn persistDensePostingSidecarByNameWithOptions(
@@ -9301,12 +9537,24 @@ pub const IndexManager = struct {
                 // source transaction is currently open. Its request is
                 // already satisfied even when that newer capture is mutated.
                 if (!options.consume_owned_source_capture) return;
-                // The explicit owner still has to publish a mutated capture;
-                // an empty equal-boundary transaction can be retired without
-                // adding a redundant coverage frame.
+                // Even an explicit name-based finisher does not own a capture
+                // opened after this durable boundary. Catch-up deliberately
+                // completes through a later callback, so the capture's base
+                // source interval is its durable lease token.
                 if (!capture_active) return;
+                if (options.capture_lease == null) {
+                    if (entry.index.experimentalPostingMutationCaptureBaseSourceSequence()) |base_sequence| {
+                        if (applied_sequence <= base_sequence) return;
+                    }
+                }
+                // An empty equal-boundary transaction can be retired without
+                // adding a redundant coverage frame.
                 if (!capture_has_mutations) {
-                    entry.index.cancelExperimentalPostingMutationCapture();
+                    if (options.capture_lease) |lease| {
+                        try entry.index.cancelExperimentalPostingMutationCaptureWithLease(lease);
+                    } else {
+                        entry.index.cancelExperimentalPostingMutationCapture();
+                    }
                     return;
                 }
             }
@@ -9354,7 +9602,11 @@ pub const IndexManager = struct {
             }
             self.vector_block_build_mu.unlock();
         }
-        entry.index.persistExperimentalPostingSidecarAtAppliedSequence(applied_sequence, .{}) catch |err| {
+        entry.index.persistExperimentalPostingSidecarAtAppliedSequenceWithLease(
+            applied_sequence,
+            .{},
+            options.capture_lease,
+        ) catch |err| {
             if (entry.index.experimentalPostingWalAuthoritative()) {
                 std.log.err("dense posting WAL publication failed before applied watermark index={s} sequence={} err={s}", .{
                     name,
@@ -9642,6 +9894,14 @@ pub const IndexManager = struct {
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
+        var native_location_session: ?*DenseVectorLoadSession = null;
+        if (active_dense_vector_load_session) |session| {
+            if (entry.vector_loader_context != null and session.context == entry.vector_loader_context.?) {
+                session.clearNativeVectorLocations();
+                native_location_session = session;
+            }
+        }
+        defer if (native_location_session) |session| session.clearNativeVectorLocations();
 
         return try entry.index.searchWithRequest(req);
     }
@@ -9670,6 +9930,14 @@ pub const IndexManager = struct {
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
+        var native_location_session: ?*DenseVectorLoadSession = null;
+        if (active_dense_vector_load_session) |session| {
+            if (entry.vector_loader_context != null and session.context == entry.vector_loader_context.?) {
+                session.clearNativeVectorLocations();
+                native_location_session = session;
+            }
+        }
+        defer if (native_location_session) |session| session.clearNativeVectorLocations();
 
         return try entry.index.searchProfiledRequest(req);
     }
@@ -12776,6 +13044,9 @@ pub const IndexManager = struct {
                 index.setExternalVectorBatchScratchLoader(vector_loader_context, loadDenseVectorsForHbcBatch);
                 index.setExternalVectorBatchTransformedMatrixLoader(vector_loader_context, loadDenseVectorsForHbcBatchIntoTransformedMatrix);
                 index.setExternalVectorBatchDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatch);
+                index.setExternalVectorBatchBoundedDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatchBounded);
+                index.setExternalVectorBatchLocatedDistanceLoader(vector_loader_context, scoreDenseVectorsFromNativeLocations);
+                index.setExternalVectorBoundedDistanceAvailable(vector_loader_context, denseVectorBoundedProjectionAvailable);
                 self.attachVectorBlockResidencyPolicy(&index);
                 if (densePostingSidecarEnabled() or index.experimentalPostingWalAuthoritative()) {
                     var posting_sequence: u64 = 0;
@@ -12842,6 +13113,7 @@ pub const IndexManager = struct {
 
                 var entry = DenseIndex{
                     .apply_mutex = apply_mutex,
+                    .capture_incarnation = self.allocateDenseCaptureIncarnation(),
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
                     .field_name = try self.alloc.dupe(u8, dense_cfg.field_name),
                     .dims = dense_cfg.dims,
@@ -18126,7 +18398,11 @@ pub const IndexManager = struct {
         const vector_block_generation = blk: {
             const source_sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse break :blk null;
             const generation = manager.acquireVectorBlockGeneration() orelse break :blk null;
-            if (generation.opened.store.covered_source_sequence != source_sequence) {
+            const precision = generation.opened.scorePrecision();
+            if (generation.opened.store.covered_source_sequence != source_sequence or
+                (precision != .authoritative_float32 and
+                    precision != .authoritative_float32_with_bounded_float16))
+            {
                 generation.release();
                 break :blk null;
             }
@@ -18166,7 +18442,7 @@ pub const IndexManager = struct {
                 const matrix_start = std.math.mul(usize, matrix_pos, dims) catch return error.BufferTooSmall;
                 const matrix_end = std.math.add(usize, matrix_start, dims) catch return error.BufferTooSmall;
                 if (matrix_end > matrix.len) return error.BufferTooSmall;
-                const vector = value.vectorView() orelse try value.decodeInto(scratch);
+                const vector = value.vectorView() orelse try value.decodeExactInto(scratch);
                 _ = transform(index, vector, matrix[matrix_start..matrix_end]);
             }
             key_count = remaining_count;
@@ -18228,6 +18504,110 @@ pub const IndexManager = struct {
         }
     }
 
+    fn denseVectorBoundedProjectionAvailable(ctx: *anyopaque, source_sequence: ?u64) bool {
+        const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
+        const sequence = source_sequence orelse return false;
+        if (active_dense_vector_load_session) |session| {
+            if (session.context == loader and session.native_vector_source_sequence == sequence) {
+                if (session.native_vector_generation) |generation| {
+                    return generation.opened.store.covered_source_sequence == sequence and
+                        (generation.opened.scorePrecision() == .bounded_float16 or
+                            generation.opened.scorePrecision() == .authoritative_float32_with_bounded_float16);
+                }
+            }
+        }
+        const generation = loader.manager.acquireVectorBlockGeneration() orelse return false;
+        defer generation.release();
+        return generation.opened.store.covered_source_sequence == sequence and
+            (generation.opened.scorePrecision() == .bounded_float16 or
+                generation.opened.scorePrecision() == .authoritative_float32_with_bounded_float16);
+    }
+
+    fn scoreDenseVectorsFromNativeLocations(
+        ctx: *anyopaque,
+        vector_ids: []const u64,
+        query: []const f32,
+        query_measure: f32,
+        metric: vector_mod.DistanceMetric,
+        distances: []f32,
+        batch_scratch: []f32,
+        dims: usize,
+        source_sequence: ?u64,
+        profile: ?*hbc_mod.SearchProfile,
+    ) !void {
+        if (vector_ids.len != distances.len or query.len != dims) return error.InvalidArgument;
+        const required_floats = std.math.mul(usize, vector_ids.len, dims) catch return error.BufferTooSmall;
+        if (batch_scratch.len < required_floats) return error.BufferTooSmall;
+        @memset(distances, std.math.inf(f32));
+
+        const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
+        const session = active_dense_vector_load_session orelse return;
+        if (session.context != loader) return;
+        const sequence = source_sequence orelse return;
+        if (session.native_vector_source_sequence != sequence) return;
+        const generation = session.native_vector_generation orelse return;
+        if (generation.opened.store.covered_source_sequence != sequence) return;
+
+        var residual_bytes: usize = 0;
+        var residual_count: usize = 0;
+        for (vector_ids) |vector_id| {
+            const projection = session.nativeVectorLocation(vector_id, sequence) orelse continue;
+            residual_bytes = std.math.add(usize, residual_bytes, projection.located.residualBytes()) catch return error.BufferTooSmall;
+            residual_count += 1;
+        }
+        if (residual_count == 0) return;
+
+        const request_bytes = @as(u64, @intCast(residual_count)) *|
+            (@sizeOf(vector_block_store_mod.ResidualReadRequest) + @sizeOf(usize));
+        session.setNativeVectorIoBytes(@as(u64, @intCast(residual_bytes)) +| request_bytes);
+        defer session.setNativeVectorIoBytes(0);
+
+        var read_arena = std.heap.ArenaAllocator.init(loader.manager.alloc);
+        defer read_arena.deinit();
+        const read_alloc = read_arena.allocator();
+        const residual_scratch = try read_alloc.alloc(u8, residual_bytes);
+        const requests = try read_alloc.alloc(vector_block_store_mod.ResidualReadRequest, residual_count);
+        const request_slots = try read_alloc.alloc(usize, residual_count);
+        var request_count: usize = 0;
+        var residual_offset: usize = 0;
+        for (vector_ids, 0..) |vector_id, slot| {
+            const projection = session.nativeVectorLocation(vector_id, sequence) orelse continue;
+            const len = projection.located.residualBytes();
+            requests[request_count] = .{
+                .projection = projection,
+                .scratch = residual_scratch[residual_offset..][0..len],
+            };
+            request_slots[request_count] = slot;
+            residual_offset += len;
+            request_count += 1;
+        }
+
+        const read_start = platform_time.monotonicNs();
+        try generation.opened.readExactResidualsIntoBatch(loader.manager.io, requests);
+        for (requests, request_slots) |request, slot| {
+            const projection = request.projection;
+            const value = request.value orelse continue;
+            if (value.dims != dims) continue;
+            const vector_start = std.math.mul(usize, slot, dims) catch return error.BufferTooSmall;
+            const vector_scratch = batch_scratch[vector_start .. vector_start + dims];
+            const distance_start = platform_time.monotonicNs();
+            distances[slot] = try exactVectorBlockDistance(value, query, query_measure, metric, vector_scratch);
+            if (profile) |p| {
+                const elapsed = platform_time.monotonicNs() - distance_start;
+                p.rerank_vector_block_hits += 1;
+                p.rerank_vector_location_reuses += 1;
+                if (projection.located.residualBytes() != 0) {
+                    p.rerank_vector_residual_reads += 1;
+                    p.rerank_vector_residual_bytes +|= @intCast(projection.located.residualBytes());
+                }
+                p.rerank_artifact_cache_hits += 1;
+                p.rerank_artifact_distance_ns += elapsed;
+                p.rerank_distance_ns += elapsed;
+            }
+        }
+        if (profile) |p| p.rerank_artifact_read_ns += platform_time.monotonicNs() - read_start;
+    }
+
     fn scoreDenseVectorsForHbcBatch(
         ctx: *anyopaque,
         vector_ids: []const u64,
@@ -18241,11 +18621,75 @@ pub const IndexManager = struct {
         scratch: hbc_mod.HBCIndex.ExternalVectorBatchDistanceScratch,
         profile: ?*hbc_mod.SearchProfile,
     ) !void {
+        return try scoreDenseVectorsForHbcBatchCore(
+            ctx,
+            vector_ids,
+            metadata,
+            query,
+            query_measure,
+            metric,
+            distances,
+            null,
+            batch_scratch,
+            dims,
+            scratch,
+            profile,
+        );
+    }
+
+    fn scoreDenseVectorsForHbcBatchBounded(
+        ctx: *anyopaque,
+        vector_ids: []const u64,
+        metadata: []const ?[]const u8,
+        query: []const f32,
+        query_measure: f32,
+        metric: vector_mod.DistanceMetric,
+        distances: []f32,
+        error_bounds: []f32,
+        batch_scratch: []f32,
+        dims: usize,
+        scratch: hbc_mod.HBCIndex.ExternalVectorBatchDistanceScratch,
+        profile: ?*hbc_mod.SearchProfile,
+    ) !void {
+        return try scoreDenseVectorsForHbcBatchCore(
+            ctx,
+            vector_ids,
+            metadata,
+            query,
+            query_measure,
+            metric,
+            distances,
+            error_bounds,
+            batch_scratch,
+            dims,
+            scratch,
+            profile,
+        );
+    }
+
+    fn scoreDenseVectorsForHbcBatchCore(
+        ctx: *anyopaque,
+        vector_ids: []const u64,
+        metadata: []const ?[]const u8,
+        query: []const f32,
+        query_measure: f32,
+        metric: vector_mod.DistanceMetric,
+        distances: []f32,
+        error_bounds: ?[]f32,
+        batch_scratch: []f32,
+        dims: usize,
+        scratch: hbc_mod.HBCIndex.ExternalVectorBatchDistanceScratch,
+        profile: ?*hbc_mod.SearchProfile,
+    ) !void {
         const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
         const manager = loader.manager;
         const store = manager.primary_store orelse return error.NotFound;
         const entry = manager.denseIndex(loader.index_name) orelse return error.IndexNotFound;
         if (vector_ids.len != metadata.len or vector_ids.len != distances.len) return error.InvalidArgument;
+        if (error_bounds) |bounds| {
+            if (bounds.len != vector_ids.len) return error.InvalidArgument;
+            @memset(bounds, 0);
+        }
         if (dims == 0 or query.len != dims) return error.InvalidVectorDimensions;
         if (batch_scratch.len < dims) return error.BufferTooSmall;
         if (scratch.artifact_keys.len < vector_ids.len) return error.InvalidArgument;
@@ -18253,6 +18697,11 @@ pub const IndexManager = struct {
         if (scratch.vector_views.len < vector_ids.len) return error.InvalidArgument;
         const required_batch_floats = std.math.mul(usize, vector_ids.len, dims) catch return error.BufferTooSmall;
         if (batch_scratch.len < required_batch_floats) return error.BufferTooSmall;
+        const bounded_query_norm = if (error_bounds != null) switch (metric) {
+            .inner_product => vector_mod.norm(query),
+            .cosine => query_measure,
+            .l2_squared => 0,
+        } else 0;
 
         // Dense apply always publishes the authoritative vector artifact under
         // the configured embedding name, or the index name for direct fields.
@@ -18262,11 +18711,90 @@ pub const IndexManager = struct {
             if (session.context != loader) break :blk null;
             break :blk session;
         };
+        var native_vector_io_accounted = false;
+        defer if (native_vector_io_accounted) load_session.?.setNativeVectorIoBytes(0);
+
+        // The bounded callback is an acceleration capability, not a request
+        // to eagerly exact-score the complete rerank shell from the primary
+        // store. Without a matching f16 generation, decline before cache,
+        // metadata, or artifact work so HBC retains its progressive exact
+        // batching and early-stop behavior.
+        var release_vector_block_generation = false;
+        const vector_block_generation = if (scratch.source_sequence) |source_sequence| blk: {
+            const session_generation = if (load_session) |session|
+                if (session.native_vector_source_sequence == source_sequence)
+                    session.native_vector_generation
+                else
+                    null
+            else
+                null;
+            const generation = session_generation orelse manager.acquireVectorBlockGeneration() orelse {
+                if (error_bounds != null) return error.Unsupported;
+                break :blk null;
+            };
+            release_vector_block_generation = session_generation == null;
+            if (generation.opened.store.covered_source_sequence != source_sequence or
+                (if (error_bounds != null)
+                    generation.opened.scorePrecision() != .bounded_float16 and
+                        generation.opened.scorePrecision() != .authoritative_float32_with_bounded_float16
+                else
+                    generation.opened.scorePrecision() != .authoritative_float32 and
+                        generation.opened.scorePrecision() != .authoritative_float32_with_bounded_float16))
+            {
+                if (release_vector_block_generation) generation.release();
+                release_vector_block_generation = false;
+                if (error_bounds != null) return error.Unsupported;
+                break :blk null;
+            }
+            // Transfer the acquired generation lease to the query session on
+            // the bounded pass. Exact completion then reuses both the same
+            // immutable authority and the locations cached below, even if a
+            // newer CURRENT is published concurrently.
+            if (error_bounds != null and load_session != null and session_generation == null) {
+                load_session.?.pinNativeVectorGeneration(generation, source_sequence);
+                release_vector_block_generation = false;
+            }
+            break :blk generation;
+        } else blk: {
+            if (error_bounds != null) return error.Unsupported;
+            break :blk null;
+        };
+        defer if (release_vector_block_generation) vector_block_generation.?.release();
 
         const key_start = platform_time.monotonicNs();
         var key_arena = std.heap.ArenaAllocator.init(manager.alloc);
         defer key_arena.deinit();
         const key_alloc = key_arena.allocator();
+        var vector_block_payload_scratch: []u8 = &.{};
+        var vector_block_payload_stride: usize = 0;
+        if (vector_block_generation) |generation| {
+            const encoding = generation.opened.baseEncoding() orelse return error.InconsistentVectorBlockEncoding;
+            const vector_bytes = try vector_block_mod.encodedVectorBytesLen(encoding, dims);
+            const residual_bytes = if (error_bounds == null and encoding == .float16)
+                try vector_block_mod.exactResidualMaxBytes(dims)
+            else
+                0;
+            vector_block_payload_stride = std.math.add(usize, vector_bytes, residual_bytes) catch return error.BufferTooSmall;
+            const payload_bytes = std.math.mul(usize, vector_block_payload_stride, vector_ids.len) catch return error.BufferTooSmall;
+            if (load_session) |session| {
+                const io_request_bytes: usize = if (error_bounds != null)
+                    @sizeOf(vector_block_store_mod.ProjectionReadRequest)
+                else
+                    @sizeOf(vector_block_store_mod.ExactReadRequest);
+                const per_request_bytes: usize = @sizeOf(?vector_block_store_mod.LocatedValue) +
+                    @sizeOf(?vector_block_mod.Value) +
+                    @sizeOf(?vector_block_store_mod.LoadedProjection) +
+                    @sizeOf(usize) +
+                    io_request_bytes;
+                const request_bytes = @as(u64, @intCast(vector_ids.len)) *| per_request_bytes;
+                session.setNativeVectorIoBytes(@as(u64, @intCast(payload_bytes)) +| request_bytes);
+                native_vector_io_accounted = true;
+            }
+            vector_block_payload_scratch = try key_alloc.alloc(
+                u8,
+                payload_bytes,
+            );
+        }
         const artifact_reads = try key_alloc.alloc(DenseArtifactReadKey, vector_ids.len);
         const missing_positions = try key_alloc.alloc(usize, vector_ids.len);
         const vector_cache_epoch = entry.index.vectorCacheEpoch();
@@ -18331,6 +18859,38 @@ pub const IndexManager = struct {
                     }
                     continue;
                 }
+                if (error_bounds == null and scratch.source_sequence != null and vector_block_generation != null) {
+                    if (session.nativeVectorLocation(vector_ids[i], scratch.source_sequence.?)) |projection| {
+                        const value: ?vector_block_mod.Value = vector_block_generation.?.opened.viewExactFromProjection(projection) catch null;
+                        if (value) |exact_value| {
+                            if (exact_value.dims == dims) {
+                                const vector_start = std.math.mul(usize, i, dims) catch return error.BufferTooSmall;
+                                const vector_scratch = batch_scratch[vector_start .. vector_start + dims];
+                                const distance_start = platform_time.monotonicNs();
+                                distances[i] = try exactVectorBlockDistance(
+                                    exact_value,
+                                    query,
+                                    query_measure,
+                                    metric,
+                                    vector_scratch,
+                                );
+                                if (profile) |p| {
+                                    const elapsed = platform_time.monotonicNs() - distance_start;
+                                    p.rerank_vector_block_hits += 1;
+                                    p.rerank_vector_location_reuses += 1;
+                                    if (projection.located.residualBytes() != 0) {
+                                        p.rerank_vector_residual_reads += 1;
+                                        p.rerank_vector_residual_bytes +|= @intCast(projection.located.residualBytes());
+                                    }
+                                    p.rerank_artifact_cache_hits += 1;
+                                    p.rerank_artifact_distance_ns += elapsed;
+                                    p.rerank_distance_ns += elapsed;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
                 if (profile) |p| p.vector_cache_misses += 1;
                 const doc_key = maybe_doc_key orelse continue;
                 const artifact_key = if (internal_keys.isInternalUserKey(doc_key))
@@ -18350,15 +18910,6 @@ pub const IndexManager = struct {
         // newer replacement base may have discarded an overwritten revision;
         // an older base may be missing a committed mutation. Either mismatch
         // falls through to the authoritative primary artifact store.
-        const vector_block_generation = if (scratch.source_sequence) |source_sequence| blk: {
-            const generation = manager.acquireVectorBlockGeneration() orelse break :blk null;
-            if (generation.opened.store.covered_source_sequence != source_sequence) {
-                generation.release();
-                break :blk null;
-            }
-            break :blk generation;
-        } else null;
-        defer if (vector_block_generation) |generation| generation.release();
         if (vector_block_generation == null) {
             if (profile) |p| p.rerank_vector_block_fallbacks +|= @intCast(key_count);
         }
@@ -18366,23 +18917,75 @@ pub const IndexManager = struct {
             const shard_count = generation.opened.store.manifest.?.shard_count;
             std.mem.sort(DenseArtifactReadKey, artifact_reads[0..key_count], shard_count, DenseArtifactReadKey.blockLessThan);
             const block_read_start = platform_time.monotonicNs();
-            var remaining_count: usize = 0;
-            for (artifact_reads[0..key_count]) |artifact_read| {
+            const locations = try key_alloc.alloc(?vector_block_store_mod.LocatedValue, key_count);
+            @memset(locations, null);
+            const values = try key_alloc.alloc(?vector_block_mod.Value, key_count);
+            @memset(values, null);
+            const projections = try key_alloc.alloc(?vector_block_store_mod.LoadedProjection, key_count);
+            @memset(projections, null);
+            const request_positions = try key_alloc.alloc(usize, key_count);
+            var projection_requests: []vector_block_store_mod.ProjectionReadRequest = &.{};
+            var exact_requests: []vector_block_store_mod.ExactReadRequest = &.{};
+            if (error_bounds != null) {
+                projection_requests = try key_alloc.alloc(vector_block_store_mod.ProjectionReadRequest, key_count);
+            } else {
+                exact_requests = try key_alloc.alloc(vector_block_store_mod.ExactReadRequest, key_count);
+            }
+            var request_count: usize = 0;
+
+            // Resolve mmap metadata first, then issue unrelated payload reads
+            // in bounded waves. This retains shard-aware lookup locality while
+            // allowing the shared runtime to overlap positional I/O latency.
+            for (artifact_reads[0..key_count], 0..) |artifact_read, artifact_pos| {
                 const source_sequence = scratch.source_sequence.?;
-                const found = generation.opened.getHashed(artifact_read.key, artifact_read.block_hash, source_sequence, null) catch {
+                const found = generation.opened.locateHashed(
+                    artifact_read.key,
+                    artifact_read.block_hash,
+                    source_sequence,
+                    null,
+                ) catch continue;
+                const location = switch (found) {
+                    .vector => |vector| vector,
+                    .missing, .tombstone => continue,
+                };
+                locations[artifact_pos] = location;
+                request_positions[request_count] = artifact_pos;
+                const payload_start = std.math.mul(usize, request_count, vector_block_payload_stride) catch return error.BufferTooSmall;
+                const payload = vector_block_payload_scratch[payload_start..][0..vector_block_payload_stride];
+                if (error_bounds != null) {
+                    projection_requests[request_count] = .{ .located = location, .scratch = payload };
+                } else {
+                    exact_requests[request_count] = .{ .located = location, .scratch = payload };
+                }
+                request_count += 1;
+            }
+            if (error_bounds != null) {
+                try generation.opened.readProjectionsIntoBatch(manager.io, projection_requests[0..request_count]);
+                for (projection_requests[0..request_count], request_positions[0..request_count]) |request, artifact_pos| {
+                    const value = request.value orelse continue;
+                    values[artifact_pos] = value;
+                    projections[artifact_pos] = .{ .located = request.located, .value = value };
+                }
+            } else {
+                try generation.opened.readExactIntoBatch(manager.io, exact_requests[0..request_count]);
+                for (exact_requests[0..request_count], request_positions[0..request_count]) |request, artifact_pos| {
+                    values[artifact_pos] = request.value;
+                }
+            }
+
+            var remaining_count: usize = 0;
+            for (artifact_reads[0..key_count], 0..) |artifact_read, artifact_pos| {
+                const location = locations[artifact_pos] orelse {
                     if (profile) |p| p.rerank_vector_block_misses += 1;
                     artifact_reads[remaining_count] = artifact_read;
                     remaining_count += 1;
                     continue;
                 };
-                const value = switch (found) {
-                    .vector => |vector| vector,
-                    .missing, .tombstone => {
-                        if (profile) |p| p.rerank_vector_block_misses += 1;
-                        artifact_reads[remaining_count] = artifact_read;
-                        remaining_count += 1;
-                        continue;
-                    },
+                const value = values[artifact_pos] orelse {
+                    if (profile) |p| p.rerank_vector_block_misses += 1;
+                    artifact_reads[remaining_count] = artifact_read;
+                    remaining_count += 1;
+                    continue;
                 };
                 if (value.dims != dims) {
                     if (profile) |p| p.rerank_vector_block_misses += 1;
@@ -18394,10 +18997,25 @@ pub const IndexManager = struct {
                 const vector_start = std.math.mul(usize, slot, dims) catch return error.BufferTooSmall;
                 const vector_scratch = batch_scratch[vector_start .. vector_start + dims];
                 const distance_start = platform_time.monotonicNs();
-                distances[slot] = try exactVectorBlockDistance(value, query, query_measure, metric, vector_scratch);
+                if (error_bounds) |bounds| {
+                    const bounded = try boundedVectorBlockDistance(value, query, query_measure, bounded_query_norm, metric, vector_scratch);
+                    distances[slot] = bounded.distance;
+                    bounds[slot] = bounded.error_bound;
+                    if (load_session) |session| session.cacheNativeVectorLocation(vector_ids[slot], projections[artifact_pos].?);
+                } else {
+                    distances[slot] = try exactVectorBlockDistance(value, query, query_measure, metric, vector_scratch);
+                }
                 if (profile) |p| {
                     const elapsed = platform_time.monotonicNs() - distance_start;
                     p.rerank_vector_block_hits += 1;
+                    if (location.projectionBytes() != 0) {
+                        p.rerank_vector_projection_reads += 1;
+                        p.rerank_vector_projection_bytes +|= @intCast(location.projectionBytes());
+                    }
+                    if (error_bounds == null and location.residualBytes() != 0) {
+                        p.rerank_vector_residual_reads += 1;
+                        p.rerank_vector_residual_bytes +|= @intCast(location.residualBytes());
+                    }
                     p.rerank_artifact_cache_hits += 1;
                     p.rerank_artifact_distance_ns += elapsed;
                     p.rerank_distance_ns += elapsed;
@@ -18719,6 +19337,19 @@ pub const IndexManager = struct {
         if (value.vectorView()) |vector| {
             return exactStoredVectorDistance(query, query_measure, vector, metric);
         }
+        const decoded = try value.decodeExactInto(decode_scratch);
+        if (decoded.len != query.len) return error.InvalidVectorDimensions;
+        return exactStoredVectorDistance(query, query_measure, decoded, metric);
+    }
+
+    fn boundedVectorBlockDistance(
+        value: anytype,
+        query: []const f32,
+        query_measure: f32,
+        query_norm: f32,
+        metric: vector_mod.DistanceMetric,
+        decode_scratch: []f32,
+    ) !vector_mod.BoundedDistance {
         if (value.encoding == .float16 and
             builtin.target.cpu.arch.endian() == .little and
             @intFromPtr(value.bytes.ptr) % @alignOf(f16) == 0)
@@ -18726,11 +19357,23 @@ pub const IndexManager = struct {
             const aligned: []align(@alignOf(f16)) const u8 = @alignCast(value.bytes);
             const encoded = std.mem.bytesAsSlice(f16, aligned);
             if (encoded.len != query.len) return error.InvalidVectorDimensions;
-            return vector_mod.distanceToQueryF16(query, query_measure, encoded, value.scale, metric);
+            if (value.quantization_error_norm) |error_norm| {
+                const decoded_norm = value.decoded_norm_lower_bound orelse return error.CorruptedVectorBlock;
+                const distance = vector_mod.distanceToQueryF16(query, query_measure, encoded, value.scale, metric);
+                return vector_mod.boundedDistanceFromProjectionMetadata(
+                    distance,
+                    query_norm,
+                    error_norm,
+                    decoded_norm,
+                    metric,
+                );
+            }
+            return vector_mod.distanceToQueryF16BoundedWithQueryNorm(query, query_measure, query_norm, encoded, value.scale, metric);
         }
-        const decoded = try value.decodeInto(decode_scratch);
-        if (decoded.len != query.len) return error.InvalidVectorDimensions;
-        return exactStoredVectorDistance(query, query_measure, decoded, metric);
+        return .{
+            .distance = try exactVectorBlockDistance(value, query, query_measure, metric, decode_scratch),
+            .error_bound = 0,
+        };
     }
 
     fn loadDenseVectorArtifactForHbc(
@@ -29317,6 +29960,98 @@ test "dense artifact rerank cosine distance includes candidate norm" {
     );
 }
 
+test "native float16 residual rerank returns authoritative float32 score" {
+    const alloc = std.testing.allocator;
+    const source = [_]f32{ 0.10003, -0.20007, 0.30011, 12_345.678 };
+    const query = [_]f32{ -0.75, 0.125, 2.5, -0.00031 };
+    var writer = try vector_block_mod.Writer.initWithEncoding(alloc, 1, 0, 1, 1, .float16);
+    defer writer.deinit();
+    try writer.appendVector("artifact", 1, 1, &source);
+    const block = try writer.build();
+    defer alloc.free(block);
+    const reader = try vector_block_mod.Reader.init(block);
+    const value = (try reader.get("artifact", 1, 1)).vector;
+    var scratch: [source.len]f32 = undefined;
+    const expected = vector_mod.distanceToQuery(&query, 0, &source, .inner_product);
+    const actual = try IndexManager.exactVectorBlockDistance(value, &query, 0, .inner_product, &scratch);
+    try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(actual)));
+}
+
+test "native rerank exact completion reuses location and reads one residual" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var manager_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const manager_path = try std.fmt.bufPrint(&manager_path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var manager = try IndexManager.init(alloc, manager_path);
+    defer manager.deinit();
+
+    var memory = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const root = "/native-location-rerank";
+    var store = try vector_block_store_mod.Store.open(alloc, memory.storage(), root);
+    defer store.deinit();
+    const source = [_]f32{ 0.10003, -0.20007, 0.30011, 12_345.678 };
+    var writer = try vector_block_mod.Writer.initWithEncoding(alloc, 1, 0, 1, 9, .float16);
+    defer writer.deinit();
+    try writer.appendVector("artifact", 9, 1, &source);
+    const block = try writer.build();
+    defer alloc.free(block);
+    store.covered_source_sequence = 9;
+    try store.publishGeneration(1, 9, &.{.{ .shard_id = 0, .bytes = block }}, true);
+
+    const opened = try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), root);
+    const generation = try SharedVectorBlockGeneration.create(alloc, opened);
+    var context: IndexManager.DenseVectorLoadContext = .{
+        .manager = &manager,
+        .index_name = @constCast("native-location-rerank"),
+    };
+    var session: IndexManager.DenseVectorLoadSession = .{ .context = &context };
+    defer session.deinit();
+    session.pinNativeVectorGeneration(generation, 9);
+    const location = (try generation.opened.locateHashed(
+        "artifact",
+        vector_block_mod.keyHash("artifact"),
+        9,
+        1,
+    )).vector;
+    const projection = try generation.opened.viewProjection(location);
+    session.cacheNativeVectorLocation(17, projection);
+    const cached_projection = session.nativeVectorLocation(17, 9) orelse return error.TestExpectedCachedProjection;
+    try std.testing.expect(@intFromPtr(cached_projection.value.bytes.ptr) != @intFromPtr(projection.value.bytes.ptr));
+    try std.testing.expect(session.working_bytes_current >= session.native_vector_projection_bytes.capacity);
+
+    const previous_session = IndexManager.active_dense_vector_load_session;
+    IndexManager.active_dense_vector_load_session = &session;
+    defer IndexManager.active_dense_vector_load_session = previous_session;
+    const query = [_]f32{ -0.75, 0.125, 2.5, -0.00031 };
+    var distances: [2]f32 = undefined;
+    var batch_scratch: [2 * source.len]f32 = undefined;
+    var profile: hbc_mod.SearchProfile = .{};
+    try IndexManager.scoreDenseVectorsFromNativeLocations(
+        &context,
+        &.{ 17, 99 },
+        &query,
+        0,
+        .inner_product,
+        &distances,
+        &batch_scratch,
+        source.len,
+        9,
+        &profile,
+    );
+    const expected = vector_mod.distanceToQuery(&query, 0, &source, .inner_product);
+    try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(distances[0])));
+    try std.testing.expectEqual(std.math.inf(f32), distances[1]);
+    try std.testing.expectEqual(@as(u64, 1), profile.rerank_vector_location_reuses);
+    // The bounded pass owns projection I/O. Exact completion reuses its
+    // validated view and touches only this selected vector's residual.
+    try std.testing.expectEqual(@as(u64, 0), profile.rerank_vector_projection_reads);
+    try std.testing.expectEqual(@as(u64, 0), profile.rerank_vector_projection_bytes);
+    try std.testing.expectEqual(@as(u64, 1), profile.rerank_vector_residual_reads);
+    try std.testing.expectEqual(@as(u64, @intCast(location.residualBytes())), profile.rerank_vector_residual_bytes);
+}
+
 test "force text compaction supersedes in-flight scheduled merge" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -30236,7 +30971,8 @@ test "authoritative posting capture starts inside an existing replay session" {
     var session_open = true;
     defer if (session_open) manager.abortDenseStreamingReplaySessionByName("dv_v1");
 
-    try std.testing.expect(try manager.beginDensePostingSidecarCaptureByName("dv_v1"));
+    const first_lease = (try manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions("dv_v1", .{})).?;
+    try std.testing.expect(first_lease.ownsLifecycle());
     try std.testing.expect(entry.index.experimentalPostingMutationCaptureActive());
     // An idempotent catalog/status publication for the already-covered
     // boundary must not consume or reject the next empty source window.
@@ -30246,10 +30982,15 @@ test "authoritative posting capture starts inside an existing replay session" {
         error.PostingWalCaptureOwnershipConflict,
         manager.beginDensePostingSidecarCaptureByName("dv_v1"),
     );
-    try std.testing.expect(!try manager.beginDensePostingSidecarCaptureByNameWithOptions(
+    const borrower = (try manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(
         "dv_v1",
         .{ .borrow_active_source = true },
-    ));
+    )).?;
+    try std.testing.expect(!borrower.ownsLifecycle());
+    try std.testing.expectError(
+        error.PostingWalCaptureBorrowerCannotFinish,
+        manager.finishDensePostingSidecarCaptureLeaseByName("dv_v1", borrower, 0),
+    );
     try manager.finishDenseStreamingReplaySessionByNameWithOptions("dv_v1", .{});
     session_open = false;
     try std.testing.expectEqual(
@@ -30258,7 +30999,7 @@ test "authoritative posting capture starts inside an existing replay session" {
     );
     // The completed session captured no mutation, so its owner can retire the
     // coverage-only handoff without adding another WAL generation.
-    try manager.finishDensePostingSidecarCaptureByName("dv_v1", 0);
+    try manager.finishDensePostingSidecarCaptureLeaseByName("dv_v1", first_lease, 0);
     try std.testing.expect(!entry.index.experimentalPostingMutationCaptureActive());
 
     // Seed a real member outside the transaction under test, then delete it
@@ -30267,7 +31008,7 @@ test "authoritative posting capture starts inside an existing replay session" {
     try entry.index.insertVectorForTest(42, &captured_vector);
     try manager.beginDenseStreamingReplaySessionByName("dv_v1");
     session_open = true;
-    try std.testing.expect(try manager.beginDensePostingSidecarCaptureByName("dv_v1"));
+    const second_lease = (try manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions("dv_v1", .{})).?;
     try std.testing.expectEqual(
         hbc_mod.ExperimentalPostingCaptureOwner.source,
         entry.index.experimentalPostingMutationCaptureOwner(),
@@ -30285,8 +31026,17 @@ test "authoritative posting capture starts inside an existing replay session" {
         error.ReplayDocumentNotVisible,
         manager.beginDensePostingSidecarCaptureByName("dv_v1"),
     );
-    try manager.finishDensePostingSidecarCaptureByName("dv_v1", 0);
+    try manager.finishDensePostingSidecarCaptureLeaseByName("dv_v1", second_lease, 0);
     try std.testing.expect(!entry.index.experimentalPostingMutationCaptureActive());
+
+    // A completed token cannot consume the next capture even when allocator
+    // addresses and source coverage are unchanged.
+    const third_lease = (try manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions("dv_v1", .{})).?;
+    defer manager.cancelDensePostingSidecarCaptureLeaseByName("dv_v1", third_lease) catch {};
+    try std.testing.expectError(
+        error.PostingWalCaptureSuperseded,
+        manager.finishDensePostingSidecarCaptureLeaseByName("dv_v1", second_lease, 0),
+    );
 }
 
 test "stable native finalization certifies an empty dense index" {
@@ -30547,6 +31297,16 @@ test "opportunistic vector publication requires a fully settled primary write pl
     try std.testing.expect(!IndexManager.primaryWritePlaneSafeForProjection(stats, 0));
     stats.compaction_scheduler_active_jobs = 0;
     try std.testing.expect(IndexManager.primaryWritePlaneSafeForProjection(stats, 1));
+}
+
+test "initial native WAL flatten does not wait forever on idle mutable rows" {
+    try std.testing.expect(IndexManager.exactNativeGenerationRequiresInitialFlatten(true, false, 1_000_000));
+    try std.testing.expect(!IndexManager.exactNativeGenerationRequiresInitialFlatten(false, false, 1_000_000));
+    try std.testing.expect(!IndexManager.exactNativeGenerationRequiresInitialFlatten(true, true, 1_000_000));
+    try std.testing.expect(!IndexManager.exactNativeGenerationRequiresInitialFlatten(true, false, 0));
+    try std.testing.expect(!IndexManager.projectionRequiresSettledPrimaryWritePlane(false, true));
+    try std.testing.expect(!IndexManager.projectionRequiresSettledPrimaryWritePlane(true, false));
+    try std.testing.expect(IndexManager.projectionRequiresSettledPrimaryWritePlane(false, false));
 }
 
 test "dense vector block physical order drains one low-bit shard at a time" {

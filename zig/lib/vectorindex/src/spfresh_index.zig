@@ -332,9 +332,13 @@ pub const FlatCentroidBuildOutcome = union(enum) {
 };
 
 /// Conservative peak allocation for a cold flat-directory build. It covers
-/// the retained RaBitQ output for the worst case (every published node is a
-/// leaf), traversal arrays, raw centroid blocks, and RaBitQ's normalization
-/// workspace. ArrayList growth is budgeted at twice its logical capacity.
+/// the larger of the retained RaBitQ output and an exact persisted-generation
+/// overlay for the worst case (every published node is a leaf), traversal
+/// arrays, raw centroid blocks, and quantization/overlay construction
+/// workspace. A native WAL tail may legitimately shadow every base posting;
+/// loading that generation owns a float32 overlay even when new directories
+/// normally use RaBitQ. ArrayList growth is budgeted at twice its logical
+/// capacity.
 pub fn projectedFlatCentroidDirectoryBuildBytes(
     node_count: u64,
     dims: usize,
@@ -350,9 +354,18 @@ pub fn projectedFlatCentroidDirectoryBuildBytes(
     // Retained directory and its worst-case block-array capacity.
     try checkedAddMul(&retained, @max(block_count *| 2, 16), @sizeOf(FlatCentroidBlock));
     try checkedAddMul(&retained, node_count, @sizeOf(u64) + @sizeOf(f32));
-    try checkedAddMul(&retained, node_count, code_width *| @sizeOf(u64));
-    try checkedAddMul(&retained, node_count, 4 * @sizeOf(f32) + @sizeOf(u32));
-    try checkedAddMul(&retained, block_count, @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    var rabit_payload: u64 = 0;
+    try checkedAddMul(&rabit_payload, node_count, code_width *| @sizeOf(u64));
+    try checkedAddMul(&rabit_payload, node_count, 4 * @sizeOf(f32) + @sizeOf(u32));
+    try checkedAddMul(&rabit_payload, block_count, @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    var exact_overlay_payload: u64 = 0;
+    try checkedAddMul(
+        &exact_overlay_payload,
+        node_count,
+        @as(u64, @intCast(dims)) *| @sizeOf(f32) + @sizeOf(f32),
+    );
+    retained = std.math.add(u64, retained, @max(rabit_payload, exact_overlay_payload)) catch
+        return error.OutOfMemory;
     // Traversal and block construction workspace. Quantization temporarily
     // holds a normalized copy alongside the raw centroid block.
     var transient: u64 = 0;
@@ -366,7 +379,24 @@ pub fn projectedFlatCentroidDirectoryBuildBytes(
     try checkedAddMul(&transient, 1, @sizeOf(types.Node));
     try checkedAddMul(&transient, 1, @as(u64, @intCast(dims)) *| @sizeOf(f32));
     try checkedAddMul(&transient, @intCast(max_node_entries), @sizeOf(u64));
+    // Persisted exact overlays are accumulated in growable arrays before
+    // ownership moves into the directory. Retained admission covers the final
+    // payload; one additional logical payload covers geometric growth and a
+    // potentially allocating shrink-to-owned handoff.
+    transient = std.math.add(u64, transient, exact_overlay_payload) catch
+        return error.OutOfMemory;
     return .{ .transient_bytes = transient, .retained_bytes = retained };
+}
+
+test "flat centroid projection covers a million-scale exact WAL overlay" {
+    const node_count: u64 = 8_950;
+    const dims: usize = 768;
+    const projection = try projectedFlatCentroidDirectoryBuildBytes(node_count, dims, 1_280, 128);
+    const exact_payload = node_count *
+        (@as(u64, dims) * @sizeOf(f32) + @sizeOf(f32));
+
+    try std.testing.expect(projection.retained_bytes >= exact_payload);
+    try std.testing.expect(projection.transient_bytes >= exact_payload);
 }
 
 pub const FlatCentroidProbe = search_types.FlatCentroidProbe;
