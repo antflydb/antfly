@@ -134,6 +134,76 @@ pub fn syncFileAndParentPortable(io: anytype, path: []const u8) !void {
     try syncDirPortable(io, parent);
 }
 
+/// Copies one regular file and verifies that the source did not change while
+/// it was being read. The destination and its parent directory are synced
+/// before returning so callers can use this while constructing a durable
+/// generation.
+pub fn copyFileDurablePortable(io: std.Io, source_path: []const u8, destination_path: []const u8) !u64 {
+    if (std.fs.path.dirname(destination_path)) |parent| try createDirPathPortable(io, parent);
+
+    var source = if (std.fs.path.isAbsolute(source_path))
+        try std.Io.Dir.openFileAbsolute(io, source_path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, source_path, .{});
+    defer source.close(io);
+    const initial = try source.stat(io);
+
+    var destination = try createFilePortable(io, destination_path, .{ .truncate = true });
+    defer destination.close(io);
+    var writer_buffer: [16 * 1024]u8 = undefined;
+    var writer = destination.writer(io, &writer_buffer);
+    var reader: std.Io.File.Reader = .initSize(source, io, &.{}, initial.size);
+    _ = writer.interface.sendFileAll(&reader, .unlimited) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        error.WriteFailed => return writer.err.?,
+    };
+    try writer.end();
+
+    const final = try source.stat(io);
+    if (final.size != initial.size or !std.meta.eql(final.mtime, initial.mtime))
+        return error.SourceFileChanged;
+    try destination.sync(io);
+    const parent = std.fs.path.dirname(destination_path) orelse if (std.fs.path.isAbsolute(destination_path)) "/" else ".";
+    try syncDirPortable(io, parent);
+    return initial.size;
+}
+
+/// Recursively copies a directory containing only regular files and
+/// directories into a durable destination tree.
+pub fn copyDirectoryDurablePortable(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source_path: []const u8,
+    destination_path: []const u8,
+) !u64 {
+    try createDirPathPortable(io, destination_path);
+    var source = if (std.fs.path.isAbsolute(source_path))
+        try std.Io.Dir.openDirAbsolute(io, source_path, .{ .iterate = true })
+    else
+        try std.Io.Dir.cwd().openDir(io, source_path, .{ .iterate = true });
+    defer source.close(io);
+
+    var walker = try source.walk(alloc);
+    defer walker.deinit();
+    var total: u64 = 0;
+    while (try walker.next(io)) |entry| {
+        const destination = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ destination_path, entry.path });
+        defer alloc.free(destination);
+        switch (entry.kind) {
+            .directory => try createDirPathPortable(io, destination),
+            .file => {
+                const source_file = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ source_path, entry.path });
+                defer alloc.free(source_file);
+                total = std.math.add(u64, total, try copyFileDurablePortable(io, source_file, destination)) catch
+                    return error.FileTooBig;
+            },
+            else => return error.UnsupportedFileType,
+        }
+    }
+    try syncDirPortable(io, destination_path);
+    return total;
+}
+
 pub fn pathsReferToSameExistingFile(allocator: std.mem.Allocator, io: anytype, a: []const u8, b: []const u8) !bool {
     const a_real = realPathAlloc(allocator, io, a) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return false,

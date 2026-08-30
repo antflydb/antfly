@@ -444,6 +444,11 @@ pub const RuntimeStorageTarget = struct {
 };
 
 pub const RuntimeStatusResult = struct {
+    // Keep /status wire-compatible with the public ClusterStatus contract while
+    // retaining serverless runtime diagnostics as additive fields.
+    health: RuntimeHealth = .healthy,
+    deployment_mode: RuntimeDeploymentMode = .serverless,
+    index_capabilities: IndexRuntimeCapabilities = .{},
     role: RuntimeRole,
     combined_mode: bool = false,
     tick_interval_ms: u64,
@@ -461,6 +466,29 @@ pub const RuntimeStatusResult = struct {
         alloc.free(self.targets);
         self.* = undefined;
     }
+};
+
+pub const RuntimeHealth = enum {
+    unknown,
+    healthy,
+    unhealthy,
+    degraded,
+    @"error",
+};
+
+pub const RuntimeDeploymentMode = enum {
+    serverless,
+};
+
+pub const IndexRuntimeCapabilities = struct {
+    artifact_sources: bool = false,
+    artifact_sources_state: ArtifactSourcesCapabilityState = .unsupported,
+};
+
+pub const ArtifactSourcesCapabilityState = enum {
+    available,
+    upgrade_pending,
+    unsupported,
 };
 
 pub const HealthResult = struct {
@@ -699,6 +727,10 @@ test "runtime status defaults maintenance features to enabled" {
     try std.testing.expect(status.compaction_enabled);
     try std.testing.expect(status.prune_enabled);
     try std.testing.expect(status.enrichment_enabled);
+    try std.testing.expectEqual(RuntimeHealth.healthy, status.health);
+    try std.testing.expectEqual(RuntimeDeploymentMode.serverless, status.deployment_mode);
+    try std.testing.expect(!status.index_capabilities.artifact_sources);
+    try std.testing.expectEqual(ArtifactSourcesCapabilityState.unsupported, status.index_capabilities.artifact_sources_state);
 }
 
 test "metrics result deinit handles namespace array" {

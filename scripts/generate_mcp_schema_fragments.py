@@ -61,6 +61,7 @@ FRAGMENTS = (
 QUERY_REQUEST_PROPERTIES = (
     "query",
     "full_text_search",
+    "full_text_index",
     "filter_query",
     "exclusion_query",
     "semantic_search",
@@ -120,6 +121,12 @@ MCP_QUERY_SHORTHAND_PROPERTIES: dict[str, dict[str, Any]] = {
     "fullTextSearchField": {
         "type": "string",
         "description": "Field to search when fullTextSearch is a string shorthand.",
+    },
+    "fullTextIndex": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "description": "Named full-text index used by fullTextSearch; omission uses the active schema index.",
     },
     "semanticSearch": {"type": "string"},
     "fields": {"type": "array", "items": {"type": "string"}},
@@ -400,6 +407,17 @@ def mcp_query_input_schema(schemas: dict[str, Any]) -> dict[str, Any]:
         "required": ["tableName"],
         "properties": properties,
         "not": {"anyOf": conflicting_pairs},
+        "allOf": [
+            {
+                "if": property_has_non_null_value("fullTextIndex"),
+                "then": {
+                    "anyOf": [
+                        property_has_non_null_value("fullTextSearch"),
+                        property_has_non_null_value("full_text_search"),
+                    ]
+                },
+            }
+        ],
     }
 
 

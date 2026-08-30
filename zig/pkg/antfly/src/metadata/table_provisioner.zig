@@ -27,6 +27,7 @@ const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const coverage_policy = @import("../api/coverage_policy.zig");
+const table_index_config = @import("../api/table_index_config.zig");
 const indexes_api = @import("../api/indexes.zig");
 const table_reads = @import("../api/table_reads.zig");
 const table_catalog = @import("../api/table_catalog.zig");
@@ -77,6 +78,7 @@ pub const ReconcileReplicaRootOptions = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
     restore_open_options: backups_api.OpenOptions = .{},
+    embedding_options: managed_embedder.InitOptions = .{},
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 };
 
@@ -106,6 +108,8 @@ const RestoreIntentSource = struct {
     connection: []const u8 = "",
     artifact_size_bytes: u64 = 0,
     artifact_sha256: []const u8 = "",
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
 };
 
 pub fn groupDbPathFromReplicaRoot(alloc: std.mem.Allocator, replica_root_dir: []const u8, group_id: u64) ![]u8 {
@@ -171,6 +175,8 @@ pub fn provisioningFingerprint(
         hashBytes(&hasher, range.restore_connection);
         hasher.update(std.mem.asBytes(&range.restore_artifact_size_bytes));
         hashBytes(&hasher, range.restore_artifact_sha256);
+        hasher.update(std.mem.asBytes(&range.restore_native_manifest_size_bytes));
+        hashBytes(&hasher, range.restore_native_manifest_sha256);
         hasher.update(&range.completed_restore_fingerprint);
         hasher.update(std.mem.asBytes(&table.table_id));
         hashBytes(&hasher, table.name);
@@ -219,16 +225,21 @@ pub fn reconcileReplicaRootWithOptions(
         const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(path);
 
-        try fs_paths.createDirPathPortable(options.io, path);
+        const io = if (options.backend_runtime) |runtime|
+            runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable
+        else
+            options.io;
+        try fs_paths.createDirPathPortable(io, path);
         var restore_open_options = options.restore_open_options;
-        if (restore_open_options.io == null) restore_open_options.io = options.io;
-        try applyRestoreIntentIfNeededWithOptions(
+        if (restore_open_options.io == null) restore_open_options.io = io;
+        try applyRestoreIntentIfNeededWithRuntime(
             alloc,
             path,
             group_id,
             table,
             range,
             restore_open_options,
+            options.backend_runtime,
         );
 
         const runtime_schema = try runtimeTableSchemaFromJson(alloc, table.schema_json);
@@ -240,6 +251,7 @@ pub fn reconcileReplicaRootWithOptions(
         defer db.close();
         summary.dbs_opened += 1;
         const index_summary = try reconcileDbIndexesWithOptions(alloc, &db, table.indexes_json, .{
+            .embedding_options = options.embedding_options,
             .source_table = table.name,
             .destination_authorizer = options.destination_authorizer,
         });
@@ -265,6 +277,7 @@ pub fn reconcileDbIndexes(
 
 pub const ReconcileDbIndexOptions = struct {
     drain_resolver_backfill: bool = true,
+    embedding_options: managed_embedder.InitOptions = .{},
     source_table: []const u8 = "",
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 };
@@ -284,7 +297,7 @@ pub fn reconcileDbIndexesWithOptions(
         for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
         desired_enrichments.deinit(alloc);
     }
-    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, &desired_enrichments);
+    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.embedding_options, &desired_enrichments);
     try indexes_api.validateArtifactEnrichmentConfigs(alloc, desired_enrichments.items);
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
     indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
@@ -339,6 +352,16 @@ pub fn reconcileDbIndexTarget(
     indexes_json: []const u8,
     index_name: []const u8,
 ) !ProvisionSummary {
+    return try reconcileDbIndexTargetWithOptions(alloc, db, indexes_json, index_name, .{});
+}
+
+pub fn reconcileDbIndexTargetWithOptions(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+    index_name: []const u8,
+    options: ReconcileDbIndexOptions,
+) !ProvisionSummary {
     if (!dbIndexReconciliationCanMutate(db)) return .{};
     if (index_name.len == 0 or
         std.mem.eql(u8, index_name, "resolvers") or
@@ -356,7 +379,7 @@ pub fn reconcileDbIndexTarget(
         for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
         desired_enrichments.deinit(alloc);
     }
-    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, &desired_enrichments);
+    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.embedding_options, &desired_enrichments);
     try indexes_api.validateArtifactEnrichmentConfigs(alloc, desired_enrichments.items);
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
     indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
@@ -392,7 +415,7 @@ pub fn reconcileDbIndexTarget(
     }
 
     if (target_value) |value| {
-        try indexes_api.collectArtifactEnrichmentsFromValue(alloc, value, &target_enrichments);
+        try indexes_api.collectArtifactEnrichmentsFromValueWithOptions(alloc, value, options.embedding_options, &target_enrichments);
         dedupeDesiredEnrichments(alloc, &target_enrichments);
         indexes_api.sortArtifactEnrichmentsByDependency(target_enrichments.items);
     }
@@ -774,6 +797,8 @@ fn collectLocalRestoreProgressWithIo(
         if (!std.mem.eql(u8, state.backup_id, restore.backup_id)) continue;
         if (!std.mem.eql(u8, state.location, restore.location)) continue;
         if (!std.mem.eql(u8, state.artifact_sha256, restore.artifact_sha256)) continue;
+        if (state.native_manifest_size_bytes != restore.native_manifest_size_bytes) continue;
+        if (!std.mem.eql(u8, state.native_manifest_sha256, restore.native_manifest_sha256)) continue;
         if (restore.snapshot_path.len > 0 and !std.mem.eql(u8, state.snapshot_path, restore.snapshot_path)) continue;
         if (state.group_id != group_id) continue;
 
@@ -793,6 +818,8 @@ fn collectLocalRestoreProgressWithIo(
                 .location = progress_location,
                 .snapshot_path = &.{},
                 .artifact_sha256 = &.{},
+                .native_manifest_size_bytes = state.native_manifest_size_bytes,
+                .native_manifest_sha256 = &.{},
                 .primary_restored = state.primary_restored,
                 .runtime_repair_complete = state.runtime_repair_complete,
                 .phase = &.{},
@@ -804,6 +831,7 @@ fn collectLocalRestoreProgressWithIo(
         errdefer if (!appended) table_manager.freeRestoreProgress(alloc, record);
         record.snapshot_path = try alloc.dupe(u8, state.snapshot_path);
         record.artifact_sha256 = try alloc.dupe(u8, state.artifact_sha256);
+        record.native_manifest_sha256 = try alloc.dupe(u8, state.native_manifest_sha256);
         record.phase = try alloc.dupe(u8, state.phase);
         record.last_error = try alloc.dupe(u8, state.last_error);
         try out.append(alloc, record);
@@ -838,6 +866,26 @@ pub fn applyRestoreIntentIfNeededWithOptions(
     range: table_manager.RangeRecord,
     open_options: backups_api.OpenOptions,
 ) !void {
+    return try applyRestoreIntentIfNeededWithRuntime(
+        alloc,
+        path,
+        group_id,
+        table,
+        range,
+        open_options,
+        null,
+    );
+}
+
+pub fn applyRestoreIntentIfNeededWithRuntime(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    table: table_manager.TableRecord,
+    range: table_manager.RangeRecord,
+    open_options: backups_api.OpenOptions,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+) !void {
     const restore = resolveRestoreIntent(range, table) orelse return;
     try backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, .{
         .backup_id = restore.backup_id,
@@ -847,7 +895,10 @@ pub fn applyRestoreIntentIfNeededWithOptions(
         .authority = .{ .external = restore.connection },
         .expected_artifact_size_bytes = restore.artifact_size_bytes,
         .expected_artifact_sha256 = restore.artifact_sha256,
+        .expected_native_manifest_size_bytes = restore.native_manifest_size_bytes,
+        .expected_native_manifest_sha256 = restore.native_manifest_sha256,
         .open_options = open_options,
+        .backend_runtime = backend_runtime,
     }, .{
         .expected_table_name = table.name,
         .expected_identity_namespace = doc_identity.Namespace{
@@ -871,6 +922,8 @@ fn resolveRestoreIntent(
             .connection = range.restore_connection,
             .artifact_size_bytes = range.restore_artifact_size_bytes,
             .artifact_sha256 = range.restore_artifact_sha256,
+            .native_manifest_size_bytes = range.restore_native_manifest_size_bytes,
+            .native_manifest_sha256 = range.restore_native_manifest_sha256,
         };
     }
     _ = table;
@@ -955,18 +1008,16 @@ fn ensureIndexDefinition(
     else
         try extractIndexConfigJsonForKind(alloc, name, kind, config_value);
     defer alloc.free(config_json);
-    const configured_coverage_generation = coverage_policy.incarnation(config_value) orelse 0;
+    const configured_coverage_generation = coverage_policy.incarnation(config_value) orelse
+        internal_keys.derivedCoverageGeneration(config_json);
     const desired = db_mod.types.IndexConfig{
         .name = name,
         .kind = kind,
         .config_json = config_json,
-        // The catalog persists the effective derived generation. Normalize
-        // desired state at the same boundary so a reopen cannot misclassify
-        // an unchanged vector index as a replacement.
-        .coverage_generation = if (kind == .dense_vector or kind == .sparse_vector)
-            internal_keys.derivedCoverageGenerationForConfig(configured_coverage_generation, config_json)
-        else
-            configured_coverage_generation,
+        // New catalog records carry a random incarnation. v0.2 records may
+        // predate that field, so derive the same deterministic fallback used
+        // by public readiness and storage-open parsing.
+        .coverage_generation = configured_coverage_generation,
     };
     const existing = findIndexConfig(current, name);
     if (existing) |existing_cfg| {
@@ -1127,10 +1178,11 @@ fn jsonValuesEqualIgnoringTopLevelEnrichments(a: std.json.Value, b: std.json.Val
 fn collectDesiredEnrichmentsFromJson(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
+    embedding_options: managed_embedder.InitOptions,
     out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
 ) !void {
     {
-        const collected = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
+        const collected = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, indexes_json, embedding_options);
         errdefer db_mod.types.freeEnrichmentConfigs(alloc, collected);
         try out.appendSlice(alloc, collected);
         alloc.free(collected);
@@ -1644,15 +1696,7 @@ fn extractStoredIndexConfigJson(alloc: std.mem.Allocator, value: std.json.Value)
 }
 
 fn skipPublicIndexMetadataField(kind: db_mod.types.IndexKind, field: []const u8) bool {
-    if (std.mem.eql(u8, field, "type") or
-        std.mem.eql(u8, field, "name") or
-        std.mem.eql(u8, field, "description") or
-        std.mem.eql(u8, field, "enrichments") or
-        std.mem.eql(u8, field, "derive_from_schema"))
-    {
-        return true;
-    }
-    return kind != .algebraic and std.mem.eql(u8, field, "version");
+    return table_index_config.isCatalogMetadataField(kind, field);
 }
 
 fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
@@ -2110,7 +2154,7 @@ test "table provisioner admits algebraic index on a non-empty table through gene
 test "table provisioner extracts public algebraic metadata as internal config" {
     const alloc = std.testing.allocator;
     const index_json =
-        \\{"type":"algebraic","version":1,"table":"docs","schema_version":2,"derive_from_schema":true,"group_fields":[{"name":"customer","path":"customer","type":"string"}],"materializations":[]}
+        \\{"type":"algebraic","version":1,"table":"docs","schema_version":2,"derive_from_schema":true,"_index_incarnation":42,"_coverage_incarnation":41,"group_fields":[{"name":"customer","path":"customer","type":"string"}],"materializations":[]}
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
     defer parsed.deinit();
@@ -2123,6 +2167,8 @@ test "table provisioner extracts public algebraic metadata as internal config" {
 
     try std.testing.expect(config.value.object.get("type") == null);
     try std.testing.expect(config.value.object.get("derive_from_schema") == null);
+    try std.testing.expect(config.value.object.get("_index_incarnation") == null);
+    try std.testing.expect(config.value.object.get("_coverage_incarnation") == null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"version\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"schema_version\":2") != null);
 }
@@ -2173,6 +2219,14 @@ test "table provisioner registers top-level enrichments without creating enrichm
     try std.testing.expect(db.core.index_manager.has("full_text_index_v0"));
     try std.testing.expect(!db.core.index_manager.has("enrichments"));
 
+    const indexes = try db.listIndexes(std.testing.allocator);
+    defer db_mod.types.freeIndexConfigs(std.testing.allocator, indexes);
+    try std.testing.expectEqual(@as(usize, 1), indexes.len);
+    try std.testing.expectEqual(
+        internal_keys.derivedCoverageGeneration(indexes[0].config_json),
+        indexes[0].coverage_generation,
+    );
+
     const enrichments = try db.listEnrichments(std.testing.allocator);
     defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, enrichments);
     try std.testing.expectEqual(@as(usize, 1), enrichments.len);
@@ -2194,7 +2248,7 @@ test "table provisioner registers a resolver declared in the table index config"
     const indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
@@ -2251,7 +2305,7 @@ test "table provisioner registers a resolver declared in the table index config"
     const bumped_indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
@@ -2297,7 +2351,7 @@ test "table provisioner registers a resolver declared in the table index config"
     const removed_indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[]
         \\}
@@ -2352,7 +2406,7 @@ test "table provisioner can admit resolver backfill without draining corpus work
     const graph_only =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
         \\}
     ;
@@ -2371,7 +2425,7 @@ test "table provisioner can admit resolver backfill without draining corpus work
     const with_resolver =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",

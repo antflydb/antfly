@@ -460,6 +460,10 @@ pub const Config = struct {
     /// every supplied interface alive until all lane leases are released and
     /// `BackendRuntime.deinit` returns.
     borrowed_io: ?BorrowedIo = null,
+    /// Optional caller-owned synchronous filesystem authority. Manual
+    /// runtimes use this for lifecycle locks and durable metadata without
+    /// acquiring a worker executor. It must outlive the runtime.
+    filesystem_io: ?Io = null,
 };
 
 pub const BorrowedIo = struct {
@@ -571,6 +575,7 @@ pub const DurableJobLane = struct {
         resume_owner: *const fn (ptr: *anyopaque, owner_id: u64) anyerror!void = lifecycleUnsupported,
         reopen_owner: *const fn (ptr: *anyopaque, owner_id: u64) anyerror!void = lifecycleUnsupported,
         poll: *const fn (ptr: *anyopaque, max_jobs: usize) anyerror!usize,
+        is_accepting: ?*const fn (ptr: *anyopaque) bool = null,
         executes_inline: bool = false,
     };
 
@@ -607,6 +612,14 @@ pub const DurableJobLane = struct {
 
     pub fn poll(self: DurableJobLane, max_jobs: usize) !usize {
         return try self.vtable.poll(self.ptr, max_jobs);
+    }
+
+    /// Whether the lane still admits successor work. Durable jobs use this to
+    /// make delayed retries responsive to runtime shutdown while leaving their
+    /// on-disk intent available for reconciliation on the next open.
+    pub fn isAccepting(self: DurableJobLane) bool {
+        const callback = self.vtable.is_accepting orelse return true;
+        return callback(self.ptr);
     }
 
     /// Manual runtimes execute submissions on the caller's stack. Workers
@@ -763,6 +776,7 @@ pub const BackendRuntime = struct {
     native_storage_pool: *storage_io.NativeStoragePool,
     borrowed_storage: ?storage_io.IoStorage = null,
     lsm_owner_clone_registry: LsmOwnerCloneRegistry,
+    borrowed_filesystem_io: ?Io = null,
     io_impl: ?*IoImpl = null,
     raft_inbound_io_impl: ?*IoImpl = null,
     raft_outbound_io_impl: ?*IoImpl = null,
@@ -811,6 +825,7 @@ pub const BackendRuntime = struct {
             .owner_registry = owner_registry,
             .native_storage_pool = native_storage_pool,
             .lsm_owner_clone_registry = LsmOwnerCloneRegistry.init(alloc),
+            .borrowed_filesystem_io = config.filesystem_io,
             .durable_jobs = undefined,
             .borrowed_io = config.borrowed_io,
             .borrowed_storage = if (config.borrowed_io) |borrowed| storage_io.IoStorage.init(borrowed.general) else null,
@@ -912,6 +927,12 @@ pub const BackendRuntime = struct {
 
     pub fn usesBorrowedIo(self: *const BackendRuntime) bool {
         return self.borrowed_io != null;
+    }
+
+    /// I/O authority for synchronous storage work. Unlike `io`, this may be
+    /// caller-owned and does not imply that background scheduling is enabled.
+    pub fn filesystemIo(self: *BackendRuntime) ?Io {
+        return self.io() orelse self.borrowed_filesystem_io;
     }
 
     pub fn nativeStoragePool(self: *BackendRuntime) *storage_io.NativeStoragePool {
@@ -1220,6 +1241,11 @@ pub const BackendRuntime = struct {
 pub const BackendRuntimeHandle = struct {
     alloc: Allocator,
     runtime: *BackendRuntime,
+    /// Filesystem executor owned by this handle and lent to a manual runtime.
+    /// Keeping the authority in the same move-only value as the runtime makes
+    /// runtime handoff atomic and prevents callers from preserving one while
+    /// accidentally destroying the other.
+    owned_filesystem_io: ?*IoImpl = null,
 
     pub fn init(alloc: Allocator, config: Config) !BackendRuntimeHandle {
         const runtime = try alloc.create(BackendRuntime);
@@ -1231,10 +1257,27 @@ pub const BackendRuntimeHandle = struct {
         };
     }
 
+    pub fn initManualWithOwnedFilesystemIo(alloc: Allocator) !BackendRuntimeHandle {
+        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
+        const filesystem_io = try initIoLane(alloc, threaded_io_limits.service);
+        errdefer deinitIoLane(alloc, filesystem_io);
+        var handle = try init(alloc, .{
+            .backend = .manual,
+            .filesystem_io = filesystem_io.io(),
+        });
+        handle.owned_filesystem_io = filesystem_io;
+        return handle;
+    }
+
     pub fn deinit(self: *BackendRuntimeHandle) void {
         self.runtime.deinit();
         self.alloc.destroy(self.runtime);
+        if (self.owned_filesystem_io) |io_impl| deinitIoLane(self.alloc, io_impl);
         self.* = undefined;
+    }
+
+    pub fn ownsFilesystemIo(self: *const BackendRuntimeHandle) bool {
+        return self.owned_filesystem_io != null;
     }
 
     pub fn ptr(self: *BackendRuntimeHandle) *BackendRuntime {
@@ -1338,6 +1381,10 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     fn poll(_: *anyopaque, _: usize) !usize {
         return 0;
     }
+
+    fn isAccepting(_: *anyopaque) bool {
+        return false;
+    }
 } else struct {
     const Entry = struct {
         lane: *ThreadedDurableJobLane,
@@ -1362,6 +1409,7 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     reap_mutex: std.atomic.Mutex = .unlocked,
     shutdown_reaper: std.atomic.Value(bool) = .init(false),
     completed_count: std.atomic.Value(usize) = .init(0),
+    accepting: std.atomic.Value(bool) = .init(true),
     reaper_future: ?Io.Future(void) = null,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
 
@@ -1385,6 +1433,7 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn deinit(self: *ThreadedDurableJobLane) void {
+        self.accepting.store(false, .release);
         self.shutdown_reaper.store(true, .release);
         if (self.reaper_future) |*future| {
             _ = future.await(self.io_impl.io());
@@ -1397,8 +1446,10 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
 
     fn submit(ptr: *anyopaque, job: Job) !void {
         const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
+        if (!self.accepting.load(.acquire)) return error.BackendRuntimeShuttingDown;
         try self.owners.beginJob(job.owner_id);
         errdefer self.owners.finishJob(job.owner_id);
+        if (!self.accepting.load(.acquire)) return error.BackendRuntimeShuttingDown;
         const entry = try self.alloc.create(Entry);
         entry.* = .{
             .lane = self,
@@ -1445,6 +1496,11 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     fn poll(ptr: *anyopaque, max_jobs: usize) !usize {
         const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
         return self.reapCompleted(max_jobs);
+    }
+
+    fn isAccepting(ptr: *anyopaque) bool {
+        const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
+        return self.accepting.load(.acquire);
     }
 
     fn runEntry(entry: *Entry) void {
@@ -1571,6 +1627,7 @@ const threaded_vtable = DurableJobLane.VTable{
     .resume_owner = ThreadedDurableJobLane.resumeOwner,
     .reopen_owner = ThreadedDurableJobLane.reopenOwner,
     .poll = ThreadedDurableJobLane.poll,
+    .is_accepting = ThreadedDurableJobLane.isAccepting,
 };
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
@@ -1607,13 +1664,18 @@ test "lane lease gate closes admission and drains a committed borrower" {
 }
 
 test "backend runtime handle owns a stable runtime pointer" {
-    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer handle.deinit();
 
     const first = handle.ptr();
     const second = handle.ptr();
     try std.testing.expect(first == second);
     try std.testing.expect(first.io_impl == null);
+    try std.testing.expect(first.io() == null);
+    try std.testing.expect(first.filesystemIo() != null);
 }
 
 test "backend runtime durable lane runs inline jobs" {

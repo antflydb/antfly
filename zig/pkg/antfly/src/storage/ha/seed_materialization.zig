@@ -17,6 +17,7 @@ const topology_records = @import("../../common/topology_records.zig");
 const extensions = @import("../../extensions/mod.zig");
 const raft_catalog = @import("../../raft/storage/catalog.zig");
 const db_mod = @import("../db/db.zig");
+const db_core = @import("../db/core.zig");
 const generation_lifecycle = @import("../db/generation_lifecycle.zig");
 const backend_types = @import("../backend_types.zig");
 const lsm_backend = @import("../lsm_backend.zig");
@@ -60,6 +61,9 @@ pub const ReplicaSnapshot = struct {
     table_name: []const u8,
     snapshot_path: []const u8,
     logical_sha256: []const u8,
+    /// Present for the versioned logical snapshot layout. Absence preserves
+    /// the released v0.2.0 store.bin/change-journal.bin seed contract.
+    snapshot_manifest_sha256: ?[]const u8 = null,
     identity_table_id: u64,
     identity_shard_id: u64,
     identity_range_id: u64,
@@ -474,6 +478,16 @@ pub fn validateTopology(
         const store_path = try std.fs.path.join(alloc, &.{ raw_root, replica.snapshot_path, "store.bin" });
         defer alloc.free(store_path);
         try expectFileSha256(io, alloc, store_path, replica.logical_sha256);
+        if (replica.snapshot_manifest_sha256) |expected_sha256| {
+            if (!isCanonicalSha256(expected_sha256)) return error.SeedReplicaIdentityMismatch;
+            const manifest_path = try std.fs.path.join(alloc, &.{
+                raw_root,
+                replica.snapshot_path,
+                db_core.logical_snapshot_manifest_file_name,
+            });
+            defer alloc.free(manifest_path);
+            try expectFileSha256(io, alloc, manifest_path, expected_sha256);
+        }
     }
 
     for (topology.extension_artifacts, 0..) |artifact, index| {

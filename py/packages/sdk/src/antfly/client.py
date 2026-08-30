@@ -35,11 +35,21 @@ from antfly.client_generated.models import (
 )
 from antfly.client_generated.types import UNSET
 
-from .exceptions import AntflyException, InferenceAPIError, InferenceCapacityError, StorageResourceExhaustedError
+from .exceptions import (
+    AntflyException,
+    IndexMutationTemporarilyUnavailableError,
+    InferenceAPIError,
+    InferenceCapacityError,
+    StorageResourceExhaustedError,
+)
+from .index_config import validate_create_index_request_relationships
 
 DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20
 DEFAULT_MAX_JSON_RESPONSE_BYTES = 64 << 20
 DEFAULT_MAX_ERROR_RESPONSE_BYTES = 1 << 20
+INDEX_MUTATION_TEMPORARILY_UNAVAILABLE_CODES = frozenset(
+    {"index_capability_upgrade_pending", "index_probe_unavailable"}
+)
 MAX_INFERENCE_ERROR_BYTES = 1 << 20
 MAX_GENERATION_RESPONSE_BYTES = 16 << 20
 MAX_GENERATION_SSE_EVENT_BYTES = 16 << 20
@@ -237,6 +247,7 @@ class IndexOperations:
             raise ValueError("index name is owned by the path; pass it as the name argument")
         if not isinstance(payload.get("type"), str) or not payload["type"]:
             raise ValueError("index config requires a non-empty type")
+        validate_create_index_request_relationships(payload)
         result = self._client._request(
             "POST",
             f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}",
@@ -409,6 +420,26 @@ class AntflyClient:
                             retry_after_ms,
                             retry_after_seconds,
                         )
+                    if (
+                        response.status_code == 503
+                        and error_body is not None
+                        and error_body.get("error") in INDEX_MUTATION_TEMPORARILY_UNAVAILABLE_CODES
+                        and error_body.get("retryable") is True
+                    ):
+                        retry_after_header = response.headers.get("Retry-After")
+                        try:
+                            retry_after_seconds = int(retry_after_header) if retry_after_header else None
+                        except ValueError:
+                            retry_after_seconds = None
+                        if retry_after_seconds is not None and retry_after_seconds <= 0:
+                            retry_after_seconds = None
+                        code = error_body["error"]
+                        detail = error_body.get("message")
+                        raise IndexMutationTemporarilyUnavailableError(
+                            code,
+                            detail if isinstance(detail, str) and detail else msg,
+                            retry_after_seconds,
+                        )
                 raise AntflyException(f"Request failed ({response.status_code}): {msg}")
             if response.status_code == 204:
                 return None
@@ -501,6 +532,11 @@ class AntflyClient:
         if num_shards is not None:
             body["num_shards"] = num_shards
         if indexes is not None:
+            for index_name, config in indexes.items():
+                try:
+                    validate_create_index_request_relationships(config)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"invalid index {index_name!r}: {exc}") from exc
             body["indexes"] = indexes
         if schema is not None:
             body["schema"] = schema
@@ -556,6 +592,7 @@ class AntflyClient:
         *,
         query: dict[str, Any] | None = None,
         full_text_search: dict[str, Any] | None = None,
+        full_text_index: str | None = None,
         semantic_search: str | None = None,
         embedding_template: str | None = None,
         indexes: list[str] | None = None,
@@ -595,6 +632,7 @@ class AntflyClient:
             table: Table name
             query: Canonical public query AST
             full_text_search: Full-text query object
+            full_text_index: Named full-text index used by the scoring text query
             semantic_search: Natural-language vector search query
             embedding_template: Optional multimodal embedding template
             indexes: Vector index names for semantic search
@@ -647,6 +685,7 @@ class AntflyClient:
         query_fields = {
             "query": query,
             "full_text_search": full_text_search,
+            "full_text_index": full_text_index,
             "semantic_search": semantic_search,
             "embedding_template": embedding_template,
             "indexes": indexes,

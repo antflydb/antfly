@@ -1479,6 +1479,35 @@ components:
   schemas:
     Error:
       $ref: "../auth/api.yaml#/components/schemas/Error"
+    UnsupportedIndexCapabilityError:
+      type: object
+      additionalProperties: false
+      description: The requested index depends on a capability unavailable in the current deployment.
+      required: [error, message, retryable]
+      properties:
+        error:
+          type: string
+          enum: [unsupported_index_capability]
+        message:
+          type: string
+          enum: [artifact-backed index sources are not supported by this deployment]
+        retryable:
+          type: boolean
+          enum: [false]
+    IndexMutationServiceUnavailableError:
+      type: object
+      additionalProperties: false
+      description: A retryable index mutation failure, including a distributed artifact-source protocol fence or a temporarily unavailable model probe.
+      required: [error, message, retryable]
+      properties:
+        error:
+          type: string
+          enum: [index_capability_upgrade_pending, index_probe_unavailable]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [true]
     MetadataCapabilityUnavailableError:
       type: object
       additionalProperties: false
@@ -1724,6 +1753,84 @@ components:
           type: boolean
           enum: [false]
           description: Retrying the same cursor cannot succeed; restart traversal instead.
+    UnsupportedHierarchyGroupingError:
+      type: object
+      additionalProperties: false
+      description: A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity.
+      required: [status, error, message, reason, field, action, retryable]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [unsupported_hierarchy_grouping]
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable remediation using only public query fields.
+        reason:
+          type: string
+          enum: [unit_identity_unavailable]
+          description: Stable reason the requested hierarchy level is unavailable.
+        field:
+          type: string
+          enum: [hierarchy.group_by.level]
+          description: Public request field that selected the unsupported grouping level.
+        action:
+          type: string
+          enum: [use_source_grouping_or_direct_members]
+          description: Select source grouping, omit group_by for direct members, or use an index whose every source is unit-backed.
+        retryable:
+          type: boolean
+          enum: [false]
+          description: Retrying the same request cannot succeed without changing its hierarchy grouping.
+    UnsupportedQueryError:
+      type: object
+      additionalProperties: false
+      description: A query requests an unsupported feature without a more specific structured diagnostic.
+      required: [status, error, message, retryable]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [unsupported_query_request]
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable error summary.
+        retryable:
+          type: boolean
+          enum: [false]
+          description: Retrying the same request cannot succeed without changing it.
+    QueryFilterError:
+      type: object
+      additionalProperties: false
+      description: A public filter or exclusion query contains an invalid or unsupported node.
+      required: [status, error, message, field, offending_node, retryable]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [400, 422]
+        error:
+          type: string
+          enum: [invalid_query_request, unsupported_query_request]
+        message:
+          type: string
+        field:
+          type: string
+          enum: [filter_query, exclusion_query]
+        offending_node:
+          type: string
+          description: Stable name of the first invalid or unsupported filter node.
+        retryable:
+          type: boolean
+          enum: [false]
     ExactSortError:
       type: object
       additionalProperties: false
@@ -1802,6 +1909,21 @@ components:
         - degraded
         - error
       description: Overall health status of the cluster
+    IndexRuntimeCapabilities:
+      type: object
+      additionalProperties: false
+      required: [artifact_sources, artifact_sources_state]
+      description: Deployment-level index capabilities clients can inspect before submitting index mutations.
+      properties:
+        artifact_sources:
+          type: boolean
+          description: Whether full-text, embedding, and graph indexes may currently consume generated artifact streams through either single-source or multi-source request forms. Equivalent to artifact_sources_state=available.
+        artifact_sources_state:
+          $ref: "#/components/schemas/ArtifactSourcesCapabilityState"
+    ArtifactSourcesCapabilityState:
+      type: string
+      enum: [available, upgrade_pending, unsupported]
+      description: Whether artifact-backed index mutations are accepted now, temporarily fenced during a distributed rolling upgrade, or permanently unsupported by this deployment.
     ClusterStatus:
       type: object
       required:
@@ -1821,6 +1943,8 @@ components:
           type: string
           enum: [embedded, distributed, standalone, serverless]
           description: Runtime deployment topology
+        index_capabilities:
+          $ref: "#/components/schemas/IndexRuntimeCapabilities"
         secret_store:
           $ref: "#/components/schemas/SecretStoreStatus"
         runtime_config:
@@ -1847,6 +1971,8 @@ components:
           type: string
           enum: [embedded, distributed, standalone, serverless]
           description: Runtime deployment topology
+        index_capabilities:
+          $ref: "#/components/schemas/IndexRuntimeCapabilities"
         secret_store:
           $ref: "#/components/schemas/SecretStoreStatus"
         runtime_config:
@@ -2444,6 +2570,7 @@ components:
         - corrupt_artifact
         - unreadable_artifact
         - enrichment_failed
+        - resource_limit_exceeded
     RepairTarget:
       type: string
       description: Repair subsystem to inspect or run.
@@ -2480,6 +2607,9 @@ components:
         unit_id:
           type: string
           description: Unit identifier for unit-scoped artifacts, when applicable.
+        index_source_artifact_name:
+          type: string
+          description: Canonical artifact stream configured on the affected index. This is the authoritative source-readiness identity and is distinct from the producer input and the derived artifact being repaired.
         source_artifact_name:
           type: string
           description: Source artifact stream used to produce this artifact, when applicable.
@@ -3595,7 +3725,7 @@ components:
           type: object
           additionalProperties:
             x-go-type-skip-optional-pointer: false
-            $ref: "indexes.yaml#/components/schemas/IndexConfig"
+            $ref: "indexes.yaml#/components/schemas/CreatedIndex"
         shards: # map[types.ID]*ShardInfo
           type: object
           additionalProperties:
@@ -4021,7 +4151,7 @@ components:
           additionalProperties:
             $ref: "indexes.yaml#/components/schemas/IndexStats"
         config:
-          $ref: "indexes.yaml#/components/schemas/IndexConfig"
+          $ref: "indexes.yaml#/components/schemas/CreatedIndex"
         status:
           $ref: "indexes.yaml#/components/schemas/IndexStats"
     LsmStorageStatus:
@@ -6638,7 +6768,8 @@ components:
         size predictable. The presence of this object selects the canonical contract:
         without `group_by` or `children`, including when the object is empty, direct index
         matches are returned. `ancestors` only controls projected context and never changes result
-        cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+        cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit
+        source-grouped result shape.
       allOf:
         - not:
             description: Relevance grouping and sequential child traversal are separate operations.
@@ -6748,6 +6879,7 @@ components:
               - anyOf:
                   - required: [query]
                   - required: [full_text_search]
+                  - required: [full_text_index]
                   - required: [filter_query]
                   - required: [exclusion_query]
                   - required: [semantic_search]
@@ -6821,6 +6953,23 @@ components:
           example:
             query: "+body:computer +category:technology"
             boost: 1.0
+        full_text_index:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          minLength: 1
+          maxLength: 256
+          x-antfly-runtime-validation: "Requires full_text_search or at least one scoring text clause after normalizing the query AST; filter-only and exclusion-only query trees receive HTTP 422."
+          description: |
+            Full-text index used by `full_text_search` and by scoring text clauses in `query`.
+            Use this to query a named document- or artifact-backed full-text index. The selected
+            index must exist and have type `full_text`. Omit this field to use the table's active
+            schema full-text index, preserving v0.2 behavior. Structured document filters continue
+            to use the active schema index even when retrieval uses a named artifact index. This
+            selector is invalid without `full_text_search` or a scoring text clause in `query` and
+            receives HTTP 422. This semantic relationship is enforced after the recursive query AST
+            is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses
+            from filter-only or exclusion-only trees.
+          example: "document_text"
         semantic_search:
           type: string
           x-antfly-max-utf8-bytes: 1048576
@@ -6864,8 +7013,15 @@ components:
           items:
             type: string
           description: |
-            List of vector index names to use for semantic search. Required when using semantic_search.
-            Multiple indexes can be specified, and their results will be merged using RRF.
+            Embedding index names selected for `semantic_search` or explicit `embeddings`.
+            Dense and sparse indexes are supported when the corresponding query representation is
+            supplied. Provisioned deployments require at least one index for `semantic_search`;
+            serverless may infer its single published dense index when this field is omitted. When
+            `embeddings` is supplied without this field, the embedding map keys select the indexes.
+            Provisioned results from multiple indexes are merged using RRF. Serverless currently
+            executes at most one dense and one sparse index per request; it rejects multiple
+            same-kind selectors and omitted selectors when more than one corresponding index is
+            published rather than choosing an index by catalog order.
           example: ["title_body_nomic", "description_embedding"]
         filter_prefix:
           type: string
@@ -7920,6 +8076,9 @@ components:
           description: Unit identifier when the hit is attached to a document unit.
         artifact:
           $ref: "#/components/schemas/HierarchyArtifact"
+        matched_artifact:
+          $ref: "#/components/schemas/HierarchyArtifact"
+          description: Artifact member that supplied the score for a source-level grouped hit.
         ancestors:
           $ref: "#/components/schemas/QueryHitHierarchyAncestors"
         evidence:
@@ -7938,7 +8097,7 @@ components:
         chunks:
           type: array
           deprecated: true
-          description: Legacy child chunk hits included for source-level rollups.
+          description: Deprecated child chunk hits included by the v0.2-compatible implicit source rollup.
           items:
             $ref: "#/components/schemas/HierarchyMatchHit"
 
@@ -7985,9 +8144,10 @@ components:
             Stable ancestry envelope for derived document hierarchy hits. Present when
             the hit is a derived unit/chunk/embedding artifact or when a source-level
             group includes nested matches. Standard fields include `level`,
-            `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and
+            `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`, and
             `ancestors` with response-local or requested DB-backed source/unit context when available.
-            Legacy rollup requests continue to use `chunks` instead of `matches`.
+            V0.2-compatible implicit rollup requests continue to use the deprecated
+            `chunks` field instead of `matches`.
         _sort:
           type: array
           items: {}
@@ -8559,6 +8719,18 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    IndexMutationBadRequest:
+      description: Invalid index configuration or a deployment capability mismatch
+      content:
+        application/json:
+          schema:
+            # The generic Error schema intentionally accepts this structured
+            # shape, so these alternatives overlap by design. Keep the typed
+            # capability error first for generators that parse alternatives in
+            # declaration order.
+            anyOf:
+              - $ref: "#/components/schemas/UnsupportedIndexCapabilityError"
+              - $ref: "#/components/schemas/Error"
     PayloadTooLarge:
       description: Request body exceeds the configured size limit
       content:
@@ -8589,6 +8761,26 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    IndexMutationServiceUnavailable:
+      description: Index validation is temporarily unavailable or a distributed rolling upgrade has not yet converged.
+      headers:
+        Retry-After:
+          required: false
+          description: Minimum number of seconds clients should wait when the failure is retryable.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            # Create-table, create-index, and restore also share infrastructure
+            # failures (metadata leadership, HA admission, and restore-worker
+            # capacity). Keep the narrow typed retry contract first, then fall
+            # back to the public error envelope for generators that probe
+            # alternatives in declaration order.
+            anyOf:
+              - $ref: "#/components/schemas/IndexMutationServiceUnavailableError"
+              - $ref: "#/components/schemas/Error"
     BackupMetadataUnavailable:
       description: Backup could not establish the required metadata authority before starting side effects.
       headers:
@@ -8676,6 +8868,16 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ExactSortError"
+    UnsupportedQuery:
+      description: The query is valid JSON but requests an unsupported execution or result contract
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/ExactSortError"
+              - $ref: "#/components/schemas/QueryFilterError"
+              - $ref: "#/components/schemas/UnsupportedHierarchyGroupingError"
+              - $ref: "#/components/schemas/UnsupportedQueryError"
     HierarchyCursorStale:
       description: The hierarchy changed after the traversal cursor was issued
       content:
@@ -9744,7 +9946,7 @@ paths:
         "409":
           $ref: "#/components/responses/HierarchyCursorStale"
         "422":
-          $ref: "#/components/responses/UnsupportedExactSort"
+          $ref: "#/components/responses/UnsupportedQuery"
         "503":
           $ref: "#/components/responses/QueryTemporarilyUnavailable"
         "500":
@@ -10070,13 +10272,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/Table"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          $ref: "#/components/responses/IndexMutationBadRequest"
         "422":
           description: Durable destinations cannot be bound to this credential type
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
     delete:
       summary: Drop a table
       tags:
@@ -10138,7 +10342,7 @@ paths:
         "409":
           $ref: "#/components/responses/HierarchyCursorStale"
         "422":
-          $ref: "#/components/responses/UnsupportedExactSort"
+          $ref: "#/components/responses/UnsupportedQuery"
         "404":
           $ref: "#/components/responses/NotFound" # If table doesn't exist
         "503":
@@ -10374,7 +10578,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/destination-authorization:
@@ -11375,7 +11579,7 @@ paths:
               schema:
                 $ref: "indexes.yaml#/components/schemas/CreatedIndex"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          $ref: "#/components/responses/IndexMutationBadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
         "405":
@@ -11391,7 +11595,7 @@ paths:
         "429":
           $ref: "#/components/responses/StorageResourceExhausted"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
     delete:

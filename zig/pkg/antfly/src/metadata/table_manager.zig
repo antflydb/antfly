@@ -13,6 +13,8 @@
 // limitations.
 
 const std = @import("std");
+
+pub const artifact_sources_protocol_version: u16 = 1;
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
@@ -113,6 +115,8 @@ pub const RestoreIntentIdentity = struct {
     connection: []const u8,
     artifact_size_bytes: u64,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
 };
 
 pub fn restoreIntentIdentity(record: RangeRecord) RestoreIntentIdentity {
@@ -126,6 +130,8 @@ pub fn restoreIntentIdentity(record: RangeRecord) RestoreIntentIdentity {
         .connection = record.restore_connection,
         .artifact_size_bytes = record.restore_artifact_size_bytes,
         .artifact_sha256 = record.restore_artifact_sha256,
+        .native_manifest_size_bytes = record.restore_native_manifest_size_bytes,
+        .native_manifest_sha256 = record.restore_native_manifest_sha256,
     };
 }
 
@@ -138,7 +144,9 @@ pub fn restoreIntentMatchesRange(expected: RestoreIntentIdentity, record: RangeR
         std.mem.eql(u8, expected.snapshot_path, record.restore_snapshot_path) and
         std.mem.eql(u8, expected.connection, record.restore_connection) and
         expected.artifact_size_bytes == record.restore_artifact_size_bytes and
-        std.mem.eql(u8, expected.artifact_sha256, record.restore_artifact_sha256);
+        std.mem.eql(u8, expected.artifact_sha256, record.restore_artifact_sha256) and
+        expected.native_manifest_size_bytes == record.restore_native_manifest_size_bytes and
+        std.mem.eql(u8, expected.native_manifest_sha256, record.restore_native_manifest_sha256);
 }
 
 pub fn cloneRestoreIntentIdentity(
@@ -157,6 +165,8 @@ pub fn cloneRestoreIntentIdentity(
     errdefer alloc.free(connection);
     const artifact_sha256 = try alloc.dupe(u8, identity.artifact_sha256);
     errdefer alloc.free(artifact_sha256);
+    const native_manifest_sha256 = try alloc.dupe(u8, identity.native_manifest_sha256);
+    errdefer alloc.free(native_manifest_sha256);
     return .{
         .group_id = identity.group_id,
         .table_id = identity.table_id,
@@ -167,6 +177,8 @@ pub fn cloneRestoreIntentIdentity(
         .connection = connection,
         .artifact_size_bytes = identity.artifact_size_bytes,
         .artifact_sha256 = artifact_sha256,
+        .native_manifest_size_bytes = identity.native_manifest_size_bytes,
+        .native_manifest_sha256 = native_manifest_sha256,
     };
 }
 
@@ -180,6 +192,7 @@ pub fn freeRestoreIntentIdentity(
     alloc.free(identity.snapshot_path);
     alloc.free(identity.connection);
     alloc.free(identity.artifact_sha256);
+    alloc.free(identity.native_manifest_sha256);
 }
 
 pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeRecord) !void {
@@ -200,6 +213,8 @@ pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeReco
     errdefer alloc.free(connection);
     const artifact_sha256 = try alloc.dupe(u8, "");
     errdefer alloc.free(artifact_sha256);
+    const native_manifest_sha256 = try alloc.dupe(u8, "");
+    errdefer alloc.free(native_manifest_sha256);
 
     alloc.free(record.restore_backup_id);
     alloc.free(record.restore_artifact_backup_id);
@@ -207,6 +222,7 @@ pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeReco
     alloc.free(record.restore_snapshot_path);
     alloc.free(record.restore_connection);
     alloc.free(record.restore_artifact_sha256);
+    alloc.free(record.restore_native_manifest_sha256);
     record.restore_backup_id = backup_id;
     record.restore_artifact_backup_id = artifact_backup_id;
     record.restore_location = location;
@@ -214,6 +230,8 @@ pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeReco
     record.restore_connection = connection;
     record.restore_artifact_size_bytes = 0;
     record.restore_artifact_sha256 = artifact_sha256;
+    record.restore_native_manifest_size_bytes = 0;
+    record.restore_native_manifest_sha256 = native_manifest_sha256;
     record.completed_restore_fingerprint = completed_restore_fingerprint;
 }
 
@@ -234,6 +252,8 @@ pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
         std.mem.eql(u8, lhs.restore_connection, rhs.restore_connection) and
         lhs.restore_artifact_size_bytes == rhs.restore_artifact_size_bytes and
         std.mem.eql(u8, lhs.restore_artifact_sha256, rhs.restore_artifact_sha256) and
+        lhs.restore_native_manifest_size_bytes == rhs.restore_native_manifest_size_bytes and
+        std.mem.eql(u8, lhs.restore_native_manifest_sha256, rhs.restore_native_manifest_sha256) and
         std.mem.eql(
             u8,
             &lhs.completed_restore_fingerprint,
@@ -271,6 +291,12 @@ pub const node_lifecycle_active = "active";
 pub const node_lifecycle_draining = "draining";
 pub const node_lifecycle_finalizing = "finalizing";
 
+/// Data-store protocol required to stage, validate, and atomically publish a
+/// native backup generation without discarding validated generated indexes.
+/// Persisting this per store lets metadata fence restore placement during a
+/// rolling data-plane upgrade instead of relying on the metadata codec level.
+pub const native_generation_restore_protocol_version: u16 = 1;
+
 pub fn nodeLifecycleActive(lifecycle: []const u8) bool {
     return std.mem.eql(u8, lifecycle, node_lifecycle_active);
 }
@@ -293,6 +319,11 @@ pub const StoreRecord = struct {
     reporter_incarnation: u64 = 0,
     /// Highest status snapshot generation accepted for `reporter_incarnation`.
     status_generation: u64 = 0,
+    /// Non-zero only after this store can parse, materialize, and report the
+    /// generalized artifact-source index contract. Missing means an older or
+    /// not-yet-observed reporter and therefore fails cluster admission closed.
+    artifact_sources_protocol_version: u16 = 0,
+    native_generation_restore_version: u16 = 0,
     api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
@@ -643,6 +674,7 @@ pub const StoreStatusReport = struct {
     reporter_incarnation: u64 = 0,
     /// Monotonic snapshot generation within `reporter_incarnation`.
     status_generation: u64 = 0,
+    artifact_sources_protocol_version: u16 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     capacity_bytes: u64 = 0,
@@ -660,6 +692,37 @@ pub const StoreStatusReport = struct {
 /// never exist without the process incarnation that gives it meaning.
 pub fn reporterFenceValid(reporter_incarnation: u64, status_generation: u64) bool {
     return reporter_incarnation != 0 or status_generation == 0;
+}
+
+pub fn artifactSourcesProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
+    return protocol_version <= artifact_sources_protocol_version and
+        (protocol_version == 0 or reporter_incarnation != 0);
+}
+
+/// Capability admission is intentionally stricter than wire validation.
+/// Version zero is a valid rolling-upgrade record, but it is never proof that
+/// the store can materialize the generalized artifact-source index contract.
+pub fn artifactSourcesProtocolSupported(reporter_incarnation: u64, protocol_version: u16) bool {
+    return reporter_incarnation != 0 and
+        protocol_version >= artifact_sources_protocol_version and
+        artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
+}
+
+/// Store roles are placement classes, not process kinds. Data runtimes may use
+/// custom roles such as `hot` or `cold`; only the metadata-only role is known
+/// not to host table shards.
+pub fn storeServesTableData(role: []const u8) bool {
+    return !std.mem.eql(u8, role, "metadata");
+}
+
+test "artifact source protocol support fails closed and includes custom placement roles" {
+    try std.testing.expect(!artifactSourcesProtocolSupported(0, artifact_sources_protocol_version));
+    try std.testing.expect(!artifactSourcesProtocolSupported(7, 0));
+    try std.testing.expect(artifactSourcesProtocolSupported(7, artifact_sources_protocol_version));
+    try std.testing.expect(storeServesTableData("data"));
+    try std.testing.expect(storeServesTableData("hot"));
+    try std.testing.expect(storeServesTableData("cold"));
+    try std.testing.expect(!storeServesTableData("metadata"));
 }
 
 pub const RuntimeEnrichmentStatusReport = struct {
@@ -827,11 +890,19 @@ pub const RuntimeIndexStatusReport = struct {
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
+    source_replay: []RuntimeIndexSourceReplayStatusReport = &.{},
     repair_status: ?IndexRepairStatus = null,
     /// This proof is meaningful only while repair_status is non-null. It means
     /// the active generation is safe to query, not necessarily complete.
     /// Missing proof is deliberately false so mixed-version reports fail closed.
     repair_active_generation_serviceable: bool = false,
+};
+
+pub const RuntimeIndexSourceReplayStatusReport = struct {
+    artifact_name: []const u8 = "",
+    published_sequence: u64 = 0,
+    target_sequence: u64 = 0,
+    failed: bool = false,
 };
 
 pub const SchemaProgressRecord = struct {
@@ -852,6 +923,8 @@ pub const RestoreProgressRecord = struct {
     location: []const u8 = "",
     snapshot_path: []const u8 = "",
     artifact_sha256: []const u8 = "",
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
     primary_restored: bool = false,
     runtime_repair_complete: bool = false,
     phase: []const u8 = "",
@@ -1752,6 +1825,8 @@ pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
     errdefer alloc.free(restore_connection);
     const restore_artifact_sha256 = try alloc.dupe(u8, record.restore_artifact_sha256);
     errdefer alloc.free(restore_artifact_sha256);
+    const restore_native_manifest_sha256 = try alloc.dupe(u8, record.restore_native_manifest_sha256);
+    errdefer alloc.free(restore_native_manifest_sha256);
     return .{
         .group_id = record.group_id,
         .range_id = if (record.range_id == 0) record.group_id else record.range_id,
@@ -1768,6 +1843,8 @@ pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
         .restore_connection = restore_connection,
         .restore_artifact_size_bytes = record.restore_artifact_size_bytes,
         .restore_artifact_sha256 = restore_artifact_sha256,
+        .restore_native_manifest_size_bytes = record.restore_native_manifest_size_bytes,
+        .restore_native_manifest_sha256 = restore_native_manifest_sha256,
         .completed_restore_fingerprint = record.completed_restore_fingerprint,
     };
 }
@@ -1798,6 +1875,7 @@ pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
     alloc.free(record.restore_snapshot_path);
     alloc.free(record.restore_connection);
     alloc.free(record.restore_artifact_sha256);
+    alloc.free(record.restore_native_manifest_sha256);
 }
 
 pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRecord) !RestoreProgressRecord {
@@ -1811,6 +1889,8 @@ pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRec
     errdefer alloc.free(snapshot_path);
     const artifact_sha256 = try alloc.dupe(u8, record.artifact_sha256);
     errdefer alloc.free(artifact_sha256);
+    const native_manifest_sha256 = try alloc.dupe(u8, record.native_manifest_sha256);
+    errdefer alloc.free(native_manifest_sha256);
     const phase = try alloc.dupe(u8, record.phase);
     errdefer alloc.free(phase);
     const last_error = try alloc.dupe(u8, record.last_error);
@@ -1824,6 +1904,8 @@ pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRec
         .location = location,
         .snapshot_path = snapshot_path,
         .artifact_sha256 = artifact_sha256,
+        .native_manifest_size_bytes = record.native_manifest_size_bytes,
+        .native_manifest_sha256 = native_manifest_sha256,
         .primary_restored = record.primary_restored,
         .runtime_repair_complete = record.runtime_repair_complete,
         .phase = phase,
@@ -1838,6 +1920,7 @@ pub fn freeRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressReco
     alloc.free(record.location);
     alloc.free(record.snapshot_path);
     alloc.free(record.artifact_sha256);
+    alloc.free(record.native_manifest_sha256);
     alloc.free(record.phase);
     alloc.free(record.last_error);
 }
@@ -1958,6 +2041,8 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .node_id = record.node_id,
         .reporter_incarnation = record.reporter_incarnation,
         .status_generation = record.status_generation,
+        .artifact_sources_protocol_version = record.artifact_sources_protocol_version,
+        .native_generation_restore_version = record.native_generation_restore_version,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,
@@ -2128,6 +2213,21 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
     errdefer alloc.free(kind);
     const load_error = if (record.load_error) |value| try alloc.dupe(u8, value) else null;
     errdefer if (load_error) |value| alloc.free(value);
+    const source_replay = try alloc.alloc(RuntimeIndexSourceReplayStatusReport, record.source_replay.len);
+    var source_count: usize = 0;
+    errdefer {
+        for (source_replay[0..source_count]) |source| alloc.free(source.artifact_name);
+        if (source_replay.len > 0) alloc.free(source_replay);
+    }
+    for (record.source_replay, 0..) |source, i| {
+        source_replay[i] = .{
+            .artifact_name = try alloc.dupe(u8, source.artifact_name),
+            .published_sequence = source.published_sequence,
+            .target_sequence = source.target_sequence,
+            .failed = source.failed,
+        };
+        source_count += 1;
+    }
     return .{
         .name = name,
         .kind = kind,
@@ -2149,6 +2249,7 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .replay_applied_sequence = record.replay_applied_sequence,
         .replay_target_sequence = record.replay_target_sequence,
         .replay_catch_up_required = record.replay_catch_up_required,
+        .source_replay = source_replay,
         .repair_status = record.repair_status,
         .repair_active_generation_serviceable = record.repair_active_generation_serviceable,
     };
@@ -2158,6 +2259,8 @@ pub fn freeRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeInd
     alloc.free(record.name);
     alloc.free(record.kind);
     if (record.load_error) |value| alloc.free(value);
+    for (record.source_replay) |source| alloc.free(source.artifact_name);
+    if (record.source_replay.len > 0) alloc.free(record.source_replay);
 }
 
 pub fn cloneRuntimeIndexStatusReports(alloc: std.mem.Allocator, records: []const RuntimeIndexStatusReport) ![]RuntimeIndexStatusReport {

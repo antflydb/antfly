@@ -1919,6 +1919,53 @@ pub const ResourceManager = struct {
         };
     }
 
+    /// Atomically admits as much of a requested observer growth as the slice
+    /// and aggregate memory limits currently permit. A full admission first
+    /// gets the normal reclamation opportunity; the partial fallback is
+    /// selected and recorded under one lock so concurrent slice users cannot
+    /// invalidate a stats-based estimate between observation and reservation.
+    pub fn adjustUsageAtMost(
+        self: *ResourceManager,
+        slice: Slice,
+        current: *u64,
+        requested_additional: u64,
+    ) !u64 {
+        if (requested_additional == 0) return 0;
+        const requested_next = std.math.add(u64, current.*, requested_additional) catch
+            return error.ResourceBudgetExceeded;
+        self.adjustUsage(slice, current, requested_next) catch |err| {
+            if (err != error.ResourceBudgetExceeded) return err;
+            return self.adjustUsageAtMostOnce(slice, current, requested_additional);
+        };
+        return requested_additional;
+    }
+
+    fn adjustUsageAtMostOnce(
+        self: *ResourceManager,
+        slice: Slice,
+        current: *u64,
+        requested_additional: u64,
+    ) !u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const state = &self.slices[sliceIndex(slice)];
+        const slice_available = if (state.budget.hard_limit_bytes == 0)
+            requested_additional
+        else
+            state.budget.hard_limit_bytes -| state.used_bytes;
+        const memory_available = if (self.memory.budget.hard_limit_bytes == 0)
+            requested_additional
+        else
+            self.memory.budget.hard_limit_bytes -| self.memory.used_bytes;
+        const granted = @min(requested_additional, @min(slice_available, memory_available));
+        if (granted == 0) return error.ResourceBudgetExceeded;
+        const next = std.math.add(u64, current.*, granted) catch return error.ResourceBudgetExceeded;
+        try self.reconcileUsageLocked(slice, @intFromPtr(current), current.*, next, true);
+        current.* = next;
+        return granted;
+    }
+
     /// Atomically moves accounting between two observer-owned contributions in
     /// the same slice. This is the ownership handoff used when a pre-admitted
     /// retained reservation becomes a live cache object: the allocation is
@@ -3156,6 +3203,36 @@ test "resource manager tracks full text build working set independently" {
 
     try manager.adjustUsage(.full_text_build_working_set, &current, 0);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.full_text_build_working_set).used_bytes);
+}
+
+test "bounded observer growth grants aggregate slice and host capacity atomically" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{
+        .budgets = budgets,
+        .memory_budget = .{ .hard_limit_bytes = 80 },
+    });
+    var requester: u64 = 0;
+    var competing_slice_owner: u64 = 0;
+    var other_slice_owner: u64 = 0;
+    defer manager.observeUsage(.document_extraction_working_set, &requester, 0);
+    defer manager.observeUsage(.document_extraction_working_set, &competing_slice_owner, 0);
+    defer manager.observeUsage(.full_text_build_working_set, &other_slice_owner, 0);
+
+    try manager.adjustUsage(.document_extraction_working_set, &requester, 10);
+    try manager.adjustUsage(.document_extraction_working_set, &competing_slice_owner, 30);
+    try manager.adjustUsage(.full_text_build_working_set, &other_slice_owner, 20);
+    try std.testing.expectEqual(
+        @as(u64, 20),
+        try manager.adjustUsageAtMost(.document_extraction_working_set, &requester, 100),
+    );
+    try std.testing.expectEqual(@as(u64, 30), requester);
+    try std.testing.expectEqual(@as(u64, 60), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 80), manager.snapshot().memory.used_bytes);
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        manager.adjustUsageAtMost(.document_extraction_working_set, &requester, 1),
+    );
 }
 
 test "resource manager tracks inference prompt cache usage" {

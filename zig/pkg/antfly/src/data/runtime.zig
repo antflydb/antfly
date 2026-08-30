@@ -611,7 +611,28 @@ const IndexRepairQueueEntry = struct {
 const IndexRepairQueueWake = enum {
     immediate,
     retained,
+    parked,
 };
+
+fn indexRepairQueueWakeFromAggregate(wake: antfly.db.DB.IndexRepairWake) IndexRepairQueueWake {
+    return switch (wake) {
+        // Pending debt paired with an empty aggregate is an inconsistent/lost
+        // wake observation. Fail toward a bounded audit instead of parking it.
+        .immediate, .empty => .immediate,
+        .at_realtime_ms => .retained,
+        .parked => .parked,
+    };
+}
+
+test "data runtime preserves tagged aggregate index repair wake semantics" {
+    try std.testing.expectEqual(IndexRepairQueueWake.immediate, indexRepairQueueWakeFromAggregate(.immediate));
+    try std.testing.expectEqual(IndexRepairQueueWake.immediate, indexRepairQueueWakeFromAggregate(.empty));
+    try std.testing.expectEqual(IndexRepairQueueWake.parked, indexRepairQueueWakeFromAggregate(.parked));
+    try std.testing.expectEqual(
+        IndexRepairQueueWake.retained,
+        indexRepairQueueWakeFromAggregate(.{ .at_realtime_ms = 42 }),
+    );
+}
 
 const IndexRepairQueueMutationGuard = union(enum) {
     unguarded,
@@ -1861,6 +1882,17 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_rejected_admissions_total", "counter", "Query embedding results rejected by cache admission control", api_request_stats.query_embedding_cache.rejected_admissions);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_entries", "gauge", "Live query embedding cache entries", api_request_stats.query_embedding_cache.entries);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_live_bytes", "gauge", "Accounted live query embedding cache bytes", api_request_stats.query_embedding_cache.live_bytes);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_hits_total", "counter", "Durable incoming-graph route directory hits", api_request_stats.incoming_graph_routes.durable_hits);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_misses_total", "counter", "Durable incoming-graph route directory misses, including stale fences", api_request_stats.incoming_graph_routes.durable_misses);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_read_failures_total", "counter", "Durable incoming-graph route directory read or decode failures", api_request_stats.incoming_graph_routes.durable_read_failures);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_write_failures_total", "counter", "Durable incoming-graph route directory write failures", api_request_stats.incoming_graph_routes.durable_write_failures);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_write_retries_total", "counter", "Durable incoming-graph route directory background write retries", api_request_stats.incoming_graph_routes.durable_write_retries);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_writes_coalesced_total", "counter", "Durable incoming-graph route hints superseded in the bounded write coalescer", api_request_stats.incoming_graph_routes.durable_writes_coalesced);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_writes_dropped_total", "counter", "Best-effort durable incoming-graph route hints dropped under bounded queue pressure", api_request_stats.incoming_graph_routes.durable_writes_dropped);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_batches_committed_total", "counter", "Bounded durable incoming-graph route batches committed", api_request_stats.incoming_graph_routes.durable_batches_committed);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_collision_evictions_total", "counter", "Durable incoming-graph route entries evicted after all bounded hash candidates were occupied", api_request_stats.incoming_graph_routes.durable_collision_evictions);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_pending_entries", "gauge", "Durable incoming-graph route hints awaiting background persistence", api_request_stats.incoming_graph_routes.pending_durable_entries);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_pending_bytes", "gauge", "Encoded durable incoming-graph route hint bytes awaiting background persistence", api_request_stats.incoming_graph_routes.pending_durable_bytes);
         try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_bytes", "gauge", "Shared inference cache bytes in use", api_request_stats.inference_cache_budget.used_bytes);
         try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_limit_bytes", "gauge", "Shared inference cache byte limit", api_request_stats.inference_cache_budget.max_bytes);
         try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_rejected_reservations_total", "counter", "Shared inference cache reservations rejected by the hard limit", api_request_stats.inference_cache_budget.rejected_reservations);
@@ -2966,6 +2998,7 @@ const CachedSplitKey = union(enum) {
 const StoreStatusHeartbeatCache = struct {
     reporter_incarnation: u64 = 0,
     status_generation: u64 = 0,
+    artifact_sources_protocol_version: u16 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     owns_health_class: bool = false,
@@ -5099,6 +5132,8 @@ pub const DataServer = struct {
     distributed_entity_sink: ?antfly.public_api.DistributedEntitySink = null,
     status_source: antfly.public_api.http_server.StatusSource,
     http_server: ?antfly.public_api.ApiHttpServer = null,
+    owned_incoming_graph_route_backend: ?lsm_backend_mod.BackendHandle = null,
+    owned_incoming_graph_route_store: ?antfly.storage_backend_erased.Store = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     h1_disconnect_probe: ?httpx.H1DisconnectProbe = null,
     data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
@@ -5466,6 +5501,30 @@ pub const DataServer = struct {
                 return error.AmbiguousQueryResultLifecycleOwner;
             api_server_cfg.query_result_lifecycle_hook = self.apiQueryResultLifecycleHook();
         }
+        if (api_server_cfg.incoming_graph_route_store == null and
+            api_server_cfg.deployment_mode != .serverless)
+        {
+            const route_root = try std.fmt.allocPrint(
+                self.alloc,
+                "{s}/incoming-graph-routes",
+                .{self.write_source.replica_root_dir},
+            );
+            defer self.alloc.free(route_root);
+            self.owned_incoming_graph_route_backend = try lsm_backend_mod.BackendHandle.open(self.alloc, route_root, .{});
+            errdefer {
+                self.owned_incoming_graph_route_backend.?.close();
+                self.owned_incoming_graph_route_backend = null;
+            }
+            self.owned_incoming_graph_route_store = try self.owned_incoming_graph_route_backend.?.backend.runtimeStore(
+                self.alloc,
+                .{ .name = "system/incoming-graph-routes" },
+            );
+            errdefer {
+                self.owned_incoming_graph_route_store.?.deinit();
+                self.owned_incoming_graph_route_store = null;
+            }
+            api_server_cfg.incoming_graph_route_store = &self.owned_incoming_graph_route_store.?;
+        }
         var owned_restore_job_store_path: ?[]u8 = null;
         defer if (owned_restore_job_store_path) |path| self.alloc.free(path);
         // Runtimes that do not supply engine-owned persistence keep API job
@@ -5607,6 +5666,10 @@ pub const DataServer = struct {
             self.read_source.source(),
             self.write_source.source(),
         );
+        // Graph queries issued through the provisioned source and auxiliary
+        // API helpers share one fenced directory. This prevents duplicate L1s
+        // from diverging and gives both paths the configured durable L2.
+        self.http_server.?.bindIncomingGraphRoutes(self.read_source.source());
         antfly.public_api.kernel_bridge.setAntflyProvider(&self.http_server.?, self.read_source.antfly_provider);
     }
 
@@ -6187,6 +6250,7 @@ pub const DataServer = struct {
             for (topology_replicas.items) |replica| {
                 alloc.free(replica.snapshot_path);
                 alloc.free(replica.logical_sha256);
+                if (replica.snapshot_manifest_sha256) |sha256| alloc.free(sha256);
             }
             topology_replicas.deinit(alloc);
         }
@@ -6215,12 +6279,20 @@ pub const DataServer = struct {
             defer alloc.free(store_path);
             const digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, store_path);
             errdefer alloc.free(digest);
+            const snapshot_manifest_path = try std.fs.path.join(alloc, &.{
+                destination_root,
+                antfly.db.logical_snapshot_manifest_file_name,
+            });
+            defer alloc.free(snapshot_manifest_path);
+            const snapshot_manifest_digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, snapshot_manifest_path);
+            errdefer alloc.free(snapshot_manifest_digest);
             try topology_replicas.append(alloc, .{
                 .group_id = group_id,
                 .table_id = range.table_id,
                 .table_name = table.name,
                 .snapshot_path = snapshot_path,
                 .logical_sha256 = digest,
+                .snapshot_manifest_sha256 = snapshot_manifest_digest,
                 .identity_table_id = table.table_id,
                 .identity_shard_id = range.doc_identity_shard_id,
                 .identity_range_id = range.doc_identity_range_id,
@@ -6508,7 +6580,9 @@ pub const DataServer = struct {
             defer alloc.free(expected_path);
             if (!std.mem.eql(u8, replica.snapshot_path, expected_path) or
                 replica.table_id == 0 or replica.table_name.len == 0 or
-                !validLowerSha256(replica.logical_sha256))
+                !validLowerSha256(replica.logical_sha256) or
+                (replica.snapshot_manifest_sha256 != null and
+                    !validLowerSha256(replica.snapshot_manifest_sha256.?)))
                 return error.InvalidHASeedSnapshotTopology;
             const store_path = try std.fs.path.join(alloc, &.{ prepared_root, replica.snapshot_path, "store.bin" });
             defer alloc.free(store_path);
@@ -6516,6 +6590,18 @@ pub const DataServer = struct {
             defer alloc.free(actual_digest);
             if (!std.mem.eql(u8, actual_digest, replica.logical_sha256))
                 return error.HASeedSnapshotLogicalDigestMismatch;
+            if (replica.snapshot_manifest_sha256) |expected_sha256| {
+                const snapshot_manifest_path = try std.fs.path.join(alloc, &.{
+                    prepared_root,
+                    replica.snapshot_path,
+                    antfly.db.logical_snapshot_manifest_file_name,
+                });
+                defer alloc.free(snapshot_manifest_path);
+                const actual_snapshot_manifest_digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, snapshot_manifest_path);
+                defer alloc.free(actual_snapshot_manifest_digest);
+                if (!std.mem.eql(u8, actual_snapshot_manifest_digest, expected_sha256))
+                    return error.HASeedSnapshotLogicalDigestMismatch;
+            }
         }
 
         var root = try std.Io.Dir.cwd().openDir(io, prepared_root, .{ .iterate = true });
@@ -6548,6 +6634,14 @@ pub const DataServer = struct {
                     const journal_rel = try std.fs.path.join(alloc, &.{ replica.snapshot_path, "change-journal.bin" });
                     defer alloc.free(journal_rel);
                     if (std.mem.eql(u8, entry.path, journal_rel)) break;
+                    if (replica.snapshot_manifest_sha256 != null) {
+                        const snapshot_manifest_rel = try std.fs.path.join(alloc, &.{
+                            replica.snapshot_path,
+                            antfly.db.logical_snapshot_manifest_file_name,
+                        });
+                        defer alloc.free(snapshot_manifest_rel);
+                        if (std.mem.eql(u8, entry.path, snapshot_manifest_rel)) break;
+                    }
                 } else return error.HASeedSnapshotUnexpectedArtifact;
                 continue;
             }
@@ -7149,6 +7243,8 @@ pub const DataServer = struct {
         self.store_status_heartbeat_cache.clear(self.alloc);
         self.provisioned_storage.deinit();
         self.write_source.deinit();
+        if (self.owned_incoming_graph_route_store) |*store| store.deinit();
+        if (self.owned_incoming_graph_route_backend) |*backend| backend.close();
         if (self.remote_metadata) |remote_metadata| {
             remote_metadata.deinit();
             self.alloc.destroy(remote_metadata);
@@ -7168,6 +7264,8 @@ pub const DataServer = struct {
         self.owned_backend_runtime = null;
         self.backend_runtime = null;
         self.query_io_impl = null;
+        self.owned_incoming_graph_route_store = null;
+        self.owned_incoming_graph_route_backend = null;
     }
 
     fn ensureHttpRuntime(self: *DataServer) !*httpx.HttpRuntime {
@@ -12361,6 +12459,8 @@ pub const DataServer = struct {
             .store_id = registration.store_id,
             .node_id = registration.node_id,
             .reporter_incarnation = try self.reporterIncarnation(),
+            .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
+            .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
             .api_url = api_url,
             .raft_url = raft_url,
             .role = registration.role,
@@ -12974,11 +13074,14 @@ pub const DataServer = struct {
         const reporter_incarnation = try self.reporterIncarnation();
         if (snapshot.status.runtime_status_protocol_ready_version >=
             metadata_runtime_status_protocol.current_record_version and
-            !storeReporterIncarnationVisible(
+            (!storeReporterIncarnationVisible(
                 snapshot.stores,
                 registration.store_id,
                 reporter_incarnation,
-            ))
+            ) or !storeNativeGenerationRestoreCapabilityVisible(
+                snapshot.stores,
+                registration.store_id,
+            )))
         {
             // A process that registered while v13 was still rolling out has a
             // legacy zero-incarnation record. Re-register once activation is
@@ -13060,6 +13163,7 @@ pub const DataServer = struct {
             .store_id = registration.store_id,
             .reporter_incarnation = reporter_incarnation,
             .status_generation = status_generation,
+            .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .live = true,
             .health_class = "healthy",
             .capacity_bytes = capacity.capacity_bytes,
@@ -13467,6 +13571,7 @@ pub const DataServer = struct {
             .store_id = store_id,
             .reporter_incarnation = cache.reporter_incarnation,
             .status_generation = cache.status_generation,
+            .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
             .live = cache.live,
             .health_class = try self.alloc.dupe(u8, cache.health_class),
             .capacity_bytes = cache.capacity_bytes,
@@ -13496,6 +13601,7 @@ pub const DataServer = struct {
         var next: StoreStatusHeartbeatCache = .{
             .reporter_incarnation = report.reporter_incarnation,
             .status_generation = report.status_generation,
+            .artifact_sources_protocol_version = report.artifact_sources_protocol_version,
             .live = report.live,
             .health_class = health_class,
             .owns_health_class = true,
@@ -13869,11 +13975,14 @@ pub const DataServer = struct {
         mutation_guard: IndexRepairQueueMutationGuard,
     ) !bool {
         const now_ms = self.backgroundMonotonicMs();
-        const next_retry_at_ms = indexRepairMonotonicDeadlineMs(
-            next_retry_at_realtime_ms,
-            self.backgroundRealtimeMs(),
-            now_ms,
-        );
+        const next_retry_at_ms = if (wake == .parked)
+            std.math.maxInt(u64)
+        else
+            indexRepairMonotonicDeadlineMs(
+                next_retry_at_realtime_ms,
+                self.backgroundRealtimeMs(),
+                now_ms,
+            );
 
         // The overwhelmingly common path is retaining an exact durable wake
         // that is already in the linked queue. Keep that path allocation-free:
@@ -14910,7 +15019,7 @@ pub const DataServer = struct {
                     table_name,
                     group_id,
                     result.index_repair_retry_at_ms,
-                    .retained,
+                    indexRepairQueueWakeFromAggregate(result.index_repair_wake),
                     .{ .selected = candidate.queue_wake_generation },
                 ) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
@@ -15722,7 +15831,7 @@ pub const DataServer = struct {
             }
             if (try self.snapshotManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id)) |live_status| {
                 var status = live_status;
-                status.metadata = status.metadata.withDefaults(.live_writer_publish, self.backgroundMonotonicNs());
+                status.withMetadataDefaults(.live_writer_publish, self.backgroundMonotonicNs());
                 self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
                 try items.append(self.alloc, status);
                 continue;
@@ -15781,7 +15890,11 @@ pub const DataServer = struct {
                         status,
                         self.provisioned_storage.visibleRootGenerationForGroup(group_id),
                     )) {
-                        status.metadata.source = .cached_snapshot;
+                        status.relabel(
+                            .cached_snapshot,
+                            status.metadata.freshness,
+                            status.metadata.updated_at_ns,
+                        );
                     } else {
                         self.setRuntimeStatusMetadata(&status, .cached_snapshot, .stale);
                     }
@@ -15880,9 +15993,7 @@ pub const DataServer = struct {
         source: runtime_status.RuntimeStatusSource,
         freshness: runtime_status.RuntimeStatusFreshness,
     ) void {
-        status.metadata.source = source;
-        status.metadata.freshness = freshness;
-        status.metadata.updated_at_ns = self.backgroundMonotonicNs();
+        status.relabel(source, freshness, self.backgroundMonotonicNs());
     }
 
     fn syntheticConfiguredRuntimeStatus(
@@ -18350,6 +18461,24 @@ fn runtimeIndexStatusReportFromLocalIndex(
     errdefer alloc.free(kind);
     const load_error = if (index.load_error) |value| try alloc.dupe(u8, value) else null;
     errdefer if (load_error) |value| alloc.free(value);
+    const source_replay = try alloc.alloc(
+        antfly.metadata.table_manager.RuntimeIndexSourceReplayStatusReport,
+        index.source_replay.len,
+    );
+    var source_count: usize = 0;
+    errdefer {
+        for (source_replay[0..source_count]) |source| alloc.free(source.artifact_name);
+        if (source_replay.len > 0) alloc.free(source_replay);
+    }
+    for (index.source_replay, 0..) |source, i| {
+        source_replay[i] = .{
+            .artifact_name = try alloc.dupe(u8, source.artifact_name),
+            .published_sequence = source.published_sequence,
+            .target_sequence = source.target_sequence,
+            .failed = source.failed,
+        };
+        source_count += 1;
+    }
     return .{
         .name = name,
         .kind = kind,
@@ -18371,6 +18500,7 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .replay_applied_sequence = index.replay_applied_sequence,
         .replay_target_sequence = index.replay_target_sequence,
         .replay_catch_up_required = index.replay_catch_up_required,
+        .source_replay = source_replay,
         .repair_status = index.index_repair_status,
         .repair_active_generation_serviceable = index.index_repair_active_generation_serviceable,
     };
@@ -18396,6 +18526,27 @@ test "data runtime report preserves compact managed repair admission state" {
         "{\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
         encoded,
     );
+}
+
+test "data runtime report preserves per-source replay watermarks" {
+    const alloc = std.testing.allocator;
+    const report = try runtimeIndexStatusReportFromLocalIndex(alloc, .{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .source_replay = @constCast(&[_]antfly.db.types.IndexSourceReplayStatus{
+            .{
+                .artifact_name = "document_chunks_v1",
+                .published_sequence = 17,
+                .target_sequence = 19,
+            },
+        }),
+    });
+    defer antfly.metadata.table_manager.freeRuntimeIndexStatusReport(alloc, report);
+
+    try std.testing.expectEqual(@as(usize, 1), report.source_replay.len);
+    try std.testing.expectEqualStrings("document_chunks_v1", report.source_replay[0].artifact_name);
+    try std.testing.expectEqual(@as(u64, 17), report.source_replay[0].published_sequence);
+    try std.testing.expectEqual(@as(u64, 19), report.source_replay[0].target_sequence);
 }
 
 fn progressMillis(progress: f64) u16 {
@@ -18579,6 +18730,7 @@ fn storeRegistrationVisible(
         // process incarnation and stale processes lose report authority.
         if (store.reporter_incarnation != 0 and
             store.reporter_incarnation != record.reporter_incarnation) continue;
+        if (store.native_generation_restore_version != record.native_generation_restore_version) continue;
         return true;
     }
     return false;
@@ -18593,6 +18745,37 @@ fn storeReporterIncarnationVisible(
         if (store.store_id == store_id) return store.reporter_incarnation == reporter_incarnation;
     }
     return false;
+}
+
+fn storeNativeGenerationRestoreCapabilityVisible(
+    stores: []const antfly.metadata.table_manager.StoreRecord,
+    store_id: u64,
+) bool {
+    for (stores) |store| {
+        if (store.store_id == store_id) {
+            return store.native_generation_restore_version >=
+                antfly.metadata.table_manager.native_generation_restore_protocol_version;
+        }
+    }
+    return false;
+}
+
+test "data store registration waits for native generation capability acknowledgment" {
+    const expected = antfly.metadata.table_manager.StoreRecord{
+        .store_id = 101,
+        .node_id = 11,
+        .role = "data",
+        .reporter_incarnation = 0x1234,
+        .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
+    };
+    var committed = expected;
+    committed.native_generation_restore_version = 0;
+
+    try std.testing.expect(!storeRegistrationVisible(&.{committed}, expected));
+    try std.testing.expect(!storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
+    committed.native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version;
+    try std.testing.expect(storeRegistrationVisible(&.{committed}, expected));
+    try std.testing.expect(storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
 }
 
 fn findRangeByGroupId(
@@ -27268,6 +27451,17 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     ));
     try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
     try std.testing.expectEqual(selected_generation, server.provisioned_index_repair_group_ages.get(7001).?.wake_generation);
+    try std.testing.expect(try server.enqueueProvisionedIndexRepairWithRetryForTable(
+        "docs",
+        7001,
+        0,
+        .parked,
+        .{ .selected = selected_generation },
+    ));
+    try std.testing.expectEqual(
+        std.math.maxInt(u64),
+        server.provisioned_index_repair_group_ages.get(7001).?.next_retry_at_ms,
+    );
 
     // A newer external wake is allocation-free too, but advances ownership.
     // Completion of the selected generation cannot remove that later edge;
@@ -29311,6 +29505,15 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight_limit 16") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_live_bytes 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_hits_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_misses_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_read_failures_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_write_failures_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_writes_coalesced_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_writes_dropped_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_batches_committed_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_pending_entries 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_pending_bytes 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_limit_bytes 67108864") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_rejected_reservations_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_resource_disk_reserved_bytes 0") != null);
@@ -29474,9 +29677,11 @@ const TestHASeedSnapshotProvider = struct {
         defer snapshot_db.close();
         const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-g1", .{request.generation});
         defer alloc.free(snapshot_token);
-        _ = try snapshot_db.snapshot(snapshot_token);
         const source_snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ self.db_path, snapshot_token });
         defer alloc.free(source_snapshot_root);
+        std.Io.Dir.cwd().deleteTree(io, source_snapshot_root) catch {};
+        defer std.Io.Dir.cwd().deleteTree(io, source_snapshot_root) catch {};
+        _ = try snapshot_db.snapshot(snapshot_token);
         try antfly.public_api.backups.copyDirectoryRecursive(alloc, source_snapshot_root, replica_snapshot_root);
 
         const store_path = try std.fs.path.join(alloc, &.{ replica_snapshot_root, "store.bin" });
@@ -29489,6 +29694,20 @@ const TestHASeedSnapshotProvider = struct {
         for (digest, 0..) |byte, index| {
             digest_hex[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
             digest_hex[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+        }
+        const snapshot_manifest_path = try std.fs.path.join(alloc, &.{
+            replica_snapshot_root,
+            antfly.db.logical_snapshot_manifest_file_name,
+        });
+        defer alloc.free(snapshot_manifest_path);
+        const snapshot_manifest_bytes = try std.Io.Dir.cwd().readFileAlloc(io, snapshot_manifest_path, alloc, .limited(4096));
+        defer alloc.free(snapshot_manifest_bytes);
+        var snapshot_manifest_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(snapshot_manifest_bytes, &snapshot_manifest_digest, .{});
+        var snapshot_manifest_digest_hex: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
+        for (snapshot_manifest_digest, 0..) |byte, index| {
+            snapshot_manifest_digest_hex[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+            snapshot_manifest_digest_hex[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
         }
 
         const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
@@ -29516,6 +29735,7 @@ const TestHASeedSnapshotProvider = struct {
                 .table_name = "docs",
                 .snapshot_path = "replicas/group-1",
                 .logical_sha256 = digest_hex[0..],
+                .snapshot_manifest_sha256 = snapshot_manifest_digest_hex[0..],
                 .identity_table_id = 20,
                 .identity_shard_id = 10,
                 .identity_range_id = 1,
@@ -30033,9 +30253,12 @@ test "data server wires configured HA executors into API server" {
         captured_replica.snapshot_path,
     });
     defer alloc.free(captured_snapshot_root);
-    const captured_journal_path = try std.fs.path.join(alloc, &.{ captured_snapshot_root, "change-journal.bin" });
-    defer alloc.free(captured_journal_path);
-    try std.Io.Dir.accessAbsolute(io_impl.io(), captured_journal_path, .{});
+    const captured_snapshot_manifest_path = try std.fs.path.join(alloc, &.{
+        captured_snapshot_root,
+        antfly.db.logical_snapshot_manifest_file_name,
+    });
+    defer alloc.free(captured_snapshot_manifest_path);
+    try std.Io.Dir.accessAbsolute(io_impl.io(), captured_snapshot_manifest_path, .{});
     const restored_db_path = try std.fs.path.join(alloc, &.{ capture_fixture_root, "restored/group-1/table-db" });
     defer alloc.free(restored_db_path);
     {

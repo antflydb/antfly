@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const agl_data = @import("agl_data.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -73,6 +74,118 @@ pub const NamedEncoding = enum {
     standard,
 };
 
+/// PostScript glyph-name vectors used when a simple PDF font selects a named
+/// encoding. These are intentionally glyph names rather than Unicode values:
+/// CFF charsets are name-keyed and two names can share a Unicode scalar while
+/// selecting different glyph programs.
+pub const win_ansi_glyph_names: [256][]const u8 = .{
+    ".notdef",    ".notdef",     ".notdef",        ".notdef",        ".notdef",       ".notdef",      ".notdef",       ".notdef",
+    ".notdef",    ".notdef",     ".notdef",        ".notdef",        ".notdef",       ".notdef",      ".notdef",       ".notdef",
+    ".notdef",    ".notdef",     ".notdef",        ".notdef",        ".notdef",       ".notdef",      ".notdef",       ".notdef",
+    ".notdef",    ".notdef",     ".notdef",        ".notdef",        ".notdef",       ".notdef",      ".notdef",       ".notdef",
+    "space",      "exclam",      "quotedbl",       "numbersign",     "dollar",        "percent",      "ampersand",     "quotesingle",
+    "parenleft",  "parenright",  "asterisk",       "plus",           "comma",         "hyphen",       "period",        "slash",
+    "zero",       "one",         "two",            "three",          "four",          "five",         "six",           "seven",
+    "eight",      "nine",        "colon",          "semicolon",      "less",          "equal",        "greater",       "question",
+    "at",         "A",           "B",              "C",              "D",             "E",            "F",             "G",
+    "H",          "I",           "J",              "K",              "L",             "M",            "N",             "O",
+    "P",          "Q",           "R",              "S",              "T",             "U",            "V",             "W",
+    "X",          "Y",           "Z",              "bracketleft",    "backslash",     "bracketright", "asciicircum",   "underscore",
+    "grave",      "a",           "b",              "c",              "d",             "e",            "f",             "g",
+    "h",          "i",           "j",              "k",              "l",             "m",            "n",             "o",
+    "p",          "q",           "r",              "s",              "t",             "u",            "v",             "w",
+    "x",          "y",           "z",              "braceleft",      "bar",           "braceright",   "asciitilde",    "bullet",
+    "Euro",       "bullet",      "quotesinglbase", "florin",         "quotedblbase",  "ellipsis",     "dagger",        "daggerdbl",
+    "circumflex", "perthousand", "Scaron",         "guilsinglleft",  "OE",            "bullet",       "Zcaron",        "bullet",
+    "bullet",     "quoteleft",   "quoteright",     "quotedblleft",   "quotedblright", "bullet",       "endash",        "emdash",
+    "tilde",      "trademark",   "scaron",         "guilsinglright", "oe",            "bullet",       "zcaron",        "Ydieresis",
+    "space",      "exclamdown",  "cent",           "sterling",       "currency",      "yen",          "brokenbar",     "section",
+    "dieresis",   "copyright",   "ordfeminine",    "guillemotleft",  "logicalnot",    "hyphen",       "registered",    "macron",
+    "degree",     "plusminus",   "twosuperior",    "threesuperior",  "acute",         "mu",           "paragraph",     "periodcentered",
+    "cedilla",    "onesuperior", "ordmasculine",   "guillemotright", "onequarter",    "onehalf",      "threequarters", "questiondown",
+    "Agrave",     "Aacute",      "Acircumflex",    "Atilde",         "Adieresis",     "Aring",        "AE",            "Ccedilla",
+    "Egrave",     "Eacute",      "Ecircumflex",    "Edieresis",      "Igrave",        "Iacute",       "Icircumflex",   "Idieresis",
+    "Eth",        "Ntilde",      "Ograve",         "Oacute",         "Ocircumflex",   "Otilde",       "Odieresis",     "multiply",
+    "Oslash",     "Ugrave",      "Uacute",         "Ucircumflex",    "Udieresis",     "Yacute",       "Thorn",         "germandbls",
+    "agrave",     "aacute",      "acircumflex",    "atilde",         "adieresis",     "aring",        "ae",            "ccedilla",
+    "egrave",     "eacute",      "ecircumflex",    "edieresis",      "igrave",        "iacute",       "icircumflex",   "idieresis",
+    "eth",        "ntilde",      "ograve",         "oacute",         "ocircumflex",   "otilde",       "odieresis",     "divide",
+    "oslash",     "ugrave",      "uacute",         "ucircumflex",    "udieresis",     "yacute",       "thorn",         "ydieresis",
+};
+
+pub const mac_roman_glyph_names: [256][]const u8 = .{
+    "NUL",            "Eth",            "eth",            "Lslash",        "lslash",        "Scaron",         "scaron",      "Yacute",
+    "yacute",         "HT",             "LF",             "Thorn",         "thorn",         "CR",             "Zcaron",      "zcaron",
+    "DLE",            "DC1",            "DC2",            "DC3",           "DC4",           "onehalf",        "onequarter",  "onesuperior",
+    "threequarters",  "threesuperior",  "twosuperior",    "brokenbar",     "minus",         "multiply",       "RS",          "US",
+    "space",          "exclam",         "quotedbl",       "numbersign",    "dollar",        "percent",        "ampersand",   "quotesingle",
+    "parenleft",      "parenright",     "asterisk",       "plus",          "comma",         "hyphen",         "period",      "slash",
+    "zero",           "one",            "two",            "three",         "four",          "five",           "six",         "seven",
+    "eight",          "nine",           "colon",          "semicolon",     "less",          "equal",          "greater",     "question",
+    "at",             "A",              "B",              "C",             "D",             "E",              "F",           "G",
+    "H",              "I",              "J",              "K",             "L",             "M",              "N",           "O",
+    "P",              "Q",              "R",              "S",             "T",             "U",              "V",           "W",
+    "X",              "Y",              "Z",              "bracketleft",   "backslash",     "bracketright",   "asciicircum", "underscore",
+    "grave",          "a",              "b",              "c",             "d",             "e",              "f",           "g",
+    "h",              "i",              "j",              "k",             "l",             "m",              "n",           "o",
+    "p",              "q",              "r",              "s",             "t",             "u",              "v",           "w",
+    "x",              "y",              "z",              "braceleft",     "bar",           "braceright",     "asciitilde",  "DEL",
+    "Adieresis",      "Aring",          "Ccedilla",       "Eacute",        "Ntilde",        "Odieresis",      "Udieresis",   "aacute",
+    "agrave",         "acircumflex",    "adieresis",      "atilde",        "aring",         "ccedilla",       "eacute",      "egrave",
+    "ecircumflex",    "edieresis",      "iacute",         "igrave",        "icircumflex",   "idieresis",      "ntilde",      "oacute",
+    "ograve",         "ocircumflex",    "odieresis",      "otilde",        "uacute",        "ugrave",         "ucircumflex", "udieresis",
+    "dagger",         "degree",         "cent",           "sterling",      "section",       "bullet",         "paragraph",   "germandbls",
+    "registered",     "copyright",      "trademark",      "acute",         "dieresis",      "notequal",       "AE",          "Oslash",
+    "infinity",       "plusminus",      "lessequal",      "greaterequal",  "yen",           "mu",             "partialdiff", "summation",
+    "product",        "pi",             "integral",       "ordfeminine",   "ordmasculine",  "Omega",          "ae",          "oslash",
+    "questiondown",   "exclamdown",     "logicalnot",     "radical",       "florin",        "approxequal",    "Delta",       "guillemotleft",
+    "guillemotright", "ellipsis",       "nbspace",        "Agrave",        "Atilde",        "Otilde",         "OE",          "oe",
+    "endash",         "emdash",         "quotedblleft",   "quotedblright", "quoteleft",     "quoteright",     "divide",      "lozenge",
+    "ydieresis",      "Ydieresis",      "fraction",       "currency",      "guilsinglleft", "guilsinglright", "fi",          "fl",
+    "daggerdbl",      "periodcentered", "quotesinglbase", "quotedblbase",  "perthousand",   "Acircumflex",    "Ecircumflex", "Aacute",
+    "Edieresis",      "Egrave",         "Iacute",         "Icircumflex",   "Idieresis",     "Igrave",         "Oacute",      "Ocircumflex",
+    "apple",          "Ograve",         "Uacute",         "Ucircumflex",   "Ugrave",        "dotlessi",       "circumflex",  "tilde",
+    "macron",         "breve",          "dotaccent",      "ring",          "cedilla",       "hungarumlaut",   "ogonek",      "caron",
+};
+
+/// MacExpertEncoding from PDF 1.7, Appendix D.3. This is a PDF encoding,
+/// distinct from the CFF predefined ExpertEncoding and from an expert font's
+/// built-in encoding.
+pub const mac_expert_glyph_names: [256][]const u8 = .{
+    ".notdef",           ".notdef",            ".notdef",           ".notdef",           ".notdef",          ".notdef",             ".notdef",          ".notdef",
+    ".notdef",           ".notdef",            ".notdef",           ".notdef",           ".notdef",          ".notdef",             ".notdef",          ".notdef",
+    ".notdef",           ".notdef",            ".notdef",           ".notdef",           ".notdef",          ".notdef",             ".notdef",          ".notdef",
+    ".notdef",           ".notdef",            ".notdef",           ".notdef",           ".notdef",          ".notdef",             ".notdef",          ".notdef",
+    "space",             "exclamsmall",        "Hungarumlautsmall", "centoldstyle",      "dollaroldstyle",   "dollarsuperior",      "ampersandsmall",   "Acutesmall",
+    "parenleftsuperior", "parenrightsuperior", "twodotenleader",    "onedotenleader",    "comma",            "hyphen",              "period",           "fraction",
+    "zerooldstyle",      "oneoldstyle",        "twooldstyle",       "threeoldstyle",     "fouroldstyle",     "fiveoldstyle",        "sixoldstyle",      "sevenoldstyle",
+    "eightoldstyle",     "nineoldstyle",       "colon",             "semicolon",         ".notdef",          "threequartersemdash", ".notdef",          "questionsmall",
+    ".notdef",           ".notdef",            ".notdef",           ".notdef",           "Ethsmall",         ".notdef",             ".notdef",          "onequarter",
+    "onehalf",           "threequarters",      "oneeighth",         "threeeighths",      "fiveeighths",      "seveneighths",        "onethird",         "twothirds",
+    ".notdef",           ".notdef",            ".notdef",           ".notdef",           ".notdef",          ".notdef",             "ff",               "fi",
+    "fl",                "ffi",                "ffl",               "parenleftinferior", ".notdef",          "parenrightinferior",  "Circumflexsmall",  "hypheninferior",
+    "Gravesmall",        "Asmall",             "Bsmall",            "Csmall",            "Dsmall",           "Esmall",              "Fsmall",           "Gsmall",
+    "Hsmall",            "Ismall",             "Jsmall",            "Ksmall",            "Lsmall",           "Msmall",              "Nsmall",           "Osmall",
+    "Psmall",            "Qsmall",             "Rsmall",            "Ssmall",            "Tsmall",           "Usmall",              "Vsmall",           "Wsmall",
+    "Xsmall",            "Ysmall",             "Zsmall",            "colonmonetary",     "onefitted",        "rupiah",              "Tildesmall",       ".notdef",
+    ".notdef",           "asuperior",          "centsuperior",      ".notdef",           ".notdef",          ".notdef",             ".notdef",          "Aacutesmall",
+    "Agravesmall",       "Acircumflexsmall",   "Adieresissmall",    "Atildesmall",       "Aringsmall",       "Ccedillasmall",       "Eacutesmall",      "Egravesmall",
+    "Ecircumflexsmall",  "Edieresissmall",     "Iacutesmall",       "Igravesmall",       "Icircumflexsmall", "Idieresissmall",      "Ntildesmall",      "Oacutesmall",
+    "Ogravesmall",       "Ocircumflexsmall",   "Odieresissmall",    "Otildesmall",       "Uacutesmall",      "Ugravesmall",         "Ucircumflexsmall", "Udieresissmall",
+    ".notdef",           "eightsuperior",      "fourinferior",      "threeinferior",     "sixinferior",      "eightinferior",       "seveninferior",    "Scaronsmall",
+    ".notdef",           "centinferior",       "twoinferior",       ".notdef",           "Dieresissmall",    ".notdef",             "Caronsmall",       "osuperior",
+    "fiveinferior",      ".notdef",            "commainferior",     "periodinferior",    "Yacutesmall",      ".notdef",             "dollarinferior",   ".notdef",
+    ".notdef",           "Thornsmall",         ".notdef",           "nineinferior",      "zeroinferior",     "Zcaronsmall",         "AEsmall",          "Oslashsmall",
+    "questiondownsmall", "oneinferior",        "Lslashsmall",       ".notdef",           ".notdef",          ".notdef",             ".notdef",          ".notdef",
+    ".notdef",           "Cedillasmall",       ".notdef",           ".notdef",           ".notdef",          ".notdef",             ".notdef",          "OEsmall",
+    "figuredash",        "hyphensuperior",     ".notdef",           ".notdef",           ".notdef",          ".notdef",             "exclamdownsmall",  ".notdef",
+    "Ydieresissmall",    ".notdef",            "onesuperior",       "twosuperior",       "threesuperior",    "foursuperior",        "fivesuperior",     "sixsuperior",
+    "sevensuperior",     "ninesuperior",       "zerosuperior",      ".notdef",           "esuperior",        "rsuperior",           "tsuperior",        ".notdef",
+    ".notdef",           "isuperior",          "ssuperior",         "dsuperior",         ".notdef",          ".notdef",             ".notdef",          ".notdef",
+    ".notdef",           "lsuperior",          "Ogoneksmall",       "Brevesmall",        "Macronsmall",      "bsuperior",           "nsuperior",        "msuperior",
+    "commasuperior",     "periodsuperior",     "Dotaccentsmall",    "Ringsmall",         ".notdef",          ".notdef",             ".notdef",          ".notdef",
+};
+
 pub fn decodeNamedAlloc(alloc: Allocator, enc: NamedEncoding, bytes: []const u8) ![]u8 {
     if (isUtf16Be(bytes)) return try utf16BeDecodeAlloc(alloc, bytes);
     const table: *const [256]u21 = switch (enc) {
@@ -98,44 +211,86 @@ pub fn decodeTableAlloc(alloc: Allocator, table: *const [256]u21, bytes: []const
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn glyphNameToRune(name: []const u8) ?u21 {
-    if (name.len == 1) return name[0];
-    if (std.mem.eql(u8, name, "space")) return ' ';
-    if (std.mem.eql(u8, name, "period")) return '.';
-    if (std.mem.eql(u8, name, "comma")) return ',';
-    if (std.mem.eql(u8, name, "colon")) return ':';
-    if (std.mem.eql(u8, name, "semicolon")) return ';';
-    if (std.mem.eql(u8, name, "hyphen")) return '-';
-    if (std.mem.eql(u8, name, "endash")) return 0x2013;
-    if (std.mem.eql(u8, name, "emdash")) return 0x2014;
-    if (std.mem.eql(u8, name, "quotedbl")) return '"';
-    if (std.mem.eql(u8, name, "quotesingle")) return '\'';
-    if (std.mem.eql(u8, name, "parenleft")) return '(';
-    if (std.mem.eql(u8, name, "parenright")) return ')';
-    if (std.mem.eql(u8, name, "bracketleft")) return '[';
-    if (std.mem.eql(u8, name, "bracketright")) return ']';
-    if (std.mem.eql(u8, name, "braceleft")) return '{';
-    if (std.mem.eql(u8, name, "braceright")) return '}';
-    if (std.mem.eql(u8, name, "slash")) return '/';
-    if (std.mem.eql(u8, name, "backslash")) return '\\';
-    if (std.mem.eql(u8, name, "plus")) return '+';
-    if (std.mem.eql(u8, name, "equal")) return '=';
-    if (std.mem.eql(u8, name, "less")) return '<';
-    if (std.mem.eql(u8, name, "greater")) return '>';
-    if (std.mem.eql(u8, name, "question")) return '?';
-    if (std.mem.eql(u8, name, "exclam")) return '!';
-    if (std.mem.eql(u8, name, "numbersign")) return '#';
-    if (std.mem.eql(u8, name, "dollar")) return '$';
-    if (std.mem.eql(u8, name, "percent")) return '%';
-    if (std.mem.eql(u8, name, "ampersand")) return '&';
-    if (std.mem.eql(u8, name, "asterisk")) return '*';
-    if (std.mem.eql(u8, name, "at")) return '@';
-    if (std.mem.eql(u8, name, "underscore")) return '_';
-    if (std.mem.eql(u8, name, "bar")) return '|';
-    if (std.mem.eql(u8, name, "asciitilde")) return '~';
-    if (std.mem.eql(u8, name, "grave")) return '`';
-    if (std.mem.eql(u8, name, "Euro")) return 0x20ac;
+fn adobeGlyphCodepoints(name: []const u8) ?[]const u21 {
+    var low: usize = 0;
+    var high: usize = agl_data.entries.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const order = std.mem.order(u8, agl_data.entries[mid].name, name);
+        switch (order) {
+            .lt => low = mid + 1,
+            .gt => high = mid,
+            .eq => return agl_data.entries[mid].codepoints,
+        }
+    }
     return null;
+}
+
+fn parseUnicodeScalarHex(bytes: []const u8) ?u21 {
+    const value = std.fmt.parseInt(u21, bytes, 16) catch return null;
+    if (value > 0x10ffff or (value >= 0xd800 and value <= 0xdfff)) return null;
+    return value;
+}
+
+fn algorithmicGlyphCodepoint(name: []const u8) ?u21 {
+    if (std.mem.startsWith(u8, name, "uni") and name.len == 7)
+        return parseUnicodeScalarHex(name[3..]);
+    if (name.len >= 5 and name.len <= 7 and name[0] == 'u')
+        return parseUnicodeScalarHex(name[1..]);
+    return null;
+}
+
+fn appendUtf8Codepoint(out: *std.ArrayList(u8), alloc: Allocator, cp: u21) !void {
+    var buf: [4]u8 = undefined;
+    const encoded_len = try std.unicode.utf8Encode(cp, &buf);
+    try out.appendSlice(alloc, buf[0..encoded_len]);
+}
+
+fn appendGlyphComponentUtf8(out: *std.ArrayList(u8), alloc: Allocator, component: []const u8) !bool {
+    if (adobeGlyphCodepoints(component)) |codepoints| {
+        for (codepoints) |cp| try appendUtf8Codepoint(out, alloc, cp);
+        return true;
+    }
+
+    if (std.mem.startsWith(u8, component, "uni") and component.len > 3 and (component.len - 3) % 4 == 0) {
+        var offset: usize = 3;
+        while (offset < component.len) : (offset += 4) {
+            const cp = parseUnicodeScalarHex(component[offset .. offset + 4]) orelse return false;
+            try appendUtf8Codepoint(out, alloc, cp);
+        }
+        return true;
+    }
+    if (algorithmicGlyphCodepoint(component)) |cp| {
+        try appendUtf8Codepoint(out, alloc, cp);
+        return true;
+    }
+    return false;
+}
+
+/// Resolve a PostScript glyph name according to Adobe's glyph-name algorithm.
+/// The returned UTF-8 slice is owned because AGL entries and underscore names
+/// may expand to multiple Unicode scalars.
+pub fn glyphNameToUtf8Alloc(alloc: Allocator, name: []const u8) !?[]u8 {
+    const canonical = name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse name.len];
+    if (canonical.len == 0) return null;
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+    var components = std.mem.splitScalar(u8, canonical, '_');
+    while (components.next()) |component| {
+        if (component.len == 0 or !try appendGlyphComponentUtf8(&out, alloc, component)) return null;
+    }
+    if (out.items.len == 0) return null;
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Scalar-only compatibility helper for name-keyed font lookup paths.
+pub fn glyphNameToRune(name: []const u8) ?u21 {
+    const canonical = name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse name.len];
+    if (std.mem.indexOfScalar(u8, canonical, '_') != null) return null;
+    if (adobeGlyphCodepoints(canonical)) |codepoints|
+        return if (codepoints.len == 1) codepoints[0] else null;
+    return algorithmicGlyphCodepoint(canonical);
 }
 
 fn decodeUtf16Codepoint(units: []const u16) !struct { u21, usize } {
@@ -259,9 +414,42 @@ pub const mac_roman_encoding = [256]u21{
     0x00af, 0x02d8, 0x02d9, 0x02da, 0x00b8, 0x02dd, 0x02db, 0x02c7,
 };
 
-pub const standard_encoding: [256]u21 = blk: {
-    const table = pdf_doc_encoding;
-    break :blk table;
+/// Adobe/PostScript StandardEncoding (PDF 1.7, Appendix D.1). This is not
+/// PDFDocEncoding: its high-byte positions contain punctuation, ligatures,
+/// accents, and a small Latin repertoire used by Type 1 fonts.
+pub const standard_encoding = [256]u21{
+    no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune,
+    no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune,
+    no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune,
+    no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune,
+    0x0020,  0x0021,  0x0022,  0x0023,  0x0024,  0x0025,  0x0026,  0x2019,
+    0x0028,  0x0029,  0x002a,  0x002b,  0x002c,  0x002d,  0x002e,  0x002f,
+    0x0030,  0x0031,  0x0032,  0x0033,  0x0034,  0x0035,  0x0036,  0x0037,
+    0x0038,  0x0039,  0x003a,  0x003b,  0x003c,  0x003d,  0x003e,  0x003f,
+    0x0040,  0x0041,  0x0042,  0x0043,  0x0044,  0x0045,  0x0046,  0x0047,
+    0x0048,  0x0049,  0x004a,  0x004b,  0x004c,  0x004d,  0x004e,  0x004f,
+    0x0050,  0x0051,  0x0052,  0x0053,  0x0054,  0x0055,  0x0056,  0x0057,
+    0x0058,  0x0059,  0x005a,  0x005b,  0x005c,  0x005d,  0x005e,  0x005f,
+    0x2018,  0x0061,  0x0062,  0x0063,  0x0064,  0x0065,  0x0066,  0x0067,
+    0x0068,  0x0069,  0x006a,  0x006b,  0x006c,  0x006d,  0x006e,  0x006f,
+    0x0070,  0x0071,  0x0072,  0x0073,  0x0074,  0x0075,  0x0076,  0x0077,
+    0x0078,  0x0079,  0x007a,  0x007b,  0x007c,  0x007d,  0x007e,  no_rune,
+    no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune,
+    no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune,
+    no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune,
+    no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune,
+    no_rune, 0x00a1,  0x00a2,  0x00a3,  0x2044,  0x00a5,  0x0192,  0x00a7,
+    0x00a4,  0x0027,  0x201c,  0x00ab,  0x2039,  0x203a,  0xfb01,  0xfb02,
+    no_rune, 0x2013,  0x2020,  0x2021,  0x00b7,  no_rune, 0x00b6,  0x2022,
+    0x201a,  0x201e,  0x201d,  0x00bb,  0x2026,  0x2030,  no_rune, 0x00bf,
+    no_rune, 0x0060,  0x00b4,  0x02c6,  0x02dc,  0x00af,  0x02d8,  0x02d9,
+    0x00a8,  no_rune, 0x02da,  0x00b8,  no_rune, 0x02dd,  0x02db,  0x02c7,
+    0x2014,  no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune,
+    no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune, no_rune,
+    no_rune, 0x00c6,  no_rune, 0x00aa,  no_rune, no_rune, no_rune, no_rune,
+    0x0141,  0x00d8,  0x0152,  0x00ba,  no_rune, no_rune, no_rune, no_rune,
+    no_rune, 0x00e6,  no_rune, no_rune, no_rune, 0x0131,  no_rune, no_rune,
+    0x0142,  0x00f8,  0x0153,  0x00df,  no_rune, no_rune, no_rune, no_rune,
 };
 
 test "pdf doc decode handles high-bit mapping" {
@@ -283,4 +471,43 @@ test "win ansi decode handles euro" {
     const decoded = try decodeNamedAlloc(alloc, .win_ansi, &.{0x80});
     defer alloc.free(decoded);
     try std.testing.expectEqualStrings("\u{20ac}", decoded);
+}
+
+test "MacExpertEncoding matches PDF specification assignments" {
+    try std.testing.expectEqualStrings("space", mac_expert_glyph_names[32]);
+    try std.testing.expectEqualStrings("exclamsmall", mac_expert_glyph_names[33]);
+    try std.testing.expectEqualStrings("onequarter", mac_expert_glyph_names[71]);
+    try std.testing.expectEqualStrings(".notdef", mac_expert_glyph_names[65]);
+    try std.testing.expectEqualStrings("Asmall", mac_expert_glyph_names[97]);
+    try std.testing.expectEqualStrings("AEsmall", mac_expert_glyph_names[190]);
+}
+
+test "StandardEncoding is distinct from PDFDocEncoding" {
+    try std.testing.expectEqual(@as(u21, 0x00b4), standard_encoding[194]);
+    try std.testing.expectEqual(@as(u21, 0x2014), standard_encoding[208]);
+    try std.testing.expectEqual(@as(u21, 0x00c6), standard_encoding[225]);
+    try std.testing.expect(standard_encoding[194] != pdf_doc_encoding[194]);
+}
+
+test "Adobe glyph names decode complete and algorithmic Unicode mappings" {
+    const alloc = std.testing.allocator;
+
+    const aacute = (try glyphNameToUtf8Alloc(alloc, "Aacute.swash")).?;
+    defer alloc.free(aacute);
+    try std.testing.expectEqualStrings("Á", aacute);
+
+    const hebrew = (try glyphNameToUtf8Alloc(alloc, "dalethatafpatah")).?;
+    defer alloc.free(hebrew);
+    try std.testing.expectEqualStrings("דֲ", hebrew);
+
+    const algorithmic = (try glyphNameToUtf8Alloc(alloc, "uni00410042.alt")).?;
+    defer alloc.free(algorithmic);
+    try std.testing.expectEqualStrings("AB", algorithmic);
+
+    const components = (try glyphNameToUtf8Alloc(alloc, "A_uni0301")).?;
+    defer alloc.free(components);
+    try std.testing.expectEqualStrings("Á", components);
+
+    try std.testing.expect((try glyphNameToUtf8Alloc(alloc, "uniD800")) == null);
+    try std.testing.expectEqual(@as(?u21, 0x00c1), glyphNameToRune("Aacute.alt"));
 }

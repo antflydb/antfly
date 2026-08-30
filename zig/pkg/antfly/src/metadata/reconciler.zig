@@ -36,6 +36,34 @@ pub const MergeRuntimeObservation = struct {
     observation: transition_state.MergeObservation,
 };
 
+test "native restore publication waits for every target store capability" {
+    const range: table_manager.RangeRecord = .{
+        .group_id = 77,
+        .table_id = 7,
+        .start_key = "",
+        .restore_native_manifest_size_bytes = 128,
+        .restore_native_manifest_sha256 = "manifest-sha256",
+    };
+    const placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 11 }, .store_id = 101 },
+        .{ .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 12 }, .store_id = 102 },
+    };
+    var stores = [_]table_manager.StoreRecord{
+        .{ .store_id = 101, .node_id = 11, .native_generation_restore_version = table_manager.native_generation_restore_protocol_version },
+        .{ .store_id = 102, .node_id = 12 },
+    };
+
+    var capabilities = try NativeRestoreCapabilityIndex.init(std.testing.allocator, &stores, &.{range}, &placements);
+    defer capabilities.deinit();
+    try std.testing.expect(!capabilities.rangeTargetsCapable(range));
+    try std.testing.expect(!capabilities.placementTargetCapable(placements[1]));
+    capabilities.deinit();
+    stores[1].native_generation_restore_version = table_manager.native_generation_restore_protocol_version;
+    capabilities = try NativeRestoreCapabilityIndex.init(std.testing.allocator, &stores, &.{range}, &placements);
+    try std.testing.expect(capabilities.rangeTargetsCapable(range));
+    try std.testing.expect(capabilities.placementTargetCapable(placements[1]));
+}
+
 pub const MedianKeyLookup = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -390,6 +418,13 @@ pub const Reconciler = struct {
         else
             try self.alloc.alloc(raft_reconciler.PlacementIntent, 0);
         defer planner.freeIntents(self.alloc, desired_placements);
+        var native_restore_capabilities = try NativeRestoreCapabilityIndex.init(
+            self.alloc,
+            current.stores,
+            desired_ranges,
+            desired_placements,
+        );
+        defer native_restore_capabilities.deinit();
         var membership_index = try MembershipTransitionIndex.init(self.alloc, current, desired_placements, &evidence);
         defer membership_index.deinit();
         var active_transition_contracts = try ActiveTransitionContractIndex.init(
@@ -458,6 +493,7 @@ pub const Reconciler = struct {
 
         for (desired_placements) |desired| {
             {
+                if (!native_restore_capabilities.placementTargetCapable(desired)) continue;
                 if (membership_index.deferDesiredPlacement(desired.record.group_id, desired.record.local_node_id)) continue;
                 const contracting = membership_index.contracting(desired.record.group_id);
                 const latched_peers = membership_index.latchedFinalPeers(desired.record.group_id);
@@ -515,6 +551,7 @@ pub const Reconciler = struct {
             }
         }
         for (desired_ranges) |desired| {
+            if (!native_restore_capabilities.rangeTargetsCapable(desired)) continue;
             const existing = findRangeRecord(current.ranges, desired.group_id);
             if (active_transition_contracts.rangeMutationFenced(desired.group_id) or
                 (existing != null and
@@ -653,6 +690,11 @@ pub const Reconciler = struct {
 
         for (current.placement_intents) |intent| {
             if (!membership_index.hasDesiredMember(intent.record.group_id, intent.record.local_node_id)) {
+                if (findRangeRecord(desired_ranges, intent.record.group_id)) |desired_range| {
+                    // Do not contract a healthy generation while its planned
+                    // replacement owners are fenced by the restore protocol.
+                    if (!native_restore_capabilities.rangeTargetsCapable(desired_range)) continue;
+                }
                 const current_range = findRangeRecord(
                     current.ranges,
                     intent.record.group_id,
@@ -1292,7 +1334,9 @@ fn backupRestoreBootstrapEqual(
         std.mem.eql(u8, a.?.snapshot_path, b.?.snapshot_path) and
         std.mem.eql(u8, a.?.connection, b.?.connection) and
         a.?.artifact_size_bytes == b.?.artifact_size_bytes and
-        std.mem.eql(u8, a.?.artifact_sha256, b.?.artifact_sha256);
+        std.mem.eql(u8, a.?.artifact_sha256, b.?.artifact_sha256) and
+        a.?.native_manifest_size_bytes == b.?.native_manifest_size_bytes and
+        std.mem.eql(u8, a.?.native_manifest_sha256, b.?.native_manifest_sha256);
 }
 
 fn findPlacementIntent(intents: []const raft_reconciler.PlacementIntent, group_id: u64, local_node_id: u64) ?raft_reconciler.PlacementIntent {
@@ -1317,6 +1361,74 @@ fn placementTargetDrainRequested(
     return false;
 }
 
+fn rangeCarriesNativeRestoreIdentity(range: table_manager.RangeRecord) bool {
+    return range.restore_native_manifest_size_bytes != 0 or
+        range.restore_native_manifest_sha256.len != 0;
+}
+
+const NativeRestoreCapabilityIndex = struct {
+    alloc: std.mem.Allocator,
+    capable_store_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    capable_node_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    groups: std.AutoHashMapUnmanaged(u64, GroupTargets) = .empty,
+
+    const GroupTargets = struct {
+        count: usize = 0,
+        all_capable: bool = true,
+    };
+
+    fn init(
+        alloc: std.mem.Allocator,
+        stores: []const table_manager.StoreRecord,
+        ranges: []const table_manager.RangeRecord,
+        placements: []const raft_reconciler.PlacementIntent,
+    ) !NativeRestoreCapabilityIndex {
+        var index = NativeRestoreCapabilityIndex{ .alloc = alloc };
+        errdefer index.deinit();
+        for (stores) |store| {
+            if (store.native_generation_restore_version <
+                table_manager.native_generation_restore_protocol_version) continue;
+            try index.capable_store_ids.put(alloc, store.store_id, {});
+            try index.capable_node_ids.put(alloc, store.node_id, {});
+        }
+        for (ranges) |range| {
+            if (rangeCarriesNativeRestoreIdentity(range))
+                try index.groups.put(alloc, range.group_id, .{});
+        }
+        for (placements) |intent| {
+            const targets = index.groups.getPtr(intent.record.group_id) orelse continue;
+            targets.count += 1;
+            targets.all_capable = targets.all_capable and index.targetCapable(intent);
+        }
+        return index;
+    }
+
+    fn deinit(self: *NativeRestoreCapabilityIndex) void {
+        self.capable_store_ids.deinit(self.alloc);
+        self.capable_node_ids.deinit(self.alloc);
+        self.groups.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn targetCapable(self: *const NativeRestoreCapabilityIndex, intent: raft_reconciler.PlacementIntent) bool {
+        if (intent.store_id != 0) return self.capable_store_ids.contains(intent.store_id);
+        return self.capable_node_ids.contains(intent.record.local_node_id);
+    }
+
+    fn placementTargetCapable(self: *const NativeRestoreCapabilityIndex, intent: raft_reconciler.PlacementIntent) bool {
+        if (!self.groups.contains(intent.record.group_id)) return true;
+        return self.targetCapable(intent);
+    }
+
+    fn rangeTargetsCapable(self: *const NativeRestoreCapabilityIndex, range: table_manager.RangeRecord) bool {
+        if (!rangeCarriesNativeRestoreIdentity(range)) return true;
+        const targets = self.groups.get(range.group_id) orelse return false;
+        // Never publish a native identity before an explicit owner generation
+        // exists and every owner can consume it.
+        return targets.count != 0 and targets.all_capable;
+    }
+};
+
 fn normalizeRestoreBootstrapIntent(
     current: CurrentMetadataState,
     tables: []const table_manager.TableRecord,
@@ -1336,6 +1448,8 @@ fn normalizeRestoreBootstrapIntent(
         range.restore_location,
         range.restore_snapshot_path,
         range.restore_artifact_sha256,
+        range.restore_native_manifest_size_bytes,
+        range.restore_native_manifest_sha256,
     )) |progress| {
         if (!progress.primary_restored) return effective;
         effective.record.bootstrap_mode = .persisted;
@@ -1352,6 +1466,8 @@ fn normalizeRestoreBootstrapIntent(
             .connection = range.restore_connection,
             .artifact_size_bytes = range.restore_artifact_size_bytes,
             .artifact_sha256 = range.restore_artifact_sha256,
+            .native_manifest_size_bytes = range.restore_native_manifest_size_bytes,
+            .native_manifest_sha256 = range.restore_native_manifest_sha256,
         };
     }
     return effective;
@@ -2093,6 +2209,8 @@ fn findRestoreProgress(
     location: []const u8,
     snapshot_path: []const u8,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64,
+    native_manifest_sha256: []const u8,
 ) ?table_manager.RestoreProgressRecord {
     for (records) |record| {
         if (record.table_id != table_id) continue;
@@ -2102,6 +2220,8 @@ fn findRestoreProgress(
         if (!std.mem.eql(u8, record.location, location)) continue;
         if (!std.mem.eql(u8, record.snapshot_path, snapshot_path)) continue;
         if (!std.mem.eql(u8, record.artifact_sha256, artifact_sha256)) continue;
+        if (record.native_manifest_size_bytes != native_manifest_size_bytes) continue;
+        if (!std.mem.eql(u8, record.native_manifest_sha256, native_manifest_sha256)) continue;
         return record;
     }
     return null;
@@ -3740,6 +3860,8 @@ fn rangeRecordsEqual(a: table_manager.RangeRecord, b: table_manager.RangeRecord)
         std.mem.eql(u8, a.restore_connection, b.restore_connection) and
         a.restore_artifact_size_bytes == b.restore_artifact_size_bytes and
         std.mem.eql(u8, a.restore_artifact_sha256, b.restore_artifact_sha256) and
+        a.restore_native_manifest_size_bytes == b.restore_native_manifest_size_bytes and
+        std.mem.eql(u8, a.restore_native_manifest_sha256, b.restore_native_manifest_sha256) and
         std.mem.eql(
             u8,
             &a.completed_restore_fingerprint,
