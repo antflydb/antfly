@@ -142,11 +142,17 @@ pub const Scenario = struct {
         name ++ ".stream-crash-after-apply",
     };
 
-    const State = struct {
+    /// Reusable production replication owner. Focused histories own their
+    /// VoprIo, while deployment-shaped histories borrow the cluster runtime
+    /// and may supply the real target write path and shared work permit.
+    pub const Fixture = struct {
         allocator: std.mem.Allocator,
-        sim: vopr.vopr_io.VoprIo,
+        owned_sim: ?vopr.vopr_io.VoprIo,
+        sim: *vopr.vopr_io.VoprIo,
         registry: foreign.Registry = .{},
         records: std.ArrayListUnmanaged(table_manager.ReplicationSourceStatusRecord) = .empty,
+        external_work_permit: ?replication.WorkPermit = null,
+        external_write_source: ?table_writes.TableWriteSource = null,
         mode: Mode = .clean,
         complete: bool = false,
         lease_valid: bool = true,
@@ -167,14 +173,66 @@ pub const Scenario = struct {
         const config_v1 = "[{\"type\":\"postgres\",\"dsn\":\"postgres://vopr\",\"postgres_table\":\"users_v1\",\"key_template\":\"id\"}]";
         const config_v2 = "[{\"type\":\"postgres\",\"dsn\":\"postgres://vopr\",\"postgres_table\":\"users_v2\",\"key_template\":\"id\"}]";
 
-        fn deinit(self: *@This()) void {
+        fn init(allocator: std.mem.Allocator) !*Fixture {
+            const self = try allocator.create(Fixture);
+            errdefer allocator.destroy(self);
+            self.* = .{
+                .allocator = allocator,
+                .owned_sim = try vopr.vopr_io.VoprIo.init(.{
+                    .seed = 0x52504c,
+                    .instrumentation = .{ .enabled = false, .map_digest = 0x52504c },
+                }),
+                .sim = undefined,
+            };
+            errdefer self.owned_sim.?.deinit();
+            self.sim = &self.owned_sim.?;
+            return try self.initRegistry();
+        }
+
+        pub fn initWithVoprIo(
+            allocator: std.mem.Allocator,
+            sim: *vopr.vopr_io.VoprIo,
+        ) !*Fixture {
+            const self = try allocator.create(Fixture);
+            errdefer allocator.destroy(self);
+            self.* = .{
+                .allocator = allocator,
+                .owned_sim = null,
+                .sim = sim,
+            };
+            return try self.initRegistry();
+        }
+
+        fn initRegistry(self: *Fixture) !*Fixture {
+            try self.registry.registerWithContext(
+                self.allocator,
+                .postgres,
+                self,
+                sourceFactory,
+                null,
+            );
+            return self;
+        }
+
+        pub fn deinit(self: *@This()) void {
             for (self.records.items) |record| table_manager.freeReplicationSourceStatus(self.allocator, record);
             self.records.deinit(self.allocator);
             self.registry.deinit(self.allocator);
             self.service_port = null;
             if (self.service_model) |*model| model.deinit();
             self.service_model = null;
-            self.sim.deinit();
+            if (self.owned_sim) |*owned| owned.deinit();
+            const allocator = self.allocator;
+            self.* = undefined;
+            allocator.destroy(self);
+        }
+
+        pub fn setWorkPermit(self: *@This(), permit_override: replication.WorkPermit) void {
+            self.external_work_permit = permit_override;
+        }
+
+        pub fn setWriteSource(self: *@This(), write_source: table_writes.TableWriteSource) void {
+            self.external_write_source = write_source;
         }
 
         fn enableServiceRates(self: *@This()) !void {
@@ -248,7 +306,8 @@ pub const Scenario = struct {
         }
 
         fn permit(self: *@This()) replication.WorkPermit {
-            return .{ .ptr = self, .checkpoint_fn = checkpoint, .deadline_fn = deadline };
+            return self.external_work_permit orelse
+                .{ .ptr = self, .checkpoint_fn = checkpoint, .deadline_fn = deadline };
         }
 
         fn lifecycle(self: *@This()) replication.ReplicationLifecycleHook {
@@ -310,15 +369,15 @@ pub const Scenario = struct {
 
         fn sourceQuery(_: *anyopaque, allocator: std.mem.Allocator, params: foreign.QueryParams) !foreign.QueryResult {
             const rows_json = [_][]const u8{
-                "{\"id\":\"doc:1\",\"name\":\"alpha\"}",
-                "{\"id\":\"doc:2\",\"name\":\"beta\"}",
+                "{\"id\":\"doc:d\",\"name\":\"alpha\"}",
+                "{\"id\":\"doc:e\",\"name\":\"beta\"}",
             };
             // The production snapshot runner converts its durable keyset
             // checkpoint into a filter and resets the numeric offset to zero.
             // Honor that contract so a resumed VOPR history cannot return the
             // same terminal row forever.
             const start = if (params.filter_query_json) |filter|
-                if (std.mem.indexOf(u8, filter, "doc:2") != null) rows_json.len else 1
+                if (std.mem.indexOf(u8, filter, "doc:e") != null) rows_json.len else 1
             else
                 params.offset;
             if (start >= rows_json.len) return .{ .total = rows_json.len };
@@ -345,7 +404,7 @@ pub const Scenario = struct {
             changes[0] = .{
                 .op = .insert,
                 .checkpoint = try allocator.dupe(u8, "lsn:3"),
-                .row = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"id\":\"doc:3\",\"name\":\"gamma\"}", .{}),
+                .row = try std.json.parseFromSliceLeaky(std.json.Value, allocator, "{\"id\":\"doc:f\",\"name\":\"gamma\"}", .{}),
             };
             return .{
                 .changes = changes,
@@ -353,12 +412,21 @@ pub const Scenario = struct {
             };
         }
 
-        fn batch(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, req: db_types.BatchRequest) !?void {
+        fn batch(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_types.BatchRequest,
+        ) !?void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.apply_calls += 1;
             if (self.mode == .target_crash and self.fault_armed) {
                 self.fault_armed = false;
                 return error.ConnectionResetByPeer;
+            }
+            if (self.external_write_source) |write_source| {
+                _ = try write_source.batch(allocator, table_name, req) orelse
+                    return error.ReplicationTargetBatchUnsupported;
             }
             for (req.writes) |write| self.markApplied(write.key);
             for (req.transforms) |transform| self.markApplied(transform.key);
@@ -367,15 +435,15 @@ pub const Scenario = struct {
         }
 
         fn markApplied(self: *@This(), key: []const u8) void {
-            if (std.mem.eql(u8, key, "doc:1")) self.applied_mask |= 1;
-            if (std.mem.eql(u8, key, "doc:2")) self.applied_mask |= 2;
-            if (std.mem.eql(u8, key, "doc:3")) self.applied_mask |= 4;
+            if (std.mem.eql(u8, key, "doc:d")) self.applied_mask |= 1;
+            if (std.mem.eql(u8, key, "doc:e")) self.applied_mask |= 2;
+            if (std.mem.eql(u8, key, "doc:f")) self.applied_mask |= 4;
         }
 
         fn clearApplied(self: *@This(), key: []const u8) void {
-            if (std.mem.eql(u8, key, "doc:1")) self.applied_mask &= ~@as(u8, 1);
-            if (std.mem.eql(u8, key, "doc:2")) self.applied_mask &= ~@as(u8, 2);
-            if (std.mem.eql(u8, key, "doc:3")) self.applied_mask &= ~@as(u8, 4);
+            if (std.mem.eql(u8, key, "doc:d")) self.applied_mask &= ~@as(u8, 1);
+            if (std.mem.eql(u8, key, "doc:e")) self.applied_mask &= ~@as(u8, 2);
+            if (std.mem.eql(u8, key, "doc:f")) self.applied_mask &= ~@as(u8, 4);
         }
 
         fn writeSource(self: *@This()) table_writes.TableWriteSource {
@@ -451,28 +519,27 @@ pub const Scenario = struct {
             }
             self.complete = true;
         }
+
+        pub fn runClean(self: *@This()) !void {
+            self.mode = .clean;
+            try self.run();
+        }
+
+        pub fn completionSound(self: *const @This()) bool {
+            return self.complete and self.applied_mask == 7 and
+                self.max_snapshot_checkpoint <= @popCount(self.applied_mask & 3) and
+                self.apply_calls >= 3 and self.lifecycle_calls > 0;
+        }
     };
 
-    pub const World = struct { state: *State };
+    pub const World = struct { state: *Fixture };
 
     pub fn init(allocator: std.mem.Allocator) !World {
-        const state = try allocator.create(State);
-        errdefer allocator.destroy(state);
-        state.* = .{
-            .allocator = allocator,
-            .sim = try vopr.vopr_io.VoprIo.init(.{
-                .seed = 0x52504c,
-                .instrumentation = .{ .enabled = false, .map_digest = 0x52504c },
-            }),
-        };
-        errdefer state.sim.deinit();
-        try state.registry.registerWithContext(allocator, .postgres, state, State.sourceFactory, null);
-        return .{ .state = state };
+        return .{ .state = try Fixture.init(allocator) };
     }
 
-    pub fn deinit(world: *World, allocator: std.mem.Allocator) void {
+    pub fn deinit(world: *World, _: std.mem.Allocator) void {
         world.state.deinit();
-        allocator.destroy(world.state);
         world.* = undefined;
     }
 
@@ -548,7 +615,7 @@ test "replication backfill service rates compose and heal across production snap
     var done = false;
     var failure: ?anyerror = null;
     const Task = struct {
-        fn run(target: *Scenario.State, completed: *bool, task_failure: *?anyerror) void {
+        fn run(target: *Scenario.Fixture, completed: *bool, task_failure: *?anyerror) void {
             target.run() catch |err| {
                 task_failure.* = err;
             };

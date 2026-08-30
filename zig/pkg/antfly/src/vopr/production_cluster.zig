@@ -18,8 +18,10 @@ const raft_transport = @import("../raft/transport/mod.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 const api_http_client = @import("../api/http_client.zig");
 const api_http_server = @import("../api/http_server.zig");
+const api_batch = @import("../api/batch.zig");
 const api_distributed_graph = @import("../api/distributed_graph.zig");
 const api_distributed_join = @import("../api/distributed_join.zig");
+const api_table_write_source = @import("../api/table_write_source.zig");
 const test_contract_helpers = @import("../api/test_contract_helpers.zig");
 const common_http = @import("../common/http/http_common.zig");
 const io_http_executor = @import("../common/http/io_http_executor.zig");
@@ -34,6 +36,7 @@ const backend_erased = @import("../storage/backend_erased.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const http_disconnect = @import("http_disconnect.zig");
 const usermgr = @import("../usermgr/user_manager.zig");
+const db_types = @import("../storage/db/types.zig");
 
 // The composed deployment uses the same service identity as the metadata
 // quorum fixture. Leaving this unset does not model an unauthenticated legacy
@@ -253,6 +256,17 @@ pub const Fixture = struct {
         graph: [node_count]api_distributed_graph.WorkCostPort,
     };
 
+    /// Keeps production listeners, Raft drivers, and storage owners live until
+    /// a co-scheduled deployment workload has reached its terminal boundary.
+    pub const CompletionFence = struct {
+        ptr: *anyopaque,
+        ready_fn: *const fn (ptr: *anyopaque) bool,
+
+        fn ready(self: @This()) bool {
+            return self.ready_fn(self.ptr);
+        }
+    };
+
     alloc: std.mem.Allocator,
     sim: *vopr.vopr_io.VoprIo,
     metadata: ?*metadata_sim.VoprPublicClusterFixture = null,
@@ -329,6 +343,10 @@ pub const Fixture = struct {
     control_round_active: bool = false,
     public_request_ingress_count: u64 = 0,
     public_response_ready_count: u64 = 0,
+    replication_batch_attempts: u64 = 0,
+    replication_batch_successes: u64 = 0,
+    replication_last_status: u16 = 0,
+    completion_fence: ?CompletionFence = null,
     write_statuses: [3]u16 = .{ 0, 0, 0 },
     write_body_digests: [3]u64 = .{ 0, 0, 0 },
     write_attempts: [3]u64 = .{ 0, 0, 0 },
@@ -750,6 +768,88 @@ pub const Fixture = struct {
     pub fn setWorkCostPorts(self: *Fixture, ports: WorkCostPorts) void {
         std.debug.assert(self.phase == .created);
         self.work_cost_ports = ports;
+    }
+
+    pub fn setCompletionFence(self: *Fixture, fence: CompletionFence) void {
+        self.completion_fence = fence;
+    }
+
+    /// Production target for composed replication-backfill histories. The
+    /// runner supplies typed BatchRequest values; this adapter preserves them
+    /// as public batch JSON and deliberately crosses the ordinary HTTP router,
+    /// DataServer leader forwarding, data-Raft apply, and index visibility
+    /// path. It is not a direct DB test hook.
+    pub fn replicationWriteSource(self: *Fixture) api_table_write_source.TableWriteSource {
+        return .{ .ptr = self, .vtable = &.{ .batch = applyReplicationBatch } };
+    }
+
+    fn applyReplicationBatch(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_types.BatchRequest,
+    ) !?void {
+        const self: *Fixture = @ptrCast(@alignCast(ptr));
+        if (req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
+            req.predicates.len != 0 or
+            req.split_checkpoint != null or req.split_replication != null or
+            req.split_transition != null or req.merge_checkpoint != null or
+            req.merge_replication != null or req.merge_source_transition != null or
+            req.transaction != null)
+            return error.UnsupportedReplicationPublicBatchShape;
+        const body_slice = try api_batch.encodeBatchRequest(allocator, req);
+        defer allocator.free(body_slice);
+
+        const route_index: usize = @intCast(self.replication_batch_attempts % self.data_api_uri_count);
+        self.replication_batch_attempts +|= 1;
+        var response = try self.client.fetchBatch(
+            self.data_api_uris[route_index],
+            table_name,
+            body_slice,
+        );
+        defer response.deinit(self.alloc);
+        self.replication_last_status = response.status;
+        self.replication_batch_successes +|= 1;
+        return {};
+    }
+
+    pub fn replicationBackfillVisible(self: *Fixture) !bool {
+        const expected = [_]struct {
+            key: []const u8,
+            value: []const u8,
+        }{
+            .{ .key = "doc:d", .value = "alpha" },
+            .{ .key = "doc:e", .value = "beta" },
+            .{ .key = "doc:f", .value = "gamma" },
+        };
+        for (0..node_count * 64) |_| {
+            var visible: usize = 0;
+            for (self.data_api_uris[0..self.data_api_uri_count]) |uri| {
+                var route_sound = true;
+                for (expected) |document| {
+                    var response = self.client.fetchLookupResponse(
+                        uri,
+                        "docs",
+                        document.key,
+                        null,
+                    ) catch {
+                        route_sound = false;
+                        break;
+                    };
+                    defer response.deinit(self.alloc);
+                    if (response.status != 200 or
+                        std.mem.indexOf(u8, response.body, document.value) == null)
+                    {
+                        route_sound = false;
+                        break;
+                    }
+                }
+                if (route_sound) visible += 1;
+            }
+            if (visible == self.data_api_uri_count) return true;
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        }
+        return false;
     }
 
     pub fn currentGraphOwnerIndex(self: *Fixture) ?usize {
@@ -2376,6 +2476,9 @@ pub const Fixture = struct {
         self.runWorkloadInner() catch |err| {
             self.failure = err;
         };
+        if (self.failure == null) self.awaitCompletionFence() catch |err| {
+            self.failure = err;
+        };
         self.workload_done = true;
         if (self.graph_restart_future) |*future| {
             if (self.graph_owner_restart_requested) {
@@ -2458,6 +2561,16 @@ pub const Fixture = struct {
         self.cleanupRuntime();
         self.complete = true;
         self.phase = .complete;
+    }
+
+    fn awaitCompletionFence(self: *Fixture) !void {
+        const fence = self.completion_fence orelse return;
+        for (0..100_000) |_| {
+            if (fence.ready()) return;
+            if (self.teardown_started) return error.Canceled;
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        }
+        return error.ProductionDataExternalCompletionTimeout;
     }
 
     fn runWorkloadInner(self: *Fixture) !void {
