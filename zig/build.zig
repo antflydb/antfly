@@ -7468,6 +7468,18 @@ pub fn build(b: *std.Build) void {
     );
     production_cluster_replication_backfill_vopr_test_step.dependOn(&run_production_cluster_replication_backfill_vopr_tests.step);
 
+    const production_cluster_replication_schema_change_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production replication schema change resumes through public data raft and exact replays"},
+        .max_rss = full_cluster_vopr_max_rss,
+    });
+    const run_production_cluster_replication_schema_change_vopr_tests = b.addRunArtifact(production_cluster_replication_schema_change_vopr_tests);
+    const production_cluster_replication_schema_change_vopr_test_step = b.step(
+        "production-cluster-replication-schema-change-vopr-test",
+        "Run interrupted schema-change backfill, durable resume, public DataServer Raft visibility, and exact replay",
+    );
+    production_cluster_replication_schema_change_vopr_test_step.dependOn(&run_production_cluster_replication_schema_change_vopr_tests.step);
+
     const production_cluster_graph_hydration_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production public graph hydration exact replay"},
@@ -7736,6 +7748,7 @@ pub fn build(b: *std.Build) void {
         run_production_cluster_service_rate_vopr_tests,
         run_production_cluster_query_cache_service_rate_vopr_tests,
         run_production_cluster_replication_backfill_vopr_tests,
+        run_production_cluster_replication_schema_change_vopr_tests,
         run_production_cluster_graph_hydration_vopr_tests,
         run_production_cluster_graph_cancellation_vopr_tests,
         run_production_cluster_graph_cancellation_transport_vopr_tests,
@@ -7845,7 +7858,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_graph_split_socket_pressure_vopr_test_step.dependOn(&run_production_cluster_graph_split_socket_pressure_vopr_tests.step);
     const production_cluster_vopr_test_step = b.step(
         "production-cluster-vopr-test",
-        "Run every focused production DataServer cluster history through v42",
+        "Run every focused production DataServer cluster history through v43",
     );
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_deep_test_step);
@@ -7868,6 +7881,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_vopr_test_step.dependOn(production_cluster_service_rate_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_query_cache_service_rate_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_replication_backfill_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_replication_schema_change_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_hydration_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_cancellation_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_cancellation_transport_vopr_test_step);

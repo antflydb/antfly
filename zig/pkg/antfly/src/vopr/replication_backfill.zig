@@ -161,6 +161,7 @@ pub const Scenario = struct {
         stale_rejected: bool = false,
         target_rebalanced: bool = false,
         schema_changed: bool = false,
+        schema_v2_query_seen: bool = false,
         applied_mask: u8 = 0,
         apply_calls: u32 = 0,
         lifecycle_calls: u32 = 0,
@@ -367,7 +368,10 @@ pub const Scenario = struct {
             return .{ .row_count = 2, .size_bytes = 64 };
         }
 
-        fn sourceQuery(_: *anyopaque, allocator: std.mem.Allocator, params: foreign.QueryParams) !foreign.QueryResult {
+        fn sourceQuery(ptr: *anyopaque, allocator: std.mem.Allocator, params: foreign.QueryParams) !foreign.QueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, params.table, "users_v2"))
+                self.schema_v2_query_seen = true;
             const rows_json = [_][]const u8{
                 "{\"id\":\"doc:d\",\"name\":\"alpha\"}",
                 "{\"id\":\"doc:e\",\"name\":\"beta\"}",
@@ -525,10 +529,38 @@ pub const Scenario = struct {
             try self.run();
         }
 
+        /// Interrupt after the first snapshot batch has reached the target,
+        /// publish a changed source schema, and resume from durable status.
+        /// Deployment-shaped histories use this entry point directly; there
+        /// is intentionally no compatibility selector or stringly mode API.
+        pub fn runSchemaChange(self: *@This()) !void {
+            self.mode = .schema_change;
+            self.fault_armed = true;
+            try self.run();
+        }
+
         pub fn completionSound(self: *const @This()) bool {
             return self.complete and self.applied_mask == 7 and
                 self.max_snapshot_checkpoint <= @popCount(self.applied_mask & 3) and
                 self.apply_calls >= 3 and self.lifecycle_calls > 0;
+        }
+
+        pub fn schemaChangeRecoverySound(self: *const @This()) bool {
+            return self.completionSound() and self.first_attempt_failed and
+                self.schema_changed and self.schema_v2_query_seen and
+                !self.fault_armed;
+        }
+
+        pub fn firstAttemptFailed(self: *const @This()) bool {
+            return self.first_attempt_failed;
+        }
+
+        pub fn schemaChanged(self: *const @This()) bool {
+            return self.schema_changed;
+        }
+
+        pub fn schemaV2QuerySeen(self: *const @This()) bool {
+            return self.schema_v2_query_seen;
         }
     };
 
