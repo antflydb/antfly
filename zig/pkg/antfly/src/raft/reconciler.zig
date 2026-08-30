@@ -403,6 +403,7 @@ const RouteRetryState = struct {
 };
 
 const FailureRetryState = struct {
+    intent_hash: ?u64 = null,
     phase: ReconcileFailurePhase,
     classification: ReconcileFailureClassification,
     err: anyerror,
@@ -564,10 +565,13 @@ pub const PreparedReconcile = struct {
     intents: []PlacementIntent,
     ensures: []PreparedEnsure,
     removals: []u64,
+    deferred_failures: []ReconcileFailure,
     catalog_upserts: []catalog.ReplicaRecord,
+    catalog_upsert_hashes: []u64,
     catalog_upsert_enabled: []bool,
     catalog_upsert_count: usize,
-    catalog_revision: ?u64,
+    catalog_token: ?catalog.ReplicaCatalogToken,
+    catalog_commit_token: ?catalog.ReplicaCatalogToken = null,
     live: PreparedLiveConvergence,
     /// Set only after the retirement half of the catalog transition is
     /// durable (or when there are no retirements). Callers that stage sidecar
@@ -575,6 +579,12 @@ pub const PreparedReconcile = struct {
     /// committed removal whose live teardown still needs recovery.
     catalog_commit_complete: bool = false,
     durability_complete: bool = false,
+    classification_complete: bool = false,
+    admission_commit_complete: bool = false,
+    live_commit_complete: bool = false,
+    retirement_commit_attempted: bool = false,
+    retirement_suppressed: bool = false,
+    result: ReconcileResult = .{},
     committed: bool = false,
     aborted: bool = false,
 
@@ -585,7 +595,9 @@ pub const PreparedReconcile = struct {
         }
         self.owner.alloc.free(self.ensures);
         self.owner.alloc.free(self.removals);
+        self.owner.alloc.free(self.deferred_failures);
         self.owner.alloc.free(self.catalog_upserts);
+        self.owner.alloc.free(self.catalog_upsert_hashes);
         self.owner.alloc.free(self.catalog_upsert_enabled);
         freeIntentSlice(self.owner.alloc, self.intents);
         self.* = undefined;
@@ -617,9 +629,10 @@ pub const PreparedReconcile = struct {
         // Classification can reject additional candidates only after the
         // caller re-enters the runtime owner. Compact exactly once at commit.
         var write_index: usize = 0;
-        for (self.catalog_upserts, self.catalog_upsert_enabled) |record, enabled| {
+        for (self.catalog_upserts, self.catalog_upsert_hashes, self.catalog_upsert_enabled) |record, intent_hash, enabled| {
             if (!enabled) continue;
             self.catalog_upserts[write_index] = record;
+            self.catalog_upsert_hashes[write_index] = intent_hash;
             write_index += 1;
         }
         self.catalog_upsert_count = write_index;
@@ -640,18 +653,16 @@ pub const PreparedReconcile = struct {
         }
     }
 
-    pub fn commit(self: *PreparedReconcile) !ReconcileResult {
-        if (!self.durability_complete or self.committed or self.aborted) return error.InvalidReconcilePhase;
-
-        var result: ReconcileResult = .{};
-        var retirement_blocked = false;
-
+    /// Revalidates prepared descriptors against live runtime state. This is a
+    /// short owner-lock phase and performs no filesystem work.
+    pub fn classifyAdmissions(self: *PreparedReconcile) !void {
+        if (!self.durability_complete or self.classification_complete or self.committed or self.aborted)
+            return error.InvalidReconcilePhase;
         // Descriptor construction is deliberately independent from live
         // runtime state. Classify it only after the caller re-enters the Raft
         // owner's serialization lock.
         for (self.ensures) |*entry| {
             if (entry.prepare_error != null) {
-                retirement_blocked = true;
                 continue;
             }
             const intent = self.intents[entry.intent_index];
@@ -661,7 +672,6 @@ pub const PreparedReconcile = struct {
                 entry.failure_phase = .admission_classify;
                 if (entry.catalog_upsert_index) |catalog_index|
                     self.catalog_upsert_enabled[catalog_index] = false;
-                retirement_blocked = true;
                 continue;
             };
             if (conflict) |value| switch (value) {
@@ -671,33 +681,44 @@ pub const PreparedReconcile = struct {
                     entry.failure_phase = .admission_classify;
                     if (entry.catalog_upsert_index) |catalog_index|
                         self.catalog_upsert_enabled[catalog_index] = false;
-                    retirement_blocked = true;
                 },
             };
         }
         self.compactCatalogUpserts();
+        self.classification_complete = true;
+    }
 
-        // Make additions durable before publishing them. Removals are a
-        // second transaction after every replacement admission succeeds, so
-        // old ownership survives crashes and partial failures.
+    /// Makes admissions durable without holding the Raft owner lock. The
+    /// returned catalog revision is the opaque fence for retirement; callers
+    /// must never refresh it from the catalog between phases.
+    pub fn commitAdmissionsDurable(self: *PreparedReconcile) !void {
+        if (!self.classification_complete or self.admission_commit_complete or self.committed or self.aborted)
+            return error.InvalidReconcilePhase;
+        self.catalog_commit_token = self.catalog_token;
         if (self.catalog_upsert_count > 0) {
-            self.owner.host.commitReplicaCatalog(
-                self.catalog_revision,
+            self.catalog_commit_token = try self.owner.host.commitReplicaCatalog(
+                self.catalog_token,
                 self.catalog_upserts[0..self.catalog_upsert_count],
                 &.{},
-            ) catch |err| {
-                for (self.catalog_upserts[0..self.catalog_upsert_count]) |record|
-                    self.owner.recordGroupFailure(&result, record.group_id, .catalog_admission, err);
-                return err;
-            };
+            );
         }
+        self.admission_commit_complete = true;
+    }
 
+    /// Publishes prepared replicas and advances live convergence. This is a
+    /// short owner-lock phase and performs no catalog I/O.
+    pub fn publishLive(self: *PreparedReconcile) !void {
+        if (!self.admission_commit_complete or self.live_commit_complete or self.committed or self.aborted)
+            return error.InvalidReconcilePhase;
+        for (self.deferred_failures) |failure| self.result.recordFailure(failure);
+        for (self.catalog_upserts[0..self.catalog_upsert_count]) |record|
+            self.owner.clearGroupFailure(record.group_id, .catalog_admission);
         for (self.ensures) |*entry| {
             const intent = self.intents[entry.intent_index];
             if (entry.prepare_error) |err| {
                 if (entry.prepare_bootstrap)
                     self.owner.host.noteReplicaBootstrapPreparationFailure(intent.record, err);
-                self.owner.recordGroupFailure(&result, intent.record.group_id, entry.failure_phase, err);
+                self.owner.recordIntentFailure(&self.result, intent.record.group_id, entry.intent_hash, entry.failure_phase, err);
                 continue;
             }
             if (entry.restart_policy_blocked) {
@@ -714,66 +735,121 @@ pub const PreparedReconcile = struct {
             }
             const prepared = if (entry.replica) |*replica| replica else return error.InvalidReconcilePhase;
             _ = self.owner.host.installPreparedReplica(intent.record, prepared) catch |err| {
-                retirement_blocked = true;
-                self.owner.recordGroupFailure(&result, intent.record.group_id, .live_install, err);
+                self.owner.recordIntentFailure(&self.result, intent.record.group_id, entry.intent_hash, .live_install, err);
                 continue;
             };
-            result.ensured += 1;
+            self.result.ensured += 1;
             self.owner.last_intent_hashes.putAssumeCapacity(
                 intent.record.group_id,
                 entry.intent_hash,
             );
             self.owner.clearAdmissionFailure(intent.record.group_id);
         }
-        try self.live.commit(&result);
+        try self.live.commit(&self.result);
         for (self.intents) |intent| {
             if (!self.owner.host.hasReplica(intent.record.group_id)) continue;
             const outcome = self.owner.reconcileRaftMembership(intent) catch |err| {
-                self.owner.recordGroupFailure(&result, intent.record.group_id, .membership, err);
+                self.owner.recordGroupFailure(&self.result, intent.record.group_id, .membership, err);
                 continue;
             };
             self.owner.membership_convergence.putAssumeCapacity(intent.record.group_id, outcome);
-            result.recordMembership(outcome);
+            self.result.recordMembership(outcome);
             self.owner.clearGroupFailure(intent.record.group_id, .membership);
         }
+        self.live_commit_complete = true;
+    }
 
-        if (self.removals.len > 0 and (retirement_blocked or result.hasPlacementFailures())) {
+    /// Commits eligible retirements outside the owner lock. Retirement uses
+    /// the exact admission token, so any intervening catalog writer rejects
+    /// this stale plan instead of deleting newly admitted ownership.
+    ///
+    /// Replacement dependencies belong to authoritative desired state: the
+    /// controller retains an old placement in `retiring` until its replacement
+    /// is ready. Once a group is absent from desired state, an unrelated local
+    /// admission failure must not block its cleanup.
+    pub fn commitRetirementsDurable(self: *PreparedReconcile) !void {
+        if (!self.live_commit_complete or self.retirement_commit_attempted or self.committed or self.aborted)
+            return error.InvalidReconcilePhase;
+        self.retirement_commit_attempted = true;
+        if (self.removals.len > 0 and self.retirement_suppressed) {
+            return;
+        } else if (self.removals.len > 0) {
+            self.catalog_commit_token = try self.owner.host.commitReplicaCatalog(
+                self.catalog_commit_token,
+                &.{},
+                self.removals,
+            );
+            self.catalog_commit_complete = true;
+        } else {
+            self.catalog_commit_complete = true;
+        }
+    }
+
+    /// Records an admission durability error while the caller owns the live
+    /// runtime lock. The durable phase itself deliberately does not mutate
+    /// owner diagnostics.
+    pub fn noteAdmissionDurabilityFailure(self: *PreparedReconcile, err: anyerror) void {
+        for (
+            self.catalog_upserts[0..self.catalog_upsert_count],
+            self.catalog_upsert_hashes[0..self.catalog_upsert_count],
+        ) |record, intent_hash| {
+            self.owner.recordGroupFailureImpl(
+                &self.result,
+                record.group_id,
+                intent_hash,
+                .catalog_admission,
+                err,
+            );
+            for (self.ensures) |entry| {
+                if (!entry.prepare_bootstrap or
+                    self.intents[entry.intent_index].record.group_id != record.group_id) continue;
+                self.owner.host.noteReplicaBootstrapPreparationFailure(
+                    self.intents[entry.intent_index].record,
+                    err,
+                );
+                break;
+            }
+        }
+    }
+
+    pub fn noteRetirementDurabilityFailure(self: *PreparedReconcile, err: anyerror) void {
+        for (self.removals) |group_id|
+            self.owner.recordGroupFailure(&self.result, group_id, .catalog_retirement, err);
+    }
+
+    /// Prevents a stale desired-state snapshot from retiring ownership after
+    /// its admissions are already durable. The next epoch will converge the
+    /// admitted record, while old ownership remains available in the interim.
+    pub fn suppressRetirements(self: *PreparedReconcile) void {
+        self.retirement_suppressed = true;
+    }
+
+    /// Removes durably retired groups from the live runtime and publishes the
+    /// final result. This is a short owner-lock phase.
+    pub fn finish(self: *PreparedReconcile) !ReconcileResult {
+        if (!self.retirement_commit_attempted or self.committed or self.aborted)
+            return error.InvalidReconcilePhase;
+        if (!self.catalog_commit_complete) {
             for (self.removals) |group_id| {
                 self.owner.recordGroupFailure(
-                    &result,
+                    &self.result,
                     group_id,
                     .catalog_retirement,
                     error.RetirementPrerequisitePending,
                 );
             }
-        } else if (self.removals.len > 0) {
-            self.owner.host.commitReplicaCatalog(
-                self.owner.host.replicaCatalogRevision(),
-                &.{},
-                self.removals,
-            ) catch |err| {
-                for (self.removals) |group_id|
-                    self.owner.recordGroupFailure(&result, group_id, .catalog_retirement, err);
-                return err;
-            };
-            self.catalog_commit_complete = true;
-        } else {
-            self.catalog_commit_complete = true;
-        }
-
-        if (!self.catalog_commit_complete) {
-            result.admission_blocked = self.owner.countAdmissionBlocked(self.intents);
-            result.route_retrying_groups = self.owner.countRouteRetrying(self.intents);
+            self.result.admission_blocked = self.owner.countAdmissionBlocked(self.intents);
+            self.result.route_retrying_groups = self.owner.countRouteRetrying(self.intents);
             self.owner.host.metrics.reconcile_rounds += 1;
-            self.owner.publishConvergenceMetrics(result);
+            self.owner.publishConvergenceMetrics(self.result);
             self.committed = true;
-            return result;
+            return self.result;
         }
 
         for (self.removals) |group_id| {
             if (self.owner.host.hasReplica(group_id)) {
                 self.owner.host.removePreparedReplica(group_id) catch |err| {
-                    self.owner.recordGroupFailure(&result, group_id, .live_retirement, err);
+                    self.owner.recordGroupFailure(&self.result, group_id, .live_retirement, err);
                     continue;
                 };
             }
@@ -783,18 +859,35 @@ pub const PreparedReconcile = struct {
             _ = self.owner.route_retries.remove(group_id);
             _ = self.owner.policy_retries.remove(group_id);
             _ = self.owner.failure_retries.remove(group_id);
-            result.removed += 1;
+            self.result.removed += 1;
         }
         self.owner.host.metrics.reconcile_rounds += 1;
-        self.owner.publishConvergenceMetrics(result);
+        self.owner.publishConvergenceMetrics(self.result);
         self.committed = true;
-        return result;
+        return self.result;
+    }
+
+    /// Convenience transaction for callers that already provide their own
+    /// serialization. Production runtimes use the individual stages so disk
+    /// durability is never performed under the Raft owner lock.
+    pub fn commit(self: *PreparedReconcile) !ReconcileResult {
+        try self.classifyAdmissions();
+        self.commitAdmissionsDurable() catch |err| {
+            self.noteAdmissionDurabilityFailure(err);
+            return err;
+        };
+        try self.publishLive();
+        self.commitRetirementsDurable() catch |err| {
+            self.noteRetirementDurabilityFailure(err);
+            return err;
+        };
+        return try self.finish();
     }
 
     /// Discards unpublished descriptors after the caller observes a newer
     /// desired-state epoch. Durable catalog state is untouched until commit.
     pub fn abortDurable(self: *PreparedReconcile) !void {
-        if (!self.durability_complete or self.committed or self.aborted)
+        if (!self.durability_complete or self.admission_commit_complete or self.committed or self.aborted)
             return error.InvalidReconcilePhase;
         for (self.ensures) |entry| {
             if (!entry.prepare_bootstrap) continue;
@@ -982,6 +1075,102 @@ pub const Reconciler = struct {
         };
     }
 
+    fn isAdmissionFailurePhase(phase: ReconcileFailurePhase) bool {
+        return switch (phase) {
+            .admission_prepare, .admission_classify, .catalog_admission, .live_install => true,
+            .routes, .membership, .catalog_retirement, .live_retirement => false,
+        };
+    }
+
+    /// Returns true while an unchanged admission is intentionally parked.
+    /// Retryable failures honor their deadline; permanent and restart-scoped
+    /// failures wake only when the intent fingerprint changes.
+    fn admissionAttemptDeferred(
+        self: *Reconciler,
+        group_id: u64,
+        intent_hash: u64,
+        now_ns: u64,
+    ) bool {
+        const state = self.failure_retries.get(group_id) orelse return false;
+        if (!isAdmissionFailurePhase(state.phase)) return false;
+        if (state.intent_hash == null or state.intent_hash.? != intent_hash) {
+            _ = self.failure_retries.remove(group_id);
+            return false;
+        }
+        return switch (state.classification) {
+            .retryable => now_ns < state.next_retry_ns,
+            .permanent, .restart_required => true,
+        };
+    }
+
+    fn retirementAttemptDeferred(self: *const Reconciler, group_id: u64, now_ns: u64) bool {
+        const state = self.failure_retries.get(group_id) orelse return false;
+        switch (state.phase) {
+            .catalog_retirement, .live_retirement => {},
+            else => return false,
+        }
+        return switch (state.classification) {
+            .retryable => now_ns < state.next_retry_ns,
+            .permanent, .restart_required => true,
+        };
+    }
+
+    fn clearObsoleteRetirementFailure(self: *Reconciler, group_id: u64) void {
+        const state = self.failure_retries.get(group_id) orelse return;
+        switch (state.phase) {
+            .catalog_retirement, .live_retirement => _ = self.failure_retries.remove(group_id),
+            else => {},
+        }
+    }
+
+    /// Desired-scoped convergence state is mark/swept every authoritative
+    /// planning generation. Retirement failures remain until their durable or
+    /// live owner disappears; failed never-admitted intents are removed as
+    /// soon as they leave desired state.
+    fn pruneConvergenceState(
+        self: *Reconciler,
+        desired: *const std.AutoHashMapUnmanaged(u64, void),
+        removals: *const std.AutoHashMapUnmanaged(u64, void),
+    ) !void {
+        var stale = std.ArrayListUnmanaged(u64).empty;
+        defer stale.deinit(self.alloc);
+
+        var membership_it = self.membership_convergence.keyIterator();
+        while (membership_it.next()) |group_id| {
+            if (!desired.contains(group_id.*)) try stale.append(self.alloc, group_id.*);
+        }
+        for (stale.items) |group_id| _ = self.membership_convergence.remove(group_id);
+        stale.clearRetainingCapacity();
+
+        var route_it = self.route_convergence.keyIterator();
+        while (route_it.next()) |group_id| {
+            if (!desired.contains(group_id.*)) try stale.append(self.alloc, group_id.*);
+        }
+        for (stale.items) |group_id| {
+            _ = self.route_convergence.remove(group_id);
+            _ = self.route_retries.remove(group_id);
+        }
+        stale.clearRetainingCapacity();
+
+        var policy_it = self.policy_retries.keyIterator();
+        while (policy_it.next()) |group_id| {
+            if (!desired.contains(group_id.*)) try stale.append(self.alloc, group_id.*);
+        }
+        for (stale.items) |group_id| _ = self.policy_retries.remove(group_id);
+        stale.clearRetainingCapacity();
+
+        var failure_it = self.failure_retries.iterator();
+        while (failure_it.next()) |entry| {
+            if (desired.contains(entry.key_ptr.*)) continue;
+            if (removals.contains(entry.key_ptr.*) and switch (entry.value_ptr.phase) {
+                .catalog_retirement, .live_retirement => true,
+                else => false,
+            }) continue;
+            try stale.append(self.alloc, entry.key_ptr.*);
+        }
+        for (stale.items) |group_id| _ = self.failure_retries.remove(group_id);
+    }
+
     pub fn prepare(self: *Reconciler) !PreparedReconcile {
         const intents = try self.provider.listLocalIntents(self.alloc, self.host.cfg.local_node_id);
         errdefer freeIntentSlice(self.alloc, intents);
@@ -1007,27 +1196,20 @@ pub const Reconciler = struct {
         errdefer ensures.deinit(self.alloc);
         var removals = std.ArrayListUnmanaged(u64).empty;
         errdefer removals.deinit(self.alloc);
+        var deferred_failures = std.ArrayListUnmanaged(ReconcileFailure).empty;
+        errdefer deferred_failures.deinit(self.alloc);
         var removal_group_ids = std.AutoHashMapUnmanaged(u64, void).empty;
         defer removal_group_ids.deinit(self.alloc);
         var catalog_upserts = std.ArrayListUnmanaged(catalog.ReplicaRecord).empty;
         errdefer catalog_upserts.deinit(self.alloc);
+        var catalog_upsert_hashes = std.ArrayListUnmanaged(u64).empty;
+        errdefer catalog_upsert_hashes.deinit(self.alloc);
+        const now_ns = platform_time.monotonicNs();
 
         for (intents, 0..) |intent, intent_index| {
             try intent.desiredMembership().validate();
             try desired_group_ids.put(self.alloc, intent.record.group_id, {});
-
-            const catalog_upsert_index: ?usize = if (catalog_snapshot) |snapshot| catalog: {
-                const stored_record = if (catalog_record_indexes.get(intent.record.group_id)) |index|
-                    snapshot.records[index]
-                else
-                    null;
-                if (stored_record != null and catalog.eqlReplicaRecord(stored_record.?, intent.record))
-                    break :catalog null;
-                const index = catalog_upserts.items.len;
-                try catalog_upserts.append(self.alloc, intent.record);
-                break :catalog index;
-            } else null;
-
+            self.clearObsoleteRetirementFailure(intent.record.group_id);
             const intent_hash = hashIntent(intent);
             const hosted_status = self.host.status(intent.record.group_id);
             const stored_hash = self.last_intent_hashes.get(intent.record.group_id);
@@ -1039,10 +1221,35 @@ pub const Reconciler = struct {
                 .active, .quarantined => false,
                 .absent, .starting, .quiesced, .snapshotting, .failed => true,
             };
-            const should_apply =
-                lifecycle_incomplete or
+            const admission_deferred = self.admissionAttemptDeferred(
+                intent.record.group_id,
+                intent_hash,
+                now_ns,
+            );
+            if (admission_deferred) {
+                if (self.failureDiagnostics(intent.record.group_id)) |failure|
+                    try deferred_failures.append(self.alloc, failure);
+            }
+            const should_apply = !admission_deferred and (lifecycle_incomplete or
                 stored_hash == null or
-                stored_hash.? != intent_hash;
+                stored_hash.? != intent_hash);
+
+            // A live replica can repair catalog drift without rebuilding its
+            // descriptor. Any admission whose failure is backed off waits for
+            // its deadline before touching the catalog again.
+            const catalog_upsert_index: ?usize = if (catalog_snapshot) |snapshot| catalog: {
+                const stored_record = if (catalog_record_indexes.get(intent.record.group_id)) |index|
+                    snapshot.records[index]
+                else
+                    null;
+                if (stored_record != null and catalog.eqlReplicaRecord(stored_record.?, intent.record))
+                    break :catalog null;
+                if (admission_deferred) break :catalog null;
+                const index = catalog_upserts.items.len;
+                try catalog_upserts.append(self.alloc, intent.record);
+                try catalog_upsert_hashes.append(self.alloc, intent_hash);
+                break :catalog index;
+            } else null;
 
             if (should_apply) {
                 try ensures.append(self.alloc, .{
@@ -1057,23 +1264,38 @@ pub const Reconciler = struct {
         for (existing) |group_id| {
             if (desired_group_ids.contains(group_id)) continue;
             if (try removal_group_ids.fetchPut(self.alloc, group_id, {}) != null) continue;
+            if (self.retirementAttemptDeferred(group_id, now_ns)) {
+                if (self.failureDiagnostics(group_id)) |failure|
+                    try deferred_failures.append(self.alloc, failure);
+                continue;
+            }
             try removals.append(self.alloc, group_id);
         }
         if (catalog_snapshot) |snapshot| for (snapshot.records) |record| {
             if (desired_group_ids.contains(record.group_id)) continue;
             if (try removal_group_ids.fetchPut(self.alloc, record.group_id, {}) != null) continue;
+            if (self.retirementAttemptDeferred(record.group_id, now_ns)) {
+                if (self.failureDiagnostics(record.group_id)) |failure|
+                    try deferred_failures.append(self.alloc, failure);
+                continue;
+            }
             try removals.append(self.alloc, record.group_id);
         };
+        try self.pruneConvergenceState(&desired_group_ids, &removal_group_ids);
         const owned_ensures = try ensures.toOwnedSlice(self.alloc);
         errdefer self.alloc.free(owned_ensures);
         const owned_removals = try removals.toOwnedSlice(self.alloc);
         errdefer self.alloc.free(owned_removals);
+        const owned_deferred_failures = try deferred_failures.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(owned_deferred_failures);
         const owned_catalog_upserts = try catalog_upserts.toOwnedSlice(self.alloc);
         errdefer self.alloc.free(owned_catalog_upserts);
+        const owned_catalog_upsert_hashes = try catalog_upsert_hashes.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(owned_catalog_upsert_hashes);
         const catalog_upsert_enabled = try self.alloc.alloc(bool, owned_catalog_upserts.len);
         errdefer self.alloc.free(catalog_upsert_enabled);
         @memset(catalog_upsert_enabled, true);
-        const catalog_revision = if (catalog_snapshot) |snapshot| snapshot.revision else null;
+        const catalog_token = if (catalog_snapshot) |snapshot| snapshot.token else null;
         try self.ensureConvergenceCapacity(intents.len +| owned_removals.len);
         const intent_hash_capacity = std.math.cast(
             u32,
@@ -1091,10 +1313,12 @@ pub const Reconciler = struct {
             .intents = intents,
             .ensures = owned_ensures,
             .removals = owned_removals,
+            .deferred_failures = owned_deferred_failures,
             .catalog_upserts = owned_catalog_upserts,
+            .catalog_upsert_hashes = owned_catalog_upsert_hashes,
             .catalog_upsert_enabled = catalog_upsert_enabled,
             .catalog_upsert_count = owned_catalog_upserts.len,
-            .catalog_revision = catalog_revision,
+            .catalog_token = catalog_token,
             .live = live,
         };
     }
@@ -1117,10 +1341,35 @@ pub const Reconciler = struct {
         phase: ReconcileFailurePhase,
         err: anyerror,
     ) void {
+        self.recordGroupFailureImpl(result, group_id, null, phase, err);
+    }
+
+    fn recordIntentFailure(
+        self: *Reconciler,
+        result: *ReconcileResult,
+        group_id: u64,
+        intent_hash: u64,
+        phase: ReconcileFailurePhase,
+        err: anyerror,
+    ) void {
+        self.recordGroupFailureImpl(result, group_id, intent_hash, phase, err);
+    }
+
+    fn recordGroupFailureImpl(
+        self: *Reconciler,
+        result: *ReconcileResult,
+        group_id: u64,
+        intent_hash: ?u64,
+        phase: ReconcileFailurePhase,
+        err: anyerror,
+    ) void {
         const classification = classifyReconcileFailure(phase, err);
         const previous = self.failure_retries.get(group_id);
         const attempts: u32 = if (previous) |state|
-            if (state.phase == phase and state.err == err) state.attempts +| 1 else 1
+            if (state.intent_hash == intent_hash and state.phase == phase and state.err == err)
+                state.attempts +| 1
+            else
+                1
         else
             1;
         const next_retry_ns = if (classification == .retryable)
@@ -1128,6 +1377,7 @@ pub const Reconciler = struct {
         else
             0;
         self.failure_retries.putAssumeCapacity(group_id, .{
+            .intent_hash = intent_hash,
             .phase = phase,
             .classification = classification,
             .err = err,
@@ -1992,7 +2242,7 @@ test "reconciler isolates live install failures and retries without replaying du
 
     const failed = try owner.reconcileOnce();
     try std.testing.expect(failed.hasFailures());
-    try std.testing.expectEqual(@as(usize, 2), failed.failed_groups);
+    try std.testing.expectEqual(@as(usize, 1), failed.failed_groups);
     try std.testing.expectEqual(@as(u64, 511), failed.failures()[0].group_id);
     try std.testing.expectEqual(ReconcileFailurePhase.live_install, failed.failures()[0].phase);
     try std.testing.expectEqual(error.InjectedInstallFailure, failed.failures()[0].err);
@@ -2002,17 +2252,24 @@ test "reconciler isolates live install failures and retries without replaying du
     try std.testing.expectEqual(RouteConvergence.retrying, owner.routeStatus(511).?);
     try std.testing.expect(catalog_iface.containsReplica(510));
     try std.testing.expect(catalog_iface.containsReplica(511));
-    try std.testing.expect(catalog_iface.containsReplica(512));
+    // Unrelated retirement follows authoritative desired state and is not
+    // held hostage by this group's failed local install.
+    try std.testing.expect(!catalog_iface.containsReplica(512));
     try std.testing.expect(owner.failureDiagnostics(511).?.next_retry_ns != 0);
     const durable_revision = catalog_iface.revision();
 
     transport.fail_group_id = 0;
+    const deferred = try owner.reconcileOnce();
+    try std.testing.expectEqual(@as(usize, 0), deferred.ensured);
+    try std.testing.expect(!host.hasReplica(511));
+    try std.testing.expectEqual(durable_revision, catalog_iface.revision());
+
+    owner.failure_retries.getPtr(511).?.next_retry_ns = 0;
     const recovered = try owner.reconcileOnce();
     try std.testing.expectEqual(@as(usize, 1), recovered.ensured);
     try std.testing.expect(host.hasReplica(511));
     try std.testing.expectEqual(RouteConvergence.converged, owner.routeStatus(511).?);
-    try std.testing.expect(!catalog_iface.containsReplica(512));
-    try std.testing.expectEqual(durable_revision + 1, catalog_iface.revision());
+    try std.testing.expectEqual(durable_revision, catalog_iface.revision());
 }
 
 test "prepared reconcile rejects catalog races without clobbering concurrent admissions" {
@@ -2088,6 +2345,123 @@ test "prepared reconcile rejects catalog races without clobbering concurrent adm
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.active, host.status(501));
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.absent, host.status(502));
     try std.testing.expectError(error.InvalidReconcilePhase, prepared.commit());
+}
+
+test "retirement uses the exact post-admission catalog fence" {
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var factory = StagedReconcileTestFactory{
+        .alloc = std.testing.allocator,
+        .stores = .{ &store_a, &store_b },
+    };
+    var replica_catalog = catalog.MemoryReplicaCatalog.init(std.testing.allocator);
+    defer replica_catalog.deinit();
+    const catalog_iface = replica_catalog.catalog();
+    try catalog_iface.upsertReplica(.{ .group_id = 521, .replica_id = 1, .local_node_id = 1 });
+    var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .descriptor_factory = factory.iface(),
+        .replica_catalog = catalog_iface,
+    });
+    defer host.deinit();
+    _ = try host.ensureReplica(.{ .group_id = 521, .replica_id = 1, .local_node_id = 1 });
+    var provider = MemoryPlacementProvider.init(std.testing.allocator);
+    defer provider.deinit();
+    try provider.replaceAll(&.{.{
+        .record = .{ .group_id = 522, .replica_id = 2, .local_node_id = 1 },
+    }});
+    var owner = Reconciler{
+        .alloc = std.testing.allocator,
+        .host = &host,
+        .provider = provider.provider(),
+    };
+    defer owner.deinit();
+
+    var prepared = try owner.prepare();
+    defer prepared.deinit();
+    prepared.beginPreparation();
+    try prepared.prepareDurable();
+    try prepared.classifyAdmissions();
+    try prepared.commitAdmissionsDurable();
+    try std.testing.expect(catalog_iface.containsReplica(522));
+
+    // This write lands after admission durability but before retirement. A
+    // refreshed revision would incorrectly authorize the stale removal plan.
+    try catalog_iface.upsertReplica(.{ .group_id = 523, .replica_id = 3, .local_node_id = 1 });
+    try prepared.publishLive();
+    try std.testing.expectError(
+        error.ReplicaCatalogRevisionChanged,
+        prepared.commitRetirementsDurable(),
+    );
+    try std.testing.expect(catalog_iface.containsReplica(521));
+    try std.testing.expect(catalog_iface.containsReplica(522));
+    try std.testing.expect(catalog_iface.containsReplica(523));
+    try std.testing.expect(host.hasReplica(521));
+}
+
+test "removal-only plans retain their snapshot catalog fence" {
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var factory = StagedReconcileTestFactory{
+        .alloc = std.testing.allocator,
+        .stores = .{ &store_a, &store_b },
+    };
+    var replica_catalog = catalog.MemoryReplicaCatalog.init(std.testing.allocator);
+    defer replica_catalog.deinit();
+    const catalog_iface = replica_catalog.catalog();
+    try catalog_iface.upsertReplica(.{ .group_id = 531, .replica_id = 1, .local_node_id = 1 });
+    var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .descriptor_factory = factory.iface(),
+        .replica_catalog = catalog_iface,
+    });
+    defer host.deinit();
+    _ = try host.ensureReplica(.{ .group_id = 531, .replica_id = 1, .local_node_id = 1 });
+    var provider = MemoryPlacementProvider.init(std.testing.allocator);
+    defer provider.deinit();
+    var owner = Reconciler{
+        .alloc = std.testing.allocator,
+        .host = &host,
+        .provider = provider.provider(),
+    };
+    defer owner.deinit();
+
+    var prepared = try owner.prepare();
+    defer prepared.deinit();
+    prepared.beginPreparation();
+    try prepared.prepareDurable();
+    try prepared.classifyAdmissions();
+    try prepared.commitAdmissionsDurable();
+    try catalog_iface.upsertReplica(.{ .group_id = 532, .replica_id = 2, .local_node_id = 1 });
+    try prepared.publishLive();
+    try std.testing.expectError(
+        error.ReplicaCatalogRevisionChanged,
+        prepared.commitRetirementsDurable(),
+    );
+    try std.testing.expect(catalog_iface.containsReplica(531));
+    try std.testing.expect(catalog_iface.containsReplica(532));
+    try std.testing.expect(host.hasReplica(531));
+
+    prepared.noteRetirementDurabilityFailure(error.ReplicaCatalogRevisionChanged);
+    {
+        var backed_off = try owner.prepare();
+        defer backed_off.deinit();
+        try std.testing.expectEqual(@as(usize, 1), backed_off.deferred_failures.len);
+        try std.testing.expectEqual(@as(u64, 531), backed_off.deferred_failures[0].group_id);
+        for (backed_off.removals) |group_id| try std.testing.expect(group_id != 531);
+    }
+
+    // Reintroducing a desired group invalidates obsolete retirement debt.
+    try provider.replaceAll(&.{.{
+        .record = .{ .group_id = 531, .replica_id = 1, .local_node_id = 1 },
+    }});
+    {
+        var desired_again = try owner.prepare();
+        defer desired_again.deinit();
+    }
+    try std.testing.expect(owner.failureDiagnostics(531) == null);
 }
 
 test "restart-scoped policy conflicts are isolated and durably deduplicated" {
@@ -2377,6 +2751,49 @@ test "prepared reconcile failure never publishes an unprepared replica" {
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.failed, host.status(503));
     try std.testing.expect(!host.hasReplica(503));
     try std.testing.expectError(error.InvalidReconcilePhase, prepared.commit());
+
+    // An unchanged permanent failure is parked instead of rebuilding the same
+    // invalid descriptor every control round.
+    {
+        var deferred = try owner.prepare();
+        defer deferred.deinit();
+        try std.testing.expectEqual(@as(usize, 0), deferred.ensures.len);
+    }
+
+    // Desired-state removal sweeps diagnostics for a group that never reached
+    // either live or catalog ownership.
+    try provider.replaceAll(&.{});
+    {
+        var pruned = try owner.prepare();
+        defer pruned.deinit();
+        try std.testing.expectEqual(@as(usize, 0), pruned.removals.len);
+    }
+    try std.testing.expect(owner.failureDiagnostics(503) == null);
+
+    // A changed intent fingerprint wakes admission immediately.
+    try provider.replaceAll(&.{.{
+        .record = .{
+            .group_id = 503,
+            .replica_id = 1,
+            .local_node_id = 1,
+            .metadata_version = 2,
+            .bootstrap_mode = .fetch_snapshot,
+            .backup_restore_bootstrap = .{
+                .backup_id = "backup-503",
+                .artifact_backup_id = "backup-503",
+                .location = "file:///unused",
+                .snapshot_path = "backup-503/groups/503",
+                .connection = "backup-store",
+                .artifact_size_bytes = 1,
+                .artifact_sha256 = "e3b0c44298fc1c149afbf4a8996fb92427ae41e4649b934ca495991b7852b855",
+            },
+        },
+    }});
+    {
+        var changed = try owner.prepare();
+        defer changed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), changed.ensures.len);
+    }
 }
 
 test "blocked reconcile preparation does not block existing raft progress" {

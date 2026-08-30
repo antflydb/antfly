@@ -655,11 +655,6 @@ pub const Host = struct {
         self.clearBootstrapStatus(record.group_id);
     }
 
-    pub fn replicaCatalogRevision(self: *Host) ?u64 {
-        const replica_catalog = self.deps.replica_catalog orelse return null;
-        return replica_catalog.revision();
-    }
-
     pub fn snapshotReplicaCatalog(
         self: *Host,
         alloc: std.mem.Allocator,
@@ -677,13 +672,13 @@ pub const Host = struct {
 
     pub fn commitReplicaCatalog(
         self: *Host,
-        expected_revision: ?u64,
+        expected_token: ?catalog.ReplicaCatalogToken,
         upserts: []const catalog.ReplicaRecord,
         removals: []const u64,
-    ) !void {
-        const replica_catalog = self.deps.replica_catalog orelse return;
-        try replica_catalog.applyBatch(
-            expected_revision orelse return error.MissingReplicaCatalogRevision,
+    ) !?catalog.ReplicaCatalogToken {
+        const replica_catalog = self.deps.replica_catalog orelse return null;
+        return try replica_catalog.applyBatch(
+            expected_token orelse return error.MissingReplicaCatalogRevision,
             upserts,
             removals,
         );
@@ -1788,21 +1783,23 @@ test "host can ensure and remove a replica" {
 
         fn snapshotReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) !catalog.ReplicaCatalogSnapshot {
             return .{
-                .revision = revision(ptr),
+                .token = revision(ptr),
                 .records = try listReplicas(ptr, alloc),
             };
         }
 
-        fn revision(_: *anyopaque) u64 {
-            return 1;
+        fn revision(_: *anyopaque) catalog.ReplicaCatalogToken {
+            return .{ .revision = 1 };
         }
 
         fn applyBatch(
             _: *anyopaque,
-            _: u64,
+            _: catalog.ReplicaCatalogToken,
             _: []const catalog.ReplicaRecord,
             _: []const u64,
-        ) !void {}
+        ) !catalog.ReplicaCatalogToken {
+            return .{ .revision = 1 };
+        }
     };
 
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);

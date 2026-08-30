@@ -389,13 +389,13 @@ pub const ReplicaCatalog = struct {
         contains_replica: *const fn (ptr: *anyopaque, group_id: u64) bool,
         list_replicas: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]ReplicaRecord,
         snapshot_replicas: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!ReplicaCatalogSnapshot,
-        revision: *const fn (ptr: *anyopaque) u64,
+        revision: *const fn (ptr: *anyopaque) ReplicaCatalogToken,
         apply_batch: *const fn (
             ptr: *anyopaque,
-            expected_revision: u64,
+            expected_token: ReplicaCatalogToken,
             upserts: []const ReplicaRecord,
             removals: []const u64,
-        ) anyerror!void,
+        ) anyerror!ReplicaCatalogToken,
     };
 
     pub fn upsertReplica(self: ReplicaCatalog, record: ReplicaRecord) !void {
@@ -423,23 +423,36 @@ pub const ReplicaCatalog = struct {
         return try self.vtable.snapshot_replicas(self.ptr, alloc);
     }
 
-    pub fn revision(self: ReplicaCatalog) u64 {
+    pub fn token(self: ReplicaCatalog) ReplicaCatalogToken {
         return self.vtable.revision(self.ptr);
+    }
+
+    /// Numeric revision is exposed for diagnostics and observability only.
+    /// Mutations require the opaque token returned by `token` or a snapshot.
+    pub fn revision(self: ReplicaCatalog) u64 {
+        return self.token().revision;
     }
 
     pub fn applyBatch(
         self: ReplicaCatalog,
-        expected_revision: u64,
+        expected_token: ReplicaCatalogToken,
         upserts: []const ReplicaRecord,
         removals: []const u64,
-    ) !void {
+    ) !ReplicaCatalogToken {
         for (upserts) |record| try validateReplicaRecord(record);
-        return try self.vtable.apply_batch(self.ptr, expected_revision, upserts, removals);
+        return try self.vtable.apply_batch(self.ptr, expected_token, upserts, removals);
     }
 };
 
-pub const ReplicaCatalogSnapshot = struct {
+/// Opaque optimistic-concurrency capability for one catalog generation.
+/// Reconciliation carries this value forward across admission and retirement
+/// instead of reconstructing a fence from a newly observed integer.
+pub const ReplicaCatalogToken = struct {
     revision: u64,
+};
+
+pub const ReplicaCatalogSnapshot = struct {
+    token: ReplicaCatalogToken,
     records: []ReplicaRecord,
 
     pub fn deinit(self: *ReplicaCatalogSnapshot, alloc: std.mem.Allocator) void {
@@ -535,42 +548,43 @@ pub const MemoryReplicaCatalog = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         return .{
-            .revision = self.current_revision,
+            .token = .{ .revision = self.current_revision },
             .records = try cloneReplicaRecordsFromMap(alloc, &self.records),
         };
     }
 
-    fn revision(ptr: *anyopaque) u64 {
+    fn revision(ptr: *anyopaque) ReplicaCatalogToken {
         const self: *MemoryReplicaCatalog = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        return self.current_revision;
+        return .{ .revision = self.current_revision };
     }
 
     fn applyBatch(
         ptr: *anyopaque,
-        expected_revision: u64,
+        expected_token: ReplicaCatalogToken,
         upserts: []const ReplicaRecord,
         removals: []const u64,
-    ) !void {
+    ) !ReplicaCatalogToken {
         const self: *MemoryReplicaCatalog = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        if (self.current_revision != expected_revision) return error.ReplicaCatalogRevisionChanged;
-        if (upserts.len == 0 and removals.len == 0) return;
-        if (replicaBatchClearlyNoOp(&self.records, upserts, removals)) return;
+        if (self.current_revision != expected_token.revision) return error.ReplicaCatalogRevisionChanged;
+        if (upserts.len == 0 and removals.len == 0) return .{ .revision = self.current_revision };
+        if (replicaBatchClearlyNoOp(&self.records, upserts, removals)) return .{ .revision = self.current_revision };
 
         var next = try cloneReplicaMapFromMap(self.alloc, &self.records);
         errdefer deinitReplicaMap(self.alloc, &next);
         try applyReplicaBatchToMap(self.alloc, &next, upserts, removals);
         if (replicaMapsEqual(&self.records, &next)) {
             deinitReplicaMap(self.alloc, &next);
-            return;
+            return .{ .revision = self.current_revision };
         }
         const next_revision = try nextRevision(self.current_revision);
         deinitReplicaMap(self.alloc, &self.records);
         self.records = next;
         self.current_revision = next_revision;
+        return .{ .revision = next_revision };
     }
 };
 
@@ -694,37 +708,37 @@ pub const FileReplicaCatalog = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         return .{
-            .revision = self.current_revision,
+            .token = .{ .revision = self.current_revision },
             .records = try cloneReplicaRecordsFromMap(alloc, &self.records),
         };
     }
 
-    fn revision(ptr: *anyopaque) u64 {
+    fn revision(ptr: *anyopaque) ReplicaCatalogToken {
         const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        return self.current_revision;
+        return .{ .revision = self.current_revision };
     }
 
     fn applyBatch(
         ptr: *anyopaque,
-        expected_revision: u64,
+        expected_token: ReplicaCatalogToken,
         upserts: []const ReplicaRecord,
         removals: []const u64,
-    ) !void {
+    ) !ReplicaCatalogToken {
         const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        if (self.current_revision != expected_revision) return error.ReplicaCatalogRevisionChanged;
-        if (upserts.len == 0 and removals.len == 0) return;
-        if (replicaBatchClearlyNoOp(&self.records, upserts, removals)) return;
+        if (self.current_revision != expected_token.revision) return error.ReplicaCatalogRevisionChanged;
+        if (upserts.len == 0 and removals.len == 0) return .{ .revision = self.current_revision };
+        if (replicaBatchClearlyNoOp(&self.records, upserts, removals)) return .{ .revision = self.current_revision };
 
         var next = try cloneReplicaMapFromMap(self.alloc, &self.records);
         errdefer deinitReplicaMap(self.alloc, &next);
         try applyReplicaBatchToMap(self.alloc, &next, upserts, removals);
         if (replicaMapsEqual(&self.records, &next)) {
             deinitReplicaMap(self.alloc, &next);
-            return;
+            return .{ .revision = self.current_revision };
         }
         const next_revision = try nextRevision(self.current_revision);
 
@@ -736,6 +750,7 @@ pub const FileReplicaCatalog = struct {
         };
         deinitReplicaMap(self.alloc, &previous);
         self.current_revision = next_revision;
+        return .{ .revision = next_revision };
     }
 
     fn load(self: *FileReplicaCatalog) !void {
@@ -1191,22 +1206,26 @@ test "memory replica catalog batch is revision fenced and publishes atomically" 
     const iface = replica_catalog.catalog();
 
     try iface.upsertReplica(.{ .group_id = 11, .replica_id = 1, .local_node_id = 3 });
-    const revision = iface.revision();
-    try iface.applyBatch(revision, &.{
+    const token = iface.token();
+    const revision = token.revision;
+    const committed_token = try iface.applyBatch(token, &.{
         .{ .group_id = 12, .replica_id = 2, .local_node_id = 3 },
         .{ .group_id = 13, .replica_id = 3, .local_node_id = 3 },
     }, &.{11});
+    try std.testing.expectEqual(revision + 1, committed_token.revision);
     try std.testing.expectEqual(revision + 1, iface.revision());
-    const converged_revision = iface.revision();
-    try iface.applyBatch(converged_revision, &.{
+    const converged_token = iface.token();
+    const converged_revision = converged_token.revision;
+    const no_op_token = try iface.applyBatch(converged_token, &.{
         .{ .group_id = 12, .replica_id = 2, .local_node_id = 3 },
         .{ .group_id = 13, .replica_id = 3, .local_node_id = 3 },
     }, &.{11});
+    try std.testing.expectEqual(converged_revision, no_op_token.revision);
     try std.testing.expectEqual(converged_revision, iface.revision());
 
     try std.testing.expectError(
         error.ReplicaCatalogRevisionChanged,
-        iface.applyBatch(revision, &.{.{ .group_id = 14, .replica_id = 4, .local_node_id = 3 }}, &.{}),
+        iface.applyBatch(token, &.{.{ .group_id = 14, .replica_id = 4, .local_node_id = 3 }}, &.{}),
     );
     const records = try iface.listReplicas(std.testing.allocator);
     defer freeReplicaRecords(std.testing.allocator, records);
@@ -1300,7 +1319,7 @@ test "file replica catalog reopens catalogs larger than one MiB" {
         var replica_catalog = try FileReplicaCatalog.init(std.testing.allocator, path);
         defer replica_catalog.deinit();
         const iface = replica_catalog.catalog();
-        try iface.applyBatch(iface.revision(), upserts, &.{});
+        _ = try iface.applyBatch(iface.token(), upserts, &.{});
     }
 
     var reopened = try FileReplicaCatalog.init(std.testing.allocator, path);

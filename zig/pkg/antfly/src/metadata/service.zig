@@ -2558,6 +2558,7 @@ pub const MetadataService = struct {
     projection_epoch: std.atomic.Value(u64) = .init(1),
     catalog_epoch: std.atomic.Value(u64) = .init(1),
     placement_epoch: std.atomic.Value(u64) = .init(1),
+    placement_catalog_gate: std.Io.Mutex = .init,
     reconcile_lease_epoch: std.atomic.Value(u64) = .init(1),
     transition_epoch: std.atomic.Value(u64) = .init(1),
     metadata_incarnation_candidate: ?metadata_mod.MetadataClusterIncarnation = null,
@@ -2857,7 +2858,11 @@ pub const MetadataService = struct {
         }
         switch (signal.kind) {
             .table, .range, .shuffle_join_lease, .restore_job => _ = self.projection_epoch.fetchAdd(1, .monotonic),
-            .placement_intent => _ = self.placement_epoch.fetchAdd(1, .monotonic),
+            .placement_intent => {
+                self.placement_catalog_gate.lockUncancelable(std.Options.debug_io);
+                defer self.placement_catalog_gate.unlock(std.Options.debug_io);
+                _ = self.placement_epoch.fetchAdd(1, .release);
+            },
             .reconcile_lease => _ = self.reconcile_lease_epoch.fetchAdd(1, .monotonic),
             .split_transition, .merge_transition => _ = self.transition_epoch.fetchAdd(1, .monotonic),
             else => {},
@@ -4517,9 +4522,52 @@ pub const MetadataService = struct {
             self.local_placement_epoch = null;
             return;
         }
+        reconcile.classifyAdmissions() catch |err| {
+            self.unlockRuntime();
+            return err;
+        };
+        self.unlockRuntime();
+
+        reconcile.commitAdmissionsDurable() catch |err| {
+            self.lockRuntime();
+            reconcile.noteAdmissionDurabilityFailure(err);
+            self.unlockRuntime();
+            return err;
+        };
+
+        self.lockRuntime();
+        if (self.placement_epoch.load(.monotonic) != current_epoch) {
+            reconcile.suppressRetirements();
+            self.local_placement_epoch = null;
+        }
+        reconcile.publishLive() catch |err| {
+            self.unlockRuntime();
+            return err;
+        };
+        self.unlockRuntime();
+
+        var retirement_error: ?anyerror = null;
+        self.placement_catalog_gate.lockUncancelable(std.Options.debug_io);
+        if (self.placement_epoch.load(.acquire) != current_epoch) {
+            reconcile.suppressRetirements();
+            self.local_placement_epoch = null;
+        }
+        reconcile.commitRetirementsDurable() catch |err| {
+            retirement_error = err;
+        };
+        self.placement_catalog_gate.unlock(std.Options.debug_io);
+        if (retirement_error) |err| {
+            self.lockRuntime();
+            reconcile.noteRetirementDurabilityFailure(err);
+            self.unlockRuntime();
+            return err;
+        }
+
+        self.lockRuntime();
         defer self.unlockRuntime();
-        const reconcile_result = try reconcile.commit();
+        const reconcile_result = try reconcile.finish();
         if (reconcile_result.hasPlacementFailures()) return error.ReplicaReconcileIncomplete;
+        if (self.placement_epoch.load(.monotonic) != current_epoch) return;
         self.local_placement_epoch = current_epoch;
         self.last_local_placement_refresh_at_ms = nowMs();
     }
@@ -4941,6 +4989,7 @@ pub const MetadataHttpService = struct {
     projected_core_epoch: std.atomic.Value(u64) = .init(1),
     transition_readiness_epoch: std.atomic.Value(u64) = .init(1),
     placement_epoch: std.atomic.Value(u64) = .init(1),
+    placement_catalog_gate: std.Io.Mutex = .init,
     reconcile_lease_epoch: std.atomic.Value(u64) = .init(1),
     transition_epoch: std.atomic.Value(u64) = .init(1),
     metadata_incarnation_candidate: ?metadata_mod.MetadataClusterIncarnation = null,
@@ -5209,7 +5258,11 @@ pub const MetadataHttpService = struct {
             .table, .range, .store, .shuffle_join_lease, .restore_job => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .schema_progress => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .restore_progress, .replication_source_status => _ = self.projection_epoch.fetchAdd(1, .monotonic),
-            .placement_intent => _ = self.placement_epoch.fetchAdd(1, .monotonic),
+            .placement_intent => {
+                self.placement_catalog_gate.lockUncancelable(std.Options.debug_io);
+                defer self.placement_catalog_gate.unlock(std.Options.debug_io);
+                _ = self.placement_epoch.fetchAdd(1, .release);
+            },
             .reconcile_lease => _ = self.reconcile_lease_epoch.fetchAdd(1, .monotonic),
             .split_transition, .merge_transition => _ = self.transition_epoch.fetchAdd(1, .monotonic),
         }
@@ -8233,9 +8286,52 @@ pub const MetadataHttpService = struct {
             self.local_placement_epoch = null;
             return;
         }
+        reconcile.classifyAdmissions() catch |err| {
+            self.unlockRuntime();
+            return err;
+        };
+        self.unlockRuntime();
+
+        reconcile.commitAdmissionsDurable() catch |err| {
+            self.lockRuntime();
+            reconcile.noteAdmissionDurabilityFailure(err);
+            self.unlockRuntime();
+            return err;
+        };
+
+        self.lockRuntime();
+        if (self.placement_epoch.load(.monotonic) != current_epoch) {
+            reconcile.suppressRetirements();
+            self.local_placement_epoch = null;
+        }
+        reconcile.publishLive() catch |err| {
+            self.unlockRuntime();
+            return err;
+        };
+        self.unlockRuntime();
+
+        var retirement_error: ?anyerror = null;
+        self.placement_catalog_gate.lockUncancelable(std.Options.debug_io);
+        if (self.placement_epoch.load(.acquire) != current_epoch) {
+            reconcile.suppressRetirements();
+            self.local_placement_epoch = null;
+        }
+        reconcile.commitRetirementsDurable() catch |err| {
+            retirement_error = err;
+        };
+        self.placement_catalog_gate.unlock(std.Options.debug_io);
+        if (retirement_error) |err| {
+            self.lockRuntime();
+            reconcile.noteRetirementDurabilityFailure(err);
+            self.unlockRuntime();
+            return err;
+        }
+
+        self.lockRuntime();
         defer self.unlockRuntime();
-        const reconcile_result = try reconcile.commit();
+        const reconcile_result = try reconcile.finish();
         if (reconcile_result.hasPlacementFailures()) return error.ReplicaReconcileIncomplete;
+        if (self.placement_epoch.load(.monotonic) != current_epoch) return;
         self.local_placement_epoch = current_epoch;
         self.last_local_placement_refresh_at_ms = nowMs();
     }

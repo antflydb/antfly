@@ -12088,12 +12088,42 @@ pub const DataServer = struct {
         {
             lockAtomic(&self.data_raft_mutex);
             defer self.data_raft_mutex.unlock();
-            const reconcile_result: ?antfly.raft.ReconcileResult = reconcile.commit() catch |err| failed: {
+            reconcile.classifyAdmissions() catch |err| {
+                reconcile_commit_error = err;
+            };
+        }
+        if (reconcile_commit_error == null) {
+            reconcile.commitAdmissionsDurable() catch |err| {
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                reconcile.noteAdmissionDurabilityFailure(err);
+                reconcile_commit_error = err;
+            };
+        }
+        if (reconcile_commit_error == null) {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            reconcile.publishLive() catch |err| {
+                reconcile_commit_error = err;
+            };
+        }
+        if (reconcile_commit_error == null) {
+            reconcile.commitRetirementsDurable() catch |err| {
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                reconcile.noteRetirementDurabilityFailure(err);
+                reconcile_commit_error = err;
+            };
+        }
+        if (reconcile_commit_error == null) {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            const result: ?antfly.raft.ReconcileResult = reconcile.finish() catch |err| failed: {
                 reconcile_commit_error = err;
                 break :failed null;
             };
-            if (reconcile_result) |result| {
-                if (result.hasPlacementFailures()) reconcile_commit_error = error.ReplicaReconcileIncomplete;
+            if (result) |value| {
+                if (value.hasPlacementFailures()) reconcile_commit_error = error.ReplicaReconcileIncomplete;
             }
             if (reconcile_commit_error == null) {
                 if (apply_group_transition) |*transition| transition.commit();
