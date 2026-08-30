@@ -367,6 +367,22 @@ pub const Fixture = struct {
     global_query_authorization_denied_status: u16 = 0,
     global_query_authorization_recovered_status: u16 = 0,
     global_query_authorization_sound: bool = false,
+    global_query_transport_failure_armed: bool = false,
+    global_query_transport_boundary_observed: bool = false,
+    global_query_transport_fault_injected: bool = false,
+    global_query_transport_fault_observed: bool = false,
+    global_query_transport_fault_matches: u64 = 0,
+    global_query_transport_fault_count_before: u64 = 0,
+    global_query_transport_fault_healed: bool = false,
+    global_query_transport_rejected_without_partial: bool = false,
+    global_query_transport_recovered: bool = false,
+    global_query_transport_rejected_status: u16 = 0,
+    global_query_transport_recovered_status: u16 = 0,
+    global_query_transport_sound: bool = false,
+    global_query_transport_target_index: usize = 0,
+    global_query_transport_target_configured: bool = false,
+    global_query_transport_fault_endpoint: ?std.Io.net.IpAddress = null,
+    global_query_route_index: usize = 1,
     join_sound: bool = false,
     split_join_sound: bool = false,
     post_split_join_sound: bool = false,
@@ -557,6 +573,7 @@ pub const Fixture = struct {
     global_query_enabled: bool = false,
     global_query_cancellation_enabled: bool = false,
     global_query_authorization_revocation_enabled: bool = false,
+    global_query_transport_failure_enabled: bool = false,
     join_cancellation_enabled: bool = false,
     join_cancellation_overlap_enabled: bool = false,
     join_cancellation_owner_restart_enabled: bool = false,
@@ -631,6 +648,11 @@ pub const Fixture = struct {
     pub fn setGlobalQueryAuthorizationRevocationEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.global_query_authorization_revocation_enabled = enabled;
+    }
+
+    pub fn setGlobalQueryTransportFailureEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.global_query_transport_failure_enabled = enabled;
     }
 
     fn liveAuthorizationEnabled(self: *const Fixture) bool {
@@ -708,6 +730,27 @@ pub const Fixture = struct {
 
     pub fn currentGraphOwnerIndex(self: *Fixture) ?usize {
         return self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.graph_data_group_id);
+    }
+
+    pub fn currentTenantOwnerIndex(self: *Fixture) ?usize {
+        return self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.tenant_data_group_id);
+    }
+
+    /// Freeze one real directional coordinator-to-tenant-owner link for the
+    /// deployment manifest. The payload selector installed at the result
+    /// boundary later limits the outage to the second table's query stream.
+    pub fn configureGlobalQueryTransportTarget(self: *Fixture, target_index: usize) !usize {
+        if (self.phase != .leaders_ready or !self.global_query_transport_failure_enabled or
+            target_index >= self.data_server_count or !self.data_server_live[target_index])
+            return error.InvalidProductionGlobalQueryTransportTarget;
+        const coordinator_index = for (0..self.data_api_uri_count) |index| {
+            if (index != target_index and self.data_server_live[index]) break index;
+        } else return error.ProductionGlobalQueryRemoteCoordinatorMissing;
+        self.global_query_transport_target_index = target_index;
+        self.global_query_transport_target_configured = true;
+        self.global_query_transport_fault_endpoint = try parseHttpBaseUriAddress(self.data_api_uris[target_index]);
+        self.global_query_route_index = coordinator_index;
+        return coordinator_index;
     }
 
     pub fn configureGraphRestartTarget(self: *Fixture, index: usize) !void {
@@ -841,6 +884,10 @@ pub const Fixture = struct {
         if (self.global_query_authorization_revocation_enabled and
             (!self.global_query_enabled or self.global_query_cancellation_enabled))
             return error.InvalidProductionClusterGlobalQueryAuthorizationMode;
+        if (self.global_query_transport_failure_enabled and
+            (!self.global_query_enabled or self.global_query_cancellation_enabled or
+                self.global_query_authorization_revocation_enabled))
+            return error.InvalidProductionClusterGlobalQueryTransportMode;
         if (self.graph_stale_snapshot_retry_exhaustion_enabled and
             (!self.graph_enabled or !self.active_split_enabled))
             return error.InvalidProductionClusterGraphStaleSnapshotMode;
@@ -1224,6 +1271,22 @@ pub const Fixture = struct {
                     .table,
                 );
                 self.global_query_authorization_revoked = true;
+            }
+            if (self.global_query_transport_failure_enabled and
+                self.global_query_transport_failure_armed and
+                std.mem.eql(u8, event.table_name, "docs"))
+            {
+                const endpoint = self.global_query_transport_fault_endpoint orelse
+                    return error.ProductionGlobalQueryTransportFaultEndpointMissing;
+                self.global_query_transport_failure_armed = false;
+                self.global_query_transport_boundary_observed = true;
+                self.global_query_transport_fault_count_before =
+                    self.sim.outboundEndpointPayloadOutageCount();
+                try self.sim.setOutboundEndpointPayloadOutage(
+                    endpoint,
+                    "/tables/tenant_b_docs/query",
+                );
+                self.global_query_transport_fault_injected = true;
             }
         }
     }
@@ -2379,6 +2442,8 @@ pub const Fixture = struct {
                 try self.runGlobalMultiQueryCancellation()
             else if (self.global_query_authorization_revocation_enabled)
                 try self.runGlobalMultiQueryAuthorizationRevocation()
+            else if (self.global_query_transport_failure_enabled)
+                try self.runGlobalMultiQueryTransportFailure()
             else
                 try self.runGlobalMultiQuery();
             if (!self.global_query_sound)
@@ -3199,7 +3264,7 @@ pub const Fixture = struct {
 
     fn runGlobalMultiQuery(self: *Fixture) !bool {
         var response = try self.client.fetchGlobalMultiQueryRaw(
-            self.data_api_uris[1],
+            self.data_api_uris[self.global_query_route_index],
             global_query_body,
         );
         defer response.deinit(self.alloc);
@@ -3342,6 +3407,60 @@ pub const Fixture = struct {
             self.global_query_authorization_restored and
             self.global_query_authorization_recovered;
         return self.global_query_authorization_sound;
+    }
+
+    fn runGlobalMultiQueryTransportFailure(self: *Fixture) !bool {
+        if (!self.global_query_transport_target_configured)
+            return error.ProductionGlobalQueryTransportTargetMissing;
+        if (self.currentTenantOwnerIndex() != self.global_query_transport_target_index)
+            return error.ProductionGlobalQueryTransportTargetLeadershipChanged;
+        defer if (self.global_query_transport_fault_injected and
+            !self.global_query_transport_fault_healed)
+        {
+            self.sim.setOutboundEndpointOutage(null);
+            self.global_query_transport_fault_healed = true;
+        };
+
+        const results_before = self.global_query_result_assembled_count;
+        self.global_query_transport_failure_armed = true;
+        var rejected = try self.client.fetchGlobalMultiQueryRaw(
+            self.data_api_uris[self.global_query_route_index],
+            global_query_body,
+        );
+        defer rejected.deinit(self.alloc);
+        self.global_query_transport_rejected_status = rejected.status;
+        self.global_query_transport_fault_matches =
+            self.sim.outboundEndpointPayloadOutageCount() -|
+            self.global_query_transport_fault_count_before;
+        self.global_query_transport_fault_observed =
+            self.global_query_transport_fault_matches == 1;
+        self.global_query_transport_rejected_without_partial =
+            self.global_query_transport_boundary_observed and
+            self.global_query_transport_fault_injected and
+            self.global_query_transport_fault_observed and
+            self.global_query_result_assembled_count == results_before + 1 and
+            rejected.status == 503 and
+            std.mem.eql(
+                u8,
+                rejected.body,
+                "{\"code\":\"distributed_query_unavailable\",\"message\":\"distributed query unavailable\",\"retryable\":true}",
+            );
+        if (!self.global_query_transport_rejected_without_partial) return false;
+
+        self.sim.setOutboundEndpointOutage(null);
+        self.global_query_transport_fault_healed = true;
+        const recovered = try self.runGlobalMultiQuery();
+        self.global_query_transport_recovered_status = self.global_query_status;
+        self.global_query_transport_recovered = recovered and
+            self.global_query_result_assembled_count == results_before + 3;
+        self.global_query_transport_sound =
+            self.global_query_transport_boundary_observed and
+            self.global_query_transport_fault_injected and
+            self.global_query_transport_fault_observed and
+            self.global_query_transport_fault_healed and
+            self.global_query_transport_rejected_without_partial and
+            self.global_query_transport_recovered;
+        return self.global_query_transport_sound;
     }
 
     fn runGraphQuery(
@@ -4387,6 +4506,8 @@ pub const Fixture = struct {
         self.releaseNodeMemory();
         self.graph_transport_fault_armed = false;
         self.graph_transport_fault_endpoint = null;
+        self.global_query_transport_failure_armed = false;
+        self.global_query_transport_fault_endpoint = null;
         self.sim.setOutboundEndpointOutage(null);
         var transition_index = self.transition_registration_count;
         while (transition_index > 0) {
@@ -4641,6 +4762,8 @@ pub const Fixture = struct {
         self.releaseNodeMemory();
         self.graph_transport_fault_armed = false;
         self.graph_transport_fault_endpoint = null;
+        self.global_query_transport_failure_armed = false;
+        self.global_query_transport_fault_endpoint = null;
         self.sim.setOutboundEndpointOutage(null);
         self.driver_stop = true;
         if (self.public_executor_live) self.public_executor.beginShutdown();
@@ -4681,6 +4804,16 @@ pub const Fixture = struct {
         global_query_authorization_denied_status: u16,
         global_query_authorization_recovered_status: u16,
         global_query_authorization_ok: bool,
+        global_query_transport_boundary_observed: bool,
+        global_query_transport_fault_injected: bool,
+        global_query_transport_fault_observed: bool,
+        global_query_transport_fault_matches: u64,
+        global_query_transport_fault_healed: bool,
+        global_query_transport_rejected_without_partial: bool,
+        global_query_transport_recovered: bool,
+        global_query_transport_rejected_status: u16,
+        global_query_transport_recovered_status: u16,
+        global_query_transport_ok: bool,
         join_query_ok: bool,
         split_join_query_ok: bool,
         post_split_join_query_ok: bool,
@@ -4848,6 +4981,16 @@ pub const Fixture = struct {
             .global_query_authorization_denied_status = self.global_query_authorization_denied_status,
             .global_query_authorization_recovered_status = self.global_query_authorization_recovered_status,
             .global_query_authorization_ok = self.global_query_authorization_sound,
+            .global_query_transport_boundary_observed = self.global_query_transport_boundary_observed,
+            .global_query_transport_fault_injected = self.global_query_transport_fault_injected,
+            .global_query_transport_fault_observed = self.global_query_transport_fault_observed,
+            .global_query_transport_fault_matches = self.global_query_transport_fault_matches,
+            .global_query_transport_fault_healed = self.global_query_transport_fault_healed,
+            .global_query_transport_rejected_without_partial = self.global_query_transport_rejected_without_partial,
+            .global_query_transport_recovered = self.global_query_transport_recovered,
+            .global_query_transport_rejected_status = self.global_query_transport_rejected_status,
+            .global_query_transport_recovered_status = self.global_query_transport_recovered_status,
+            .global_query_transport_ok = self.global_query_transport_sound,
             .join_query_ok = self.join_sound,
             .split_join_query_ok = self.split_join_sound,
             .post_split_join_query_ok = self.post_split_join_sound,

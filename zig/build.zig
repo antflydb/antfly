@@ -3893,7 +3893,6 @@ pub fn build(b: *std.Build) void {
         "api http stale hierarchy cursor response is actionable and machine readable",
         "api http server preserves public query availability errors",
         "public table query handler preserves retryable failure status",
-        "distributed graph transport failures become one retryable availability condition",
         "api http unsupported unsorted query response is machine readable",
         "api http unsupported hierarchy grouping response uses the public contract",
         "api http point lookup retries bounded local readiness races",
@@ -6353,6 +6352,26 @@ pub fn build(b: *std.Build) void {
     );
     const lib_api_graph_wire_test_step = b.step("lib-api-graph-wire-test", "Run canonical internal graph wire-contract regressions");
     lib_api_graph_wire_test_step.dependOn(&run_lib_api_graph_wire_tests.step);
+    const lib_api_distributed_query_availability_runtime_filters = &.{"distributed query transport failures become one retryable availability condition"};
+    const lib_api_distributed_query_availability_tests = b.addTest(.{
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = lib_api_distributed_query_availability_runtime_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_distributed_query_availability_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        lib_api_distributed_query_availability_tests,
+        lib_api_distributed_query_availability_runtime_filters,
+    );
+    const lib_api_distributed_query_availability_test_step = b.step(
+        "lib-api-distributed-query-availability-test",
+        "Run retryable distributed-query transport classification regressions",
+    );
+    lib_api_distributed_query_availability_test_step.dependOn(&run_lib_api_distributed_query_availability_tests.step);
+    root_test_step.dependOn(lib_api_distributed_query_availability_test_step);
     const api_derived_coverage_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_derived_coverage_test_root.zig"),
         .target = target,
@@ -7516,6 +7535,18 @@ pub fn build(b: *std.Build) void {
     );
     production_cluster_global_query_authorization_vopr_test_step.dependOn(&run_production_cluster_global_query_authorization_vopr_tests.step);
 
+    const production_cluster_global_query_transport_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production public global query transport failure exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_production_cluster_global_query_transport_vopr_tests = b.addRunArtifact(production_cluster_global_query_transport_vopr_tests);
+    const production_cluster_global_query_transport_vopr_test_step = b.step(
+        "production-cluster-global-query-transport-vopr-test",
+        "Cut the second table's production query link after the first result and prove fail-closed recovery",
+    );
+    production_cluster_global_query_transport_vopr_test_step.dependOn(&run_production_cluster_global_query_transport_vopr_tests.step);
+
     const production_cluster_baseline_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane baseline exact replay"},
@@ -7670,6 +7701,7 @@ pub fn build(b: *std.Build) void {
         run_production_cluster_global_query_vopr_tests,
         run_production_cluster_global_query_cancellation_vopr_tests,
         run_production_cluster_global_query_authorization_vopr_tests,
+        run_production_cluster_global_query_transport_vopr_tests,
     }) |run_production_cluster_test| {
         // addRunArtifact appends cache-dir, seed, and --listen arguments after
         // the artifact; simple mode needs only the artifact itself.
@@ -7769,7 +7801,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_graph_split_socket_pressure_vopr_test_step.dependOn(&run_production_cluster_graph_split_socket_pressure_vopr_tests.step);
     const production_cluster_vopr_test_step = b.step(
         "production-cluster-vopr-test",
-        "Run every focused production DataServer cluster history through v38",
+        "Run every focused production DataServer cluster history through v39",
     );
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_deep_test_step);
@@ -7798,6 +7830,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_vopr_test_step.dependOn(production_cluster_global_query_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_global_query_cancellation_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_global_query_authorization_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_global_query_transport_vopr_test_step);
 
     const generation_reranking_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,

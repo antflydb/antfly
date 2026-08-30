@@ -95,11 +95,11 @@ const platform_time = @import("antfly_platform").time;
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const fusion_mod = @import("../search/fusion.zig");
 
-/// Collapse failures of the internal graph-fanout transport into one public
-/// availability condition. The coordinator owns every intermediate graph
+/// Collapse failures of an internal distributed-query transport into one
+/// public availability condition. The coordinator owns every intermediate
 /// result, so callers must never receive a successful response assembled from
 /// only the workers that happened to answer.
-pub fn normalizeDistributedGraphOperationalError(err: anyerror) anyerror {
+pub fn normalizeDistributedQueryOperationalError(err: anyerror) anyerror {
     return switch (err) {
         error.RemoteUnavailable,
         error.ConnectionFailed,
@@ -133,16 +133,16 @@ pub fn normalizeDistributedGraphOperationalError(err: anyerror) anyerror {
     };
 }
 
-test "distributed graph transport failures become one retryable availability condition" {
-    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.SendFailed));
-    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.ConnectionResetByPeer));
-    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.ConnectionTimedOut));
-    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.TopologyChanged));
-    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.UnknownGroup));
-    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.NotLeader));
-    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.ReadIndexTimeout));
-    try std.testing.expectEqual(error.Timeout, normalizeDistributedGraphOperationalError(error.Timeout));
-    try std.testing.expectEqual(error.InternalFailure, normalizeDistributedGraphOperationalError(error.InternalFailure));
+test "distributed query transport failures become one retryable availability condition" {
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.SendFailed));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.ConnectionResetByPeer));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.ConnectionTimedOut));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.TopologyChanged));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.UnknownGroup));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.NotLeader));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.ReadIndexTimeout));
+    try std.testing.expectEqual(error.Timeout, normalizeDistributedQueryOperationalError(error.Timeout));
+    try std.testing.expectEqual(error.InternalFailure, normalizeDistributedQueryOperationalError(error.InternalFailure));
 }
 const regex_mod = @import("../search/regex.zig");
 const httpx = @import("httpx");
@@ -3472,7 +3472,7 @@ pub const ProvisionedTableReadSource = struct {
             var worker_ctx = ProvisionedGraphWorkerContext.init(self);
             const worker = worker_ctx.worker();
             const graph_results = distributed_graph.executeCrossRange(alloc, self.catalog, worker, table_name, graph_req, merged, consistency) catch |err|
-                return normalizeDistributedGraphOperationalError(err);
+                return normalizeDistributedQueryOperationalError(err);
             merged.graph_results = graph_results;
 
             // Aggregation may return to the source table after graph fanout.
@@ -4788,7 +4788,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
             const worker = hostedGraphWorker(self);
             const graph_results = distributed_graph.executeCrossRange(alloc, self.catalog, worker, table_name, graph_req, merged, consistency) catch |err|
-                return normalizeDistributedGraphOperationalError(err);
+                return normalizeDistributedQueryOperationalError(err);
             merged.graph_results = graph_results;
 
             var meta: query_api.QueryResponseMeta = .{
@@ -4956,14 +4956,14 @@ pub const HostedProvisionedTableReadSource = struct {
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
         defer route.deinit(alloc);
         switch (route) {
-            .remote => |remote| return try queryResponseRemote(
+            .remote => |remote| return queryResponseRemote(
                 self.internalExecutor(),
                 alloc,
                 remote.base_uri,
                 group_id,
                 table_name,
                 req,
-            ),
+            ) catch |err| return normalizeDistributedQueryOperationalError(err),
             .local => {},
         }
         if (self.local_source) |local| return try local.queryGroupLocal(alloc, group_id, table_name, req, consistency);
@@ -5646,11 +5646,14 @@ fn queryHostedAcrossGroupsParallel(
             var group_req = shard_req_inner.*;
             if (required_identity_generation) |generation| group_req.identity_read_generation = generation;
             slot.result = switch (route) {
-                .local => source.requireSearchResultLocal(arena, group_id, table_name_inner, group_req, consistency_inner),
-                .remote => |remote| queryRemote(source.internalExecutor(), arena, remote.base_uri, group_id, table_name_inner, group_req),
-            } catch |err| {
-                slot.err = err;
-                return;
+                .local => source.requireSearchResultLocal(arena, group_id, table_name_inner, group_req, consistency_inner) catch |err| {
+                    slot.err = err;
+                    return;
+                },
+                .remote => |remote| queryRemote(source.internalExecutor(), arena, remote.base_uri, group_id, table_name_inner, group_req) catch |err| {
+                    slot.err = normalizeDistributedQueryOperationalError(err);
+                    return;
+                },
             };
         }
     };
@@ -8385,7 +8388,8 @@ fn queryHostedAcrossGroupsPhase(
         defer route.deinit(alloc);
         shard_results[i] = switch (route) {
             .local => try self.requireSearchResultLocal(alloc, group_id, table_name, group_req, consistency),
-            .remote => |remote| try queryRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, group_req),
+            .remote => |remote| queryRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, group_req) catch |err|
+                return normalizeDistributedQueryOperationalError(err),
         };
         initialized += 1;
         result_identity_generations[i] = shard_results[i].identity_read_generation;
