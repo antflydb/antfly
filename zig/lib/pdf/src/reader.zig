@@ -1805,6 +1805,26 @@ const ColorComponentRange = struct {
     max: f64 = 1,
 };
 
+const max_image_color_space_decode_depth: u8 = 8;
+
+/// Image samples are decoded exactly once, then constrained by each enclosing
+/// ICCBased profile before reaching its alternate color space. Keeping the
+/// small clamp chain by value avoids a per-image scratch allocation while also
+/// preserving the specified order for nested profiles with disjoint ranges.
+const ImageSampleDecode = struct {
+    decode_obj: ?*const syntax.Object = null,
+    clamp_count: u8 = 0,
+    clamps: [max_image_color_space_decode_depth][4]ColorComponentRange =
+        [_][4]ColorComponentRange{.{ .{}, .{}, .{}, .{} }} ** max_image_color_space_decode_depth,
+
+    fn value(self: ImageSampleDecode, sample: u8, component_index: usize) f64 {
+        var decoded = applyDecodeUnit(sample, self.decode_obj, component_index);
+        for (self.clamps[0..self.clamp_count]) |ranges|
+            decoded = clampColorComponent(decoded, ranges[component_index]);
+        return decoded;
+    }
+};
+
 const CalibratedColorSpace = union(enum) {
     gray: struct {
         white_point: [3]f64,
@@ -7725,17 +7745,37 @@ pub const Reader = struct {
         resolved_color_space: *const syntax.Object,
         decode_obj: ?*const syntax.Object,
     ) anyerror!void {
+        return try self.decodeResolvedImageColorSpaceToRgbaGuarded(
+            rgba,
+            pixel_count,
+            samples,
+            resolved_color_space,
+            .{ .decode_obj = decode_obj },
+            0,
+        );
+    }
+
+    fn decodeResolvedImageColorSpaceToRgbaGuarded(
+        self: *const Reader,
+        rgba: []u8,
+        pixel_count: usize,
+        samples: []const u8,
+        resolved_color_space: *const syntax.Object,
+        sample_decode: ImageSampleDecode,
+        depth: u8,
+    ) anyerror!void {
+        if (depth >= max_image_color_space_decode_depth) return error.UnsupportedPdfRendering;
         if (resolved_color_space.asName()) |color_space| {
-            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, samples, color_space, decode_obj, self.cancellation);
+            try decodeDeviceColorSpaceToRgbaWithSampleDecode(rgba, pixel_count, samples, color_space, sample_decode, self.cancellation);
         } else if (resolved_color_space.* == .array) {
-            if (try self.tryDecodeIccBasedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+            if (try self.tryDecodeIccBasedImageToRgbaGuarded(rgba, pixel_count, samples, resolved_color_space.array, sample_decode, depth)) {
                 // handled
-            } else if (try self.tryDecodeCalibratedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+            } else if (try self.tryDecodeCalibratedImageToRgbaWithSampleDecode(rgba, pixel_count, samples, resolved_color_space.array, sample_decode)) {
                 // handled
-            } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+            } else if (try self.tryDecodeSpotColorSpaceToRgbaGuarded(rgba, pixel_count, samples, resolved_color_space.array, sample_decode, depth)) {
                 // handled
             } else {
-                try self.decodeIndexedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj);
+                try self.decodeIndexedImageToRgbaGuarded(rgba, pixel_count, samples, resolved_color_space.array, sample_decode, depth);
             }
         } else return error.UnsupportedPdfRendering;
     }
@@ -7807,6 +7847,25 @@ pub const Reader = struct {
         color_space: []const syntax.Object,
         decode_obj: ?*const syntax.Object,
     ) !bool {
+        return try self.tryDecodeIccBasedImageToRgbaGuarded(
+            rgba,
+            pixel_count,
+            decoded,
+            color_space,
+            .{ .decode_obj = decode_obj },
+            0,
+        );
+    }
+
+    fn tryDecodeIccBasedImageToRgbaGuarded(
+        self: *const Reader,
+        rgba: []u8,
+        pixel_count: usize,
+        decoded: []const u8,
+        color_space: []const syntax.Object,
+        sample_decode: ImageSampleDecode,
+        depth: u8,
+    ) !bool {
         if (color_space.len < 2) return false;
         const color_space_name = color_space[0].asName() orelse return false;
         if (!std.mem.eql(u8, color_space_name, "ICCBased")) return false;
@@ -7815,25 +7874,56 @@ pub const Reader = struct {
         defer profile.deinit(self.alloc);
         if (profile != .stream) return error.UnsupportedPdfRendering;
 
+        const components_obj = profile.get("N") orelse return error.UnsupportedPdfRendering;
+        const components_i = (try self.resolvedIntegerObjectValue(components_obj)) orelse
+            return error.UnsupportedPdfRendering;
+        if (components_i <= 0 or components_i > 4) return error.UnsupportedPdfRendering;
+        const component_count: usize = @intCast(components_i);
+
+        var constrained_decode = sample_decode;
+        if (constrained_decode.clamp_count >= max_image_color_space_decode_depth)
+            return error.UnsupportedPdfRendering;
+        var ranges = [4]ColorComponentRange{ .{}, .{}, .{}, .{} };
+        if (profile.get("Range")) |range_obj| {
+            var resolved_range = try self.resolveValue(range_obj);
+            defer resolved_range.deinit(self.alloc);
+            if (resolved_range != .array or resolved_range.array.len != component_count * 2)
+                return error.UnsupportedPdfRendering;
+            for (0..component_count) |component| {
+                const min = (try self.resolvedNumericObjectValue(&resolved_range.array[component * 2])) orelse
+                    return error.UnsupportedPdfRendering;
+                const max = (try self.resolvedNumericObjectValue(&resolved_range.array[component * 2 + 1])) orelse
+                    return error.UnsupportedPdfRendering;
+                if (!std.math.isFinite(min) or !std.math.isFinite(max) or min > max)
+                    return error.UnsupportedPdfRendering;
+                ranges[component] = .{ .min = min, .max = max };
+            }
+        }
+        constrained_decode.clamps[constrained_decode.clamp_count] = ranges;
+        constrained_decode.clamp_count += 1;
+
         if (profile.get("Alternate")) |alternate| {
             var resolved_alternate = try self.resolveImageColorSpaceForDecodeAlloc(alternate);
             defer resolved_alternate.deinit(self.alloc);
             const alternate_components = try self.colorSpaceInputComponentCount(&resolved_alternate);
-            if (profile.get("N")) |components| {
-                const profile_components = components.asInteger() orelse return error.UnsupportedPdfRendering;
-                if (profile_components <= 0 or alternate_components != @as(usize, @intCast(profile_components)))
-                    return error.UnsupportedPdfRendering;
-            }
-            try self.decodeResolvedImageColorSpaceToRgba(rgba, pixel_count, decoded, &resolved_alternate, decode_obj);
-        } else if (profile.get("N")) |components| {
-            const device_name: []const u8 = switch (components.asInteger() orelse return error.UnsupportedPdfRendering) {
+            if (alternate_components != component_count) return error.UnsupportedPdfRendering;
+            try self.decodeResolvedImageColorSpaceToRgbaGuarded(
+                rgba,
+                pixel_count,
+                decoded,
+                &resolved_alternate,
+                constrained_decode,
+                depth + 1,
+            );
+        } else {
+            const device_name: []const u8 = switch (components_i) {
                 1 => "DeviceGray",
                 3 => "DeviceRGB",
                 4 => "DeviceCMYK",
                 else => return error.UnsupportedPdfRendering,
             };
-            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, decoded, device_name, decode_obj, self.cancellation);
-        } else return error.UnsupportedPdfRendering;
+            try decodeDeviceColorSpaceToRgbaWithSampleDecode(rgba, pixel_count, decoded, device_name, constrained_decode, self.cancellation);
+        }
         return true;
     }
 
@@ -7864,6 +7954,23 @@ pub const Reader = struct {
         color_space: []const syntax.Object,
         decode_obj: ?*const syntax.Object,
     ) !bool {
+        return try self.tryDecodeCalibratedImageToRgbaWithSampleDecode(
+            rgba,
+            pixel_count,
+            decoded,
+            color_space,
+            .{ .decode_obj = decode_obj },
+        );
+    }
+
+    fn tryDecodeCalibratedImageToRgbaWithSampleDecode(
+        self: *const Reader,
+        rgba: []u8,
+        pixel_count: usize,
+        decoded: []const u8,
+        color_space: []const syntax.Object,
+        sample_decode: ImageSampleDecode,
+    ) !bool {
         if (color_space.len < 2) return false;
         const name = color_space[0].asName() orelse return false;
         if (std.mem.eql(u8, name, "CalGray")) {
@@ -7872,7 +7979,7 @@ pub const Reader = struct {
             if (selection.kind == .unsupported) return error.UnsupportedPdfRendering;
             for (0..pixel_count) |pixel| {
                 if (pixel & 4095 == 0) try self.checkCancellation();
-                const color = renderColorSpaceComponents(selection.value, .{ applyDecodeUnit(decoded[pixel], decode_obj, 0), 0, 0, 0 });
+                const color = renderColorSpaceComponents(selection.value, .{ sample_decode.value(decoded[pixel], 0), 0, 0, 0 });
                 @memcpy(rgba[pixel * 4 ..][0..4], &color);
             }
             return true;
@@ -7885,9 +7992,9 @@ pub const Reader = struct {
                 if (pixel & 4095 == 0) try self.checkCancellation();
                 const src = pixel * 3;
                 const color = renderColorSpaceComponents(selection.value, .{
-                    applyDecodeUnit(decoded[src], decode_obj, 0),
-                    applyDecodeUnit(decoded[src + 1], decode_obj, 1),
-                    applyDecodeUnit(decoded[src + 2], decode_obj, 2),
+                    sample_decode.value(decoded[src], 0),
+                    sample_decode.value(decoded[src + 1], 1),
+                    sample_decode.value(decoded[src + 2], 2),
                     0,
                 });
                 @memcpy(rgba[pixel * 4 ..][0..4], &color);
@@ -7905,9 +8012,9 @@ pub const Reader = struct {
                 if (i & 4095 == 0) try self.checkCancellation();
                 const src = i * 3;
                 const dst = i * 4;
-                const l = applyDecodeUnit(decoded[src + 0], decode_obj, 0) * 100.0;
-                const a = mapUnitToRange(applyDecodeUnit(decoded[src + 1], decode_obj, 1), range_a[0], range_a[1]);
-                const b = mapUnitToRange(applyDecodeUnit(decoded[src + 2], decode_obj, 2), range_b[0], range_b[1]);
+                const l = sample_decode.value(decoded[src + 0], 0) * 100.0;
+                const a = mapUnitToRange(sample_decode.value(decoded[src + 1], 1), range_a[0], range_a[1]);
+                const b = mapUnitToRange(sample_decode.value(decoded[src + 2], 2), range_b[0], range_b[1]);
                 const color = labColor(l, a, b, white);
                 rgba[dst + 0] = color[0];
                 rgba[dst + 1] = color[1];
@@ -7926,6 +8033,25 @@ pub const Reader = struct {
         decoded: []const u8,
         color_space: []const syntax.Object,
         decode_obj: ?*const syntax.Object,
+    ) !void {
+        return try self.decodeIndexedImageToRgbaGuarded(
+            rgba,
+            pixel_count,
+            decoded,
+            color_space,
+            .{ .decode_obj = decode_obj },
+            0,
+        );
+    }
+
+    fn decodeIndexedImageToRgbaGuarded(
+        self: *const Reader,
+        rgba: []u8,
+        pixel_count: usize,
+        decoded: []const u8,
+        color_space: []const syntax.Object,
+        sample_decode: ImageSampleDecode,
+        depth: u8,
     ) !void {
         if (color_space.len < 4) return error.UnsupportedPdfRendering;
         const indexed_name = color_space[0].asName() orelse return error.UnsupportedPdfRendering;
@@ -7966,18 +8092,19 @@ pub const Reader = struct {
         try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ rgba.len, decoded.len, owned_lookup_len, palette_rgba_len });
         const palette_rgba = try self.alloc.alloc(u8, palette_rgba_len);
         defer self.alloc.free(palette_rgba);
-        try self.decodeResolvedImageColorSpaceToRgba(
+        try self.decodeResolvedImageColorSpaceToRgbaGuarded(
             palette_rgba,
             palette_entries,
             lookup[0..palette_sample_len],
             &color_space[1],
-            null,
+            .{},
+            depth + 1,
         );
 
         var i: usize = 0;
         while (i < pixel_count) : (i += 1) {
             if (i & 4095 == 0) try self.checkCancellation();
-            const idx = try applyIndexedDecode(decoded[i], decode_obj, palette_entries);
+            const idx = try applyIndexedSampleDecode(decoded[i], sample_decode, palette_entries);
             if (idx >= palette_entries) return error.UnsupportedPdfRendering;
             const src = @as(usize, idx) * 4;
             const dst = i * 4;
@@ -7992,6 +8119,25 @@ pub const Reader = struct {
         decoded: []const u8,
         color_space: []const syntax.Object,
         decode_obj: ?*const syntax.Object,
+    ) !bool {
+        return try self.tryDecodeSpotColorSpaceToRgbaGuarded(
+            rgba,
+            pixel_count,
+            decoded,
+            color_space,
+            .{ .decode_obj = decode_obj },
+            0,
+        );
+    }
+
+    fn tryDecodeSpotColorSpaceToRgbaGuarded(
+        self: *const Reader,
+        rgba: []u8,
+        pixel_count: usize,
+        decoded: []const u8,
+        color_space: []const syntax.Object,
+        sample_decode: ImageSampleDecode,
+        depth: u8,
     ) !bool {
         if (color_space.len < 4) return false;
         const cs_name = color_space[0].asName() orelse return false;
@@ -8026,13 +8172,13 @@ pub const Reader = struct {
         var i: usize = 0;
         while (i < pixel_count) : (i += 1) {
             if (i & 4095 == 0) try self.checkCancellation();
-            const tint = applyDecodeUnit(decoded[i], decode_obj, 0);
+            const tint = sample_decode.value(decoded[i], 0);
             for (0..alt_components) |component| {
                 alt_bytes[i * alt_components + component] = floatChannel(evalExponentialTintComponent(&transform, tint, component));
             }
         }
 
-        try self.decodeResolvedImageColorSpaceToRgba(rgba, pixel_count, alt_bytes, &color_space[alt_index], null);
+        try self.decodeResolvedImageColorSpaceToRgbaGuarded(rgba, pixel_count, alt_bytes, &color_space[alt_index], .{}, depth + 1);
         return true;
     }
 
@@ -8088,6 +8234,24 @@ pub const Reader = struct {
         decode_obj: ?*const syntax.Object,
         cancellation: CancellationProbe,
     ) !void {
+        return try decodeDeviceColorSpaceToRgbaWithSampleDecode(
+            rgba,
+            pixel_count,
+            decoded,
+            color_space,
+            .{ .decode_obj = decode_obj },
+            cancellation,
+        );
+    }
+
+    fn decodeDeviceColorSpaceToRgbaWithSampleDecode(
+        rgba: []u8,
+        pixel_count: usize,
+        decoded: []const u8,
+        color_space: []const u8,
+        sample_decode: ImageSampleDecode,
+        cancellation: CancellationProbe,
+    ) !void {
         if (std.mem.eql(u8, color_space, "DeviceRGB")) {
             if (decoded.len < pixel_count * 3) return error.UnsupportedPdfRendering;
             var i: usize = 0;
@@ -8095,9 +8259,9 @@ pub const Reader = struct {
                 if (i & 4095 == 0) try cancellation.check();
                 const src = i * 3;
                 const dst = i * 4;
-                rgba[dst + 0] = applyDecodeByte(decoded[src + 0], decode_obj, 0);
-                rgba[dst + 1] = applyDecodeByte(decoded[src + 1], decode_obj, 1);
-                rgba[dst + 2] = applyDecodeByte(decoded[src + 2], decode_obj, 2);
+                rgba[dst + 0] = floatChannel(sample_decode.value(decoded[src + 0], 0));
+                rgba[dst + 1] = floatChannel(sample_decode.value(decoded[src + 1], 1));
+                rgba[dst + 2] = floatChannel(sample_decode.value(decoded[src + 2], 2));
                 rgba[dst + 3] = 0xff;
             }
             return;
@@ -8108,7 +8272,7 @@ pub const Reader = struct {
             while (i < pixel_count) : (i += 1) {
                 if (i & 4095 == 0) try cancellation.check();
                 const dst = i * 4;
-                const gray = applyDecodeByte(decoded[i], decode_obj, 0);
+                const gray = floatChannel(sample_decode.value(decoded[i], 0));
                 rgba[dst + 0] = gray;
                 rgba[dst + 1] = gray;
                 rgba[dst + 2] = gray;
@@ -8124,10 +8288,10 @@ pub const Reader = struct {
                 const src = i * 4;
                 const dst = i * 4;
                 const color = cmykColor(
-                    applyDecodeUnit(decoded[src + 0], decode_obj, 0),
-                    applyDecodeUnit(decoded[src + 1], decode_obj, 1),
-                    applyDecodeUnit(decoded[src + 2], decode_obj, 2),
-                    applyDecodeUnit(decoded[src + 3], decode_obj, 3),
+                    sample_decode.value(decoded[src + 0], 0),
+                    sample_decode.value(decoded[src + 1], 1),
+                    sample_decode.value(decoded[src + 2], 2),
+                    sample_decode.value(decoded[src + 3], 3),
                 );
                 rgba[dst + 0] = color[0];
                 rgba[dst + 1] = color[1];
@@ -15651,11 +15815,14 @@ fn applyDecodeUnit(value: u8, decode_obj: ?*const syntax.Object, component_index
 }
 
 fn applyIndexedDecode(value: u8, decode_obj: ?*const syntax.Object, palette_entries: usize) !u8 {
+    return try applyIndexedSampleDecode(value, .{ .decode_obj = decode_obj }, palette_entries);
+}
+
+fn applyIndexedSampleDecode(value: u8, sample_decode: ImageSampleDecode, palette_entries: usize) !u8 {
     if (palette_entries == 0) return error.UnsupportedPdfRendering;
+    if (sample_decode.decode_obj == null and sample_decode.clamp_count == 0) return value;
     const max_index = @as(f64, @floatFromInt(palette_entries - 1));
-    const unit = @as(f64, @floatFromInt(value)) / 255.0;
-    const range = decodeRange(decode_obj, 0) orelse return value;
-    const mapped = std.math.clamp(range.min + unit * (range.max - range.min), 0.0, max_index);
+    const mapped = std.math.clamp(sample_decode.value(value, 0), 0.0, max_index);
     return @intFromFloat(@round(mapped));
 }
 
@@ -19068,6 +19235,78 @@ test "reader decodes ICCBased alternate image xobject draw" {
     try std.testing.expectEqual(@as(u8, 255), runs[0].rgba[0]);
     try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[1]);
     try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[2]);
+}
+
+test "reader clips decoded ICCBased image samples to profile range" {
+    const alloc = std.testing.allocator;
+    const image_data = "\x00\xff";
+    const content = "q\n2 0 0 1 0 0 cm\n/Im1 Do\nQ\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace [/ICCBased 5 0 R] /BitsPerComponent 8 /Decode [-1 2] /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ image_data.len, image_data },
+    );
+    defer alloc.free(image_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /N 1 /Alternate /DeviceGray /Range [0.25 0.75] /Length 0 >>\nstream\nendstream\nendobj\n",
+        image_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageImageRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(u8, 64), runs[0].rgba[0]);
+    try std.testing.expectEqual(@as(u8, 191), runs[0].rgba[4]);
+}
+
+test "reader rejects cyclic ICCBased image alternates" {
+    const alloc = std.testing.allocator;
+    const image_data = "\x00";
+    const content = "q\n1 0 0 1 0 0 cm\n/Im1 Do\nQ\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /CS1 /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ image_data.len, image_data },
+    );
+    defer alloc.free(image_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /ColorSpace << /CS1 [/ICCBased 5 0 R] >> /XObject << /Im1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /N 1 /Alternate /CS1 /Length 0 >>\nstream\nendstream\nendobj\n",
+        image_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    try std.testing.expectError(error.UnsupportedPdfRendering, reader.extractPageImageRunsAlloc(1));
 }
 
 test "reader decodes packed one-bit ICCBased gray image" {
