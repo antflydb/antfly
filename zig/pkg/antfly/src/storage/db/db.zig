@@ -38546,53 +38546,6 @@ fn shouldPrecomputeGeneratedRequest(
     };
 }
 
-const VisitState = enum { unvisited, visiting, done };
-
-fn sortGraphQueriesByDependencies(alloc: Allocator, queries: []const types.NamedGraphQuery) ![]usize {
-    return try db_query_graph.sortGraphQueriesByDependencies(alloc, queries);
-}
-
-fn visitGraphQuery(
-    alloc: Allocator,
-    queries: []const types.NamedGraphQuery,
-    by_name: *std.StringHashMapUnmanaged(usize),
-    states: []VisitState,
-    sorted: *std.ArrayListUnmanaged(usize),
-    index: usize,
-) !void {
-    switch (states[index]) {
-        .done => return,
-        .visiting => return error.GraphQueryCycle,
-        .unvisited => {},
-    }
-
-    states[index] = .visiting;
-    const query = queries[index];
-    if (graphQueryDependencyName(query.query.start_nodes)) |dep_name| {
-        if (by_name.get(dep_name)) |dep_index| try visitGraphQuery(alloc, queries, by_name, states, sorted, dep_index);
-    }
-    if (query.query.target_nodes) |target_nodes| {
-        if (graphQueryDependencyName(target_nodes)) |dep_name| {
-            if (by_name.get(dep_name)) |dep_index| try visitGraphQuery(alloc, queries, by_name, states, sorted, dep_index);
-        }
-    }
-    states[index] = .done;
-    try sorted.append(alloc, index);
-}
-
-fn graphQueryDependencyName(selector: graph_query_mod.NodeSelector) ?[]const u8 {
-    return switch (selector) {
-        .keys => null,
-        .identities => null,
-        .result_ref => |result_ref| blk: {
-            if (std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) {
-                break :blk result_ref.ref["$graph_results.".len..];
-            }
-            break :blk null;
-        },
-    };
-}
-
 fn applyGraphUnion(alloc: Allocator, result: *types.SearchResult) !void {
     try db_query_graph.applyGraphUnion(alloc, result);
 }
@@ -72542,8 +72495,8 @@ test "db preflightSearchRequest validates live lane bindings" {
     }, 0);
     defer graph_summary.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), graph_summary.graph_query_order.len);
-    try std.testing.expectEqualStrings("related", graph_summary.graph_query_order[0]);
-    try std.testing.expectEqualStrings("pattern_related", graph_summary.graph_query_order[1]);
+    try std.testing.expectEqualStrings("pattern_related", graph_summary.graph_query_order[0]);
+    try std.testing.expectEqualStrings("related", graph_summary.graph_query_order[1]);
     try std.testing.expectEqual(@as(usize, 1), graph_summary.graph_indexes.len);
     try std.testing.expectEqualStrings("graph_v1", graph_summary.graph_indexes[0].name);
     try std.testing.expectEqual(@as(u64, 0), graph_summary.graph_indexes[0].edge_count);

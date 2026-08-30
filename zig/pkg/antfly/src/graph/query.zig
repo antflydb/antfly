@@ -82,6 +82,152 @@ pub fn validateExecutionOperationBudget(queries: anytype) !void {
     }
 }
 
+const ExecutionDependencies = struct {
+    start: ?usize,
+    target: ?usize,
+
+    fn ready(self: ExecutionDependencies, emitted: []const bool) bool {
+        if (self.start) |index| if (!emitted[index]) return false;
+        if (self.target) |index| if (!emitted[index]) return false;
+        return true;
+    }
+};
+
+/// Return a stable topological order for named graph operations. JSON object
+/// member order is not semantic, so ready operations are selected by their
+/// UTF-8 name bytes. That keeps shared request budgets and their diagnostics
+/// identical across SDK map implementations and wire encodings.
+///
+/// Requests contain at most `max_named_queries` operations and each operation
+/// has at most two dependencies. A bounded scan therefore avoids another heap
+/// and adjacency structure while doing at most 4,096 readiness checks.
+pub fn executionOrderAlloc(alloc: Allocator, queries: anytype) ![]usize {
+    try validateExecutionOperationBudget(queries);
+
+    var by_name = std.StringHashMapUnmanaged(usize).empty;
+    defer by_name.deinit(alloc);
+    for (queries, 0..) |query, index| {
+        const result = try by_name.getOrPut(alloc, query.name);
+        if (result.found_existing) return error.InvalidQueryRequest;
+        result.value_ptr.* = index;
+    }
+
+    const dependencies = try alloc.alloc(ExecutionDependencies, queries.len);
+    defer alloc.free(dependencies);
+    for (queries, 0..) |query, index| {
+        dependencies[index] = .{
+            .start = try dependencyIndex(queries, &by_name, query.query.start_nodes),
+            .target = if (query.query.target_nodes) |target|
+                try dependencyIndex(queries, &by_name, target)
+            else
+                null,
+        };
+    }
+
+    const emitted = try alloc.alloc(bool, queries.len);
+    defer alloc.free(emitted);
+    @memset(emitted, false);
+
+    const order = try alloc.alloc(usize, queries.len);
+    errdefer alloc.free(order);
+    for (order) |*slot| {
+        var next: ?usize = null;
+        for (queries, 0..) |query, index| {
+            if (emitted[index] or !dependencies[index].ready(emitted)) continue;
+            if (next == null or std.mem.order(u8, query.name, queries[next.?].name) == .lt)
+                next = index;
+        }
+        const index = next orelse return error.InvalidQueryRequest;
+        emitted[index] = true;
+        slot.* = index;
+    }
+    return order;
+}
+
+fn dependencyIndex(
+    queries: anytype,
+    by_name: *const std.StringHashMapUnmanaged(usize),
+    selector: NodeSelector,
+) !?usize {
+    const result_ref = switch (selector) {
+        .keys, .identities => return null,
+        .result_ref => |value| value,
+    };
+    if (!std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) return null;
+
+    const dep_name = result_ref.ref["$graph_results.".len..];
+    const dep_index = by_name.get(dep_name) orelse return error.InvalidQueryRequest;
+    const dependency = queries[dep_index].query;
+    switch (dependency.query_type) {
+        .neighbors, .traverse, .shortest_path, .k_shortest_paths => if (result_ref.binding != null) return error.InvalidQueryRequest,
+        .pattern => {
+            const binding = result_ref.binding orelse return error.InvalidQueryRequest;
+            if (dependency.match_pattern == null or dependency.aggregates.len > 0)
+                return error.InvalidQueryRequest;
+            for (dependency.return_aliases) |alias| {
+                if (std.mem.eql(u8, alias, binding)) return dep_index;
+            }
+            return error.InvalidQueryRequest;
+        },
+    }
+    return dep_index;
+}
+
+test "graph operation execution order is independent of declaration order" {
+    const NamedQuery = struct {
+        name: []const u8,
+        query: GraphQuery,
+    };
+    const alpha = NamedQuery{ .name = "alpha", .query = .{
+        .query_type = .traverse,
+        .index_name = "graph",
+        .start_nodes = .{ .keys = &.{"a"} },
+    } };
+    const after_alpha = NamedQuery{ .name = "after_alpha", .query = .{
+        .query_type = .traverse,
+        .index_name = "graph",
+        .start_nodes = .{ .result_ref = .{ .ref = "$graph_results.alpha" } },
+    } };
+    const zulu = NamedQuery{ .name = "zulu", .query = .{
+        .query_type = .traverse,
+        .index_name = "graph",
+        .start_nodes = .{ .keys = &.{"z"} },
+    } };
+
+    const first = [_]NamedQuery{ zulu, after_alpha, alpha };
+    const second = [_]NamedQuery{ alpha, zulu, after_alpha };
+    inline for (.{ first, second }) |queries| {
+        const order = try executionOrderAlloc(std.testing.allocator, &queries);
+        defer std.testing.allocator.free(order);
+        try std.testing.expectEqualStrings("alpha", queries[order[0]].name);
+        try std.testing.expectEqualStrings("after_alpha", queries[order[1]].name);
+        try std.testing.expectEqualStrings("zulu", queries[order[2]].name);
+    }
+}
+
+test "graph operation execution order rejects cycles" {
+    const NamedQuery = struct {
+        name: []const u8,
+        query: GraphQuery,
+    };
+    const queries = [_]NamedQuery{
+        .{ .name = "alpha", .query = .{
+            .query_type = .traverse,
+            .index_name = "graph",
+            .start_nodes = .{ .result_ref = .{ .ref = "$graph_results.beta" } },
+        } },
+        .{ .name = "beta", .query = .{
+            .query_type = .traverse,
+            .index_name = "graph",
+            .start_nodes = .{ .result_ref = .{ .ref = "$graph_results.alpha" } },
+        } },
+    };
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        executionOrderAlloc(std.testing.allocator, &queries),
+    );
+}
+
 pub fn isValidQueryName(name: []const u8) bool {
     if (!isValidIdentifier(name)) return false;
     // `$...` is reserved for typed result namespaces such as

@@ -119,27 +119,7 @@ pub fn sortQueriesByDependencies(
     alloc: std.mem.Allocator,
     queries: []const db_mod.types.NamedGraphQuery,
 ) ![]usize {
-    try graph_query_mod.validateExecutionOperationBudget(queries);
-    var by_name = std.StringHashMapUnmanaged(usize).empty;
-    defer by_name.deinit(alloc);
-    for (queries, 0..) |query, i| {
-        const result = try by_name.getOrPut(alloc, query.name);
-        if (result.found_existing) return error.InvalidQueryRequest;
-        result.value_ptr.* = i;
-    }
-
-    var sorted = std.ArrayListUnmanaged(usize).empty;
-    defer sorted.deinit(alloc);
-
-    const VisitState = enum { unvisited, visiting, done };
-    const states = try alloc.alloc(VisitState, queries.len);
-    defer alloc.free(states);
-    @memset(states, .unvisited);
-
-    for (queries, 0..) |_, i| {
-        try visitQuery(alloc, queries, &by_name, states, &sorted, i);
-    }
-    return try sorted.toOwnedSlice(alloc);
+    return try graph_query_mod.executionOrderAlloc(alloc, queries);
 }
 
 pub fn resolveGraphSelectorAlloc(
@@ -445,65 +425,6 @@ fn parseSupportedGraphQuery(
     query: indexes_openapi.GraphQuery,
 ) !graph_query_mod.GraphQuery {
     return try query_contract.parseGraphQuery(alloc, query);
-}
-
-fn visitQuery(
-    alloc: std.mem.Allocator,
-    queries: []const db_mod.types.NamedGraphQuery,
-    by_name: *std.StringHashMapUnmanaged(usize),
-    states: anytype,
-    sorted: *std.ArrayListUnmanaged(usize),
-    index: usize,
-) !void {
-    switch (states[index]) {
-        .done => return,
-        .visiting => return error.InvalidQueryRequest,
-        .unvisited => {},
-    }
-
-    states[index] = .visiting;
-    const query = queries[index];
-    if (try dependencyIndex(queries, by_name, query.query.start_nodes)) |dep_index| {
-        try visitQuery(alloc, queries, by_name, states, sorted, dep_index);
-    }
-    if (query.query.target_nodes) |target_nodes| {
-        if (try dependencyIndex(queries, by_name, target_nodes)) |dep_index|
-            try visitQuery(alloc, queries, by_name, states, sorted, dep_index);
-    }
-    states[index] = .done;
-    try sorted.append(alloc, index);
-}
-
-fn dependencyIndex(
-    queries: []const db_mod.types.NamedGraphQuery,
-    by_name: *const std.StringHashMapUnmanaged(usize),
-    selector: graph_query_mod.NodeSelector,
-) !?usize {
-    const result_ref = switch (selector) {
-        .keys, .identities => return null,
-        .result_ref => |value| value,
-    };
-    if (!std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) return null;
-    const dep_name = result_ref.ref["$graph_results.".len..];
-    const dep_index = by_name.get(dep_name) orelse return error.InvalidQueryRequest;
-    const dependency = queries[dep_index].query;
-    switch (dependency.query_type) {
-        .neighbors, .traverse, .shortest_path, .k_shortest_paths => if (result_ref.binding != null) return error.InvalidQueryRequest,
-        .pattern => {
-            const binding = result_ref.binding orelse return error.InvalidQueryRequest;
-            if (dependency.match_pattern == null or dependency.aggregates.len > 0)
-                return error.InvalidQueryRequest;
-            var returned = false;
-            for (dependency.return_aliases) |alias| {
-                if (std.mem.eql(u8, alias, binding)) {
-                    returned = true;
-                    break;
-                }
-            }
-            if (!returned) return error.InvalidQueryRequest;
-        },
-    }
-    return dep_index;
 }
 
 fn findResultSetByRef(available_sets: anytype, ref: []const u8) ?@TypeOf(available_sets[0]) {

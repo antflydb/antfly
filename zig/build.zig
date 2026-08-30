@@ -3885,6 +3885,8 @@ pub fn build(b: *std.Build) void {
         "graph coordinator rejects merged node collections above the public cap",
         "graph merge rejects missing and inexact aggregate shards",
         "graph merge rejects missing duplicate and unknown traversal operations",
+        "graph operation execution order is independent of declaration order",
+        "graph operation execution order rejects cycles",
         "graph query dependency sorting enforces request-wide operation bounds",
         "graph query dependency sorting accepts path result endpoints",
         "stateful path results materialize endpoint nodes for result refs",
