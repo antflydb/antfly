@@ -7415,10 +7415,15 @@ pub fn build(b: *std.Build) void {
     );
     query_embedding_cache_vopr_test_step.dependOn(&run_query_embedding_cache_vopr_tests.step);
 
+    // Every filtered full-cluster gate analyzes the same production-heavy
+    // root. Current macOS ReleaseSafe compiles peak around 15.1 GB; reserve
+    // one honest shared amount so the build scheduler cannot co-schedule them
+    // under stale per-mode estimates. Linux retains its measured 7 GiB bound.
+    const full_cluster_vopr_max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024;
     const full_cluster_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster VOPR exact replays"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_full_cluster_vopr_tests = b.addRunArtifact(full_cluster_vopr_tests);
     const full_cluster_vopr_test_step = b.step(
@@ -7430,7 +7435,7 @@ pub fn build(b: *std.Build) void {
     const production_cluster_service_rate_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production service rates compose heal and exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_service_rate_vopr_tests = b.addRunArtifact(production_cluster_service_rate_vopr_tests);
     const production_cluster_service_rate_vopr_test_step = b.step(
@@ -7439,10 +7444,22 @@ pub fn build(b: *std.Build) void {
     );
     production_cluster_service_rate_vopr_test_step.dependOn(&run_production_cluster_service_rate_vopr_tests.step);
 
+    const production_cluster_query_cache_service_rate_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production query embedding cache service rates compose heal and exact replay"},
+        .max_rss = full_cluster_vopr_max_rss,
+    });
+    const run_production_cluster_query_cache_service_rate_vopr_tests = b.addRunArtifact(production_cluster_query_cache_service_rate_vopr_tests);
+    const production_cluster_query_cache_service_rate_vopr_test_step = b.step(
+        "production-cluster-query-cache-service-rate-vopr-test",
+        "Run query-cache coalescing and hit costs with DataServer, graph, and serverless node slowdown",
+    );
+    production_cluster_query_cache_service_rate_vopr_test_step.dependOn(&run_production_cluster_query_cache_service_rate_vopr_tests.step);
+
     const production_cluster_graph_hydration_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production public graph hydration exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_hydration_vopr_tests = b.addRunArtifact(production_cluster_graph_hydration_vopr_tests);
     const production_cluster_graph_hydration_vopr_test_step = b.step(
@@ -7454,7 +7471,7 @@ pub fn build(b: *std.Build) void {
     const production_cluster_graph_cancellation_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production public graph cancellation exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_cancellation_vopr_tests = b.addRunArtifact(production_cluster_graph_cancellation_vopr_tests);
     const production_cluster_graph_cancellation_vopr_test_step = b.step(
@@ -7466,7 +7483,7 @@ pub fn build(b: *std.Build) void {
     const production_cluster_graph_cancellation_transport_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production public graph cancellation under transport fault exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_cancellation_transport_vopr_tests = b.addRunArtifact(production_cluster_graph_cancellation_transport_vopr_tests);
     const production_cluster_graph_cancellation_transport_vopr_test_step = b.step(
@@ -7478,7 +7495,7 @@ pub fn build(b: *std.Build) void {
     const production_cluster_graph_inflight_authorization_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production public graph inflight authorization revocation exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_inflight_authorization_vopr_tests = b.addRunArtifact(production_cluster_graph_inflight_authorization_vopr_tests);
     const production_cluster_graph_inflight_authorization_vopr_test_step = b.step(
@@ -7490,7 +7507,7 @@ pub fn build(b: *std.Build) void {
     const production_cluster_graph_stale_snapshot_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production public graph stale snapshot retry exhaustion exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_stale_snapshot_vopr_tests = b.addRunArtifact(production_cluster_graph_stale_snapshot_vopr_tests);
     const production_cluster_graph_stale_snapshot_vopr_test_step = b.step(
@@ -7502,7 +7519,7 @@ pub fn build(b: *std.Build) void {
     const production_cluster_global_query_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production public global query exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_global_query_vopr_tests = b.addRunArtifact(production_cluster_global_query_vopr_tests);
     const production_cluster_global_query_vopr_test_step = b.step(
@@ -7514,7 +7531,7 @@ pub fn build(b: *std.Build) void {
     const production_cluster_global_query_cancellation_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production public global query cancellation exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_global_query_cancellation_vopr_tests = b.addRunArtifact(production_cluster_global_query_cancellation_vopr_tests);
     const production_cluster_global_query_cancellation_vopr_test_step = b.step(
@@ -7526,7 +7543,7 @@ pub fn build(b: *std.Build) void {
     const production_cluster_global_query_authorization_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production public global query inflight authorization revocation exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_global_query_authorization_vopr_tests = b.addRunArtifact(production_cluster_global_query_authorization_vopr_tests);
     const production_cluster_global_query_authorization_vopr_test_step = b.step(
@@ -7538,7 +7555,7 @@ pub fn build(b: *std.Build) void {
     const production_cluster_global_query_transport_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production public global query transport failure exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_global_query_transport_vopr_tests = b.addRunArtifact(production_cluster_global_query_transport_vopr_tests);
     const production_cluster_global_query_transport_vopr_test_step = b.step(
@@ -7550,7 +7567,7 @@ pub fn build(b: *std.Build) void {
     const production_cluster_global_query_owner_restart_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production public global query owner restart exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_global_query_owner_restart_vopr_tests = b.addRunArtifact(production_cluster_global_query_owner_restart_vopr_tests);
     const production_cluster_global_query_owner_restart_vopr_test_step = b.step(
@@ -7562,13 +7579,13 @@ pub fn build(b: *std.Build) void {
     const production_cluster_baseline_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane baseline exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_baseline_vopr_tests = b.addRunArtifact(production_cluster_baseline_vopr_tests);
     const production_cluster_bounded_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane VOPR bounded cutoff exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_bounded_vopr_tests = b.addRunArtifact(production_cluster_bounded_vopr_tests);
     // Each production composition may use most of its large RSS allowance.
@@ -7578,103 +7595,103 @@ pub fn build(b: *std.Build) void {
     const production_cluster_deep_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane VOPR active split exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_deep_vopr_tests = b.addRunArtifact(production_cluster_deep_vopr_tests);
     const production_cluster_graph_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane graph exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_vopr_tests = b.addRunArtifact(production_cluster_graph_vopr_tests);
     const production_cluster_graph_split_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane graph active split exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_vopr_tests = b.addRunArtifact(production_cluster_graph_split_vopr_tests);
     const production_cluster_graph_split_transport_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane graph active split transport failure exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_transport_vopr_tests = b.addRunArtifact(production_cluster_graph_split_transport_vopr_tests);
     const production_cluster_graph_split_owner_restart_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane graph active split owner restart exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_owner_restart_vopr_tests = b.addRunArtifact(production_cluster_graph_split_owner_restart_vopr_tests);
     const production_cluster_graph_split_partial_write_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane graph active split partial write exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_partial_write_vopr_tests = b.addRunArtifact(production_cluster_graph_split_partial_write_vopr_tests);
     const production_cluster_graph_split_resource_pressure_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane graph active split resource pressure exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_resource_pressure_vopr_tests = b.addRunArtifact(production_cluster_graph_split_resource_pressure_vopr_tests);
     const production_cluster_join_split_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane distributed join active split exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_join_split_vopr_tests = b.addRunArtifact(production_cluster_join_split_vopr_tests);
     const production_cluster_durable_join_takeover_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane durable shuffle join finalizer takeover exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_takeover_vopr_tests = b.addRunArtifact(production_cluster_durable_join_takeover_vopr_tests);
     const production_cluster_durable_join_cancellation_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production durable shuffle join cancellation exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_cancellation_vopr_tests = b.addRunArtifact(production_cluster_durable_join_cancellation_vopr_tests);
     const production_cluster_durable_join_worker_retry_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production durable shuffle partition worker failover exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_worker_retry_vopr_tests = b.addRunArtifact(production_cluster_durable_join_worker_retry_vopr_tests);
     const production_cluster_durable_join_owner_restart_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production durable shuffle partition owner reconstruction exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_owner_restart_vopr_tests = b.addRunArtifact(production_cluster_durable_join_owner_restart_vopr_tests);
     const production_cluster_durable_join_retry_exhaustion_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production durable shuffle overlapping fault retry exhaustion exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_retry_exhaustion_vopr_tests = b.addRunArtifact(production_cluster_durable_join_retry_exhaustion_vopr_tests);
     const production_cluster_durable_join_cancellation_overlap_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production durable shuffle cancellation under overlapping faults exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_cancellation_overlap_vopr_tests = b.addRunArtifact(production_cluster_durable_join_cancellation_overlap_vopr_tests);
     const production_cluster_durable_join_cancellation_owner_restart_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production durable shuffle cancellation with owner reconstruction exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_durable_join_cancellation_owner_restart_vopr_tests = b.addRunArtifact(production_cluster_durable_join_cancellation_owner_restart_vopr_tests);
     const production_cluster_graph_split_overlapping_faults_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane graph active split overlapping link resource faults exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_overlapping_faults_vopr_tests = b.addRunArtifact(production_cluster_graph_split_overlapping_faults_vopr_tests);
     const production_cluster_graph_split_socket_pressure_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane graph active split socket pressure exact replay"},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_graph_split_socket_pressure_vopr_tests = b.addRunArtifact(production_cluster_graph_split_socket_pressure_vopr_tests);
     // Stackful VoprIo fibers do not use Zig's persistent std.zig.Server test
@@ -7705,6 +7722,7 @@ pub fn build(b: *std.Build) void {
         run_production_cluster_graph_split_overlapping_faults_vopr_tests,
         run_production_cluster_graph_split_socket_pressure_vopr_tests,
         run_production_cluster_service_rate_vopr_tests,
+        run_production_cluster_query_cache_service_rate_vopr_tests,
         run_production_cluster_graph_hydration_vopr_tests,
         run_production_cluster_graph_cancellation_vopr_tests,
         run_production_cluster_graph_cancellation_transport_vopr_tests,
@@ -7814,7 +7832,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_graph_split_socket_pressure_vopr_test_step.dependOn(&run_production_cluster_graph_split_socket_pressure_vopr_tests.step);
     const production_cluster_vopr_test_step = b.step(
         "production-cluster-vopr-test",
-        "Run every focused production DataServer cluster history through v40",
+        "Run every focused production DataServer cluster history through v41",
     );
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_deep_test_step);
@@ -7835,6 +7853,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_overlapping_faults_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_socket_pressure_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_service_rate_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_query_cache_service_rate_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_hydration_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_cancellation_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_cancellation_transport_vopr_test_step);

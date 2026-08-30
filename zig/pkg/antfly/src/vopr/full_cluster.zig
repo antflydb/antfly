@@ -8,8 +8,10 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
+const cache_budget = @import("../common/cache_budget.zig");
 const data_runtime = @import("../data/runtime.zig");
 const distributed_graph = @import("../api/distributed_graph.zig");
+const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
 const metadata_sim = @import("../metadata/sim_harness.zig");
 const production_cluster = @import("production_cluster.zig");
 const serverless_workflow = @import("serverless_workflow.zig");
@@ -18,7 +20,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 40;
+    pub const version: u32 = 41;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -41,6 +43,7 @@ pub const Scenario = struct {
     const production_overlapping_faults_id = vopr.id.stable(name, "production-graph-overlapping-link-resource-faults-recover");
     const production_socket_pressure_id = vopr.id.stable(name, "production-listener-socket-pressure-recovers-during-split");
     const production_service_rate_id = vopr.id.stable(name, "production-service-rates-compose-and-heal");
+    const production_query_cache_service_rate_id = vopr.id.stable(name, "production-query-embedding-cache-service-rates-compose-and-heal");
     const production_graph_hydration_id = vopr.id.stable(name, "production-public-graph-hydrates-documents");
     const production_graph_cancellation_id = vopr.id.stable(name, "production-public-graph-cancellation-drains-fanout");
     const production_graph_cancellation_transport_id = vopr.id.stable(name, "production-public-graph-cancellation-under-transport-fault");
@@ -86,6 +89,7 @@ pub const Scenario = struct {
         .{ .id = production_overlapping_faults_id, .name = name ++ ".production-graph-overlapping-link-resource-faults-recover", .kind = .always },
         .{ .id = production_socket_pressure_id, .name = name ++ ".production-listener-socket-pressure-recovers-during-split", .kind = .always },
         .{ .id = production_service_rate_id, .name = name ++ ".production-service-rates-compose-and-heal", .kind = .always },
+        .{ .id = production_query_cache_service_rate_id, .name = name ++ ".production-query-embedding-cache-service-rates-compose-and-heal", .kind = .always },
         .{ .id = production_graph_hydration_id, .name = name ++ ".production-public-graph-hydrates-documents", .kind = .always },
         .{ .id = production_graph_cancellation_id, .name = name ++ ".production-public-graph-cancellation-drains-fanout", .kind = .always },
         .{ .id = production_graph_cancellation_transport_id, .name = name ++ ".production-public-graph-cancellation-under-transport-fault", .kind = .always },
@@ -150,6 +154,7 @@ pub const Scenario = struct {
         production_data_plane_global_query_inflight_authorization_revocation,
         production_data_plane_global_query_transport_failure,
         production_data_plane_global_query_owner_restart,
+        production_data_plane_query_embedding_cache_service_rate,
 
         fn isProduction(self: Mode) bool {
             return self == .production_data_plane_baseline or
@@ -180,12 +185,13 @@ pub const Scenario = struct {
                 self == .production_data_plane_global_query_cancellation or
                 self == .production_data_plane_global_query_inflight_authorization_revocation or
                 self == .production_data_plane_global_query_transport_failure or
-                self == .production_data_plane_global_query_owner_restart;
+                self == .production_data_plane_global_query_owner_restart or
+                self == .production_data_plane_query_embedding_cache_service_rate;
         }
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_durable_join_owner_restart, .production_data_plane_durable_join_retry_exhaustion, .production_data_plane_durable_join_cancellation_overlapping_faults, .production_data_plane_durable_join_cancellation_owner_restart, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation, .production_data_plane_global_query_inflight_authorization_revocation, .production_data_plane_global_query_transport_failure, .production_data_plane_global_query_owner_restart => .clean,
+                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_durable_join_owner_restart, .production_data_plane_durable_join_retry_exhaustion, .production_data_plane_durable_join_cancellation_overlapping_faults, .production_data_plane_durable_join_cancellation_owner_restart, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation, .production_data_plane_global_query_inflight_authorization_revocation, .production_data_plane_global_query_transport_failure, .production_data_plane_global_query_owner_restart, .production_data_plane_query_embedding_cache_service_rate => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -244,6 +250,7 @@ pub const Scenario = struct {
             vopr.id.stable(name, "production-data-plane-global-query-inflight-authorization-revocation"),
             vopr.id.stable(name, "production-data-plane-global-query-transport-failure"),
             vopr.id.stable(name, "production-data-plane-global-query-owner-restart"),
+            vopr.id.stable(name, "production-data-plane-query-embedding-cache-service-rate"),
         };
     };
     const mode_names = [_][]const u8{
@@ -285,6 +292,7 @@ pub const Scenario = struct {
         name ++ ".production-data-plane-global-query-inflight-authorization-revocation",
         name ++ ".production-data-plane-global-query-transport-failure",
         name ++ ".production-data-plane-global-query-owner-restart",
+        name ++ ".production-data-plane-query-embedding-cache-service-rate",
     };
 
     const production_baseline_ordinal: usize = @intFromEnum(Mode.production_data_plane_baseline);
@@ -316,6 +324,7 @@ pub const Scenario = struct {
     const production_global_query_authorization_ordinal: usize = @intFromEnum(Mode.production_data_plane_global_query_inflight_authorization_revocation);
     const production_global_query_transport_ordinal: usize = @intFromEnum(Mode.production_data_plane_global_query_transport_failure);
     const production_global_query_owner_restart_ordinal: usize = @intFromEnum(Mode.production_data_plane_global_query_owner_restart);
+    const production_query_cache_service_rate_ordinal: usize = @intFromEnum(Mode.production_data_plane_query_embedding_cache_service_rate);
 
     const metadata_role = vopr.id.stable(name, "role.metadata");
     const public_data_role = vopr.id.stable(name, "role.public-data");
@@ -567,6 +576,11 @@ pub const Scenario = struct {
     const enrichment_operation = vopr.service_rate.Operation.named(name ++ ".serverless-enrichment", 70);
     const compaction_operation = vopr.service_rate.Operation.named(name ++ ".serverless-compaction", 80);
     const prune_operation = vopr.service_rate.Operation.named(name ++ ".serverless-prune", 90);
+    const query_cache_request_operation = vopr.service_rate.Operation.named(name ++ ".query-cache-request", 2);
+    const query_cache_hit_copy_operation = vopr.service_rate.Operation.named(name ++ ".query-cache-hit-copy", 1);
+    const query_cache_coalesced_wait_operation = vopr.service_rate.Operation.named(name ++ ".query-cache-coalesced-wait", 3);
+    const query_cache_producer_operation = vopr.service_rate.Operation.named(name ++ ".query-cache-producer-compute", 5);
+    const query_cache_key: query_embedding_cache.Key = [_]u8{0x41} ** 32;
     const service_nodes = [_]vopr.service_rate.Node{
         .{ .id = deployment_node_ids[0], .name = name ++ ".node.1" },
         .{ .id = deployment_node_ids[1], .name = name ++ ".node.2" },
@@ -583,6 +597,10 @@ pub const Scenario = struct {
         enrichment_operation,
         compaction_operation,
         prune_operation,
+        query_cache_request_operation,
+        query_cache_hit_copy_operation,
+        query_cache_coalesced_wait_operation,
+        query_cache_producer_operation,
     };
 
     const CostAccounting = struct {
@@ -673,6 +691,29 @@ pub const Scenario = struct {
         }
     };
 
+    const QueryCacheServiceRateAdapter = struct {
+        port: vopr.service_rate.Port,
+        healed: *const bool,
+        accounting: CostAccounting = .{},
+
+        fn iface(self: *@This()) query_embedding_cache.WorkCostPort {
+            return .{ .ptr = self, .charge_fn = charge };
+        }
+
+        fn charge(ptr: *anyopaque, kind: query_embedding_cache.WorkKind, units: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const was_healed = self.healed.*;
+            const operation = switch (kind) {
+                .request => query_cache_request_operation,
+                .hit_copy => query_cache_hit_copy_operation,
+                .coalesced_wait => query_cache_coalesced_wait_operation,
+                .producer_compute => query_cache_producer_operation,
+            };
+            const charged = try self.port.charge(operation.id, units);
+            self.accounting.record(was_healed, operation.base_cost_ns, units, charged);
+        }
+    };
+
     const State = struct {
         owner_alloc: std.mem.Allocator,
         fixture_allocator: FixtureAllocator,
@@ -681,6 +722,9 @@ pub const Scenario = struct {
         data_service_rate_adapters: [3]DataServiceRateAdapter,
         graph_service_rate_adapters: [3]GraphServiceRateAdapter,
         serverless_service_rate_adapter: ServerlessServiceRateAdapter,
+        query_cache_service_rate_adapter: QueryCacheServiceRateAdapter,
+        query_cache_budget: cache_budget.CacheBudget,
+        query_cache: query_embedding_cache.QueryEmbeddingCache,
         service_rates_enabled: bool = false,
         service_rates_healed: bool = false,
         public_cluster: ?*metadata_sim.VoprPublicClusterFixture = null,
@@ -689,6 +733,7 @@ pub const Scenario = struct {
         serverless: *serverless_workflow.Scenario.Fixture,
         initialization_future: ?std.Io.Future(void) = null,
         serverless_future: ?std.Io.Future(void) = null,
+        query_cache_future: ?std.Io.Future(void) = null,
         completion_future: ?std.Io.Future(void) = null,
         mode: ?Mode = null,
         initialization_done: bool = false,
@@ -698,6 +743,14 @@ pub const Scenario = struct {
         serverless_sound: bool = false,
         serverless_public_sound: bool = false,
         serverless_public_error_code: u64 = 0,
+        query_cache_compute_release: std.Io.Event = .unset,
+        query_cache_producer_started: bool = false,
+        query_cache_pre_heal_done: bool = false,
+        query_cache_done: bool = false,
+        query_cache_sound: bool = false,
+        query_cache_error_code: u64 = 0,
+        query_cache_compute_calls: u64 = 0,
+        query_cache_successful_results: u64 = 0,
         shared_io_sound: bool = false,
         deployment_sound: bool = false,
         complete: bool = false,
@@ -744,6 +797,26 @@ pub const Scenario = struct {
                 .port = try self.service_rate_model.port(self.sim.io(), service_nodes[3].id),
                 .healed = &self.service_rates_healed,
             };
+            self.query_cache_service_rate_adapter = .{
+                // Production query caches are ApiHttpServer-owned. Place this
+                // production cache instance in node 1's public/DataServer
+                // process domain so its costs compose with that owner's Raft,
+                // LSM, and graph work rather than inventing a cache-only node.
+                .port = try self.service_rate_model.port(self.sim.io(), service_nodes[0].id),
+                .healed = &self.service_rates_healed,
+            };
+            const query_cache_charge = query_embedding_cache.QueryEmbeddingCache.entryChargeBytes(3);
+            self.query_cache_budget = cache_budget.CacheBudget.init(query_cache_charge * 2);
+            self.query_cache = query_embedding_cache.QueryEmbeddingCache.init(
+                fixture_alloc,
+                self.sim.io(),
+                .{
+                    .max_bytes = query_cache_charge * 2,
+                    .ttl_ns = std.math.maxInt(u64),
+                    .max_inflight = 1,
+                },
+            );
+            errdefer self.query_cache.deinit(&self.query_cache_budget);
             self.serverless = try serverless_workflow.Scenario.Fixture.initWithVoprIo(fixture_alloc, &self.sim);
             errdefer self.serverless.deinit();
             self.mode = null;
@@ -751,6 +824,7 @@ pub const Scenario = struct {
             self.production_cluster = null;
             self.deployment = null;
             self.serverless_future = null;
+            self.query_cache_future = null;
             self.completion_future = null;
             self.initialization_done = false;
             self.initialization_failed = false;
@@ -759,6 +833,14 @@ pub const Scenario = struct {
             self.serverless_sound = false;
             self.serverless_public_sound = false;
             self.serverless_public_error_code = 0;
+            self.query_cache_compute_release = .unset;
+            self.query_cache_producer_started = false;
+            self.query_cache_pre_heal_done = false;
+            self.query_cache_done = false;
+            self.query_cache_sound = false;
+            self.query_cache_error_code = 0;
+            self.query_cache_compute_calls = 0;
+            self.query_cache_successful_results = 0;
             self.shared_io_sound = false;
             self.deployment_sound = false;
             self.complete = false;
@@ -769,6 +851,11 @@ pub const Scenario = struct {
 
         fn deinit(self: *State) void {
             self.tearing_down = true;
+            // Producer compute is an intentionally uncancelable production
+            // callback boundary. Release it before draining so a bounded run
+            // cannot strand the cache flight during teardown.
+            if (!self.query_cache_compute_release.isSet())
+                self.query_cache_compute_release.set(self.sim.io());
             if (self.production_cluster) |fixture| fixture.beginTeardown();
             if (self.public_cluster) |fixture| fixture.beginTeardown();
             _ = self.sim.cancelAndDrainTasksForTeardown(
@@ -786,6 +873,10 @@ pub const Scenario = struct {
                 future.cancel(self.sim.io());
                 self.serverless_future = null;
             }
+            if (self.query_cache_future) |*future| {
+                future.cancel(self.sim.io());
+                self.query_cache_future = null;
+            }
             if (self.initialization_future) |*future| {
                 future.cancel(self.sim.io());
                 self.initialization_future = null;
@@ -794,6 +885,7 @@ pub const Scenario = struct {
             self.serverless.deinit();
             if (self.public_cluster) |fixture| fixture.deinit();
             if (self.production_cluster) |fixture| fixture.deinit();
+            self.query_cache.deinit(&self.query_cache_budget);
             self.service_rate_model.deinit();
             self.sim.deinit();
             std.debug.assert(self.fixture_allocator.deinit() == .ok);
@@ -823,6 +915,8 @@ pub const Scenario = struct {
                 .graph = graph_ports,
             });
             self.serverless.setWorkCostPort(self.serverless_service_rate_adapter.iface());
+            if (self.mode == .production_data_plane_query_embedding_cache_service_rate)
+                self.query_cache.setWorkCostPort(self.query_cache_service_rate_adapter.iface());
         }
 
         fn healServiceRates(self: *State) void {
@@ -831,8 +925,9 @@ pub const Scenario = struct {
             self.service_rates_healed = true;
         }
 
-        fn serviceRatesSound(self: *const State) bool {
+        fn serviceRatesSound(self: *State) bool {
             if (!self.service_rates_enabled) return true;
+            const query_cache_required = self.mode == .production_data_plane_query_embedding_cache_service_rate;
             var data_pre: u64 = 0;
             var data_post: u64 = 0;
             var graph_post: u64 = 0;
@@ -846,11 +941,113 @@ pub const Scenario = struct {
                 graph_post +|= adapter.accounting.post_heal_units;
                 accounting_sound = accounting_sound and adapter.accounting.sound;
             }
+            if (query_cache_required)
+                accounting_sound = accounting_sound and self.query_cache_service_rate_adapter.accounting.sound;
             return self.service_rates_healed and
                 self.service_rate_model.activeEffectCount() == 0 and
                 data_pre > 0 and data_post > 0 and graph_post > 0 and
                 self.serverless_service_rate_adapter.accounting.pre_heal_units > 0 and
+                (!query_cache_required or
+                    (self.query_cache_service_rate_adapter.accounting.pre_heal_units == 4 and
+                        self.query_cache_service_rate_adapter.accounting.post_heal_units == 4 and
+                        self.queryCacheSound())) and
                 accounting_sound;
+        }
+
+        fn queryCacheSound(self: *State) bool {
+            if (self.mode != .production_data_plane_query_embedding_cache_service_rate) return true;
+            const stats = self.query_cache.stats(&self.query_cache_budget);
+            const budget_stats = self.query_cache_budget.stats();
+            return self.query_cache_done and self.query_cache_sound and
+                self.query_cache_error_code == 0 and
+                self.query_cache_compute_calls == 1 and
+                self.query_cache_successful_results == 3 and
+                stats.hits == 1 and stats.misses == 1 and
+                stats.coalesced_waiters == 1 and stats.producer_computations == 1 and
+                stats.inflight == 0 and stats.entries == 1 and
+                budget_stats.used_bytes == query_embedding_cache.QueryEmbeddingCache.entryChargeBytes(3);
+        }
+
+        fn computeQueryEmbedding(ptr: *anyopaque, allocator: std.mem.Allocator) ![]f32 {
+            const self: *State = @ptrCast(@alignCast(ptr));
+            self.query_cache_compute_calls +|= 1;
+            self.query_cache_producer_started = true;
+            self.query_cache_compute_release.waitUncancelable(self.sim.io());
+            return try allocator.dupe(f32, &.{ 1, 2, 3 });
+        }
+
+        fn fetchQueryEmbedding(self: *State) !void {
+            const result = try self.query_cache.getOrCompute(
+                &self.query_cache_budget,
+                self.fixture_allocator.allocator(),
+                query_cache_key,
+                null,
+                self,
+                computeQueryEmbedding,
+            );
+            defer self.fixture_allocator.allocator().free(result);
+            if (!std.mem.eql(f32, result, &.{ 1, 2, 3 }))
+                return error.InvalidFullClusterQueryEmbedding;
+            self.query_cache_successful_results +|= 1;
+        }
+
+        fn runQueryCacheProducer(self: *State) void {
+            self.fetchQueryEmbedding() catch |err| {
+                self.query_cache_sound = false;
+                self.query_cache_error_code = @intFromError(err);
+            };
+        }
+
+        fn runQueryCacheWaiter(self: *State) void {
+            self.fetchQueryEmbedding() catch |err| {
+                self.query_cache_sound = false;
+                self.query_cache_error_code = @intFromError(err);
+            };
+        }
+
+        fn runQueryCache(self: *State) void {
+            defer {
+                // Also releases runServerless if an unexpected cache error
+                // occurs before the intended coalesced-wait boundary.
+                self.query_cache_pre_heal_done = true;
+                self.query_cache_done = true;
+            }
+            self.query_cache_sound = true;
+            self.runQueryCacheInner() catch |err| {
+                self.query_cache_sound = false;
+                self.query_cache_error_code = @intFromError(err);
+            };
+        }
+
+        fn runQueryCacheInner(self: *State) !void {
+            var producer = self.sim.io().async(runQueryCacheProducer, .{self});
+            while (!self.query_cache_producer_started)
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+
+            var waiter = self.sim.io().async(runQueryCacheWaiter, .{self});
+            // `waiter started` is not a sufficient boundary when its request
+            // charge itself yields. Observe the production cache's flight
+            // ledger so healing cannot race ahead of actual coalescing.
+            while (self.query_cache.stats(&self.query_cache_budget).coalesced_waiters == 0)
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+            self.query_cache_pre_heal_done = true;
+            self.query_cache_compute_release.set(self.sim.io());
+            producer.await(self.sim.io());
+            waiter.await(self.sim.io());
+
+            while (!self.service_rates_healed)
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+            try self.fetchQueryEmbedding();
+            self.query_cache_sound = self.query_cache_sound and self.queryCacheSoundBeforeDone();
+        }
+
+        fn queryCacheSoundBeforeDone(self: *State) bool {
+            const stats = self.query_cache.stats(&self.query_cache_budget);
+            return self.query_cache_compute_calls == 1 and
+                self.query_cache_successful_results == 3 and
+                stats.hits == 1 and stats.misses == 1 and
+                stats.coalesced_waiters == 1 and stats.producer_computations == 1 and
+                stats.inflight == 0 and stats.entries == 1;
         }
 
         fn clusterHealth(self: *State) ?ClusterHealth {
@@ -1077,13 +1274,15 @@ pub const Scenario = struct {
                     self.complete = true;
                     return;
                 };
-                if (mode == .production_data_plane_service_rate) self.enableServiceRates() catch |err| {
-                    self.initialization_failed = true;
-                    self.initialization_error_code = @intFromError(err);
-                    self.initialization_done = true;
-                    self.complete = true;
-                    return;
-                };
+                if (mode == .production_data_plane_service_rate or
+                    mode == .production_data_plane_query_embedding_cache_service_rate)
+                    self.enableServiceRates() catch |err| {
+                        self.initialization_failed = true;
+                        self.initialization_error_code = @intFromError(err);
+                        self.initialization_done = true;
+                        self.complete = true;
+                        return;
+                    };
                 self.production_cluster.?.setActiveSplitEnabled(
                     mode == .production_data_plane or
                         mode == .production_data_plane_graph_split or
@@ -1099,6 +1298,7 @@ pub const Scenario = struct {
                 self.production_cluster.?.setGraphEnabled(
                     mode == .production_data_plane_graph or
                         mode == .production_data_plane_service_rate or
+                        mode == .production_data_plane_query_embedding_cache_service_rate or
                         mode == .production_data_plane_graph_hydration or
                         mode == .production_data_plane_graph_cancellation or
                         mode == .production_data_plane_graph_cancellation_transport_failure or
@@ -1253,12 +1453,23 @@ pub const Scenario = struct {
                 };
             }
             self.serverless_future = self.sim.io().async(runServerless, .{self});
+            if (mode == .production_data_plane_query_embedding_cache_service_rate)
+                self.query_cache_future = self.sim.io().async(runQueryCache, .{self});
             self.completion_future = self.sim.io().async(waitForCompletion, .{self});
             self.initialization_done = true;
         }
 
         fn runServerless(self: *State) void {
             defer {
+                if (self.mode == .production_data_plane_query_embedding_cache_service_rate) {
+                    // Keep the node slowdown active until the cache has paid
+                    // both same-key request costs and entered the coalesced
+                    // waiter path. This is a lifecycle boundary, not a chosen
+                    // scheduler outcome, so every exact replay proves the
+                    // same pre/post-heal contract.
+                    while (!self.query_cache_pre_heal_done and !self.tearing_down)
+                        self.sim.io().sleep(.fromMilliseconds(1), .awake) catch break;
+                }
                 self.serverless.stopPublicCatalog();
                 self.serverless_done = true;
                 self.healServiceRates();
@@ -1279,7 +1490,8 @@ pub const Scenario = struct {
 
         fn waitForCompletion(self: *State) void {
             while (!(if (self.production_cluster) |fixture| fixture.complete else self.public_cluster.?.complete) or
-                !self.serverless_done)
+                !self.serverless_done or
+                (self.mode == .production_data_plane_query_embedding_cache_service_rate and !self.query_cache_done))
             {
                 // Poll at the same logical cadence as the production Raft
                 // driver. A 1ns waiter becomes the globally earliest timer and
@@ -1498,7 +1710,7 @@ pub const Scenario = struct {
                         .activate = activateJoinCancellationOverlapFaults,
                     });
                 },
-                .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_join_split, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation, .production_data_plane_global_query_inflight_authorization_revocation => {},
+                .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_join_split, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation, .production_data_plane_global_query_inflight_authorization_revocation, .production_data_plane_query_embedding_cache_service_rate => {},
             }
         }
 
@@ -1694,6 +1906,17 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".service-rates-healed", @intFromBool(state.service_rates_healed));
         try builder.addNamed(allocator, name ++ ".service-rates-sound", @intFromBool(state.serviceRatesSound()));
         try builder.addNamed(allocator, name ++ ".service-rate-active-effects", @intCast(state.service_rate_model.activeEffectCount()));
+        const query_cache_stats = state.query_cache.stats(&state.query_cache_budget);
+        try builder.addNamed(allocator, name ++ ".query-cache-pre-heal-done", @intFromBool(state.query_cache_pre_heal_done));
+        try builder.addNamed(allocator, name ++ ".query-cache-done", @intFromBool(state.query_cache_done));
+        try builder.addNamed(allocator, name ++ ".query-cache-sound", @intFromBool(state.queryCacheSound()));
+        try builder.addNamed(allocator, name ++ ".query-cache-error", @intCast(state.query_cache_error_code));
+        try builder.addNamed(allocator, name ++ ".query-cache-compute-calls", @intCast(state.query_cache_compute_calls));
+        try builder.addNamed(allocator, name ++ ".query-cache-results", @intCast(state.query_cache_successful_results));
+        try builder.addNamed(allocator, name ++ ".query-cache-hits", @intCast(query_cache_stats.hits));
+        try builder.addNamed(allocator, name ++ ".query-cache-misses", @intCast(query_cache_stats.misses));
+        try builder.addNamed(allocator, name ++ ".query-cache-coalesced-waiters", @intCast(query_cache_stats.coalesced_waiters));
+        try builder.addNamed(allocator, name ++ ".query-cache-inflight", @intCast(query_cache_stats.inflight));
         try builder.addNamed(allocator, name ++ ".data-hosts", if (cluster) |snapshot| @intCast(snapshot.hosts) else 0);
         try builder.addNamed(allocator, name ++ ".public-requests-ok", @intFromBool(if (cluster) |snapshot| snapshot.requests_ok else false));
         try builder.addNamed(allocator, name ++ ".write-ok", @intFromBool(if (production) |value| value.write_sound else if (fixture) |public_cluster| public_cluster.write_sound else false));
@@ -1889,6 +2112,7 @@ pub const Scenario = struct {
         const production_mode = state.mode != null and state.mode.?.isProduction();
         const production_graph_mode = state.mode == .production_data_plane_graph or
             state.mode == .production_data_plane_service_rate or
+            state.mode == .production_data_plane_query_embedding_cache_service_rate or
             state.mode == .production_data_plane_graph_hydration or
             state.mode == .production_data_plane_graph_cancellation or
             state.mode == .production_data_plane_graph_cancellation_transport_failure or
@@ -2169,7 +2393,12 @@ pub const Scenario = struct {
                 cluster.?.socket_pressure_no_ingress and cluster.?.socket_pressure_recovered and
                 cluster.?.post_split_graph_query_ok));
         try sink.check(allocator, production_service_rate_id, !state.complete or
-            state.mode.? != .production_data_plane_service_rate or state.serviceRatesSound());
+            (state.mode.? != .production_data_plane_service_rate and
+                state.mode.? != .production_data_plane_query_embedding_cache_service_rate) or
+            state.serviceRatesSound());
+        try sink.check(allocator, production_query_cache_service_rate_id, !state.complete or
+            state.mode.? != .production_data_plane_query_embedding_cache_service_rate or
+            state.queryCacheSound());
         try sink.check(allocator, production_graph_hydration_id, !state.complete or
             state.mode.? != .production_data_plane_graph_hydration or
             (cluster != null and cluster.?.graph_hydration_ok and
@@ -2254,10 +2483,15 @@ pub const Scenario = struct {
                 @as(u64, @intFromBool(if (fixture) |public_cluster| public_cluster.read_finished else false)) +
                 @as(u64, @intFromBool(if (fixture) |public_cluster| public_cluster.tenant_write_finished else false)) +
                 @as(u64, @intFromBool(if (fixture) |public_cluster| public_cluster.tenant_read_finished else false)) +
-                @as(u64, @intFromBool(state.serverless_done)),
+                @as(u64, @intFromBool(state.serverless_done)) +
+                @as(u64, @intFromBool(state.query_cache_done)),
             .recovery_expected = state.mode != null and state.mode.? != .clean,
             .recovery_complete = state.complete and cluster != null and cluster.?.topology_ok,
-            .consistency_valid = !state.initialization_failed and (cluster == null or cluster.?.requests_ok) and (!state.serverless_done or state.serverless_sound),
+            .consistency_valid = !state.initialization_failed and
+                (cluster == null or cluster.?.requests_ok) and
+                (!state.serverless_done or state.serverless_sound) and
+                (state.mode != .production_data_plane_query_embedding_cache_service_rate or
+                    !state.query_cache_done or state.queryCacheSound()),
             .cleanup_complete = state.complete and cluster != null and cluster.?.cleanup_ok,
         });
     }
@@ -2314,6 +2548,7 @@ fn runExactMode(
     const production_global_query_authorization_mode = mode_id == Scenario.mode_ids[Scenario.production_global_query_authorization_ordinal];
     const production_global_query_transport_mode = mode_id == Scenario.mode_ids[Scenario.production_global_query_transport_ordinal];
     const production_global_query_owner_restart_mode = mode_id == Scenario.mode_ids[Scenario.production_global_query_owner_restart_ordinal];
+    const production_query_cache_service_rate_mode = mode_id == Scenario.mode_ids[Scenario.production_query_cache_service_rate_ordinal];
     const production_mode = production_baseline_mode or production_graph_mode or
         production_split_mode or production_graph_split_mode or
         production_graph_split_transport_mode or production_graph_split_owner_restart_mode or
@@ -2329,7 +2564,8 @@ fn runExactMode(
         production_graph_inflight_authorization_mode or
         production_graph_stale_snapshot_mode or production_global_query_mode or
         production_global_query_cancellation_mode or production_global_query_authorization_mode or
-        production_global_query_transport_mode or production_global_query_owner_restart_mode;
+        production_global_query_transport_mode or production_global_query_owner_restart_mode or
+        production_query_cache_service_rate_mode;
     // Fault extensions of the promoted graph/split history keep its
     // cooperative scheduling seed. The prefixed mode remains distinct replay
     // truth, while comparable scheduling ensures the experiment changes the
@@ -2347,7 +2583,7 @@ fn runExactMode(
         Scenario.production_graph_split_transport_ordinal
     else if (production_graph_split_overlapping_faults_mode or production_graph_split_socket_pressure_mode)
         Scenario.production_graph_split_transport_ordinal
-    else if (production_service_rate_mode)
+    else if (production_service_rate_mode or production_query_cache_service_rate_mode)
         Scenario.production_graph_ordinal
     else if (production_graph_hydration_mode)
         Scenario.production_graph_ordinal
@@ -2375,7 +2611,9 @@ fn runExactMode(
         .resource_budget = if (production_mode) 256 else 96,
         .backend_ids = &backend_ids,
         .source_revision = if (production_mode)
-            (if (production_global_query_owner_restart_mode)
+            (if (production_query_cache_service_rate_mode)
+                "full-cluster-vopr-v41-query-embedding-cache-service-rate"
+            else if (production_global_query_owner_restart_mode)
                 "full-cluster-vopr-v40-public-global-query-owner-restart"
             else if (production_global_query_transport_mode)
                 "full-cluster-vopr-v39-public-global-query-transport-failure"
@@ -2744,6 +2982,19 @@ test "full cluster production service rates compose heal and exact replay" {
         Scenario.mode_ids[ordinal],
         ordinal,
         90_000,
+        .complete,
+    );
+}
+
+test "full cluster production query embedding cache service rates compose heal and exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.production_query_cache_service_rate_ordinal;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        120_000,
         .complete,
     );
 }
