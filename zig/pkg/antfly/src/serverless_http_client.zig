@@ -570,14 +570,14 @@ pub const ServerlessHttpClient = struct {
         base_uri: []const u8,
         req: serverless.TableIngestBatchRequest,
     ) !TableIngestBatchResult {
-        const path = try std.fmt.allocPrint(self.alloc, "/tables/{s}/ingest-batch", .{req.table_name});
-        defer self.alloc.free(path);
-
-        const body = try self.stringifyRequestAlloc(serverless.TableIngestBatchBody{
+        const body = try (serverless.TableIngestBatchBody{
             .timestamp_ns = req.timestamp_ns,
             .mutations = req.mutations,
-        });
+        }).stringifyAlloc(self.alloc);
         defer self.alloc.free(body);
+
+        const path = try std.fmt.allocPrint(self.alloc, "/tables/{s}/ingest-batch", .{req.table_name});
+        defer self.alloc.free(path);
 
         return try self.requestJsonValue(TableIngestBatchResult, .PUT, base_uri, path, body);
     }
@@ -1148,10 +1148,10 @@ test "serverless http client serializes canonical table mutation variants" {
         try serverless.TableIngestMutation.initUpsert("doc-a", "{\"body\":\"alpha\"}"),
         serverless.TableIngestMutation.initDelete("doc-b"),
     };
-    const body = try client.stringifyRequestAlloc(serverless.TableIngestBatchBody{
+    const body = try (serverless.TableIngestBatchBody{
         .timestamp_ns = 1,
         .mutations = &mutations,
-    });
+    }).stringifyAlloc(alloc);
     defer alloc.free(body);
 
     try ant_json.testing.expectEqualJsonText(alloc,
@@ -1160,6 +1160,19 @@ test "serverless http client serializes canonical table mutation variants" {
     try std.testing.expectError(
         error.InvalidDocumentMutation,
         serverless.TableIngestMutation.initUpsert("doc-c", "plain text"),
+    );
+
+    const invalid_mutations = [_]serverless.TableIngestMutation{.{ .upsert = .{
+        .doc_id = "doc-d",
+        .document = .{ .bytes = "plain text" },
+    } }};
+    try std.testing.expectError(
+        error.InvalidDocumentMutation,
+        client.ingestTableBatch("", .{
+            .table_name = "docs",
+            .timestamp_ns = 2,
+            .mutations = &invalid_mutations,
+        }),
     );
 }
 

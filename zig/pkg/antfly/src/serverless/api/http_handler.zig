@@ -898,17 +898,19 @@ pub const HttpHandler = struct {
             return try textResponse(self.alloc, 429, "table backpressured");
         }
 
-        var parsed = ant_json.parseFromSlice(api_types.TableIngestBatchBody, self.alloc, body, .{}) catch |err| switch (err) {
+        var parsed = ant_json.parseFromSlice(api_types.TableIngestBatchInputBody, self.alloc, body, .{}) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            error.UnexpectedToken => return try textResponse(
+            else => return try textResponse(self.alloc, 400, "invalid ingest request"),
+        };
+        defer parsed.deinit();
+        const mutations = lowerTableIngestMutationsAlloc(self.alloc, parsed.value.mutations) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.InvalidDocumentMutation => return try textResponse(
                 self.alloc,
                 400,
                 "upserts require an object document and deletes must omit document",
             ),
-            else => return try textResponse(self.alloc, 400, "invalid ingest request"),
         };
-        defer parsed.deinit();
-        const mutations = try lowerTableIngestMutationsAlloc(self.alloc, parsed.value.mutations);
         defer self.alloc.free(mutations);
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
@@ -7117,19 +7119,26 @@ fn parseIngestBatchRequest(alloc: Allocator, namespace: []const u8, body: []cons
 
 fn lowerTableIngestMutationsAlloc(
     alloc: Allocator,
-    public_mutations: []const api_types.TableIngestMutation,
+    input_mutations: []const api_types.TableIngestMutationInput,
 ) ![]api_types.DocumentMutation {
-    const mutations = try alloc.alloc(api_types.DocumentMutation, public_mutations.len);
-    for (public_mutations, 0..) |mutation, idx| {
-        mutations[idx] = switch (mutation) {
-            .upsert => |upsert| .{
-                .kind = .upsert,
-                .doc_id = upsert.doc_id,
-                .body = upsert.document.bytes,
+    const mutations = try alloc.alloc(api_types.DocumentMutation, input_mutations.len);
+    errdefer alloc.free(mutations);
+    for (input_mutations, 0..) |mutation, idx| {
+        mutations[idx] = switch (mutation.kind) {
+            .upsert => switch (mutation.document) {
+                .object => |document| .{
+                    .kind = .upsert,
+                    .doc_id = mutation.doc_id,
+                    .body = document.bytes,
+                },
+                .absent, .null_value, .non_object => return error.InvalidDocumentMutation,
             },
-            .delete => |delete| .{
-                .kind = .delete,
-                .doc_id = delete.doc_id,
+            .delete => switch (mutation.document) {
+                .absent => .{
+                    .kind = .delete,
+                    .doc_id = mutation.doc_id,
+                },
+                .null_value, .object, .non_object => return error.InvalidDocumentMutation,
             },
         };
     }
@@ -7138,7 +7147,7 @@ fn lowerTableIngestMutationsAlloc(
 
 test "serverless public table mutation admission lowers embedded object documents without copying" {
     const alloc = std.testing.allocator;
-    var valid = try ant_json.parseFromSlice(api_types.TableIngestBatchBody, alloc,
+    var valid = try ant_json.parseFromSlice(api_types.TableIngestBatchInputBody, alloc,
         \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":{"body":"alpha"}},{"kind":"delete","doc_id":"doc-b"}]}
     , .{});
     defer valid.deinit();
@@ -7146,7 +7155,7 @@ test "serverless public table mutation admission lowers embedded object document
     defer alloc.free(mutations);
     try std.testing.expectEqual(@as(usize, 2), mutations.len);
     try std.testing.expectEqualStrings("{\"body\":\"alpha\"}", mutations[0].body.?);
-    try std.testing.expect(mutations[0].body.?.ptr == valid.value.mutations[0].upsert.document.bytes.ptr);
+    try std.testing.expect(mutations[0].body.?.ptr == valid.value.mutations[0].document.object.bytes.ptr);
 
     inline for (.{
         \\{"timestamp_ns":1,"mutations":[{"kind":"upsert","doc_id":"doc-a","document":"plain text"}]}
@@ -7162,11 +7171,18 @@ test "serverless public table mutation admission lowers embedded object document
         \\{"timestamp_ns":1,"mutations":[{"kind":"delete","doc_id":"doc-a","document":{}}]}
         ,
     }) |invalid| {
+        var parsed = try ant_json.parseFromSlice(api_types.TableIngestBatchInputBody, alloc, invalid, .{});
+        defer parsed.deinit();
         try std.testing.expectError(
-            error.UnexpectedToken,
-            ant_json.parseFromSlice(api_types.TableIngestBatchBody, alloc, invalid, .{}),
+            error.InvalidDocumentMutation,
+            lowerTableIngestMutationsAlloc(alloc, parsed.value.mutations),
         );
     }
+
+    try std.testing.expectError(
+        error.UnexpectedToken,
+        ant_json.parseFromSlice(api_types.TableIngestBatchInputBody, alloc, "[]", .{}),
+    );
 }
 
 fn parseEnsureNamespaceRequest(alloc: Allocator, body: []const u8) !api_types.EnsureNamespaceRequest {
@@ -11256,6 +11272,15 @@ test "http handler resolves table routes through persisted serving namespace map
         "upserts require an object document and deletes must omit document",
         invalid_ingest.body,
     );
+
+    var malformed_ingest = try handler.handle(.{
+        .method = .put,
+        .path = "/tables/docs/ingest-batch",
+        .body = "[]",
+    });
+    defer malformed_ingest.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), malformed_ingest.status);
+    try std.testing.expectEqualStrings("invalid ingest request", malformed_ingest.body);
 
     var ingest = try handler.handle(.{
         .method = .put,
