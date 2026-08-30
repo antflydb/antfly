@@ -527,6 +527,7 @@ pub const ArtifactRepairReason = enum {
     corrupt_artifact,
     unreadable_artifact,
     enrichment_failed,
+    resource_limit_exceeded,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -534,6 +535,7 @@ pub const ArtifactRepairReason = enum {
             .corrupt_artifact => "corrupt_artifact",
             .unreadable_artifact => "unreadable_artifact",
             .enrichment_failed => "enrichment_failed",
+            .resource_limit_exceeded => "resource_limit_exceeded",
         };
         try jw.write(s);
     }
@@ -548,6 +550,36 @@ pub const ArtifactRepairReason = enum {
             .{ "corrupt_artifact", .corrupt_artifact },
             .{ "unreadable_artifact", .unreadable_artifact },
             .{ "enrichment_failed", .enrichment_failed },
+            .{ "resource_limit_exceeded", .resource_limit_exceeded },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Whether artifact-backed index mutations are accepted now, temporarily fenced during a distributed rolling upgrade, or permanently unsupported by this deployment.
+pub const ArtifactSourcesCapabilityState = enum {
+    available,
+    upgrade_pending,
+    unsupported,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .available => "available",
+            .upgrade_pending => "upgrade_pending",
+            .unsupported => "unsupported",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "available", .available },
+            .{ "upgrade_pending", .upgrade_pending },
+            .{ "unsupported", .unsupported },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -924,6 +956,7 @@ pub const ClusterStatus = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
     storage: ?StorageRuntimeStatus = null,
@@ -937,6 +970,7 @@ pub const ClusterTopology = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
     storage: ?StorageRuntimeStatus = null,
@@ -1689,9 +1723,23 @@ pub const IncompleteDetails = struct {
     reason: []const u8,
 };
 
+/// A retryable index mutation failure, including a distributed artifact-source protocol fence or a temporarily unavailable model probe.
+pub const IndexMutationServiceUnavailableError = struct {
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
+/// Deployment-level index capabilities clients can inspect before submitting index mutations.
+pub const IndexRuntimeCapabilities = struct {
+    /// Whether full-text, embedding, and graph indexes may currently consume generated artifact streams through either single-source or multi-source request forms. Equivalent to artifact_sources_state=available.
+    artifact_sources: bool,
+    artifact_sources_state: ArtifactSourcesCapabilityState,
+};
+
 pub const IndexStatus = struct {
     shard_status: std.json.ArrayHashMap(antfly_indexes_openapi.IndexStats),
-    config: antfly_indexes_openapi.IndexConfig,
+    config: antfly_indexes_openapi.CreatedIndex,
     status: antfly_indexes_openapi.IndexStats,
 };
 
@@ -2273,7 +2321,18 @@ pub const QueryBuilderResult = struct {
     warnings: ?[]const []const u8 = null,
 };
 
-/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+/// A public filter or exclusion query contains an invalid or unsupported node.
+pub const QueryFilterError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    field: []const u8,
+    /// Stable name of the first invalid or unsupported filter node.
+    offending_node: []const u8,
+    retryable: bool,
+};
+
+/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit source-grouped result shape.
 pub const QueryHierarchy = struct {
     group_by: ?HierarchyGroupBy = null,
     ancestors: ?HierarchyAncestors = null,
@@ -2291,7 +2350,7 @@ pub const QueryHit = struct {
     /// Scores partitioned by index when using RRF search.
     _index_scores: ?std.json.Value = null,
     _source: ?std.json.Value = null,
-    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. Legacy rollup requests continue to use `chunks` instead of `matches`.
+    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. V0.2-compatible implicit rollup requests continue to use the deprecated `chunks` field instead of `matches`.
     hierarchy: ?QueryHitHierarchy = null,
     /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
     _sort: ?[]const std.json.Value = null,
@@ -2305,6 +2364,8 @@ pub const QueryHitHierarchy = struct {
     /// Unit identifier when the hit is attached to a document unit.
     parent_unit_id: ?[]const u8 = null,
     artifact: ?HierarchyArtifact = null,
+    /// Artifact member that supplied the score for a source-level grouped hit.
+    matched_artifact: ?HierarchyArtifact = null,
     ancestors: ?QueryHitHierarchyAncestors = null,
     evidence: ?HierarchyEvidence = null,
     /// Matching descendant hits attached by the canonical hierarchy.group_by request.
@@ -2313,7 +2374,7 @@ pub const QueryHitHierarchy = struct {
     position: ?[]const u8 = null,
     /// Composite source hierarchy revision to which the position and cursor are bound.
     revision: ?[]const u8 = null,
-    /// Legacy child chunk hits included for source-level rollups.
+    /// Deprecated child chunk hits included by the v0.2-compatible implicit source rollup.
     chunks: ?[]const HierarchyMatchHit = null,
 };
 
@@ -2397,11 +2458,13 @@ pub const QueryRequest = struct {
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?RawQuery = null,
+    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index. This selector is invalid without `full_text_search` or a scoring text clause in `query` and receives HTTP 422. This semantic relationship is enforced after the recursive query AST is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses from filter-only or exclusion-only trees.
+    full_text_index: ?[]const u8 = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
     /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
-    /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
+    /// Embedding index names selected for `semantic_search` or explicit `embeddings`. Dense and sparse indexes are supported when the corresponding query representation is supplied. Provisioned deployments require at least one index for `semantic_search`; serverless may infer its single published dense index when this field is omitted. When `embeddings` is supplied without this field, the embedding map keys select the indexes. Provisioned results from multiple indexes are merged using RRF. Serverless currently executes at most one dense and one sparse index per request; it rejects multiple same-kind selectors and omitted selectors when more than one corresponding index is published rather than choosing an index by catalog order.
     indexes: ?[]const []const u8 = null,
     /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
     filter_prefix: ?[]const u8 = null,
@@ -2854,11 +2917,13 @@ pub const RetrievalQueryRequest = struct {
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?RawQuery = null,
+    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index. This selector is invalid without `full_text_search` or a scoring text clause in `query` and receives HTTP 422. This semantic relationship is enforced after the recursive query AST is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses from filter-only or exclusion-only trees.
+    full_text_index: ?[]const u8 = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
     /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
-    /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
+    /// Embedding index names selected for `semantic_search` or explicit `embeddings`. Dense and sparse indexes are supported when the corresponding query representation is supplied. Provisioned deployments require at least one index for `semantic_search`; serverless may infer its single published dense index when this field is omitted. When `embeddings` is supplied without this field, the embedding map keys select the indexes. Provisioned results from multiple indexes are merged using RRF. Serverless currently executes at most one dense and one sparse index per request; it rejects multiple same-kind selectors and omitted selectors when more than one corresponding index is published rather than choosing an index by catalog order.
     indexes: ?[]const []const u8 = null,
     /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
     filter_prefix: ?[]const u8 = null,
@@ -3331,7 +3396,7 @@ pub const Table = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
-    indexes: std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig),
+    indexes: std.json.ArrayHashMap(antfly_indexes_openapi.CreatedIndex),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?antfly_schema_openapi.TableSchema = null,
     /// Present only when the table is migrating between schema versions. Absent means the table is stable.
@@ -3430,6 +3495,8 @@ pub const TableRepairIssue = struct {
     parent_doc_key: ?[]const u8 = null,
     /// Unit identifier for unit-scoped artifacts, when applicable.
     unit_id: ?[]const u8 = null,
+    /// Canonical artifact stream configured on the affected index. This is the authoritative source-readiness identity and is distinct from the producer input and the derived artifact being repaired.
+    index_source_artifact_name: ?[]const u8 = null,
     /// Source artifact stream used to produce this artifact, when applicable.
     source_artifact_name: ?[]const u8 = null,
     /// Derived artifact name that must be reprocessed or made readable.
@@ -3601,7 +3668,7 @@ pub const TableStatus = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
-    indexes: std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig),
+    indexes: std.json.ArrayHashMap(antfly_indexes_openapi.CreatedIndex),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?antfly_schema_openapi.TableSchema = null,
     /// Present only when the table is migrating between schema versions. Absent means the table is stable.
@@ -3898,6 +3965,41 @@ pub const TreeSearchConfig = struct {
     max_depth: ?i64 = null,
     /// Number of branches to explore at each level
     beam_width: ?i64 = null,
+};
+
+/// A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity.
+pub const UnsupportedHierarchyGroupingError = struct {
+    status: i32,
+    /// Stable machine-readable error code.
+    @"error": []const u8,
+    /// Human-readable remediation using only public query fields.
+    message: []const u8,
+    /// Stable reason the requested hierarchy level is unavailable.
+    reason: []const u8,
+    /// Public request field that selected the unsupported grouping level.
+    field: []const u8,
+    /// Select source grouping, omit group_by for direct members, or use an index whose every source is unit-backed.
+    action: []const u8,
+    /// Retrying the same request cannot succeed without changing its hierarchy grouping.
+    retryable: bool,
+};
+
+/// The requested index depends on a capability unavailable in the current deployment.
+pub const UnsupportedIndexCapabilityError = struct {
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
+/// A query requests an unsupported feature without a more specific structured diagnostic.
+pub const UnsupportedQueryError = struct {
+    status: i32,
+    /// Stable machine-readable error code.
+    @"error": []const u8,
+    /// Human-readable error summary.
+    message: []const u8,
+    /// Retrying the same request cannot succeed without changing it.
+    retryable: bool,
 };
 
 pub const UpdatePasswordRequest = struct {

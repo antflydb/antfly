@@ -396,6 +396,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidTableIndexMetadata => status(.invalid_argument, .invalid_table_index_metadata),
         error.InvalidEnrichmentConfig => status(.invalid_argument, .invalid_enrichment_config),
         error.UnsupportedQueryRequest => status(.unsupported, .unsupported_query_request),
+        error.UnsupportedHierarchyGrouping => status(.unsupported, .unsupported_query_request),
         error.UnsupportedFilterQueryRequest => status(.unsupported, .unsupported_filter_query_request),
         error.UnsupportedExclusionQueryRequest => status(.unsupported, .unsupported_exclusion_query_request),
         error.UnsupportedSyncLevel => status(.unsupported, .unsupported_sync_level),

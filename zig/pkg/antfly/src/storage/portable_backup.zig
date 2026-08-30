@@ -1846,17 +1846,49 @@ fn importEdgeBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !voi
 
 fn graphArtifactValueFromPortableEdgeValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
     if (enrichment_artifact_codec.decodeHeader(value)) |header| {
-        if (header.kind == .graph_edge) return try alloc.dupe(u8, value);
+        if (header.kind == .graph_edge) {
+            var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, value);
+            defer decoded.deinit(alloc);
+            return try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(
+                alloc,
+                decoded.weight,
+                decoded.created_at,
+                decoded.updated_at,
+                decoded.metadata_json,
+            );
+        }
     } else |_| {}
 
     if (value.len >= 24) {
         const weight = @as(f64, @bitCast(std.mem.readInt(u64, value[0..][0..8], .little)));
         const created_at = std.mem.readInt(u64, value[8..][0..8], .little);
         const updated_at = std.mem.readInt(u64, value[16..][0..8], .little);
-        return try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, weight, created_at, updated_at, value[24..]);
+        return try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(alloc, weight, created_at, updated_at, value[24..]);
     }
 
-    return try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 1.0, 0, 0, value);
+    return try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(alloc, 1.0, 0, 0, value);
+}
+
+test "portable graph conversion accepts generation-less v1 edge artifacts" {
+    const alloc = std.testing.allocator;
+    const legacy =
+        "AFENRCH\x00" ++
+        "\x01\x00\x05\x00" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x23\x00\x00\x00" ++
+        "\x00\x00\x00\x00\x00\x00\xf8\x3f" ++
+        "\x0a\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x14\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x07\x00\x00\x00{\"k\":1}";
+
+    const portable = try graphArtifactValueFromPortableEdgeValueAlloc(alloc, legacy);
+    defer alloc.free(portable);
+    try std.testing.expect(enrichment_artifact_codec.isPortableUnboundGraphEdge(portable));
+    var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, portable);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 0), decoded.generation);
+    try std.testing.expectEqual(@as(f64, 1.5), decoded.weight);
+    try std.testing.expectEqualStrings("{\"k\":1}", decoded.metadata_json);
 }
 
 /// Decode an edge batch payload (mirrors backup_codec.encodeEdgeBatch).
@@ -2645,7 +2677,7 @@ test "export and import graph edge artifacts round trip with arbitrary ids" {
 
     const edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, source_doc, "social\x00idx", "follows:fast", target_doc);
     defer alloc.free(edge_key);
-    const edge_val = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 2.5, 11, 22, "{\"ok\":true}");
+    const edge_val = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 1, 2.5, 11, 22, "{\"ok\":true}");
     defer alloc.free(edge_val);
     try src.putBatch(&.{.{ .key = edge_key, .value = edge_val }}, &.{});
 
@@ -2669,6 +2701,8 @@ test "export and import graph edge artifacts round trip with arbitrary ids" {
         defer alloc.free(val);
         var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, val);
         defer decoded.deinit(alloc);
+        try std.testing.expect(enrichment_artifact_codec.isPortableUnboundGraphEdge(val));
+        try std.testing.expectEqual(@as(u64, 0), decoded.generation);
         try std.testing.expectApproxEqAbs(@as(f64, 2.5), decoded.weight, 0.001);
         try std.testing.expectEqual(@as(u64, 11), decoded.created_at);
         try std.testing.expectEqual(@as(u64, 22), decoded.updated_at);

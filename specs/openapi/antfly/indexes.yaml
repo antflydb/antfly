@@ -82,6 +82,30 @@ components:
             $ref: "#/components/schemas/EnrichmentConfig"
           x-go-type-skip-optional-pointer: true
           description: "Inline managed enrichment definitions required by this index."
+    ArtifactIndexSource:
+      type: object
+      additionalProperties: false
+      required: [artifact]
+      description: "Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment."
+      properties:
+        artifact:
+          type: string
+          minLength: 1
+          description: "Stable name of a generated artifact stream."
+    FullTextArtifactIndexSource:
+      type: object
+      additionalProperties: false
+      required: [artifact]
+      description: "Textual artifact stream consumed by a full-text index, with an optional source-local projection."
+      properties:
+        artifact:
+          type: string
+          minLength: 1
+          description: "Stable name of a chunk or textual asset artifact stream. Artifact names must be unique within the index."
+        field:
+          type: string
+          minLength: 1
+          description: "Optional field selected from this artifact's records. When omitted, the index-level field is inherited; when both are omitted, Antfly indexes the default text projection."
     CreateFullTextIndexRequest:
       description: "Create a full-text index."
       allOf:
@@ -118,19 +142,22 @@ components:
     GraphArtifactSourceConfig:
       type: object
       additionalProperties: false
-      required: [kind, artifact]
-      description: "Artifact stream materialized into graph edges."
+      required: [artifact]
+      description: "Artifact stream materialized into graph edges. Each source artifact is limited to 16 MiB and 1,000,000 relation items so live apply, repair, split, and restore share one bounded admission contract. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are rejected by serverless deployments."
       properties:
-        kind:
-          type: string
-          enum: [artifact]
         artifact: { type: string, minLength: 1 }
-        path: { type: string }
+        path:
+          type: string
+          pattern: '^(\$|\$\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*(\[\*\])?)?$'
+          description: "Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`."
         format:
           type: string
           enum: [extraction_relation, extraction_graph]
           default: extraction_relation
         mention_edge_type: { type: string }
+        nodes: { $ref: "#/components/schemas/GraphArtifactNodeMappingConfig" }
+        edge: { $ref: "#/components/schemas/GraphArtifactEdgeMappingConfig" }
+        context: { $ref: "#/components/schemas/GraphArtifactContextConfig" }
     GraphArtifactProducerSourceConfig:
       type: object
       additionalProperties: false
@@ -162,7 +189,7 @@ components:
           writeOnly: true
           description: "Write-only producer configuration; it may contain credentials and is never returned."
     GraphTemplateValue:
-      description: "A literal numeric value or a Handlebars template evaluated for each materialized graph item."
+      description: "A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item."
       anyOf:
         - type: string
         - type: number
@@ -176,7 +203,6 @@ components:
           type: string
           enum: [document, external]
           default: document
-        source: { $ref: "#/components/schemas/GraphTemplateValue" }
         target: { $ref: "#/components/schemas/GraphTemplateValue" }
     GraphArtifactEdgeMappingConfig:
       type: object
@@ -226,6 +252,22 @@ components:
         source: { $ref: "#/components/schemas/GraphArtifactProducerSourceConfig" }
         content_type: { type: string }
         execution: { $ref: "#/components/schemas/ExecutionPolicy" }
+    CreatedGraphArtifactSourceConfig:
+      type: object
+      additionalProperties: false
+      required: [artifact]
+      description: "Canonical artifact stream materialized into graph edges."
+      properties:
+        artifact: { type: string, minLength: 1 }
+        path: { type: string }
+        format:
+          type: string
+          enum: [extraction_relation, extraction_graph]
+          default: extraction_relation
+        mention_edge_type: { type: string }
+        nodes: { $ref: "#/components/schemas/GraphArtifactNodeMappingConfig" }
+        edge: { $ref: "#/components/schemas/GraphArtifactEdgeMappingConfig" }
+        context: { $ref: "#/components/schemas/GraphArtifactContextConfig" }
     GraphResolverConfig:
       type: object
       additionalProperties: false
@@ -270,6 +312,10 @@ components:
               enum: [algebraic]
     CreateIndexRequest:
       description: "Type-safe configuration for a new index. The index name is owned by the request path."
+      x-antfly-sdk-alternative:
+        description: "SDK builders also accept the named IndexConfig form and convert it to this path-identified request. This is an alternative construction API, not a deprecated wire request."
+        schema:
+          $ref: "#/components/schemas/IndexConfig"
       oneOf:
         - $ref: "#/components/schemas/CreateFullTextIndexRequest"
         - $ref: "#/components/schemas/CreateEmbeddingsIndexRequest"
@@ -350,6 +396,10 @@ components:
         template: { type: string }
         source_artifact_name: { type: string }
         expected_dims: { type: integer, minimum: 0 }
+        vector_space:
+          type: string
+          minLength: 1
+          description: "Optional stable model/token-space identifier asserted for this embedding artifact."
         chunk_size: { type: integer, minimum: 0 }
         chunk_overlap: { type: integer, minimum: 0 }
         chunker_json: { type: string }
@@ -358,7 +408,7 @@ components:
         execution: { $ref: "#/components/schemas/ExecutionPolicy" }
     CreatedEmbeddingsIndexConfig:
       type: object
-      description: "Credential-free normalized embeddings configuration returned after creation."
+      description: "Credential-free normalized embeddings configuration returned after creation. Single-source v0.2 fields are preserved alongside canonical sources for read compatibility."
       properties:
         publication_policy: { $ref: "#/components/schemas/IndexPublicationPolicy" }
         coverage_policy: { $ref: "#/components/schemas/DerivedCoveragePolicy" }
@@ -366,8 +416,23 @@ components:
         sparse: { type: boolean, default: false }
         dimension: { type: integer, minimum: 1 }
         field: { type: string }
-        embedding_name: { type: string }
-        source_artifact_name: { type: string }
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/ArtifactIndexSource" }
+          description: "Embedding artifact streams indexed together as independent vector members."
+        embedding_name:
+          type: string
+          readOnly: true
+          description: "Released v0.2 single-source read field, preserved when that request form created the index. Canonical source identity is also returned through sources."
+        source_artifact_name:
+          type: string
+          readOnly: true
+          deprecated: true
+          x-deprecated-reason: "Use the matching embedding enrichment's source_artifact_name; it is authoritative."
+          description: "Deprecated v0.2 descriptive source read field, preserved when supplied with embedding_name. The matching enrichment is authoritative."
         template: { type: string }
         distance_metric: { $ref: "#/components/schemas/DistanceMetric" }
         mem_only: { type: boolean }
@@ -378,6 +443,18 @@ components:
         min_weight: { type: number, format: float, default: 0.0 }
         chunk_size: { type: integer, minimum: 64, default: 1024 }
         execution: { $ref: "#/components/schemas/IndexExecutionConfig" }
+    CreatedFullTextIndexConfig:
+      type: object
+      description: "Canonical full-text configuration returned after creation. Single-source alternative request forms are represented through sources."
+      properties:
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/FullTextArtifactIndexSource" }
+        mem_only: { type: boolean }
+        field: { type: string }
     CreatedGraphIndexConfig:
       type: object
       description: "Credential-free normalized graph configuration returned after creation."
@@ -387,12 +464,18 @@ components:
         edge_types:
           type: array
           items: { $ref: "#/components/schemas/EdgeTypeConfig" }
-        max_edges_per_document: { type: integer }
-        source: { $ref: "#/components/schemas/GraphArtifactSourceConfig" }
+        max_edges_per_document:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          description: "Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests."
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/CreatedGraphArtifactSourceConfig" }
         artifact: { $ref: "#/components/schemas/CreatedGraphArtifactProducerConfig" }
-        nodes: { $ref: "#/components/schemas/GraphArtifactNodeMappingConfig" }
-        edge: { $ref: "#/components/schemas/GraphArtifactEdgeMappingConfig" }
-        context: { $ref: "#/components/schemas/GraphArtifactContextConfig" }
         algebraic_planning: { $ref: "#/components/schemas/GraphAlgebraicPlanningConfig" }
         resolvers:
           type: array
@@ -401,7 +484,7 @@ components:
       description: "Normalized effective full-text index configuration returned after creation."
       allOf:
         - $ref: "#/components/schemas/CreatedIndexCommon"
-        - $ref: "#/components/schemas/FullTextIndexConfig"
+        - $ref: "#/components/schemas/CreatedFullTextIndexConfig"
         - type: object
           required: [type]
           properties:
@@ -518,6 +601,11 @@ components:
           type: integer
           minimum: 0
           description: "Expected embedding dimension for embedding enrichments."
+        vector_space:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          minLength: 1
+          description: "Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently."
         chunk_size:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -545,13 +633,24 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           writeOnly: true
-          description: "Write-only serialized asset producer configuration. It may contain provider credentials and is never returned."
+          description: "Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded."
         execution:
           $ref: "#/components/schemas/ExecutionPolicy"
           description: "Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity."
     FullTextIndexConfig:
       type: object
+      x-antfly-mutually-exclusive:
+        - [sources, artifact_name]
       properties:
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/FullTextArtifactIndexSource"
+          x-go-type-skip-optional-pointer: true
+          description: "Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
         mem_only:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -559,11 +658,13 @@ components:
         field:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Document field indexed as text. Omit for the table's default full-document text index."
+          minLength: 1
+          description: "Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection."
         artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Generated artifact stream indexed as text. Use with matching inline enrichments."
+          minLength: 1
+          description: "Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
     AlgebraicIndexConfig:
       type: object
       description: "Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned."
@@ -580,6 +681,32 @@ components:
         - ready
         - failed
       description: "Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans."
+    IndexReadinessReason:
+      type: string
+      enum:
+        - load_failure
+        - enrichment_failure
+        - runtime_unavailable
+        - shard_observation_incomplete
+        - incarnation_pending
+        - source_publication
+        - repair
+        - backfill
+        - coverage
+        - replay
+        - publication
+      description: "Stable machine-readable reason why an index is pending, partial, or failed."
+    IndexSourceReadinessReason:
+      type: string
+      enum:
+        - index_failed
+        - enrichment_failure
+        - repair
+        - runtime_unavailable
+        - shard_observation_incomplete
+        - source_observation_incomplete
+        - publication
+      description: "Stable machine-readable reason why an artifact source is pending or failed."
     IndexReadinessStatus:
       type: object
       additionalProperties: false
@@ -611,8 +738,13 @@ components:
         pending_reasons:
           type: array
           items:
-            type: string
-          description: "Stable, machine-readable blockers. Empty when state is ready."
+            $ref: '#/components/schemas/IndexReadinessReason'
+          description: "Stable, machine-readable blockers or failure reasons. Empty when state is ready."
+        sources:
+          type: array
+          description: "Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order."
+          items:
+            $ref: '#/components/schemas/IndexSourceReadinessStatus'
     IndexMilestoneStatus:
       type: object
       additionalProperties: false
@@ -745,6 +877,32 @@ components:
           format: date-time
           nullable: true
           description: "Completion time of the latest successful embedding batch, or null before the first batch."
+    IndexSourceReadinessStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - artifact
+        - state
+        - complete
+        - pending_reasons
+      properties:
+        artifact:
+          type: string
+          description: "Configured artifact stream identity."
+        state:
+          type: string
+          enum:
+            - pending
+            - ready
+            - failed
+        complete:
+          type: boolean
+          description: "Whether this source is fully observed and published on every expected shard."
+        pending_reasons:
+          type: array
+          items:
+            $ref: '#/components/schemas/IndexSourceReadinessReason'
+          description: "Stable, machine-readable blockers or failure reasons for this source. Empty when state is ready."
     IndexRepairStatus:
       type: object
       description: Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics.
@@ -999,6 +1157,18 @@ components:
         When sparse is true, creates a sparse vector index (SPLADE inverted index).
         When sparse is false (default), creates a dense vector index (HNSW).
         For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
+      x-antfly-mutually-exclusive:
+        - [sources, external]
+        - [sources, field]
+        - [sources, template]
+        - [sources, chunker]
+        - [sources, embedding_name]
+        - [sources, source_artifact_name]
+      # OpenAPI 3.0 has no dependentRequired keyword. Repository-owned server
+      # and SDK request validators mirror this extension while keeping generated
+      # models usable instead of forcing the configuration into an opaque union.
+      x-antfly-dependent-required:
+        source_artifact_name: [embedding_name]
       properties:
         publication_policy:
           $ref: "#/components/schemas/IndexPublicationPolicy"
@@ -1029,14 +1199,32 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Field to extract embeddings from (managed indexes only; not allowed when external=true)"
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/ArtifactIndexSource"
+          x-go-type-skip-optional-pointer: true
+          description: >-
+            Embedding artifact streams indexed together. Each artifact record is an independent
+            vector member identified by (artifact name, source key). All sources must use the same
+            dense vector space or sparse token space. Not allowed with external, field, template,
+            chunker, embedding_name, or source_artifact_name. Requires
+            index_capabilities.artifact_sources=true and is rejected by serverless deployments.
         embedding_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings."
+          minLength: 1
+          description: "Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
         source_artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source."
+          minLength: 1
+          deprecated: true
+          x-deprecated-reason: "Set source_artifact_name only on the matching embedding enrichment."
+          description: "Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name is required and this value must exactly match the source_artifact_name on the authoritative embedding enrichment. New clients should declare the relationship only on that enrichment."
         template:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -2055,7 +2243,18 @@ components:
     GraphIndexConfig:
       type: object
       description: "Configuration for graph index type"
+      x-antfly-mutually-exclusive:
+        - [sources, source]
       properties:
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/GraphArtifactSourceConfig"
+          x-go-type-skip-optional-pointer: true
+          description: "Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
         summarizer:
           description: "Configuration for generating node summaries (enables tree navigation in Retrieval Agent)"
           $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
@@ -2075,17 +2274,15 @@ components:
         max_edges_per_document:
           x-go-type-skip-optional-pointer: true
           type: integer
-          description: "Maximum number of edges per document (0 = unlimited)"
+          minimum: 0
+          maximum: 1000000
+          description: "Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests."
         source:
+          description: "Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
           $ref: "#/components/schemas/GraphArtifactSourceConfig"
         artifact:
           $ref: "#/components/schemas/GraphArtifactProducerConfig"
-        nodes:
-          $ref: "#/components/schemas/GraphArtifactNodeMappingConfig"
-        edge:
-          $ref: "#/components/schemas/GraphArtifactEdgeMappingConfig"
-        context:
-          $ref: "#/components/schemas/GraphArtifactContextConfig"
+          description: "Single asset-producer shorthand. It must be paired with exactly one source selecting the same artifact name."
         algebraic_planning:
           $ref: "#/components/schemas/GraphAlgebraicPlanningConfig"
         resolvers:

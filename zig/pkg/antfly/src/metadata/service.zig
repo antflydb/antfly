@@ -918,6 +918,35 @@ fn storeHasRuntimeRepairStatus(record: metadata_table_manager.StoreRecord) bool 
     return false;
 }
 
+fn storeHasRuntimeArtifactSourceStatus(record: metadata_table_manager.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.source_replay.len != 0) return true;
+        }
+    }
+    return false;
+}
+
+fn storesHaveRuntimeArtifactSourceStatus(stores: []const metadata_table_manager.StoreRecord) bool {
+    for (stores) |store| {
+        if (store.artifact_sources_protocol_version != 0 or
+            storeHasRuntimeArtifactSourceStatus(store)) return true;
+    }
+    return false;
+}
+
+fn reportsHaveRuntimeArtifactSourceStatus(reports: []const metadata_table_manager.StoreStatusReport) bool {
+    for (reports) |report| {
+        if (report.artifact_sources_protocol_version != 0) return true;
+        for (report.runtime_statuses) |runtime_status| {
+            for (runtime_status.indexes) |index_status| {
+                if (index_status.source_replay.len != 0) return true;
+            }
+        }
+    }
+    return false;
+}
+
 fn reportsHaveRuntimeRepairStatus(reports: []const metadata_table_manager.StoreStatusReport) bool {
     for (reports) |report| {
         for (report.runtime_statuses) |runtime_status| {
@@ -985,36 +1014,52 @@ fn stripRuntimeEmbeddingActivity(record: *metadata_table_manager.StoreRecord) vo
     }
 }
 
+fn stripRuntimeArtifactSourceStatus(
+    alloc: std.mem.Allocator,
+    record: *metadata_table_manager.StoreRecord,
+) void {
+    for (record.runtime_statuses) |*runtime_status| {
+        for (runtime_status.indexes) |*index_status| {
+            for (index_status.source_replay) |source| alloc.free(source.artifact_name);
+            if (index_status.source_replay.len > 0) alloc.free(index_status.source_replay);
+            index_status.source_replay = &.{};
+        }
+    }
+}
+
 fn stripRuntimeReporterFence(record: *metadata_table_manager.StoreRecord) void {
     record.reporter_incarnation = 0;
     record.status_generation = 0;
+    record.artifact_sources_protocol_version = 0;
+    record.native_generation_restore_version = 0;
 }
 
 fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
     if (record.native_generation_restore_version != 0 or
+        record.artifact_sources_protocol_version != 0 or
         storeHasRuntimeRepairStatus(record) or
+        storeHasRuntimeArtifactSourceStatus(record) or
         record.reporter_incarnation != 0 or record.status_generation != 0)
         return metadata_runtime_status_protocol.current_record_version;
     return metadata_runtime_status_protocol.legacy_record_version;
 }
 
-/// Facts at or below this version are part of admission or restore safety and
-/// cannot be erased merely to cross an older proposal boundary. Activity is
-/// deliberately absent: it is an observability projection, not durable truth.
+/// Every durable fact beyond v12 participates in admission or restore safety
+/// and cannot be erased merely to cross an older proposal boundary. Embedding
+/// activity is deliberately absent: it is an ephemeral observability overlay.
 fn runtimeStatusMandatoryRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
-    if (record.native_generation_restore_version != 0 or
-        storeHasRuntimeRepairStatus(record) or
-        record.reporter_incarnation != 0 or record.status_generation != 0)
-        return metadata_runtime_status_protocol.current_record_version;
-    return metadata_runtime_status_protocol.legacy_record_version;
+    return runtimeStatusRequiredRecordVersion(record);
 }
 
-fn stripRuntimeStatusAboveVersion(record: *metadata_table_manager.StoreRecord, supported_version: u16) void {
-    if (supported_version != metadata_runtime_status_protocol.current_record_version) {
-        record.native_generation_restore_version = 0;
-        stripRuntimeRepairStatus(record);
-        stripRuntimeReporterFence(record);
-    }
+fn stripRuntimeStatusAboveVersion(
+    alloc: std.mem.Allocator,
+    record: *metadata_table_manager.StoreRecord,
+    supported_version: u16,
+) void {
+    if (supported_version == metadata_runtime_status_protocol.current_record_version) return;
+    stripRuntimeRepairStatus(record);
+    stripRuntimeArtifactSourceStatus(alloc, record);
+    stripRuntimeReporterFence(record);
 }
 
 fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16) u16 {
@@ -1044,14 +1089,14 @@ fn runtimeStatusProtocolSafeCommand(
             )) return error.InvalidStoreReporterFence;
             const required_version = runtimeStatusRequiredRecordVersion(record);
             const supported_version = highestSupportedRuntimeStatusVersion(service, required_version);
-            if (supported_version >= required_version and !storeHasRuntimeEmbeddingActivity(record)) return command;
+            if (supported_version == required_version and !storeHasRuntimeEmbeddingActivity(record)) return command;
             // Unlike registration, an upsert can be a clone of committed
             // safety state. Never downgrade those facts; only optional
             // observability fields may be projected away.
             if (runtimeStatusMandatoryRecordVersion(record) > supported_version)
                 return error.RuntimeStatusProtocolUnavailable;
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
-            stripRuntimeStatusAboveVersion(&legacy_record, supported_version);
+            stripRuntimeStatusAboveVersion(service.alloc, &legacy_record, supported_version);
             stripRuntimeEmbeddingActivity(&legacy_record);
             owned_legacy_store.* = legacy_record;
             return .{ .upsert_store = legacy_record };
@@ -1063,9 +1108,9 @@ fn runtimeStatusProtocolSafeCommand(
             )) return error.InvalidStoreReporterFence;
             const required_version = runtimeStatusRequiredRecordVersion(record);
             const supported_version = highestSupportedRuntimeStatusVersion(service, required_version);
-            if (supported_version >= required_version and !storeHasRuntimeEmbeddingActivity(record)) return command;
+            if (supported_version == required_version and !storeHasRuntimeEmbeddingActivity(record)) return command;
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
-            stripRuntimeStatusAboveVersion(&legacy_record, supported_version);
+            stripRuntimeStatusAboveVersion(service.alloc, &legacy_record, supported_version);
             stripRuntimeEmbeddingActivity(&legacy_record);
             owned_legacy_store.* = legacy_record;
             return .{ .register_store = legacy_record };
@@ -8336,10 +8381,13 @@ fn reportStoreStatusesWithProjected(
     // together at the V15 profile boundary; V12 remains the only downgrade.
     const repair_status_transition_possible = reportsHaveRuntimeRepairStatus(reports) or
         storesHaveRuntimeRepairStatus(projected);
+    const artifact_source_transition_possible = reportsHaveRuntimeArtifactSourceStatus(reports) or
+        storesHaveRuntimeArtifactSourceStatus(projected);
     const reporter_fence_transition_possible = reportsHaveRuntimeReporterFence(reports) or
         storesHaveRuntimeReporterFence(projected);
     const required_version = if (storesHaveNativeGenerationRestoreCapability(projected) or
-        repair_status_transition_possible or reporter_fence_transition_possible)
+        repair_status_transition_possible or artifact_source_transition_possible or
+        reporter_fence_transition_possible)
         metadata_runtime_status_protocol.current_record_version
     else
         metadata_runtime_status_protocol.legacy_record_version;
@@ -8380,7 +8428,7 @@ fn reportStoreStatusesWithProjected(
         }
         var proposal = try metadata_table_manager.cloneStore(service.alloc, record);
         defer metadata_table_manager.freeStore(service.alloc, proposal);
-        stripRuntimeStatusAboveVersion(&proposal, supported_version);
+        stripRuntimeStatusAboveVersion(service.alloc, &proposal, supported_version);
         try service.upsertStore(proposal);
     }
     // Cache owner heartbeats only after every required durable proposal was

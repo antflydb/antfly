@@ -21,12 +21,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
 // CreateTable creates a new table
 func (c *AntflyClient) CreateTable(ctx context.Context, tableName string, req CreateTableRequest) error {
+	indexNames := make([]string, 0, len(req.Indexes))
+	for indexName := range req.Indexes {
+		indexNames = append(indexNames, indexName)
+	}
+	sort.Strings(indexNames)
+	for _, indexName := range indexNames {
+		indexConfig := req.Indexes[indexName]
+		if err := validateCreateIndexRequest(indexConfig); err != nil {
+			return fmt.Errorf("validating index %q: %w", indexName, err)
+		}
+	}
 	resp, err := c.client.CreateTable(ctx, tableName, req)
 	if err != nil {
 		return fmt.Errorf("creating table: %w", err)
@@ -92,6 +104,9 @@ func (c *AntflyClient) ListTables(ctx context.Context) ([]TableStatus, error) {
 
 // CreateIndex creates a new index and returns its normalized effective config.
 func (c *AntflyClient) CreateIndex(ctx context.Context, tableName, indexName string, config CreateIndexRequest) (*CreatedIndex, error) {
+	if err := validateCreateIndexRequest(config); err != nil {
+		return nil, fmt.Errorf("validating index %q: %w", indexName, err)
+	}
 	resp, err := c.client.CreateIndex(ctx, tableName, indexName, config)
 	if err != nil {
 		return nil, fmt.Errorf("creating index: %w", err)
@@ -105,6 +120,26 @@ func (c *AntflyClient) CreateIndex(ctx context.Context, tableName, indexName str
 		return nil, fmt.Errorf("parsing create index response: %w", err)
 	}
 	return &created, nil
+}
+
+// validateCreateIndexRequest keeps every transport entry point aligned with
+// the relationship checks used by NewCreateIndexRequest. CreateIndexRequest is
+// an exported generated union, so callers may construct it directly without
+// passing through the convenience builder.
+func validateCreateIndexRequest(config CreateIndexRequest) error {
+	data, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	discriminator, err := config.Discriminator()
+	if err != nil {
+		return fmt.Errorf("read type: %w", err)
+	}
+	indexType := IndexType(discriminator)
+	if !indexType.Valid() {
+		return fmt.Errorf("unknown index type %q", discriminator)
+	}
+	return validateIndexRequestRelationships(data, indexType)
 }
 
 // DropIndex drops an index from a table
@@ -139,9 +174,37 @@ func (c *AntflyClient) ListIndexes(ctx context.Context, tableName string) (map[s
 	// Convert array to map keyed by index name
 	indexes := make(map[string]IndexStatus, len(indexList))
 	for _, idx := range indexList {
-		indexes[idx.Config.Name] = idx
+		name, err := createdIndexName(idx.Config)
+		if err != nil {
+			return nil, fmt.Errorf("parsing response index identity: %w", err)
+		}
+		indexes[name] = idx
 	}
 	return indexes, nil
+}
+
+func createdIndexName(config oapi.CreatedIndex) (string, error) {
+	value, err := config.ValueByDiscriminator()
+	if err != nil {
+		return "", err
+	}
+	var name string
+	switch typed := value.(type) {
+	case CreatedFullTextIndex:
+		name = typed.Name
+	case CreatedEmbeddingsIndex:
+		name = typed.Name
+	case CreatedGraphIndex:
+		name = typed.Name
+	case CreatedAlgebraicIndex:
+		name = typed.Name
+	default:
+		return "", fmt.Errorf("unsupported created index type %T", value)
+	}
+	if name == "" {
+		return "", fmt.Errorf("created index name is empty")
+	}
+	return name, nil
 }
 
 // GetIndex gets a specific index for a table

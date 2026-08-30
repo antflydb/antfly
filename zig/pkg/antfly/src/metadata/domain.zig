@@ -80,6 +80,7 @@ pub const RuntimeDocIdentityStatusReport = table_manager.RuntimeDocIdentityStatu
 pub const RuntimeDocSetPlanningStatusReport = table_manager.RuntimeDocSetPlanningStatusReport;
 pub const RuntimeIndexStatusReport = table_manager.RuntimeIndexStatusReport;
 pub const RuntimeEmbeddingActivityStatusReport = table_manager.RuntimeEmbeddingActivityStatusReport;
+pub const RuntimeIndexSourceReplayStatusReport = table_manager.RuntimeIndexSourceReplayStatusReport;
 pub const IndexRepairStatus = table_manager.IndexRepairStatus;
 pub const SchemaProgressRecord = table_manager.SchemaProgressRecord;
 pub const RestoreProgressRecord = table_manager.RestoreProgressRecord;

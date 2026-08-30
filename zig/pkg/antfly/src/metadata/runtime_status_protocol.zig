@@ -20,11 +20,13 @@
 pub const legacy_record_version: u16 = 12;
 pub const current_record_version: u16 = 15;
 
-/// These facts form one admission-safety profile. Keeping the semantic aliases
-/// makes call sites state why V15 is required without inventing intermediate
-/// compatibility levels.
+/// These facts form one current admission-safety profile. Keeping semantic
+/// aliases makes call sites state why V15 is required without inventing
+/// intermediate compatibility levels when new facts join that profile.
 pub const repair_status_record_version: u16 = current_record_version;
 pub const native_restore_identity_record_version: u16 = current_record_version;
+pub const artifact_source_status_record_version: u16 = current_record_version;
+pub const artifact_source_failure_status_record_version: u16 = current_record_version;
 
 pub fn isSupported(version: u16) bool {
     return version >= 1 and version <= legacy_record_version or

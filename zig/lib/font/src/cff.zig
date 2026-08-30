@@ -30,6 +30,9 @@ const ParseError = Error || std.mem.Allocator.Error;
 
 pub const OutlineLimits = struct {
     max_operations: usize = std.math.maxInt(usize),
+    /// Optional caller-owned page/request meter. Every attempted charstring
+    /// operation is charged, including work performed before a parse error.
+    remaining_operations: ?*usize = null,
 };
 
 fn predefinedEncodingGlyphName(encoding: *const [256]u16, code: u8) ?[]const u8 {
@@ -206,7 +209,12 @@ pub const Font = struct {
         var width_seen = false;
         var hint_count: usize = 0;
         var transient: [32]f64 = [_]f64{0} ** 32;
-        var remaining_operations = limits.max_operations;
+        const shared_limit = if (limits.remaining_operations) |remaining| remaining.* else std.math.maxInt(usize);
+        var remaining_operations = @min(limits.max_operations, shared_limit);
+        const initial_operations = remaining_operations;
+        defer if (limits.remaining_operations) |remaining| {
+            remaining.* -|= initial_operations - remaining_operations;
+        };
         try self.executeCharStringAllocLimited(alloc, program, self.localSubrsForGlyph(glyph_index), &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, &remaining_operations, 0);
 
         if (contours.items.len == 0) return null;

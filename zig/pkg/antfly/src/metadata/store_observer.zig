@@ -41,6 +41,7 @@ pub fn applyObservation(
         observation.reporter_incarnation == existing.reporter_incarnation)
     {
         updated.status_generation = observation.status_generation;
+        updated.artifact_sources_protocol_version = observation.artifact_sources_protocol_version;
     }
     updated.live = observation.live;
     updated.health_class = observation.health_class;
@@ -96,6 +97,7 @@ pub fn applyObservationsOwnedWithRepairStatus(
             observation.reporter_incarnation == records[index].reporter_incarnation)
         {
             records[index].status_generation = observation.status_generation;
+            records[index].artifact_sources_protocol_version = observation.artifact_sources_protocol_version;
         }
         records[index].live = observation.live;
         records[index].capacity_bytes = observation.capacity_bytes;
@@ -225,6 +227,7 @@ pub fn observationChangesRecordWithRepairStatus(
         !std.mem.eql(u8, existing.health_class, observation.health_class) or
         (existing.reporter_incarnation != 0 and
             existing.status_generation != observation.status_generation) or
+        existing.artifact_sources_protocol_version != observation.artifact_sources_protocol_version or
         existing.capacity_bytes != observation.capacity_bytes or
         existing.available_bytes != observation.available_bytes or
         existing.lease_pressure != observation.lease_pressure or
@@ -466,6 +469,7 @@ fn runtimeStatusEqual(
             left.replay_applied_sequence != right.replay_applied_sequence or
             left.replay_target_sequence != right.replay_target_sequence or
             left.replay_catch_up_required != right.replay_catch_up_required or
+            !runtimeIndexSourceReplayEqual(left.source_replay, right.source_replay) or
             (include_repair_status and (left.repair_status != right.repair_status or
                 left.repair_active_generation_serviceable != right.repair_active_generation_serviceable)))
         {
@@ -479,6 +483,20 @@ fn stripVolatileEmbeddingActivity(statuses: []table_manager.RuntimeGroupStatusRe
     for (statuses) |*status| {
         for (status.indexes) |*index| index.embedding_activity = .{};
     }
+}
+
+fn runtimeIndexSourceReplayEqual(
+    lhs: []const table_manager.RuntimeIndexSourceReplayStatusReport,
+    rhs: []const table_manager.RuntimeIndexSourceReplayStatusReport,
+) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left.artifact_name, right.artifact_name) or
+            left.published_sequence != right.published_sequence or
+            left.target_sequence != right.target_sequence or
+            left.failed != right.failed) return false;
+    }
+    return true;
 }
 
 fn optionalStringsEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {

@@ -480,7 +480,7 @@ const IndexSummary = struct {
     complete: bool,
     queryable: bool = false,
     failed: bool,
-    pending_reasons: []const []const u8 = &.{},
+    pending_reasons: []const antfly_client.types.IndexReadinessReason = &.{},
     queryable_blockers: []const []const u8 = &.{},
     complete_blockers: []const []const u8 = &.{},
     incarnation: ?[]const u8 = null,
@@ -627,8 +627,8 @@ fn summarizeStats(stats: anytype) IndexSummary {
         .queryable = queryable,
         .failed = failed,
         .pending_reasons = if (readiness) |value| value.pending_reasons else &.{},
-        .queryable_blockers = if (milestones) |value| value.queryable.blockers else if (readiness) |value| value.pending_reasons else &.{},
-        .complete_blockers = if (milestones) |value| value.complete.blockers else if (readiness) |value| value.pending_reasons else &.{},
+        .queryable_blockers = if (milestones) |value| value.queryable.blockers else &.{},
+        .complete_blockers = if (milestones) |value| value.complete.blockers else &.{},
         .incarnation = if (@hasField(Stats, "incarnation"))
             if (stats.incarnation != null) stats.incarnation else if (readiness) |value| value.incarnation else null
         else if (readiness) |value|
@@ -683,11 +683,14 @@ const WaitProgressReporter = struct {
     }
 };
 
-fn writePendingReasons(writer: anytype, pending_reasons: []const []const u8) !void {
+fn writePendingReasons(
+    writer: anytype,
+    pending_reasons: []const antfly_client.types.IndexReadinessReason,
+) !void {
     try writer.writeAll(" pending_reasons=[");
     for (pending_reasons, 0..) |reason, index| {
         if (index > 0) try writer.writeAll(",");
-        try writer.writeAll(reason);
+        try writer.writeAll(@tagName(reason));
     }
     try writer.writeAll("]");
 }
@@ -816,10 +819,12 @@ fn waitDisposition(summary: IndexSummary, target: WaitTarget) WaitDisposition {
 
 fn writeIndexSummary(allocator: std.mem.Allocator, io: std.Io, index: antfly_client.types.IndexStatus) !void {
     const summary = summarizeIndex(index);
+    const index_name = index_readiness.createdIndexName(index.config);
+    const index_type = index_readiness.createdIndexType(index.config);
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const writer = &out.writer;
-    try writer.print("{s}\t{s}\t{s}\t", .{ index.config.name, @tagName(index.config.type), summary.state });
+    try writer.print("{s}\t{s}\t{s}\t", .{ index_name, @tagName(index_type), summary.state });
     if (summary.progress) |progress| {
         try writer.print("{d:.1}%", .{@max(0.0, @min(1.0, progress)) * 100.0});
     } else {
@@ -855,7 +860,7 @@ fn writeWaitSuccess(
     defer out.deinit();
     const writer = &out.writer;
     try writer.print("Index {s} ({s}) reached {s}: state={s} progress=", .{
-        index.config.name,
+        index_readiness.createdIndexName(index.config),
         summary.index_type,
         @tagName(target),
         summary.state,
@@ -1385,9 +1390,7 @@ test "index wait prefers authoritative readiness contract" {
             .queryable = false,
             .complete = false,
             .incarnation = "g-000000000000002a",
-            .target_revision = 11,
-            .published_revision = 10,
-            .pending_reasons = &.{"publication"},
+            .pending_reasons = &.{.publication},
         },
     });
     try std.testing.expectEqualStrings("pending", summary.state);
@@ -1403,9 +1406,7 @@ test "index wait prefers authoritative readiness contract" {
             .queryable = true,
             .complete = false,
             .incarnation = "g-000000000000002a",
-            .target_revision = 11,
-            .published_revision = 7,
-            .pending_reasons = &.{ "coverage", "publication" },
+            .pending_reasons = &.{ .coverage, .publication },
         },
     });
     try std.testing.expectEqualStrings("queryable_partial", summary.state);
@@ -1426,9 +1427,7 @@ test "index wait prefers authoritative readiness contract" {
             .queryable = true,
             .complete = false,
             .incarnation = "g-000000000000002a",
-            .target_revision = 11,
-            .published_revision = 10,
-            .pending_reasons = &.{"coverage"},
+            .pending_reasons = &.{.coverage},
         },
     });
     try std.testing.expectEqualStrings("ready", summary.state);
@@ -1447,8 +1446,6 @@ test "index wait prefers authoritative readiness contract" {
             .queryable = true,
             .complete = true,
             .incarnation = "g-000000000000002a",
-            .target_revision = 11,
-            .published_revision = 11,
             .pending_reasons = &.{},
         },
     });
@@ -1474,7 +1471,7 @@ test "index wait prefers authoritative readiness contract" {
             .incarnation = "g-000000000000002a",
             .target_revision = 11,
             .published_revision = 11,
-            .pending_reasons = &.{"repair"},
+            .pending_reasons = &.{.repair},
         },
     });
     try std.testing.expectEqualStrings("failed", summary.state);
@@ -1488,7 +1485,7 @@ test "index wait prefers authoritative readiness contract" {
     try std.testing.expect(summary.repair_blocks_queryable.?);
     try std.testing.expect(summary.repair_blocks_complete.?);
     try std.testing.expectEqualStrings("activation_manifest_missing", summary.repair_reason.?);
-    try std.testing.expectEqualStrings("repair", summary.pending_reasons[0]);
+    try std.testing.expectEqual(antfly_client.types.IndexReadinessReason.repair, summary.pending_reasons[0]);
 
     var failure_buffer: [512]u8 = undefined;
     var failure_writer = std.Io.Writer.fixed(&failure_buffer);
@@ -1516,7 +1513,7 @@ test "index wait prefers authoritative readiness contract" {
             .incarnation = "g-000000000000002a",
             .target_revision = 11,
             .published_revision = 11,
-            .pending_reasons = &.{"repair"},
+            .pending_reasons = &.{.repair},
         },
     });
     try std.testing.expect(retained_failure.failed);

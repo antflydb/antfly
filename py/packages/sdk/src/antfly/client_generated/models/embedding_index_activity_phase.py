@@ -6,7 +6,7 @@ class EmbeddingIndexActivityPhase(str, Enum):
     IDLE = "idle"
     PREPARING = "preparing"
     PUBLISHING = "publishing"
-    RETRYING = "retrying"
+    WAITING_RETRY = "waiting_retry"
 
     def __str__(self) -> str:
         return str(self.value)
