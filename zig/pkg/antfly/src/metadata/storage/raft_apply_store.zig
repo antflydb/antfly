@@ -5869,6 +5869,10 @@ fn appendRuntimeIndexStatusRecord(
     record: metadata.RuntimeIndexStatusReport,
     version: u16,
 ) !void {
+    // Production writers emit only released, negotiable profiles. Historical
+    // versions remain decoder-only compatibility surfaces.
+    if (!runtime_status_protocol.isNegotiable(version))
+        return error.InvalidMetadataTransitionEncoding;
     try appendRequiredString(alloc, out, record.name);
     try appendRequiredString(alloc, out, record.kind);
     try appendInt(alloc, out, u64, record.doc_count);
@@ -5889,22 +5893,20 @@ fn appendRuntimeIndexStatusRecord(
     try appendInt(alloc, out, u64, record.replay_target_sequence);
     try out.append(alloc, if (record.replay_catch_up_required) 1 else 0);
     try appendOptionalString(alloc, out, record.load_error);
-    if (version >= runtime_status_protocol.repair_status_record_version) {
+    if (version == runtime_status_protocol.current_record_version) {
+        // V15 is one atomic profile: safety-critical repair state and
+        // per-source replay state must never be projected independently.
         try out.append(alloc, if (record.repair_status) |status| @intFromEnum(status) else 0);
         try out.append(
             alloc,
             if (record.repair_status != null and record.repair_active_generation_serviceable) 1 else 0,
         );
-    }
-    if (version >= runtime_status_protocol.artifact_source_status_record_version) {
         try appendInt(alloc, out, u16, @intCast(record.source_replay.len));
         for (record.source_replay) |source| {
             try appendRequiredString(alloc, out, source.artifact_name);
             try appendInt(alloc, out, u64, source.published_sequence);
             try appendInt(alloc, out, u64, source.target_sequence);
-            if (version >= runtime_status_protocol.artifact_source_failure_status_record_version) {
-                try out.append(alloc, if (source.failed) 1 else 0);
-            }
+            try out.append(alloc, if (source.failed) 1 else 0);
         }
     }
 }
@@ -11598,6 +11600,15 @@ test "metadata runtime index status decoder accepts version ten records" {
     var encoded = std.ArrayListUnmanaged(u8).empty;
     defer encoded.deinit(alloc);
 
+    try std.testing.expectError(
+        error.InvalidMetadataTransitionEncoding,
+        appendRuntimeIndexStatusRecord(alloc, &encoded, .{
+            .name = "must_not_write_v10",
+            .kind = "dense_vector",
+        }, 10),
+    );
+    try std.testing.expectEqual(@as(usize, 0), encoded.items.len);
+
     try appendRuntimeIndexStatusRecord(alloc, &encoded, .{
         .name = "legacy_idx",
         .kind = "dense_vector",
@@ -11605,12 +11616,13 @@ test "metadata runtime index status decoder accepts version ten records" {
         .replay_applied_sequence = 9,
         .replay_target_sequence = 11,
         .replay_catch_up_required = true,
-    }, runtime_status_protocol.repair_status_record_version);
+    }, runtime_status_protocol.legacy_record_version);
 
-    // Version 10 ended immediately after replay_catch_up_required. Remove the
-    // version-11 optional load-error tag and the two current-profile repair bytes.
-    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, encoded.items[encoded.items.len - 3 ..]);
-    encoded.items.len -= 3;
+    // V10 and the released V12 profile share the same index layout except for
+    // the V11 optional load-error tag. Keep the production writer restricted
+    // to V12/V15 and derive this decoder-only fixture from immutable V12.
+    try std.testing.expectEqual(@as(u8, 0), encoded.items[encoded.items.len - 1]);
+    encoded.items.len -= 1;
 
     var pos: usize = 0;
     const decoded = try readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, 10);

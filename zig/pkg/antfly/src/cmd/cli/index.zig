@@ -697,7 +697,9 @@ fn writePendingReasons(
 
 fn writeSourceCoverage(writer: anytype, summary: IndexSummary) !void {
     if (summary.source_pending != null or summary.source_skipped != null or summary.source_failed != null) {
-        try writer.writeAll(" sources=");
+        // Keep the public label aligned with the structured API field even
+        // when the CLI can render the richer per-outcome breakdown.
+        try writer.writeAll(" source_coverage=");
         if (summary.source_covered) |covered| try writer.print("{d} covered", .{covered}) else try writer.writeAll("? covered");
         if (summary.source_pending) |pending| try writer.print(", {d} pending", .{pending});
         if (summary.source_skipped) |skipped| try writer.print(", {d} skipped", .{skipped});
@@ -715,6 +717,29 @@ fn writeSourceCoverage(writer: anytype, summary: IndexSummary) !void {
     } else {
         try writer.writeAll("-");
     }
+}
+
+test "index wait source coverage keeps its stable public label" {
+    var buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeSourceCoverage(&writer, .{
+        .state = "queryable_partial",
+        .progress = 1,
+        .source_covered = 2,
+        .source_total = 2,
+        .source_pending = 0,
+        .source_skipped = 0,
+        .source_failed = 0,
+        .indexed = 1,
+        .visible = 1,
+        .complete = false,
+        .queryable = true,
+        .failed = false,
+    });
+    try std.testing.expectEqualStrings(
+        " source_coverage=2 covered, 0 pending, 0 skipped, 0 failed / 2",
+        writer.buffered(),
+    );
 }
 
 fn blockersForTarget(summary: IndexSummary, target: WaitTarget) []const []const u8 {
