@@ -105,7 +105,7 @@ pub const HttpTransportStack = struct {
     pub fn runtimeHooks(self: *HttpTransportStack) raft_engine.runtime.multi_raft.RuntimeHooks {
         return .{
             .transport = self.transport_host.transport(),
-            .snapshot_transport = self.snapshot_transport.transport(),
+            .snapshot_transport = self.snapshot_transport.submissionTransport(),
         };
     }
 

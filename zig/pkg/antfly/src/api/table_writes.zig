@@ -8588,6 +8588,13 @@ pub const ProvisionedTableWriteSource = struct {
             const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, entry.name });
             defer alloc.free(path);
             if (std.mem.startsWith(u8, entry.name, replica_retirement_batch_prefix)) {
+                // The journal stripe is the per-batch coordinator. Recovery,
+                // preparation, cancellation, and completion all acquire it
+                // before changing holder state, so no operation can act on a
+                // holder observation from an earlier journal epoch.
+                const journal_lock = self.replicaRetirementJournalLock(path);
+                lockAtomic(journal_lock);
+                defer journal_lock.unlock();
                 const batch_retry = self.recoverReplicaRetirementBatch(alloc, io, dir_path, path, ownership) catch |err| {
                     if (err == error.InvalidReplicaRetirementIntent) {
                         quarantineRecoveryIntent(alloc, io, self.replica_root_dir, path, "replica-retirement-batch") catch |quarantine_err| {
@@ -8756,6 +8763,13 @@ pub const ProvisionedTableWriteSource = struct {
         const batch_path = try replicaRetirementBatchPath(alloc, self.replica_root_dir, intents);
         errdefer alloc.free(batch_path);
 
+        // Lock hierarchy: journal stripe -> ownership mutex. The stripe is a
+        // keyed lease for this canonical batch; holder admission and durable
+        // phase publication are one serializable operation without imposing a
+        // process-wide filesystem lock on unrelated batches.
+        const journal_lock = self.replicaRetirementJournalLock(batch_path);
+        lockAtomic(journal_lock);
+        defer journal_lock.unlock();
         lockAtomic(&self.replica_retirement_intent_mutex);
         for (intents) |intent| {
             if (self.recovering_replica_retirement_intents.contains(intent.group_id)) {
@@ -8781,12 +8795,8 @@ pub const ProvisionedTableWriteSource = struct {
         self.replica_retirement_intent_mutex.unlock();
         errdefer _ = self.releaseActiveReplicaRetirementIntents(intents);
 
-        // Same-batch publication is serialized by a bounded stripe while
-        // unrelated batches proceed independently on the source-owned I/O
-        // service. Active claims keep recovery from classifying the record.
-        const journal_lock = self.replicaRetirementJournalLock(batch_path);
-        lockAtomic(journal_lock);
-        defer journal_lock.unlock();
+        // Active claims keep recovery from classifying the record. The keyed
+        // lease remains held until the prepared phase is fully durable.
         const io = self.table_activity_threaded.io();
         try fs_paths.createDirPathPortable(io, dir_path);
         var batch_created = false;
@@ -8820,8 +8830,10 @@ pub const ProvisionedTableWriteSource = struct {
         prepared: *const PreparedReplicaRetirements,
     ) void {
         var recovery_required = false;
-        const any_active = self.releaseActiveReplicaRetirementIntents(prepared.intents);
         const io = self.table_activity_threaded.io();
+        if (prepared.batch_path == null) {
+            _ = self.releaseActiveReplicaRetirementIntents(prepared.intents);
+        }
         if (prepared.batch_path == null) for (prepared.intents) |intent| {
             // A pre-existing record may belong to an earlier committed
             // retirement. This failed preparation did not create it and must
@@ -8836,6 +8848,13 @@ pub const ProvisionedTableWriteSource = struct {
             };
         };
         if (prepared.batch_path) |path| batch_cancel: {
+            // Release the holder and decide journal ownership under the same
+            // keyed lease. A new prepare cannot reserve this batch between the
+            // observation and deletion.
+            const journal_lock = self.replicaRetirementJournalLock(path);
+            lockAtomic(journal_lock);
+            defer journal_lock.unlock();
+            const any_active = self.releaseActiveReplicaRetirementIntents(prepared.intents);
             if (any_active) break :batch_cancel;
             if (!prepared.batch_created) {
                 recovery_required = true;
@@ -8843,9 +8862,6 @@ pub const ProvisionedTableWriteSource = struct {
             }
             // Another holder may have committed this shared batch before the
             // creator cancelled. Never erase a committed recovery proof.
-            const journal_lock = self.replicaRetirementJournalLock(path);
-            lockAtomic(journal_lock);
-            defer journal_lock.unlock();
             var loaded_batch = loadReplicaRetirementBatch(prepared.alloc, io, path) catch |err| {
                 std.log.warn("uncommitted replica-retirement batch inspection deferred path={s} err={s}", .{ path, @errorName(err) });
                 recovery_required = true;
@@ -8870,6 +8886,21 @@ pub const ProvisionedTableWriteSource = struct {
     ) !void {
         var first_error: ?anyerror = null;
 
+        // Keep the batch epoch stable through both durable phase publication
+        // and holder release. A waiter may begin immediately after unlock, but
+        // it can only observe the new committed phase and post-release holder
+        // state together.
+        const batch_journal_lock = if (prepared.batch_path) |path|
+            self.replicaRetirementJournalLock(path)
+        else
+            null;
+        var batch_journal_lock_held = false;
+        if (batch_journal_lock) |journal_lock| {
+            lockAtomic(journal_lock);
+            batch_journal_lock_held = true;
+        }
+        defer if (batch_journal_lock_held) batch_journal_lock.?.unlock();
+
         // Publish the committed phase while the active claims still fence
         // recovery, but never hold the ownership mutex across allocation,
         // filesystem access, or fsync.
@@ -8882,9 +8913,6 @@ pub const ProvisionedTableWriteSource = struct {
         var directory_dirty = false;
         if (prepared.batch_path) |path| {
             if (dir_path) |directory| {
-                const journal_lock = self.replicaRetirementJournalLock(path);
-                lockAtomic(journal_lock);
-                defer journal_lock.unlock();
                 writeReplicaRetirementBatch(
                     prepared.alloc,
                     io,
@@ -8927,6 +8955,13 @@ pub const ProvisionedTableWriteSource = struct {
             };
         }
         _ = self.releaseActiveReplicaRetirementIntents(prepared.intents);
+        // Recovery may execute inline for standalone/manual runtimes and
+        // reacquire this batch lease. Publish holder release before dropping
+        // the lease, then schedule only after the coordinator is unlocked.
+        if (batch_journal_lock_held) {
+            batch_journal_lock.?.unlock();
+            batch_journal_lock_held = false;
+        }
 
         // Catalog removal and the committed sidecar are the synchronous
         // durability boundary. Cache drains, exclusive read-cache waits,
