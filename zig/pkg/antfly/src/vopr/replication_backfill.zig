@@ -171,6 +171,11 @@ pub const Scenario = struct {
         source_sessions_peak: u64 = 0,
         source_crash_session: u64 = 0,
         source_recovery_session: u64 = 0,
+        cancellation_injected: bool = false,
+        cancellation_checkpoint: u64 = 0,
+        cancellation_session: u64 = 0,
+        cancellation_recovery_session: u64 = 0,
+        first_attempt_error_code: u64 = 0,
         applied_mask: u8 = 0,
         apply_calls: u32 = 0,
         lifecycle_calls: u32 = 0,
@@ -296,6 +301,13 @@ pub const Scenario = struct {
         fn checkpoint(ptr: *anyopaque, kind: replication.WorkKind) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!self.lease_valid) return error.CdcWorkLeaseLost;
+            // The fixture owns the lease/fencing layer even when a deployment
+            // supplies a production charging permit. Replacing this wrapper
+            // with the external permit would silently disable cancellation.
+            if (self.external_work_permit) |permit_override| {
+                try permit_override.checkpoint(kind);
+                return;
+            }
             const port = self.service_port orelse return;
             const operation, const charge_index = switch (kind) {
                 .snapshot_step => .{ snapshot_operation, @as(usize, 0) },
@@ -316,13 +328,15 @@ pub const Scenario = struct {
             }
         }
 
-        fn deadline(_: *anyopaque) !u64 {
+        fn deadline(ptr: *anyopaque) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.external_work_permit) |permit_override|
+                return try permit_override.deadlineNs();
             return std.math.maxInt(u64);
         }
 
         fn permit(self: *@This()) replication.WorkPermit {
-            return self.external_work_permit orelse
-                .{ .ptr = self, .checkpoint_fn = checkpoint, .deadline_fn = deadline };
+            return .{ .ptr = self, .checkpoint_fn = checkpoint, .deadline_fn = deadline };
         }
 
         fn lifecycle(self: *@This()) replication.ReplicationLifecycleHook {
@@ -343,9 +357,12 @@ pub const Scenario = struct {
                     // source session.
                     self.source_crash_pending = true;
                 },
-                .cancellation => if (event.phase == .provider_prepared) {
+                .cancellation => if (event.phase == .snapshot_checkpoint_persisted and event.snapshot_offset == 1) {
                     self.fault_armed = false;
                     self.lease_valid = false;
+                    self.cancellation_injected = true;
+                    self.cancellation_checkpoint = event.snapshot_offset;
+                    self.cancellation_session = self.source_sessions_opened;
                 },
                 .stale_owner => if (event.phase == .snapshot_batch_applied) {
                     self.fault_armed = false;
@@ -413,6 +430,8 @@ pub const Scenario = struct {
             }
             if (self.source_crash_injected and session.generation > self.source_crash_session)
                 self.source_recovery_session = session.generation;
+            if (self.cancellation_injected and session.generation > self.cancellation_session)
+                self.cancellation_recovery_session = session.generation;
             if (std.mem.eql(u8, params.table, "users_v2"))
                 self.schema_v2_query_seen = true;
             const rows_json = [_][]const u8{
@@ -514,6 +533,7 @@ pub const Scenario = struct {
                 snapshot_complete = summary.snapshot_complete;
             } else |err| {
                 self.first_attempt_failed = true;
+                self.first_attempt_error_code = @intFromError(err);
                 self.stale_rejected = self.mode != .stale_owner or err == error.CdcWorkLeaseLost;
             }
             if (!snapshot_complete) {
@@ -591,6 +611,15 @@ pub const Scenario = struct {
             try self.run();
         }
 
+        /// Revoke the production work lease immediately after the first
+        /// snapshot checkpoint is durable, then resume through a replacement
+        /// source session without replaying the committed target batch.
+        pub fn runCancellation(self: *@This()) !void {
+            self.mode = .cancellation;
+            self.fault_armed = true;
+            try self.run();
+        }
+
         pub fn completionSound(self: *const @This()) bool {
             return self.complete and self.applied_mask == 7 and
                 self.max_snapshot_checkpoint <= @popCount(self.applied_mask & 3) and
@@ -607,12 +636,25 @@ pub const Scenario = struct {
             return self.completionSound() and self.first_attempt_failed and
                 self.source_crash_injected and !self.source_crash_pending and
                 self.source_crash_error_code == @intFromError(error.ConnectionResetByPeer) and
+                self.first_attempt_error_code == self.source_crash_error_code and
                 self.source_crash_session == 1 and
                 self.source_recovery_session == 2 and
                 self.source_sessions_opened == 3 and
                 self.source_sessions_closed == self.source_sessions_opened and
                 self.source_sessions_live == 0 and self.source_sessions_peak == 1 and
                 !self.fault_armed;
+        }
+
+        pub fn cancellationRecoverySound(self: *const @This()) bool {
+            return self.completionSound() and self.first_attempt_failed and
+                self.cancellation_injected and self.cancellation_checkpoint == 1 and
+                self.first_attempt_error_code == @intFromError(error.CdcWorkLeaseLost) and
+                self.cancellation_session == 1 and
+                self.cancellation_recovery_session == 2 and
+                self.source_sessions_opened == 3 and
+                self.source_sessions_closed == self.source_sessions_opened and
+                self.source_sessions_live == 0 and self.source_sessions_peak == 1 and
+                self.apply_calls == 3 and self.lease_valid and !self.fault_armed;
         }
 
         pub fn firstAttemptFailed(self: *const @This()) bool {
@@ -674,6 +716,11 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".source-sessions-peak", @intCast(world.state.source_sessions_peak));
         try builder.addNamed(allocator, name ++ ".source-crash-session", @intCast(world.state.source_crash_session));
         try builder.addNamed(allocator, name ++ ".source-recovery-session", @intCast(world.state.source_recovery_session));
+        try builder.addNamed(allocator, name ++ ".cancellation-injected", @intFromBool(world.state.cancellation_injected));
+        try builder.addNamed(allocator, name ++ ".cancellation-checkpoint", @intCast(world.state.cancellation_checkpoint));
+        try builder.addNamed(allocator, name ++ ".cancellation-session", @intCast(world.state.cancellation_session));
+        try builder.addNamed(allocator, name ++ ".cancellation-recovery-session", @intCast(world.state.cancellation_recovery_session));
+        try builder.addNamed(allocator, name ++ ".first-attempt-error", @intCast(world.state.first_attempt_error_code));
     }
 
     pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: std.mem.Allocator) !void {
@@ -688,7 +735,8 @@ pub const Scenario = struct {
         );
         try sink.check(allocator, recovery_id, state.complete and
             (state.mode == .clean or state.first_attempt_failed) and
-            (state.mode != .source_crash or state.sourceCrashRecoverySound()));
+            (state.mode != .source_crash or state.sourceCrashRecoverySound()) and
+            (state.mode != .cancellation or state.cancellationRecoverySound()));
     }
 
     pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
