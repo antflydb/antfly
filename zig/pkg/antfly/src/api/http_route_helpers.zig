@@ -217,7 +217,28 @@ test "lookup options decode generated SDK query values before splitting fields" 
 }
 
 pub fn parseScanKeysRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedScanKeysRequest {
+    return parseScanKeysRequestImpl(alloc, body, false);
+}
+
+pub fn parseInternalScanKeysRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedScanKeysRequest {
+    return parseScanKeysRequestImpl(alloc, body, true);
+}
+
+fn parseScanKeysRequestImpl(alloc: std.mem.Allocator, body: []const u8, allow_internal_options: bool) !OwnedScanKeysRequest {
     if (body.len == 0) return .{};
+
+    const include_content_hashes = if (allow_internal_options) blk: {
+        var raw = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidQueryRequest,
+        };
+        defer raw.deinit();
+        if (raw.value != .object) return error.InvalidQueryRequest;
+        break :blk if (raw.value.object.get("_include_content_hashes")) |value| switch (value) {
+            .bool => |flag| flag,
+            else => return error.InvalidQueryRequest,
+        } else false;
+    } else false;
 
     var parsed = metadata_openapi.server.parseScanKeysBody(alloc, body) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -257,6 +278,7 @@ pub fn parseScanKeysRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedSc
             .fields = fields,
             .include_all_fields = false,
             .filter_query_json = filter_query_json,
+            .include_content_hashes = include_content_hashes,
         },
     };
 }

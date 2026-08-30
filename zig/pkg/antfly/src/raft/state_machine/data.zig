@@ -30,6 +30,7 @@ pub const DataStateMachine = struct {
                 .prepare_snapshot = prepareSnapshot,
                 .build_snapshot = buildSnapshot,
                 .apply_ready = applyReady,
+                .retire_group = retireGroup,
             },
         };
     }
@@ -86,5 +87,10 @@ pub const DataStateMachine = struct {
         else
             0;
         if (applied_index > 0) try self.applied_sink.setAppliedIndex(group_id, applied_index);
+    }
+
+    fn retireGroup(ptr: *anyopaque, group_id: raft_engine.core.types.GroupId) void {
+        const self: *DataStateMachine = @ptrCast(@alignCast(ptr));
+        if (self.delegate) |delegate| delegate.retireGroup(group_id);
     }
 };

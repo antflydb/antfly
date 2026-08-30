@@ -81,6 +81,17 @@ class RetrievalQueryRequest:
                 IPRangeQuery | MatchAllQuery | MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery |
                 MultiPhraseQuery | NumericRangeQuery | PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery |
                 TermRangeQuery | Unset | WildcardQuery):
+            full_text_index (str | Unset): Full-text index used by `full_text_search` and by scoring text clauses in
+                `query`.
+                Use this to query a named document- or artifact-backed full-text index. The selected
+                index must exist and have type `full_text`. Omit this field to use the table's active
+                schema full-text index, preserving v0.2 behavior. Structured document filters continue
+                to use the active schema index even when retrieval uses a named artifact index. This
+                selector is invalid without `full_text_search` or a scoring text clause in `query` and
+                receives HTTP 422. This semantic relationship is enforced after the recursive query AST
+                is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses
+                from filter-only or exclusion-only trees.
+                 Example: document_text.
             semantic_search (str | Unset): Natural language query for vector similarity search. Results are ranked by
                 semantic similarity
                 to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF).
@@ -113,9 +124,15 @@ class RetrievalQueryRequest:
 
                 When not specified, the semantic_search string is embedded as plain text.
                  Example: {{remoteMedia url=this}}.
-            indexes (list[str] | Unset): List of vector index names to use for semantic search. Required when using
-                semantic_search.
-                Multiple indexes can be specified, and their results will be merged using RRF.
+            indexes (list[str] | Unset): Embedding index names selected for `semantic_search` or explicit `embeddings`.
+                Dense and sparse indexes are supported when the corresponding query representation is
+                supplied. Provisioned deployments require at least one index for `semantic_search`;
+                serverless may infer its single published dense index when this field is omitted. When
+                `embeddings` is supplied without this field, the embedding map keys select the indexes.
+                Provisioned results from multiple indexes are merged using RRF. Serverless currently
+                executes at most one dense and one sparse index per request; it rejects multiple
+                same-kind selectors and omitted selectors when more than one corresponding index is
+                published rather than choosing an index by catalog order.
                  Example: ['title_body_nomic', 'description_embedding'].
             filter_prefix (str | Unset): Filter results by key prefix. Only returns documents whose keys start with this
                 string.
@@ -201,7 +218,8 @@ class RetrievalQueryRequest:
                 size predictable. The presence of this object selects the canonical contract:
                 without `group_by` or `children`, including when the object is empty, direct index
                 matches are returned. `ancestors` only controls projected context and never changes result
-                cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+                cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit
+                source-grouped result shape.
             limit (int | Unset): Maximum number of top-level results to return. For semantic_search, this is the topk
                 parameter.
                 This does not limit nested matches attached through hierarchy.group_by.matches;
@@ -395,6 +413,7 @@ class RetrievalQueryRequest:
         | Unset
         | WildcardQuery
     ) = UNSET
+    full_text_index: str | Unset = UNSET
     semantic_search: str | Unset = UNSET
     embedding_template: str | Unset = UNSET
     indexes: list[str] | Unset = UNSET
@@ -572,6 +591,8 @@ class RetrievalQueryRequest:
             full_text_search = self.full_text_search.to_dict()
         else:
             full_text_search = self.full_text_search.to_dict()
+
+        full_text_index = self.full_text_index
 
         semantic_search = self.semantic_search
 
@@ -789,6 +810,8 @@ class RetrievalQueryRequest:
             field_dict["query"] = query
         if full_text_search is not UNSET:
             field_dict["full_text_search"] = full_text_search
+        if full_text_index is not UNSET:
+            field_dict["full_text_index"] = full_text_index
         if semantic_search is not UNSET:
             field_dict["semantic_search"] = semantic_search
         if embedding_template is not UNSET:
@@ -1146,6 +1169,8 @@ class RetrievalQueryRequest:
             return componentsschemas_query_type_25
 
         full_text_search = _parse_full_text_search(d.pop("full_text_search", UNSET))
+
+        full_text_index = d.pop("full_text_index", UNSET)
 
         semantic_search = d.pop("semantic_search", UNSET)
 
@@ -1758,6 +1783,7 @@ class RetrievalQueryRequest:
             table=table,
             query=query,
             full_text_search=full_text_search,
+            full_text_index=full_text_index,
             semantic_search=semantic_search,
             embedding_template=embedding_template,
             indexes=indexes,

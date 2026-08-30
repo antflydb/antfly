@@ -252,6 +252,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.ValueTooLong,
         error.InvalidQueryRequest,
         error.UnsupportedQueryRequest,
+        error.UnsupportedHierarchyGrouping,
         error.InvalidFilterQueryRequest,
         error.InvalidExclusionQueryRequest,
         error.UnsupportedFilterQueryRequest,

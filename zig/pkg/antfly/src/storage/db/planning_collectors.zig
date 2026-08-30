@@ -32,7 +32,10 @@ pub fn resolveTextIndexEstimate(
     req: types.SearchRequest,
 ) !?query_search.TextIndexEstimate {
     const entry = core.textIndexEntry(index_name) orelse return null;
-    const chunk_backed = entry.chunk_name != null;
+    // Use the runtime's authoritative classifier. In particular, canonical
+    // multi-source full-text configs keep their artifact names in
+    // `source_artifact_names`, not the single-source compatibility field.
+    const chunk_backed = try core.textIndexIsChunkBacked(alloc, entry.config.name);
     const persistent = core.textIndex(entry.config.name) orelse return error.IndexNotFound;
     const indexed_doc_count = persistent.snapshot().liveDocCount();
     return .{

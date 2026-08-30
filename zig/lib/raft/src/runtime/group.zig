@@ -23,9 +23,22 @@ pub const GroupConfig = struct {
 };
 
 pub const Group = struct {
+    const max_tracked_proposal_receipts: usize = 4096;
+
+    const ProposalReceiptKey = struct {
+        term: core.types.Term,
+        index: core.types.Index,
+    };
+
+    const ProposalReceiptProof = struct {
+        observed_term: ?core.types.Term = null,
+        waiters: usize = 0,
+    };
+
     alloc: std.mem.Allocator,
     cfg: GroupConfig,
     raw_node: core.RawNode,
+    tracked_proposal_receipts: std.AutoHashMapUnmanaged(ProposalReceiptKey, ProposalReceiptProof) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, cfg: GroupConfig) !Group {
         if (cfg.group_id == 0) return error.InvalidGroupId;
@@ -47,6 +60,7 @@ pub const Group = struct {
     }
 
     pub fn deinit(self: *Group) void {
+        self.tracked_proposal_receipts.deinit(self.alloc);
         self.raw_node.deinit();
         if (self.cfg.raft_config.peers.len > 0) self.alloc.free(self.cfg.raft_config.peers);
         self.* = undefined;
@@ -91,6 +105,50 @@ pub const Group = struct {
 
     pub fn proposeWithReceipt(self: *Group, data: []const u8, accepted_index: *?core.types.Index) !void {
         return try self.raw_node.proposeWithReceipt(data, accepted_index);
+    }
+
+    /// Reserves the bounded bookkeeping needed before Raft accepts a proposal.
+    /// Callers must do this before proposing so an allocation failure can never
+    /// strand an accepted receipt without its compaction proof.
+    pub fn prepareProposalReceiptTracking(self: *Group) !void {
+        if (self.tracked_proposal_receipts.count() >= max_tracked_proposal_receipts) {
+            return error.ProposalReceiptCapacityExhausted;
+        }
+        try self.tracked_proposal_receipts.ensureUnusedCapacity(self.alloc, 1);
+    }
+
+    /// Records an accepted receipt using capacity reserved before proposal.
+    pub fn trackProposalReceipt(self: *Group, term: core.types.Term, index: core.types.Index) void {
+        std.debug.assert(term != 0 and index != 0);
+        self.tracked_proposal_receipts.putAssumeCapacity(.{ .term = term, .index = index }, .{});
+    }
+
+    pub fn acquireProposalReceipt(self: *Group, term: core.types.Term, index: core.types.Index) bool {
+        const proof = self.tracked_proposal_receipts.getPtr(.{ .term = term, .index = index }) orelse return false;
+        proof.waiters +|= 1;
+        return true;
+    }
+
+    pub fn releaseProposalReceipt(self: *Group, term: core.types.Term, index: core.types.Index) void {
+        const key: ProposalReceiptKey = .{ .term = term, .index = index };
+        const proof = self.tracked_proposal_receipts.getPtr(key) orelse return;
+        std.debug.assert(proof.waiters > 0);
+        proof.waiters -= 1;
+        if (proof.waiters == 0) _ = self.tracked_proposal_receipts.remove(key);
+    }
+
+    /// The caller must first establish that `index` is applied. While the log
+    /// entry is live this captures its actual term; after local compaction it
+    /// returns the proof captured by compactAppliedLogTo.
+    pub fn termAtTrackedProposalReceipt(self: *Group, term: core.types.Term, index: core.types.Index) !core.types.Term {
+        const key: ProposalReceiptKey = .{ .term = term, .index = index };
+        if (self.tracked_proposal_receipts.getPtr(key)) |proof| {
+            if (proof.observed_term) |observed| return observed;
+            const observed = try self.termAt(index);
+            proof.observed_term = observed;
+            return observed;
+        }
+        return try self.termAt(index);
     }
 
     pub fn readIndex(self: *Group, request_ctx: []const u8) !void {
@@ -143,6 +201,13 @@ pub const Group = struct {
     }
 
     pub fn compactAppliedLogTo(self: *Group, index: core.types.Index) !void {
+        var receipts = self.tracked_proposal_receipts.iterator();
+        while (receipts.next()) |receipt| {
+            if (receipt.key_ptr.index > index or receipt.value_ptr.observed_term != null) continue;
+            // A replacement at the same position is just as important to
+            // retain as a match: waiters must return superseded, never success.
+            receipt.value_ptr.observed_term = self.raw_node.termAt(receipt.key_ptr.index) catch null;
+        }
         try self.raw_node.compactAppliedLogTo(index);
     }
 

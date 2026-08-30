@@ -1299,6 +1299,67 @@ pub fn liveDocSetFromStoreAlloc(alloc: Allocator, store: *docstore_mod.DocStore)
     return try visibleDocSetFromStoreAlloc(alloc, store, null);
 }
 
+/// Resolves a document-key prefix through the canonical document identity
+/// mapping. The encoded range scan is proportional to the matching keyspace,
+/// and the second pass removes identities that are not visible at the requested
+/// generation. Callers can therefore project the resulting ordinals into any
+/// physical index without applying a raw document prefix to artifact member
+/// keys.
+pub fn visibleDocSetForPrefixFromStoreAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    prefix: []const u8,
+    generation: ?u64,
+) !doc_set.ResolvedDocSet {
+    if (prefix.len == 0) return try visibleDocSetFromStoreAlloc(alloc, store, generation);
+
+    const lower_len = 2 + internal_keys.encodedBodyLen(prefix);
+    const lower = try alloc.alloc(u8, lower_len);
+    defer alloc.free(lower);
+    lower[0] = internal_keys.identity_namespace;
+    lower[1] = internal_keys.identity_doc_to_ordinal_kind;
+    _ = internal_keys.encodeBody(lower[2..], prefix);
+    const upper = (try internal_keys.nextPrefixAlloc(alloc, lower)) orelse return error.InvalidDocIdentity;
+    defer alloc.free(upper);
+
+    const State = struct {
+        alloc: Allocator,
+        ordinals: std.ArrayListUnmanaged(DocOrdinal) = .empty,
+
+        fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (key.len < 4 or
+                key[0] != internal_keys.identity_namespace or
+                key[1] != internal_keys.identity_doc_to_ordinal_kind or
+                internal_keys.findComponentTerminator(key, 2) != key.len - 2 or
+                value.len != @sizeOf(DocOrdinal))
+            {
+                return error.InvalidDocIdentity;
+            }
+            try state.ordinals.append(state.alloc, std.mem.readInt(DocOrdinal, value[0..4], .big));
+            return .@"continue";
+        }
+    };
+
+    var state = State{ .alloc = alloc };
+    defer state.ordinals.deinit(alloc);
+    try store.scanWithContext(lower, upper, .{}, &state, State.scanEntry);
+
+    if ((try allVisibleFromSummaryFast(store, generation)) orelse false) {
+        return try doc_set.fromOrdinalsAlloc(alloc, state.ordinals.items);
+    }
+    if (state.ordinals.items.len > doc_set.small_set_threshold) {
+        var candidates = try doc_set.fromOrdinalsAlloc(alloc, state.ordinals.items);
+        defer candidates.deinit(alloc);
+        if (try nonVisibleDocSetFromStoreAlloc(alloc, store, generation, default_max_nonvisible_doc_set_entries)) |resolved_nonvisible| {
+            var nonvisible = resolved_nonvisible;
+            defer nonvisible.deinit(alloc);
+            if (try doc_set.differenceAlloc(alloc, &candidates, &nonvisible)) |visible| return visible;
+        }
+    }
+    return try visibleFilteredOrdinalsFromStoreAlloc(alloc, store, state.ordinals.items, generation);
+}
+
 pub fn visibleDocSetFromStoreAlloc(alloc: Allocator, store: *docstore_mod.DocStore, generation: ?u64) !doc_set.ResolvedDocSet {
     const State = struct {
         alloc: Allocator,
@@ -3265,6 +3326,65 @@ test "live primary doc set requires complete live primary coverage" {
     defer visible_before_tombstone.deinit(alloc);
     try std.testing.expect(visible_before_tombstone.containsOrdinal(1));
     try std.testing.expect(visible_before_tombstone.containsOrdinal(2));
+}
+
+test "document identity prefix resolution preserves byte prefixes and generation visibility" {
+    const mem_backend = @import("../mem_backend.zig");
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    var initial_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &initial_writes);
+    try appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        10,
+        &initial_writes,
+        &.{ "tenant:a", "tenant:a\x00child", "tenant:b" },
+        &.{},
+    );
+    try store.putBatchWithReplay(null, initial_writes.items, &.{}, null);
+
+    var tenant_a_at_10 = try visibleDocSetForPrefixFromStoreAlloc(alloc, &store, "tenant:a", 10);
+    defer tenant_a_at_10.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 2), tenant_a_at_10.estimatedCardinality());
+    try std.testing.expect(tenant_a_at_10.containsOrdinal(1));
+    try std.testing.expect(tenant_a_at_10.containsOrdinal(2));
+
+    var binary_prefix = try visibleDocSetForPrefixFromStoreAlloc(alloc, &store, "tenant:a\x00", 10);
+    defer binary_prefix.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 1), binary_prefix.estimatedCardinality());
+    try std.testing.expect(binary_prefix.containsOrdinal(2));
+
+    var tombstone_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &tombstone_writes);
+    try appendBatchIdentityMetadataAlloc(
+        alloc,
+        &store,
+        0,
+        0,
+        11,
+        &tombstone_writes,
+        &.{},
+        &.{"tenant:a"},
+    );
+    try store.putBatchWithReplay(null, tombstone_writes.items, &.{}, null);
+
+    var tenant_a_at_11 = try visibleDocSetForPrefixFromStoreAlloc(alloc, &store, "tenant:a", 11);
+    defer tenant_a_at_11.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 1), tenant_a_at_11.estimatedCardinality());
+    try std.testing.expect(tenant_a_at_11.containsOrdinal(2));
+
+    var historical = try visibleDocSetForPrefixFromStoreAlloc(alloc, &store, "tenant:a", 10);
+    defer historical.deinit(alloc);
+    try std.testing.expectEqual(@as(?usize, 2), historical.estimatedCardinality());
 }
 
 test "non-visible doc set complements visibility per generation" {

@@ -2609,6 +2609,13 @@ pub const HBCIndex = struct {
         }
     }
 
+    pub fn pinNativeCheckpoint(self: *HBCIndex) !lsm_backend.Backend.NativeCheckpoint {
+        return switch (self.env_owner) {
+            .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
+            .lmdb => error.Unsupported,
+        };
+    }
+
     pub fn snapshotLsmNativeStorageStats(self: *const HBCIndex) ?lsm_backend.NativeStorageStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),
@@ -12619,6 +12626,7 @@ test "flat rabitq full effort exhausts an underfilled published directory" {
     try std.testing.expectEqual(stats.active_count, profiled.profile.approx_vectors_scored);
     try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_bound_stops);
     try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_frontier_remaining);
+    try std.testing.expectEqual(vectorindex_search_results.CandidateCoverage.exhausted, profiled.results.candidate_coverage);
 
     const published_directory = idx.flat_centroid_directory orelse return error.TestUnexpectedResult;
     var repeated = try idx.searchProfiledRequest(.{
@@ -12670,6 +12678,7 @@ test "tree full effort exhausts underfilled leaves beyond estimated width" {
     try std.testing.expectEqual(stats.active_count, profiled.profile.approx_vectors_scored);
     try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_bound_stops);
     try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_frontier_remaining);
+    try std.testing.expectEqual(vectorindex_search_results.CandidateCoverage.exhausted, profiled.results.candidate_coverage);
 }
 
 test "searchProfiled records phase timings and counters" {
