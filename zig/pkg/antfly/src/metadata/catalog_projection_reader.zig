@@ -44,6 +44,8 @@ pub const CatalogProjectionReader = struct {
     };
 
     pub const Snapshot = struct {
+        metadata_incarnation: ?metadata_api.MetadataClusterIncarnation = null,
+        catalog_revision: u64 = 0,
         tables: []metadata_table_manager.TableRecord = &.{},
         ranges: []metadata_table_manager.RangeRecord = &.{},
         index: metadata_api.CatalogProjectionIndex = .{},
@@ -139,9 +141,18 @@ pub const CatalogProjectionReader = struct {
         defer self.unlock();
 
         const snapshot = try self.validationSnapshotLocked(alloc, metadata_group_id, source, deadline_ns);
+        // Incarnation is immutable after first publication, but its projection
+        // signal is intentionally outside table/range cache invalidation. Read
+        // it on every exported snapshot so a cache populated during bootstrap
+        // cannot retain a pre-incarnation null authority forever.
+        const store = source.projectedStore() orelse return error.MissingMetadataStore;
+        const incarnation = try store.getMetadataIncarnation(metadata_group_id);
         const tables = try cloneTables(alloc, snapshot.tables, deadline_ns);
         errdefer freeTables(alloc, tables);
         return .{
+            .metadata_group_id = metadata_group_id,
+            .metadata_incarnation = incarnation,
+            .catalog_revision = snapshot.catalog_revision,
             .tables = tables,
             .ranges = try cloneRanges(alloc, snapshot.ranges, deadline_ns),
         };
@@ -176,6 +187,8 @@ pub const CatalogProjectionReader = struct {
         var snapshot: Snapshot = .{};
         errdefer snapshot.deinit(alloc);
         const projected = try store.captureCatalogProjection(alloc, metadata_group_id, deadline_ns);
+        snapshot.metadata_incarnation = projected.metadata_incarnation;
+        snapshot.catalog_revision = projected.catalog_revision;
         snapshot.tables = projected.tables;
         snapshot.ranges = projected.ranges;
         snapshot.index = try metadata_api.CatalogProjectionIndex.init(alloc, snapshot.tables, snapshot.ranges);

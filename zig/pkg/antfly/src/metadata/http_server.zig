@@ -85,6 +85,7 @@ pub const AdminSource = struct {
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         routing_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = unsupportedRoutingSnapshot,
+        linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
         validate_table_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) anyerror!bool = null,
@@ -162,6 +163,11 @@ pub const AdminSource = struct {
 
     pub fn routingSnapshot(self: AdminSource, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
         return try self.vtable.routing_snapshot(self.ptr, deadline_ns);
+    }
+
+    pub fn linearizableRoutingSnapshot(self: AdminSource, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+        const capture = self.vtable.linearizable_routing_snapshot orelse return error.UnsupportedOperation;
+        return try capture(self.ptr, request);
     }
 
     pub fn freeRoutingSnapshot(self: AdminSource, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -347,6 +353,7 @@ pub const AdminSource = struct {
                 .status = metadataServiceStatus,
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .routing_snapshot = metadataServiceRoutingSnapshot,
+                .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .validate_publication = metadataServiceValidatePublication,
                 .validate_table_publication = metadataServiceValidateTablePublication,
@@ -394,6 +401,7 @@ pub const AdminSource = struct {
                 .status = metadataHttpServiceStatus,
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
+                .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
                 .validate_publication = metadataHttpServiceValidatePublication,
                 .validate_table_publication = metadataHttpServiceValidateTablePublication,
@@ -489,6 +497,11 @@ pub const AdminSource = struct {
     fn metadataServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         return try svc.catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn metadataServiceLinearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        return try service.linearizableCatalogRoutingSnapshot(service.MetadataService, svc, request);
     }
 
     fn metadataServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -864,6 +877,11 @@ pub const AdminSource = struct {
         return try svc.catalogRoutingSnapshot(deadline_ns);
     }
 
+    fn metadataHttpServiceLinearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try service.linearizableCatalogRoutingSnapshot(service.MetadataHttpService, svc, request);
+    }
+
     fn metadataHttpServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         svc.freeCatalogRoutingSnapshot(snapshot);
@@ -1210,6 +1228,7 @@ pub const MetadataHttpServer = struct {
         // barrier that gives this endpoint its meaning.
         try server.post(routes.Routes.internal_linearizable_head, httpx.Handler.bind(self, metadataLinearizableHead));
         try server.post(routes.Routes.internal_linearizable_snapshot, httpx.Handler.bind(self, metadataLinearizableSnapshot));
+        try server.post(routes.Routes.internal_linearizable_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableRoutingSnapshot));
         try server.get(routes.Routes.runtime_topology, httpx.Handler.bind(self, metadataRuntimeTopology));
         try server.get(routes.Routes.status, httpx.Handler.bind(self, metadataStatus));
         try server.get(routes.Routes.admin_snapshot, httpx.Handler.bind(self, metadataSnapshot));
@@ -1273,6 +1292,7 @@ pub const MetadataHttpServer = struct {
                 }.call,
             } else .none,
             .request_id = ctx.header("x-request-id") orelse "",
+            .deadline_ns = ctx.application_deadline_ns,
         };
     }
 
@@ -1368,7 +1388,9 @@ pub const MetadataHttpServer = struct {
             error.InvalidArgument => ctx.status(400).text("invalid path parameter"),
             error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
             error.Canceled => ctx.status(408).text("request canceled"),
-            error.DeadlineExceeded => ctx.status(504).text("request deadline exceeded"),
+            error.DeadlineExceeded,
+            error.CatalogRoutingSnapshotTimeout,
+            => ctx.status(504).text("request deadline exceeded"),
             else => err,
         };
     }
@@ -1399,6 +1421,25 @@ pub const MetadataHttpServer = struct {
         return self.trackedJson(ctx, result);
     }
 
+    fn applyRoutingBudget(ctx: *httpx.Context) !void {
+        if (ctx.application_deadline_ns != null) return;
+        if (ctx.header(routes.routing_remaining_ms_header)) |raw| {
+            const remaining_ms = std.fmt.parseUnsigned(u64, raw, 10) catch return error.InvalidArgument;
+            if (remaining_ms == 0) return error.CatalogRoutingSnapshotTimeout;
+            ctx.application_deadline_ns = platform_time.monotonicNs() +|
+                remaining_ms *| std.time.ns_per_ms;
+        }
+    }
+
+    fn metadataLinearizableRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        const request = requestContext(ctx);
+        var result = self.source.linearizableRoutingSnapshot(request) catch |err| return metadataReadError(ctx, err);
+        defer self.source.freeRoutingSnapshot(&result);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return self.trackedJson(ctx, result);
+    }
+
     fn metadataRuntimeTopology(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const result = self.source.runtimeTopology() catch |err| return metadataReadError(ctx, err);
         if (self.internal_service_auth_capability) |capability| {
@@ -1423,6 +1464,7 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
         var result = self.source.routingSnapshot(ctx.application_deadline_ns) catch |err| return metadataReadError(ctx, err);
         defer self.source.freeRoutingSnapshot(&result);
         return self.trackedJson(ctx, result);
@@ -3239,6 +3281,79 @@ test "metadata http server reports reallocation protocol upgrade gating" {
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 503), response.status.code);
     try std.testing.expectEqualStrings("metadata voter upgrade required", response.body.?);
+}
+
+test "metadata routing server converts relative budget to local deadline" {
+    const RoutingSource = struct {
+        observed_deadline_ns: ?u64 = null,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = routingSnapshot,
+                .linearizable_routing_snapshot = linearizableRoutingSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observed_deadline_ns = deadline_ns;
+            return .{ .tables = &.{}, .ranges = &.{} };
+        }
+
+        fn linearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+            return routingSnapshot(ptr, request.deadline_ns);
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+    };
+
+    var source = RoutingSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer request.deinit();
+    try request.headers.append(routes.routing_remaining_ms_header, "250");
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    const before_ns = platform_time.monotonicNs();
+    var response = try server.metadataRoutingSnapshot(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const observed = source.observed_deadline_ns orelse return error.TestExpectedDeadline;
+    try std.testing.expect(observed >= before_ns + 250 * std.time.ns_per_ms);
+    try std.testing.expect(observed <= platform_time.monotonicNs() + 250 * std.time.ns_per_ms);
+
+    source.observed_deadline_ns = null;
+    var linearizable_request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        routes.Routes.internal_linearizable_routing_snapshot,
+    );
+    defer linearizable_request.deinit();
+    try linearizable_request.headers.append(routes.routing_remaining_ms_header, "125");
+    var linearizable_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &linearizable_request);
+    defer linearizable_ctx.deinit();
+    const linearizable_before_ns = platform_time.monotonicNs();
+    var linearizable_response = try server.metadataLinearizableRoutingSnapshot(&linearizable_ctx);
+    defer linearizable_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), linearizable_response.status.code);
+    const linearizable_observed = source.observed_deadline_ns orelse return error.TestExpectedDeadline;
+    try std.testing.expect(linearizable_observed >= linearizable_before_ns + 125 * std.time.ns_per_ms);
+    try std.testing.expect(linearizable_observed <= platform_time.monotonicNs() + 125 * std.time.ns_per_ms);
 }
 
 test "metadata http server serves status and filtered admin routes" {

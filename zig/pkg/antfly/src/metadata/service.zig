@@ -196,6 +196,27 @@ pub fn coherentLinearizableAdminSnapshot(
     return error.MetadataLinearizableReadTimeout;
 }
 
+/// Return a compact catalog projection captured after a linearizable read
+/// barrier. This is used to confirm negative routing results without paying
+/// the cost of an administrative snapshot.
+pub fn linearizableCatalogRoutingSnapshot(
+    comptime Service: type,
+    svc: *Service,
+    request: api_operation.RequestContext,
+) !metadata_api.CatalogRoutingSnapshot {
+    svc.ensureLinearizableReadWithContext(request) catch |err| switch (err) {
+        error.DeadlineExceeded,
+        error.MetadataLinearizableReadTimeout,
+        => return error.CatalogRoutingSnapshotTimeout,
+        else => return err,
+    };
+    request.ensureActive() catch |err| switch (err) {
+        error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
+        else => return err,
+    };
+    return try svc.catalogRoutingSnapshot(request.deadline_ns);
+}
+
 fn logMetadataRunRoundPhase(name: []const u8, elapsed_ns: u64) void {
     if (elapsed_ns > metadata_run_round_slow_phase_threshold_ns) {
         std.log.warn("metadata runRound phase slow phase={s} elapsed_ms={d}", .{
@@ -13616,6 +13637,9 @@ test "metadata service admin snapshot captures projected topology and status" {
 
     var routing = try svc.catalogRoutingSnapshot(null);
     defer svc.freeCatalogRoutingSnapshot(&routing);
+    try std.testing.expectEqual(@as(u64, 1973), routing.metadata_group_id);
+    try std.testing.expect(routing.metadata_incarnation != null);
+    try std.testing.expect(routing.catalog_revision > 0);
     try std.testing.expectEqual(@as(usize, 1), routing.tables.len);
     try std.testing.expectEqual(@as(usize, 1), routing.ranges.len);
     try std.testing.expectEqual(@as(u64, 89), routing.tables[0].table_id);

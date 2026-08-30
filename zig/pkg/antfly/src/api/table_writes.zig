@@ -79,8 +79,36 @@ fn resolveCatalogGroupsEventually(
         timeout_ns,
         poll_interval_ms,
     )) {
-        .found => |groups| groups,
+        .found => |plan_value| blk: {
+            var plan = plan_value;
+            defer plan.deinit(alloc);
+            break :blk try plan.groupIdsAlloc(alloc);
+        },
         .not_found => try alloc.alloc(u64, 0),
+        .timed_out => error.CatalogRoutingSnapshotTimeout,
+    };
+}
+
+fn resolveCatalogRouteEventually(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+    timeout_ns: u64,
+    poll_interval_ms: u64,
+) !?table_catalog.CatalogRoutePlan {
+    return switch (try table_catalog.resolveGroupsForSpanEventually(
+        alloc,
+        catalog,
+        table_name,
+        from_key,
+        to_key,
+        timeout_ns,
+        poll_interval_ms,
+    )) {
+        .found => |plan| plan,
+        .not_found => null,
         .timed_out => error.CatalogRoutingSnapshotTimeout,
     };
 }
@@ -9591,7 +9619,9 @@ pub const ProvisionedTableWriteSource = struct {
         cache.inference_api_url = self.inference_api_url;
         cache.remote_content = self.remote_content;
         self.syncRuntimeHooksToCache(cache);
-        const identity_namespace = if (preloaded_metadata) |metadata|
+        const identity_namespace = if (managed_open_options.identity_namespace_override) |namespace|
+            namespace
+        else if (preloaded_metadata) |metadata|
             metadata.identity_namespace
         else
             try loadTableIdentityNamespaceForGroup(cache.alloc, self.catalog, table_name, group_id);
@@ -15254,7 +15284,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.localWriteOwnerSource()) |owner| return try owner.createTable(alloc, table_name, req);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         std.log.info("provisioned create table local begin table={s}", .{table_name});
-        const group_ids = try resolveCatalogGroupsEventually(
+        var route = (try resolveCatalogRouteEventually(
             alloc,
             self.catalog,
             table_name,
@@ -15262,9 +15292,10 @@ pub const ProvisionedTableWriteSource = struct {
             "",
             5 * std.time.ns_per_s,
             10,
-        );
+        )) orelse return null;
+        defer route.deinit(alloc);
+        const group_ids = try route.groupIdsAlloc(alloc);
         defer alloc.free(group_ids);
-        if (group_ids.len == 0) return null;
 
         const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
         const schema_json = tables_api.effectiveSchemaJson(req.schema_json);
@@ -15292,10 +15323,12 @@ pub const ProvisionedTableWriteSource = struct {
                 std.log.info("provisioned create table local group begin table={s} group_id={d}", .{ table_name, group_id });
                 const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
                 defer alloc.free(path);
+                const group_route = route.group(group_id) orelse return error.CatalogChanged;
+                const identity_namespace = docIdentityNamespaceFromCatalog(group_route.identity_namespace);
 
                 const visible_generation = self.visibleRootGeneration(group_id);
                 {
-                    var cached = try self.getOrOpenCachedDbForLocalMutation(
+                    var cached = try self.getOrOpenCachedDbForLocalMutationWithOptions(
                         alloc,
                         cache,
                         path,
@@ -15303,12 +15336,13 @@ pub const ProvisionedTableWriteSource = struct {
                         visible_generation,
                         table_name,
                         false,
+                        .{ .identity_namespace_override = identity_namespace },
                     );
                     errdefer cached.deinit(alloc);
                     const entry = cached.entry orelse return error.StaleCachedDbLease;
                     if (entry.retired) return error.StaleCachedDbLease;
                     target_generations[group_index] = entry.lsm_root_generation;
-                    try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
+                    try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
                     try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
                     // Catalog admission and local create can race an earlier
                     // startup/status open of this generation. The entry
@@ -15391,7 +15425,8 @@ pub const ProvisionedTableWriteSource = struct {
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
 
-            const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+            const group_route = route.group(group_id) orelse return error.CatalogChanged;
+            const identity_namespace = docIdentityNamespaceFromCatalog(group_route.identity_namespace);
             const lsm_root_generation = self.visibleRootGeneration(group_id);
             if (self.write_cache) |cache| {
                 if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
@@ -23194,6 +23229,10 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
 }
 
 const ManagedDbOpenOptions = struct {
+    /// Identity captured with the route that selected the group. Supplying it
+    /// prevents a cache miss from performing a second, potentially older,
+    /// catalog read before creating the database.
+    identity_namespace_override: ?doc_identity.Namespace = null,
     drain_resolver_backfill: bool = true,
     source_table: []const u8 = "",
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
@@ -26369,12 +26408,12 @@ fn loadTableIdentityNamespaceForGroup(
     // group selection and namespace selection on the compact projection.
     var snapshot = try catalog.routingSnapshot(null);
     defer catalog.freeRoutingSnapshot(&snapshot);
-    const table = findTableRecordByName(snapshot.tables, table_name) orelse return null;
+    const table = findTableRecordByName(snapshot.tables, table_name) orelse return error.TableNotFound;
     for (snapshot.ranges) |range| {
         if (range.table_id != table.table_id or range.group_id != group_id) continue;
         return tableIdentityNamespaceForRange(table.*, range);
     }
-    return null;
+    return error.TopologyChanged;
 }
 
 fn findTableRecordByName(
@@ -26392,6 +26431,14 @@ fn tableIdentityNamespaceForRange(
     range: metadata_table_manager.RangeRecord,
 ) doc_identity.Namespace {
     return tableIdentityNamespaceForRangeId(table.table_id, range);
+}
+
+fn docIdentityNamespaceFromCatalog(namespace: table_catalog.CatalogIdentityNamespace) doc_identity.Namespace {
+    return .{
+        .table_id = namespace.table_id,
+        .shard_id = namespace.shard_id,
+        .range_id = namespace.range_id,
+    };
 }
 
 fn tableIdentityNamespaceForRangeId(

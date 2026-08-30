@@ -1002,6 +1002,7 @@ pub const StatusSource = struct {
         linearizable_snapshot: ?*const fn (ptr: *anyopaque, request: api_operation.RequestContext) anyerror!?metadata_api.AdminSnapshot = null,
         free_admin_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void = null,
         routing_snapshot: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
+        linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         free_routing_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
@@ -1066,6 +1067,11 @@ pub const StatusSource = struct {
     pub fn routingSnapshot(self: StatusSource, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
         const fn_ptr = self.vtable.routing_snapshot orelse return error.CatalogRoutingUnavailable;
         return try BoundaryAbi.call("routing_snapshot", self.boundary_dispatch, fn_ptr, .{ self.ptr, deadline_ns });
+    }
+
+    pub fn linearizableRoutingSnapshot(self: StatusSource, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const fn_ptr = self.vtable.linearizable_routing_snapshot orelse return error.CatalogRoutingUnavailable;
+        return try BoundaryAbi.call("linearizable_routing_snapshot", self.boundary_dispatch, fn_ptr, .{ self.ptr, deadline_ns });
     }
 
     pub fn freeRoutingSnapshot(self: StatusSource, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -1239,6 +1245,12 @@ pub const StatusSource = struct {
                 return try cast(ptr).catalogRoutingSnapshot(deadline_ns);
             }
 
+            fn linearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot {
+                return try metadata_service.linearizableCatalogRoutingSnapshot(T, cast(ptr), .{
+                    .deadline_ns = deadline_ns,
+                });
+            }
+
             fn freeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
                 cast(ptr).freeCatalogRoutingSnapshot(snapshot);
             }
@@ -1363,6 +1375,7 @@ pub const StatusSource = struct {
             .linearizable_snapshot = Gen.linearizableSnapshot,
             .free_admin_snapshot = Gen.freeAdminSnapshot,
             .routing_snapshot = Gen.routingSnapshot,
+            .linearizable_routing_snapshot = Gen.linearizableRoutingSnapshot,
             .free_routing_snapshot = Gen.freeRoutingSnapshot,
             .create_table = Gen.createTable,
             .replace_table_definition = Gen.replaceTableDefinition,
@@ -4214,12 +4227,24 @@ pub const ApiHttpServer = struct {
     }
 
     fn catalogSource(self: *ApiHttpServer) table_catalog.CatalogSource {
+        if (self.source.vtable.linearizable_routing_snapshot == null) {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = apiHttpServerCatalogAdminSnapshot,
+                    .free_admin_snapshot = apiHttpServerCatalogFreeAdminSnapshot,
+                    .routing_snapshot = apiHttpServerCatalogRoutingSnapshot,
+                    .free_routing_snapshot = apiHttpServerCatalogFreeRoutingSnapshot,
+                },
+            };
+        }
         return .{
             .ptr = self,
             .vtable = &.{
                 .admin_snapshot = apiHttpServerCatalogAdminSnapshot,
                 .free_admin_snapshot = apiHttpServerCatalogFreeAdminSnapshot,
                 .routing_snapshot = apiHttpServerCatalogRoutingSnapshot,
+                .linearizable_routing_snapshot = apiHttpServerCatalogLinearizableRoutingSnapshot,
                 .free_routing_snapshot = apiHttpServerCatalogFreeRoutingSnapshot,
             },
         };
@@ -6700,6 +6725,11 @@ pub const ApiHttpServer = struct {
     fn apiHttpServerCatalogRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         return try self.source.routingSnapshot(deadline_ns);
+    }
+
+    fn apiHttpServerCatalogLinearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        return try self.source.linearizableRoutingSnapshot(deadline_ns);
     }
 
     fn apiHttpServerCatalogFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {

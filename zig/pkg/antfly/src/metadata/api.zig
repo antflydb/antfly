@@ -205,10 +205,16 @@ pub const AdminSnapshot = struct {
     merged_group_statuses: []metadata_reconciler.MergedGroupStatus = &.{},
 };
 
-/// Atomic projected catalog view used only for table-to-group routing. Keep
-/// identity and operational status out of this type so it cannot accidentally
-/// be used as a publication fence or an admin snapshot.
+/// Atomic projected catalog view used only for table-to-group routing. It
+/// includes the authority and range identity needed to consume a route, while
+/// excluding operational and reconciliation status so it cannot accidentally
+/// become an administrative snapshot.
 pub const CatalogRoutingSnapshot = struct {
+    /// Authority and revision are captured with the projection. Remote callers
+    /// must validate the authority before using any route from this snapshot.
+    metadata_group_id: u64 = 0,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
+    catalog_revision: u64 = 0,
     tables: []table_manager.TableRecord,
     ranges: []table_manager.RangeRecord,
 };

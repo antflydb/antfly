@@ -818,6 +818,7 @@ const LocalStandaloneMetadata = struct {
                 .admin_snapshot = catalogAdminSnapshot,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
                 .routing_snapshot = catalogRoutingSnapshot,
+                .linearizable_routing_snapshot = catalogRoutingSnapshot,
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
             },
         };
@@ -833,6 +834,7 @@ const LocalStandaloneMetadata = struct {
                 .linearizable_snapshot = linearizableSnapshot,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
                 .routing_snapshot = catalogRoutingSnapshot,
+                .linearizable_routing_snapshot = catalogRoutingSnapshot,
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .create_table = createTable,
                 .replace_table_definition = replaceTableDefinition,
@@ -986,7 +988,12 @@ const LocalStandaloneMetadata = struct {
         if (deadline_ns) |deadline| {
             if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
-        return .{ .tables = tables, .ranges = ranges };
+        return .{
+            .metadata_group_id = group_ids.main_metadata_group_id,
+            .catalog_revision = self.epoch,
+            .tables = tables,
+            .ranges = ranges,
+        };
     }
 
     fn catalogFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *antfly.metadata_api.CatalogRoutingSnapshot) void {

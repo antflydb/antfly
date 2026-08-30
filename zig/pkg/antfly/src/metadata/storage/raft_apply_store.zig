@@ -39,6 +39,8 @@ pub const AppliedMetadataBatch = struct {
 };
 
 pub const CatalogProjectionSnapshot = struct {
+    metadata_incarnation: ?metadata_incarnation.MetadataClusterIncarnation,
+    catalog_revision: u64,
     tables: []metadata.TableRecord,
     ranges: []metadata.RangeRecord,
 };
@@ -1625,6 +1627,28 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
 
+        var apply_key_buf: [128]u8 = undefined;
+        const apply_key = try keyForGroup(&apply_key_buf, group_id);
+        const applied = txn.get(apply_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const catalog_revision = if (applied) |encoded| blk: {
+            if (encoded.len < @sizeOf(u64)) return error.InvalidMetadataApplyBatch;
+            break :blk std.mem.readInt(u64, encoded[0..8], .little);
+        } else 0;
+
+        var incarnation_key_buf: [160]u8 = undefined;
+        const incarnation_key = try metadataIncarnationKeyForGroup(&incarnation_key_buf, group_id);
+        const incarnation_encoded = txn.get(incarnation_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const incarnation = if (incarnation_encoded) |encoded|
+            (try decodeMetadataIncarnationRecord(encoded)).incarnation
+        else
+            null;
+
         const tables = try self.listTablesTxn(alloc, &txn, group_id);
         errdefer self.freeTables(alloc, tables);
         if (deadline_ns) |deadline| {
@@ -1636,6 +1660,8 @@ pub const RaftApplyStore = struct {
             if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
         return .{
+            .metadata_incarnation = incarnation,
+            .catalog_revision = catalog_revision,
             .tables = tables,
             .ranges = ranges,
         };
@@ -8487,6 +8513,8 @@ test "metadata raft apply store catalog projection uses storage snapshot indepen
         );
         defer store.freeTables(std.testing.allocator, snapshot.tables);
         defer store.freeRanges(std.testing.allocator, snapshot.ranges);
+        try std.testing.expectEqual(@as(u64, 4), snapshot.catalog_revision);
+        try std.testing.expectEqual(@as(?metadata_incarnation.MetadataClusterIncarnation, null), snapshot.metadata_incarnation);
         try std.testing.expectEqual(@as(usize, 1), snapshot.tables.len);
         try std.testing.expectEqual(@as(usize, 1), snapshot.ranges.len);
         try std.testing.expectEqual(snapshot.tables[0].table_id, snapshot.ranges[0].table_id);

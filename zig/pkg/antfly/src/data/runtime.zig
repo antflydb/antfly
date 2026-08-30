@@ -15763,6 +15763,7 @@ const RemoteMetadataSource = struct {
                 .admin_snapshot = remoteAdminSnapshot,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .routing_snapshot = remoteRoutingSnapshot,
+                .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = remoteValidateCatalogPublication,
@@ -15781,6 +15782,7 @@ const RemoteMetadataSource = struct {
                 .linearizable_snapshot = remoteLinearizableSnapshot,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .routing_snapshot = remoteRoutingSnapshot,
+                .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
                 .create_table = remoteCreateTable,
                 .replace_table_definition = remoteReplaceTableDefinition,
@@ -16033,6 +16035,19 @@ const RemoteMetadataSource = struct {
 
     fn remoteRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        return try self.remoteRoutingSnapshotWithMode(deadline_ns, false);
+    }
+
+    fn remoteLinearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        return try self.remoteRoutingSnapshotWithMode(deadline_ns, true);
+    }
+
+    fn remoteRoutingSnapshotWithMode(
+        self: *RemoteMetadataSource,
+        deadline_ns: ?u64,
+        linearizable: bool,
+    ) !antfly.metadata_api.CatalogRoutingSnapshot {
         const budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline|
             .{ .deadline_ns = deadline }
         else
@@ -16045,7 +16060,10 @@ const RemoteMetadataSource = struct {
             defer arena.deinit();
             const scratch = arena.allocator();
             var metadata_client = self.metadataClient(scratch);
-            var parsed = metadata_client.fetchRoutingSnapshotWithBudget(self.base_uris[index], budget) catch |err| {
+            var parsed = (if (linearizable)
+                metadata_client.fetchLinearizableRoutingSnapshot(self.base_uris[index], budget)
+            else
+                metadata_client.fetchRoutingSnapshotWithBudget(self.base_uris[index], budget)) catch |err| {
                 if (err == error.Timeout or err == error.DeadlineExceeded or err == error.Cancelled) {
                     last_err = error.CatalogRoutingSnapshotTimeout;
                     continue;
@@ -16054,10 +16072,20 @@ const RemoteMetadataSource = struct {
                 continue;
             };
             defer parsed.deinit();
+            self.acceptMetadataIdentity(
+                parsed.value.metadata_group_id,
+                parsed.value.metadata_incarnation,
+            ) catch |err| {
+                last_err = err;
+                continue;
+            };
             self.noteMetadataReadSuccess(index);
             const tables = try cloneTablesOwned(self.alloc, parsed.value.tables);
             errdefer freeTablesOwned(self.alloc, tables);
             return .{
+                .metadata_group_id = parsed.value.metadata_group_id,
+                .metadata_incarnation = parsed.value.metadata_incarnation,
+                .catalog_revision = parsed.value.catalog_revision,
                 .tables = tables,
                 .ranges = try cloneRangesOwned(self.alloc, parsed.value.ranges),
             };

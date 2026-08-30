@@ -39,6 +39,9 @@ pub const CatalogSource = struct {
         /// override the unsupported defaults; test doubles that never route may
         /// retain them without silently falling back to an admin snapshot.
         routing_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = unsupportedRoutingSnapshot,
+        /// Compact projection captured after a linearizable read barrier. It
+        /// is only required to confirm an eventual negative routing result.
+        linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         /// Production sources must fail closed when either linearizable
         /// publication validator is unavailable.
@@ -64,12 +67,31 @@ pub const CatalogSource = struct {
         self.vtable.free_routing_snapshot(self.ptr, snapshot);
     }
 
+    pub fn linearizableRoutingSnapshot(self: CatalogSource, deadline_ns: ?u64) !?metadata_api.CatalogRoutingSnapshot {
+        const capture = self.vtable.linearizable_routing_snapshot orelse return null;
+        return try capture(self.ptr, deadline_ns);
+    }
+
     /// Reports whether this source explicitly implements compact catalog
     /// routing. The unsupported defaults deliberately never fall back to an
     /// administrative snapshot.
     pub fn hasRoutingCapability(self: CatalogSource) bool {
         return self.vtable.routing_snapshot != unsupportedRoutingSnapshot and
-            self.vtable.free_routing_snapshot != unsupportedFreeRoutingSnapshot;
+            self.vtable.free_routing_snapshot != unsupportedFreeRoutingSnapshot and
+            self.vtable.linearizable_routing_snapshot != null;
+    }
+
+    /// Capture an eventual projection, upgrading only a table-level miss to a
+    /// compact linearizable projection. The caller owns the returned snapshot.
+    fn routingSnapshotForTable(self: CatalogSource, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        var snapshot = try self.routingSnapshot(deadline_ns);
+        if (findTableByName(snapshot.tables, table_name) != null or
+            self.vtable.linearizable_routing_snapshot == null)
+        {
+            return snapshot;
+        }
+        self.freeRoutingSnapshot(&snapshot);
+        return (try self.linearizableRoutingSnapshot(deadline_ns)).?;
     }
 
     pub fn validatePublication(self: CatalogSource, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -89,6 +111,7 @@ pub const CatalogSource = struct {
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
                 .routing_snapshot = metadataServiceRoutingSnapshot,
+                .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = metadataServiceValidatePublication,
@@ -104,6 +127,7 @@ pub const CatalogSource = struct {
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
+                .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = metadataHttpServiceValidatePublication,
@@ -119,6 +143,7 @@ pub const CatalogSource = struct {
                 .admin_snapshot = metadataServerAdminSnapshot,
                 .free_admin_snapshot = metadataServerFreeAdminSnapshot,
                 .routing_snapshot = metadataServerRoutingSnapshot,
+                .linearizable_routing_snapshot = metadataServerLinearizableRoutingSnapshot,
                 .free_routing_snapshot = metadataServerFreeRoutingSnapshot,
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = metadataServerValidatePublication,
@@ -224,10 +249,10 @@ pub fn resolveSingleRangeGroup(
     catalog: CatalogSource,
     table_name: []const u8,
 ) !?u64 {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
-    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    var snapshot = try catalog.routingSnapshotForTable(table_name, null);
+    defer catalog.freeRoutingSnapshot(&snapshot);
+    const table = findTableByName(snapshot.tables, table_name) orelse return null;
+    const ranges = try listTableRanges(alloc, snapshot.ranges, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
     if (ranges.len == 0) return null;
     if (ranges.len != 1) return error.UnsupportedMultiRangeTable;
@@ -240,10 +265,10 @@ pub fn resolveGroupForKey(
     table_name: []const u8,
     key: []const u8,
 ) !?u64 {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
-    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    var snapshot = try catalog.routingSnapshotForTable(table_name, null);
+    defer catalog.freeRoutingSnapshot(&snapshot);
+    const table = findTableByName(snapshot.tables, table_name) orelse return null;
+    const ranges = try listTableRanges(alloc, snapshot.ranges, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
     if (ranges.len == 0) return null;
     return resolveGroupForKeyFromRanges(ranges, key);
@@ -264,10 +289,10 @@ pub fn routedGroupSnapshot(
     table_name: []const u8,
     key: []const u8,
 ) !RoutedGroupSnapshot {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return .{ .group_id = null, .topology_epoch = 0 };
-    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    var snapshot = try catalog.routingSnapshotForTable(table_name, null);
+    defer catalog.freeRoutingSnapshot(&snapshot);
+    const table = findTableByName(snapshot.tables, table_name) orelse return .{ .group_id = null, .topology_epoch = 0 };
+    const ranges = try listTableRanges(alloc, snapshot.ranges, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
     sortRangeRefs(ranges);
     return .{
@@ -338,9 +363,9 @@ pub fn tableExists(
     catalog: CatalogSource,
     table_name: []const u8,
 ) !bool {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
-    return tables_api.findTableByName(&snapshot, table_name) != null;
+    var snapshot = try catalog.routingSnapshotForTable(table_name, null);
+    defer catalog.freeRoutingSnapshot(&snapshot);
+    return findTableByName(snapshot.tables, table_name) != null;
 }
 
 pub fn topologyEpoch(
@@ -348,10 +373,21 @@ pub fn topologyEpoch(
     catalog: CatalogSource,
     table_name: []const u8,
 ) !u64 {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return 0;
-    return try topologyEpochFromSnapshot(alloc, &snapshot, table.*);
+    var snapshot = try catalog.routingSnapshotForTable(table_name, null);
+    defer catalog.freeRoutingSnapshot(&snapshot);
+    const table = findTableByName(snapshot.tables, table_name) orelse return 0;
+    return try topologyEpochFromProjection(alloc, snapshot.ranges, table.*);
+}
+
+fn topologyEpochFromProjection(
+    alloc: std.mem.Allocator,
+    catalog_ranges: []const metadata_table_manager.RangeRecord,
+    table: metadata_table_manager.TableRecord,
+) !u64 {
+    const ranges = try listTableRanges(alloc, catalog_ranges, table.table_id);
+    defer metadata_admin.freeRangeRefs(alloc, ranges);
+    sortRangeRefs(ranges);
+    return topologyEpochFromSortedRanges(table, ranges);
 }
 
 fn topologyEpochFromSnapshot(
@@ -448,10 +484,10 @@ pub fn groupTopologyEpoch(
     table_name: []const u8,
     group_id: u64,
 ) !u64 {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    var snapshot = try catalog.routingSnapshotForTable(table_name, null);
+    defer catalog.freeRoutingSnapshot(&snapshot);
+    const table = findTableByName(snapshot.tables, table_name) orelse return error.TableNotFound;
+    const ranges = try listTableRanges(alloc, snapshot.ranges, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
     sortRangeRefs(ranges);
     for (ranges) |range| {
@@ -641,19 +677,61 @@ pub fn resolveGroupsForSpan(
     to_key: []const u8,
 ) ![]u64 {
     return switch (try resolveGroupsForSpanWithDeadline(alloc, catalog, table_name, from_key, to_key, null)) {
-        .found => |groups| groups,
+        .found => |plan_value| blk: {
+            var plan = plan_value;
+            defer plan.deinit(alloc);
+            break :blk try plan.groupIdsAlloc(alloc);
+        },
         .not_found => try alloc.alloc(u64, 0),
         .timed_out => unreachable,
     };
 }
 
+pub const CatalogIdentityNamespace = struct {
+    table_id: u64,
+    shard_id: u64,
+    range_id: u64,
+};
+
+pub const CatalogGroupRoute = struct {
+    group_id: u64,
+    range_id: u64,
+    identity_namespace: CatalogIdentityNamespace,
+};
+
+/// A complete routing decision derived from one immutable catalog projection.
+/// Group selection and database identity must never be looked up separately.
+pub const CatalogRoutePlan = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: ?metadata_api.MetadataClusterIncarnation,
+    catalog_revision: u64,
+    table_id: u64,
+    groups: []CatalogGroupRoute,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.groups);
+        self.* = undefined;
+    }
+
+    pub fn groupIdsAlloc(self: @This(), alloc: std.mem.Allocator) ![]u64 {
+        const ids = try alloc.alloc(u64, self.groups.len);
+        for (self.groups, ids) |route, *id| id.* = route.group_id;
+        return ids;
+    }
+
+    pub fn group(self: @This(), group_id: u64) ?CatalogGroupRoute {
+        for (self.groups) |route| if (route.group_id == group_id) return route;
+        return null;
+    }
+};
+
 pub const ResolveGroupsResult = union(enum) {
-    found: []u64,
+    found: CatalogRoutePlan,
     not_found,
     timed_out,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.* == .found) alloc.free(self.found);
+        if (self.* == .found) self.found.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -668,19 +746,57 @@ fn resolveGroupsForSpanWithDeadline(
 ) !ResolveGroupsResult {
     var snapshot = try catalog.routingSnapshot(deadline_ns);
     defer catalog.freeRoutingSnapshot(&snapshot);
-    const table = findTableByName(snapshot.tables, table_name) orelse return .not_found;
+    if (try routePlanFromSnapshot(alloc, snapshot, table_name, from_key, to_key)) |plan| {
+        return .{ .found = plan };
+    }
+
+    // Eventual replicas are sufficient for positive routing, but a lagging
+    // replica can falsely report that a recently-created table is absent.
+    // Confirm only the negative path through the compact linearizable
+    // capability; legacy test doubles may omit that capability.
+    var authoritative = (try catalog.linearizableRoutingSnapshot(deadline_ns)) orelse return .not_found;
+    defer catalog.freeRoutingSnapshot(&authoritative);
+    if (try routePlanFromSnapshot(alloc, authoritative, table_name, from_key, to_key)) |plan| {
+        return .{ .found = plan };
+    }
+    return .not_found;
+}
+
+fn routePlanFromSnapshot(
+    alloc: std.mem.Allocator,
+    snapshot: metadata_api.CatalogRoutingSnapshot,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+) !?CatalogRoutePlan {
+    const table = findTableByName(snapshot.tables, table_name) orelse return null;
     const ranges = try listTableRanges(alloc, snapshot.ranges, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
 
     sortRangeRefs(ranges);
-    var groups = std.ArrayListUnmanaged(u64).empty;
+    var groups = std.ArrayListUnmanaged(CatalogGroupRoute).empty;
     defer groups.deinit(alloc);
     for (ranges) |range| {
         if (!rangeOverlapsSpan(range.*, from_key, to_key)) continue;
-        try groups.append(alloc, range.group_id);
+        const range_id = metadata_table_manager.rangeDocIdentityRangeId(range.*);
+        try groups.append(alloc, .{
+            .group_id = range.group_id,
+            .range_id = range_id,
+            .identity_namespace = .{
+                .table_id = table.table_id,
+                .shard_id = metadata_table_manager.rangeDocIdentityShardId(range.*),
+                .range_id = range_id,
+            },
+        });
     }
-    if (groups.items.len == 0) return .not_found;
-    return .{ .found = try groups.toOwnedSlice(alloc) };
+    if (groups.items.len == 0) return null;
+    return .{
+        .metadata_group_id = snapshot.metadata_group_id,
+        .metadata_incarnation = snapshot.metadata_incarnation,
+        .catalog_revision = snapshot.catalog_revision,
+        .table_id = table.table_id,
+        .groups = try groups.toOwnedSlice(alloc),
+    };
 }
 
 pub const RoutedSpanSnapshot = struct {
@@ -696,13 +812,13 @@ pub fn routedSpanSnapshot(
     from_key: []const u8,
     to_key: []const u8,
 ) !RoutedSpanSnapshot {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return .{
+    var snapshot = try catalog.routingSnapshotForTable(table_name, null);
+    defer catalog.freeRoutingSnapshot(&snapshot);
+    const table = findTableByName(snapshot.tables, table_name) orelse return .{
         .group_ids = try alloc.alloc(u64, 0),
         .topology_epoch = 0,
     };
-    const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+    const ranges = try listTableRanges(alloc, snapshot.ranges, table.table_id);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
 
     sortRangeRefs(ranges);
@@ -744,7 +860,7 @@ pub fn resolveGroupsForSpanEventually(
         switch (result) {
             .found => return result,
             .timed_out => return result,
-            .not_found => {},
+            .not_found => if (catalog.hasRoutingCapability()) return result,
         }
         if (platform_time.monotonicNs() >= deadline_ns) return .not_found;
         platform_clock.Clock.real().sleepMs(poll_interval_ms);
@@ -764,6 +880,13 @@ fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Adm
 fn metadataServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     return try svc.catalogRoutingSnapshot(deadline_ns);
+}
+
+fn metadataServiceLinearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try metadata_service.linearizableCatalogRoutingSnapshot(metadata_service.MetadataService, svc, .{
+        .deadline_ns = deadline_ns,
+    });
 }
 
 fn metadataServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -796,6 +919,13 @@ fn metadataHttpServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metad
     return try svc.catalogRoutingSnapshot(deadline_ns);
 }
 
+fn metadataHttpServiceLinearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try metadata_service.linearizableCatalogRoutingSnapshot(metadata_service.MetadataHttpService, svc, .{
+        .deadline_ns = deadline_ns,
+    });
+}
+
 fn metadataHttpServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     svc.freeCatalogRoutingSnapshot(snapshot);
@@ -824,6 +954,13 @@ fn metadataServerFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Admi
 fn metadataServerRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     return try srv.svc.catalogRoutingSnapshot(deadline_ns);
+}
+
+fn metadataServerLinearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return try metadata_service.linearizableCatalogRoutingSnapshot(metadata_service.MetadataHttpService, srv.svc, .{
+        .deadline_ns = deadline_ns,
+    });
 }
 
 fn metadataServerFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -983,6 +1120,8 @@ test "catalog source resolves a single-range table group" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -1049,6 +1188,7 @@ test "catalog source resolves groups by key and span" {
 test "span routing uses compact catalog snapshot when available" {
     const TestState = struct {
         freed: bool = false,
+        routing_calls: usize = 0,
     };
     const FakeCatalog = struct {
         const tables = [_]metadata_table_manager.TableRecord{
@@ -1076,7 +1216,9 @@ test "span routing uses compact catalog snapshot when available" {
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
-        fn routingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        fn routingSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.routing_calls += 1;
             return .{
                 .tables = @constCast(tables[0..]),
                 .ranges = @constCast(ranges[0..]),
@@ -1100,10 +1242,20 @@ test "span routing uses compact catalog snapshot when available" {
     );
     defer found.deinit(std.testing.allocator);
     switch (found) {
-        .found => |groups| try std.testing.expectEqualSlices(u64, &.{7001}, groups),
+        .found => |plan| {
+            try std.testing.expectEqual(@as(u64, 7), plan.table_id);
+            try std.testing.expectEqual(@as(usize, 1), plan.groups.len);
+            try std.testing.expectEqual(@as(u64, 7001), plan.groups[0].group_id);
+            try std.testing.expectEqual(CatalogIdentityNamespace{
+                .table_id = 7,
+                .shard_id = 7001,
+                .range_id = 7001,
+            }, plan.groups[0].identity_namespace);
+        },
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(state.freed);
+    try std.testing.expectEqual(@as(usize, 1), state.routing_calls);
 
     const not_found = try resolveGroupsForSpanWithDeadline(
         std.testing.allocator,
@@ -1114,6 +1266,81 @@ test "span routing uses compact catalog snapshot when available" {
         null,
     );
     try std.testing.expectEqual(ResolveGroupsResult.not_found, not_found);
+}
+
+test "span routing confirms eventual misses with a linearizable compact snapshot" {
+    const TestState = struct {
+        eventual_calls: usize = 0,
+        linearizable_calls: usize = 0,
+        frees: usize = 0,
+    };
+    const FakeCatalog = struct {
+        const tables = [_]metadata_table_manager.TableRecord{
+            .{ .table_id = 11, .name = "new-table", .placement_role = "data" },
+        };
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 11001, .table_id = 11, .range_id = 17, .start_key = "", .end_key = null },
+        };
+
+        fn iface(state: *TestState) CatalogSource {
+            return .{ .ptr = state, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = routingSnapshot,
+                .linearizable_routing_snapshot = linearizableRoutingSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
+            } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.AdminSnapshotUsedForRouting;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn routingSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.eventual_calls += 1;
+            return .{ .catalog_revision = 4, .tables = &.{}, .ranges = &.{} };
+        }
+
+        fn linearizableRoutingSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.linearizable_calls += 1;
+            return .{
+                .catalog_revision = 5,
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(ptr: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.frees += 1;
+        }
+    };
+
+    var state = TestState{};
+    var result = try resolveGroupsForSpanWithDeadline(
+        std.testing.allocator,
+        FakeCatalog.iface(&state),
+        "new-table",
+        "",
+        "",
+        null,
+    );
+    defer result.deinit(std.testing.allocator);
+    switch (result) {
+        .found => |plan| {
+            try std.testing.expectEqual(@as(u64, 5), plan.catalog_revision);
+            try std.testing.expectEqual(@as(u64, 11001), plan.groups[0].group_id);
+            try std.testing.expectEqual(@as(u64, 17), plan.groups[0].identity_namespace.range_id);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), state.eventual_calls);
+    try std.testing.expectEqual(@as(usize, 1), state.linearizable_calls);
+    try std.testing.expectEqual(@as(usize, 2), state.frees);
 }
 
 test "eventual span routing distinguishes snapshot timeout" {
