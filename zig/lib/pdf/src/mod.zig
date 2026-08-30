@@ -171,8 +171,7 @@ fn renderParsedPagePngNativeAlloc(
     defer render_runs.deinit(reader_alloc);
     try parsed.checkCancellation();
     if (profile == .ocr) {
-        try reader.prepareOcrBilevelFallbacksAlloc(reader_alloc, render_runs.image_runs, parsed.cancellationProbe());
-        for (render_runs.image_runs) |*run| run.ocr_coverage_minify = run.bilevel;
+        try reader.prepareOcrRenderRunsAlloc(reader_alloc, render_runs.image_runs, render_runs.pattern_runs, parsed.cancellationProbe());
     }
     scalePageRenderRuns(&render_runs, scale);
     alignPageBoxToPixelGrid(&render_runs.page_box);
@@ -384,6 +383,11 @@ fn scalePatternRuns(runs: []reader.PatternRun, scale: f64) void {
         }
         if (run.clip_box) |*box| scaleBox(box, scale);
         scalePoints(run.clip_points, scale);
+        // A retained stencil is the page-space target of the Pattern paint,
+        // unlike tile-local image runs. Scale it exactly once with the outer
+        // pattern occurrence.
+        if (run.stencil_mask) |*mask|
+            scaleImageRuns(@as(*[1]reader.ImageRun, @ptrCast(mask))[0..], scale);
         // Tiling geometry and tile-local runs remain in pattern space. The
         // pattern matrix is the single mapping into the scaled page space;
         // scaling both produced tiles that grew by scale^2 at higher DPI.
@@ -2738,9 +2742,25 @@ test "OCR DPI scaling maps tiling patterns exactly once" {
         .points = tile_points,
     };
     const target_points = try alloc.dupe([2]f64, &.{ .{ 0, 0 }, .{ 20, 0 }, .{ 20, 20 }, .{ 0, 20 } });
+    const stencil_rgba = try alloc.dupe(u8, &.{ 0xff, 0xff, 0xff, 0xff });
     var runs = [_]reader.PatternRun{.{
         .kind = .fill,
         .points = target_points,
+        .stencil_mask = .{
+            .rgba = stencil_rgba,
+            .width = 1,
+            .height = 1,
+            .a = 20,
+            .b = 0,
+            .c = 0,
+            .d = 20,
+            .e = 3,
+            .f = 4,
+            .x = 3,
+            .y = 4,
+            .draw_width = 20,
+            .draw_height = 20,
+        },
         .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 5, .max_y = 5 },
         .pattern_x_step = 5,
         .pattern_y_step = 5,
@@ -2754,6 +2774,10 @@ test "OCR DPI scaling maps tiling patterns exactly once" {
     try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].pattern_x_step, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].pattern_bbox.max_x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 5), runs[0].tile_shape_runs[0].points[1][0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 40), runs[0].stencil_mask.?.a, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 40), runs[0].stencil_mask.?.d, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 6), runs[0].stencil_mask.?.e, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 8), runs[0].stencil_mask.?.f, 0.001);
 }
 
 test "native page renderer renders the requested one-based PDF page" {
