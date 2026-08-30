@@ -898,13 +898,15 @@ fn runtimeStatusProtocolCompatible(
     required_version: u16,
 ) bool {
     const peer_incarnation = peer_status.metadata_incarnation orelse return false;
-    if (!metadata_runtime_status_protocol.isNegotiable(required_version) or
-        !metadata_runtime_status_protocol.isNegotiable(peer_status.runtime_status_record_version)) return false;
+    const required_profile = metadata_runtime_status_protocol.profileForVersion(required_version) orelse return false;
+    const peer_profile = metadata_runtime_status_protocol.profileForVersion(peer_status.runtime_status_record_version) orelse return false;
     return peer_status.metadata_group_id == metadata_group_id and
         peer_status.metadata_raft_local_node_id == node_id and
         std.mem.eql(u8, &peer_incarnation, &incarnation) and
-        (required_version == metadata_runtime_status_protocol.v0_2_0_record_version or
-            peer_status.runtime_status_record_version == metadata_runtime_status_protocol.current_record_version);
+        switch (required_profile) {
+            .released_v0_2_0 => true,
+            .current => peer_profile == .current,
+        };
 }
 
 const RuntimeStatusMembershipFingerprint = [std.crypto.hash.sha2.Sha256.digest_length]u8;
@@ -4894,8 +4896,9 @@ pub const MetadataHttpService = struct {
             &membership_fingerprint,
         );
         self.runtime_status_protocol_ready_fingerprint = membership_fingerprint;
-        self.runtime_status_protocol_ready_version = if (same_membership)
-            @max(self.runtime_status_protocol_ready_version, ready_version)
+        self.runtime_status_protocol_ready_version = if (same_membership and
+            self.runtime_status_protocol_ready_version == metadata_runtime_status_protocol.current_record_version)
+            metadata_runtime_status_protocol.current_record_version
         else
             ready_version;
     }
@@ -4921,7 +4924,7 @@ pub const MetadataHttpService = struct {
         defer if (required_node_ids.len > 0) self.alloc.free(required_node_ids);
         if (required_node_ids.len == 0) return null;
 
-        var common_version = metadata_runtime_status_protocol.current_record_version;
+        var all_voters_current = true;
 
         var client = metadata_http_client.MetadataHttpClient.init(
             self.alloc,
@@ -4964,8 +4967,13 @@ pub const MetadataHttpService = struct {
                 );
                 return null;
             }
-            common_version = @min(common_version, peer_status.runtime_status_record_version);
+            if (peer_status.runtime_status_record_version != metadata_runtime_status_protocol.current_record_version)
+                all_voters_current = false;
         }
+        const common_version = if (all_voters_current)
+            metadata_runtime_status_protocol.current_record_version
+        else
+            metadata_runtime_status_protocol.v0_2_0_record_version;
         if (common_version < required_version) {
             std.log.info(
                 "runtime-status protocol activation awaiting upgrade: requested={d} common={d}",

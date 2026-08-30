@@ -20,6 +20,19 @@
 pub const v0_2_0_record_version: u16 = 12;
 pub const current_record_version: u16 = 15;
 
+pub const Profile = enum(u16) {
+    released_v0_2_0 = v0_2_0_record_version,
+    current = current_record_version,
+
+    pub fn wireVersion(self: @This()) u16 {
+        return @intFromEnum(self);
+    }
+};
+
+pub fn profileForVersion(version: u16) ?Profile {
+    return std.enums.fromInt(Profile, version);
+}
+
 /// These facts form one current admission-safety profile. Keeping semantic
 /// aliases makes call sites state why V15 is required without inventing
 /// intermediate compatibility levels when new facts join that profile.
@@ -33,11 +46,10 @@ pub fn isSupported(version: u16) bool {
 }
 
 pub fn isNegotiable(version: u16) bool {
-    return version == v0_2_0_record_version or version == current_record_version;
+    return profileForVersion(version) != null;
 }
 
 test "runtime status exposes only released compatibility profiles" {
-    const std = @import("std");
     try std.testing.expect(!isSupported(1));
     try std.testing.expect(isSupported(v0_2_0_record_version));
     try std.testing.expect(isSupported(current_record_version));
@@ -51,4 +63,8 @@ test "runtime status exposes only released compatibility profiles" {
     try std.testing.expect(!isNegotiable(11));
     try std.testing.expect(!isNegotiable(13));
     try std.testing.expect(!isNegotiable(14));
+    try std.testing.expectEqual(Profile.released_v0_2_0, profileForVersion(12).?);
+    try std.testing.expectEqual(Profile.current, profileForVersion(15).?);
 }
+
+const std = @import("std");

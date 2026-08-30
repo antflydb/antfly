@@ -5453,18 +5453,11 @@ fn appendRuntimeGroupStatusRecord(
 }
 
 fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u16 {
-    var version = runtime_status_protocol.v0_2_0_record_version;
     for (record.indexes) |index| {
-        for (index.source_replay) |source| if (source.failed)
-            return runtime_status_protocol.artifact_source_failure_status_record_version;
-        if (index.source_replay.len != 0) {
-            version = @max(version, runtime_status_protocol.artifact_source_status_record_version);
-        }
-        if (index.repair_status != null) {
-            version = @max(version, runtime_status_protocol.repair_status_record_version);
-        }
+        if (index.source_replay.len != 0 or index.repair_status != null)
+            return runtime_status_protocol.current_record_version;
     }
-    return version;
+    return runtime_status_protocol.v0_2_0_record_version;
 }
 
 fn appendRuntimeEnrichmentStatusRecord(
