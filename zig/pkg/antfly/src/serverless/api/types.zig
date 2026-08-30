@@ -149,7 +149,7 @@ pub const TableMutationDocumentPresence = union(enum) {
     absent,
     null_value,
     object: ant_json.RawObject,
-    non_object: ant_json.RawValue,
+    non_object,
 
     pub fn jsonParse(
         allocator: Allocator,
@@ -163,7 +163,11 @@ pub const TableMutationDocumentPresence = union(enum) {
         if (try source.peekNextTokenType() == .object_begin) {
             return .{ .object = try std.json.innerParse(ant_json.RawObject, allocator, source, options) };
         }
-        return .{ .non_object = try std.json.innerParse(ant_json.RawValue, allocator, source, options) };
+        // The value is retained only to distinguish mutation-shape failures
+        // from malformed JSON. Consume it for syntax validation without
+        // materializing bytes that admission will immediately reject.
+        try source.skipValue();
+        return .non_object;
     }
 
     pub fn jsonParseFromValue(
@@ -175,9 +179,21 @@ pub const TableMutationDocumentPresence = union(enum) {
         if (source == .object) {
             return .{ .object = try std.json.innerParseFromValue(ant_json.RawObject, allocator, source, options) };
         }
-        return .{ .non_object = try std.json.innerParseFromValue(ant_json.RawValue, allocator, source, options) };
+        return .non_object;
     }
 };
+
+test "serverless non-object table mutation documents are discarded without allocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var scanner = std.json.Scanner.initCompleteInput(failing.allocator(), "\"plain text\"");
+    defer scanner.deinit();
+
+    const presence = try TableMutationDocumentPresence.jsonParse(failing.allocator(), &scanner, .{});
+    try std.testing.expect(presence == .non_object);
+    try std.testing.expectEqual(std.json.TokenType.end_of_document, try scanner.peekNextTokenType());
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
 
 pub const TableIngestMutationInput = struct {
     kind: MutationKind,
