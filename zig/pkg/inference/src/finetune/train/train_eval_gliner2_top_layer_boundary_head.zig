@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(report_path);
     const rendered = try std.json.Stringify.valueAlloc(allocator, summary, .{ .whitespace = .indent_2 });
     defer allocator.free(rendered);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = report_path, .data = rendered });
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = report_path, .data = rendered });
 
     const stdout = std.Io.File.stdout();
     var buf: [8192]u8 = undefined;

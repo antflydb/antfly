@@ -31,8 +31,8 @@ pub fn main(init: std.process.Init) !void {
     defer finetune.freeLoRABundleInspectionSummary(allocator, &summary);
 
     if (report_path) |path| {
-        const io = compat.io();
-        var file = try compat.cwd().createFile(io, path, .{ .truncate = true });
+        const io = init.io;
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
         defer file.close(io);
         const rendered = try std.json.Stringify.valueAlloc(allocator, summary, .{ .whitespace = .indent_2 });
         defer allocator.free(rendered);

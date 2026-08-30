@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
 
     const training_config_path = try std.fs.path.join(allocator, &.{ out_dir, "training_config.json" });
     defer allocator.free(training_config_path);
-    try artifact_writer.writeJsonFile(allocator, training_config_path, .{
+    try artifact_writer.writeJsonFile(allocator, init.io, training_config_path, .{
         .contract_version = run_contract.training_config_version,
         .artifact_family_version = summary.artifact_family_version,
         .task = "gliner2_boundary_task_head_train_eval",
@@ -68,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
     });
     const training_report_path = try std.fs.path.join(allocator, &.{ out_dir, "training_report.json" });
     defer allocator.free(training_report_path);
-    try artifact_writer.writeJsonFile(allocator, training_report_path, .{
+    try artifact_writer.writeJsonFile(allocator, init.io, training_report_path, .{
         .contract_version = run_contract.training_report_version,
         .artifact_family_version = summary.artifact_family_version,
         .task = "gliner2_boundary_task_head_train_eval",

@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
         .out_csv_path = summary.out_csv_path,
     }, .{ .whitespace = .indent_2 }, &json_buf.writer);
     try json_buf.writer.writeByte('\n');
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = out_summary_path, .data = json_buf.written() });
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_summary_path, .data = json_buf.written() });
 
     std.debug.print("mode: {s}\n", .{@tagName(summary.mode)});
     std.debug.print("examples_written: {d}\n", .{summary.examples_written});

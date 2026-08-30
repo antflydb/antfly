@@ -1195,7 +1195,7 @@ fn writeQualityEvalJson(
         try out.appendSlice(allocator, row);
     }
     try out.appendSlice(allocator, "\n]}\n");
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
 }
 
 fn runActivationTraceCompare(allocator: std.mem.Allocator, opts: Options) !void {

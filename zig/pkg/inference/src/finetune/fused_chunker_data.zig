@@ -141,7 +141,7 @@ fn resolveJsonlFiles(allocator: std.mem.Allocator, path: []const u8, split: ?[]c
     const arena_alloc = arena.allocator();
 
     if (std.mem.trim(u8, path, " \t\r\n").len == 0) return error.EmptyPath;
-    const stat = try compat.cwd().statFile(compat.io(), path, .{});
+    const stat = try std.Io.Dir.cwd().statFile(compat.testingIo(), path, .{});
     if (stat.kind == .file) {
         const one = try arena_alloc.alloc([]const u8, 1);
         one[0] = try arena_alloc.dupe(u8, path);
@@ -153,12 +153,12 @@ fn resolveJsonlFiles(allocator: std.mem.Allocator, path: []const u8, split: ?[]c
     }
     if (stat.kind != .directory) return error.UnsupportedPathType;
 
-    var dir = try compat.cwd().openDir(compat.io(), path, .{ .iterate = true });
-    defer dir.close(compat.io());
+    var dir = try std.Io.Dir.cwd().openDir(compat.testingIo(), path, .{ .iterate = true });
+    defer dir.close(compat.testingIo());
     var iter = dir.iterate();
     var paths = std.ArrayListUnmanaged([]const u8).empty;
     defer paths.deinit(arena_alloc);
-    while (try iter.next(compat.io())) |entry| {
+    while (try iter.next(compat.testingIo())) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
         if (split) |want_split| {
@@ -189,7 +189,7 @@ fn loadSamplesFromFile(
     path: []const u8,
     out: *std.ArrayListUnmanaged(FusedSample),
 ) !void {
-    const data = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(64 * 1024 * 1024));
+    const data = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .limited(64 * 1024 * 1024));
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");

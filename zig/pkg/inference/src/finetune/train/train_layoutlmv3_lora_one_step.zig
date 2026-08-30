@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
     });
     defer finetune.freeLoRAOneStepSummary(allocator, &step);
 
-    try finetune.saveLoRABundle(&bundle, out_dir);
+    try finetune.saveLoRABundle(init.io, &bundle, out_dir);
 
     const report_path = try std.fs.path.join(allocator, &.{ out_dir, "one_step_report.json" });
     defer allocator.free(report_path);
@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
         .saved_adapter_checkpoint = finetune.adapter_checkpoint_file_name,
     }, .{ .whitespace = .indent_2 });
     defer allocator.free(rendered);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = report_path, .data = rendered });
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = report_path, .data = rendered });
 
     const stdout = std.Io.File.stdout();
     var buf: [2048]u8 = undefined;

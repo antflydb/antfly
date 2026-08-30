@@ -42,8 +42,8 @@ pub const TokenizerBatch = struct {
         dir_path: []const u8,
         max_length: usize,
     ) !TokenizerBatch {
-        const io = compat.io();
-        const cwd = compat.cwd();
+        const io = compat.testingIo();
+        const cwd = std.Io.Dir.cwd();
         const dir = try cwd.openDir(io, dir_path, .{});
         const tok = try HfTokenizer.loadFromDir(allocator, dir, io, "tokenizer.json");
         return .{

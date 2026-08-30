@@ -301,7 +301,7 @@ pub fn bootstrapLoRABundle(
     errdefer freeLoRATargetTensors(allocator, resolved_tensors);
     if (resolved_tensors.len == 0) return error.NoLoRATargetTensorsResolved;
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
     errdefer allocator.free(adapter_checkpoint_path);
     const adapter_config_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_config_file_name });
@@ -550,7 +550,7 @@ pub fn loadLoRABundle(
 
 pub fn saveLoRABundle(bundle: *const LoadedLoRABundle, out_dir: []const u8) !void {
     const allocator = bundle.allocator;
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     const config_path = try std.fs.path.join(allocator, &.{ out_dir, adapter_config_file_name });
@@ -680,10 +680,10 @@ pub fn materializeMergedModel(
 
     const output_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, checkpoint_file_name });
     errdefer allocator.free(output_checkpoint_path);
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const bytes = try buildMergedSafetensorsFile(allocator, base_access, base_names, &merged);
     defer allocator.free(bytes);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = output_checkpoint_path, .data = bytes });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = output_checkpoint_path, .data = bytes });
 
     try copySupportingArtifactIfPresent(allocator, base_model_dir, out_dir, config_file_name);
     try copySupportingArtifactIfPresent(allocator, base_model_dir, out_dir, tokenizer_config_file_name);
@@ -3632,8 +3632,8 @@ fn writeHeaderAndTensorsF32(
         offset += byte_len;
     }
     try writer.writeByte('}');
-    const io = compat.io();
-    var file = try compat.cwd().createFile(io, path, .{ .truncate = true });
+    const io = compat.testingIo();
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
     defer file.close(io);
     var len_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_buf, header_buf.written().len, .little);
@@ -3671,7 +3671,7 @@ fn writeAdapterConfigJson(
         .top_layer_count = top_layer_count,
         .use_dora = use_dora,
     }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 fn buildDeterministicLoraA(allocator: std.mem.Allocator, rows: usize, cols: usize) ![]f32 {
@@ -3721,7 +3721,7 @@ fn copySupportingArtifactIfPresent(
     defer allocator.free(bytes);
     const dst = try std.fs.path.join(allocator, &.{ out_dir, file_name });
     defer allocator.free(dst);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst, .data = bytes });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = dst, .data = bytes });
 }
 
 fn openTensorAccessForFile(allocator: std.mem.Allocator, path: []const u8) !tensor_access.TensorAccess {
@@ -3862,7 +3862,7 @@ fn requiredPathInDir(allocator: std.mem.Allocator, dir_path: []const u8, basenam
 fn optionalPathInDir(allocator: std.mem.Allocator, dir_path: []const u8, basename: []const u8) !?[]u8 {
     const path = try std.fs.path.join(allocator, &.{ dir_path, basename });
     errdefer allocator.free(path);
-    compat.cwd().access(compat.io(), path, .{}) catch {
+    std.Io.Dir.cwd().access(compat.testingIo(), path, .{}) catch {
         allocator.free(path);
         return null;
     };
@@ -3918,16 +3918,16 @@ test "reranker lora bootstrap inspect load save materialize" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_reranker_lora_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const config_path = try std.fs.path.join(allocator, &.{ root, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = config_path, .data = "{\"model_type\":\"xlm-roberta\",\"hidden_size\":8,\"num_hidden_layers\":2,\"num_attention_heads\":2}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = config_path, .data = "{\"model_type\":\"xlm-roberta\",\"hidden_size\":8,\"num_hidden_layers\":2,\"num_attention_heads\":2}" });
     const tokenizer_path = try std.fs.path.join(allocator, &.{ root, tokenizer_file_name });
     defer allocator.free(tokenizer_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_path, .data = "{}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tokenizer_path, .data = "{}" });
 
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);

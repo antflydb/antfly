@@ -1770,7 +1770,7 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
 fn loadManifest(allocator: std.mem.Allocator, adapter_dir: []const u8) !Manifest {
     const manifest_path = try std.fs.path.join(allocator, &.{ adapter_dir, "training_manifest.json" });
     defer allocator.free(manifest_path);
-    const data = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(4 * 1024 * 1024));
+    const data = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), manifest_path, allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(data);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
@@ -2170,11 +2170,11 @@ const DebertaJsonConfig = struct {
 fn loadDebertaGraphConfig(allocator: std.mem.Allocator, model_dir: []const u8) !deberta_graph.Config {
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "encoder_config", "config.json" });
     defer allocator.free(config_path);
-    const bytes = compat.cwd().readFileAlloc(compat.io(), config_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), config_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => blk: {
             const fallback_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
             defer allocator.free(fallback_path);
-            break :blk try compat.cwd().readFileAlloc(compat.io(), fallback_path, allocator, .limited(8 * 1024 * 1024));
+            break :blk try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), fallback_path, allocator, .limited(8 * 1024 * 1024));
         },
         else => return err,
     };

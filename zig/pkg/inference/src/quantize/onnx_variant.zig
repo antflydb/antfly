@@ -66,7 +66,7 @@ pub fn run(allocator: Allocator, io: std.Io, opts: options.Options) !void {
     };
     defer if (owned_output_dir) |path| allocator.free(path);
 
-    try compat.cwd().createDirPath(io, output_dir);
+    try std.Io.Dir.cwd().createDirPath(io, output_dir);
 
     var stats: QuantizeStats = .{};
     try createVariantDir(allocator, io, opts, output_dir, &stats);
@@ -109,7 +109,7 @@ fn createVariantDir(
     stats: *QuantizeStats,
 ) !void {
     const same_dir = try pathsReferToSameDirectory(allocator, io, opts.model_dir, output_dir);
-    var dir = try compat.cwd().openDir(io, opts.model_dir, .{ .iterate = true });
+    var dir = try std.Io.Dir.cwd().openDir(io, opts.model_dir, .{ .iterate = true });
     defer dir.close(io);
 
     var names = std.ArrayListUnmanaged([]u8).empty;
@@ -181,9 +181,9 @@ fn copyModelFile(
 fn copyFileStreaming(allocator: Allocator, io: std.Io, source_path: []const u8, target_path: []const u8) !void {
     if (try pathsReferToSameFile(allocator, io, source_path, target_path)) return;
 
-    var src = try compat.cwd().openFile(io, source_path, .{});
+    var src = try std.Io.Dir.cwd().openFile(io, source_path, .{});
     defer src.close(io);
-    var dst = try compat.cwd().createFile(io, target_path, .{ .truncate = true });
+    var dst = try std.Io.Dir.cwd().createFile(io, target_path, .{ .truncate = true });
     defer dst.close(io);
 
     var buf: [1024 * 1024]u8 = undefined;
@@ -199,9 +199,9 @@ fn copyFileStreaming(allocator: Allocator, io: std.Io, source_path: []const u8, 
 
 fn pathsReferToSameDirectory(allocator: Allocator, io: std.Io, a: []const u8, b: []const u8) !bool {
     if (pathsEqualLexically(a, b)) return true;
-    const a_real = try compat.cwd().realPathFileAlloc(io, a, allocator);
+    const a_real = try std.Io.Dir.cwd().realPathFileAlloc(io, a, allocator);
     defer allocator.free(a_real);
-    const b_real = compat.cwd().realPathFileAlloc(io, b, allocator) catch |err| switch (err) {
+    const b_real = std.Io.Dir.cwd().realPathFileAlloc(io, b, allocator) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -211,9 +211,9 @@ fn pathsReferToSameDirectory(allocator: Allocator, io: std.Io, a: []const u8, b:
 
 fn pathsReferToSameFile(allocator: Allocator, io: std.Io, source_path: []const u8, target_path: []const u8) !bool {
     if (pathsEqualLexically(source_path, target_path)) return true;
-    const source_real = try compat.cwd().realPathFileAlloc(io, source_path, allocator);
+    const source_real = try std.Io.Dir.cwd().realPathFileAlloc(io, source_path, allocator);
     defer allocator.free(source_real);
-    const target_real = compat.cwd().realPathFileAlloc(io, target_path, allocator) catch |err| switch (err) {
+    const target_real = std.Io.Dir.cwd().realPathFileAlloc(io, target_path, allocator) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -251,7 +251,7 @@ fn rewriteOnnxFile(
     try rewriteInitializersAsQ8_0(allocator, proto_string_arena.allocator(), &model, opts.min_elements, external_name, external_path);
     const model_bytes = try onnx_graph.serializeModel(allocator, &model.onnx);
     defer allocator.free(model_bytes);
-    try compat.cwd().writeFile(io, .{ .sub_path = output_path, .data = model_bytes });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = model_bytes });
 }
 
 fn writeManifest(
@@ -274,7 +274,7 @@ fn writeManifest(
 
     const path = try std.fs.path.join(allocator, &.{ output_dir, "quantization_manifest.json" });
     defer allocator.free(path);
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
 const ExternalDataWriter = struct {
@@ -284,17 +284,17 @@ const ExternalDataWriter = struct {
 
     fn init(allocator: Allocator, relative_path: []const u8, absolute_path: []const u8) !ExternalDataWriter {
         _ = allocator;
-        const file = try compat.cwd().createFile(compat.io(), absolute_path, .{ .truncate = true });
+        const file = try std.Io.Dir.cwd().createFile(compat.testingIo(), absolute_path, .{ .truncate = true });
         return .{ .file = file, .relative_path = relative_path };
     }
 
     fn deinit(self: *ExternalDataWriter) void {
-        self.file.close(compat.io());
+        self.file.close(compat.testingIo());
     }
 
     fn append(self: *ExternalDataWriter, bytes: []const u8) !ExternalSlice {
         const offset = self.offset;
-        try self.file.writeStreamingAll(compat.io(), bytes);
+        try self.file.writeStreamingAll(compat.testingIo(), bytes);
         self.offset += bytes.len;
         return .{ .offset = offset, .length = bytes.len };
     }
@@ -801,16 +801,16 @@ test "copyFileStreaming skips same file through canonical alias" {
     const allocator = std.testing.allocator;
     const dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/onnx-copy-same-file-{d}", .{std.posix.system.getpid()});
     defer allocator.free(dir_path);
-    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
 
     const source_path = try std.fs.path.join(allocator, &.{ dir_path, "payload.bin" });
     defer allocator.free(source_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = source_path, .data = "payload-data" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = source_path, .data = "payload-data" });
 
     const alias_path = try std.fmt.allocPrint(allocator, "{s}/./payload.bin", .{dir_path});
     defer allocator.free(alias_path);
-    try copyFileStreaming(allocator, compat.io(), source_path, alias_path);
+    try copyFileStreaming(allocator, compat.testingIo(), source_path, alias_path);
 
     const after = try c_file.readFile(allocator, source_path);
     defer allocator.free(after);
@@ -821,8 +821,8 @@ test "ClipClap ONNX quantize writes suffixed variants beside defaults" {
     const allocator = std.testing.allocator;
     const dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/clipclap-onnx-single-repo-{d}", .{std.posix.system.getpid()});
     defer allocator.free(dir_path);
-    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
 
     const onnx_files = [_][]const u8{
         "text_model.onnx",
@@ -836,7 +836,7 @@ test "ClipClap ONNX quantize writes suffixed variants beside defaults" {
         try writeTinyOnnxModel(allocator, dir_path, file_name);
     }
 
-    try run(allocator, compat.io(), .{
+    try run(allocator, compat.testingIo(), .{
         .model_dir = dir_path,
         .target = .onnx,
         .format = "q8_0",
@@ -880,9 +880,9 @@ test "ClipClap ONNX quantize output stages default external data" {
     defer allocator.free(source_path);
     const output_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/clipclap-onnx-output-{d}", .{std.posix.system.getpid()});
     defer allocator.free(output_path);
-    defer compat.cwd().deleteTree(compat.io(), source_path) catch {};
-    defer compat.cwd().deleteTree(compat.io(), output_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), source_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), source_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), output_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), source_path);
 
     const onnx_files = [_][]const u8{
         "text_model.onnx",
@@ -898,10 +898,10 @@ test "ClipClap ONNX quantize output stages default external data" {
         defer allocator.free(data_name);
         const data_path = try std.fs.path.join(allocator, &.{ source_path, data_name });
         defer allocator.free(data_path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = data_path, .data = "default-data" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = data_path, .data = "default-data" });
     }
 
-    try run(allocator, compat.io(), .{
+    try run(allocator, compat.testingIo(), .{
         .model_dir = source_path,
         .target = .onnx,
         .format = "q8_0",
@@ -935,5 +935,5 @@ fn writeTinyOnnxModel(allocator: Allocator, dir_path: []const u8, file_name: []c
 
     const path = try std.fs.path.join(allocator, &.{ dir_path, file_name });
     defer allocator.free(path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = model_bytes });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = model_bytes });
 }

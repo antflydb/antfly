@@ -79,7 +79,7 @@ fn runSmoke(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
         try std.fs.path.join(allocator, &.{ opts.output_root, "text_pilot.jsonl" });
     defer allocator.free(dataset_path);
 
-    try compat.cwd().createDirPath(compat.io(), opts.output_root);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), opts.output_root);
 
     const started_at = std.Io.Timestamp.now(init.io, .awake);
     var pilot_cmd = std.ArrayListUnmanaged([]const u8).empty;
@@ -300,7 +300,7 @@ fn writeResults(
         },
     }, .{ .whitespace = .indent_2 }, &out.writer);
     try out.writer.writeByte('\n');
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = results_path, .data = out.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = results_path, .data = out.written() });
 }
 
 fn parseOptions(args: *std.process.Args.Iterator) !Options {
@@ -424,11 +424,11 @@ fn fileSize(allocator: std.mem.Allocator, path: []const u8) u64 {
 }
 
 fn dirSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
-    var dir = compat.cwd().openDir(compat.io(), path, .{ .iterate = true }) catch return 0;
-    defer dir.close(compat.io());
+    var dir = std.Io.Dir.cwd().openDir(compat.testingIo(), path, .{ .iterate = true }) catch return 0;
+    defer dir.close(compat.testingIo());
     var total: u64 = 0;
     var it = dir.iterate();
-    while (try it.next(compat.io())) |entry| {
+    while (try it.next(compat.testingIo())) |entry| {
         const child_path = try std.fs.path.join(allocator, &.{ path, entry.name });
         defer allocator.free(child_path);
         switch (entry.kind) {
@@ -441,7 +441,7 @@ fn dirSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
 }
 
 fn fileExists(path: []const u8) bool {
-    compat.cwd().access(compat.io(), path, .{}) catch return false;
+    std.Io.Dir.cwd().access(compat.testingIo(), path, .{}) catch return false;
     return true;
 }
 

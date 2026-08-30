@@ -2853,11 +2853,11 @@ test "manifest detects gliner gguf head sidecar" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-gliner-head");
     defer allocator.free(dir_path);
-    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
 
     const head_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner_head.gguf" });
     defer allocator.free(head_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = head_path, .data = "" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = head_path, .data = "" });
 
     var manifest = try loadFromDir(allocator, dir_path);
     defer manifest.deinit();
@@ -2869,17 +2869,17 @@ test "manifest reads gliner special tokens from tokenizer json" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-gliner-tokenizer-json");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const gliner_config_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner_config.json" });
     defer allocator.free(gliner_config_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = gliner_config_path, .data = "{\"model_type\":\"gliner2\"}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = gliner_config_path, .data = "{\"model_type\":\"gliner2\"}" });
 
     const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = tokenizer_path,
         .data =
         \\{"version":"1.0","added_tokens":[
@@ -2906,43 +2906,43 @@ test "manifest detects incomplete colqwen bundle" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-colqwen-incomplete");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = config_path, .data = "{\"model_type\":\"qwen2\"}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = config_path, .data = "{\"model_type\":\"qwen2\"}" });
 
     const model_manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "model_manifest.json" });
     defer allocator.free(model_manifest_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = model_manifest_path,
         .data = "{\"type\":\"reranker\",\"capabilities\":[\"colqwen\",\"multimodal_late_interaction\"],\"inputs\":[\"text\",\"image\"]}",
     });
 
     const bundle_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_bundle.json" });
     defer allocator.free(bundle_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = bundle_path, .data = "{\"family\":\"colqwen2_gguf_bundle/v1\"}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = bundle_path, .data = "{\"family\":\"colqwen2_gguf_bundle/v1\"}" });
 
     const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = tokenizer_path,
         .data = "{\"version\":\"1.0\",\"model\":{\"type\":\"BPE\",\"vocab\":{},\"merges\":[]}}",
     });
 
     const tokenizer_config_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer_config.json" });
     defer allocator.free(tokenizer_config_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_config_path, .data = "{\"model_max_length\":16}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tokenizer_config_path, .data = "{\"model_max_length\":16}" });
 
     const preprocessor_path = try std.fs.path.join(allocator, &.{ dir_path, "preprocessor_config.json" });
     defer allocator.free(preprocessor_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = preprocessor_path, .data = "{\"patch_size\":14}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = preprocessor_path, .data = "{\"patch_size\":14}" });
 
     const gguf_path = try std.fs.path.join(allocator, &.{ dir_path, "model.gguf" });
     defer allocator.free(gguf_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = gguf_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = gguf_path, .data = "GGUFstub" });
 
     var manifest = try loadFromDir(allocator, dir_path);
     defer manifest.deinit();
@@ -3024,7 +3024,7 @@ test "manifest discovers clip onnx variants and prefers f16 over i8" {
     const allocator = std.testing.allocator;
     const model_dir = try testScratchDir(allocator, "manifest-clip-onnx-f16-preferred");
     defer {
-        compat.cwd().deleteTree(compat.io(), model_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), model_dir) catch {};
         allocator.free(model_dir);
     }
 
@@ -3039,7 +3039,7 @@ test "manifest discovers clip onnx variants and prefers f16 over i8" {
     for (files) |file_name| {
         const path = try std.fs.path.join(allocator, &.{ model_dir, file_name });
         defer allocator.free(path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = "" });
     }
 
     var manifest = try loadFromDir(allocator, model_dir);
@@ -3056,7 +3056,7 @@ test "manifest prefers split clip text model over combined model" {
     const allocator = std.testing.allocator;
     const model_dir = try testScratchDir(allocator, "manifest-clip-text-model-before-combined");
     defer {
-        compat.cwd().deleteTree(compat.io(), model_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), model_dir) catch {};
         allocator.free(model_dir);
     }
 
@@ -3068,7 +3068,7 @@ test "manifest prefers split clip text model over combined model" {
     for (files) |file_name| {
         const path = try std.fs.path.join(allocator, &.{ model_dir, file_name });
         defer allocator.free(path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = "" });
     }
 
     var manifest = try loadFromDir(allocator, model_dir);
@@ -3083,7 +3083,7 @@ test "manifest discovers clip i8 onnx fallback variants" {
     const allocator = std.testing.allocator;
     const model_dir = try testScratchDir(allocator, "manifest-clip-onnx-i8-fallback");
     defer {
-        compat.cwd().deleteTree(compat.io(), model_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), model_dir) catch {};
         allocator.free(model_dir);
     }
 
@@ -3094,7 +3094,7 @@ test "manifest discovers clip i8 onnx fallback variants" {
     for (files) |file_name| {
         const path = try std.fs.path.join(allocator, &.{ model_dir, file_name });
         defer allocator.free(path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = "" });
     }
 
     var manifest = try loadFromDir(allocator, model_dir);
@@ -3109,15 +3109,15 @@ test "manifest parses clipclap variants gguf pair" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-clipclap-variants-gguf");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const clip_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clip.Q4_K.gguf" });
     defer allocator.free(clip_path);
     const clap_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clap.Q4_K.gguf" });
     defer allocator.free(clap_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clip_path, .data = "clip" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clap_path, .data = "clap" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clip_path, .data = "clip" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clap_path, .data = "clap" });
 
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
@@ -3151,33 +3151,33 @@ test "manifest loads canonical antfly clipclap variants before first gguf fallba
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-clipclap-canonical-variants");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const clip_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clip.Q4_K.gguf" });
     defer allocator.free(clip_path);
     const clap_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clap.Q4_K.gguf" });
     defer allocator.free(clap_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clip_path, .data = "GGUFstub" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clap_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clip_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clap_path, .data = "GGUFstub" });
 
     const model_manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "model_manifest.json" });
     defer allocator.free(model_manifest_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = model_manifest_path,
         .data = "{\"type\":\"embedder\",\"tasks\":[\"embed\"],\"inputs\":[\"text\",\"image\",\"audio\"]}",
     });
 
     const clip_config_path = try std.fs.path.join(allocator, &.{ dir_path, "clip_config.json" });
     defer allocator.free(clip_config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = clip_config_path,
         .data = "{\"model_type\":\"clipclap\",\"text_config\":{\"max_position_embeddings\":77}}",
     });
 
     const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
     defer allocator.free(variants_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = variants_path,
         .data =
         \\{
@@ -3209,7 +3209,7 @@ test "manifest ignores stale clipclap variants with missing gguf files" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-clipclap-stale-variants");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
@@ -3240,15 +3240,15 @@ test "manifest falls back to first existing clipclap variant when preferred pair
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-clipclap-variants-fallback");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const clip_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clip.Q8_0.gguf" });
     defer allocator.free(clip_path);
     const clap_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clap.Q8_0.gguf" });
     defer allocator.free(clap_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clip_path, .data = "clip" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clap_path, .data = "clap" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clip_path, .data = "clip" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clap_path, .data = "clap" });
 
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
@@ -3284,15 +3284,15 @@ test "manifest parses gliner2 variants gguf pair" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-gliner2-variants-gguf");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const encoder_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner2-encoder.Q4_K.gguf" });
     defer allocator.free(encoder_path);
     const head_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner2-head.Q4_K.gguf" });
     defer allocator.free(head_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = encoder_path, .data = "GGUFstub" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = head_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = encoder_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = head_path, .data = "GGUFstub" });
 
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
@@ -3324,12 +3324,12 @@ test "manifest parses florence2 variants gguf model" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-florence2-variants-gguf");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const q4_path = try std.fs.path.join(allocator, &.{ dir_path, "florence-2-base.Q4_K.gguf" });
     defer allocator.free(q4_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q4_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = q4_path, .data = "GGUFstub" });
 
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
@@ -3361,15 +3361,15 @@ test "manifest parses lowercase florence variants gguf model" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-florence-lowercase-variants-gguf");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const q8_path = try std.fs.path.join(allocator, &.{ dir_path, "florence2.Q8_0.gguf" });
     defer allocator.free(q8_path);
     const q4_path = try std.fs.path.join(allocator, &.{ dir_path, "florence2.Q4_K.gguf" });
     defer allocator.free(q4_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q8_path, .data = "GGUFstub" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q4_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = q8_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = q4_path, .data = "GGUFstub" });
 
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
@@ -3407,41 +3407,41 @@ test "manifest loads canonical antfly florence2 variants before first gguf fallb
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-florence2-canonical-variants");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const q8_path = try std.fs.path.join(allocator, &.{ dir_path, "florence-2-base.Q8_0.gguf" });
     defer allocator.free(q8_path);
     const q4_path = try std.fs.path.join(allocator, &.{ dir_path, "florence-2-base.Q4_K.gguf" });
     defer allocator.free(q4_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q8_path, .data = "GGUFstub" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q4_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = q8_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = q4_path, .data = "GGUFstub" });
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data = "{\"model_type\":\"florence2\",\"text_config\":{\"d_model\":768},\"vision_config\":{\"image_size\":768}}",
     });
     const model_manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "model_manifest.json" });
     defer allocator.free(model_manifest_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = model_manifest_path,
         .data = "{\"type\":\"reader\",\"tasks\":[\"read\"],\"inputs\":[\"text\",\"image\"]}",
     });
     const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_path, .data = "{}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tokenizer_path, .data = "{}" });
     const tokenizer_config_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer_config.json" });
     defer allocator.free(tokenizer_config_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_config_path, .data = "{}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tokenizer_config_path, .data = "{}" });
     const preprocessor_path = try std.fs.path.join(allocator, &.{ dir_path, "preprocessor_config.json" });
     defer allocator.free(preprocessor_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = preprocessor_path, .data = "{\"size\":{\"height\":768,\"width\":768}}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = preprocessor_path, .data = "{\"size\":{\"height\":768,\"width\":768}}" });
 
     const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
     defer allocator.free(variants_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = variants_path,
         .data =
         \\{
@@ -3481,7 +3481,7 @@ test "manifest ignores stale florence2 variants with missing gguf files" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-florence2-stale-variants");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
@@ -3510,13 +3510,13 @@ test "manifest uses clipclap variants when default ONNX bundle is partial" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-clipclap-partial-onnx");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const onnx_path = try std.fs.path.join(allocator, &.{ dir_path, "text_model.onnx" });
     defer allocator.free(onnx_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = onnx_path, .data = "" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = onnx_path, .data = "" });
 
     var catalog = try ArtifactCatalog.initPublished(allocator, dir_path);
     defer catalog.deinit();
@@ -3527,7 +3527,7 @@ test "manifest keeps default clipclap ONNX when six model files are present" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-clipclap-complete-onnx");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
@@ -3542,7 +3542,7 @@ test "manifest keeps default clipclap ONNX when six model files are present" {
     for (onnx_files) |file_name| {
         const file_path = try std.fs.path.join(allocator, &.{ dir_path, file_name });
         defer allocator.free(file_path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = file_path, .data = "" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = file_path, .data = "" });
     }
 
     var catalog = try ArtifactCatalog.initPublished(allocator, dir_path);
@@ -3607,20 +3607,20 @@ test "manifest detects layoutlmv3 token classification architecture as recognize
     const allocator = std.testing.allocator;
     const model_dir = try testScratchDir(allocator, "manifest-layoutlmv3-token-recognizer");
     defer {
-        compat.cwd().deleteTree(compat.io(), model_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), model_dir) catch {};
         allocator.free(model_dir);
     }
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
     defer allocator.free(config_path);
     const tokenizer_path = try std.fs.path.join(allocator, &.{ model_dir, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"layoutlmv3","architectures":["LayoutLMv3ForTokenClassification"],"hidden_size":768,"num_hidden_layers":12,"num_attention_heads":12,"num_labels":2}
         ,
     });
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = tokenizer_path,
         .data = "{}",
     });
@@ -3636,8 +3636,8 @@ fn testScratchDir(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     defer allocator.free(root);
     const dir_path = try std.fs.path.join(allocator, &.{ "/tmp", root, name });
     errdefer allocator.free(dir_path);
-    compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
     return dir_path;
 }
 

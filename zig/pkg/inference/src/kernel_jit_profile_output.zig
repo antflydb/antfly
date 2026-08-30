@@ -197,7 +197,7 @@ pub fn loadCanonicalQualifiedProfile(
     allow_empty: bool,
 ) !CanonicalQualifiedProfile {
     try validateOutputPath(path);
-    const bytes = try compat.cwd().readFileAlloc(
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
         allocator,
@@ -320,7 +320,7 @@ fn writeFileAtomic(
     // .iterate forces a real O_RDONLY directory fd; the Zig 0.16 Threaded io
     // otherwise opens O_PATH on Linux, and fsync on an O_PATH fd aborts with
     // EBADF inside syncDirectory.
-    var dir = try compat.cwd().openDir(io, parent_path, .{ .iterate = true });
+    var dir = try std.Io.Dir.cwd().openDir(io, parent_path, .{ .iterate = true });
     defer dir.close(io);
     const tmp_name = try std.fmt.allocPrint(
         allocator,
@@ -364,7 +364,7 @@ pub fn loadQualifiedProfileBundle(
     bundle_path: []const u8,
 ) !LoadedProfileBundle {
     try validateOutputPath(bundle_path);
-    const bytes = try compat.cwd().readFileAlloc(
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
         bundle_path,
         allocator,
@@ -413,7 +413,7 @@ pub fn loadQualifiedProfileBundleIfPresent(
     io: std.Io,
     path: []const u8,
 ) !?LoadedProfileBundle {
-    const bytes = try compat.cwd().readFileAlloc(
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
         allocator,
@@ -444,7 +444,7 @@ fn validateQualifiedProfileFile(
     io: std.Io,
     path: []const u8,
 ) !bool {
-    const bytes = try compat.cwd().readFileAlloc(
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
         allocator,
@@ -1015,7 +1015,7 @@ test "component profile bundle is relocatable and accepts complete zero-winner m
     var second = try loadQualifiedProfileBundle(std.testing.allocator, std.testing.io, bundle_path);
     defer second.deinit();
     try std.testing.expect(!std.mem.eql(u8, old_primary_path, second.kernelJitBundle().primary));
-    const old_primary = try compat.cwd().readFileAlloc(
+    const old_primary = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
         old_primary_path,
         std.testing.allocator,

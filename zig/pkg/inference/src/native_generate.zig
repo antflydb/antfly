@@ -144,18 +144,17 @@ const Options = struct {
     kernel_jit_draft_qualified_profile: ?[]const u8 = null,
 };
 
-fn kernelJitProfileOutputPathsAlias(left: []const u8, right: []const u8) !bool {
+fn kernelJitProfileOutputPathsAlias(io: std.Io, left: []const u8, right: []const u8) !bool {
     if (!std.mem.eql(u8, std.fs.path.basename(left), std.fs.path.basename(right))) return false;
 
-    const io = compat.io();
     var left_parent_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const left_parent_len = try compat.cwd().realPathFile(
+    const left_parent_len = try std.Io.Dir.cwd().realPathFile(
         io,
         std.fs.path.dirname(left) orelse ".",
         &left_parent_buffer,
     );
     var right_parent_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const right_parent_len = try compat.cwd().realPathFile(
+    const right_parent_len = try std.Io.Dir.cwd().realPathFile(
         io,
         std.fs.path.dirname(right) orelse ".",
         &right_parent_buffer,
@@ -167,7 +166,7 @@ fn kernelJitProfileOutputPathsAlias(left: []const u8, right: []const u8) !bool {
     );
 }
 
-fn validateKernelJitOptions(opts: Options) !kernel_jit.Config {
+fn validateKernelJitOptions(io: std.Io, opts: Options) !kernel_jit.Config {
     var config = opts.kernel_jit;
     const draft_profile_requested = opts.kernel_jit_draft_profile_out != null or
         opts.kernel_jit_draft_qualified_profile != null;
@@ -178,7 +177,7 @@ fn validateKernelJitOptions(opts: Options) !kernel_jit.Config {
         opts.kernel_jit_draft_profile_out != null;
     if (opts.kernel_jit_profile_out != null and
         opts.kernel_jit_draft_profile_out != null and
-        try kernelJitProfileOutputPathsAlias(opts.kernel_jit_profile_out.?, opts.kernel_jit_draft_profile_out.?))
+        try kernelJitProfileOutputPathsAlias(io, opts.kernel_jit_profile_out.?, opts.kernel_jit_draft_profile_out.?))
     {
         return error.KernelJitTargetDraftProfileOutputConflict;
     }
@@ -280,7 +279,7 @@ fn validateCacheCompactionOption(ratio: ?f32) !void {
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
-    const jit_config = try validateKernelJitOptions(opts);
+    const jit_config = try validateKernelJitOptions(io, opts);
     try validateCacheCompactionOption(opts.cache_compaction_ratio);
     try native_backend_choice.validate(opts.backend);
     if (opts.raw_decode_bench and (opts.image_count > 0 or opts.audio_count > 0)) return error.RawDecodeBenchRequiresTextOnly;
@@ -2808,7 +2807,7 @@ fn writeRawDecodeBenchJson(
         },
     );
     defer allocator.free(json);
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
 fn perToken(count: usize, tokens: usize) f64 {
@@ -5616,7 +5615,7 @@ fn writeJsonTiming(
         },
     );
     defer allocator.free(json);
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
 fn writeLiveWholeModelJsonTiming(
@@ -5678,7 +5677,7 @@ fn writeLiveWholeModelJsonTiming(
         },
     );
     defer allocator.free(json);
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
 fn printGpuHostedTimingDetails(cb_opt: ?*const ops.ComputeBackend) void {
@@ -8593,9 +8592,9 @@ test "parseArgs accepts kernel JIT profile output" {
     });
     try std.testing.expectEqualStrings("/tmp/profile.json", opts.kernel_jit_profile_out.?);
     if (build_options.enable_metal) {
-        try std.testing.expectEqual(kernel_jit.Mode.shadow, (try validateKernelJitOptions(opts)).mode);
+        try std.testing.expectEqual(kernel_jit.Mode.shadow, (try validateKernelJitOptions(std.testing.io, opts)).mode);
     } else {
-        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(opts));
+        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(std.testing.io, opts));
     }
 
     try std.testing.expectError(error.MissingKernelJitProfileOut, parseArgs(&.{
@@ -8635,9 +8634,9 @@ test "parseArgs accepts native kernel JIT configuration" {
     try std.testing.expectEqualStrings("/tmp/profile.json", opts.kernel_jit.qualified_profile_path.?);
     try std.testing.expect(opts.kernel_jit_options_explicit);
     if (build_options.enable_metal) {
-        _ = try validateKernelJitOptions(opts);
+        _ = try validateKernelJitOptions(std.testing.io, opts);
     } else {
-        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(opts));
+        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(std.testing.io, opts));
     }
 
     try std.testing.expectError(error.MissingKernelJitMode, parseArgs(&.{
@@ -8675,13 +8674,13 @@ test "parseArgs accepts isolated target and draft kernel JIT profiles" {
     try std.testing.expectEqualStrings("/tmp/target-capture.json", capture_opts.kernel_jit_profile_out.?);
     try std.testing.expectEqualStrings("/tmp/draft-capture.json", capture_opts.kernel_jit_draft_profile_out.?);
     if (build_options.enable_metal) {
-        const target_config = try validateKernelJitOptions(capture_opts);
+        const target_config = try validateKernelJitOptions(std.testing.io, capture_opts);
         try std.testing.expectEqual(kernel_jit.Mode.shadow, target_config.mode);
         try std.testing.expect(target_config.profile_capture_only);
         try std.testing.expect((try draftKernelJitConfig(target_config, null, true)).profile_capture_only);
         try std.testing.expect(!(try draftKernelJitConfig(target_config, null, false)).profile_capture_only);
     } else {
-        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(capture_opts));
+        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(std.testing.io, capture_opts));
     }
 
     const qualified_opts = try parseArgs(&.{
@@ -8699,7 +8698,7 @@ test "parseArgs accepts isolated target and draft kernel JIT profiles" {
         "/tmp/draft-qualified.json",
     });
     if (build_options.enable_metal) {
-        const target_config = try validateKernelJitOptions(qualified_opts);
+        const target_config = try validateKernelJitOptions(std.testing.io, qualified_opts);
         const draft_config = try draftKernelJitConfig(target_config, qualified_opts.kernel_jit_draft_qualified_profile, false);
         try std.testing.expectEqualStrings("/tmp/target-qualified.json", target_config.qualified_profile_path.?);
         try std.testing.expectEqualStrings("/tmp/draft-qualified.json", draft_config.qualified_profile_path.?);
@@ -8707,7 +8706,7 @@ test "parseArgs accepts isolated target and draft kernel JIT profiles" {
 
         var draft_only_opts = qualified_opts;
         draft_only_opts.kernel_jit.qualified_profile_path = null;
-        const draft_only_target = try validateKernelJitOptions(draft_only_opts);
+        const draft_only_target = try validateKernelJitOptions(std.testing.io, draft_only_opts);
         try std.testing.expect(draft_only_target.qualified_profile_path == null);
         try std.testing.expectEqualStrings(
             "/tmp/draft-qualified.json",
@@ -8722,7 +8721,7 @@ test "parseArgs accepts isolated target and draft kernel JIT profiles" {
         const required_draft = try draftKernelJitConfig(required_target, "/tmp/draft-qualified.json", false);
         try std.testing.expectEqual(kernel_jit.Mode.required, required_draft.mode);
     } else {
-        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(qualified_opts));
+        try std.testing.expectError(error.KernelJitProfileRequiresMetalBackend, validateKernelJitOptions(std.testing.io, qualified_opts));
     }
 
     try std.testing.expectError(error.MissingKernelJitDraftProfileOut, parseArgs(&.{
@@ -8752,7 +8751,7 @@ test "parseArgs accepts isolated target and draft kernel JIT profiles" {
 test "native kernel JIT profile policy is fail closed" {
     try std.testing.expectError(
         error.KernelJitTargetDraftProfileOutputConflict,
-        validateKernelJitOptions(.{
+        validateKernelJitOptions(std.testing.io, .{
             .model_dir = "/tmp/model",
             .prompt = "hello",
             .backend = .metal,
@@ -8763,7 +8762,7 @@ test "native kernel JIT profile policy is fail closed" {
     );
     try std.testing.expectError(
         error.KernelJitTargetDraftProfileOutputConflict,
-        validateKernelJitOptions(.{
+        validateKernelJitOptions(std.testing.io, .{
             .model_dir = "/tmp/model",
             .prompt = "hello",
             .backend = .metal,
@@ -8774,7 +8773,7 @@ test "native kernel JIT profile policy is fail closed" {
     );
     try std.testing.expectError(
         error.KernelJitProfileRequiresMetalBackend,
-        validateKernelJitOptions(.{
+        validateKernelJitOptions(std.testing.io, .{
             .model_dir = "/tmp/model",
             .prompt = "hello",
             .backend = .native,
@@ -8783,7 +8782,7 @@ test "native kernel JIT profile policy is fail closed" {
     );
     try std.testing.expectError(
         error.KernelJitProfileRequiresMetalBackend,
-        validateKernelJitOptions(.{
+        validateKernelJitOptions(std.testing.io, .{
             .model_dir = "/tmp/model",
             .prompt = "hello",
             .backend = .cuda,
@@ -8802,11 +8801,11 @@ test "native kernel JIT profile policy is fail closed" {
     });
     try std.testing.expectError(
         error.KernelJitProfileCaptureRequiresShadow,
-        validateKernelJitOptions(explicit_off),
+        validateKernelJitOptions(std.testing.io, explicit_off),
     );
     try std.testing.expectError(
         error.KernelJitDraftProfileRequiresDraftModel,
-        validateKernelJitOptions(.{
+        validateKernelJitOptions(std.testing.io, .{
             .model_dir = "/tmp/model",
             .prompt = "hello",
             .backend = .metal,
@@ -8815,7 +8814,7 @@ test "native kernel JIT profile policy is fail closed" {
     );
     try std.testing.expectError(
         error.KernelJitDraftProfileRequiresDraftModel,
-        validateKernelJitOptions(.{
+        validateKernelJitOptions(std.testing.io, .{
             .model_dir = "/tmp/model",
             .prompt = "hello",
             .backend = .metal,
@@ -8825,7 +8824,7 @@ test "native kernel JIT profile policy is fail closed" {
     );
     try std.testing.expectError(
         error.KernelJitQualifiedProfileCaptureConflict,
-        validateKernelJitOptions(.{
+        validateKernelJitOptions(std.testing.io, .{
             .model_dir = "/tmp/model",
             .prompt = "hello",
             .backend = .metal,

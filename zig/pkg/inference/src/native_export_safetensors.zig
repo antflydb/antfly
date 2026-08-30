@@ -152,11 +152,11 @@ fn writeSafetensors(
     while ((header.written().len % 8) != 0) try writer.writeByte(' ');
 
     if (std.fs.path.dirname(output_path)) |dir| {
-        if (dir.len > 0) try compat.cwd().createDirPath(compat.io(), dir);
+        if (dir.len > 0) try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir);
     }
 
-    const io = compat.io();
-    var file = try compat.cwd().createFile(io, output_path, .{ .truncate = true });
+    const io = compat.testingIo();
+    var file = try std.Io.Dir.cwd().createFile(io, output_path, .{ .truncate = true });
     defer file.close(io);
 
     var size_buf: [8]u8 = undefined;
@@ -259,9 +259,9 @@ test "writeSafetensors emits sorted header and tensor payloads" {
 
     const dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/antfly-inference-safetensors-export-{d}", .{std.posix.system.getpid()});
     defer allocator.free(dir_path);
-    compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
-    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(out_path);

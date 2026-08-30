@@ -4453,14 +4453,14 @@ fn checkQuantCompilerEvidenceJsonPath(allocator: std.mem.Allocator, bytes: []con
 
 fn writeFileCreatingParent(io: std.Io, path: []const u8, data: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
-        if (parent.len > 0) try compat.cwd().createDirPath(io, parent);
+        if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent);
     }
     if (std.fs.path.isAbsolute(path)) {
         var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
         defer file.close(io);
         try file.writeStreamingAll(io, data);
     } else {
-        try compat.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
     }
 }
 
@@ -4643,8 +4643,8 @@ fn replaceOnce(allocator: std.mem.Allocator, input: []const u8, needle: []const 
 test "cuda microbench evidence writer creates absolute parent directories" {
     const root = try std.fmt.allocPrint(std.testing.allocator, "/tmp/antfly_quant_evidence_test_{d}", .{std.posix.system.getpid()});
     defer std.testing.allocator.free(root);
-    compat.cwd().deleteTree(std.testing.io, root) catch {};
-    defer compat.cwd().deleteTree(std.testing.io, root) catch {};
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
 
     const evidence_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested/q4.json", .{root});
     defer std.testing.allocator.free(evidence_path);
@@ -4795,7 +4795,7 @@ fn runGemma4KernelBench(
             \\}
             \\
         );
-        try compat.cwd().writeFile(io, .{ .sub_path = path, .data = json_out.items });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json_out.items });
     }
 }
 

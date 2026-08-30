@@ -673,7 +673,7 @@ fn qualityGateFailureError(failure: QualityGateFailure) anyerror {
 }
 
 fn writeQualitySummary(init: std.process.Init, out_path: []const u8, summary: QualitySummary) !void {
-    var file = try compat.cwd().createFile(init.io, out_path, .{ .truncate = true });
+    var file = try std.Io.Dir.cwd().createFile(init.io, out_path, .{ .truncate = true });
     defer file.close(init.io);
 
     var buf: [32768]u8 = undefined;
@@ -684,7 +684,7 @@ fn writeQualitySummary(init: std.process.Init, out_path: []const u8, summary: Qu
 }
 
 fn writeTextFile(init: std.process.Init, out_path: []const u8, text: []const u8) !void {
-    var file = try compat.cwd().createFile(init.io, out_path, .{ .truncate = true });
+    var file = try std.Io.Dir.cwd().createFile(init.io, out_path, .{ .truncate = true });
     defer file.close(init.io);
 
     var buf: [4096]u8 = undefined;

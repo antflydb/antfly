@@ -12751,8 +12751,8 @@ pub fn tuneMetalExactSignature(
         if (pipeline.*) |owned| termite_metal_generated_pipeline_destroy(owned);
     };
 
-    metal_jit_process_gpu_mutex.lockUncancelable(io_compat.io());
-    defer metal_jit_process_gpu_mutex.unlock(io_compat.io());
+    metal_jit_process_gpu_mutex.lockUncancelable(io_compat.testingIo());
+    defer metal_jit_process_gpu_mutex.unlock(io_compat.testingIo());
 
     for (schedules[0..candidate_count], 0..) |schedule, candidate_index| {
         evidence[candidate_index] = .{
@@ -13393,7 +13393,7 @@ fn activateMetalQualifiedProfile(
     profile_path: []const u8,
 ) !MetalJitPreloadStop {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        io_compat.io(),
+        io_compat.testingIo(),
         profile_path,
         context.allocator,
         .limited(16 * 1024 * 1024),
@@ -13501,8 +13501,8 @@ fn metalJitCachedQualification(
 }
 
 fn metalJitQualificationWork(job: *MetalJitQualificationJob) anyerror!void {
-    metal_jit_process_gpu_mutex.lockUncancelable(io_compat.io());
-    defer metal_jit_process_gpu_mutex.unlock(io_compat.io());
+    metal_jit_process_gpu_mutex.lockUncancelable(io_compat.testingIo());
+    defer metal_jit_process_gpu_mutex.unlock(io_compat.testingIo());
 
     if (!job.session.qualification_cache_persistent) {
         return error.MetalJitQualificationCacheUnavailable;
@@ -13794,8 +13794,8 @@ fn compileMetalJitProduction(
         defer context.allocator.free(kernel_name);
         var error_buffer: [4096]u8 = @splat(0);
         const generated = blk: {
-            metal_jit_process_gpu_mutex.lockUncancelable(io_compat.io());
-            defer metal_jit_process_gpu_mutex.unlock(io_compat.io());
+            metal_jit_process_gpu_mutex.lockUncancelable(io_compat.testingIo());
+            defer metal_jit_process_gpu_mutex.unlock(io_compat.testingIo());
             break :blk termite_metal_generated_pipeline_create(
                 emitted.data.ptr,
                 emitted.data.len,
@@ -13982,7 +13982,7 @@ pub fn initializeMetalKernelJitWithOptions(owner: anytype, options: MetalJitOpti
         const max_cache_bytes = options.config.maxCacheBytes() catch unreachable;
         session.cache = kernel_jit.ArtifactCache.initPath(
             allocator,
-            io_compat.io(),
+            io_compat.testingIo(),
             path,
             max_cache_bytes,
         ) catch |err| blk: {

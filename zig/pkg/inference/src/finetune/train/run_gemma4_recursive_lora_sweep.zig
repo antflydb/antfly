@@ -100,7 +100,7 @@ fn runSweep(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
     const teacher_temperatures = try parseCsv(allocator, opts.teacher_temperatures_csv);
     defer allocator.free(teacher_temperatures);
 
-    try compat.cwd().createDirPath(compat.io(), opts.output_root);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), opts.output_root);
 
     var baseline_dirs = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -250,7 +250,7 @@ fn writeComparison(
         .smallest_trained_adapter = smallest_trained_adapter,
     }, .{ .whitespace = .indent_2 }, &out.writer);
     try out.writer.writeByte('\n');
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = comparison_path, .data = out.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = comparison_path, .data = out.written() });
 }
 
 fn baselineRow(allocator: std.mem.Allocator, backend: []const u8, path: []const u8) !Row {

@@ -511,7 +511,7 @@ fn writeBenchmarkJson(allocator: std.mem.Allocator, io: std.Io, model_name: []co
     try buf.appendSlice(allocator, "}\n");
 
     if (opts.json_timing_path) |path| {
-        try compat.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items });
     }
     try writeToStdout(io, buf.items);
 }

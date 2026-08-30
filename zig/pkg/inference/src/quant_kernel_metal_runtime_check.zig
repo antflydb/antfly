@@ -3009,7 +3009,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (cfg.evidence_out_path) |path| {
         var collected_provenance: ?CollectedAttestedProvenance = if (cfg.attest_provenance)
-            try collectAttestedProvenance(allocator, compat.io())
+            try collectAttestedProvenance(allocator, init.io)
         else
             null;
         defer if (collected_provenance) |*provenance| provenance.deinit(allocator);
@@ -3734,7 +3734,7 @@ fn writeSweepEvidence(
         try out.appendSlice(allocator, if (emitted == total) "\n" else ",\n");
     }
     try out.appendSlice(allocator, "  ]\n}\n");
-    try writeFileCreatingParent(compat.io(), path, out.items);
+    try writeFileCreatingParent(compat.testingIo(), path, out.items);
 }
 
 fn appendSweepScheduleJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), schedule: quant_kernel_compiler.KernelSchedule) !void {
@@ -5496,7 +5496,7 @@ fn writeEvidence(
         \\}
         \\
     );
-    try writeFileCreatingParent(compat.io(), path, out.items);
+    try writeFileCreatingParent(compat.testingIo(), path, out.items);
     if (promotion_ready_kernel) |kernel| {
         if (emit_promotion_diagnostics and promotion_ready_count != promotion_case_count) {
             std.debug.print(
@@ -5734,14 +5734,14 @@ fn appendF64ArrayField(
 
 fn writeFileCreatingParent(io: std.Io, path: []const u8, data: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
-        if (parent.len > 0) try compat.cwd().createDirPath(io, parent);
+        if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent);
     }
     if (std.fs.path.isAbsolute(path)) {
         var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
         defer file.close(io);
         try file.writeStreamingAll(io, data);
     } else {
-        try compat.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
     }
 }
 
@@ -6205,14 +6205,14 @@ fn checkEvidenceFileWithSummaryExpected(
     require_kernel: ?[]const u8,
     expected_provenance_override: ?AttestedProvenance,
 ) !EvidenceSummary {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(compat.io(), path, allocator, .limited(1024 * 1024));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);
     try checkEvidenceJson(allocator, bytes, require_promotion_ready, require_runtime_route_all, require_kernel);
     if (require_promotion_ready) {
         if (expected_provenance_override) |expected_provenance| {
             try checkEvidenceProvenanceMatches(allocator, bytes, expected_provenance);
         } else {
-            var expected_provenance = try collectAttestedProvenance(allocator, compat.io());
+            var expected_provenance = try collectAttestedProvenance(allocator, compat.testingIo());
             defer expected_provenance.deinit(allocator);
             try checkEvidenceProvenanceMatches(allocator, bytes, expected_provenance.value);
         }
@@ -6315,12 +6315,12 @@ fn checkEvidenceJsonCommandPath(allocator: std.mem.Allocator, bytes: []const u8,
 fn commandEvidenceOutMatches(allocator: std.mem.Allocator, command: []const u8, path: []const u8) !bool {
     const actual = commandArgValue(command, "--evidence-out") orelse return false;
     if (std.mem.eql(u8, actual, path)) return true;
-    const actual_real = compat.cwd().realPathFileAlloc(compat.io(), actual, allocator) catch |err| switch (err) {
+    const actual_real = std.Io.Dir.cwd().realPathFileAlloc(compat.testingIo(), actual, allocator) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
     defer allocator.free(actual_real);
-    const expected_real = compat.cwd().realPathFileAlloc(compat.io(), path, allocator) catch |err| switch (err) {
+    const expected_real = std.Io.Dir.cwd().realPathFileAlloc(compat.testingIo(), path, allocator) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -7709,7 +7709,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceFile(std.testing.allocator, copied_path, false, false, null));
     try std.testing.expect(try commandEvidenceOutMatches(std.testing.allocator, "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /tmp/a --repeat-runs 3", "/tmp/a"));
     try std.testing.expect(!try commandEvidenceOutMatches(std.testing.allocator, "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /tmp/abc --repeat-runs 3", "/tmp/a"));
-    const absolute_path = try compat.cwd().realPathFileAlloc(std.testing.io, path, std.testing.allocator);
+    const absolute_path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, path, std.testing.allocator);
     defer std.testing.allocator.free(absolute_path);
     try checkEvidenceJsonCommandPath(std.testing.allocator, actual, absolute_path);
 

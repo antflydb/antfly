@@ -461,9 +461,9 @@ test "GLiNER2 inference: fixed text produces deterministic token logits" {
 
     const out_dir = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_e2e_task_head_export_{d}", .{std.posix.system.getpid()});
     defer allocator.free(out_dir);
-    compat.cwd().deleteTree(compat.io(), out_dir) catch {};
-    try compat.cwd().createDirPath(compat.io(), out_dir);
-    defer compat.cwd().deleteTree(compat.io(), out_dir) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), out_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), out_dir) catch {};
 
     const weight_slot = regularParamSlot(&trainer, "task_classifier.weight") orelse return error.MissingClassifierHead;
     const bias_slot = regularParamSlot(&trainer, "task_classifier.bias") orelse return error.MissingClassifierHead;

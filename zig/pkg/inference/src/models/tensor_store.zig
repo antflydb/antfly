@@ -1172,7 +1172,7 @@ test "open sharded safetensors tensor store from manifest" {
 
     const dir_path = try testScratchDir(allocator, "tensor-store-sharded-safetensors");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const shard1_path = try std.fs.path.join(allocator, &.{ dir_path, "model-00001-of-00002.safetensors" });
@@ -1181,9 +1181,9 @@ test "open sharded safetensors tensor store from manifest" {
     defer allocator.free(shard2_path);
     const index_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors.index.json" });
     defer allocator.free(index_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = shard1_path, .data = shard1.items });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = shard2_path, .data = shard2.items });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = index_path, .data = index_json });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = shard1_path, .data = shard1.items });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = shard2_path, .data = shard2.items });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = index_path, .data = index_json });
 
     var manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
@@ -1227,17 +1227,17 @@ test "safetensors tensor store preserves f16 dtype" {
 
     const dir_path = try testScratchDir(allocator, "tensor-store-safetensors-f16");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = file.items });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = file.items });
     const gguf_path = try std.fs.path.join(allocator, &.{ dir_path, "export.gguf" });
     defer allocator.free(gguf_path);
     // A default export is colocated with its safetensors source. Keep this
     // deliberately invalid so the test proves the runtime never opens it.
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = gguf_path, .data = "stale export" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = gguf_path, .data = "stale export" });
 
     var manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
@@ -1274,12 +1274,12 @@ test "safetensors tensor store describes absolute byte ranges" {
 
     const dir_path = try testScratchDir(allocator, "tensor-store-safetensors-range");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = file.items });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = file.items });
 
     var manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
@@ -1313,19 +1313,19 @@ test "open gguf tensor store from manifest" {
     try appendString(allocator, &data, "tok_embeddings.weight");
     try appendLe(u32, allocator, &data, 1);
     try appendLe(u64, allocator, &data, 4);
-    try appendLe(u32, allocator, &data, @intFromEnum(gguf_mod.tensor_types.KnownTensorType.F16));
+    try appendLe(u32, allocator, &data, @backingInt(gguf_mod.tensor_types.KnownTensorType.F16));
     try appendLe(u64, allocator, &data, 0);
     try padToAlignment(allocator, &data, gguf_mod.format.default_alignment);
     try data.appendSlice(allocator, &[_]u8{ 0x00, 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44 });
 
     const dir_path = try testScratchDir(allocator, "tensor-store-gguf");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const path = try std.fs.path.join(allocator, &.{ dir_path, "model.gguf" });
     defer allocator.free(path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = data.items });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = data.items });
 
     var manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
@@ -1363,7 +1363,7 @@ test "open split gliner gguf bundle from manifest" {
     try appendString(allocator, &gguf_data, "embeddings.word_embeddings.weight");
     try appendLe(u32, allocator, &gguf_data, 1);
     try appendLe(u64, allocator, &gguf_data, 4);
-    try appendLe(u32, allocator, &gguf_data, @intFromEnum(gguf_mod.tensor_types.KnownTensorType.F16));
+    try appendLe(u32, allocator, &gguf_data, @backingInt(gguf_mod.tensor_types.KnownTensorType.F16));
     try appendLe(u64, allocator, &gguf_data, 0);
     try padToAlignment(allocator, &gguf_data, gguf_mod.format.default_alignment);
     try gguf_data.appendSlice(allocator, &[_]u8{ 0x00, 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44 });
@@ -1380,13 +1380,13 @@ test "open split gliner gguf bundle from manifest" {
     try appendString(allocator, &head_data, "span_rep.test");
     try appendLe(u32, allocator, &head_data, 1);
     try appendLe(u64, allocator, &head_data, 2);
-    try appendLe(u32, allocator, &head_data, @intFromEnum(gguf_mod.tensor_types.KnownTensorType.F32));
+    try appendLe(u32, allocator, &head_data, @backingInt(gguf_mod.tensor_types.KnownTensorType.F32));
     try appendLe(u64, allocator, &head_data, 0);
     try appendString(allocator, &head_data, "span_rep.quant.weight");
     try appendLe(u32, allocator, &head_data, 2);
     try appendLe(u64, allocator, &head_data, 256);
     try appendLe(u64, allocator, &head_data, 2);
-    try appendLe(u32, allocator, &head_data, @intFromEnum(gguf_mod.tensor_types.KnownTensorType.Q4_K));
+    try appendLe(u32, allocator, &head_data, @backingInt(gguf_mod.tensor_types.KnownTensorType.Q4_K));
     try appendLe(u64, allocator, &head_data, gguf_mod.format.default_alignment);
     try padToAlignment(allocator, &head_data, gguf_mod.format.default_alignment);
     try head_data.appendSlice(allocator, std.mem.asBytes(&[_]f32{ 5.0, 6.0 }));
@@ -1395,15 +1395,15 @@ test "open split gliner gguf bundle from manifest" {
 
     const dir_path = try testScratchDir(allocator, "tensor-store-gliner-split");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const gguf_path = try std.fs.path.join(allocator, &.{ dir_path, "encoder.gguf" });
     defer allocator.free(gguf_path);
     const head_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner_head.gguf" });
     defer allocator.free(head_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = gguf_path, .data = gguf_data.items });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = head_path, .data = head_data.items });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = gguf_path, .data = gguf_data.items });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = head_path, .data = head_data.items });
 
     var manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
@@ -1469,8 +1469,8 @@ fn testScratchDir(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     defer allocator.free(root);
     const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", root, name });
     errdefer allocator.free(dir_path);
-    compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
     return dir_path;
 }
 

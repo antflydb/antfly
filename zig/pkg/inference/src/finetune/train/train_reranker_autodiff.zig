@@ -198,7 +198,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // ------------------------------------------------------------------
     // 1. Create output directory
     // ------------------------------------------------------------------
-    try compat.cwd().createDirPath(compat.io(), opts.out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), opts.out_dir);
 
     print("train-reranker-autodiff\n  model_dir={s}\n  train_data={s}\n  out_dir={s}\n", .{
         opts.model_dir,
@@ -227,7 +227,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     // ------------------------------------------------------------------
     var config_path_buf: [512]u8 = undefined;
     const config_path = try std.fmt.bufPrint(&config_path_buf, "{s}/config.json", .{opts.model_dir});
-    const config_bytes = try compat.cwd().readFileAlloc(compat.io(), config_path, allocator, .limited(8 * 1024 * 1024));
+    const config_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), config_path, allocator, .limited(8 * 1024 * 1024));
     defer allocator.free(config_bytes);
     const bert_config = try bert_types.parseConfig(allocator, config_bytes);
     print("  bert: hidden={d} layers={d} heads={d} vocab={d}\n", .{

@@ -214,15 +214,15 @@ pub fn validateRun(
     const task_head_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, gliner2.task_head_checkpoint_file_name });
     errdefer allocator.free(task_head_checkpoint_path);
 
-    const manifest_bytes = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(4 * 1024 * 1024));
+    const manifest_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), manifest_path, allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(manifest_bytes);
     var manifest_parsed = try std.json.parseFromSlice(std.json.Value, allocator, manifest_bytes, .{ .ignore_unknown_fields = true });
     defer manifest_parsed.deinit();
     if (manifest_parsed.value != .object) return error.InvalidTrainingManifest;
     const manifest = inspectManifest(manifest_parsed.value.object) catch return error.InvalidTrainingManifest;
 
-    const io = compat.io();
-    var metrics_file = try compat.cwd().openFile(io, metrics_path, .{});
+    const io = compat.testingIo();
+    var metrics_file = try std.Io.Dir.cwd().openFile(io, metrics_path, .{});
     defer metrics_file.close(io);
     const metrics_reader_buffer = try allocator.alloc(u8, 4 * 1024 * 1024);
     defer allocator.free(metrics_reader_buffer);
@@ -1274,12 +1274,12 @@ fn inspectMetricsJsonl(allocator: std.mem.Allocator, reader: *std.Io.Reader) !st
 }
 
 fn countAdapterParameterFiles(out_dir: []const u8) !usize {
-    var dir = try compat.cwd().openDir(compat.io(), out_dir, .{ .iterate = true });
-    defer dir.close(compat.io());
+    var dir = try std.Io.Dir.cwd().openDir(compat.testingIo(), out_dir, .{ .iterate = true });
+    defer dir.close(compat.testingIo());
 
     var count: usize = 0;
     var iter = dir.iterate();
-    while (try iter.next(compat.io())) |entry| {
+    while (try iter.next(compat.testingIo())) |entry| {
         if (entry.kind != .file) continue;
         if (std.mem.endsWith(u8, entry.name, ".lora_A" ++ adapter_file_suffix) or
             std.mem.endsWith(u8, entry.name, ".lora_B" ++ adapter_file_suffix)) count += 1;
@@ -1293,7 +1293,7 @@ fn validatePeftAdapterBundle(
     adapter_config_path: []const u8,
     manifest: ManifestInspection,
 ) !usize {
-    const config_bytes = try compat.cwd().readFileAlloc(compat.io(), adapter_config_path, allocator, .limited(4 * 1024 * 1024));
+    const config_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), adapter_config_path, allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(config_bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();

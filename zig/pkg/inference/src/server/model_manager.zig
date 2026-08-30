@@ -4677,10 +4677,10 @@ pub const ModelManager = struct {
         };
     };
 
-    fn componentPlanIo(self: *ModelManager) std.Io {
+    fn componentPlanIo(self: *ModelManager) !std.Io {
         self.lockLoadedModels();
         defer self.unlockLoadedModels();
-        return self.session_manager.io orelse std.Io.Threaded.global_single_threaded.io();
+        return self.session_manager.io orelse error.MissingIoRuntime;
     }
 
     fn applyCachedComponentPlan(
@@ -4698,7 +4698,7 @@ pub const ModelManager = struct {
         defer entry.release();
 
         const signature = try componentDependencySignature(
-            self.componentPlanIo(),
+            try self.componentPlanIo(),
             entry.dependencies,
         );
         if (!std.mem.eql(u8, signature[0..], entry.signature[0..])) return false;
@@ -4803,7 +4803,7 @@ pub const ModelManager = struct {
             );
             defer inspection.deinit();
             const signature_before = try componentDependencySignature(
-                self.componentPlanIo(),
+                try self.componentPlanIo(),
                 inspection.dependencies.items,
             );
             try validateComponentNativeArtifacts(
@@ -4819,7 +4819,7 @@ pub const ModelManager = struct {
                 &inspection,
             );
             const signature_after = try componentDependencySignature(
-                self.componentPlanIo(),
+                try self.componentPlanIo(),
                 inspection.dependencies.items,
             );
             if (!std.mem.eql(
@@ -5354,7 +5354,7 @@ pub const ModelManager = struct {
 
         var receipt = try managed_receipt.loadValidated(
             self.allocator,
-            self.componentPlanIo(),
+            try self.componentPlanIo(),
             model_dir,
         );
         defer if (receipt) |*validated| validated.deinit();
@@ -5366,7 +5366,7 @@ pub const ModelManager = struct {
         else
             managed_receipt.resolveContainedArtifactPath(
                 self.allocator,
-                self.componentPlanIo(),
+                try self.componentPlanIo(),
                 model_dir,
                 "generation_config.json",
             ) catch |err| switch (err) {
@@ -5410,7 +5410,7 @@ pub const ModelManager = struct {
             owned_paths.appendAssumeCapacity(path);
             try dependencies.append(self.allocator, path);
         }
-        return componentDependencySignature(self.componentPlanIo(), dependencies.items);
+        return componentDependencySignature(try self.componentPlanIo(), dependencies.items);
     }
 
     fn loadWhisperCompositeAssetsUncached(
@@ -5538,8 +5538,11 @@ pub const ModelManager = struct {
             self.unlockLoadedModels();
             return err;
         };
-        const coordination_io = self.session_manager.io orelse
-            std.Io.Threaded.global_single_threaded.io();
+        const coordination_io = self.session_manager.io orelse {
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return error.MissingIoRuntime;
+        };
         flight.* = .{ .io = coordination_io };
         self.in_flight_whisper_assets.put(
             self.allocator,
@@ -5870,10 +5873,11 @@ pub const ModelManager = struct {
         // Antfly injects BackendRuntime.io through Node.attachIo. Keep the
         // inference package coupled only to the std.Io capability so standalone
         // and embedded owners can provide different runtime implementations.
-        // The process-local fallback is only for offline callers that do not
-        // attach a runtime.
-        const coordination_io = self.session_manager.io orelse
-            std.Io.Threaded.global_single_threaded.io();
+        const coordination_io = self.session_manager.io orelse {
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return error.MissingIoRuntime;
+        };
         flight.* = .{
             .io = coordination_io,
         };

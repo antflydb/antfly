@@ -1957,7 +1957,7 @@ pub const RuntimeJitCancellation = struct {
 };
 
 fn runtimeJitMonotonicNowNs() u64 {
-    const value = std.Io.Clock.awake.now(io_compat.io()).nanoseconds;
+    const value = std.Io.Clock.awake.now(io_compat.testingIo()).nanoseconds;
     if (value <= 0) return 0;
     return @intCast(@min(value, std.math.maxInt(u64)));
 }
@@ -2852,7 +2852,7 @@ pub const KernelModule = struct {
         if (cache_path) |path| {
             cache = kernel_jit.ArtifactCache.initPath(
                 allocator,
-                io_compat.io(),
+                io_compat.testingIo(),
                 path,
                 try config.maxCacheBytes(),
             ) catch |err| blk: {

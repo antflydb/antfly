@@ -610,7 +610,7 @@ pub fn saveTrainerAsQwenAdapterDir(
     var adapter_inspect = try colqwen2.inspectCheckpoint(allocator, adapter_model_dir);
     defer colqwen2.freeInspectionSummary(allocator, &adapter_inspect);
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, colqwen2.adapter_checkpoint_file_name });
     defer allocator.free(adapter_checkpoint_path);
     const adapter_config_path = try std.fs.path.join(allocator, &.{ out_dir, colqwen2.adapter_config_file_name });
@@ -838,18 +838,18 @@ fn writeHeaderAndTensorsF32(allocator: std.mem.Allocator, path: []const u8, tens
     }
     try writer.writeByte('}');
 
-    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
-    defer file.close(compat.io());
+    var file = try std.Io.Dir.cwd().createFile(compat.testingIo(), path, .{ .truncate = true });
+    defer file.close(compat.testingIo());
     var len_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_buf, header_buf.written().len, .little);
-    try file.writeStreamingAll(compat.io(), &len_buf);
-    try file.writeStreamingAll(compat.io(), header_buf.written());
+    try file.writeStreamingAll(compat.testingIo(), &len_buf);
+    try file.writeStreamingAll(compat.testingIo(), header_buf.written());
     for (tensors) |tensor| {
         for (tensor.data) |item| {
             const bits: u32 = @bitCast(item);
             var bits_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &bits_buf, bits, .little);
-            try file.writeStreamingAll(compat.io(), &bits_buf);
+            try file.writeStreamingAll(compat.testingIo(), &bits_buf);
         }
     }
 }
@@ -872,7 +872,7 @@ fn writeAdapterConfigJson(
         .lora_alpha = alpha,
         .target_modules = target_modules,
     }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 fn copySupportingArtifactIfPresent(
@@ -886,5 +886,5 @@ fn copySupportingArtifactIfPresent(
     defer allocator.free(contents);
     const dst_path = try std.fs.path.join(allocator, &.{ out_dir, file_name });
     defer allocator.free(dst_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst_path, .data = contents });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = dst_path, .data = contents });
 }

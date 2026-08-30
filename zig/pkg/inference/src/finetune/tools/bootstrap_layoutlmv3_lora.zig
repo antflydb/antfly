@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
     const rank = try std.fmt.parseUnsigned(usize, rank_arg, 10);
     const alpha = try std.fmt.parseFloat(f32, alpha_arg);
 
-    var summary = try finetune.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
+    var summary = try finetune.bootstrapLoRABundle(allocator, init.io, model_dir, out_dir, .{
         .rank = rank,
         .alpha = alpha,
         .base_model_name_or_path = base_model_name_or_path,

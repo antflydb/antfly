@@ -93,10 +93,10 @@ pub fn save(
 
     // 3. Write the file.
     if (std.fs.path.dirname(path)) |dir| {
-        if (dir.len > 0) try compat.cwd().createDirPath(compat.io(), dir);
+        if (dir.len > 0) try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir);
     }
-    const io = compat.io();
-    var file = try compat.cwd().createFile(io, path, .{ .truncate = true });
+    const io = compat.testingIo();
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
     defer file.close(io);
     var write_buffer: [64 * 1024]u8 = undefined;
     var file_writer = file.writer(io, &write_buffer);

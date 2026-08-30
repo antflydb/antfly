@@ -753,12 +753,12 @@ test "safetensors access reads descriptor and dense bytes" {
 
     const dir_path = try testScratchDir(allocator, "tensor-access-safetensors");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = file.items });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = file.items });
 
     var manifest = manifest_mod.ModelManifest{ .allocator = allocator, .safetensors_path = try allocator.dupe(u8, path) };
     defer manifest.deinit();
@@ -790,19 +790,19 @@ test "gguf access reads descriptor and raw tensor bytes" {
     try appendString(allocator, &data, "tok_embeddings.weight");
     try appendLe(u32, allocator, &data, 1);
     try appendLe(u64, allocator, &data, 4);
-    try appendLe(u32, allocator, &data, @intFromEnum(gguf_mod.tensor_types.KnownTensorType.F16));
+    try appendLe(u32, allocator, &data, @backingInt(gguf_mod.tensor_types.KnownTensorType.F16));
     try appendLe(u64, allocator, &data, 0);
     try padToAlignment(allocator, &data, gguf_mod.format.default_alignment);
     try data.appendSlice(allocator, &[_]u8{ 0x00, 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44 });
 
     const dir_path = try testScratchDir(allocator, "tensor-access-gguf");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const path = try std.fs.path.join(allocator, &.{ dir_path, "model.gguf" });
     defer allocator.free(path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = data.items });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = data.items });
 
     var manifest = manifest_mod.ModelManifest{ .allocator = allocator, .gguf_path = try allocator.dupe(u8, path) };
     defer manifest.deinit();
@@ -826,7 +826,7 @@ test "onnx initializer access reads prefixed dense bytes" {
 
     const dir_path = try testScratchDir(allocator, "tensor-access-onnx");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
@@ -843,7 +843,7 @@ test "onnx initializer access reads prefixed dense bytes" {
 
     const onnx_path = try std.fs.path.join(allocator, &.{ dir_path, "text_model.onnx" });
     defer allocator.free(onnx_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = onnx_path, .data = model_bytes });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = onnx_path, .data = model_bytes });
 
     var manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
@@ -886,8 +886,8 @@ fn testScratchDir(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     defer allocator.free(root);
     const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", root, name });
     errdefer allocator.free(dir_path);
-    compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
     return dir_path;
 }
 

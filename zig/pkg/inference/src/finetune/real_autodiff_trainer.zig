@@ -1012,10 +1012,10 @@ pub const RealAutodiffTrainer = struct {
 
         const temporary_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
         defer self.allocator.free(temporary_path);
-        compat.cwd().deleteFile(compat.io(), temporary_path) catch {};
-        errdefer compat.cwd().deleteFile(compat.io(), temporary_path) catch {};
+        std.Io.Dir.cwd().deleteFile(compat.testingIo(), temporary_path) catch {};
+        errdefer std.Io.Dir.cwd().deleteFile(compat.testingIo(), temporary_path) catch {};
         try safetensors_checkpoint.save(self.allocator, temporary_path, tensors.items);
-        try std.Io.Dir.rename(compat.cwd(), temporary_path, compat.cwd(), path, compat.io());
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), temporary_path, std.Io.Dir.cwd(), path, compat.testingIo());
         try syncParentDirectory(path);
     }
 
@@ -1026,7 +1026,7 @@ pub const RealAutodiffTrainer = struct {
         path: []const u8,
         expected: *const [32]u8,
     ) !void {
-        const absolute_path = try compat.cwd().realPathFileAlloc(compat.io(), path, self.allocator);
+        const absolute_path = try std.Io.Dir.cwd().realPathFileAlloc(compat.testingIo(), path, self.allocator);
         defer self.allocator.free(absolute_path);
         var reader = try safetensors.MMapReader.openFileAbsolute(self.allocator, absolute_path);
         defer reader.deinit();
@@ -1040,7 +1040,7 @@ pub const RealAutodiffTrainer = struct {
         if (self.step_count != 0 or self.optimizer_step_count != 0 or self.accum_count != 0 or self.optimizer_state.param_states.count() != 0) {
             return error.TrainerAlreadyStarted;
         }
-        const absolute_path = try compat.cwd().realPathFileAlloc(compat.io(), path, self.allocator);
+        const absolute_path = try std.Io.Dir.cwd().realPathFileAlloc(compat.testingIo(), path, self.allocator);
         defer self.allocator.free(absolute_path);
         var reader = try safetensors.MMapReader.openFileAbsolute(self.allocator, absolute_path);
         defer reader.deinit();
@@ -1068,7 +1068,7 @@ pub const RealAutodiffTrainer = struct {
         path: []const u8,
         expected_run_fingerprint: ?*const [32]u8,
     ) !RestoredTrainingStateCounters {
-        const absolute_path = try compat.cwd().realPathFileAlloc(compat.io(), path, self.allocator);
+        const absolute_path = try std.Io.Dir.cwd().realPathFileAlloc(compat.testingIo(), path, self.allocator);
         defer self.allocator.free(absolute_path);
         var reader = try safetensors.MMapReader.openFileAbsolute(self.allocator, absolute_path);
         defer reader.deinit();
@@ -1090,7 +1090,7 @@ pub const RealAutodiffTrainer = struct {
         expected_run_fingerprint: ?*const [32]u8,
     ) !void {
         _ = try self.inspectTrainingState(path, expected_run_fingerprint);
-        const absolute_path = try compat.cwd().realPathFileAlloc(compat.io(), path, self.allocator);
+        const absolute_path = try std.Io.Dir.cwd().realPathFileAlloc(compat.testingIo(), path, self.allocator);
         defer self.allocator.free(absolute_path);
         var reader = try safetensors.MMapReader.openFileAbsolute(self.allocator, absolute_path);
         defer reader.deinit();
@@ -1740,21 +1740,21 @@ pub const RealAutodiffTrainer = struct {
     ///     n_elements     (u64)
     ///     raw f32 data   (n_elements * 4 bytes)
     pub fn saveAdapters(self: *const RealAutodiffTrainer, out_dir: []const u8) !void {
-        try compat.cwd().createDirPath(compat.io(), out_dir);
+        try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
         // A reused output directory must describe exactly this run. Remove
         // only legacy autodiff adapter parameter files; preserve manifests,
         // configs, and unrelated user artifacts.
-        var dir = try compat.cwd().openDir(compat.io(), out_dir, .{ .iterate = true });
-        defer dir.close(compat.io());
+        var dir = try std.Io.Dir.cwd().openDir(compat.testingIo(), out_dir, .{ .iterate = true });
+        defer dir.close(compat.testingIo());
         var iter = dir.iterate();
-        while (try iter.next(compat.io())) |entry| {
+        while (try iter.next(compat.testingIo())) |entry| {
             if (entry.kind != .file) continue;
             if (std.mem.endsWith(u8, entry.name, ".lora_A.bin") or
                 std.mem.endsWith(u8, entry.name, ".lora_B.bin") or
                 std.mem.endsWith(u8, entry.name, ".lora_A.bin.tmp") or
                 std.mem.endsWith(u8, entry.name, ".lora_B.bin.tmp"))
             {
-                try dir.deleteFile(compat.io(), entry.name);
+                try dir.deleteFile(compat.testingIo(), entry.name);
             }
         }
         for (self.lora_params.items) |slot| {
@@ -1788,13 +1788,13 @@ pub const RealAutodiffTrainer = struct {
             // (none in our target set) would need a per-element swap.
             try buf.appendSlice(self.allocator, std.mem.sliceAsBytes(slot.weights));
 
-            compat.cwd().deleteFile(compat.io(), tmp_file_name) catch {};
-            errdefer compat.cwd().deleteFile(compat.io(), tmp_file_name) catch {};
-            try compat.cwd().writeFile(compat.io(), .{
+            std.Io.Dir.cwd().deleteFile(compat.testingIo(), tmp_file_name) catch {};
+            errdefer std.Io.Dir.cwd().deleteFile(compat.testingIo(), tmp_file_name) catch {};
+            try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
                 .sub_path = tmp_file_name,
                 .data = buf.items,
             });
-            try std.Io.Dir.rename(compat.cwd(), tmp_file_name, compat.cwd(), file_name, compat.io());
+            try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_file_name, std.Io.Dir.cwd(), file_name, compat.testingIo());
         }
     }
 
@@ -2822,10 +2822,10 @@ fn syncParentDirectory(path: []const u8) !void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return;
     const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
     var dir = if (std.fs.path.isAbsolute(parent))
-        try std.Io.Dir.openDirAbsolute(compat.io(), parent, .{ .iterate = true })
+        try std.Io.Dir.openDirAbsolute(compat.testingIo(), parent, .{ .iterate = true })
     else
-        try compat.cwd().openDir(compat.io(), parent, .{ .iterate = true });
-    defer dir.close(compat.io());
+        try std.Io.Dir.cwd().openDir(compat.testingIo(), parent, .{ .iterate = true });
+    defer dir.close(compat.testingIo());
     while (true) switch (std.posix.errno(std.posix.system.fsync(dir.handle))) {
         .SUCCESS => return,
         .INTR => continue,

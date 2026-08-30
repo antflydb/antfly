@@ -105,8 +105,7 @@ pub const LoadedMultiStageReader = struct {
         var metadata = try metadata_mod.loadFromDir(allocator, model_path);
         defer metadata.deinit();
         if (!metadata_mod.isMultiStage(&metadata)) return error.InvalidMetadata;
-        const runtime_io = session_manager.io orelse
-            std.Io.Threaded.global_single_threaded.io();
+        const runtime_io = session_manager.io orelse return error.MissingIoRuntime;
         var asset_resolver = try AssetResolver.init(
             allocator,
             runtime_io,

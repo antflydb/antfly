@@ -136,7 +136,7 @@ fn runPilot(init: std.process.Init, allocator: std.mem.Allocator, opts: Options)
         if (!fileExists(dataset_path) and opts.image_path == null) return error.MissingPilotImagePath;
     }
 
-    try compat.cwd().createDirPath(compat.io(), opts.output_root);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), opts.output_root);
 
     if (!fileExists(dataset_path)) {
         const count_arg = try std.fmt.allocPrint(allocator, "{d}", .{count});
@@ -349,7 +349,7 @@ fn printCommand(argv0: []const u8, args: []const []const u8) void {
 }
 
 fn fileExists(path: []const u8) bool {
-    compat.cwd().access(compat.io(), path, .{}) catch return false;
+    std.Io.Dir.cwd().access(compat.testingIo(), path, .{}) catch return false;
     return true;
 }
 
