@@ -6902,7 +6902,7 @@ components:
       oneOf:
         - $ref: "query.yaml#/components/schemas/Query"
       x-go-type: json.RawMessage
-      x-zig-type: raw_json_object
+      x-zig-type: raw_json
       description: An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
 
     HierarchyProjection:

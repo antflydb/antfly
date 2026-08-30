@@ -7845,7 +7845,7 @@ pub const QueryUnprocessableError = union(enum) {
 };
 
 /// An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
-pub const RawQuery = @import("antfly-json").RawObject;
+pub const RawQuery = @import("antfly-json").RawValue;
 
 /// Bounded request to list table repair issues.
 pub const RepairIssueListRequest = struct {

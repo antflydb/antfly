@@ -302,10 +302,17 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
         interval_s=0.1,
     )
     assert public_shortest_result is not None
+    assert public_shortest_result["kind"] == "paths"
     assert len(public_shortest_result["paths"]) == 1
-    assert _graph_identity_keys(public_shortest_result["nodes"]) == ["carol"]
-    assert len(public_shortest_result["paths"]) == 1
-    assert _graph_identity_keys(public_shortest_result["paths"][0]["nodes"]) == ["alice", "bob", "carol"]
+    assert "nodes" not in public_shortest_result
+    assert public_shortest_result["stats"] == {"returned_items": 1}
+    public_shortest_path = public_shortest_result["paths"][0]["path"]
+    assert _graph_identity_keys(public_shortest_path["nodes"]) == [
+        "alice",
+        "bob",
+        "carol",
+    ]
+    assert _graph_identity_keys(public_shortest_path["nodes"][-1:]) == ["carol"]
 
     chained = wait_until(
         lambda: (
@@ -550,11 +557,18 @@ def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
         interval_s=0.5,
     )
     assert shortest_result is not None
+    assert shortest_result["kind"] == "paths"
     assert len(shortest_result["paths"]) == 1
-    assert _graph_identity_keys(shortest_result["nodes"]) == ["doc-c"]
-    assert len(shortest_result["paths"]) == 1
-    assert _graph_identity_keys(shortest_result["paths"][0]["nodes"]) == ["doc-a", "doc-b", "doc-c"]
-    assert shortest_result["paths"][0]["length"] == 2
+    assert "nodes" not in shortest_result
+    assert shortest_result["stats"] == {"returned_items": 1}
+    shortest_path = shortest_result["paths"][0]["path"]
+    assert _graph_identity_keys(shortest_path["nodes"]) == [
+        "doc-a",
+        "doc-b",
+        "doc-c",
+    ]
+    assert _graph_identity_keys(shortest_path["nodes"][-1:]) == ["doc-c"]
+    assert shortest_path["length"] == 2
 
     chained = wait_until(
         lambda: (
