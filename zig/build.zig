@@ -6402,6 +6402,7 @@ pub fn build(b: *std.Build) void {
             "forwarded write sources use the local writer owner dirty lifecycle",
             "HA ownership transition invalidates cached visibility and dirty identities",
             "HA ownership transition serializes with active writer cache mutation",
+            "HA seed request admission drains accepted writes and closes the preflight race",
             "startup cache clear retires dirty identity without a serving owner",
             "dirty auto bulk writer publishes runtime status without closing the cached writer",
             "split transition auto bulk publication retries while a writer lease is active",

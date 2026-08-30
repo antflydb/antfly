@@ -6561,6 +6561,14 @@ pub const DataServer = struct {
         }
         defer self.ha_seed_capture_active.store(false, .release);
 
+        // Stop new public writers and let already-admitted requests finish
+        // before preflight. Holding this logical reservation (rather than the
+        // activity mutex) lets those requests publish completion without a
+        // lock cycle, while keeping continuous traffic from reopening the
+        // promoted cache-owner race between preflight and the global freeze.
+        var table_request_admission = try self.write_source.acquireHASeedTableRequestAdmissionLease();
+        defer table_request_admission.release();
+
         // The production provider snapshots live managed DBs. Drain their
         // finite replay/enrichment tail before closing the process-wide
         // mutation barrier; the provider performs a second bounded check after

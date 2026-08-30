@@ -6444,6 +6444,12 @@ pub const ProvisionedTableWriteSource = struct {
     table_activity_threaded: Io.Threaded,
     table_activity_mutex: Io.Mutex = .init,
     table_activity_ready: Io.Condition = .init,
+    // Protected by table_activity_mutex. Seed capture closes only new
+    // top-level write admission while admitted requests drain. This avoids
+    // holding table_activity_mutex across the HA mutation barrier: writers
+    // need that mutex to publish completion after releasing their shared
+    // mutation lease.
+    ha_seed_table_request_admission_closed: bool = false,
     write_coalesce_mutex: Io.Mutex = .init,
     write_coalesce_ready: Io.Condition = .init,
     write_coalesce_queues: std.ArrayListUnmanaged(WriteCoalesceQueue) = .empty,
@@ -7456,6 +7462,10 @@ pub const ProvisionedTableWriteSource = struct {
     fn beginTableRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         while (true) {
+            if (self.ha_seed_table_request_admission_closed) {
+                self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                continue;
+            }
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
                 if (entry.structural_active or entry.structural_waiters > 0 or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) {
@@ -7470,6 +7480,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn tryBeginTableRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+        if (self.ha_seed_table_request_admission_closed) return false;
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
             if (entry.structural_active or entry.structural_waiters > 0 or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) return false;
@@ -11993,7 +12004,54 @@ pub const ProvisionedTableWriteSource = struct {
         return false;
     }
 
-    /// Holds the table-activity admission mutex for the full HA snapshot.
+    /// Closes new top-level write admission and drains requests that already
+    /// passed the public HA gate. The reservation remains held through
+    /// preflight and capture, preventing a continuous workload from retiring
+    /// a cache owner in the gap before the exclusive mutation freeze.
+    pub const HASeedTableRequestAdmissionLease = struct {
+        source: *ProvisionedTableWriteSource,
+        active: bool = true,
+
+        pub fn release(self: *@This()) void {
+            if (!self.active) return;
+            const io = self.source.table_activity_threaded.io();
+            self.source.table_activity_mutex.lockUncancelable(io);
+            std.debug.assert(self.source.ha_seed_table_request_admission_closed);
+            self.source.ha_seed_table_request_admission_closed = false;
+            self.source.table_activity_ready.broadcast(io);
+            self.source.table_activity_mutex.unlock(io);
+            self.active = false;
+        }
+    };
+
+    pub fn acquireHASeedTableRequestAdmissionLease(self: *ProvisionedTableWriteSource) !HASeedTableRequestAdmissionLease {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        errdefer self.table_activity_mutex.unlock(io);
+        if (self.ha_seed_table_request_admission_closed)
+            return error.HASeedCaptureAlreadyInProgress;
+        self.ha_seed_table_request_admission_closed = true;
+        errdefer {
+            self.ha_seed_table_request_admission_closed = false;
+            self.table_activity_ready.broadcast(io);
+        }
+
+        while (true) {
+            var active = false;
+            for (self.active_table_activities.items) |activity| {
+                if (activity.table_request_active > 0) {
+                    active = true;
+                    break;
+                }
+            }
+            if (!active) break;
+            self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+        }
+        self.table_activity_mutex.unlock(io);
+        return .{ .source = self };
+    }
+
+    /// Holds the remaining table-activity admission mutex for the full HA snapshot.
     /// Existing activity fails closed; new structural/group operations cannot
     /// begin after the preflight while the global mutation barrier is held.
     pub const HASeedCaptureActivityLease = struct {
@@ -36089,6 +36147,80 @@ test "provisioned table restore preparation blocks writes while allowing reads" 
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     thread.join();
+}
+
+test "HA seed request admission drains accepted writes and closes the preflight race" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const RequestWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        entered: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.source.beginTableRequest("docs");
+            self.entered.store(true, .release);
+            self.source.endTableRequest("docs");
+        }
+    };
+
+    const CaptureWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        acquired: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var lease = self.source.acquireHASeedTableRequestAdmissionLease() catch return;
+            self.acquired.store(true, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+            lease.release();
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-ha-seed-request-admission", NoCatalog.iface());
+    defer source.deinit();
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+
+    // A held capture reservation keeps a later public writer outside the
+    // activity/cache lifecycle until preflight and snapshot finish.
+    var capture_lease = try source.acquireHASeedTableRequestAdmissionLease();
+    var request_worker = RequestWorker{ .source = &source };
+    const request_thread = try std.Thread.spawn(.{}, RequestWorker.run, .{&request_worker});
+    io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
+    try std.testing.expect(!request_worker.entered.load(.acquire));
+    capture_lease.release();
+    request_thread.join();
+    try std.testing.expect(request_worker.entered.load(.acquire));
+
+    // Closing admission while a request is already active waits without
+    // holding the mutex that request needs to publish its completion.
+    source.beginTableRequest("docs");
+    var capture_worker = CaptureWorker{ .source = &source };
+    const capture_thread = try std.Thread.spawn(.{}, CaptureWorker.run, .{&capture_worker});
+    io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
+    try std.testing.expect(!capture_worker.acquired.load(.acquire));
+    source.endTableRequest("docs");
+    while (!capture_worker.acquired.load(.acquire)) {
+        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    capture_worker.release.store(true, .release);
+    capture_thread.join();
 }
 
 test "provisioned table restore lifecycle reserves forwarded owner and caller sources" {
