@@ -6272,6 +6272,7 @@ pub fn build(b: *std.Build) void {
             "derived coverage evaluation is policy exact and observation gated",
             "settled terminal enrichment debt is degraded rather than rebuilding",
             "derived coverage source totals ignore derived index fan out",
+            "dense publication target requires every expected shard observation",
             "derived coverage aggregation rejects mixed config observations",
             "derived coverage embedding activity aggregation is order independent and phase authoritative",
             "chunked dense completion follows the physical publication target",

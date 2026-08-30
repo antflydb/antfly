@@ -26986,6 +26986,7 @@ pub const DB = struct {
     fn populateConfiguredDerivedCoverageCountsBestEffort(self: *DB, index_name: []const u8, item: *types.DBIndexStats) void {
         self.populateConfiguredDerivedCoverageCounts(index_name, item) catch {
             item.coverage_summary_ready = false;
+            if (item.kind == .dense_vector) item.publication_target_ready = false;
             item.repair_degraded = true;
         };
     }
@@ -80179,9 +80180,26 @@ test "db coverage status reports partial counter tuples without scanning markers
         try std.testing.expectEqual(@as(u64, 7), index_stats.coverage_produced_count);
         try std.testing.expect(!index_stats.coverage_summary_ready);
         try std.testing.expect(index_stats.repair_degraded);
-        return;
-    }
-    return error.IndexNotFound;
+        break;
+    } else return error.IndexNotFound;
+
+    // A status-only refresh can start from a retained physical snapshot. If a
+    // counter becomes unreadable, best-effort hydration must revoke the old
+    // exact-target proof along with the coverage summary.
+    try db.core.store.put(counter_key, "invalid");
+    var retained = types.DBIndexStats{
+        .name = "external_v1",
+        .kind = .dense_vector,
+        .coverage_generation = generation,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .publication_target_count = 7,
+        .publication_target_ready = true,
+    };
+    db.populateConfiguredDerivedCoverageCountsBestEffort("external_v1", &retained);
+    try std.testing.expect(!retained.coverage_summary_ready);
+    try std.testing.expect(!retained.publication_target_ready);
+    try std.testing.expect(retained.repair_degraded);
 }
 
 test "derived coverage stats require validated config identity" {

@@ -10307,6 +10307,21 @@ export interface components {
             healthy: boolean;
             degraded: boolean;
         };
+        /** @description Exact dense-vector publication cardinality for the observed index incarnation. */
+        DenseVectorPublicationStatus: {
+            /**
+             * Format: uint64
+             * @description Exact durable vector target for the current dense-index incarnation.
+             */
+            target_vectors: number;
+            /**
+             * Format: uint64
+             * @description Physical vectors currently visible to queries.
+             */
+            searchable_vectors: number;
+            /** @description Whether searchable_vectors exactly equals target_vectors. */
+            complete: boolean;
+        };
         /** @enum {string} */
         EmbeddingIndexActivityPhase: "preparing" | "embedding" | "publishing" | "waiting_retry" | "idle";
         /** @description Volatile index-incarnation activity. It explains motion but never participates in readiness. */
@@ -10508,6 +10523,8 @@ export interface components {
              * @description Physical vectors or sparse entries visible to queries; chunked indexes may exceed source coverage.
              */
             searchable_vectors?: number;
+            /** @description Dense-only exact publication status; absent for sparse indexes and when the target proof is unavailable. */
+            publication?: components["schemas"]["DenseVectorPublicationStatus"];
             /** @description Fresh owner-reported activity, or null when no heartbeat for this index incarnation is available. */
             activity?: components["schemas"]["EmbeddingIndexActivity"];
             /** @description Error message if stats could not be retrieved */

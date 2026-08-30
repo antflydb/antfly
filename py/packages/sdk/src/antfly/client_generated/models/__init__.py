@@ -158,6 +158,7 @@ from .date_range_string_query import DateRangeStringQuery
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
 from .dense_repair_backpressure_error import DenseRepairBackpressureError
 from .dense_repair_backpressure_error_code import DenseRepairBackpressureErrorCode
+from .dense_vector_publication_status import DenseVectorPublicationStatus
 from .derived_coverage_observation_incomplete_reason import DerivedCoverageObservationIncompleteReason
 from .derived_coverage_policy import DerivedCoveragePolicy
 from .derived_coverage_status import DerivedCoverageStatus
@@ -1025,6 +1026,7 @@ __all__ = (
     "DeleteArtifactEnrichmentResponse201",
     "DenseRepairBackpressureError",
     "DenseRepairBackpressureErrorCode",
+    "DenseVectorPublicationStatus",
     "DerivedCoverageObservationIncompleteReason",
     "DerivedCoveragePolicy",
     "DerivedCoverageStatus",

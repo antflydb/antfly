@@ -2634,6 +2634,17 @@ fn aggregateIndexStatusIndexed(
         aggregate.coverage_identity_ready = coverage_generation != 0;
     }
     aggregate.missing_group_count = aggregate.expected_group_count -| aggregate.reported_group_count;
+    // The public publication target is a whole-index proof. A sum over only
+    // the currently observed shards is useful internally, but it must not be
+    // exposed as exact when topology or incarnation authority is incomplete.
+    // Readiness already fails closed on those conditions; keep the specialized
+    // publication object under the same proof boundary.
+    if (aggregate.kind == .dense_vector and
+        (aggregate.publication_target_observation_count != aggregate.expected_group_count or
+            aggregate.expected_group_count != aggregate.fresh_group_count))
+    {
+        aggregate.publication_target_ready = false;
+    }
     if (aggregate.expected_group_count != aggregate.fresh_group_count) {
         aggregate.enrichment.projection_checkpoint_identity_consistent = false;
         aggregate.enrichment.projection_checkpoint_generation = 0;
@@ -3103,6 +3114,40 @@ test "derived coverage source totals ignore derived index fan out" {
     const view = embeddingsRuntimeView(aggregate, aggregate.table_doc_count, .partial, false, 42, 99, null, true);
     try std.testing.expect(!view.backfill_active);
     try std.testing.expectEqual(@as(f64, 1.0), view.backfill_progress);
+}
+
+test "dense publication target requires every expected shard observation" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .doc_count = 5,
+        .node_count = 1,
+        .root_node = 1,
+        .publication_target_count = 5,
+        .publication_target_ready = true,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .coverage_produced_count = 5,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 1,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{
+            .source_doc_count = 5,
+            .index_count = indexes.len,
+            .indexes = indexes[0..],
+        },
+    }};
+
+    const aggregate = aggregateIndexStatusIndexed(&runtimes, "visual", &.{ 1, 2 }, 42, 99, null) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), aggregate.expected_group_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.publication_target_observation_count);
+    try std.testing.expectEqual(@as(u64, 5), aggregate.publication_target_count);
+    try std.testing.expect(!aggregate.publication_target_ready);
+    try std.testing.expect(!embeddingsArtifactPublishComplete(aggregate, false, aggregate.coverage_produced_count));
 }
 
 test "derived coverage aggregation rejects mixed config observations" {

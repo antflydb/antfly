@@ -10,6 +10,7 @@ from ..models.embeddings_index_stats_index_type import EmbeddingsIndexStatsIndex
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.dense_vector_publication_status import DenseVectorPublicationStatus
     from ..models.derived_coverage_status import DerivedCoverageStatus
     from ..models.embedding_index_activity import EmbeddingIndexActivity
     from ..models.embedding_source_coverage_status import EmbeddingSourceCoverageStatus
@@ -41,6 +42,8 @@ class EmbeddingsIndexStats:
         source_coverage (EmbeddingSourceCoverageStatus | Unset):
         searchable_vectors (int | Unset): Physical vectors or sparse entries visible to queries; chunked indexes may
             exceed source coverage.
+        publication (DenseVectorPublicationStatus | Unset): Exact dense-vector publication cardinality for the observed
+            index incarnation.
         activity (EmbeddingIndexActivity | Unset): Volatile index-incarnation activity. It explains motion but never
             participates in readiness.
         error (str | Unset): Error message if stats could not be retrieved
@@ -124,6 +127,7 @@ class EmbeddingsIndexStats:
     milestones: IndexMilestones | Unset = UNSET
     source_coverage: EmbeddingSourceCoverageStatus | Unset = UNSET
     searchable_vectors: int | Unset = UNSET
+    publication: DenseVectorPublicationStatus | Unset = UNSET
     activity: EmbeddingIndexActivity | Unset = UNSET
     error: str | Unset = UNSET
     total_indexed: int | Unset = UNSET
@@ -207,6 +211,10 @@ class EmbeddingsIndexStats:
             source_coverage = self.source_coverage.to_dict()
 
         searchable_vectors = self.searchable_vectors
+
+        publication: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.publication, Unset):
+            publication = self.publication.to_dict()
 
         activity: dict[str, Any] | Unset = UNSET
         if not isinstance(self.activity, Unset):
@@ -365,6 +373,8 @@ class EmbeddingsIndexStats:
             field_dict["source_coverage"] = source_coverage
         if searchable_vectors is not UNSET:
             field_dict["searchable_vectors"] = searchable_vectors
+        if publication is not UNSET:
+            field_dict["publication"] = publication
         if activity is not UNSET:
             field_dict["activity"] = activity
         if error is not UNSET:
@@ -488,6 +498,7 @@ class EmbeddingsIndexStats:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.dense_vector_publication_status import DenseVectorPublicationStatus
         from ..models.derived_coverage_status import DerivedCoverageStatus
         from ..models.embedding_index_activity import EmbeddingIndexActivity
         from ..models.embedding_source_coverage_status import EmbeddingSourceCoverageStatus
@@ -532,6 +543,13 @@ class EmbeddingsIndexStats:
             source_coverage = EmbeddingSourceCoverageStatus.from_dict(_source_coverage)
 
         searchable_vectors = d.pop("searchable_vectors", UNSET)
+
+        _publication = d.pop("publication", UNSET)
+        publication: DenseVectorPublicationStatus | Unset
+        if isinstance(_publication, Unset):
+            publication = UNSET
+        else:
+            publication = DenseVectorPublicationStatus.from_dict(_publication)
 
         _activity = d.pop("activity", UNSET)
         activity: EmbeddingIndexActivity | Unset
@@ -705,6 +723,7 @@ class EmbeddingsIndexStats:
             milestones=milestones,
             source_coverage=source_coverage,
             searchable_vectors=searchable_vectors,
+            publication=publication,
             activity=activity,
             error=error,
             total_indexed=total_indexed,
