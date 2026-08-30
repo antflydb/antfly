@@ -7306,6 +7306,56 @@ func TestHAAdminJobArmsTTLOnlyAfterTerminalStatusWasCheckpointed(t *testing.T) {
 	g.Expect(*observed.Spec.TTLSecondsAfterFinished).To(Equal(int32(0)))
 }
 
+func TestDisabledHADeletesExactOwnedAdminJobs(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	controller := true
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "primary", Namespace: "default", UID: types.UID("cluster-uid"),
+		},
+		Status: antflyv1.AntflyClusterStatus{HAStatus: &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{
+			{AdminJobName: "active-ha-job"},
+			{AdminJobName: "terminal-ha-job"},
+			{AdminJobName: "newer-cluster-ha-job"},
+		}}},
+	}
+	owned := func(name string) *batchv1.Job {
+		return &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: cluster.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/component": "ha-admin",
+				"app.kubernetes.io/instance":  cluster.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: antflyv1.GroupVersion.String(), Kind: "AntflyCluster",
+				Name: cluster.Name, UID: cluster.UID, Controller: &controller,
+			}},
+		}}
+	}
+	active := owned("active-ha-job")
+	terminal := owned("terminal-ha-job")
+	unrelated := owned("newer-cluster-ha-job")
+	unrelated.OwnerReferences[0].UID = types.UID("newer-cluster-uid")
+
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, active, terminal, unrelated).Build()
+	r := &AntflyClusterReconciler{Client: client, Scheme: s}
+	g.Expect(r.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+
+	for _, name := range []string{active.Name, terminal.Name} {
+		observed := &batchv1.Job{}
+		err := client.Get(context.Background(), types.NamespacedName{Name: name, Namespace: cluster.Namespace}, observed)
+		g.Expect(errors.IsNotFound(err)).To(BeTrue(), "disabled HA must cancel owned Job %s", name)
+	}
+	observed := &batchv1.Job{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{
+		Name: unrelated.Name, Namespace: cluster.Namespace,
+	}, observed)).To(Succeed(), "UID fencing must preserve a same-name cluster incarnation's Job")
+}
+
 func TestActivationJobBindsReceiptToObservedTargetPVCInstance(t *testing.T) {
 	g := NewWithT(t)
 	s := runtime.NewScheme()

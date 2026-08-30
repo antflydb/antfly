@@ -5948,9 +5948,10 @@ func (r *AntflyClusterReconciler) persistHAActionPlanBarrier(ctx context.Context
 
 func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
 	ha := cluster.Spec.HighAvailability
-	if ha == nil || ha.Admin == nil || !ha.Admin.ExecutePlannedActions ||
-		ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled ||
-		cluster.Status.HAStatus == nil {
+	if ha == nil || ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled {
+		return r.deleteDisabledHAAdminJobs(ctx, cluster)
+	}
+	if ha.Admin == nil || !ha.Admin.ExecutePlannedActions || cluster.Status.HAStatus == nil {
 		return nil
 	}
 	// Dependency evidence can freeze payload fields (notably the former-primary
@@ -6094,6 +6095,45 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 
 		if err := r.reconcileHAAdminJob(ctx, cluster, ha.Admin, action); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// deleteDisabledHAAdminJobs cancels every Job-backed HA side effect owned by
+// this exact AntflyCluster incarnation once HA is disabled. Besides preventing
+// an already-running artifact action from mutating storage after the disable
+// boundary, this releases target PVCs promptly: completed Job Pods still count
+// as PVC consumers, so retaining them for their diagnostic TTL can otherwise
+// deadlock replacement-PVC deletion behind the pvc-protection finalizer.
+func (r *AntflyClusterReconciler) deleteDisabledHAAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if r == nil || r.Client == nil || cluster == nil || cluster.UID == "" || cluster.Status.HAStatus == nil {
+		return nil
+	}
+	jobNames := map[string]struct{}{}
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		name := strings.TrimSpace(cluster.Status.HAStatus.PlannedActions[i].AdminJobName)
+		if name != "" && name != haAdminDirectAPIName {
+			jobNames[name] = struct{}{}
+		}
+	}
+	for name := range jobNames {
+		job := &batchv1.Job{}
+		if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: cluster.Namespace}, job); err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("get disabled HA admin Job %s/%s: %w", cluster.Namespace, name, err)
+		}
+		if !metav1.IsControlledBy(job, cluster) {
+			continue
+		}
+		uid := job.UID
+		resourceVersion := job.ResourceVersion
+		if err := r.Delete(ctx, job, &client.DeleteOptions{Preconditions: &metav1.Preconditions{
+			UID: &uid, ResourceVersion: &resourceVersion,
+		}}); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete disabled HA admin Job %s/%s: %w", job.Namespace, job.Name, err)
 		}
 	}
 	return nil
