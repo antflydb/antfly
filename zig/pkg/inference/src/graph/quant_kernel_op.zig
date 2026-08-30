@@ -287,8 +287,8 @@ pub const RuntimeConstraints = struct {
     }
 
     pub fn validate(self: RuntimeConstraints) !void {
-        inline for (std.meta.fields(RuntimeConstraints)) |field| {
-            try @field(self, field.name).validate();
+        inline for (@typeInfo(RuntimeConstraints).@"struct".field_names) |field_name| {
+            try @field(self, field_name).validate();
         }
     }
 
@@ -323,15 +323,15 @@ pub const RuntimeConstraints = struct {
     }
 
     pub fn matches(self: RuntimeConstraints, shape: RuntimeShape) bool {
-        inline for (std.meta.fields(RuntimeConstraints)) |field| {
-            if (!@field(self, field.name).matches(@field(shape, field.name))) return false;
+        inline for (@typeInfo(RuntimeConstraints).@"struct".field_names) |field_name| {
+            if (!@field(self, field_name).matches(@field(shape, field_name))) return false;
         }
         return true;
     }
 
     pub fn overlaps(a: RuntimeConstraints, b: RuntimeConstraints) bool {
-        inline for (std.meta.fields(RuntimeConstraints)) |field| {
-            if (!@field(a, field.name).overlaps(@field(b, field.name))) return false;
+        inline for (@typeInfo(RuntimeConstraints).@"struct".field_names) |field_name| {
+            if (!@field(a, field_name).overlaps(@field(b, field_name))) return false;
         }
         return true;
     }
@@ -344,28 +344,28 @@ const signature_fingerprint_seed: u64 = 0x4154_464c_5953_4947; // "ATFLYSIG"
 pub fn specializationSignatureFingerprint(signature: SpecializationSignature) u64 {
     var hasher = std.hash.Wyhash.init(signature_fingerprint_seed);
     hashU8(&hasher, 2); // schema version
-    hashU8(&hasher, @intFromEnum(signature.opKind()));
+    hashU8(&hasher, @backingInt(signature.opKind()));
     switch (signature) {
         .small_batch_matmul => |op| {
-            hashU16(&hasher, @intFromEnum(op.format));
-            hashU8(&hasher, @intFromEnum(op.row_bucket));
-            hashU8(&hasher, @intFromEnum(op.dispatch));
-            hashU8(&hasher, @intFromEnum(op.epilogue));
-            hashU8(&hasher, @intFromEnum(op.activation));
-            hashU8(&hasher, @intFromEnum(op.function));
-            hashU8(&hasher, @intFromEnum(op.output));
+            hashU16(&hasher, @backingInt(op.format));
+            hashU8(&hasher, @backingInt(op.row_bucket));
+            hashU8(&hasher, @backingInt(op.dispatch));
+            hashU8(&hasher, @backingInt(op.epilogue));
+            hashU8(&hasher, @backingInt(op.activation));
+            hashU8(&hasher, @backingInt(op.function));
+            hashU8(&hasher, @backingInt(op.output));
         },
         .attention => |op| {
-            hashU8(&hasher, @intFromEnum(op.kind));
-            hashU8(&hasher, @intFromEnum(op.query));
-            hashU8(&hasher, @intFromEnum(op.key));
-            hashU8(&hasher, @intFromEnum(op.value));
-            hashU8(&hasher, @intFromEnum(op.output));
+            hashU8(&hasher, @backingInt(op.kind));
+            hashU8(&hasher, @backingInt(op.query));
+            hashU8(&hasher, @backingInt(op.key));
+            hashU8(&hasher, @backingInt(op.value));
+            hashU8(&hasher, @backingInt(op.output));
         },
         .microkernel => |op| {
-            hashU8(&hasher, @intFromEnum(op.kind));
-            hashU8(&hasher, @intFromEnum(op.input));
-            hashU8(&hasher, @intFromEnum(op.output));
+            hashU8(&hasher, @backingInt(op.kind));
+            hashU8(&hasher, @backingInt(op.input));
+            hashU8(&hasher, @backingInt(op.output));
         },
     }
     return hasher.final();
@@ -385,8 +385,8 @@ pub fn specializationSignatureId(
 pub fn runtimeConstraintsFingerprint(constraints: RuntimeConstraints) u64 {
     var hasher = std.hash.Wyhash.init(signature_fingerprint_seed ^ 0x5255_4e54_494d_4521);
     hashU8(&hasher, 1);
-    inline for (std.meta.fields(RuntimeConstraints)) |field| {
-        hashDimension(&hasher, @field(constraints, field.name));
+    inline for (@typeInfo(RuntimeConstraints).@"struct".field_names) |field_name| {
+        hashDimension(&hasher, @field(constraints, field_name));
     }
     return hasher.final();
 }

@@ -4123,7 +4123,7 @@ test "downloadFile skips existing large artifact with pointer-sized metadata" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const payload = [_]u8{'G'} ** 8192;
+    const payload = @as([8192]u8, @splat('G'));
     const dest_dir = try testTmpPath(allocator, tmp, "downloads");
     defer allocator.free(dest_dir);
     try std.Io.Dir.cwd().createDirPath(io, dest_dir);
@@ -4160,7 +4160,7 @@ test "existing final file progress uses real size for pointer-sized artifacts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const payload = [_]u8{'G'} ** 8192;
+    const payload = @as([8192]u8, @splat('G'));
     const dest_dir = try testTmpPath(allocator, tmp, "downloads");
     defer allocator.free(dest_dir);
     try std.Io.Dir.cwd().createDirPath(io, dest_dir);

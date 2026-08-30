@@ -155,7 +155,7 @@ test "parquet footer preflight rejects invalid trailers" {
 
 test "parquet footer preflight rejects oversized metadata before its range is fetched" {
     const footer_metadata_len: u32 = @intCast(range_io.max_parquet_footer_metadata_bytes + 1);
-    var tail = [_]u8{0} ** trailer_len;
+    var tail = @as([trailer_len]u8, @splat(0));
     std.mem.writeInt(u32, tail[0..4], footer_metadata_len, .little);
     @memcpy(tail[4..8], parquet_magic);
     try std.testing.expectError(

@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 inference_dir="$(cd "$script_dir/../.." && pwd)"
 repo_dir="$(cd "$inference_dir/../../.." && pwd)"
-zig_bin="${ZIG_BIN:-$repo_dir/.tools/zig-x86_64-linux-0.16.0/zig}"
+zig_bin="${ZIG_BIN:-$repo_dir/.tools/zig-x86_64-linux-0.17.0-dev.1933+e19a73c2d/zig}"
 default_binary="$inference_dir/zig-out/bin/antfly-inference"
 binary="${ANTFLY_INFERENCE_BINARY:-$default_binary}"
 optimize="${OPTIMIZE:-ReleaseFast}"

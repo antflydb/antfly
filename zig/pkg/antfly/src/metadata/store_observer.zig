@@ -501,10 +501,10 @@ fn runtimeEnrichmentStatusEqual(
     lhs: table_manager.RuntimeEnrichmentStatusReport,
     rhs: table_manager.RuntimeEnrichmentStatusReport,
 ) bool {
-    inline for (std.meta.fields(table_manager.RuntimeEnrichmentStatusReport)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "projection_checkpoint_status")) {
-            if (!std.mem.eql(u8, @field(lhs, field.name), @field(rhs, field.name))) return false;
-        } else if (@field(lhs, field.name) != @field(rhs, field.name)) {
+    inline for (@typeInfo(table_manager.RuntimeEnrichmentStatusReport).@"struct".field_names) |field_name| {
+        if (comptime std.mem.eql(u8, field_name, "projection_checkpoint_status")) {
+            if (!std.mem.eql(u8, @field(lhs, field_name), @field(rhs, field_name))) return false;
+        } else if (@field(lhs, field_name) != @field(rhs, field_name)) {
             return false;
         }
     }

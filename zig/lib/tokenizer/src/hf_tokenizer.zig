@@ -339,7 +339,7 @@ pub const HfTokenizer = struct {
     const BpeCache = struct {
         owner: *HfTokenizer,
         shards: [bpe_cache_shard_count]BpeCacheShard =
-            [_]BpeCacheShard{.{}} ** bpe_cache_shard_count,
+            @as([bpe_cache_shard_count]BpeCacheShard, @splat(.{})),
         max_bytes: usize = default_bpe_cache_max_bytes,
         bulk_slots: ?[]std.atomic.Value(usize) = null,
         bulk_slots_per_shard: usize = 0,
@@ -799,7 +799,7 @@ pub const HfTokenizer = struct {
             .parallel_workspace_free_count = 0,
             .parallel_workspace_free_bytes = 0,
             .parallel_bpe_config = .{},
-            .worker_bpe_caches = [_]WorkerBpeCacheLease{.{}} ** max_worker_bpe_caches,
+            .worker_bpe_caches = @as([max_worker_bpe_caches]WorkerBpeCacheLease, @splat(.{})),
             .cache_resource_budget_mutex = .unlocked,
             .cache_resource_budget_observer_id = acquireCacheResourceBudgetObserverId(),
             .cache_resource_budget_bytes = 0,
@@ -2345,7 +2345,7 @@ pub const HfTokenizer = struct {
         stable_offset_learns: std.atomic.Value(usize) = .init(0),
         stable_offset_replays: std.atomic.Value(usize) = .init(0),
         workers: [max_parallel_bpe_chunks]ParallelBpeWorker =
-            [_]ParallelBpeWorker{.{}} ** max_parallel_bpe_chunks,
+            @as([max_parallel_bpe_chunks]ParallelBpeWorker, @splat(.{})),
 
         fn retainedBytes(self: *const ParallelBpeWorkspace) usize {
             var total: usize = @sizeOf(ParallelBpeWorkspace);

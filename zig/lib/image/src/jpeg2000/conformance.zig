@@ -331,73 +331,73 @@ pub fn runCase(allocator: std.mem.Allocator, fixture: FixtureCase) !CaseReport {
     var pure_zig_used_plane_fixup = false;
     var pure_zig_used_pixel_fixup = false;
     var pure_zig_raw_mismatch_bytes: usize = 0;
-    var pure_zig_raw_preview: [12]u8 = [_]u8{0} ** 12;
-    var pure_zig_preview: [12]u8 = [_]u8{0} ** 12;
-    var oracle_preview: [12]u8 = [_]u8{0} ** 12;
-    var pure_zig_full_preview: [60]u8 = [_]u8{0} ** 60;
-    var oracle_full_preview: [60]u8 = [_]u8{0} ** 60;
-    var pure_zig_codeblock_preview: [16]i32 = [_]i32{0} ** 16;
-    var oracle_codeblock_preview: [16]i32 = [_]i32{0} ** 16;
-    var pure_zig_codeblock_significant_counts: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_symbol_counts: [4]u32 = [_]u32{0} ** 4;
-    var pure_zig_codeblock_symbol_preview: [4][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 4;
-    var pure_zig_codeblock_last_pass_index: [4]u16 = [_]u16{0} ** 4;
-    var pure_zig_codeblock_last_pass_kind: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_last_pass_bitplane: [4]i16 = [_]i16{0} ** 4;
-    var pure_zig_codeblock_last_magnitudes: [4][4]i32 = [_][4]i32{[_]i32{0} ** 4} ** 4;
-    var pure_zig_codeblock_last_signs: [4][4]u8 = [_][4]u8{[_]u8{0} ** 4} ** 4;
-    var pure_zig_codeblock_cell1_first_sig_pass_index: [4]u16 = [_]u16{0} ** 4;
-    var pure_zig_codeblock_cell1_first_sig_kind: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell1_first_sig_bitplane: [4]i16 = [_]i16{0} ** 4;
-    var pure_zig_codeblock_cell1_first_sig_magnitude: [4]i32 = [_]i32{0} ** 4;
-    var pure_zig_codeblock_cell1_first_sig_sign: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell1_first_sig_zero_ctx: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell1_first_sig_sign_lut: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell1_first_sig_symbol: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell1_first_sig_sign_symbol: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell2_first_sig_pass_index: [4]u16 = [_]u16{0} ** 4;
-    var pure_zig_codeblock_cell2_first_sig_kind: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell2_first_sig_bitplane: [4]i16 = [_]i16{0} ** 4;
-    var pure_zig_codeblock_cell2_first_sig_sign: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell2_first_sig_zero_ctx: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell2_first_sig_sign_lut: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell2_first_sig_symbol: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell2_first_sig_sign_symbol: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell0_first_sig_pass_index: [4]u16 = [_]u16{0} ** 4;
-    var pure_zig_codeblock_cell0_first_sig_kind: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell0_first_sig_bitplane: [4]i16 = [_]i16{0} ** 4;
-    var pure_zig_codeblock_cell0_first_sig_sign: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell0_first_sig_zero_ctx: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell0_first_sig_sign_lut: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell0_first_sig_symbol: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_codeblock_cell0_first_sig_sign_symbol: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_entry_zero_bit_planes: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_entry_num_coding_passes: [4]u16 = [_]u16{0} ** 4;
-    var pure_zig_entry_body_offset: [4]u32 = [_]u32{0} ** 4;
-    var pure_zig_entry_body_length: [4]u32 = [_]u32{0} ** 4;
-    var pure_zig_entry_body_preview: [4][8]u8 = [_][8]u8{[_]u8{0} ** 8} ** 4;
+    var pure_zig_raw_preview: [12]u8 = @as([12]u8, @splat(0));
+    var pure_zig_preview: [12]u8 = @as([12]u8, @splat(0));
+    var oracle_preview: [12]u8 = @as([12]u8, @splat(0));
+    var pure_zig_full_preview: [60]u8 = @as([60]u8, @splat(0));
+    var oracle_full_preview: [60]u8 = @as([60]u8, @splat(0));
+    var pure_zig_codeblock_preview: [16]i32 = @as([16]i32, @splat(0));
+    var oracle_codeblock_preview: [16]i32 = @as([16]i32, @splat(0));
+    var pure_zig_codeblock_significant_counts: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_symbol_counts: [4]u32 = @as([4]u32, @splat(0));
+    var pure_zig_codeblock_symbol_preview: [4][16]u8 = @as([4][16]u8, @splat(@as([16]u8, @splat(0))));
+    var pure_zig_codeblock_last_pass_index: [4]u16 = @as([4]u16, @splat(0));
+    var pure_zig_codeblock_last_pass_kind: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_last_pass_bitplane: [4]i16 = @as([4]i16, @splat(0));
+    var pure_zig_codeblock_last_magnitudes: [4][4]i32 = @as([4][4]i32, @splat(@as([4]i32, @splat(0))));
+    var pure_zig_codeblock_last_signs: [4][4]u8 = @as([4][4]u8, @splat(@as([4]u8, @splat(0))));
+    var pure_zig_codeblock_cell1_first_sig_pass_index: [4]u16 = @as([4]u16, @splat(0));
+    var pure_zig_codeblock_cell1_first_sig_kind: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell1_first_sig_bitplane: [4]i16 = @as([4]i16, @splat(0));
+    var pure_zig_codeblock_cell1_first_sig_magnitude: [4]i32 = @as([4]i32, @splat(0));
+    var pure_zig_codeblock_cell1_first_sig_sign: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell1_first_sig_zero_ctx: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell1_first_sig_sign_lut: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell1_first_sig_symbol: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell1_first_sig_sign_symbol: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell2_first_sig_pass_index: [4]u16 = @as([4]u16, @splat(0));
+    var pure_zig_codeblock_cell2_first_sig_kind: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell2_first_sig_bitplane: [4]i16 = @as([4]i16, @splat(0));
+    var pure_zig_codeblock_cell2_first_sig_sign: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell2_first_sig_zero_ctx: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell2_first_sig_sign_lut: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell2_first_sig_symbol: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell2_first_sig_sign_symbol: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell0_first_sig_pass_index: [4]u16 = @as([4]u16, @splat(0));
+    var pure_zig_codeblock_cell0_first_sig_kind: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell0_first_sig_bitplane: [4]i16 = @as([4]i16, @splat(0));
+    var pure_zig_codeblock_cell0_first_sig_sign: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell0_first_sig_zero_ctx: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell0_first_sig_sign_lut: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell0_first_sig_symbol: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_codeblock_cell0_first_sig_sign_symbol: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_entry_zero_bit_planes: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_entry_num_coding_passes: [4]u16 = @as([4]u16, @splat(0));
+    var pure_zig_entry_body_offset: [4]u32 = @as([4]u32, @splat(0));
+    var pure_zig_entry_body_length: [4]u32 = @as([4]u32, @splat(0));
+    var pure_zig_entry_body_preview: [4][8]u8 = @as([4][8]u8, @splat(@as([8]u8, @splat(0))));
     var debug_best_entry0_zero_bit_planes: u8 = 0;
     var debug_best_entry0_num_coding_passes: u16 = 0;
     var debug_best_entry0_mismatch_bytes: usize = 0;
-    var debug_best_entry0_preview: [12]u8 = [_]u8{0} ** 12;
+    var debug_best_entry0_preview: [12]u8 = @as([12]u8, @splat(0));
     var debug_best_decomp_entry0_zero_bit_planes: u8 = 0;
     var debug_best_decomp_entry0_num_coding_passes: u16 = 0;
     var debug_best_decomp_entry1_zero_bit_planes: u8 = 0;
     var debug_best_decomp_entry1_num_coding_passes: u16 = 0;
     var debug_best_decomp_mismatch_bytes: usize = 0;
-    var debug_best_decomp_preview: [12]u8 = [_]u8{0} ** 12;
+    var debug_best_decomp_preview: [12]u8 = @as([12]u8, @splat(0));
     var debug_best_decomp_entry0_state_index: u8 = 0;
     var debug_best_decomp_entry1_state_index: u8 = 0;
     var debug_best_decomp_remap_mismatch_bytes: usize = 0;
-    var debug_best_decomp_remap_preview: [12]u8 = [_]u8{0} ** 12;
+    var debug_best_decomp_remap_preview: [12]u8 = @as([12]u8, @splat(0));
     var debug_best_rgb_entry1_zero_bit_planes: u8 = 0;
     var debug_best_rgb_entry1_num_coding_passes: u16 = 0;
     var debug_best_rgb_entry2_zero_bit_planes: u8 = 0;
     var debug_best_rgb_entry2_num_coding_passes: u16 = 0;
     var debug_best_rgb_mismatch_bytes: usize = 0;
-    var debug_best_rgb_preview: [12]u8 = [_]u8{0} ** 12;
-    var pure_zig_plane_preview: [3][4]i32 = [_][4]i32{[_]i32{0} ** 4} ** 3;
-    var oracle_plane_preview: [3][4]u8 = [_][4]u8{[_]u8{0} ** 4} ** 3;
+    var debug_best_rgb_preview: [12]u8 = @as([12]u8, @splat(0));
+    var pure_zig_plane_preview: [3][4]i32 = @as([3][4]i32, @splat(@as([4]i32, @splat(0))));
+    var oracle_plane_preview: [3][4]u8 = @as([3][4]u8, @splat(@as([4]u8, @splat(0))));
     copyPacketEntryMetadata(
         &pure_zig_entry_zero_bit_planes,
         &pure_zig_entry_num_coding_passes,
@@ -672,7 +672,7 @@ pub fn runCase(allocator: std.mem.Allocator, fixture: FixtureCase) !CaseReport {
         .oracle_plane_preview = oracle_plane_preview,
         .oracle_pixel_bytes = oracle_image.pixels.len,
         .used_sidecar_oracle = fixture.expected_image_path != null,
-        .debug_structural_stage = @intFromEnum(StructuralStage.none),
+        .debug_structural_stage = @backingInt(StructuralStage.none),
     };
 }
 
@@ -725,88 +725,88 @@ fn makeStructuralOnlyReport(
         .pure_zig_used_plane_fixup = false,
         .pure_zig_used_pixel_fixup = false,
         .pure_zig_raw_mismatch_bytes = 0,
-        .pure_zig_raw_preview = [_]u8{0} ** 12,
-        .pure_zig_preview = [_]u8{0} ** 12,
+        .pure_zig_raw_preview = @as([12]u8, @splat(0)),
+        .pure_zig_preview = @as([12]u8, @splat(0)),
         .oracle_preview = blk: {
-            var preview: [12]u8 = [_]u8{0} ** 12;
+            var preview: [12]u8 = @as([12]u8, @splat(0));
             copyPreview(&preview, oracle_image.pixels);
             break :blk preview;
         },
-        .pure_zig_full_preview = [_]u8{0} ** 60,
+        .pure_zig_full_preview = @as([60]u8, @splat(0)),
         .oracle_full_preview = blk: {
-            var preview: [60]u8 = [_]u8{0} ** 60;
+            var preview: [60]u8 = @as([60]u8, @splat(0));
             copyPreview60(&preview, oracle_image.pixels);
             break :blk preview;
         },
-        .pure_zig_codeblock_preview = [_]i32{0} ** 16,
-        .oracle_codeblock_preview = [_]i32{0} ** 16,
-        .pure_zig_codeblock_significant_counts = [_]u8{0} ** 4,
-        .pure_zig_codeblock_symbol_counts = [_]u32{0} ** 4,
-        .pure_zig_codeblock_symbol_preview = [_][16]u8{[_]u8{0} ** 16} ** 4,
-        .pure_zig_codeblock_last_pass_index = [_]u16{0} ** 4,
-        .pure_zig_codeblock_last_pass_kind = [_]u8{0} ** 4,
-        .pure_zig_codeblock_last_pass_bitplane = [_]i16{0} ** 4,
-        .pure_zig_codeblock_last_magnitudes = [_][4]i32{[_]i32{0} ** 4} ** 4,
-        .pure_zig_codeblock_last_signs = [_][4]u8{[_]u8{0} ** 4} ** 4,
-        .pure_zig_codeblock_cell1_first_sig_pass_index = [_]u16{0} ** 4,
-        .pure_zig_codeblock_cell1_first_sig_kind = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell1_first_sig_bitplane = [_]i16{0} ** 4,
-        .pure_zig_codeblock_cell1_first_sig_magnitude = [_]i32{0} ** 4,
-        .pure_zig_codeblock_cell1_first_sig_sign = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell1_first_sig_zero_ctx = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell1_first_sig_sign_lut = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell1_first_sig_symbol = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell1_first_sig_sign_symbol = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell2_first_sig_pass_index = [_]u16{0} ** 4,
-        .pure_zig_codeblock_cell2_first_sig_kind = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell2_first_sig_bitplane = [_]i16{0} ** 4,
-        .pure_zig_codeblock_cell2_first_sig_sign = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell2_first_sig_zero_ctx = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell2_first_sig_sign_lut = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell2_first_sig_symbol = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell2_first_sig_sign_symbol = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell0_first_sig_pass_index = [_]u16{0} ** 4,
-        .pure_zig_codeblock_cell0_first_sig_kind = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell0_first_sig_bitplane = [_]i16{0} ** 4,
-        .pure_zig_codeblock_cell0_first_sig_sign = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell0_first_sig_zero_ctx = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell0_first_sig_sign_lut = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell0_first_sig_symbol = [_]u8{0} ** 4,
-        .pure_zig_codeblock_cell0_first_sig_sign_symbol = [_]u8{0} ** 4,
-        .pure_zig_entry_zero_bit_planes = [_]u8{0} ** 4,
-        .pure_zig_entry_num_coding_passes = [_]u16{0} ** 4,
-        .pure_zig_entry_body_offset = [_]u32{0} ** 4,
-        .pure_zig_entry_body_length = [_]u32{0} ** 4,
-        .pure_zig_entry_body_preview = [_][8]u8{[_]u8{0} ** 8} ** 4,
+        .pure_zig_codeblock_preview = @as([16]i32, @splat(0)),
+        .oracle_codeblock_preview = @as([16]i32, @splat(0)),
+        .pure_zig_codeblock_significant_counts = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_symbol_counts = @as([4]u32, @splat(0)),
+        .pure_zig_codeblock_symbol_preview = @as([4][16]u8, @splat(@as([16]u8, @splat(0)))),
+        .pure_zig_codeblock_last_pass_index = @as([4]u16, @splat(0)),
+        .pure_zig_codeblock_last_pass_kind = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_last_pass_bitplane = @as([4]i16, @splat(0)),
+        .pure_zig_codeblock_last_magnitudes = @as([4][4]i32, @splat(@as([4]i32, @splat(0)))),
+        .pure_zig_codeblock_last_signs = @as([4][4]u8, @splat(@as([4]u8, @splat(0)))),
+        .pure_zig_codeblock_cell1_first_sig_pass_index = @as([4]u16, @splat(0)),
+        .pure_zig_codeblock_cell1_first_sig_kind = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell1_first_sig_bitplane = @as([4]i16, @splat(0)),
+        .pure_zig_codeblock_cell1_first_sig_magnitude = @as([4]i32, @splat(0)),
+        .pure_zig_codeblock_cell1_first_sig_sign = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell1_first_sig_zero_ctx = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell1_first_sig_sign_lut = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell1_first_sig_symbol = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell1_first_sig_sign_symbol = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell2_first_sig_pass_index = @as([4]u16, @splat(0)),
+        .pure_zig_codeblock_cell2_first_sig_kind = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell2_first_sig_bitplane = @as([4]i16, @splat(0)),
+        .pure_zig_codeblock_cell2_first_sig_sign = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell2_first_sig_zero_ctx = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell2_first_sig_sign_lut = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell2_first_sig_symbol = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell2_first_sig_sign_symbol = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell0_first_sig_pass_index = @as([4]u16, @splat(0)),
+        .pure_zig_codeblock_cell0_first_sig_kind = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell0_first_sig_bitplane = @as([4]i16, @splat(0)),
+        .pure_zig_codeblock_cell0_first_sig_sign = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell0_first_sig_zero_ctx = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell0_first_sig_sign_lut = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell0_first_sig_symbol = @as([4]u8, @splat(0)),
+        .pure_zig_codeblock_cell0_first_sig_sign_symbol = @as([4]u8, @splat(0)),
+        .pure_zig_entry_zero_bit_planes = @as([4]u8, @splat(0)),
+        .pure_zig_entry_num_coding_passes = @as([4]u16, @splat(0)),
+        .pure_zig_entry_body_offset = @as([4]u32, @splat(0)),
+        .pure_zig_entry_body_length = @as([4]u32, @splat(0)),
+        .pure_zig_entry_body_preview = @as([4][8]u8, @splat(@as([8]u8, @splat(0)))),
         .debug_best_entry0_zero_bit_planes = 0,
         .debug_best_entry0_num_coding_passes = 0,
         .debug_best_entry0_mismatch_bytes = 0,
-        .debug_best_entry0_preview = [_]u8{0} ** 12,
+        .debug_best_entry0_preview = @as([12]u8, @splat(0)),
         .debug_best_decomp_entry0_zero_bit_planes = 0,
         .debug_best_decomp_entry0_num_coding_passes = 0,
         .debug_best_decomp_entry1_zero_bit_planes = 0,
         .debug_best_decomp_entry1_num_coding_passes = 0,
         .debug_best_decomp_mismatch_bytes = 0,
-        .debug_best_decomp_preview = [_]u8{0} ** 12,
+        .debug_best_decomp_preview = @as([12]u8, @splat(0)),
         .debug_best_decomp_entry0_state_index = 0,
         .debug_best_decomp_entry1_state_index = 0,
         .debug_best_decomp_remap_mismatch_bytes = 0,
-        .debug_best_decomp_remap_preview = [_]u8{0} ** 12,
+        .debug_best_decomp_remap_preview = @as([12]u8, @splat(0)),
         .debug_best_rgb_entry1_zero_bit_planes = 0,
         .debug_best_rgb_entry1_num_coding_passes = 0,
         .debug_best_rgb_entry2_zero_bit_planes = 0,
         .debug_best_rgb_entry2_num_coding_passes = 0,
         .debug_best_rgb_mismatch_bytes = 0,
-        .debug_best_rgb_preview = [_]u8{0} ** 12,
-        .pure_zig_plane_preview = [_][4]i32{[_]i32{0} ** 4} ** 3,
+        .debug_best_rgb_preview = @as([12]u8, @splat(0)),
+        .pure_zig_plane_preview = @as([3][4]i32, @splat(@as([4]i32, @splat(0)))),
         .oracle_plane_preview = blk: {
-            var preview: [3][4]u8 = [_][4]u8{[_]u8{0} ** 4} ** 3;
+            var preview: [3][4]u8 = @as([3][4]u8, @splat(@as([4]u8, @splat(0))));
             copyInterleavedPlanePreview(&preview, oracle_image.pixels, oracle_image.components);
             break :blk preview;
         },
         .oracle_pixel_bytes = oracle_image.pixels.len,
         .used_sidecar_oracle = fixture.expected_image_path != null,
-        .debug_structural_stage = @intFromEnum(stage),
+        .debug_structural_stage = @backingInt(stage),
     };
 }
 
@@ -888,7 +888,7 @@ fn findBestSingleEntryZeroDecompOverride(
         .zero_bit_planes = packet_model.entries[0].zero_bit_planes,
         .num_coding_passes = packet_model.entries[0].num_coding_passes,
         .mismatch_bytes = std.math.maxInt(usize),
-        .preview = [_]u8{0} ** 12,
+        .preview = @as([12]u8, @splat(0)),
     };
 
     const entries = try allocator.alloc(packet.PacketCodeblockEntry, packet_model.entries.len);
@@ -926,7 +926,7 @@ fn findBestSingleEntryZeroDecompOverride(
                 best.zero_bit_planes = zero_bit_planes;
                 best.num_coding_passes = num_coding_passes;
                 best.mismatch_bytes = mismatch_bytes;
-                best.preview = [_]u8{0} ** 12;
+                best.preview = @as([12]u8, @splat(0));
                 copyPreview(&best.preview, pixels);
                 if (mismatch_bytes == 0) return best;
             }
@@ -955,7 +955,7 @@ fn findBestRgbEntry12Override(
         .entry2_zero_bit_planes = packet_model.entries[2].zero_bit_planes,
         .entry2_num_coding_passes = packet_model.entries[2].num_coding_passes,
         .mismatch_bytes = std.math.maxInt(usize),
-        .preview = [_]u8{0} ** 12,
+        .preview = @as([12]u8, @splat(0)),
     };
 
     const entries = try allocator.alloc(packet.PacketCodeblockEntry, packet_model.entries.len);
@@ -1001,7 +1001,7 @@ fn findBestRgbEntry12Override(
                         best.entry2_zero_bit_planes = entry2_zero_bit_planes;
                         best.entry2_num_coding_passes = entry2_num_coding_passes;
                         best.mismatch_bytes = mismatch_bytes;
-                        best.preview = [_]u8{0} ** 12;
+                        best.preview = @as([12]u8, @splat(0));
                         copyPreview(&best.preview, pixels);
                         if (mismatch_bytes == 0) return best;
                     }
@@ -1032,7 +1032,7 @@ fn findBestTwoEntryDecomposedOverride(
         .entry1_zero_bit_planes = packet_model.entries[1].zero_bit_planes,
         .entry1_num_coding_passes = packet_model.entries[1].num_coding_passes,
         .mismatch_bytes = std.math.maxInt(usize),
-        .preview = [_]u8{0} ** 12,
+        .preview = @as([12]u8, @splat(0)),
     };
 
     const entries = try allocator.alloc(packet.PacketCodeblockEntry, packet_model.entries.len);
@@ -1084,7 +1084,7 @@ fn findBestTwoEntryDecomposedOverride(
                         best.entry1_zero_bit_planes = entry1_zero_bit_planes;
                         best.entry1_num_coding_passes = entry1_num_coding_passes;
                         best.mismatch_bytes = mismatch_bytes;
-                        best.preview = [_]u8{0} ** 12;
+                        best.preview = @as([12]u8, @splat(0));
                         copyPreview(&best.preview, reconstruction.pixels);
                         if (mismatch_bytes == 0) return best;
                     }
@@ -1113,7 +1113,7 @@ fn findBestTwoEntryDecomposedRemapOverride(
         .entry0_state_index = @intCast(packet_model.entries[0].state_index),
         .entry1_state_index = @intCast(packet_model.entries[1].state_index),
         .mismatch_bytes = std.math.maxInt(usize),
-        .preview = [_]u8{0} ** 12,
+        .preview = @as([12]u8, @splat(0)),
     };
 
     const entries = try allocator.alloc(packet.PacketCodeblockEntry, packet_model.entries.len);
@@ -1159,7 +1159,7 @@ fn findBestTwoEntryDecomposedRemapOverride(
                 best.entry0_state_index = @intCast(entry0_state_index);
                 best.entry1_state_index = @intCast(entry1_state_index);
                 best.mismatch_bytes = mismatch_bytes;
-                best.preview = [_]u8{0} ** 12;
+                best.preview = @as([12]u8, @splat(0));
                 copyPreview(&best.preview, reconstruction.pixels);
                 if (mismatch_bytes == 0) return best;
             }
@@ -1390,7 +1390,7 @@ fn copyPacketEntryMetadata(
     @memset(num_coding_passes, 0);
     @memset(body_offset, 0);
     @memset(body_length, 0);
-    @memset(body_preview, [_]u8{0} ** 8);
+    @memset(body_preview, @as([8]u8, @splat(0)));
     const limit = @min(
         @min(@min(zero_bit_planes.len, num_coding_passes.len), @min(body_offset.len, body_length.len)),
         @min(body_preview.len, entries.len),
@@ -1459,12 +1459,12 @@ fn copyCodeblockMqTrace(
     context_init_policy: codeblock.ContextInitPolicy,
 ) !void {
     @memset(symbol_counts, 0);
-    @memset(symbol_preview, [_]u8{0} ** 16);
+    @memset(symbol_preview, @as([16]u8, @splat(0)));
     @memset(last_pass_index, 0);
     @memset(last_pass_kind, 0);
     @memset(last_pass_bitplane, 0);
-    @memset(last_magnitudes, [_]i32{0} ** 4);
-    @memset(last_signs, [_]u8{0} ** 4);
+    @memset(last_magnitudes, @as([4]i32, @splat(0)));
+    @memset(last_signs, @as([4]u8, @splat(0)));
     @memset(cell1_first_sig_pass_index, 0);
     @memset(cell1_first_sig_kind, 0);
     @memset(cell1_first_sig_bitplane, 0);
@@ -1614,7 +1614,7 @@ fn copyCodeblockMqTrace(
 }
 
 fn copyPlanePreviewI32(dst: *[3][4]i32, planes: []const []const i32) void {
-    @memset(dst, [_]i32{0} ** 4);
+    @memset(dst, @as([4]i32, @splat(0)));
     const plane_count = @min(dst.len, planes.len);
     var c: usize = 0;
     while (c < plane_count) : (c += 1) {
@@ -1624,7 +1624,7 @@ fn copyPlanePreviewI32(dst: *[3][4]i32, planes: []const []const i32) void {
 }
 
 fn copyInterleavedPlanePreview(dst: *[3][4]u8, pixels: []const u8, components: u8) void {
-    @memset(dst, [_]u8{0} ** 4);
+    @memset(dst, @as([4]u8, @splat(0)));
     if (components == 0) return;
     const sample_count = pixels.len / components;
     const plane_count: usize = @min(dst.len, components);
@@ -1967,7 +1967,7 @@ fn caseReportBySuffix(report: *const SuiteReport, suffix: []const u8) ?*const Ca
 fn expectVerifiedCase(report: *const SuiteReport, suffix: []const u8, expected_pixel_bytes: usize) !void {
     const entry = caseReportBySuffix(report, suffix) orelse return error.MissingConformanceCase;
     try std.testing.expectEqual(expected_pixel_bytes, entry.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), entry.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), entry.debug_structural_stage);
     try std.testing.expect(entry.pure_zig_pixels_verified);
     try std.testing.expect(!entry.pure_zig_used_plane_fixup);
     try std.testing.expect(!entry.pure_zig_used_pixel_fixup);
@@ -1995,7 +1995,7 @@ test "runCase on real generated 3x3 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 9), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2023,7 +2023,7 @@ test "runCase on real generated 3x3 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 27), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2048,7 +2048,7 @@ test "runCase on real generated 4x3 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 12), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2073,7 +2073,7 @@ test "runCase on real generated 4x3 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 36), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2098,7 +2098,7 @@ test "runCase on real generated 5x3 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 15), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2123,7 +2123,7 @@ test "runCase on real generated 5x3 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 45), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2148,7 +2148,7 @@ test "runCase on real generated 6x3 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 18), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2173,7 +2173,7 @@ test "runCase on real generated 6x3 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 54), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2198,7 +2198,7 @@ test "runCase on real generated 3x4 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 12), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2223,7 +2223,7 @@ test "runCase on real generated 3x4 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 36), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2248,7 +2248,7 @@ test "runCase on real generated 4x4 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 16), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2273,7 +2273,7 @@ test "runCase on real generated 4x4 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 48), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2298,7 +2298,7 @@ test "runCase on real generated 5x4 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 20), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2323,7 +2323,7 @@ test "runCase on real generated 5x4 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 60), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2348,7 +2348,7 @@ test "runCase on real generated 6x4 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 24), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2373,7 +2373,7 @@ test "runCase on real generated 6x4 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 72), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2398,7 +2398,7 @@ test "runCase on real generated 7x4 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 28), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2423,7 +2423,7 @@ test "runCase on real generated 7x4 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 84), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2448,7 +2448,7 @@ test "runCase on real generated 8x4 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 32), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2473,7 +2473,7 @@ test "runCase on real generated 8x4 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 96), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2498,7 +2498,7 @@ test "runCase on real generated 9x4 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 36), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2523,7 +2523,7 @@ test "runCase on real generated 9x4 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 108), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2548,7 +2548,7 @@ test "runCase on real generated 10x4 grayscale fixture reports current bounded s
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 40), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2573,7 +2573,7 @@ test "runCase on real generated 10x4 rgb fixture reports current bounded state" 
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 120), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2598,7 +2598,7 @@ test "runCase on real generated 3x5 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 15), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2623,7 +2623,7 @@ test "runCase on real generated 3x5 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 45), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2648,7 +2648,7 @@ test "runCase on real generated 4x5 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 20), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2673,7 +2673,7 @@ test "runCase on real generated 4x5 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 60), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2698,7 +2698,7 @@ test "runCase on real generated 5x5 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 25), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2723,7 +2723,7 @@ test "runCase on real generated 5x5 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 75), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2748,7 +2748,7 @@ test "runCase on real generated 6x5 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 30), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2773,7 +2773,7 @@ test "runCase on real generated 6x5 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 90), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2798,7 +2798,7 @@ test "runCase on real generated 7x5 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 35), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2823,7 +2823,7 @@ test "runCase on real generated 7x5 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 105), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2848,7 +2848,7 @@ test "runCase on real generated 8x5 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 40), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2873,7 +2873,7 @@ test "runCase on real generated 8x5 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 120), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2898,7 +2898,7 @@ test "runCase on real generated 9x5 grayscale fixture reports current bounded st
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 45), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2923,7 +2923,7 @@ test "runCase on real generated 9x5 rgb fixture reports current bounded state" {
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 135), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2948,7 +2948,7 @@ test "runCase on real generated 10x5 grayscale fixture reports current bounded s
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 50), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -2973,7 +2973,7 @@ test "runCase on real generated 10x5 rgb fixture reports current bounded state" 
     defer report.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 150), report.pure_zig_pixel_bytes);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixels_verified);
     try std.testing.expectEqual(@as(usize, 0), report.pure_zig_mismatch_bytes);
 }
@@ -3093,11 +3093,11 @@ test "real generated 3x2 grayscale fixture survives runCase metadata path before
     );
     defer execution.deinit(allocator);
 
-    var pure_zig_entry_zero_bit_planes: [4]u8 = [_]u8{0} ** 4;
-    var pure_zig_entry_num_coding_passes: [4]u16 = [_]u16{0} ** 4;
-    var pure_zig_entry_body_offset: [4]u32 = [_]u32{0} ** 4;
-    var pure_zig_entry_body_length: [4]u32 = [_]u32{0} ** 4;
-    var pure_zig_entry_body_preview: [4][8]u8 = [_][8]u8{[_]u8{0} ** 8} ** 4;
+    var pure_zig_entry_zero_bit_planes: [4]u8 = @as([4]u8, @splat(0));
+    var pure_zig_entry_num_coding_passes: [4]u16 = @as([4]u16, @splat(0));
+    var pure_zig_entry_body_offset: [4]u32 = @as([4]u32, @splat(0));
+    var pure_zig_entry_body_length: [4]u32 = @as([4]u32, @splat(0));
+    var pure_zig_entry_body_preview: [4][8]u8 = @as([4][8]u8, @splat(@as([8]u8, @splat(0))));
     copyPacketEntryMetadata(
         &pure_zig_entry_zero_bit_planes,
         &pure_zig_entry_num_coding_passes,
@@ -3145,7 +3145,7 @@ test "runCase on real generated 3x2 grayscale fixture reports its true current s
 
     var report = try runCase(allocator, fixture);
     defer report.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixel_bytes > 0);
 }
 
@@ -3198,7 +3198,7 @@ test "runCase on real generated 3x2 grayscale fixture without sidecar still repo
 
     var report = try runCase(allocator, fixture);
     defer report.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.debug_structural_stage);
     try std.testing.expect(report.pure_zig_pixel_bytes > 0);
 }
 
@@ -3216,7 +3216,7 @@ test "runSuite on single generated 3x2 grayscale fixture without sidecar still r
     var report = try runSuite(allocator, root);
     defer report.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), report.cases.len);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.cases[0].debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.cases[0].debug_structural_stage);
     try std.testing.expect(report.cases[0].pure_zig_pixel_bytes > 0);
 }
 
@@ -3237,7 +3237,7 @@ test "runSuite on single generated 3x2 grayscale fixture under GPA still reports
     var report = try runSuite(allocator, root);
     defer report.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), report.cases.len);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(StructuralStage.none)), report.cases[0].debug_structural_stage);
+    try std.testing.expectEqual(@as(u8, @backingInt(StructuralStage.none)), report.cases[0].debug_structural_stage);
     try std.testing.expect(report.cases[0].pure_zig_pixel_bytes > 0);
     // Check exact pixel match for lossless JPEG2000 decode
     try std.testing.expectEqual(@as(usize, 0), report.cases[0].pure_zig_mismatch_bytes);

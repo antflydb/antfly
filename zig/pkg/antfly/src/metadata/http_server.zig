@@ -2559,7 +2559,7 @@ fn cloneParsedGroupStatuses(
             .local_voter = parsed.local_voter orelse false,
             .voter_count = parsed.voter_count orelse 0,
             .voter_set_known = parsed.voter_set_known orelse false,
-            .voter_set_fingerprint = parsed.voter_set_fingerprint orelse [_]u8{0} ** metadata_table_manager.voter_set_fingerprint_len,
+            .voter_set_fingerprint = parsed.voter_set_fingerprint orelse @as([metadata_table_manager.voter_set_fingerprint_len]u8, @splat(0)),
             .joint_consensus = parsed.joint_consensus orelse false,
             .transition_pending = parsed.transition_pending orelse false,
             .replay_required = parsed.replay_required orelse false,

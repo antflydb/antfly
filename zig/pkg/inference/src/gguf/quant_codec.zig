@@ -2871,19 +2871,19 @@ test "quantize q6_k block packs representative ql qh scales and d bytes" {
     var raw: [210]u8 = undefined;
     quantizeQ6_KBlock(&input, &raw);
 
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xF1} ** 16), raw[0..16]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x1F} ** 16), raw[16..32]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xF1} ** 16), raw[32..48]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x1F} ** 16), raw[48..64]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xF1} ** 16), raw[64..80]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x1F} ** 16), raw[80..96]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xF1} ** 16), raw[96..112]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x1F} ** 16), raw[112..128]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xF0} ** 16), raw[128..144]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x0F} ** 16), raw[144..160]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xF0} ** 16), raw[160..176]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x0F} ** 16), raw[176..192]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x7F} ** 16), raw[192..208]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xF1))), raw[0..16]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x1F))), raw[16..32]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xF1))), raw[32..48]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x1F))), raw[48..64]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xF1))), raw[64..80]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x1F))), raw[80..96]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xF1))), raw[96..112]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x1F))), raw[112..128]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xF0))), raw[128..144]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x0F))), raw[144..160]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xF0))), raw[160..176]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x0F))), raw[176..192]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x7F))), raw[192..208]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x08, 0x20 }, raw[208..210]);
 }
 
@@ -3401,7 +3401,7 @@ fn quantizeQ8_KBlockScalarReference(input: []const f32, output: []u8) void {
     }
 
     const inv_scale = 1.0 / scale;
-    var block_sums: [16]i16 = [_]i16{0} ** 16;
+    var block_sums: [16]i16 = @as([16]i16, @splat(0));
     for (input, 0..) |value, i| {
         const q: i8 = @intFromFloat(@min(@max(@round(value * inv_scale), -127.0), 127.0));
         output[4 + i] = @bitCast(q);
@@ -4341,7 +4341,7 @@ test "dequantize nvfp4 uses per-subblock ue4m3 scales" {
 
 test "materialize q5_k as f32 tensor" {
     const allocator = std.testing.allocator;
-    var raw: [176]u8 = [_]u8{0} ** 176;
+    var raw: [176]u8 = @as([176]u8, @splat(0));
     raw[0] = 0x00;
     raw[1] = 0x3C;
     raw[4] = 1;

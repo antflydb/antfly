@@ -1352,8 +1352,8 @@ const SidecarDeclarationKind = enum {
 
 const SidecarDeclarationIndex = struct {
     by_name: std.StringHashMapUnmanaged(sidecar_manifest.DeclaredArtifact) = .empty,
-    implicit: [4]?sidecar_manifest.DeclaredArtifact = [_]?sidecar_manifest.DeclaredArtifact{null} ** 4,
-    implicit_ambiguous: [4]bool = [_]bool{false} ** 4,
+    implicit: [4]?sidecar_manifest.DeclaredArtifact = @as([4]?sidecar_manifest.DeclaredArtifact, @splat(null)),
+    implicit_ambiguous: [4]bool = @as([4]bool, @splat(false)),
 
     fn init(
         alloc: Allocator,
@@ -1376,7 +1376,7 @@ const SidecarDeclarationIndex = struct {
             const entry = try index.by_name.getOrPut(alloc, declaration.name);
             if (entry.found_existing) return error.AmbiguousLakeSidecarCandidateSource;
             entry.value_ptr.* = declaration;
-            const kind_index = @intFromEnum(kind);
+            const kind_index = @backingInt(kind);
             if (index.implicit[kind_index] == null) {
                 index.implicit[kind_index] = declaration;
             } else {
@@ -1452,7 +1452,7 @@ fn selectedDeclarationsAlloc(
         break :blk &local_index;
     };
     defer if (maybe_declaration_index == null) local_index.deinit(alloc);
-    const kind_index = @intFromEnum(kind);
+    const kind_index = @backingInt(kind);
     if (declaration_index.implicit_ambiguous[kind_index]) return error.AmbiguousLakeSidecarCandidateSource;
     if (declaration_index.implicit[kind_index]) |declaration| try selected.append(alloc, declaration);
     return try selected.toOwnedSlice(alloc);

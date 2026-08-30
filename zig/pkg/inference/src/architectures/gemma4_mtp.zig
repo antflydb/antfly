@@ -1002,7 +1002,7 @@ test "gemma4 mtp parses concat and kv donor modes" {
 test "gemma4 mtp fill concat input supports both orders" {
     const embedding = [_]f32{ 1.0, 2.0 };
     const activation = [_]f32{ 3.0, 4.0 };
-    var dest = [_]f32{0.0} ** 4;
+    var dest = @as([4]f32, @splat(0.0));
 
     try fillConcatInput(dest[0..], embedding[0..], activation[0..], .embedding_activation);
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0, 3.0, 4.0 }, dest[0..]);

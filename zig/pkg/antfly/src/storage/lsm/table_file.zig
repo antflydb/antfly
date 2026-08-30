@@ -83,7 +83,7 @@ pub const CompressionStats = struct {
 };
 
 pub fn blockCompressionCodecMask(codec: BlockCompression) u64 {
-    return @as(u64, 1) << @intCast(@intFromEnum(codec));
+    return @as(u64, 1) << @intCast(@backingInt(codec));
 }
 
 pub const EncodeOptions = struct {
@@ -1052,7 +1052,7 @@ pub fn encodeWithFilterToSinkOptions(
     for (blocks.items) |block| {
         try sinkAppendU32(&metadata_sink, block.physical_relative_offset);
         try sinkAppendU32(&metadata_sink, block.physical_len);
-        try sinkAppendU32(&metadata_sink, @intFromEnum(block.compression));
+        try sinkAppendU32(&metadata_sink, @backingInt(block.compression));
         try sinkAppendU32(&metadata_sink, block.checksum);
     }
     try sinkAppendU32(&metadata_sink, try checkedU32(blocks.items.len));
@@ -1062,7 +1062,7 @@ pub fn encodeWithFilterToSinkOptions(
         if (block.smallest_namespace_name) |name| try metadata_sink.appendSlice(name);
         try metadata_sink.appendSlice(block.smallest_key);
     }
-    try sinkAppendU32(&metadata_sink, @intFromEnum(options.prefix_extractor));
+    try sinkAppendU32(&metadata_sink, @backingInt(options.prefix_extractor));
     try sinkAppendU32(&metadata_sink, try checkedU32(encoded_prefix_filter.len));
     try metadata_sink.appendSlice(encoded_prefix_filter);
     try sinkAppendU32(&metadata_sink, try checkedU32(blocks.items.len));
@@ -1381,7 +1381,7 @@ pub const StreamingEncoder = struct {
         for (self.blocks.items) |block| {
             try sinkAppendU32(&metadata_sink, block.physical_relative_offset);
             try sinkAppendU32(&metadata_sink, block.physical_len);
-            try sinkAppendU32(&metadata_sink, @intFromEnum(block.compression));
+            try sinkAppendU32(&metadata_sink, @backingInt(block.compression));
             try sinkAppendU32(&metadata_sink, block.checksum);
         }
         try sinkAppendU32(&metadata_sink, try checkedU32(self.blocks.items.len));
@@ -1391,7 +1391,7 @@ pub const StreamingEncoder = struct {
             if (block.smallest_namespace_name) |name| try metadata_sink.appendSlice(name);
             try metadata_sink.appendSlice(block.smallest_key);
         }
-        try sinkAppendU32(&metadata_sink, @intFromEnum(self.prefix_extractor));
+        try sinkAppendU32(&metadata_sink, @backingInt(self.prefix_extractor));
         try sinkAppendU32(&metadata_sink, try checkedU32(encoded_prefix_filter.len));
         try metadata_sink.appendSlice(encoded_prefix_filter);
         try sinkAppendU32(&metadata_sink, try checkedU32(self.blocks.items.len));
@@ -2419,10 +2419,10 @@ pub fn decodeSequentialIndexFromFooterAlloc(
         const physical_relative_offset = try readU32(metadata, &cursor);
         const physical_len = try readU32(metadata, &cursor);
         const compression = switch (try readU32(metadata, &cursor)) {
-            @intFromEnum(BlockCompression.none) => BlockCompression.none,
-            @intFromEnum(BlockCompression.snappy) => BlockCompression.snappy,
-            @intFromEnum(BlockCompression.prefix) => BlockCompression.prefix,
-            @intFromEnum(BlockCompression.prefix_snappy) => BlockCompression.prefix_snappy,
+            @backingInt(BlockCompression.none) => BlockCompression.none,
+            @backingInt(BlockCompression.snappy) => BlockCompression.snappy,
+            @backingInt(BlockCompression.prefix) => BlockCompression.prefix,
+            @backingInt(BlockCompression.prefix_snappy) => BlockCompression.prefix_snappy,
             else => return error.InvalidTableFile,
         };
         const checksum = try readU32(metadata, &cursor);
@@ -2897,10 +2897,10 @@ fn decodeBlockPhysicalMetas(
         const compression_raw = try readU32(metadata, cursor);
         const checksum = try readU32(metadata, cursor);
         const compression: BlockCompression = switch (compression_raw) {
-            @intFromEnum(BlockCompression.none) => .none,
-            @intFromEnum(BlockCompression.snappy) => .snappy,
-            @intFromEnum(BlockCompression.prefix) => .prefix,
-            @intFromEnum(BlockCompression.prefix_snappy) => .prefix_snappy,
+            @backingInt(BlockCompression.none) => .none,
+            @backingInt(BlockCompression.snappy) => .snappy,
+            @backingInt(BlockCompression.prefix) => .prefix,
+            @backingInt(BlockCompression.prefix_snappy) => .prefix_snappy,
             else => return error.InvalidTableFile,
         };
         if (physical_len == 0) return error.InvalidTableFile;
@@ -2951,8 +2951,8 @@ fn decodeBlockSmallestKeysAlloc(
 
 fn decodePrefixExtractor(raw: u32) !PrefixExtractor {
     return switch (raw) {
-        @intFromEnum(PrefixExtractor.none) => .none,
-        @intFromEnum(PrefixExtractor.first_separator) => .first_separator,
+        @backingInt(PrefixExtractor.none) => .none,
+        @backingInt(PrefixExtractor.first_separator) => .first_separator,
         else => error.InvalidTableFile,
     };
 }
@@ -3328,7 +3328,7 @@ test "table file footer metadata includes prefix bloom filters" {
 
 test "table file prefix blooms scale with distinct prefixes rather than entries" {
     const allocator = std.testing.allocator;
-    const entries = [_]Entry{.{ .namespace_name = "docs", .key = "doc:repeated", .value = "value" }} ** 128;
+    const entries = @as([128]Entry, @splat(.{ .namespace_name = "docs", .key = "doc:repeated", .value = "value" }));
 
     var filter = try buildPrefixFilterAlloc(allocator, &entries, default_prefix_extractor, default_filter_config);
     defer filter.deinit(allocator);

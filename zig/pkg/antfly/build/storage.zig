@@ -14,6 +14,11 @@
 
 const std = @import("std");
 
+fn translateCOptimizeMode(optimize: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
+    _ = optimize;
+    return .Debug;
+}
+
 const max_openapi_spec_bytes = 2 * 1024 * 1024;
 
 pub const LmdbBackend = enum {
@@ -79,8 +84,7 @@ fn readBuildFileAlloc(b: *std.Build, path: []const u8) []const u8 {
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = b.sysroot orelse
-        b.graph.environ_map.get("SDK_PATH") orelse
+    const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse
         std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
         return;
     module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
@@ -105,7 +109,57 @@ pub fn makeLmdbEngineModule(
         mod.link_libc = true;
         addMacosSdkPaths(b, mod, target);
     }
+    addLmdbPthreadImport(b, mod, target, optimize, link_libc);
     return mod;
+}
+
+fn addLmdbPthreadImport(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    link_libc: bool,
+) void {
+    if (link_libc and target.result.os.tag != .freestanding) {
+        const translate = b.addTranslateC(.{
+            .root_source_file = b.path("pkg/antfly/src/lmdb/pthread_c.h"),
+            .target = target,
+            .optimize = translateCOptimizeMode(optimize),
+            .link_libc = true,
+        });
+        mod.addImport("lmdb_pthread", translate.createModule());
+    } else {
+        mod.addImport("lmdb_pthread", b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/lmdb/pthread_stub.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+    }
+}
+
+pub fn addLmdbCBindingsImport(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    real_bindings: bool,
+) void {
+    if (real_bindings and target.result.os.tag != .freestanding) {
+        const translate = b.addTranslateC(.{
+            .root_source_file = b.path("pkg/antfly/src/storage/lmdb_c.h"),
+            .target = target,
+            .optimize = translateCOptimizeMode(optimize),
+            .link_libc = true,
+        });
+        translate.addIncludePath(b.path("lib/lmdb"));
+        mod.addImport("lmdb_c_bindings", translate.createModule());
+    } else {
+        mod.addImport("lmdb_c_bindings", b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/storage/lmdb_c_stub.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
+    }
 }
 
 pub fn makeLmdbModule(
@@ -132,5 +186,6 @@ pub fn makeLmdbModule(
     mod.addIncludePath(b.path("lib/lmdb"));
     mod.link_libc = true;
     addMacosSdkPaths(b, mod, target);
+    addLmdbCBindingsImport(b, mod, target, optimize, true);
     return mod;
 }

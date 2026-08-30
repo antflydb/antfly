@@ -984,7 +984,7 @@ fn fillInputs(
     pattern: Pattern,
     seed: u64,
 ) void {
-    var state = seed ^ (@as(u64, @intFromEnum(pattern)) *% 0x9e37_79b9_7f4a_7c15);
+    var state = seed ^ (@as(u64, @backingInt(pattern)) *% 0x9e37_79b9_7f4a_7c15);
     switch (pattern) {
         .random => {
             for (q) |*value| value.* = nextSignedUnit(&state) * 0.125;
@@ -1225,7 +1225,7 @@ fn countBitwiseMismatches(reference: []const f32, candidate: []const f32) !usize
 
 fn loadFunction(ctx: *cuda_context.CudaContext, module: cuda_driver.CUmodule, name: []const u8) !cuda_driver.CUfunction {
     var name_buffer: [160]u8 = undefined;
-    const name_z = try std.fmt.bufPrintZ(&name_buffer, "{s}", .{name});
+    const name_z = try std.fmt.bufPrintSentinel(&name_buffer, "{s}", .{name}, 0);
     var function: cuda_driver.CUfunction = null;
     try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, name_z));
     return function orelse error.CudaKernelUnavailable;
@@ -1387,11 +1387,11 @@ fn caseSeed(cfg: Config, spec: CaseSpec) u64 {
     seed ^= @as(u64, spec.head_dim) << 41;
     seed ^= @as(u64, @intCast(spec.q_len)) *% 0x9e37_79b9;
     seed ^= @as(u64, @intCast(spec.prefix)) *% 0x85eb_ca6b;
-    seed ^= @as(u64, @intFromEnum(spec.page_order)) << 17;
-    seed ^= @as(u64, @intFromEnum(spec.pattern)) << 23;
+    seed ^= @as(u64, @backingInt(spec.page_order)) << 17;
+    seed ^= @as(u64, @backingInt(spec.pattern)) << 23;
     seed ^= @as(u64, spec.sliding_window) << 29;
     seed ^= @as(u64, @intCast(spec.page_size)) *% 0x27d4_eb2f;
-    seed ^= @as(u64, @intFromEnum(spec.capacity_mode)) << 37;
+    seed ^= @as(u64, @backingInt(spec.capacity_mode)) << 37;
     return seed;
 }
 
@@ -1581,7 +1581,7 @@ fn runMetamorphicCase(
     const row_bytes = try checkedMul(kv_width, @sizeOf(f16));
     const kv_bytes = try checkedMul(physical_capacity, row_bytes);
     const table_bytes = try checkedMul(mapped_blocks, @sizeOf(u32));
-    const seed = cfg.seed ^ (@as(u64, head_dim) << 41) ^ (@as(u64, @intFromEnum(candidate)) << 13) ^ 0x6d65_7461_7061_6765;
+    const seed = cfg.seed ^ (@as(u64, head_dim) << 41) ^ (@as(u64, @backingInt(candidate)) << 13) ^ 0x6d65_7461_7061_6765;
 
     const host_q = try allocator.alloc(f32, q_count);
     defer allocator.free(host_q);
@@ -1736,7 +1736,7 @@ fn runDeviceAuditCase(
     const kv_bytes = try checkedMul(host_physical_capacity, row_bytes);
     const table_entries = ceilDiv(kv_len, host_page_size);
     const table_bytes = try checkedMul(table_entries, @sizeOf(u32));
-    const seed = cfg.seed ^ (@as(u64, head_dim) << 41) ^ (@as(u64, @intFromEnum(candidate)) << 13) ^ (@as(u64, @intFromEnum(kind)) << 19) ^ 0x6175_6469_745f_6b76;
+    const seed = cfg.seed ^ (@as(u64, head_dim) << 41) ^ (@as(u64, @backingInt(candidate)) << 13) ^ (@as(u64, @backingInt(kind)) << 19) ^ 0x6175_6469_745f_6b76;
 
     const host_q = try allocator.alloc(f32, q_count);
     defer allocator.free(host_q);
@@ -2225,12 +2225,12 @@ test "pairwise layout covers every required axis for each candidate and head dim
     var specs: [36]CaseSpec = undefined;
     try fillCaseSpecs(cfg, &specs);
     for ([_]Candidate{ .exact, .warp }) |candidate| for ([_]u16{ 256, 512 }) |head_dim| {
-        var q_seen = [_]bool{false} ** supported_q_lengths.len;
-        var prefix_seen = [_]bool{false} ** supported_prefixes.len;
-        var order_seen = [_]bool{false} ** 4;
-        var pattern_seen = [_]bool{false} ** 5;
-        var window_seen = [_]bool{false} ** 2;
-        var geometry_seen = [_][2]bool{[_]bool{false} ** 2} ** supported_page_sizes.len;
+        var q_seen = @as([supported_q_lengths.len]bool, @splat(false));
+        var prefix_seen = @as([supported_prefixes.len]bool, @splat(false));
+        var order_seen = @as([4]bool, @splat(false));
+        var pattern_seen = @as([5]bool, @splat(false));
+        var window_seen = @as([2]bool, @splat(false));
+        var geometry_seen = @as([supported_page_sizes.len][2]bool, @splat(@as([2]bool, @splat(false))));
         for (specs) |spec| {
             if (spec.candidate != candidate or spec.head_dim != head_dim) continue;
             for (supported_q_lengths, 0..) |value, index| {
@@ -2239,11 +2239,11 @@ test "pairwise layout covers every required axis for each candidate and head dim
             for (supported_prefixes, 0..) |value, index| {
                 if (spec.prefix == value) prefix_seen[index] = true;
             }
-            order_seen[@intFromEnum(spec.page_order)] = true;
-            pattern_seen[@intFromEnum(spec.pattern)] = true;
+            order_seen[@backingInt(spec.page_order)] = true;
+            pattern_seen[@backingInt(spec.pattern)] = true;
             window_seen[@intFromBool(spec.sliding_window != 0)] = true;
             for (supported_page_sizes, 0..) |page_size, page_index| {
-                if (spec.page_size == page_size) geometry_seen[page_index][@intFromEnum(spec.capacity_mode)] = true;
+                if (spec.page_size == page_size) geometry_seen[page_index][@backingInt(spec.capacity_mode)] = true;
             }
         }
         for (q_seen) |seen| try std.testing.expect(seen);
@@ -2296,7 +2296,7 @@ test "paged F16 layout permutes pages and leaves unmapped rows poisoned" {
     try std.testing.expectEqual(@as(usize, 5), physicalToken(5, &table, 4));
 
     const logical = [_]f32{ 1.0, -2.0, 0.5, -0.5 };
-    var packed_bytes = [_]u8{0} ** 16;
+    var packed_bytes = @as([16]u8, @splat(0));
     packPagedF16(&packed_bytes, &logical, &no_table, 1, 4);
     const first_bits: u16 = @bitCast(@as(f16, 1.0));
     try std.testing.expectEqual(@as(u8, @truncate(first_bits)), packed_bytes[0]);
@@ -2307,7 +2307,7 @@ test "paged F16 layout permutes pages and leaves unmapped rows poisoned" {
 
     var permuted = [_]u32{ 0, 0, 0, 0, 0, 0, 0 };
     fillBlockTable(&permuted, .permuted, 0x42);
-    var seen = [_]bool{false} ** permuted.len;
+    var seen = @as([permuted.len]bool, @splat(false));
     for (permuted) |physical| {
         try std.testing.expect(physical < permuted.len);
         try std.testing.expect(!seen[physical]);

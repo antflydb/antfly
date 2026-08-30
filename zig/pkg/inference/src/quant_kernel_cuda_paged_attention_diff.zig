@@ -579,7 +579,7 @@ fn nextSignedUnit(state: *u64) f32 {
 }
 
 fn fillInputs(q: []f32, k: []f32, v: []f32, head_dim: usize, kv_len: usize, num_heads: usize, num_kv_heads: usize, pattern: Pattern, seed: u64) void {
-    var state = seed ^ (@as(u64, @intFromEnum(pattern)) *% 0x9e37_79b9_7f4a_7c15);
+    var state = seed ^ (@as(u64, @backingInt(pattern)) *% 0x9e37_79b9_7f4a_7c15);
     switch (pattern) {
         .random => {
             for (q) |*value| value.* = nextSignedUnit(&state) * 0.125;
@@ -744,7 +744,7 @@ fn compareOutputs(reference: []const f32, candidate: []const f32) !DiffStats {
 
 fn loadFunction(ctx: *cuda_context.CudaContext, module: cuda_driver.CUmodule, name: []const u8) !cuda_driver.CUfunction {
     var name_buffer: [160]u8 = undefined;
-    const name_z = try std.fmt.bufPrintZ(&name_buffer, "{s}", .{name});
+    const name_z = try std.fmt.bufPrintSentinel(&name_buffer, "{s}", .{name}, 0);
     var function: cuda_driver.CUfunction = null;
     try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, name_z));
     return function orelse error.CudaKernelUnavailable;
@@ -1139,8 +1139,8 @@ fn runCase(
         .value_row_bytes = @intCast(value_row_bytes),
         .block_count = if (identity_null_table) 0 else @intCast(block_count),
         .page_size_tokens = @intCast(cfg.page_size),
-        .format = @intFromEnum(key_format),
-        .value_format = @intFromEnum(value_format),
+        .format = @backingInt(key_format),
+        .value_format = @backingInt(value_format),
         .physical_token_capacity = @intCast(physical_capacity),
         .score_capacity = @intCast(score_capacity),
     };
@@ -1545,13 +1545,13 @@ test "paged attention diff reverses physical pages and packs both key formats" {
     try std.testing.expectEqual(@as(usize, 5), physicalToken(5, &table, 4));
 
     const logical = [_]f32{ -1.0, 1.0, 0.0, 0.5 };
-    var polar = [_]u8{0} ** 2;
+    var polar = @as([2]u8, @splat(0));
     const identity = [_]u32{0};
     packPagedKeys(&polar, &logical, &identity, 1, 4, 2, .polar4);
     try std.testing.expectEqual(@as(u8, 0xf0), polar[0]);
     try std.testing.expectEqual(@as(u8, 0xb8), polar[1]);
 
-    var half = [_]u8{0} ** 8;
+    var half = @as([8]u8, @splat(0));
     packPagedKeys(&half, &logical, &identity, 1, 4, 8, .f16);
     const first_bits: u16 = @bitCast(@as(f16, -1.0));
     try std.testing.expectEqual(@as(u8, @truncate(first_bits)), half[0]);
@@ -1559,7 +1559,7 @@ test "paged attention diff reverses physical pages and packs both key formats" {
 
     var permuted = [_]u32{ 0, 0, 0, 0, 0, 0, 0 };
     fillBlockTable(&permuted, .permuted, 0x42);
-    var seen = [_]bool{false} ** permuted.len;
+    var seen = @as([permuted.len]bool, @splat(false));
     for (permuted) |physical| {
         try std.testing.expect(physical < permuted.len);
         try std.testing.expect(!seen[physical]);
@@ -1608,7 +1608,7 @@ test "paged attention diff timing CV is deterministic and bounded" {
 test "paged attention diff packs F16 values and poisons unused rows" {
     const logical = [_]f32{ 1.0, -2.0 };
     const table = [_]u32{0};
-    var packed_values = [_]u8{0} ** 8;
+    var packed_values = @as([8]u8, @splat(0));
     packPagedValues(&packed_values, &logical, &table, 2, 2, .f16);
     const first_bits: u16 = @bitCast(@as(f16, 1.0));
     try std.testing.expectEqual(@as(u8, @truncate(first_bits)), packed_values[0]);

@@ -145,9 +145,10 @@ pub fn snapshot() ExecutionStats {
 
 pub fn delta(after: ExecutionStats, before: ExecutionStats) ExecutionStats {
     var result = after;
-    inline for (std.meta.fields(ExecutionStats)) |field| {
-        switch (@typeInfo(field.type)) {
-            .int => @field(result, field.name) = @field(after, field.name) -| @field(before, field.name),
+    const info = @typeInfo(ExecutionStats).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, Field| {
+        switch (@typeInfo(Field)) {
+            .int => @field(result, field_name) = @field(after, field_name) -| @field(before, field_name),
             else => {},
         }
     }
@@ -509,7 +510,7 @@ pub fn printPartitionFallbackOps(
 ) void {
     if (!enabled()) return;
 
-    var counts = [_]OpCount{.{}} ** 32;
+    var counts = @as([32]OpCount, @splat(.{}));
     var used: usize = 0;
     var fallback_nodes: usize = 0;
     var target_nodes: usize = 0;
@@ -613,19 +614,20 @@ test "executor stats wires every quant kernel plan counter" {
 
     try std.testing.expect(!hasQuantKernelPlanStats(.{}));
 
-    inline for (@typeInfo(ExecutionStats).@"struct".fields) |field| {
-        if (comptime std.mem.startsWith(u8, field.name, "quant_kernel_")) {
+    const info = @typeInfo(ExecutionStats).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, Field| {
+        if (comptime std.mem.startsWith(u8, field_name, "quant_kernel_")) {
             var stats = ExecutionStats{};
-            @field(stats, field.name) = 1;
+            @field(stats, field_name) = 1;
 
             try std.testing.expect(hasQuantKernelPlanStats(stats));
 
             record(stats);
             const aggregated = snapshot();
-            try std.testing.expectEqual(@as(field.type, 1), @field(aggregated, field.name));
+            try std.testing.expectEqual(@as(Field, 1), @field(aggregated, field_name));
 
             reset();
-            try std.testing.expectEqual(@as(field.type, 0), @field(snapshot(), field.name));
+            try std.testing.expectEqual(@as(Field, 0), @field(snapshot(), field_name));
         }
     }
 }

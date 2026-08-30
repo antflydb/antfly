@@ -1158,25 +1158,25 @@ test "heuristic result counts reject invalid library output" {
 test "heuristic fallback skips failed and oversized algorithms" {
     const heuristics = [_]MatmulHeuristicResult{
         .{
-            .algo = .{ .data = .{0} ** 8 },
+            .algo = .{ .data = @splat(0) },
             .workspace_size = 0,
             .state = 7,
             .waves_count = 0,
-            .reserved = .{0} ** 4,
+            .reserved = @splat(0),
         },
         .{
-            .algo = .{ .data = .{0} ** 8 },
+            .algo = .{ .data = @splat(0) },
             .workspace_size = 4096,
             .state = CUBLAS_STATUS_SUCCESS,
             .waves_count = 0,
-            .reserved = .{0} ** 4,
+            .reserved = @splat(0),
         },
         .{
-            .algo = .{ .data = .{0} ** 8 },
+            .algo = .{ .data = @splat(0) },
             .workspace_size = 1024,
             .state = CUBLAS_STATUS_SUCCESS,
             .waves_count = 0,
-            .reserved = .{0} ** 4,
+            .reserved = @splat(0),
         },
     };
     try std.testing.expectEqual(@as(?usize, 2), firstUsableHeuristicIndex(&heuristics, 2048));

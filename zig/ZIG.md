@@ -1,5 +1,19 @@
 # Zig Notes
 
+## 2026-08-29: Zig 0.17 nightly migration
+
+The repository is pinned to Zig `0.17.0-dev.1933+e19a73c2d`. Nightly archives
+come from `https://ziglang.org/builds/`, rather than the stable-release download
+directory.
+
+The migration includes the Zig 0.17 build-system argument API, parallel-array
+type reflection, splat-based array initialization, sentinel allocation and
+formatting APIs, the current `std.Io` networking operation interface, and
+build-system `translate-c` modules replacing the removed `@cImport` builtin.
+
+Use that exact compiler for repository builds so local results match CI and the
+container/release toolchains.
+
 ## 2026-04-20: freestanding wasm stdlib breakage in Zig 0.16
 
 This repo's embedded Antfly inference wasm build currently targets `wasm32-freestanding`.

@@ -941,7 +941,7 @@ fn readFileAllocAtPath(io: std.Io, path: []const u8, allocator: std.mem.Allocato
 
 fn loadFunction(ctx: *cuda_context.CudaContext, module: cuda_driver.CUmodule, name: []const u8) !cuda_driver.CUfunction {
     var name_buffer: [160]u8 = undefined;
-    const name_z = try std.fmt.bufPrintZ(&name_buffer, "{s}", .{name});
+    const name_z = try std.fmt.bufPrintSentinel(&name_buffer, "{s}", .{name}, 0);
     var function: cuda_driver.CUfunction = null;
     try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, name_z));
     return function orelse error.CudaKernelUnavailable;
@@ -1638,7 +1638,7 @@ test "default matrix covers production prefixes, policies, layouts, and stress p
     var hd256_q3: usize = 0;
     var hd512_q512: usize = 0;
     var hd512_q3: usize = 0;
-    var q512_prefix_counts = [_]usize{0} ** 4;
+    var q512_prefix_counts = @as([4]usize, @splat(0));
     for (specs) |spec| {
         if (spec.head_dim == 256 and spec.q_len == 512) hd256_q512 += 1;
         if (spec.head_dim == 256 and spec.q_len == 3) hd256_q3 += 1;
@@ -1706,7 +1706,7 @@ test "causal and SWA ranges cover production chunk boundaries" {
 
 test "identity, reversed, and permuted page packing preserve logical rows and poison slack" {
     const logical = [_]f16{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    var identity_dst = [_]f16{0} ** 12;
+    var identity_dst = @as([12]f16, @splat(0));
     try packPaged(&identity_dst, &logical, &.{}, 2);
     try std.testing.expectEqualSlices(f16, &logical, identity_dst[0..logical.len]);
     try std.testing.expectEqual(f16_poison_bits, @as(u16, @bitCast(identity_dst[logical.len])));
@@ -1714,7 +1714,7 @@ test "identity, reversed, and permuted page packing preserve logical rows and po
     var table = [_]u32{ 0, 0 };
     fillBlockTable(&table, .explicit_reversed);
     try std.testing.expectEqualSlices(u32, &.{ 1, 0 }, &table);
-    var paged_dst = [_]f16{0} ** (page_size * 2 * 2);
+    var paged_dst = @as([(page_size * 2 * 2)]f16, @splat(0));
     try packPaged(&paged_dst, &logical, &table, 2);
     for (0..4) |token| {
         const physical = try physicalToken(token, &table);
@@ -1728,7 +1728,7 @@ test "identity, reversed, and permuted page packing preserve logical rows and po
     var permuted_table = [_]u32{ 0, 0, 0, 0 };
     fillBlockTable(&permuted_table, .explicit_permuted);
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 0 }, &permuted_table);
-    var seen = [_]bool{false} ** permuted_table.len;
+    var seen = @as([permuted_table.len]bool, @splat(false));
     for (permuted_table) |physical_page| {
         try std.testing.expect(physical_page < seen.len);
         try std.testing.expect(!seen[physical_page]);

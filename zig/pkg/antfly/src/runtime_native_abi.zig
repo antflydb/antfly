@@ -26,7 +26,7 @@ pub const TypeContract = extern struct {
         return .{
             .alignment = @alignOf(T),
             .size = @sizeOf(T),
-            .bit_size = @bitSizeOf(T),
+            .bit_size = @sizeOf(T) * 8,
             .type_id = stableId(@typeName(T)),
             .layout_id = shallowLayoutId(T),
         };
@@ -119,33 +119,33 @@ pub fn shallowLayoutId(comptime T: type) u64 {
     var hash: u64 = stableId(@tagName(@typeInfo(T)));
     hashInteger(&hash, @sizeOf(T));
     hashInteger(&hash, @alignOf(T));
-    hashInteger(&hash, @bitSizeOf(T));
+    hashInteger(&hash, @sizeOf(T) * 8);
     switch (@typeInfo(T)) {
         .@"struct" => |structure| {
             hashBytes(&hash, @tagName(structure.layout));
-            inline for (structure.fields) |field| {
-                hashBytes(&hash, field.name);
-                hashBytes(&hash, @typeName(field.type));
-                hashInteger(&hash, @offsetOf(T, field.name));
-                hashInteger(&hash, @sizeOf(field.type));
-                hashInteger(&hash, @alignOf(field.type));
+            inline for (structure.field_names, structure.field_types) |field_name, Field| {
+                hashBytes(&hash, field_name);
+                hashBytes(&hash, @typeName(Field));
+                hashInteger(&hash, @offsetOf(T, field_name));
+                hashInteger(&hash, @sizeOf(Field));
+                hashInteger(&hash, @alignOf(Field));
             }
         },
         .@"union" => |value_union| {
             hashBytes(&hash, @tagName(value_union.layout));
             if (value_union.tag_type) |Tag| hashBytes(&hash, @typeName(Tag));
-            inline for (value_union.fields) |field| {
-                hashBytes(&hash, field.name);
-                hashBytes(&hash, @typeName(field.type));
-                hashInteger(&hash, @sizeOf(field.type));
-                hashInteger(&hash, @alignOf(field.type));
+            inline for (value_union.field_names, value_union.field_types) |field_name, Field| {
+                hashBytes(&hash, field_name);
+                hashBytes(&hash, @typeName(Field));
+                hashInteger(&hash, @sizeOf(Field));
+                hashInteger(&hash, @alignOf(Field));
             }
         },
         .@"enum" => |value_enum| {
             hashBytes(&hash, @typeName(value_enum.tag_type));
-            inline for (value_enum.fields) |field| {
-                hashBytes(&hash, field.name);
-                hashInteger(&hash, field.value);
+            inline for (value_enum.field_names, value_enum.field_values) |field_name, field_value| {
+                hashBytes(&hash, field_name);
+                hashInteger(&hash, field_value);
             }
         },
         .array => |array| {
@@ -160,9 +160,9 @@ pub fn shallowLayoutId(comptime T: type) u64 {
         .error_union => |error_union| hashBytes(&hash, @typeName(error_union.payload)),
         .pointer => |pointer| {
             hashBytes(&hash, @tagName(pointer.size));
-            hashInteger(&hash, pointer.alignment orelse @alignOf(pointer.child));
-            hashInteger(&hash, @intFromBool(pointer.is_const));
-            hashInteger(&hash, @intFromBool(pointer.is_volatile));
+            hashInteger(&hash, pointer.attrs.@"align" orelse @alignOf(pointer.child));
+            hashInteger(&hash, @intFromBool(pointer.attrs.@"const"));
+            hashInteger(&hash, @intFromBool(pointer.attrs.@"volatile"));
             hashBytes(&hash, @typeName(pointer.child));
         },
         .@"fn" => |function| {
@@ -195,11 +195,11 @@ fn hashInteger(hash: *u64, comptime value: anytype) void {
 
 pub fn assertUniqueMethodIds(comptime VTable: type) void {
     @setEvalBranchQuota(100_000);
-    const fields = std.meta.fields(VTable);
-    inline for (fields, 0..) |left, left_index| {
-        inline for (fields[left_index + 1 ..]) |right| {
-            if (stableId(left.name) == stableId(right.name))
-                @compileError("native ABI method-id collision between " ++ left.name ++ " and " ++ right.name);
+    const field_names = @typeInfo(VTable).@"struct".field_names;
+    inline for (field_names, 0..) |left, left_index| {
+        inline for (field_names[left_index + 1 ..]) |right| {
+            if (stableId(left) == stableId(right))
+                @compileError("native ABI method-id collision between " ++ left ++ " and " ++ right);
         }
     }
 }

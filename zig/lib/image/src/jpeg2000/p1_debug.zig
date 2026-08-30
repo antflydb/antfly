@@ -174,8 +174,8 @@ pub fn main() !void {
     var sum: i64 = 0;
     var clipped_hi: usize = 0;
     var clipped_lo: usize = 0;
-    var tile_max = [_]i32{0} ** 64;
-    var tile_max_idx = [_]usize{0} ** 64;
+    var tile_max = @as([64]i32, @splat(0));
+    var tile_max_idx = @as([64]usize, @splat(0));
     for (decoded.pixels, 0..) |sample, i| {
         if (sample == 4095) clipped_hi += 1;
         if (sample == 0) clipped_lo += 1;

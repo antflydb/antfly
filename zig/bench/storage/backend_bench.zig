@@ -204,7 +204,7 @@ const OpenedStore = union(enum) {
     fn openAfterClose(self: *OpenedStore, allocator: std.mem.Allocator, cfg: Config) !bool {
         switch (self.*) {
             .lmdb => |*opened| {
-                const path_z = try allocator.dupeZ(u8, opened.path);
+                const path_z = try allocator.dupeSentinel(u8, opened.path, 0);
                 defer allocator.free(path_z);
                 opened.backend = try antfly.lmdb_backend.Backend.open(allocator, path_z.ptr, .{
                     .backend = .{ .create_if_missing = true },
@@ -390,7 +390,7 @@ fn openBackend(allocator: std.mem.Allocator, selection: BackendSelection, cfg: C
         .lmdb => {
             const path = try tmpPath(allocator, "backend-bench-lmdb");
             errdefer allocator.free(path);
-            const path_z = try allocator.dupeZ(u8, path);
+            const path_z = try allocator.dupeSentinel(u8, path, 0);
             defer allocator.free(path_z);
             const backend = try antfly.lmdb_backend.Backend.open(allocator, path_z.ptr, .{
                 .backend = .{ .create_if_missing = true },

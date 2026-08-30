@@ -109,7 +109,7 @@ pub const MergedGroupStatus = struct {
     voter_count_known: bool = false,
     voter_count: u16 = 0,
     voter_set_known: bool = false,
-    voter_set_fingerprint: table_manager.VoterSetFingerprint = [_]u8{0} ** table_manager.voter_set_fingerprint_len,
+    voter_set_fingerprint: table_manager.VoterSetFingerprint = @as([table_manager.voter_set_fingerprint_len]u8, @splat(0)),
     healthy_voter_reports: u16 = 0,
     joint_consensus: bool = false,
     readiness_from_leader: bool = false,
@@ -1615,7 +1615,7 @@ const StoreEvidenceIndex = struct {
     const PlacementTopology = struct {
         member_count: usize = 0,
         voter_count: usize = 0,
-        voter_set_fingerprint: table_manager.VoterSetFingerprint = [_]u8{0} ** table_manager.voter_set_fingerprint_len,
+        voter_set_fingerprint: table_manager.VoterSetFingerprint = @as([table_manager.voter_set_fingerprint_len]u8, @splat(0)),
         initialized: bool = false,
         ambiguous: bool = false,
     };

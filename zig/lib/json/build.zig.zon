@@ -16,7 +16,7 @@
     .name = .antfly_json,
     .version = "0.0.1",
     .fingerprint = 0x1e032fe902c38c48,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0-dev.1933",
     .dependencies = .{},
     .paths = .{
         "build.zig",

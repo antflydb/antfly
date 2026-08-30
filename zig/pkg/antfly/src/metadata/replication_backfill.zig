@@ -46,9 +46,9 @@ const cutover_config_fingerprint_len = std.crypto.hash.sha2.Sha256.digest_length
 const postgres_identifier_max_len = 63;
 const exact_cutover_resource_suffix_len = "_af_".len + 16 + 1 + 16;
 const empty_cutover_config_fingerprint =
-    [_]u8{0} ** cutover_config_fingerprint_len;
+    @as([cutover_config_fingerprint_len]u8, @splat(0));
 const empty_cutover_provider_identity: foreign_mod.ExactCutoverIntent.ProviderIdentity =
-    [_]u8{0} ** cutover_config_fingerprint_len;
+    @as([cutover_config_fingerprint_len]u8, @splat(0));
 
 /// A runtime-owned CDC job must continuously prove that it still owns the
 /// replicated reconciliation lease. Provider calls receive a bounded deadline,
@@ -3835,7 +3835,7 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
             if (platform_time.monotonicNs() >= execution_deadline_ns) return error.Timeout;
             Parent.exact_cutover_calls += 1;
             if (params.exact_cutover_intent) |intent| try intent.persist(
-                [_]u8{0x7a} ** cutover_config_fingerprint_len,
+                @as([cutover_config_fingerprint_len]u8, @splat(0x7a)),
             );
             const session = try inner_alloc.create(SnapshotSession);
             session.* = .{};
@@ -4786,13 +4786,13 @@ test "metadata replication backfill durably retries interrupted exact cutover ow
             if (calls == 2) {
                 reclaimed_on_retry = params.reclaim_exact_cutover_slot;
                 if (params.exact_cutover_intent) |intent| try intent.persist(
-                    [_]u8{0x7a} ** cutover_config_fingerprint_len,
+                    @as([cutover_config_fingerprint_len]u8, @splat(0x7a)),
                 );
                 return error.ExactCutoverCleanupPending;
             }
             if (calls == 3) reclaimed_on_provider_mismatch = params.reclaim_exact_cutover_slot;
             if (params.exact_cutover_intent) |intent| try intent.persist(
-                [_]u8{if (calls == 3) 0x7b else 0x7a} ** cutover_config_fingerprint_len,
+                @as([cutover_config_fingerprint_len]u8, @splat(if (calls == 3) 0x7b else 0x7a)),
             );
             return error.ForeignConnectionFailed;
         }
@@ -5110,7 +5110,7 @@ test "metadata replication stream applies insert update and delete through bound
     };
 
     const physical_slot_name = "antfly_postgres_users_docs_af_0000000000000042";
-    const ownership_fingerprint = [_]u8{0x5c} ** cutover_config_fingerprint_len;
+    const ownership_fingerprint = @as([cutover_config_fingerprint_len]u8, @splat(0x5c));
     const existing_status = metadata_table_manager.ReplicationSourceStatusRecord{
         .table_id = 11,
         .source_ordinal = 0,
@@ -5124,7 +5124,7 @@ test "metadata replication stream applies insert update and delete through bound
         .cutover_intent_id = 0x42,
         .cutover_authority_id = 0x43,
         .cutover_config_fingerprint = ownership_fingerprint,
-        .cutover_provider_identity = [_]u8{0x7a} ** cutover_config_fingerprint_len,
+        .cutover_provider_identity = @as([cutover_config_fingerprint_len]u8, @splat(0x7a)),
     };
     try status_sink.upsertReplicationSourceStatus(existing_status);
     const summary = try runner.runTableSourceFromCheckpoint(&status_sink, .{
@@ -5151,7 +5151,7 @@ test "metadata replication stream applies insert update and delete through bound
     try std.testing.expectEqual(@as(u64, 0x43), status_sink.records.items[status_sink.records.items.len - 1].cutover_authority_id);
     try std.testing.expectEqualSlices(
         u8,
-        &([_]u8{0x7a} ** cutover_config_fingerprint_len),
+        &(@as([cutover_config_fingerprint_len]u8, @splat(0x7a))),
         &status_sink.records.items[status_sink.records.items.len - 1].cutover_provider_identity,
     );
     try std.testing.expectEqualSlices(

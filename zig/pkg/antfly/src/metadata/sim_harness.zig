@@ -1848,7 +1848,7 @@ fn buildHealthyStoreStatusReports(
         var leader_store_id: ?u64 = null;
         var voter_set_known = false;
         var voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint =
-            [_]u8{0} ** metadata_table_manager.voter_set_fingerprint_len;
+            @as([metadata_table_manager.voter_set_fingerprint_len]u8, @splat(0));
         for (projected_intents) |intent| {
             if (intent.record.group_id != base_status.group_id) continue;
             if (intent.store_id == 0) continue;
@@ -3990,10 +3990,10 @@ fn hashPlacementIntent(hasher: *std.hash.Wyhash, intent: raft_reconciler.Placeme
     hashPlacementU64(hasher, intent.record.group_id);
     hashPlacementU64(hasher, intent.record.replica_id);
     hashPlacementU64(hasher, intent.record.local_node_id);
-    hashPlacementU64(hasher, @intFromEnum(intent.record.bootstrap_mode));
+    hashPlacementU64(hasher, @backingInt(intent.record.bootstrap_mode));
     hashPlacementU64(hasher, intent.record.metadata_version);
     hashPlacementU64(hasher, intent.store_id);
-    hashPlacementU64(hasher, @intFromEnum(intent.serving_state));
+    hashPlacementU64(hasher, @backingInt(intent.serving_state));
     hashPlacementU64(hasher, intent.relocation_generation);
     hashPlacementU64(hasher, intent.relocation_source_node_id);
     hashPlacementU64(hasher, intent.relocation_source_store_id);
@@ -5319,7 +5319,7 @@ fn metadataVoprRunRandomTransportActions(
 ) !void {
     const action_count = std.meta.tags(MetadataVoprAction).len;
     for (0..count) |_| {
-        const action = @as(MetadataVoprAction, @enumFromInt(random.intRangeLessThan(u32, 0, @intCast(action_count))));
+        const action = @as(MetadataVoprAction, @fromBackingInt(@intCast(random.intRangeLessThan(u32, 0, @intCast(action_count)))));
         metadataVoprRunAction(cluster, random, cfg, state, operation_index.*, action) catch |err| {
             metadataVoprReportFailure(cfg, operation_index.*, action, err);
             return err;

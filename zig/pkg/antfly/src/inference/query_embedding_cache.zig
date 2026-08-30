@@ -447,7 +447,7 @@ pub fn testOwnedValuesAndHits() !void {
     var cache = QueryEmbeddingCache.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), .{});
     defer cache.deinit(&budget);
     var compute = TestCompute{ .value = 4 };
-    const key: Key = [_]u8{7} ** 32;
+    const key: Key = @as([32]u8, @splat(7));
 
     const first = try cache.getOrCompute(&budget, std.testing.allocator, key, null, &compute, TestCompute.run);
     defer std.testing.allocator.free(first);
@@ -499,7 +499,7 @@ pub fn testConcurrentCoalescing() !void {
     var cache = QueryEmbeddingCache.init(std.heap.page_allocator, compute_io.io(), .{ .max_bytes = 0 });
     defer cache.deinit(&budget);
     var compute = SlowCompute{ .io = compute_io.io() };
-    const key: Key = [_]u8{9} ** 32;
+    const key: Key = @as([32]u8, @splat(9));
     var first = Worker{ .cache = &cache, .budget = &budget, .compute = &compute, .key = key };
     var second = Worker{ .cache = &cache, .budget = &budget, .compute = &compute, .key = key };
 
@@ -568,12 +568,12 @@ pub fn testInflightAdmissionBound() !void {
     var cache = QueryEmbeddingCache.init(std.heap.page_allocator, compute_io.io(), .{ .max_bytes = 0, .max_inflight = 1 });
     defer cache.deinit(&budget);
     var compute = BlockingCompute{ .io = compute_io.io() };
-    var producer = Worker{ .cache = &cache, .budget = &budget, .compute = &compute, .key = [_]u8{1} ** 32 };
+    var producer = Worker{ .cache = &cache, .budget = &budget, .compute = &compute, .key = @as([32]u8, @splat(1)) };
     const producer_thread = try std.Thread.spawn(.{}, Worker.run, .{&producer});
     while (compute.calls.load(.acquire) == 0) std.atomic.spinLoopHint();
     const releaser_thread = try std.Thread.spawn(.{}, Releaser.run, .{&compute});
 
-    const producer_key: Key = [_]u8{1} ** 32;
+    const producer_key: Key = @as([32]u8, @splat(1));
     try std.testing.expectError(
         error.Timeout,
         cache.getOrCompute(
@@ -585,7 +585,7 @@ pub fn testInflightAdmissionBound() !void {
             BlockingCompute.run,
         ),
     );
-    const rejected_key: Key = [_]u8{2} ** 32;
+    const rejected_key: Key = @as([32]u8, @splat(2));
     try std.testing.expectError(
         error.QueryEmbeddingOverloaded,
         cache.getOrCompute(&budget, std.testing.allocator, rejected_key, null, &compute, BlockingCompute.run),
@@ -638,7 +638,7 @@ pub fn testDisabledCacheRetainsAdmissionBound() !void {
             self.result = self.cache.getOrCompute(
                 self.budget,
                 std.heap.page_allocator,
-                [_]u8{1} ** 32,
+                @as([32]u8, @splat(1)),
                 null,
                 self.compute,
                 BlockingCompute.run,
@@ -664,7 +664,7 @@ pub fn testDisabledCacheRetainsAdmissionBound() !void {
 
     try std.testing.expectError(
         error.QueryEmbeddingOverloaded,
-        cache.getOrCompute(&budget, std.testing.allocator, [_]u8{2} ** 32, null, &compute, BlockingCompute.run),
+        cache.getOrCompute(&budget, std.testing.allocator, @as([32]u8, @splat(2)), null, &compute, BlockingCompute.run),
     );
     try std.testing.expectEqual(@as(usize, 1), cache.stats(&budget).inflight);
 
@@ -693,7 +693,7 @@ pub fn testFlightBookkeepingOOMFailsClosed() !void {
     failing.fail_index = failing.alloc_index;
     try std.testing.expectError(
         error.OutOfMemory,
-        cache.getOrCompute(&budget, std.testing.allocator, [_]u8{8} ** 32, null, &compute, TestCompute.run),
+        cache.getOrCompute(&budget, std.testing.allocator, @as([32]u8, @splat(8)), null, &compute, TestCompute.run),
     );
     try std.testing.expectEqual(@as(u64, 0), compute.calls.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), cache.stats(&budget).rejected_admissions);
@@ -709,8 +709,8 @@ pub fn testByteBudgetEviction() !void {
     var cache = QueryEmbeddingCache.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), .{ .max_bytes = one_entry_bytes });
     defer cache.deinit(&budget);
     var compute = TestCompute{ .value = 8 };
-    const first_key: Key = [_]u8{1} ** 32;
-    const second_key: Key = [_]u8{2} ** 32;
+    const first_key: Key = @as([32]u8, @splat(1));
+    const second_key: Key = @as([32]u8, @splat(2));
 
     const first = try cache.getOrCompute(&budget, std.testing.allocator, first_key, null, &compute, TestCompute.run);
     std.testing.allocator.free(first);
@@ -739,7 +739,7 @@ pub fn testPinnedHitRetainsBudgetUntilCopyCompletes() !void {
     var cache = QueryEmbeddingCache.init(std.testing.allocator, io, .{});
     defer cache.deinit(&budget);
     var compute = TestCompute{ .value = 5 };
-    const key: Key = [_]u8{4} ** 32;
+    const key: Key = @as([32]u8, @splat(4));
 
     const result = try cache.getOrCompute(&budget, std.testing.allocator, key, null, &compute, TestCompute.run);
     std.testing.allocator.free(result);
@@ -775,7 +775,7 @@ pub fn testStatsExpireIdleEntries() !void {
     var cache = QueryEmbeddingCache.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), .{ .ttl_ns = 0 });
     defer cache.deinit(&budget);
     var compute = TestCompute{ .value = 3 };
-    const key: Key = [_]u8{3} ** 32;
+    const key: Key = @as([32]u8, @splat(3));
 
     const result = try cache.getOrCompute(&budget, std.testing.allocator, key, null, &compute, TestCompute.run);
     std.testing.allocator.free(result);
@@ -798,7 +798,7 @@ pub fn testStatsBoundExpirationWork() !void {
     var compute = TestCompute{ .value = 3 };
 
     for (0..300) |i| {
-        var key: Key = [_]u8{0} ** 32;
+        var key: Key = @as([32]u8, @splat(0));
         key[0] = @intCast(i & 0xff);
         key[1] = @intCast(i >> 8);
         const result = try cache.getOrCompute(&budget, std.testing.allocator, key, null, &compute, TestCompute.run);

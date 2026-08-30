@@ -1833,7 +1833,7 @@ pub const IndexWriter = struct {
             .name = "content",
             .sections = sections[0..],
         }};
-        const data = [_]u8{0} ** 64;
+        const data = @as([64]u8, @splat(0));
         const reader = segment_mod.SegmentReader{
             .alloc = std.testing.allocator,
             .data = &data,
@@ -2504,7 +2504,7 @@ test "resource-managed mapped residency evicts cold segments and preserves hot m
     defer alloc.free(seg_bytes);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.full_text_segment_residency)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_segment_residency)] = .{
         .soft_limit_bytes = @intCast(seg_bytes.len),
         .hard_limit_bytes = @intCast(seg_bytes.len * 8),
     };

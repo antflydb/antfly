@@ -33,7 +33,7 @@ pub const LsmMutableSnapshotReason = enum(u8) {
     bulk_current_scan,
 };
 
-pub const lsm_mutable_snapshot_reason_count = @typeInfo(LsmMutableSnapshotReason).@"enum".fields.len;
+pub const lsm_mutable_snapshot_reason_count = @typeInfo(LsmMutableSnapshotReason).@"enum".field_names.len;
 
 pub const LsmMutableSnapshotCloneReasonStats = struct {
     calls: u64 = 0,
@@ -56,7 +56,7 @@ pub const LsmOwnerCloneStats = struct {
     /// attribution record. This is a counter, not owner residency.
     labels_collapsed_total: u64 = 0,
     by_reason: [lsm_mutable_snapshot_reason_count]LsmMutableSnapshotCloneReasonStats =
-        [_]LsmMutableSnapshotCloneReasonStats{.{}} ** lsm_mutable_snapshot_reason_count,
+        @as([lsm_mutable_snapshot_reason_count]LsmMutableSnapshotCloneReasonStats, @splat(.{})),
 
     pub fn accumulate(self: *@This(), other: @This()) void {
         self.calls +|= other.calls;
@@ -1633,7 +1633,7 @@ test "backend runtime threaded durable lane sees initialized jobs" {
     defer handle.deinit();
 
     const owner_id = try handle.ptr().allocOwnerId();
-    var ctxs: [64]Ctx = [_]Ctx{.{}} ** 64;
+    var ctxs: [64]Ctx = @as([64]Ctx, @splat(.{}));
     for (&ctxs) |*ctx| {
         try handle.ptr().durable_jobs.submit(.{
             .owner_id = owner_id,
@@ -1672,7 +1672,7 @@ test "backend runtime retains LSM owner clone counters across generations" {
         .peak_bytes = 768,
         .bulk_current_scan_peak_active_bytes = 512,
     };
-    first.by_reason[@intFromEnum(LsmMutableSnapshotReason.bulk_current_scan)] = .{
+    first.by_reason[@backingInt(LsmMutableSnapshotReason.bulk_current_scan)] = .{
         .calls = 2,
         .bytes_total = 1024,
         .peak_bytes = 768,

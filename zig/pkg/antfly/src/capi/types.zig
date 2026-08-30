@@ -84,7 +84,7 @@ pub const OpenOptions = extern struct {
     ttl_cleanup_lease_ttl_ms: u64 = 0,
     ttl_cleanup_interval_ms: u64 = 0,
     ttl_cleanup_grace_period_ns: u64 = 0,
-    reserved: [8]u64 = .{0} ** 8,
+    reserved: [8]u64 = @splat(0),
 };
 
 pub const LiteOpenOptions = extern struct {
@@ -100,7 +100,7 @@ pub const LiteOpenOptions = extern struct {
     ttl_cleanup_lease_ttl_ms: u64 = 0,
     ttl_cleanup_interval_ms: u64 = 0,
     ttl_cleanup_grace_period_ns: u64 = 0,
-    reserved: [8]u64 = .{0} ** 8,
+    reserved: [8]u64 = @splat(0),
 };
 
 pub const DenseSearchHit = extern struct {
@@ -208,28 +208,28 @@ pub const ErrorCode = enum(c_int) {
 
 pub fn errorCodeName(code: c_int) [*:0]const u8 {
     return switch (code) {
-        @intFromEnum(ErrorCode.ok) => "ANTFLY_OK",
-        @intFromEnum(ErrorCode.invalid_argument) => "ANTFLY_INVALID_ARGUMENT",
-        @intFromEnum(ErrorCode.not_found) => "ANTFLY_NOT_FOUND",
-        @intFromEnum(ErrorCode.version_conflict) => "ANTFLY_VERSION_CONFLICT",
-        @intFromEnum(ErrorCode.intent_conflict) => "ANTFLY_INTENT_CONFLICT",
-        @intFromEnum(ErrorCode.txn_not_found) => "ANTFLY_TXN_NOT_FOUND",
-        @intFromEnum(ErrorCode.busy) => "ANTFLY_BUSY",
-        @intFromEnum(ErrorCode.internal) => "ANTFLY_INTERNAL",
+        @backingInt(ErrorCode.ok) => "ANTFLY_OK",
+        @backingInt(ErrorCode.invalid_argument) => "ANTFLY_INVALID_ARGUMENT",
+        @backingInt(ErrorCode.not_found) => "ANTFLY_NOT_FOUND",
+        @backingInt(ErrorCode.version_conflict) => "ANTFLY_VERSION_CONFLICT",
+        @backingInt(ErrorCode.intent_conflict) => "ANTFLY_INTENT_CONFLICT",
+        @backingInt(ErrorCode.txn_not_found) => "ANTFLY_TXN_NOT_FOUND",
+        @backingInt(ErrorCode.busy) => "ANTFLY_BUSY",
+        @backingInt(ErrorCode.internal) => "ANTFLY_INTERNAL",
         else => "ANTFLY_UNKNOWN_ERROR",
     };
 }
 
 pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
     return switch (code) {
-        @intFromEnum(ErrorCode.ok) => "operation completed successfully",
-        @intFromEnum(ErrorCode.invalid_argument) => "an argument, request, path, or open mode is invalid",
-        @intFromEnum(ErrorCode.not_found) => "the requested database object was not found",
-        @intFromEnum(ErrorCode.version_conflict) => "a version predicate did not match the current document version",
-        @intFromEnum(ErrorCode.intent_conflict) => "a transaction intent conflicts with the requested operation",
-        @intFromEnum(ErrorCode.txn_not_found) => "the requested transaction was not found",
-        @intFromEnum(ErrorCode.busy) => "the database is temporarily busy or a writer is already active",
-        @intFromEnum(ErrorCode.internal) => "an internal error occurred",
+        @backingInt(ErrorCode.ok) => "operation completed successfully",
+        @backingInt(ErrorCode.invalid_argument) => "an argument, request, path, or open mode is invalid",
+        @backingInt(ErrorCode.not_found) => "the requested database object was not found",
+        @backingInt(ErrorCode.version_conflict) => "a version predicate did not match the current document version",
+        @backingInt(ErrorCode.intent_conflict) => "a transaction intent conflicts with the requested operation",
+        @backingInt(ErrorCode.txn_not_found) => "the requested transaction was not found",
+        @backingInt(ErrorCode.busy) => "the database is temporarily busy or a writer is already active",
+        @backingInt(ErrorCode.internal) => "an internal error occurred",
         else => "unknown Antfly error code",
     };
 }

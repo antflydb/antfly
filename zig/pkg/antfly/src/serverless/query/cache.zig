@@ -2259,7 +2259,7 @@ test "serverless query cache rejects same-size corrupted range and block records
         .payload,
     );
     defer alloc.free(block_path);
-    const corrupt_record = [_]u8{'x'} ** (cache_record_header_len + 3);
+    const corrupt_record = @as([(cache_record_header_len + 3)]u8, @splat('x'));
     try overwriteFile(range_path, &corrupt_record);
     try overwriteFile(block_path, &corrupt_record);
     // Force the first corrupt read through shared reconciliation. Both records

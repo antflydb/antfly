@@ -1054,7 +1054,7 @@ pub const NativeFile = struct {
         // Free-map pages are rewritten every commit and read once, so caching
         // them buys nothing; skipping them also keeps free-map validation
         // reading disk truth before any pages are handed out for reuse.
-        if (use_cache and page.len > 4 and page[4] != @intFromEnum(PageKind.free_map)) {
+        if (use_cache and page.len > 4 and page[4] != @backingInt(PageKind.free_map)) {
             self.page_cache.put(self.allocator, page_id, page);
         }
         return page;
@@ -1808,7 +1808,7 @@ pub const NativeFile = struct {
         var out: std.Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
         try out.writer.writeAll(namespace_directory_magic);
-        try out.writer.writeByte(@intFromEnum(kind));
+        try out.writer.writeByte(@backingInt(kind));
         try out.writer.writeInt(u32, std.math.cast(u32, directory.count()) orelse return error.RecordTooLarge, .little);
         var it = directory.iterator();
         while (it.next()) |entry| {
@@ -4148,7 +4148,7 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const active_hint = header_raw[active_checkpoint_offset];
 
     var checkpoints: [checkpoint_slot_count]CheckpointSlot = undefined;
-    var valid_slots: [checkpoint_slot_count]bool = .{false} ** checkpoint_slot_count;
+    var valid_slots: [checkpoint_slot_count]bool = @splat(false);
     for (&checkpoints, 0..) |*slot, index| {
         slot.* = decodeCheckpointSlot(header_raw[checkpointOffset(index)..][0..checkpoint_slot_size]) catch {
             slot.* = .{};
@@ -4275,7 +4275,7 @@ fn encodePage(out: []u8, kind: PageKind, payload: []const u8) void {
     std.debug.assert(payload.len <= out.len - page_header_size);
     @memset(out, 0);
     @memcpy(out[0..page_magic.len], page_magic);
-    out[4] = @intFromEnum(kind);
+    out[4] = @backingInt(kind);
     std.mem.writeInt(u32, out[8..12], @intCast(payload.len), .little);
     @memcpy(out[page_header_size..][0..payload.len], payload);
 
@@ -4290,12 +4290,12 @@ fn decodePagePayloadAlloc(allocator: Allocator, raw: []const u8, expected_kind: 
     if (!std.mem.eql(u8, raw[0..page_magic.len], page_magic)) return error.InvalidNativePageMagic;
     const kind_raw = raw[4];
     const kind: PageKind = switch (kind_raw) {
-        @intFromEnum(PageKind.data) => .data,
-        @intFromEnum(PageKind.catalog) => .catalog,
-        @intFromEnum(PageKind.document) => .document,
-        @intFromEnum(PageKind.value) => .value,
-        @intFromEnum(PageKind.free_map) => .free_map,
-        @intFromEnum(PageKind.document_index) => .document_index,
+        @backingInt(PageKind.data) => .data,
+        @backingInt(PageKind.catalog) => .catalog,
+        @backingInt(PageKind.document) => .document,
+        @backingInt(PageKind.value) => .value,
+        @backingInt(PageKind.free_map) => .free_map,
+        @backingInt(PageKind.document_index) => .document_index,
         else => return error.InvalidNativePageKind,
     };
     if (kind != expected_kind) return error.UnexpectedNativePageKind;
@@ -4494,7 +4494,7 @@ fn encodeDocumentIndexNode(allocator: Allocator, node: DocumentIndexNode) ![]u8 
     const out = try allocator.alloc(u8, size);
     errdefer allocator.free(out);
     @memcpy(out[0..document_index_magic.len], document_index_magic);
-    out[8] = @intFromEnum(node.kind);
+    out[8] = @backingInt(node.kind);
     out[9] = 0;
     std.mem.writeInt(u16, out[10..12], @intCast(node.keys.len), .little);
     var pos: usize = document_index_header_size;
@@ -4519,8 +4519,8 @@ fn decodeDocumentIndexNode(allocator: Allocator, raw: []const u8) !DocumentIndex
     if (raw.len < document_index_header_size or !std.mem.eql(u8, raw[0..8], document_index_magic))
         return error.InvalidDocumentIndex;
     const kind: DocumentIndexNodeKind = switch (raw[8]) {
-        @intFromEnum(DocumentIndexNodeKind.leaf) => .leaf,
-        @intFromEnum(DocumentIndexNodeKind.internal) => .internal,
+        @backingInt(DocumentIndexNodeKind.leaf) => .leaf,
+        @backingInt(DocumentIndexNodeKind.internal) => .internal,
         else => return error.InvalidDocumentIndex,
     };
     if (raw[9] != 0) return error.InvalidDocumentIndex;
@@ -6665,11 +6665,11 @@ test "lite native page and link caches shrink under hard resource pressure" {
     const allocator = std.testing.allocator;
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lite_native_page_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.lite_native_page_cache)] = .{
         .soft_limit_bytes = 4,
         .hard_limit_bytes = 8,
     };
-    budgets[@intFromEnum(resource_manager_mod.Slice.lite_native_link_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.lite_native_link_cache)] = .{
         .soft_limit_bytes = 4,
         .hard_limit_bytes = 8,
     };

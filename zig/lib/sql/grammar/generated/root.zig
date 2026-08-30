@@ -194831,20 +194831,20 @@ pub const Token = enum {
 };
 
 pub fn tokenId(token: Token) u16 {
-    return @intFromEnum(token) + 1;
+    return @backingInt(token) + 1;
 }
 
 pub fn terminalIdByName(name: []const u8) ?u16 {
-    inline for (std.meta.fields(Token)) |field| {
-        if (std.mem.eql(u8, field.name, name)) return @intFromEnum(@field(Token, field.name)) + 1;
+    inline for (@typeInfo(Token).@"enum".field_names) |field_name| {
+        if (std.mem.eql(u8, field_name, name)) return @backingInt(@field(Token, field_name)) + 1;
     }
     return null;
 }
 
 pub fn terminalName(terminal: u16) ?[]const u8 {
     if (terminal == 0) return "$end";
-    inline for (std.meta.fields(Token)) |field| {
-        if (terminal == @intFromEnum(@field(Token, field.name)) + 1) return field.name;
+    inline for (@typeInfo(Token).@"enum".field_names) |field_name| {
+        if (terminal == @backingInt(@field(Token, field_name)) + 1) return field_name;
     }
     return null;
 }

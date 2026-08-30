@@ -799,7 +799,7 @@ pub const Cache = struct {
     /// Coalesce duplicate exact-vector publication and keep cloning outside
     /// the global map/admission lock. These locks do not guard visibility;
     /// the map lock plus HBC's mutation epoch remain authoritative.
-    vector_fill_mutexes: [shared_vector_fill_stripe_count]std.atomic.Mutex = .{.unlocked} ** shared_vector_fill_stripe_count,
+    vector_fill_mutexes: [shared_vector_fill_stripe_count]std.atomic.Mutex = @splat(.unlocked),
     global_stats: HbcCacheStats = .{},
     namespace_stats: std.AutoHashMapUnmanaged(u64, HbcCacheStats) = .empty,
     node_cache: std.AutoHashMapUnmanaged(HbcSharedCacheKey, *NodeCacheEntry) = .empty,
@@ -2263,8 +2263,8 @@ pub const HBCIndex = struct {
     // without retaining one version record per vector. A dirty stripe is odd;
     // commit/abort publication returns it to even. Existing keys in the same
     // stripe remain usable because only miss admission consults this fence.
-    vector_cache_fill_epochs: [vector_cache_fill_stripe_count]std.atomic.Value(u64) = .{std.atomic.Value(u64).init(0)} ** vector_cache_fill_stripe_count,
-    vector_cache_fill_dirty: [vector_cache_fill_dirty_word_count]std.atomic.Value(u64) = .{std.atomic.Value(u64).init(0)} ** vector_cache_fill_dirty_word_count,
+    vector_cache_fill_epochs: [vector_cache_fill_stripe_count]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
+    vector_cache_fill_dirty: [vector_cache_fill_dirty_word_count]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
     hbc_cache_bytes_accounted: u64 = 0,
     detached_hbc_accounting: HbcPhysicalAccounting = .{},
     search_workspace_bytes_accounted: u64 = 0,
@@ -2277,7 +2277,7 @@ pub const HBCIndex = struct {
     deferred_node_key_value_bytes: u64 = 0,
     deferred_oversized_leaves_peak: u64 = 0,
     bulk_split_vector_workspace: SplitVectorWorkspace = .{},
-    hbc_cache_kind_stats: [hbc_cache_kind_count]HbcCacheKindStats = .{HbcCacheKindStats{}} ** hbc_cache_kind_count,
+    hbc_cache_kind_stats: [hbc_cache_kind_count]HbcCacheKindStats = @splat(HbcCacheKindStats{}),
     deferred_quantized_nodes: std.AutoHashMapUnmanaged(u64, void),
     deferred_node_keys: std.AutoHashMapUnmanaged(u128, DeferredNodeValue),
     deferred_oversized_leaves: std.AutoHashMapUnmanaged(u64, void),
@@ -2935,7 +2935,7 @@ pub const HBCIndex = struct {
                             .leaf_size = config.leaf_size,
                             .use_quantization = config.use_quantization,
                             .quantizer_seed = config.quantizer_seed,
-                            .metric = @as(u8, @intCast(@intFromEnum(config.metric))),
+                            .metric = @as(u8, @intCast(@backingInt(config.metric))),
                         };
 
                         var meta_buf: [IndexMetadata.encoded_size]u8 = undefined;
@@ -2970,9 +2970,9 @@ pub const HBCIndex = struct {
         if (metadata.dims != config.dims) return error.DimensionMismatch;
 
         const stored_metric: vec.DistanceMetric = switch (metadata.metric) {
-            @intCast(@intFromEnum(vec.DistanceMetric.l2_squared)) => .l2_squared,
-            @intCast(@intFromEnum(vec.DistanceMetric.inner_product)) => .inner_product,
-            @intCast(@intFromEnum(vec.DistanceMetric.cosine)) => .cosine,
+            @intCast(@backingInt(vec.DistanceMetric.l2_squared)) => .l2_squared,
+            @intCast(@backingInt(vec.DistanceMetric.inner_product)) => .inner_product,
+            @intCast(@backingInt(vec.DistanceMetric.cosine)) => .cosine,
             else => return error.Corrupted,
         };
         if (stored_metric != config.metric) return error.DistanceMetricMismatch;
@@ -3093,7 +3093,7 @@ pub const HBCIndex = struct {
             .deferred_node_key_value_bytes = 0,
             .deferred_oversized_leaves_peak = 0,
             .bulk_split_vector_workspace = .{},
-            .hbc_cache_kind_stats = .{HbcCacheKindStats{}} ** hbc_cache_kind_count,
+            .hbc_cache_kind_stats = @splat(HbcCacheKindStats{}),
             .deferred_quantized_nodes = .empty,
             .deferred_node_keys = .empty,
             .deferred_oversized_leaves = .empty,
@@ -4193,15 +4193,15 @@ pub const HBCIndex = struct {
     }
 
     fn refreshHbcCacheKindBytes(self: *HBCIndex) u64 {
-        var bytes: [hbc_cache_kind_count]u64 = .{0} ** hbc_cache_kind_count;
+        var bytes: [hbc_cache_kind_count]u64 = @splat(0);
         var node_it = self.node_cache.iterator();
-        while (node_it.next()) |entry| bytes[@intFromEnum(HbcCacheKind.node)] +|= estimateNodeCacheBytes(&entry.value_ptr.*.node);
+        while (node_it.next()) |entry| bytes[@backingInt(HbcCacheKind.node)] +|= estimateNodeCacheBytes(&entry.value_ptr.*.node);
         var quantized_it = self.quantized_cache.iterator();
-        while (quantized_it.next()) |entry| bytes[@intFromEnum(HbcCacheKind.quantized)] +|= estimateQuantizedCacheBytes(&entry.value_ptr.*.quantized);
+        while (quantized_it.next()) |entry| bytes[@backingInt(HbcCacheKind.quantized)] +|= estimateQuantizedCacheBytes(&entry.value_ptr.*.quantized);
         var vector_it = self.vector_cache.iterator();
-        while (vector_it.next()) |entry| bytes[@intFromEnum(HbcCacheKind.vector)] +|= estimateVectorCacheBytes(entry.value_ptr.*.vector);
+        while (vector_it.next()) |entry| bytes[@backingInt(HbcCacheKind.vector)] +|= estimateVectorCacheBytes(entry.value_ptr.*.vector);
         var metadata_it = self.metadata_cache.iterator();
-        while (metadata_it.next()) |entry| bytes[@intFromEnum(HbcCacheKind.metadata)] +|= estimateMetadataCacheBytes(entry.value_ptr.*.metadata);
+        while (metadata_it.next()) |entry| bytes[@backingInt(HbcCacheKind.metadata)] +|= estimateMetadataCacheBytes(entry.value_ptr.*.metadata);
 
         var total: u64 = 0;
         for (bytes, 0..) |used_bytes, i| {
@@ -4222,11 +4222,11 @@ pub const HBCIndex = struct {
     }
 
     fn noteHbcCacheInsertion(self: *HBCIndex, kind: HbcCacheKind) void {
-        self.hbc_cache_kind_stats[@intFromEnum(kind)].insertions += 1;
+        self.hbc_cache_kind_stats[@backingInt(kind)].insertions += 1;
     }
 
     fn noteHbcCacheLookup(self: *HBCIndex, kind: HbcCacheKind, hit: bool) void {
-        const counters = &self.hbc_cache_kind_stats[@intFromEnum(kind)];
+        const counters = &self.hbc_cache_kind_stats[@backingInt(kind)];
         if (hit) {
             _ = @atomicRmw(u64, &counters.hits, .Add, 1, .monotonic);
         } else {
@@ -4235,11 +4235,11 @@ pub const HBCIndex = struct {
     }
 
     fn noteHbcCacheAdmissionSkip(self: *HBCIndex, kind: HbcCacheKind) void {
-        self.hbc_cache_kind_stats[@intFromEnum(kind)].admission_skips += 1;
+        self.hbc_cache_kind_stats[@backingInt(kind)].admission_skips += 1;
     }
 
     fn noteHbcCacheEviction(self: *HBCIndex, kind: HbcCacheKind) void {
-        self.hbc_cache_kind_stats[@intFromEnum(kind)].evictions += 1;
+        self.hbc_cache_kind_stats[@backingInt(kind)].evictions += 1;
     }
 
     pub fn hbcCacheStats(self: *HBCIndex) HbcCacheStats {
@@ -4251,10 +4251,10 @@ pub const HBCIndex = struct {
             .total_bytes = total_bytes,
             .accounted_bytes = self.hbc_cache_bytes_accounted +| self.detached_hbc_accounting.current(),
             .pinned_bytes = self.detached_hbc_accounting.pinned_bytes.load(.monotonic),
-            .node = self.hbc_cache_kind_stats[@intFromEnum(HbcCacheKind.node)],
-            .quantized = self.hbc_cache_kind_stats[@intFromEnum(HbcCacheKind.quantized)],
-            .vector = self.hbc_cache_kind_stats[@intFromEnum(HbcCacheKind.vector)],
-            .metadata = self.hbc_cache_kind_stats[@intFromEnum(HbcCacheKind.metadata)],
+            .node = self.hbc_cache_kind_stats[@backingInt(HbcCacheKind.node)],
+            .quantized = self.hbc_cache_kind_stats[@backingInt(HbcCacheKind.quantized)],
+            .vector = self.hbc_cache_kind_stats[@backingInt(HbcCacheKind.vector)],
+            .metadata = self.hbc_cache_kind_stats[@backingInt(HbcCacheKind.metadata)],
         };
     }
 
@@ -4576,13 +4576,13 @@ pub const HBCIndex = struct {
         if (key.len != 12) return null;
         if (key[0] != 'n' or key[1] != ':' or key[10] != ':') return null;
         const suffix: Suffix = switch (key[11]) {
-            @intFromEnum(Suffix.header) => .header,
-            @intFromEnum(Suffix.centroid) => .centroid,
-            @intFromEnum(Suffix.children) => .children,
-            @intFromEnum(Suffix.members) => .members,
-            @intFromEnum(Suffix.packed_node) => .packed_node,
-            @intFromEnum(Suffix.range) => .range,
-            @intFromEnum(Suffix.posting) => .posting,
+            @backingInt(Suffix.header) => .header,
+            @backingInt(Suffix.centroid) => .centroid,
+            @backingInt(Suffix.children) => .children,
+            @backingInt(Suffix.members) => .members,
+            @backingInt(Suffix.packed_node) => .packed_node,
+            @backingInt(Suffix.range) => .range,
+            @backingInt(Suffix.posting) => .posting,
             else => return null,
         };
         return .{
@@ -4593,19 +4593,19 @@ pub const HBCIndex = struct {
 
     fn stagedNodeKeyId(key: []const u8) ?u128 {
         const decoded = decodeNodeKey(key) orelse return null;
-        return (@as(u128, decoded.id) << 8) | @as(u128, @intFromEnum(decoded.suffix));
+        return (@as(u128, decoded.id) << 8) | @as(u128, @backingInt(decoded.suffix));
     }
 
     fn stagedNodeKeyParts(staged_key: u128) struct { id: u64, suffix: Suffix } {
         const suffix_byte: u8 = @intCast(staged_key & 0xff);
         const suffix: Suffix = switch (suffix_byte) {
-            @intFromEnum(Suffix.header) => .header,
-            @intFromEnum(Suffix.centroid) => .centroid,
-            @intFromEnum(Suffix.children) => .children,
-            @intFromEnum(Suffix.members) => .members,
-            @intFromEnum(Suffix.packed_node) => .packed_node,
-            @intFromEnum(Suffix.range) => .range,
-            @intFromEnum(Suffix.posting) => .posting,
+            @backingInt(Suffix.header) => .header,
+            @backingInt(Suffix.centroid) => .centroid,
+            @backingInt(Suffix.children) => .children,
+            @backingInt(Suffix.members) => .members,
+            @backingInt(Suffix.packed_node) => .packed_node,
+            @backingInt(Suffix.range) => .range,
+            @backingInt(Suffix.posting) => .posting,
             else => unreachable,
         };
         return .{
@@ -5674,7 +5674,7 @@ pub const HBCIndex = struct {
         }
         _ = try self.cacheVectorLocalLocked(vector_id, vector_data);
         self.noteHbcCacheInsertion(.vector);
-        if (replaced) self.hbc_cache_kind_stats[@intFromEnum(HbcCacheKind.vector)].replacements += 1;
+        if (replaced) self.hbc_cache_kind_stats[@backingInt(HbcCacheKind.vector)].replacements += 1;
         admission.commit();
         self.refreshAndEnforceHbcCacheUsage(.one(.vector, vector_id));
         return vector_data;
@@ -10571,7 +10571,7 @@ test "hbc shared cache rejects node quantized and metadata fills from an older p
 test "hbc shared cache evicts across namespaces under one resource budget" {
     const vector_bytes = estimateVectorCacheBytes(&.{ 1.0, 2.0, 3.0, 4.0 });
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes,
         .hard_limit_bytes = vector_bytes,
     };
@@ -10595,7 +10595,7 @@ test "hbc shared cache evicts across namespaces under one resource budget" {
 test "hbc shared cache CLOCK refreshes recency on borrowed vector hits" {
     const vector_bytes = estimateVectorCacheBytes(&.{ 1.0, 2.0, 3.0, 4.0 });
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = 2 * vector_bytes,
         .hard_limit_bytes = 2 * vector_bytes,
     };
@@ -10793,7 +10793,7 @@ test "hbc standalone cache yields to foreground aggregate admission" {
 test "hbc concurrent vector admission samples at a full steady target" {
     const vector_bytes = estimateVectorCacheBytes(&.{ 1.0, 2.0, 3.0, 4.0 });
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes,
         .hard_limit_bytes = vector_bytes,
     };
@@ -10822,7 +10822,7 @@ test "hbc decoded residency lease reserves a complete query and bypasses mid-que
     const second = [_]f32{ 5.0, 6.0, 7.0, 8.0 };
     const vector_bytes = estimateVectorCacheBytes(&first);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes * 2,
         .hard_limit_bytes = vector_bytes * 2,
     };
@@ -10873,7 +10873,7 @@ test "hbc overlapping cold-start leases claim free capacity once and sample repl
     const fill_count = 4;
     const target_bytes = vector_bytes * fill_count;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = target_bytes,
         .hard_limit_bytes = target_bytes,
     };
@@ -10938,7 +10938,7 @@ test "hbc sampled decoded residency evolves a full resident set within its byte 
     const replacement = [_]f32{ 9.0, 10.0, 11.0, 12.0 };
     const vector_bytes = estimateVectorCacheBytes(&first);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes * 2,
         .hard_limit_bytes = vector_bytes * 2,
     };
@@ -10978,7 +10978,7 @@ test "hbc decoded residency fails closed when pinned entries prevent precharge" 
     const vector = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const vector_bytes = estimateVectorCacheBytes(&vector);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes,
         .hard_limit_bytes = vector_bytes,
     };
@@ -11044,7 +11044,7 @@ test "hbc exact-route vector admission samples outside the search epoch" {
     const vector = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const vector_bytes = estimateVectorCacheBytes(&vector);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes,
         .hard_limit_bytes = vector_bytes,
     };
@@ -11089,13 +11089,13 @@ test "hbc shared cache reclaims exact vectors before protected routing nodes" {
         .children = children[0..],
         .members = &.{},
     };
-    const vector = [_]f32{1.0} ** 64;
+    const vector = @as([64]f32, @splat(1.0));
     const node_bytes = estimateNodeCacheBytes(&node_one);
     const vector_bytes = estimateVectorCacheBytes(&vector);
     try std.testing.expect(vector_bytes >= node_bytes);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = node_bytes + vector_bytes,
         .hard_limit_bytes = node_bytes + vector_bytes,
     };
@@ -11118,10 +11118,10 @@ test "hbc shared cache reclaims exact vectors before protected routing nodes" {
 }
 
 test "hbc shared cache reclaims an over-quota namespace for a borrowing peer" {
-    const vector = [_]f32{1.0} ** 64;
+    const vector = @as([64]f32, @splat(1.0));
     const entry_bytes = estimateVectorCacheBytes(&vector);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = entry_bytes * 4,
         .hard_limit_bytes = entry_bytes * 4,
     };
@@ -11792,7 +11792,7 @@ test "hbc cache reports byte usage to resource manager" {
     defer tp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 256,
     };
@@ -11806,14 +11806,14 @@ test "hbc cache reports byte usage to resource manager" {
     _ = try idx.cacheVector(1, &.{ 1.0, 2.0, 3.0, 4.0 });
     _ = try idx.cacheMetadata(1, "doc:1");
     var stats = resource_manager.snapshot();
-    try std.testing.expect(stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)].used_bytes > 0);
-    try std.testing.expect(stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)].soft_limit_events > 0);
-    try std.testing.expectEqual(@as(u64, 0), stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)].hard_limit_rejections);
+    try std.testing.expect(stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)].used_bytes > 0);
+    try std.testing.expect(stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)].soft_limit_events > 0);
+    try std.testing.expectEqual(@as(u64, 0), stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)].hard_limit_rejections);
 
     idx.invalidateVectorCache(1);
     idx.invalidateMetadataCache(1);
     stats = resource_manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 0), stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)].used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)].used_bytes);
 }
 
 test "hbc resource manager reattachment is idempotent and transfers local cache usage" {
@@ -11851,7 +11851,7 @@ test "hbc opportunistic vector cache skips instead of overcommitting resource bu
     defer tp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 2,
     };
@@ -11867,8 +11867,8 @@ test "hbc opportunistic vector cache skips instead of overcommitting resource bu
     try std.testing.expectEqual(@intFromPtr(input[0..].ptr), @intFromPtr(returned.ptr));
 
     const stats = resource_manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 0), stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)].used_bytes);
-    try std.testing.expect(stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)].hard_limit_rejections > 0);
+    try std.testing.expectEqual(@as(u64, 0), stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)].used_bytes);
+    try std.testing.expect(stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)].hard_limit_rejections > 0);
     try std.testing.expectEqual(@as(u64, 1), idx.hbcCacheStats().vector.admission_skips);
 }
 
@@ -12001,7 +12001,7 @@ test "cold flat centroid build preadmits transient and retained memory" {
         @max(idx.config.leaf_size, idx.config.branching_factor),
     );
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .hard_limit_bytes = projection.retained_bytes - 1,
     };
     var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
@@ -12080,7 +12080,7 @@ test "flat centroid reservation handoff does not double count retained bytes" {
 
     const directory_bytes: u64 = @sizeOf(vectorindex_spfresh_index.FlatCentroidDirectory);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .hard_limit_bytes = directory_bytes,
     };
     var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
@@ -12138,7 +12138,7 @@ test "exhaustive search workspace is admitted before growth and released after r
     idx.releaseSearchScratch(&scratch_handle);
     const baseline_bytes = idx.search_workspace_bytes_accounted;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{
         .soft_limit_bytes = baseline_bytes + 1,
         .hard_limit_bytes = baseline_bytes + 1,
     };
@@ -12243,7 +12243,7 @@ test "flat block scoring workspace is included in exhaustive pre-admission" {
     try std.testing.expect(complete_flat > frontier_only);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{
         .soft_limit_bytes = frontier_only,
         .hard_limit_bytes = frontier_only,
     };
@@ -12315,7 +12315,7 @@ test "resource pressure reclaims retained flat search scratch" {
     try std.testing.expect(retained_before > baseline_bytes);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{
         .hard_limit_bytes = baseline_bytes,
     };
     var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
@@ -12371,12 +12371,12 @@ test "hbc cache shrinks to resource budget under pressure" {
 
     const vector_bytes = estimateVectorCacheBytes(&.{ 1.0, 2.0, 3.0, 4.0 });
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes,
         .hard_limit_bytes = vector_bytes,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_action = .shrink_cache,
         .hard_action = .shrink_cache,
     };
@@ -12839,7 +12839,7 @@ test "searchWithRequest tolerates concurrent readers with runtime caches enabled
     };
 
     var failed = std.atomic.Value(u8).init(0);
-    var workers = [_]Worker{.{ .idx = &idx, .failed = &failed }} ** 8;
+    var workers = @as([8]Worker, @splat(.{ .idx = &idx, .failed = &failed }));
     var threads: [workers.len]std.Thread = undefined;
     for (&threads, &workers, 0..) |*thread, *worker, worker_index| {
         thread.* = try std.Thread.spawn(.{}, Worker.run, .{ worker, worker_index });
@@ -16812,8 +16812,8 @@ test "bulk split workspace reuses transformed external vectors and reports apply
 
     const ids = [_]u64{ 1, 2, 3 };
     const positions = [_]usize{ 0, 1, 2 };
-    var matrix: [6]f32 = .{0} ** 6;
-    var matrix_again: [6]f32 = .{0} ** 6;
+    var matrix: [6]f32 = @splat(0);
+    var matrix_again: [6]f32 = @splat(0);
     var lookups: [ids.len]FixedKeyLookup = undefined;
     var key_views: [ids.len][]const u8 = undefined;
     var values: [ids.len]?[]const u8 = undefined;

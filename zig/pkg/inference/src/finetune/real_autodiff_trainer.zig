@@ -296,7 +296,7 @@ pub const TrainerInput = struct {
     /// is not represented by batch/sequence/target shapes. Keep zero when the
     /// callbacks depend only on those shapes. GLiNER2 uses this for its
     /// contextual-slot, structure-instance, and task-count buckets.
-    graph_variant: [4]u64 = .{0} ** 4,
+    graph_variant: [4]u64 = @splat(0),
 };
 
 pub const StepResult = struct {
@@ -3187,9 +3187,9 @@ test "RealAutodiffTrainer: bounded shape cache shares trainables and isolates co
     });
     defer trainer.deinit();
 
-    var ids = [_]i64{0} ** 8;
-    var mask = [_]f32{1.0} ** 8;
-    var targets = [_]f32{0.0} ** (8 * 8);
+    var ids = @as([8]i64, @splat(0));
+    var mask = @as([8]f32, @splat(1.0));
+    var targets = @as([(8 * 8)]f32, @splat(0.0));
     const input_a = TrainerInput{
         .ctx = @ptrCast(&ctx),
         .build_forward = &TestCtx.buildForward,
@@ -3480,14 +3480,14 @@ test "RealAutodiffTrainer: training state round-trips weights moments and counte
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/training_state.safetensors", .{tmp.sub_path});
     defer allocator.free(path);
-    const fingerprint = [_]u8{7} ** 32;
-    const metrics_fingerprint = [_]u8{9} ** 32;
+    const fingerprint = @as([32]u8, @splat(7));
+    const metrics_fingerprint = @as([32]u8, @splat(9));
     try trainer.saveTrainingState(path, &fingerprint, &metrics_fingerprint);
     const inspected = try trainer.inspectTrainingState(path, &fingerprint);
     try testing.expectEqual(@as(u64, 5), inspected.micro_batch_steps);
     try testing.expectEqual(@as(u64, 3), inspected.optimizer_steps);
     try trainer.validateTrainingStateMetricsPrefix(path, &metrics_fingerprint);
-    const wrong_metrics_fingerprint = [_]u8{10} ** 32;
+    const wrong_metrics_fingerprint = @as([32]u8, @splat(10));
     try testing.expectError(
         error.TrainingStateMetricsMismatch,
         trainer.validateTrainingStateMetricsPrefix(path, &wrong_metrics_fingerprint),
@@ -3501,7 +3501,7 @@ test "RealAutodiffTrainer: training state round-trips weights moments and counte
     trainer.optimizer_state = optimizers.OptimizerState.init(allocator);
     trainer.step_count = 0;
     trainer.optimizer_step_count = 0;
-    const wrong_fingerprint = [_]u8{8} ** 32;
+    const wrong_fingerprint = @as([32]u8, @splat(8));
     try testing.expectError(error.TrainingStateFingerprintMismatch, trainer.loadTrainingState(path, &wrong_fingerprint));
     try trainer.loadTrainingState(path, &fingerprint);
 

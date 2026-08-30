@@ -45,7 +45,7 @@ pub const ComputeCapability = struct {
 
     pub fn option(self: ComputeCapability, buffer: []u8) Error![:0]u8 {
         if (self.major == 0 or self.minor > 9) return error.InvalidComputeCapability;
-        return std.fmt.bufPrintZ(buffer, "--gpu-architecture=compute_{d}{d}", .{ self.major, self.minor }) catch
+        return std.fmt.bufPrintSentinel(buffer, "--gpu-architecture=compute_{d}{d}", .{ self.major, self.minor }, 0) catch
             return error.InvalidComputeCapability;
     }
 };
@@ -159,7 +159,7 @@ fn compileWithTable(
     option_ptrs[0] = arch_option.ptr;
     for (extra_options, 1..) |option, index| option_ptrs[index] = option.ptr;
 
-    const source_z = try allocator.dupeZ(u8, source);
+    const source_z = try allocator.dupeSentinel(u8, source, 0);
     defer allocator.free(source_z);
     var program: NvrtcProgram = null;
     const create_status = fns.createProgram(&program, source_z.ptr, name.ptr, 0, null, null);
@@ -317,7 +317,7 @@ test "nvrtc: rejects unsafe compiler options before invoking NVRTC" {
             &.{interior_nul},
         ),
     );
-    const too_long: [:0]const u8 = "x" ** (max_option_bytes + 1);
+    const too_long: [:0]const u8 = &@as([max_option_bytes + 1:0]u8, @splat('x'));
     try std.testing.expectError(
         error.OptionTooLong,
         compileWithTable(

@@ -352,7 +352,7 @@ test "language detection ignores higher non-language logits" {
         .{ .token_id = 10, .code = "en" },
         .{ .token_id = 11, .code = "es" },
     };
-    var logits = [_]f32{0} ** 16;
+    var logits = @as([16]f32, @splat(0));
     logits[10] = 1;
     logits[11] = 4;
     logits[15] = 100;

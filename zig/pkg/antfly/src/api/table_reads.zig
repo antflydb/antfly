@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const reflection = @import("../common/reflection_compat.zig");
 const builtin = @import("builtin");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
@@ -1609,14 +1610,14 @@ pub fn parallelFanoutMetricsSnapshot() ParallelFanoutMetricsSnapshot {
 }
 
 fn ioAsyncLimitWidth(io_impl: *std.Io.Threaded, group_count: usize) usize {
-    const raw = @intFromEnum(io_impl.async_limit);
+    const raw = @backingInt(io_impl.async_limit);
     if (raw == 0) return 1;
     if (raw == std.math.maxInt(usize)) return @max(@as(usize, 1), group_count);
     return @max(@as(usize, 1), @min(group_count, raw));
 }
 
 fn ioAsyncLimitCap(io_impl: *std.Io.Threaded) usize {
-    const raw = @intFromEnum(io_impl.async_limit);
+    const raw = @backingInt(io_impl.async_limit);
     if (raw == 0) return 1;
     if (raw == std.math.maxInt(usize)) return std.math.maxInt(usize);
     return @max(@as(usize, 1), raw);
@@ -18785,11 +18786,11 @@ test "provisioned standby read gate permits stale reads and routes non-stale rea
 
     const receive_path_raw = try std.fmt.allocPrint(alloc, "{s}/received.wal", .{root});
     defer alloc.free(receive_path_raw);
-    const receive_path = try alloc.dupeZ(u8, receive_path_raw);
+    const receive_path = try alloc.dupeSentinel(u8, receive_path_raw, 0);
     defer alloc.free(receive_path);
     const progress_path_raw = try std.fmt.allocPrint(alloc, "{s}/progress.wal", .{root});
     defer alloc.free(progress_path_raw);
-    const progress_path = try alloc.dupeZ(u8, progress_path_raw);
+    const progress_path = try alloc.dupeSentinel(u8, progress_path_raw, 0);
     defer alloc.free(progress_path);
 
     var standby = try ha_standby_mod.Standby.open(alloc, receive_path.ptr, progress_path.ptr, .{
@@ -22073,7 +22074,7 @@ test "internal worker doc identity exchange audit covers every boundary" {
     var validates_generation_projection: usize = 0;
     var fail_closed_before_fanout: usize = 0;
 
-    inline for (std.meta.fields(DocIdentityInternalWorkerBoundary)) |field| {
+    inline for (reflection.fields(DocIdentityInternalWorkerBoundary)) |field| {
         const boundary: DocIdentityInternalWorkerBoundary = @field(DocIdentityInternalWorkerBoundary, field.name);
         switch (docIdentityInternalWorkerPolicy(boundary)) {
             .carries_shard_doc_set => carries_shard_doc_set += 1,

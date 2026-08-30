@@ -1309,7 +1309,7 @@ fn findFirstExtensionInDir(allocator: std.mem.Allocator, base_dir: []const u8, e
         return null;
     }
 
-    const base_dir_z = try allocator.dupeZ(u8, base_dir);
+    const base_dir_z = try allocator.dupeSentinel(u8, base_dir, 0);
     defer allocator.free(base_dir_z);
 
     const dir = c_file.c.opendir(base_dir_z.ptr);
@@ -4435,48 +4435,48 @@ fn appendTestString(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(
 
 fn appendTestMetadataString(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: []const u8) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.string));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.string));
     try appendTestString(allocator, data, value);
 }
 
 fn appendTestMetadataU32(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: u32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.u32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.u32));
     try appendTestLe(u32, allocator, data, value);
 }
 
 fn appendTestMetadataBool(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: bool) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.bool_));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.bool_));
     try appendTestLe(u8, allocator, data, @intFromBool(value));
 }
 
 fn appendTestMetadataF32(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: f32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.f32));
     try appendTestLe(u32, allocator, data, @bitCast(value));
 }
 
 fn appendTestMetadataStringArray(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const []const u8) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.string));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.string));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestString(allocator, data, value);
 }
 
 fn appendTestMetadataI32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const i32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.i32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.i32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(i32, allocator, data, value);
 }
 
 fn appendTestMetadataF32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const f32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.f32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(u32, allocator, data, @bitCast(value));
 }

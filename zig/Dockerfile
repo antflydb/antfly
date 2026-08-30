@@ -1,6 +1,6 @@
 FROM --platform=$BUILDPLATFORM alpine:3.21 AS zig
 
-ARG ZIG_VERSION=0.16.0
+ARG ZIG_VERSION=0.17.0-dev.1933+e19a73c2d
 ARG BUILDARCH
 
 RUN apk add --no-cache curl xz
@@ -10,7 +10,7 @@ RUN case "${BUILDARCH}" in \
         arm64) zig_arch="aarch64" ;; \
         *) echo "unsupported BUILDARCH=${BUILDARCH}" >&2; exit 1 ;; \
     esac && \
-    curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz && \
+    curl -L "https://ziglang.org/builds/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz && \
     mkdir -p /opt && \
     tar -xJf /tmp/zig.tar.xz -C /opt && \
     mv /opt/zig-${zig_arch}-linux-${ZIG_VERSION} /opt/zig

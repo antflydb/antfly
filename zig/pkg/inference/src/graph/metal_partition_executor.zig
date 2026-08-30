@@ -81,19 +81,19 @@ const OpExecutionCount = struct {
 };
 
 const OpExecutionStats = struct {
-    command_counts: [96]OpExecutionCount = [_]OpExecutionCount{.{}} ** 96,
+    command_counts: [96]OpExecutionCount = @as([96]OpExecutionCount, @splat(.{})),
     command_used: usize = 0,
-    command_class_counts: [160]CommandExecutionSummary = [_]CommandExecutionSummary{.{}} ** 160,
+    command_class_counts: [160]CommandExecutionSummary = @as([160]CommandExecutionSummary, @splat(.{})),
     command_class_used: usize = 0,
-    fallback_counts: [96]OpExecutionCount = [_]OpExecutionCount{.{}} ** 96,
+    fallback_counts: [96]OpExecutionCount = @as([96]OpExecutionCount, @splat(.{})),
     fallback_used: usize = 0,
-    host_output_counts: [96]OpExecutionCount = [_]OpExecutionCount{.{}} ** 96,
+    host_output_counts: [96]OpExecutionCount = @as([96]OpExecutionCount, @splat(.{})),
     host_output_used: usize = 0,
-    host_output_reason_counts: [32]OpExecutionCount = [_]OpExecutionCount{.{}} ** 32,
+    host_output_reason_counts: [32]OpExecutionCount = @as([32]OpExecutionCount, @splat(.{})),
     host_output_reason_used: usize = 0,
-    runtime_region_counts: [32]OpExecutionCount = [_]OpExecutionCount{.{}} ** 32,
+    runtime_region_counts: [32]OpExecutionCount = @as([32]OpExecutionCount, @splat(.{})),
     runtime_region_used: usize = 0,
-    dot_command_shapes: [128]DotShapeExecutionSummary = [_]DotShapeExecutionSummary{.{}} ** 128,
+    dot_command_shapes: [128]DotShapeExecutionSummary = @as([128]DotShapeExecutionSummary, @splat(.{})),
     dot_command_shape_used: usize = 0,
 
     fn recordCommand(self: *OpExecutionStats, name: []const u8, elapsed_ns: u64) void {
@@ -548,7 +548,7 @@ const RuntimeFrameLayerBucket = struct {
 };
 
 const RuntimeFrameLayerCollection = struct {
-    buckets: [runtime_frame_max_layers]RuntimeFrameLayerBucket = [_]RuntimeFrameLayerBucket{.{}} ** runtime_frame_max_layers,
+    buckets: [runtime_frame_max_layers]RuntimeFrameLayerBucket = @as([runtime_frame_max_layers]RuntimeFrameLayerBucket, @splat(.{})),
     count: usize = 0,
     completed_layers: usize = 0,
     reason: RuntimeFrameIneligibleReason = .none,
@@ -2556,7 +2556,7 @@ fn sortOpExecutionCounts(counts: []OpExecutionCount) void {
 }
 
 fn printOpExecutionStats(label: []const u8, counts: []OpExecutionCount, used: usize) void {
-    var sorted_buf = [_]OpExecutionCount{.{}} ** 96;
+    var sorted_buf = @as([96]OpExecutionCount, @splat(.{}));
     const n = @min(used, sorted_buf.len);
     @memcpy(sorted_buf[0..n], counts[0..n]);
     sortOpExecutionCounts(sorted_buf[0..n]);
@@ -2644,7 +2644,7 @@ fn sortCommandExecutionSummaries(summaries: []CommandExecutionSummary) void {
 }
 
 fn printCommandExecutionStats(label: []const u8, summaries: []const CommandExecutionSummary, used: usize) void {
-    var sorted_buf = [_]CommandExecutionSummary{.{}} ** 160;
+    var sorted_buf = @as([160]CommandExecutionSummary, @splat(.{}));
     const n = @min(used, sorted_buf.len);
     @memcpy(sorted_buf[0..n], summaries[0..n]);
     sortCommandExecutionSummaries(sorted_buf[0..n]);
@@ -2775,7 +2775,7 @@ fn sortDotShapeExecutionSummaries(summaries: []DotShapeExecutionSummary) void {
 }
 
 fn printDotShapeExecutionStats(label: []const u8, summaries: []const DotShapeExecutionSummary, used: usize) void {
-    var sorted_buf = [_]DotShapeExecutionSummary{.{}} ** 128;
+    var sorted_buf = @as([128]DotShapeExecutionSummary, @splat(.{}));
     const n = @min(used, sorted_buf.len);
     @memcpy(sorted_buf[0..n], summaries[0..n]);
     sortDotShapeExecutionSummaries(sorted_buf[0..n]);
@@ -3361,10 +3361,10 @@ fn printMetalPartitionOpRuns(
     last_use: []const u32,
     partition_index: usize,
 ) void {
-    var counts = [_]OpRunSummary{.{}} ** 96;
+    var counts = @as([96]OpRunSummary, @splat(.{}));
     var counts_used: usize = 0;
-    var longest = [_]LongOpRun{.{}} ** 12;
-    var dot_shapes = [_]DotShapeRunSummary{.{}} ** 96;
+    var longest = @as([12]LongOpRun, @splat(.{}));
+    var dot_shapes = @as([96]DotShapeRunSummary, @splat(.{}));
     var dot_shapes_used: usize = 0;
 
     var reachable_nodes: usize = 0;
@@ -3722,7 +3722,7 @@ fn transposeIsSimpleEnoughForHint(attrs: anytype, input_shape: Shape) bool {
     if (rank == 0 or rank > ml.graph.shape.max_rank) return false;
     const perm = transpose_utils.effectivePerm(attrs, rank, &perm_buf);
     if (perm.len != rank) return false;
-    var seen: [ml.graph.shape.max_rank]bool = [_]bool{false} ** ml.graph.shape.max_rank;
+    var seen: [ml.graph.shape.max_rank]bool = @as([ml.graph.shape.max_rank]bool, @splat(false));
     for (perm) |axis| {
         if (axis >= rank or seen[axis]) return false;
         seen[axis] = true;
@@ -4390,7 +4390,7 @@ fn recordRuntimeRegionSummary(summaries: *[32]RuntimeRegionSummary, used: *usize
 }
 
 fn printRuntimeRegionPlanSummary(graph: *const Graph, plan: RuntimeRegionPlan, partition_index: usize) void {
-    var summaries = [_]RuntimeRegionSummary{.{}} ** 32;
+    var summaries = @as([32]RuntimeRegionSummary, @splat(.{}));
     var used: usize = 0;
     for (plan.regions_by_pos, 0..) |region, pos| {
         recordRuntimeRegionSummary(&summaries, &used, std.meta.activeTag(region), pos);
@@ -7728,7 +7728,7 @@ const LayerNormForwardPattern = struct {
     bias_id: NodeId,
     dim: usize,
     eps: f32,
-    internal_node_ids: [16]NodeId = [_]NodeId{null_node} ** 16,
+    internal_node_ids: [16]NodeId = @as([16]NodeId, @splat(null_node)),
     internal_node_count: usize = 0,
 };
 
@@ -9374,7 +9374,7 @@ fn matchDecomposedLayerNormFromInput(
                                 continue;
                             }
 
-                            var internal_nodes = [_]NodeId{null_node} ** 16;
+                            var internal_nodes = @as([16]NodeId, @splat(null_node));
                             const internal_count: usize = 9;
                             internal_nodes[0] = mean_id;
                             internal_nodes[1] = mean_broadcast_id;
@@ -15289,7 +15289,7 @@ fn executeRuntimeActivation(
     // immaterial — pass the full element count (rows=1) like the eager path.
     if (output_hint) |hint| {
         if (isMetalDeviceResident(cb, input)) {
-            if (try metal_compute_mod.MetalCompute.activationInto(cb, input, @intFromEnum(kind), dim, hint)) |out| return out;
+            if (try metal_compute_mod.MetalCompute.activationInto(cb, input, @backingInt(kind), dim, hint)) |out| return out;
         }
     }
     if (try cb.decoderRuntimeApplyActivation(&.{
@@ -16980,11 +16980,11 @@ test "metal partition executor command path handles linear and norms" {
     @memset(value_device, 0);
 
     var x_data: [hidden]f32 = undefined;
-    var w_data: [hidden * hidden]f32 = .{0} ** (hidden * hidden);
-    var bias_data: [hidden]f32 = .{0} ** hidden;
-    var gamma_data: [hidden]f32 = .{1} ** hidden;
-    var beta_data: [hidden]f32 = .{0} ** hidden;
-    var rms_weight_data: [hidden]f32 = .{1} ** hidden;
+    var w_data: [hidden * hidden]f32 = @splat(0);
+    var bias_data: [hidden]f32 = @splat(0);
+    var gamma_data: [hidden]f32 = @splat(1);
+    var beta_data: [hidden]f32 = @splat(0);
+    var rms_weight_data: [hidden]f32 = @splat(1);
     for (&x_data, 0..) |*value, i| value.* = @floatFromInt(i + 1);
     for (0..hidden) |i| w_data[i * hidden + i] = 1.0;
 
@@ -17088,11 +17088,11 @@ test "metal partition executor command path runs linear and norms on metal backe
     @memset(value_device, 0);
 
     var x_data: [hidden]f32 = undefined;
-    var w_data: [hidden * hidden]f32 = .{0} ** (hidden * hidden);
-    var bias_data: [hidden]f32 = .{0} ** hidden;
-    var gamma_data: [hidden]f32 = .{1} ** hidden;
-    var beta_data: [hidden]f32 = .{0} ** hidden;
-    var rms_weight_data: [hidden]f32 = .{1} ** hidden;
+    var w_data: [hidden * hidden]f32 = @splat(0);
+    var bias_data: [hidden]f32 = @splat(0);
+    var gamma_data: [hidden]f32 = @splat(1);
+    var beta_data: [hidden]f32 = @splat(0);
+    var rms_weight_data: [hidden]f32 = @splat(1);
     for (&x_data, 0..) |*value, i| value.* = @floatFromInt(i + 1);
     for (0..hidden) |i| w_data[i * hidden + i] = 1.0;
 
@@ -17207,7 +17207,7 @@ test "metal partition executor eager multi op chain matches host" {
     @memset(value_device, 0);
 
     const x_data = [_]f32{ -4.0, -2.0, -1.0, -0.25, 0.25, 1.0, 2.0, 4.0 };
-    var w_data: [dim * dim]f32 = .{0} ** (dim * dim);
+    var w_data: [dim * dim]f32 = @splat(0);
     const bias_data = [_]f32{ 0.5, -0.25, 0.125, -0.5, 0.25, 0.75, -0.125, 0.0 };
     for (0..dim) |i| w_data[i * dim + i] = 1.0;
 

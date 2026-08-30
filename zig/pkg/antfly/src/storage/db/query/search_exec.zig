@@ -12645,7 +12645,7 @@ test "text stats use postings when segment source is omitted" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/background-postings", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
@@ -14009,7 +14009,7 @@ test "raw multi-source member search avoids fixed-factor reranking" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/multi-source-member-window", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
@@ -14302,7 +14302,7 @@ test "built-in exact dense scorer filters metadata before vector reads" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/builtin-exact-prefix", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
@@ -14372,7 +14372,7 @@ test "one percent filtered route preserves exact recall with candidate-linear IO
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/selective-exact-recall", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
@@ -14435,7 +14435,7 @@ test "one percent filtered route preserves exact recall with candidate-linear IO
     hbc_mod.setTestGetVectorViewOrScratchHook(&counter, VectorLoadCounter.onLoad);
     defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
 
-    var query = [_]f32{0} ** dims;
+    var query = @as([dims]f32, @splat(0));
     query[0] = @floatFromInt(candidate_count);
     var outcome = try exactScoreNativeDenseFilter(alloc, &entry, .{
         .query = &query,
@@ -14477,7 +14477,7 @@ test "one percent native filter routes through integrated dense search exactly" 
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/integrated-selective-exact", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var index = try hbc_mod.HBCIndex.open(alloc, path_z.ptr, .{
@@ -19871,7 +19871,7 @@ test "match_all native doc values sort streams candidates without exact candidat
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-sort-stream", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
@@ -20058,7 +20058,7 @@ test "match_all native doc values sort consumes selective ordinal candidates dir
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-sort-ordinal-candidates", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
@@ -21607,7 +21607,7 @@ fn buildDuplicateF64DocValuesSectionAlloc(alloc: Allocator) ![]u8 {
 
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(alloc);
-    try data.append(alloc, @intFromEnum(typed_dv.ValueType.f64_val));
+    try data.append(alloc, @backingInt(typed_dv.ValueType.f64_val));
     try data.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
     const chunk_end: u64 = @intCast(5 + 8 + compressed.len);
     try data.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, chunk_end))));
@@ -23137,7 +23137,7 @@ test "native sort runtime fails closed on corrupt typed doc values" {
     const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
 
     var corrupt_doc_values = [_]u8{
-        @intFromEnum(typed_dv.ValueType.u64_val),
+        @backingInt(typed_dv.ValueType.u64_val),
         1,
         0,
         0,
@@ -23279,7 +23279,7 @@ test "match_all sorted segment seek merges sorted segments and applies cursors" 
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-seek", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
@@ -23594,7 +23594,7 @@ test "match_all sorted segment seek honors deleted old sort values after upsert"
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-upsert-live-docs", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
@@ -23744,7 +23744,7 @@ test "match_all index sort uses doc values collector for selective native filter
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-selective-filter-plan", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     const docs = try alloc.alloc(TestSortedPriceDoc, 128);
@@ -23939,7 +23939,7 @@ test "text field sort uses exact native doc values filter path without index sor
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-native-doc-values-filter-sort", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
@@ -24230,7 +24230,7 @@ test "text score query exposes score top k sort profile" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-score-top-k-profile", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
@@ -24405,7 +24405,7 @@ test "text ordered query rejects unresolved stored pattern filters" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-ordered-unresolved-filter", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
@@ -24543,7 +24543,7 @@ test "text field sort uses sorted segment membership path when index sort matche
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-sorted-segment-membership", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
@@ -24807,7 +24807,7 @@ test "text index sort uses doc values collector for selective term filters" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-selective-index-sort-doc-values", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
@@ -25019,7 +25019,7 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-cursor-seek", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     const docs = try alloc.alloc(TestSortedPriceDoc, 64);
@@ -25201,7 +25201,7 @@ test "match_all sorted segment seek enforces scan budget" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-scan-budget", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     const docs = try alloc.alloc(TestSortedPriceDoc, 4);
@@ -25297,7 +25297,7 @@ test "match_all sorted segment seek checks deadline while scanning" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-scan-deadline", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
@@ -25395,7 +25395,7 @@ test "match_all sorted segment seek zero limit returns profile without scanning"
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-zero-limit", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
@@ -25477,7 +25477,7 @@ test "match_all sorted segment seek rejects cursor when segment bounds are unava
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-invalid-bounds-fallback", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
@@ -25590,7 +25590,7 @@ test "match_all native ordinal doc values path enforces exact candidate budget" 
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/match-all-native-doc-values-budget", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     const docs = [_]TestSortedPriceDoc{
@@ -25682,7 +25682,7 @@ test "text doc values sort zero limit avoids budget and decoration" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-doc-values-zero-limit", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     const docs = [_]TestSortedPriceDoc{
@@ -25831,7 +25831,7 @@ test "match_all native ordinal doc values zero limit avoids budget and decoratio
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/match-all-ordinal-doc-values-zero-limit", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     const docs = [_]TestSortedPriceDoc{
@@ -27639,7 +27639,7 @@ test "match_all native doc values without stream reports bounded exact collector
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/match-all-native-no-stream", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     const docs = [_]TestSortedPriceDoc{

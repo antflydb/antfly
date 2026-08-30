@@ -20,7 +20,7 @@ const metadata_incarnation = @import("incarnation.zig");
 /// the causal acknowledgement barrier and may clear the request prematurely.
 pub const barrier_protocol_version: u16 = 1;
 pub const MembershipFingerprint = [std.crypto.hash.sha2.Sha256.digest_length]u8;
-pub const zero_membership_fingerprint = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+pub const zero_membership_fingerprint = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));
 
 pub const ReallocationRequestRecord = struct {
     request_id: u128,

@@ -18640,7 +18640,7 @@ test "provisioned owner clone snapshot preserves retired runtime counters" {
         .bytes_total = 4096,
         .peak_bytes = 3072,
     };
-    archived.by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bulk_current_scan)] = .{
+    archived.by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bulk_current_scan)] = .{
         .calls = 2,
         .bytes_total = 4096,
         .peak_bytes = 3072,
@@ -18673,7 +18673,7 @@ test "provisioned owner clone snapshot preserves retired runtime counters" {
     try std.testing.expectEqual(@as(u64, 4096), owners[0].maintenance.mutable_snapshot_clone_bytes_total);
     try std.testing.expectEqual(
         @as(u64, 2),
-        owners[0].maintenance.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bulk_current_scan)].calls,
+        owners[0].maintenance.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bulk_current_scan)].calls,
     );
 
     const AllocationRunner = struct {
@@ -45975,7 +45975,7 @@ test "managed startup catch-up advances counterless incomplete dense repair" {
 
     const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{path});
     defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -46490,11 +46490,11 @@ test "write cache HA gate clear drains inactive pending closes before returning"
 
     const ha_log_path_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-clear-drain-log", .{tmp.sub_path});
     defer alloc.free(ha_log_path_raw);
-    const ha_log_path = try alloc.dupeZ(u8, ha_log_path_raw);
+    const ha_log_path = try alloc.dupeSentinel(u8, ha_log_path_raw, 0);
     defer alloc.free(ha_log_path);
     const ha_slots_path_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-clear-drain-slots", .{tmp.sub_path});
     defer alloc.free(ha_slots_path_raw);
-    const ha_slots_path = try alloc.dupeZ(u8, ha_slots_path_raw);
+    const ha_slots_path = try alloc.dupeSentinel(u8, ha_slots_path_raw, 0);
     defer alloc.free(ha_slots_path);
     var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path.ptr, ha_slots_path.ptr, .{
         .cluster_id = 700,
@@ -46566,11 +46566,11 @@ test "write cache retires shared HA generation stale entries before reuse" {
     });
     const primary_log_path_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-generation-primary-log", .{tmp.sub_path});
     defer alloc.free(primary_log_path_raw);
-    const primary_log_path = try alloc.dupeZ(u8, primary_log_path_raw);
+    const primary_log_path = try alloc.dupeSentinel(u8, primary_log_path_raw, 0);
     defer alloc.free(primary_log_path);
     const primary_slots_path_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-generation-primary-slots", .{tmp.sub_path});
     defer alloc.free(primary_slots_path_raw);
-    const primary_slots_path = try alloc.dupeZ(u8, primary_slots_path_raw);
+    const primary_slots_path = try alloc.dupeSentinel(u8, primary_slots_path_raw, 0);
     defer alloc.free(primary_slots_path);
     var promoted_primary = try ha_primary_mod.Primary.open(alloc, primary_log_path.ptr, primary_slots_path.ptr, .{
         .cluster_id = 700,
@@ -48379,7 +48379,7 @@ test "provisioned leader admission rejects uncommitted writes under dense repair
     };
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1,
     };

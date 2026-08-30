@@ -104,7 +104,7 @@ const LatencyStats = struct {
     ops: u64 = 0,
     total_ns: u64 = 0,
     max_ns: u64 = 0,
-    buckets: [latency_bucket_count]u64 = [_]u64{0} ** latency_bucket_count,
+    buckets: [latency_bucket_count]u64 = @as([latency_bucket_count]u64, @splat(0)),
 
     fn record(self: *LatencyStats, ns: u64) void {
         self.ops += 1;

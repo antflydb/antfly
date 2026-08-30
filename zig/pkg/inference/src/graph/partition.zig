@@ -286,18 +286,18 @@ pub const CapabilityReason = enum {
 };
 
 pub const CapabilityDiagnostics = struct {
-    counts: [@typeInfo(CapabilityReason).@"enum".fields.len]usize = .{0} ** @typeInfo(CapabilityReason).@"enum".fields.len,
+    counts: [@typeInfo(CapabilityReason).@"enum".field_names.len]usize = @splat(0),
     operator_stats: operator_plan.Stats = .{},
 
     pub fn record(self: *CapabilityDiagnostics, decision: CapabilityDecision) void {
-        self.counts[@intFromEnum(decision.reason)] += 1;
+        self.counts[@backingInt(decision.reason)] += 1;
         if (decision.can_execute and decision.should_execute) {
             if (decision.operator_plan) |plan| self.operator_stats.add(plan.operator());
         }
     }
 
     pub fn count(self: *const CapabilityDiagnostics, reason: CapabilityReason) usize {
-        return self.counts[@intFromEnum(reason)];
+        return self.counts[@backingInt(reason)];
     }
 
     pub fn operatorCount(self: *const CapabilityDiagnostics, operator: operator_plan.Operator) usize {

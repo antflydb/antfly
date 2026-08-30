@@ -135,16 +135,16 @@ fn validatePlannedObjectChecksum(
     switch (checksum.algorithm) {
         .crc32_base64 => {
             var digest: [4]u8 = undefined;
-            std.mem.writeInt(u32, &digest, std.hash.crc.Crc32.hash(body), .big);
+            std.mem.writeInt(u32, &digest, std.hash.crc.@"CRC-32/ISO-HDLC".hash(body), .big);
             try validateBase64Digest(checksum.value, &digest);
         },
         .crc32c_base64 => {
             var digest: [4]u8 = undefined;
-            std.mem.writeInt(u32, &digest, std.hash.crc.Crc32Iscsi.hash(body), .big);
+            std.mem.writeInt(u32, &digest, std.hash.crc.@"CRC-32/ISCSI".hash(body), .big);
             try validateBase64Digest(checksum.value, &digest);
         },
         .crc64nvme_base64 => {
-            const Crc64Nvme = std.hash.crc.Crc(u64, .{
+            const Crc64Nvme = std.hash.crc.Generic(u64, .{
                 .polynomial = 0xad93d23594c93659,
                 .initial = 0xffffffffffffffff,
                 .reflect_input = true,
@@ -495,7 +495,7 @@ test "lake object storage range reader validates full object checksums" {
     try std.testing.expectError(error.PreconditionFailed, mismatched_reader.parquetReader().readPlannedAlloc(alloc, full_read));
 
     var crc32c_digest: [4]u8 = undefined;
-    std.mem.writeInt(u32, &crc32c_digest, std.hash.crc.Crc32Iscsi.hash("0123456789"), .big);
+    std.mem.writeInt(u32, &crc32c_digest, std.hash.crc.@"CRC-32/ISCSI".hash("0123456789"), .big);
     var crc32c_encoded: [std.base64.standard.Encoder.calcSize(crc32c_digest.len)]u8 = undefined;
     _ = std.base64.standard.Encoder.encode(&crc32c_encoded, &crc32c_digest);
     var gcs_crc32c = ChecksumObjectStorage{ .checksum = .{

@@ -14,6 +14,14 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+
+fn repeatBytesComptime(comptime bytes: []const u8, comptime count: usize) [bytes.len * count]u8 {
+    var repeated: [bytes.len * count]u8 = undefined;
+    for (0..count) |i| {
+        @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+    }
+    return repeated;
+}
 const simd_stage1 = @import("simd_stage1.zig");
 const _skip_tape = @import("skip_tape.zig");
 const simd_typed = @import("simd_typed.zig");
@@ -291,7 +299,7 @@ test "parseFromSliceLeaky supports Value callers" {
 
 test "explicit simd requests select the stage1 backend path" {
     const selection = backendSelectionForSlice(
-        "0123456789" ** 32,
+        &repeatBytesComptime("0123456789", 32),
         .{ .preferred_backend = .simd, .simd_min_input_len = 32 },
     );
 
@@ -310,7 +318,7 @@ test "small inputs stay on stdlib path in auto mode" {
 }
 
 test "auto mode selects partial simd backend for large inputs" {
-    const selection = backendSelectionForSlice("0123456789" ** 32, .{ .simd_min_input_len = 32 });
+    const selection = backendSelectionForSlice(&repeatBytesComptime("0123456789", 32), .{ .simd_min_input_len = 32 });
 
     try std.testing.expectEqual(.auto, selection.requested);
     try std.testing.expectEqual(.simd, selection.selected);
@@ -358,7 +366,7 @@ test "auto typed selection stays on stdlib for custom jsonParse subtrees" {
         },
     };
 
-    const selection = backendSelectionForTypedSlice(T, "0123456789" ** 32, .{ .simd_min_input_len = 32 });
+    const selection = backendSelectionForTypedSlice(T, &repeatBytesComptime("0123456789", 32), .{ .simd_min_input_len = 32 });
 
     try std.testing.expectEqual(.auto, selection.requested);
     try std.testing.expectEqual(.stdlib, selection.selected);
@@ -370,7 +378,7 @@ test "auto typed selection stays on stdlib when ignoring unknown fields" {
         count: u32,
     };
 
-    const selection = backendSelectionForTypedSliceWithOptions(T, "0123456789" ** 32, .{
+    const selection = backendSelectionForTypedSliceWithOptions(T, &repeatBytesComptime("0123456789", 32), .{
         .ignore_unknown_fields = true,
     }, .{ .simd_min_input_len = 32 });
 

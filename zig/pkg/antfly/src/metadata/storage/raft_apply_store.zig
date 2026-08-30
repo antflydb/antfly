@@ -2107,7 +2107,7 @@ pub const RaftApplyStore = struct {
     };
 
     fn metadataSnapshotProjectionBit(projection: MetadataSnapshotProjection) u32 {
-        return @as(u32, 1) << @intFromEnum(projection);
+        return @as(u32, 1) << @backingInt(projection);
     }
 
     /// Exhaustively ties every durable transition command to the projection
@@ -4481,47 +4481,47 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
     try out.appendSlice(alloc, transition_magic);
     switch (command) {
         .initialize_metadata_incarnation => |incarnation| {
-            try out.append(alloc, @intFromEnum(TransitionTag.initialize_metadata_incarnation));
+            try out.append(alloc, @backingInt(TransitionTag.initialize_metadata_incarnation));
             try out.appendSlice(alloc, &incarnation);
         },
         .upsert_node => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_node));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_node));
             try appendNodeRecord(alloc, &out, record);
         },
         .register_node => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.register_node));
+            try out.append(alloc, @backingInt(TransitionTag.register_node));
             try appendNodeRecord(alloc, &out, record);
         },
         .remove_node => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_node));
+            try out.append(alloc, @backingInt(TransitionTag.remove_node));
             try appendInt(alloc, &out, u64, record.node_id);
         },
         .request_node_shutdown => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.request_node_shutdown));
+            try out.append(alloc, @backingInt(TransitionTag.request_node_shutdown));
             try appendInt(alloc, &out, u64, record.node_id);
         },
         .cancel_node_shutdown => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.cancel_node_shutdown));
+            try out.append(alloc, @backingInt(TransitionTag.cancel_node_shutdown));
             try appendInt(alloc, &out, u64, record.node_id);
         },
         .finalize_node_shutdown => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.finalize_node_shutdown));
+            try out.append(alloc, @backingInt(TransitionTag.finalize_node_shutdown));
             try appendInt(alloc, &out, u64, record.node_id);
         },
         .upsert_store => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_store));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_store));
             try appendStoreRecord(alloc, &out, record);
         },
         .register_store => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.register_store));
+            try out.append(alloc, @backingInt(TransitionTag.register_store));
             try appendStoreRecord(alloc, &out, record);
         },
         .remove_store => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_store));
+            try out.append(alloc, @backingInt(TransitionTag.remove_store));
             try appendInt(alloc, &out, u64, record.store_id);
         },
         .upsert_replica_intent => |replacement| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_replica_intent));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_replica_intent));
             try out.append(alloc, @intFromBool(replacement.expected_metadata_version != null));
             if (replacement.expected_metadata_version) |version| try appendInt(alloc, &out, u64, version);
             try appendInt(alloc, &out, u64, replacement.expected_version_fence);
@@ -4529,22 +4529,22 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try appendPlacementIntent(alloc, &out, replacement.replacement);
         },
         .remove_replica_intent => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_replica_intent));
+            try out.append(alloc, @backingInt(TransitionTag.remove_replica_intent));
             try appendInt(alloc, &out, u64, record.group_id);
             try appendInt(alloc, &out, u64, record.local_node_id);
             try appendInt(alloc, &out, u64, record.expected_metadata_version);
         },
         .upsert_table => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_table));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_table));
             try appendTableRecord(alloc, &out, record);
         },
         .compare_and_replace_table => |replacement| {
-            try out.append(alloc, @intFromEnum(TransitionTag.compare_and_replace_table));
+            try out.append(alloc, @backingInt(TransitionTag.compare_and_replace_table));
             try appendFramedTableRecord(alloc, &out, replacement.expected);
             try appendFramedTableRecord(alloc, &out, replacement.replacement);
         },
         .remove_table => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_table));
+            try out.append(alloc, @backingInt(TransitionTag.remove_table));
             try appendInt(alloc, &out, u64, record.table_id);
             try appendInt(
                 alloc,
@@ -4554,30 +4554,30 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             );
         },
         .upsert_schema_progress => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_schema_progress));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_schema_progress));
             try appendSchemaProgressRecord(alloc, &out, record);
         },
         .remove_schema_progress => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_schema_progress));
+            try out.append(alloc, @backingInt(TransitionTag.remove_schema_progress));
             try appendInt(alloc, &out, u64, record.table_id);
             try appendInt(alloc, &out, u64, record.node_id);
         },
         .upsert_restore_progress => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_restore_progress));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_restore_progress));
             try appendRestoreProgressRecord(alloc, &out, record);
         },
         .remove_restore_progress => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_restore_progress));
+            try out.append(alloc, @backingInt(TransitionTag.remove_restore_progress));
             try appendInt(alloc, &out, u64, record.table_id);
             try appendInt(alloc, &out, u64, record.node_id);
             try appendInt(alloc, &out, u64, record.group_id);
         },
         .upsert_replication_source_status => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_replication_source_status));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_replication_source_status));
             try appendReplicationSourceStatusRecord(alloc, &out, record);
         },
         .claim_replication_source_cutover => |claim| {
-            try out.append(alloc, @intFromEnum(TransitionTag.claim_replication_source_cutover));
+            try out.append(alloc, @backingInt(TransitionTag.claim_replication_source_cutover));
             try appendRequiredString(alloc, &out, claim.expected_replication_sources_json);
             try appendInt(alloc, &out, u64, claim.expected_authority_id);
             try appendReplicationSourceStatusRecord(alloc, &out, claim.record);
@@ -4585,120 +4585,120 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .complete_replication_source_retirement => |record| {
             try out.append(
                 alloc,
-                @intFromEnum(
+                @backingInt(
                     TransitionTag.complete_replication_source_retirement,
                 ),
             );
             try appendReplicationSourceStatusRecord(alloc, &out, record);
         },
         .upsert_range => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_range));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_range));
             try appendRangeRecord(alloc, &out, record);
         },
         .complete_restore_range => |identity| {
-            try out.append(alloc, @intFromEnum(TransitionTag.complete_restore_range));
+            try out.append(alloc, @backingInt(TransitionTag.complete_restore_range));
             try appendRestoreIntentIdentity(alloc, &out, identity);
         },
         .remove_range => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_range));
+            try out.append(alloc, @backingInt(TransitionTag.remove_range));
             try appendInt(alloc, &out, u64, record.group_id);
         },
         .admit_split_transition => |admission| {
-            try out.append(alloc, @intFromEnum(TransitionTag.admit_split_transition));
+            try out.append(alloc, @backingInt(TransitionTag.admit_split_transition));
             try appendInt(alloc, &out, u64, admission.expected_source_epoch);
             try appendSplitTransitionRecord(alloc, &out, admission.record);
         },
         .upsert_split_transition => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_split_transition));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_split_transition));
             try appendSplitTransitionRecord(alloc, &out, record);
         },
         .remove_split_transition => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_split_transition));
+            try out.append(alloc, @backingInt(TransitionTag.remove_split_transition));
             try appendInt(alloc, &out, u64, record.transition_id);
         },
         .upsert_merge_transition => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_merge_transition));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_merge_transition));
             try appendMergeTransitionRecord(alloc, &out, record);
         },
         .remove_merge_transition => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_merge_transition));
+            try out.append(alloc, @backingInt(TransitionTag.remove_merge_transition));
             try appendInt(alloc, &out, u64, record.transition_id);
         },
         .upsert_reconcile_lease => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_reconcile_lease));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_reconcile_lease));
             try appendReconcileLeaseRecord(alloc, &out, record);
         },
         .remove_reconcile_lease => {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_reconcile_lease));
+            try out.append(alloc, @backingInt(TransitionTag.remove_reconcile_lease));
         },
         .upsert_shuffle_join_lease => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_shuffle_join_lease));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_shuffle_join_lease));
             try appendShuffleJoinLeaseRecord(alloc, &out, record);
         },
         .remove_shuffle_join_lease => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_shuffle_join_lease));
+            try out.append(alloc, @backingInt(TransitionTag.remove_shuffle_join_lease));
             try appendInt(alloc, &out, u64, record.job_id);
         },
         .upsert_reallocation_request => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_reallocation_request));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_reallocation_request));
             try appendReallocationRequestRecord(alloc, &out, record);
         },
         .remove_reallocation_request => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_reallocation_request));
+            try out.append(alloc, @backingInt(TransitionTag.remove_reallocation_request));
             try appendInt(alloc, &out, u128, record.expected_request_id);
         },
         .upsert_extension_package => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_extension_package));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_extension_package));
             try appendJsonRecord(alloc, &out, record);
         },
         .remove_extension_package => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_extension_package));
+            try out.append(alloc, @backingInt(TransitionTag.remove_extension_package));
             try appendRequiredString(alloc, &out, record.name);
             try appendRequiredString(alloc, &out, record.version);
         },
         .upsert_installed_extension => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_installed_extension));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_installed_extension));
             try appendJsonRecord(alloc, &out, record);
         },
         .remove_installed_extension => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_installed_extension));
+            try out.append(alloc, @backingInt(TransitionTag.remove_installed_extension));
             try appendRequiredString(alloc, &out, record.name);
         },
         .upsert_extension_member => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_extension_member));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_extension_member));
             try appendJsonRecord(alloc, &out, record);
         },
         .remove_extension_member => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_extension_member));
+            try out.append(alloc, @backingInt(TransitionTag.remove_extension_member));
             try appendRequiredString(alloc, &out, record.extension_name);
             try appendRequiredString(alloc, &out, @tagName(record.object_kind));
             try appendRequiredString(alloc, &out, record.object_name);
         },
         .upsert_extension_dependency => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_extension_dependency));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_extension_dependency));
             try appendJsonRecord(alloc, &out, record);
         },
         .remove_extension_dependency => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_extension_dependency));
+            try out.append(alloc, @backingInt(TransitionTag.remove_extension_dependency));
             try appendRequiredString(alloc, &out, record.extension_name);
             try appendRequiredString(alloc, &out, record.required_extension_name);
             try appendRequiredString(alloc, &out, record.package_name);
         },
         .apply_extension_lifecycle => |delta| {
-            try out.append(alloc, @intFromEnum(TransitionTag.apply_extension_lifecycle));
+            try out.append(alloc, @backingInt(TransitionTag.apply_extension_lifecycle));
             try appendJsonRecord(alloc, &out, delta);
         },
         .upsert_restore_job => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_restore_job));
+            try out.append(alloc, @backingInt(TransitionTag.upsert_restore_job));
             try appendRequiredString(alloc, &out, record.key);
             try appendRequiredString(alloc, &out, record.value);
         },
         .remove_restore_job => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_restore_job));
+            try out.append(alloc, @backingInt(TransitionTag.remove_restore_job));
             try appendRequiredString(alloc, &out, record.key);
         },
         .remove_restore_jobs => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.remove_restore_jobs));
+            try out.append(alloc, @backingInt(TransitionTag.remove_restore_jobs));
             try appendInt(alloc, &out, u32, @intCast(record.keys.len));
             for (record.keys) |key| try appendRequiredString(alloc, &out, key);
         },
@@ -5878,7 +5878,7 @@ fn appendRuntimeIndexStatusRecord(
     try out.append(alloc, if (record.replay_catch_up_required) 1 else 0);
     try appendOptionalString(alloc, out, record.load_error);
     if (version >= runtime_status_protocol.repair_status_record_version) {
-        try out.append(alloc, if (record.repair_status) |status| @intFromEnum(status) else 0);
+        try out.append(alloc, if (record.repair_status) |status| @backingInt(status) else 0);
         try out.append(
             alloc,
             if (record.repair_status != null and record.repair_active_generation_serviceable) 1 else 0,
@@ -5946,10 +5946,10 @@ fn readRuntimeIndexStatusRecord(
         pos.* += 1;
         break :blk switch (tag) {
             0 => null,
-            @intFromEnum(metadata.IndexRepairStatus.rebuilding) => .rebuilding,
-            @intFromEnum(metadata.IndexRepairStatus.waiting) => .waiting,
-            @intFromEnum(metadata.IndexRepairStatus.paused) => .paused,
-            @intFromEnum(metadata.IndexRepairStatus.failed) => .failed,
+            @backingInt(metadata.IndexRepairStatus.rebuilding) => .rebuilding,
+            @backingInt(metadata.IndexRepairStatus.waiting) => .waiting,
+            @backingInt(metadata.IndexRepairStatus.paused) => .paused,
+            @backingInt(metadata.IndexRepairStatus.failed) => .failed,
             else => return error.InvalidMetadataTransitionEncoding,
         };
     } else null;
@@ -6164,7 +6164,7 @@ fn appendPlacementIntent(
     try appendInt(alloc, out, u64, intent.record.replica_id);
     try appendInt(alloc, out, u64, intent.record.local_node_id);
     try appendInt(alloc, out, u64, intent.record.metadata_version);
-    try out.append(alloc, @intFromEnum(intent.record.bootstrap_mode));
+    try out.append(alloc, @backingInt(intent.record.bootstrap_mode));
     try appendInt(alloc, out, u32, @intCast(intent.peer_node_ids.len));
     for (intent.peer_node_ids) |node_id| try appendInt(alloc, out, u64, node_id);
     try appendInt(alloc, out, u64, intent.store_id);
@@ -6204,7 +6204,7 @@ fn appendPlacementIntent(
         },
         else => {},
     }
-    try out.append(alloc, @intFromEnum(intent.serving_state));
+    try out.append(alloc, @backingInt(intent.serving_state));
     try appendInt(alloc, out, u64, intent.relocation_generation);
     try appendInt(alloc, out, u64, intent.relocation_source_node_id);
     try appendInt(alloc, out, u64, intent.relocation_source_store_id);
@@ -6406,7 +6406,7 @@ fn appendSplitTransitionRecord(
     try appendInt(alloc, out, u64, record.attempt_epoch);
     try appendInt(alloc, out, u64, record.source_group_id);
     try appendInt(alloc, out, u64, record.destination_group_id);
-    try out.append(alloc, @intFromEnum(record.phase));
+    try out.append(alloc, @backingInt(record.phase));
     if (record.split_key) |split_key| {
         try out.append(alloc, 1);
         try appendInt(alloc, out, u32, @intCast(split_key.len));
@@ -6445,7 +6445,7 @@ fn appendMergeTransitionRecord(
     try appendInt(alloc, out, u64, record.transition_id);
     try appendInt(alloc, out, u64, record.donor_group_id);
     try appendInt(alloc, out, u64, record.receiver_group_id);
-    try out.append(alloc, @intFromEnum(record.phase));
+    try out.append(alloc, @backingInt(record.phase));
     if (record.rollback_reason) |reason| {
         try out.append(alloc, 1);
         try appendInt(alloc, out, u32, @intCast(reason.len));
@@ -7082,14 +7082,14 @@ fn readReplicationSourceStatusRecord(
     const last_source_commit_at_ms = if (pos.* + @sizeOf(u64) <= encoded.len) try readInt(encoded, pos, u64) else 0;
     const cutover_intent_id = if (pos.* + @sizeOf(u64) <= encoded.len) try readInt(encoded, pos, u64) else 0;
     var cutover_config_fingerprint =
-        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+        @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));
     if (pos.* + cutover_config_fingerprint.len <= encoded.len) {
         @memcpy(&cutover_config_fingerprint, encoded[pos.*..][0..cutover_config_fingerprint.len]);
         pos.* += cutover_config_fingerprint.len;
     }
     const cutover_authority_id = try readInt(encoded, pos, u64);
     var cutover_provider_identity =
-        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+        @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));
     if (pos.* + cutover_provider_identity.len > encoded.len)
         return error.InvalidMetadataTransitionEncoding;
     @memcpy(
@@ -7545,13 +7545,13 @@ fn metadataSnapshotKeyBelongsToGroup(group_id: u64, key: []const u8) bool {
 }
 
 test "metadata raft apply store snapshot key registry covers every durable projection class" {
-    const projection_count = @typeInfo(RaftApplyStore.MetadataSnapshotProjection).@"enum".fields.len;
+    const projection_count = @typeInfo(RaftApplyStore.MetadataSnapshotProjection).@"enum".field_names.len;
     try std.testing.expectEqual(projection_count, RaftApplyStore.metadata_snapshot_projections.len);
 
-    var seen = [_]bool{false} ** projection_count;
+    var seen = @as([projection_count]bool, @splat(false));
     var buf: [256]u8 = undefined;
     for (RaftApplyStore.metadata_snapshot_projections) |descriptor| {
-        const ordinal = @intFromEnum(descriptor.projection);
+        const ordinal = @backingInt(descriptor.projection);
         try std.testing.expect(!seen[ordinal]);
         seen[ordinal] = true;
         const key = switch (descriptor.key) {
@@ -7827,7 +7827,7 @@ fn transitionPhaseCanAdvance(existing: metadata.TransitionPhase, incoming: metad
     if (transitionPhaseTerminal(existing)) return incoming == existing;
     if (existing == .rolling_back) return incoming == .rolling_back or incoming == .rolled_back;
     if (transitionPhaseTerminal(incoming)) return true;
-    return @intFromEnum(incoming) >= @intFromEnum(existing);
+    return @backingInt(incoming) >= @backingInt(existing);
 }
 
 fn splitTransitionUpdateAllowed(existing: metadata.SplitTransitionRecord, incoming: metadata.SplitTransitionRecord) bool {
@@ -10446,7 +10446,7 @@ test "metadata replication source status transition command round-trips" {
             .last_change_applied_at_ms = 124,
             .cutover_intent_id = 0x1122,
             .cutover_authority_id = 0x3344,
-            .cutover_provider_identity = [_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length,
+            .cutover_provider_identity = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x44)),
             .updated_at_ms = 555,
         },
     };
@@ -10476,7 +10476,7 @@ test "metadata replication source status transition command round-trips" {
     try std.testing.expectEqual(@as(u64, 0x3344), decoded.?.upsert_replication_source_status.cutover_authority_id);
     try std.testing.expectEqualSlices(
         u8,
-        &([_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length),
+        &(@as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x44))),
         &decoded.?.upsert_replication_source_status.cutover_provider_identity,
     );
 }
@@ -10626,8 +10626,8 @@ test "metadata raft apply store projects replication source status records from 
                 .phase = "cutover_preparing",
                 .cutover_intent_id = 0x1122,
                 .cutover_authority_id = 0x3344,
-                .cutover_provider_identity = [_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length,
-                .cutover_config_fingerprint = [_]u8{0x33} ** std.crypto.hash.sha2.Sha256.digest_length,
+                .cutover_provider_identity = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x44)),
+                .cutover_config_fingerprint = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x33)),
             },
         },
     });
@@ -10654,8 +10654,8 @@ test "metadata raft apply store projects replication source status records from 
             .last_change_applied_at_ms = 555,
             .cutover_intent_id = 0x1122,
             .cutover_authority_id = 0x3344,
-            .cutover_provider_identity = [_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length,
-            .cutover_config_fingerprint = [_]u8{0x33} ** std.crypto.hash.sha2.Sha256.digest_length,
+            .cutover_provider_identity = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x44)),
+            .cutover_config_fingerprint = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x33)),
             .updated_at_ms = 777,
         },
     });
@@ -10701,12 +10701,12 @@ test "metadata raft apply store projects replication source status records from 
         try std.testing.expectEqual(@as(u64, 0x3344), statuses[0].cutover_authority_id);
         try std.testing.expectEqualSlices(
             u8,
-            &([_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length),
+            &(@as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x44))),
             &statuses[0].cutover_provider_identity,
         );
         try std.testing.expectEqualSlices(
             u8,
-            &([_]u8{0x33} ** std.crypto.hash.sha2.Sha256.digest_length),
+            &(@as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x33))),
             &statuses[0].cutover_config_fingerprint,
         );
 
@@ -10721,7 +10721,7 @@ test "metadata raft apply store projects replication source status records from 
         try std.testing.expectEqual(@as(u64, 0x3344), point_status.cutover_authority_id);
         try std.testing.expectEqualSlices(
             u8,
-            &([_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length),
+            &(@as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x44))),
             &point_status.cutover_provider_identity,
         );
     }
@@ -10742,9 +10742,9 @@ test "metadata raft apply store fences exact cutover authority and retirement" {
     const replication_sources_json =
         "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]";
     const fingerprint =
-        [_]u8{0x33} ** std.crypto.hash.sha2.Sha256.digest_length;
+        @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x33));
     const provider =
-        [_]u8{0x44} ** std.crypto.hash.sha2.Sha256.digest_length;
+        @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x44));
     const authority_a = metadata.ReplicationSourceStatusRecord{
         .table_id = 41,
         .source_ordinal = 0,

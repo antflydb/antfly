@@ -88,9 +88,9 @@ fn shouldSkipAutoMtpDraftLoad(opts: Options, draft_cfg: gpt_mod.Config) bool {
 const Options = struct {
     model_dir: []const u8,
     prompt: []const u8,
-    image_paths: [8][]const u8 = .{""} ** 8,
+    image_paths: [8][]const u8 = @splat(""),
     image_count: usize = 0,
-    audio_paths: [8][]const u8 = .{""} ** 8,
+    audio_paths: [8][]const u8 = @splat(""),
     audio_count: usize = 0,
     backend: BackendChoice = .auto,
     max_tokens: i32 = 128,
@@ -6005,8 +6005,8 @@ fn traceGenerateTopLogitsEnabled() bool {
 
 fn traceGenerateTopLogits(label: []const u8, step: usize, logits: []const f32) void {
     if (!traceGenerateTopLogitsEnabled()) return;
-    var top_ids = [_]usize{0} ** 8;
-    var top_vals = [_]f32{-std.math.inf(f32)} ** 8;
+    var top_ids = @as([8]usize, @splat(0));
+    var top_vals = @as([8]f32, @splat(-std.math.inf(f32)));
     for (logits, 0..) |logit, idx| {
         var insert_at: ?usize = null;
         for (top_vals, 0..) |current, slot| {
@@ -8205,9 +8205,9 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.metal_runtime_jit_exact_q4_0_hits = 25;
     snapshot.provider.metal_runtime_jit_exact_q4_k_hits = 26;
     const generated_counts = &snapshot.provider.metal_runtime_antfly_generated_dispatch_counts;
-    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q8_0)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.none)] = 5;
-    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q6_k)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.bias)] = 24;
-    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q6_k)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.bias_gelu)] = 6;
+    generated_counts[@backingInt(quant_matmul.GeneratedQuantFormatIndex.q8_0)][@backingInt(quant_matmul.GeneratedQuantEpilogueIndex.none)] = 5;
+    generated_counts[@backingInt(quant_matmul.GeneratedQuantFormatIndex.q6_k)][@backingInt(quant_matmul.GeneratedQuantEpilogueIndex.bias)] = 24;
+    generated_counts[@backingInt(quant_matmul.GeneratedQuantFormatIndex.q6_k)][@backingInt(quant_matmul.GeneratedQuantEpilogueIndex.bias_gelu)] = 6;
     snapshot.provider.active_decode_frame_fallbacks = 7;
     snapshot.provider.prefill_frame_execute_successes = 8;
     snapshot.provider.prefill_frame_execute_attempts = 9;
@@ -8354,8 +8354,8 @@ test "metal stats compact json derives plan counters from runtime generated disp
     // q8_0/none is a promoted production route; q5_k/bias_gelu is still a dev
     // candidate (q5_k/bias was promoted, so it no longer covers the candidate
     // branch of this test).
-    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q8_0)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.none)] = 2;
-    generated_counts[@intFromEnum(quant_matmul.GeneratedQuantFormatIndex.q5_k)][@intFromEnum(quant_matmul.GeneratedQuantEpilogueIndex.bias_gelu)] = 3;
+    generated_counts[@backingInt(quant_matmul.GeneratedQuantFormatIndex.q8_0)][@backingInt(quant_matmul.GeneratedQuantEpilogueIndex.none)] = 2;
+    generated_counts[@backingInt(quant_matmul.GeneratedQuantFormatIndex.q5_k)][@backingInt(quant_matmul.GeneratedQuantEpilogueIndex.bias_gelu)] = 3;
 
     const json = try metalStatsCompactJson(std.testing.allocator, snapshot, .{});
     defer std.testing.allocator.free(json);
@@ -9138,7 +9138,7 @@ test "cuda gemma prefill prewarm defaults on with bidirectional env overrides" {
         }
     };
     for (names, &saved) |name, *slot| {
-        if (platform.env.getenv(name.ptr)) |value| slot.* = try allocator.dupeZ(u8, value);
+        if (platform.env.getenv(name.ptr)) |value| slot.* = try allocator.dupeSentinel(u8, value, 0);
         _ = unsetenv(name.ptr);
     }
 

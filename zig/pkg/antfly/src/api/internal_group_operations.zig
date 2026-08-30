@@ -967,7 +967,7 @@ test "internal transaction operations preserve pre-decision leader unavailabilit
         .writes = Source.iface(),
         .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
     };
-    const txn_id = [_]u8{0x42} ** 16;
+    const txn_id = @as([16]u8, @splat(0x42));
     try std.testing.expectError(error.GroupLeaderUnavailable, operations.txnBegin(
         std.testing.allocator,
         .{},

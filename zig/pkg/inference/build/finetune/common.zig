@@ -137,7 +137,7 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) void {
     if (spec.link_libc) exe.root_module.link_libc = true;
 
     const run = b.addRunArtifact(exe);
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     const step = b.step(spec.name, spec.description);
     step.dependOn(&run.step);
 }
@@ -247,8 +247,7 @@ fn configureMetal(
 
 fn addMacosSdkPaths(ctx: Context, module: *std.Build.Module) void {
     if (ctx.target.result.os.tag != .macos) return;
-    const sdk_root = ctx.b.sysroot orelse
-        ctx.b.graph.environ_map.get("SDK_PATH") orelse
+    const sdk_root = ctx.b.graph.environ_map.get("SDK_PATH") orelse
         std.zig.system.darwin.getSdk(ctx.b.allocator, ctx.b.graph.io, &ctx.target.result) orelse
         return;
     module.addSystemIncludePath(.{ .cwd_relative = ctx.b.fmt("{s}/usr/include", .{sdk_root}) });

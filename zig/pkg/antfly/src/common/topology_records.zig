@@ -87,4 +87,4 @@ pub const RangeRecord = struct {
 pub const RestoreCompletionFingerprint =
     [std.crypto.hash.sha2.Sha256.digest_length]u8;
 pub const empty_restore_completion_fingerprint: RestoreCompletionFingerprint =
-    [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+    @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));

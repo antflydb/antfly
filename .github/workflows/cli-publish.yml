@@ -21,7 +21,7 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  ZIG_VERSION: 0.16.0
+  ZIG_VERSION: 0.17.0-dev.1933+e19a73c2d
 
 jobs:
   package:
@@ -77,7 +77,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xz-utils
           curl --fail --location --retry 3 \
-            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            "https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
             -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1

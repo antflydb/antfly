@@ -3733,7 +3733,7 @@ const BatchTargetStats = struct {
     entity_token_count: u64 = 0,
     ignored_token_count: u64 = 0,
     entity_type_count: usize = 0,
-    positive_counts_by_entity_type: [gliner2_autodiff.max_span_start_entity_types]u64 = [_]u64{0} ** gliner2_autodiff.max_span_start_entity_types,
+    positive_counts_by_entity_type: [gliner2_autodiff.max_span_start_entity_types]u64 = @as([gliner2_autodiff.max_span_start_entity_types]u64, @splat(0)),
 
     fn entityTokenRate(self: BatchTargetStats) f64 {
         if (self.supervised_token_count == 0) return 0.0;
@@ -4809,10 +4809,10 @@ fn printSpanParityDebug(
     var neg_logits_sum: f64 = 0.0;
     var neg_count: usize = 0;
     const top_k = 5;
-    var top_bce = [_]f64{-1.0} ** top_k;
-    var top_logits = [_]f64{0.0} ** top_k;
-    var top_rows = [_]usize{0} ** top_k;
-    var top_entities = [_]usize{0} ** top_k;
+    var top_bce = @as([top_k]f64, @splat(-1.0));
+    var top_logits = @as([top_k]f64, @splat(0.0));
+    var top_rows = @as([top_k]usize, @splat(0));
+    var top_entities = @as([top_k]usize, @splat(0));
 
     for (0..rows) |row_idx| {
         const target_row = row_idx * width;
@@ -6845,7 +6845,7 @@ test "stochastic negative masking never touches the count-embed active-field blo
 test "packed target stats count only final active schema cells" {
     const E = 3;
     const width = 2 * E;
-    var targets = [_]f32{0.0} ** (2 * width);
+    var targets = @as([(2 * width)]f32, @splat(0.0));
     targets[0] = 1.0;
     targets[E + 0] = 1.0;
     targets[E + 1] = 1.0;

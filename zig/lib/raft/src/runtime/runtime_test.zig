@@ -30,7 +30,7 @@ const StorageRecorder = struct {
     compact_failures_remaining: usize = 0,
     compact_failure_group: ?core.types.GroupId = null,
     compact_successes: usize = 0,
-    compacted_groups: [8]core.types.GroupId = [_]core.types.GroupId{0} ** 8,
+    compacted_groups: [8]core.types.GroupId = @as([8]core.types.GroupId, @splat(0)),
     retired_groups: usize = 0,
 
     fn deinit(self: *StorageRecorder) void {
@@ -228,12 +228,12 @@ const ApplyRecorder = struct {
     applied_entries: usize = 0,
     applied_read_states: usize = 0,
     last_applied_index: core.types.Index = 0,
-    last_applied_by_group: [128]core.types.Index = [_]core.types.Index{0} ** 128,
+    last_applied_by_group: [128]core.types.Index = @as([128]core.types.Index, @splat(0)),
     last_read_index: core.types.Index = 0,
     snapshot_materializations: std.atomic.Value(usize) = .init(0),
     snapshot_failures_remaining: std.atomic.Value(usize) = .init(0),
     snapshot_prepare_failures_remaining: usize = 0,
-    materialized_groups: [8]std.atomic.Value(core.types.GroupId) = [_]std.atomic.Value(core.types.GroupId){.init(0)} ** 8,
+    materialized_groups: [8]std.atomic.Value(core.types.GroupId) = @as([8]std.atomic.Value(core.types.GroupId), @splat(.init(0))),
     block_snapshot_materialization: bool = false,
     snapshot_materialization_started: std.atomic.Value(bool) = .init(false),
     release_snapshot_materialization: std.atomic.Value(bool) = .init(false),
@@ -395,7 +395,7 @@ const ApplyQueueRecorder = struct {
 const PartialApplyRecorder = struct {
     attempts: usize = 0,
     failed_once: bool = false,
-    successful_by_group: [256]usize = [_]usize{0} ** 256,
+    successful_by_group: [256]usize = @as([256]usize, @splat(0)),
 
     fn iface(self: *@This()) runtime.storage_iface.StateMachine {
         return .{

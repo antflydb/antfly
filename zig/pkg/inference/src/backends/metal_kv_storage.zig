@@ -143,10 +143,10 @@ pub const MetalKvStorage = struct {
     /// out independently by each hook. A prompt-cache hook can persist across
     /// requests while request-local hooks use the same runtime, so local bump
     /// allocators would alias and corrupt retained KV pages.
-    leased_slots: [metal_runtime.attention_span_slot_capacity]bool = [_]bool{false} ** metal_runtime.attention_span_slot_capacity,
-    slot_ring_page_count: [metal_runtime.attention_span_slot_capacity]usize = [_]usize{0} ** metal_runtime.attention_span_slot_capacity,
-    slot_ring_policy_initialized: [metal_runtime.attention_span_slot_capacity]bool = [_]bool{false} ** metal_runtime.attention_span_slot_capacity,
-    slot_buffer_capacity_tokens: [metal_runtime.attention_span_slot_capacity]usize = [_]usize{0} ** metal_runtime.attention_span_slot_capacity,
+    leased_slots: [metal_runtime.attention_span_slot_capacity]bool = @as([metal_runtime.attention_span_slot_capacity]bool, @splat(false)),
+    slot_ring_page_count: [metal_runtime.attention_span_slot_capacity]usize = @as([metal_runtime.attention_span_slot_capacity]usize, @splat(0)),
+    slot_ring_policy_initialized: [metal_runtime.attention_span_slot_capacity]bool = @as([metal_runtime.attention_span_slot_capacity]bool, @splat(false)),
+    slot_buffer_capacity_tokens: [metal_runtime.attention_span_slot_capacity]usize = @as([metal_runtime.attention_span_slot_capacity]usize, @splat(0)),
     cyclic_page_table_cache: storage_runtime.CyclicPageTableCache = .{},
 
     /// Allocate a MetalKvStorage keyed to `runtime`. The storage does not own
@@ -331,7 +331,7 @@ pub const MetalKvStorage = struct {
         const rc = metal_runtime.termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
             self.runtime,
             slot,
-            @intFromEnum(self.format),
+            @backingInt(self.format),
             target,
             key_row_bytes,
             v_row_stride,
@@ -506,7 +506,7 @@ pub const MetalKvStorage = struct {
             break :paged metal_runtime.termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
                 self.runtime,
                 slot,
-                @intFromEnum(self.format),
+                @backingInt(self.format),
                 k.handle,
                 k.byte_offset,
                 v.handle,
@@ -538,7 +538,7 @@ pub const MetalKvStorage = struct {
             break :blk metal_runtime.termite_metal_decode_runtime_update_attention_span_from_f32_key_device_slot(
                 self.runtime,
                 slot,
-                @intFromEnum(self.format),
+                @backingInt(self.format),
                 k.handle,
                 k.byte_offset,
                 v.handle,
@@ -878,7 +878,7 @@ pub const MetalKvStorage = struct {
         return .{
             .runtime = @ptrCast(self.runtime),
             .slot = slot,
-            .format = @intFromEnum(self.format),
+            .format = @backingInt(self.format),
             .token_count = gather.token_count,
             .key_row_bytes = key_row_bytes,
             .base_key_row_bytes = base_key_row_bytes,

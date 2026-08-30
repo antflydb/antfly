@@ -50,7 +50,7 @@ currently live under `pkg/inference/`.
 
 ## Build Requirements
 
-- Zig `0.16.0` or newer.
+- Zig `0.17.0-dev.1933+e19a73c2d` (the exact nightly pinned by CI and container builds).
 - `uv` for Python e2e suites and repository helper scripts.
 - Optional native runtime dependencies for some inference features, such as MLX,
   ONNX Runtime, FFmpeg, or platform GPU support. The build detects available

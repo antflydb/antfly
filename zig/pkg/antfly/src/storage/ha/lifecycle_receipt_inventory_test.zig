@@ -269,7 +269,7 @@ const ChangedCounter = struct {
 fn fencedStore(alloc: std.mem.Allocator, root: []const u8) !fencing.Store {
     const raw = try std.fs.path.join(alloc, &.{ root, "fence.wal" });
     defer alloc.free(raw);
-    const path = try alloc.dupeZ(u8, raw);
+    const path = try alloc.dupeSentinel(u8, raw, 0);
     defer alloc.free(path);
     var store = try fencing.Store.open(alloc, path.ptr, .{});
     errdefer store.close();

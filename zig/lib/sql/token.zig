@@ -451,7 +451,7 @@ pub const KeywordClass = enum {
 const audited_keyword_count = 376;
 const audited_non_unreserved_keyword_count = 101;
 comptime {
-    if (std.meta.fields(TokenKeyword).len != audited_keyword_count) {
+    if (@typeInfo(TokenKeyword).@"enum".field_names.len != audited_keyword_count) {
         @compileError("TokenKeyword changed; audit keywordClass against the pinned PostgreSQL kwlist");
     }
     if (generated.token_class_count != audited_non_unreserved_keyword_count) {
@@ -461,11 +461,11 @@ comptime {
 
 const keyword_classes = blk: {
     @setEvalBranchQuota(250_000);
-    const fields = std.meta.fields(TokenKeyword);
-    var result: [fields.len]KeywordClass = @splat(.unreserved);
-    for (fields, 0..) |field, index| {
-        var terminal_name: [field.name.len]u8 = undefined;
-        for (field.name, 0..) |ch, name_index| terminal_name[name_index] = std.ascii.toUpper(ch);
+    const field_names = @typeInfo(TokenKeyword).@"enum".field_names;
+    var result: [field_names.len]KeywordClass = @splat(.unreserved);
+    for (field_names, 0..) |field_name, index| {
+        var terminal_name: [field_name.len]u8 = undefined;
+        for (field_name, 0..) |ch, name_index| terminal_name[name_index] = std.ascii.toUpper(ch);
         if (generated.tokenClassByName(&terminal_name)) |class| {
             result[index] = switch (class) {
                 .column_name => .column_name,
@@ -478,7 +478,7 @@ const keyword_classes = blk: {
 };
 
 pub fn keywordClass(keyword: TokenKeyword) KeywordClass {
-    return keyword_classes[@intFromEnum(keyword)];
+    return keyword_classes[@backingInt(keyword)];
 }
 
 pub const Token = struct {
@@ -535,10 +535,10 @@ const keyword_map = std.StaticStringMapWithEql(
     TokenKeyword,
     std.static_string_map.eqlAsciiIgnoreCase,
 ).initComptime(blk: {
-    const fields = std.meta.fields(TokenKeyword);
-    var entries: [fields.len]struct { []const u8, TokenKeyword } = undefined;
-    for (fields, 0..) |field, index| {
-        entries[index] = .{ field.name, @enumFromInt(field.value) };
+    const info = @typeInfo(TokenKeyword).@"enum";
+    var entries: [info.field_names.len]struct { []const u8, TokenKeyword } = undefined;
+    for (info.field_names, info.field_values, 0..) |field_name, field_value, index| {
+        entries[index] = .{ field_name, @fromBackingInt(@intCast(field_value)) };
     }
     break :blk entries;
 });
@@ -567,14 +567,15 @@ test "SQL keywords use pinned lexical categories and exclude synthetic terminals
 
 test "SQL grammar keyword terminals are represented by TokenKeyword" {
     const grammar = @import("grammar/generated/root.zig");
-    const first_keyword_value = @intFromEnum(grammar.Token.ACCESS);
+    const first_keyword_value = @backingInt(grammar.Token.ACCESS);
 
-    inline for (std.meta.fields(grammar.Token)) |field| {
-        if (field.value < first_keyword_value) continue;
-        if (field.value == @intFromEnum(grammar.Token.ANALYZE_VERBOSE) or
-            field.value == @intFromEnum(grammar.Token.SYSTEM_TIME_FOR)) continue;
-        if (keywordFromIdentifier(field.name) == null) {
-            std.debug.print("grammar keyword terminal {s} is missing from TokenKeyword\n", .{field.name});
+    const grammar_info = @typeInfo(grammar.Token).@"enum";
+    inline for (grammar_info.field_names, grammar_info.field_values) |field_name, field_value| {
+        if (field_value < first_keyword_value) continue;
+        if (field_value == @backingInt(grammar.Token.ANALYZE_VERBOSE) or
+            field_value == @backingInt(grammar.Token.SYSTEM_TIME_FOR)) continue;
+        if (keywordFromIdentifier(field_name) == null) {
+            std.debug.print("grammar keyword terminal {s} is missing from TokenKeyword\n", .{field_name});
             return error.TestUnexpectedResult;
         }
     }

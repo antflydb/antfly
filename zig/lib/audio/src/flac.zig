@@ -181,7 +181,7 @@ fn parseRawFrameStream(bytes: []const u8) !ParsedStream {
                 .channels = header.channel_assignment.decodedChannels(),
                 .bits_per_sample = header.bits_per_sample,
                 .total_samples = 0,
-                .md5 = [_]u8{0} ** 16,
+                .md5 = @as([16]u8, @splat(0)),
             },
             .data_offset = offset,
         };
@@ -507,7 +507,7 @@ fn decodeLpcSubframe(reader: *BitReader, out: []i64, bits_per_sample: u8, order:
     const shift = try reader.readSigned(5);
     if (shift < 0) return error.UnsupportedAudioFormat;
 
-    var coeffs = [_]i32{0} ** 32;
+    var coeffs = @as([32]i32, @splat(0));
     for (0..order) |i| {
         coeffs[i] = @intCast(try reader.readSigned(coeff_precision));
     }

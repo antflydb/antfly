@@ -1098,9 +1098,10 @@ fn optionalBoolField(root: std.json.ObjectMap, field_name: []const u8) !?bool {
 fn deploymentModeFromObject(root: std.json.ObjectMap, expected: ?DeploymentMode) !DeploymentMode {
     if (root.get("deployment_mode")) |value| {
         if (value != .string) return error.InvalidConfig;
-        inline for (std.meta.fields(DeploymentMode)) |field| {
-            if (std.mem.eql(u8, value.string, field.name)) {
-                const configured: DeploymentMode = @enumFromInt(field.value);
+        const info = @typeInfo(DeploymentMode).@"enum";
+        inline for (info.field_names, info.field_values) |field_name, field_value| {
+            if (std.mem.eql(u8, value.string, field_name)) {
+                const configured: DeploymentMode = @fromBackingInt(@intCast(field_value));
                 if (expected) |required| if (configured != required) return error.DeploymentModeMismatch;
                 return configured;
             }

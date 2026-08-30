@@ -95,7 +95,7 @@ const transition_action_lane_count: usize = 64;
 
 const TransitionActionLanes = struct {
     mutexes: [transition_action_lane_count]std.atomic.Mutex =
-        [_]std.atomic.Mutex{.unlocked} ** transition_action_lane_count,
+        @as([transition_action_lane_count]std.atomic.Mutex, @splat(.unlocked)),
 
     const Lease = struct {
         mutex: *std.atomic.Mutex,
@@ -1745,7 +1745,7 @@ pub const HealthSource = struct {
             1,
         );
         if (self.supervisor) |supervisor| {
-            try health_metrics.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(supervisor.currentState()));
+            try health_metrics.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @backingInt(supervisor.currentState()));
             try health_metrics.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(supervisor.token().isCancelled()));
         }
         if (self.data_server.backend_runtime) |backend_runtime| {
@@ -1879,7 +1879,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_parallel_query_fanout_planned_sequential_total", "counter", "Shard query fanout requests that the planner chose to execute sequentially", fanout_metrics.query_planned_sequential_total);
         try health_metrics.appendPromMetric(writer, "antfly_data_parallel_query_fanout_planned_width_total", "counter", "Sum of planner-selected shard query fanout widths", fanout_metrics.query_planned_width_total);
         try health_metrics.appendPromMetric(writer, "antfly_data_parallel_query_fanout_planned_width_count", "counter", "Number of shard query fanout requests contributing to the planned width total", fanout_metrics.query_planned_parallel_total + fanout_metrics.query_planned_sequential_total);
-        try health_metrics.appendPromMetric(writer, "antfly_data_parallel_query_fanout_async_limit", "gauge", "Configured std.Io async limit for the dedicated query fanout runtime", @intFromEnum(self.data_server.query_async_limit));
+        try health_metrics.appendPromMetric(writer, "antfly_data_parallel_query_fanout_async_limit", "gauge", "Configured std.Io async limit for the dedicated query fanout runtime", @backingInt(self.data_server.query_async_limit));
         try health_metrics.appendPromMetric(writer, "antfly_data_parallel_text_stats_fanout_total", "counter", "Parallel distributed text-stats fanout runs executed via std.Io", fanout_metrics.text_stats_parallel_total);
         try health_metrics.appendPromMetric(writer, "antfly_data_parallel_text_stats_fanout_ns_total", "counter", "Total monotonic nanoseconds spent in parallel distributed text-stats fanout", fanout_metrics.text_stats_parallel_ns_total);
         try health_metrics.appendPromMetric(writer, "antfly_data_parallel_text_stats_fanout_planned_parallel_total", "counter", "Distributed text-stats fanout requests that the planner chose to execute in parallel", fanout_metrics.text_stats_planned_parallel_total);
@@ -2129,7 +2129,7 @@ fn writeLsmOwnerCloneMetrics(
         try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_bulk_ingest_current_scan_clone_active_bytes", &labels, owner.maintenance.bulk_ingest_current_scan_clone_active_bytes);
         try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_bulk_ingest_current_scan_clone_peak_active_bytes", &labels, owner.maintenance.bulk_ingest_current_scan_clone_peak_active_bytes);
         for (owner.maintenance.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
-            const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+            const reason: lsm_backend_mod.MutableSnapshotReason = @fromBackingInt(@intCast(i));
             const reason_labels = [_]health_metrics.PromLabel{
                 .{ .name = "table", .value = owner.table_name },
                 .{ .name = "group", .value = group },
@@ -2169,19 +2169,19 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_read_snapshot_mutable_rotation_peak_bytes", "gauge", "Peak mutable memtable bytes rotated for one broad read snapshot", stats.read_snapshot_mutable_rotation_peak_bytes);
     try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_mutable_snapshot_clone_reason_calls_total", "counter", "LSM mutable snapshot clone calls by reader class");
     for (stats.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
-        const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+        const reason: lsm_backend_mod.MutableSnapshotReason = @fromBackingInt(@intCast(i));
         const labels = [_]health_metrics.PromLabel{.{ .name = "reason", .value = lsm_backend_mod.mutableSnapshotReasonName(reason) }};
         try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_mutable_snapshot_clone_reason_calls_total", &labels, reason_stats.calls);
     }
     try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_mutable_snapshot_clone_reason_bytes_total", "counter", "Total bytes cloned into LSM mutable snapshot reads by reader class");
     for (stats.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
-        const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+        const reason: lsm_backend_mod.MutableSnapshotReason = @fromBackingInt(@intCast(i));
         const labels = [_]health_metrics.PromLabel{.{ .name = "reason", .value = lsm_backend_mod.mutableSnapshotReasonName(reason) }};
         try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_mutable_snapshot_clone_reason_bytes_total", &labels, reason_stats.bytes_total);
     }
     try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_mutable_snapshot_clone_reason_peak_bytes", "gauge", "Peak bytes cloned for a single LSM mutable snapshot read by reader class");
     for (stats.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
-        const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+        const reason: lsm_backend_mod.MutableSnapshotReason = @fromBackingInt(@intCast(i));
         const labels = [_]health_metrics.PromLabel{.{ .name = "reason", .value = lsm_backend_mod.mutableSnapshotReasonName(reason) }};
         try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_mutable_snapshot_clone_reason_peak_bytes", &labels, reason_stats.peak_bytes);
     }
@@ -2214,13 +2214,13 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_active_readers", "gauge", "Cached write LSM readers currently retaining run or memtable snapshots", stats.active_readers);
     try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_active_readers_by_kind", "gauge", "Cached write LSM readers currently retaining snapshots by owner class");
     for (stats.active_readers_by_kind, 0..) |count, i| {
-        const kind: lsm_backend_mod.ReaderPinKind = @enumFromInt(i);
+        const kind: lsm_backend_mod.ReaderPinKind = @fromBackingInt(@intCast(i));
         const labels = [_]health_metrics.PromLabel{.{ .name = "kind", .value = lsm_backend_mod.readerPinKindName(kind) }};
         try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_active_readers_by_kind", &labels, count);
     }
     try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_obsolete_paths_pinned_by_reader_kind", "gauge", "Cached write LSM obsolete table paths retained by active readers by owner class");
     for (stats.obsolete_paths_pinned_by_reader_kind, 0..) |count, i| {
-        const kind: lsm_backend_mod.ReaderPinKind = @enumFromInt(i);
+        const kind: lsm_backend_mod.ReaderPinKind = @fromBackingInt(@intCast(i));
         const labels = [_]health_metrics.PromLabel{.{ .name = "kind", .value = lsm_backend_mod.readerPinKindName(kind) }};
         try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_obsolete_paths_pinned_by_reader_kind", &labels, count);
     }
@@ -2694,7 +2694,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.dense_repair_working_set,
         resource_manager_mod.Slice.shard_transition_working_set,
     }) |slice| {
-        const stats = snapshot.slices[@intFromEnum(slice)];
+        const stats = snapshot.slices[@backingInt(slice)];
         try health_metrics.appendPromSampleLabeled(writer, name, &.{
             .{ .name = "slice", .value = slice.name() },
         }, resourceMetricValue(stats, field));
@@ -4381,7 +4381,7 @@ pub const GroupMembership = struct {
     local_voter: bool = false,
     voter_count: u16 = 0,
     voter_set_known: bool = false,
-    voter_set_fingerprint: antfly.metadata.table_manager.VoterSetFingerprint = [_]u8{0} ** antfly.metadata.table_manager.voter_set_fingerprint_len,
+    voter_set_fingerprint: antfly.metadata.table_manager.VoterSetFingerprint = @as([antfly.metadata.table_manager.voter_set_fingerprint_len]u8, @splat(0)),
     joint_consensus: bool = false,
     raft_term: u64 = 0,
     raft_membership_index: u64 = 0,
@@ -4971,7 +4971,7 @@ pub const DataServer = struct {
     ha_primary_mirror_sync_wait_count: std.atomic.Value(u64) = .init(0),
     ha_primary_mirror_sync_degraded_count: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_failure_count: std.atomic.Value(u64) = .init(0),
-    ha_standby_replication_last_error: std.atomic.Value(u8) = .init(@intFromEnum(HAStandbyReplicationErrorCode.none)),
+    ha_standby_replication_last_error: std.atomic.Value(u8) = .init(@backingInt(HAStandbyReplicationErrorCode.none)),
     ha_standby_replication_last_attempt_ns: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_last_success_ns: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_next_attempt_ns: std.atomic.Value(u64) = .init(0),
@@ -5693,7 +5693,7 @@ pub const DataServer = struct {
 
         const slots_path_buf = try std.fmt.allocPrint(self.alloc, "{s}.promoted-primary-slots", .{progress_path});
         defer self.alloc.free(slots_path_buf);
-        const slots_path = try self.alloc.dupeZ(u8, slots_path_buf);
+        const slots_path = try self.alloc.dupeSentinel(u8, slots_path_buf, 0);
         defer self.alloc.free(slots_path);
 
         try self.write_source.prepareHAConfigTransition();
@@ -7076,7 +7076,7 @@ pub const DataServer = struct {
     }
 
     fn clearHAStandbyReplicationError(self: *DataServer) void {
-        self.ha_standby_replication_last_error.store(@intFromEnum(HAStandbyReplicationErrorCode.none), .release);
+        self.ha_standby_replication_last_error.store(@backingInt(HAStandbyReplicationErrorCode.none), .release);
     }
 
     fn haStandbyReplicationRetryDue(self: *DataServer, now_ns: u64) bool {
@@ -7104,11 +7104,11 @@ pub const DataServer = struct {
     }
 
     fn recordHAStandbyReplicationError(self: *DataServer, err: anyerror) void {
-        self.ha_standby_replication_last_error.store(@intFromEnum(haStandbyReplicationErrorCode(err)), .release);
+        self.ha_standby_replication_last_error.store(@backingInt(haStandbyReplicationErrorCode(err)), .release);
     }
 
     fn haStandbyReplicationLastError(self: *DataServer) ?[]const u8 {
-        const code: HAStandbyReplicationErrorCode = @enumFromInt(self.ha_standby_replication_last_error.load(.acquire));
+        const code: HAStandbyReplicationErrorCode = @fromBackingInt(@intCast(self.ha_standby_replication_last_error.load(.acquire)));
         return haStandbyReplicationErrorName(code);
     }
 
@@ -16653,19 +16653,19 @@ fn localGroupStatusFingerprint(
         hasher.update(std.mem.asBytes(&record.transition_id));
         hasher.update(std.mem.asBytes(&record.source_group_id));
         hasher.update(std.mem.asBytes(&record.destination_group_id));
-        const phase: u8 = @intFromEnum(record.phase);
+        const phase: u8 = @backingInt(record.phase);
         hasher.update(&.{phase});
     }
     for (merge_transitions) |record| {
         hasher.update(std.mem.asBytes(&record.transition_id));
         hasher.update(std.mem.asBytes(&record.donor_group_id));
         hasher.update(std.mem.asBytes(&record.receiver_group_id));
-        const phase: u8 = @intFromEnum(record.phase);
+        const phase: u8 = @backingInt(record.phase);
         hasher.update(&.{phase});
     }
     for (split_observations) |record| {
         hasher.update(std.mem.asBytes(&record.transition_id));
-        const phase: u8 = @intFromEnum(record.observation.status.phase);
+        const phase: u8 = @backingInt(record.observation.status.phase);
         hasher.update(&.{phase});
         hasher.update(std.mem.asBytes(&record.observation.status.bootstrapped));
         hasher.update(std.mem.asBytes(&record.observation.status.replay_required));
@@ -16677,8 +16677,8 @@ fn localGroupStatusFingerprint(
     }
     for (merge_observations) |record| {
         hasher.update(std.mem.asBytes(&record.transition_id));
-        const donor_phase: u8 = @intFromEnum(record.observation.donor.phase);
-        const receiver_phase: u8 = @intFromEnum(record.observation.receiver.phase);
+        const donor_phase: u8 = @backingInt(record.observation.donor.phase);
+        const receiver_phase: u8 = @backingInt(record.observation.receiver.phase);
         hasher.update(&.{ donor_phase, receiver_phase });
         hasher.update(std.mem.asBytes(&record.observation.donor.replay_required));
         hasher.update(std.mem.asBytes(&record.observation.donor.replay_caught_up));
@@ -16778,11 +16778,11 @@ fn runtimeEnrichmentStatusReportFromStats(
     stats: antfly.db.types.EnrichmentStats,
 ) !antfly.metadata.table_manager.RuntimeEnrichmentStatusReport {
     var report: antfly.metadata.table_manager.RuntimeEnrichmentStatusReport = .{};
-    inline for (std.meta.fields(antfly.metadata.table_manager.RuntimeEnrichmentStatusReport)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "projection_checkpoint_status")) {
-            @field(report, field.name) = try alloc.dupe(u8, @field(stats, field.name));
+    inline for (@typeInfo(antfly.metadata.table_manager.RuntimeEnrichmentStatusReport).@"struct".field_names) |field_name| {
+        if (comptime std.mem.eql(u8, field_name, "projection_checkpoint_status")) {
+            @field(report, field_name) = try alloc.dupe(u8, @field(stats, field_name));
         } else {
-            @field(report, field.name) = @field(stats, field.name);
+            @field(report, field_name) = @field(stats, field_name);
         }
     }
     return report;
@@ -17913,7 +17913,7 @@ fn dataRaftStorageOwnershipFingerprint(intents: []const antfly.raft.PlacementInt
         hashU64(&hasher, intent.record.group_id);
         hashU64(&hasher, intent.record.replica_id);
         hashU64(&hasher, intent.record.local_node_id);
-        hashU64(&hasher, @intFromEnum(intent.record.bootstrap_mode));
+        hashU64(&hasher, @backingInt(intent.record.bootstrap_mode));
         hashU64(&hasher, intent.record.metadata_version);
         hashU64(&hasher, intent.store_id);
         hashU64(&hasher, intent.relocation_generation);
@@ -17954,7 +17954,7 @@ fn dataRaftLocalStatusFingerprint(
         };
         hashU64(&hasher, 1);
         hashU64(&hasher, status.id);
-        hashU64(&hasher, @intFromEnum(status.soft.role));
+        hashU64(&hasher, @backingInt(status.soft.role));
         if (status.soft.leader_id) |leader_id| {
             hashU64(&hasher, 1);
             hashU64(&hasher, leader_id);
@@ -19071,7 +19071,7 @@ fn resolveExtensionPackageStoreDir(
     cli_path: ?[]const u8,
     local_base: []const u8,
 ) ![]u8 {
-    const env_var_z = try alloc.dupeZ(u8, antfly.extensions.wasmtime_runtime.package_store_env);
+    const env_var_z = try alloc.dupeSentinel(u8, antfly.extensions.wasmtime_runtime.package_store_env, 0);
     defer alloc.free(env_var_z);
     return try resolveExtensionPackageStoreDirWithEnv(
         alloc,
@@ -19190,7 +19190,7 @@ fn resolveTrustedPrincipalConfigValue(
 
     const env_var = try antfly.common.secrets.envVarForKey(alloc, key);
     defer alloc.free(env_var);
-    const env_var_z = try alloc.dupeZ(u8, env_var);
+    const env_var_z = try alloc.dupeSentinel(u8, env_var, 0);
     defer alloc.free(env_var_z);
     if (platform.env.getenvSlice(env_var_z)) |value| {
         const raw = try alloc.dupe(u8, value);
@@ -19826,10 +19826,10 @@ test "data raft apply records transaction conflicts without stopping replica pro
     const participant = try antfly.public_api.distributed_txn.participantIdForGroup(alloc, "docs", group_id);
     defer alloc.free(participant);
     const participants = [_][]const u8{participant};
-    const txn_a: antfly.db.types.TxnId = .{0x0a} ** 16;
-    const txn_b: antfly.db.types.TxnId = .{0x0b} ** 16;
-    const txn_missing: antfly.db.types.TxnId = .{0x0c} ** 16;
-    const txn_version: antfly.db.types.TxnId = .{0x0d} ** 16;
+    const txn_a: antfly.db.types.TxnId = @splat(0x0a);
+    const txn_b: antfly.db.types.TxnId = @splat(0x0b);
+    const txn_missing: antfly.db.types.TxnId = @splat(0x0c);
+    const txn_version: antfly.db.types.TxnId = @splat(0x0d);
     _ = try apply_sm.write_source.applyReplicatedBatchGroupLocal(alloc, group_id, "docs", .{
         .transaction = .{ .begin = .{
             .txn_id = txn_a,
@@ -26880,13 +26880,13 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
         .unpublished_wal_max_batch_logical_bytes = 1537,
         .active_readers = 6,
         .active_readers_by_kind = blk: {
-            var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = [_]u64{0} ** lsm_backend_mod.reader_pin_kind_count;
-            counts[@intFromEnum(lsm_backend_mod.ReaderPinKind.compaction)] = 2;
+            var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = @as([lsm_backend_mod.reader_pin_kind_count]u64, @splat(0));
+            counts[@backingInt(lsm_backend_mod.ReaderPinKind.compaction)] = 2;
             break :blk counts;
         },
         .obsolete_paths_pinned_by_reader_kind = blk: {
-            var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = [_]u64{0} ** lsm_backend_mod.reader_pin_kind_count;
-            counts[@intFromEnum(lsm_backend_mod.ReaderPinKind.compaction)] = 3;
+            var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = @as([lsm_backend_mod.reader_pin_kind_count]u64, @splat(0));
+            counts[@backingInt(lsm_backend_mod.ReaderPinKind.compaction)] = 3;
             break :blk counts;
         },
         .manifest_dirty = true,
@@ -27765,11 +27765,11 @@ test "data server wires configured HA executors into API server" {
 
     const primary_log_raw = try std.fs.path.join(alloc, &.{ capture_fixture_root, "primary.log" });
     defer alloc.free(primary_log_raw);
-    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
     defer alloc.free(primary_log);
     const primary_slots_raw = try std.fs.path.join(alloc, &.{ capture_fixture_root, "primary-slots" });
     defer alloc.free(primary_slots_raw);
-    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
     defer alloc.free(primary_slots);
     const restore_jobs_path = try std.fs.path.join(alloc, &.{ capture_fixture_root, "restore-jobs" });
     defer alloc.free(restore_jobs_path);
@@ -28602,15 +28602,15 @@ test "data server mirrors managed primary writes into HA replication log" {
     const nonce = platform_time.monotonicNs();
     const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-mirror-root-{d}", .{nonce});
     defer alloc.free(replica_root_raw);
-    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
     defer alloc.free(replica_root);
     const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-mirror-log-{d}", .{nonce});
     defer alloc.free(primary_log_raw);
-    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
     defer alloc.free(primary_log);
     const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-mirror-slots-{d}", .{nonce});
     defer alloc.free(primary_slots_raw);
-    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
     defer alloc.free(primary_slots);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -28736,15 +28736,15 @@ test "data server fail-closed sync policy rejects primary writes before local co
     const nonce = platform_time.monotonicNs();
     const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-reject-root-{d}", .{nonce});
     defer alloc.free(replica_root_raw);
-    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
     defer alloc.free(replica_root);
     const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-reject-log-{d}", .{nonce});
     defer alloc.free(primary_log_raw);
-    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
     defer alloc.free(primary_log);
     const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-reject-slots-{d}", .{nonce});
     defer alloc.free(primary_slots_raw);
-    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
     defer alloc.free(primary_slots);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -28792,7 +28792,7 @@ test "data server fail-closed sync policy rejects primary writes before local co
 
     try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
     try std.testing.expectEqual(@as(u64, 1), server.ha_primary_mirror_last_gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(antfly.ha.commit_gate.Action.reject), server.ha_primary_mirror_last_gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(antfly.ha.commit_gate.Action.reject), server.ha_primary_mirror_last_gate_action.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), server.ha_primary_mirror_sync_reject_count.load(.acquire));
 }
 
@@ -28859,15 +28859,15 @@ test "data server block sync policy waits for standby acknowledgement before com
     const nonce = platform_time.monotonicNs();
     const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-block-root-{d}", .{nonce});
     defer alloc.free(replica_root_raw);
-    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
     defer alloc.free(replica_root);
     const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-block-log-{d}", .{nonce});
     defer alloc.free(primary_log_raw);
-    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
     defer alloc.free(primary_log);
     const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-block-slots-{d}", .{nonce});
     defer alloc.free(primary_slots_raw);
-    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
     defer alloc.free(primary_slots);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -28936,7 +28936,7 @@ test "data server block sync policy waits for standby acknowledgement before com
     try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
     try std.testing.expectEqual(@as(u64, 2), server.ha_primary_mirror_last_lsn.load(.acquire));
     try std.testing.expectEqual(@as(u64, 2), server.ha_primary_mirror_last_gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(antfly.ha.commit_gate.Action.acknowledge), server.ha_primary_mirror_last_gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(antfly.ha.commit_gate.Action.acknowledge), server.ha_primary_mirror_last_gate_action.load(.acquire));
     try std.testing.expectEqual(@as(u64, 2), server.ha_primary_mirror_sync_wait_count.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), server.ha_primary_mirror_sync_reject_count.load(.acquire));
 
@@ -28999,11 +28999,11 @@ test "data server propagates standby HA write gate into provisioned write source
     const nonce = platform_time.monotonicNs();
     const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-standby-log-{d}", .{nonce});
     defer alloc.free(standby_log_raw);
-    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
     defer alloc.free(standby_log);
     const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-standby-progress-{d}", .{nonce});
     defer alloc.free(standby_progress_raw);
-    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
     defer alloc.free(standby_progress);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -29141,15 +29141,15 @@ test "storage.ha data server rejects writes and owner jobs after primary promoti
     const nonce = platform_time.monotonicNs();
     const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-fenced-primary-log-{d}", .{nonce});
     defer alloc.free(primary_log_raw);
-    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
     defer alloc.free(primary_log);
     const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-fenced-primary-slots-{d}", .{nonce});
     defer alloc.free(primary_slots_raw);
-    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
     defer alloc.free(primary_slots);
     const fence_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-fenced-primary-fence-{d}", .{nonce});
     defer alloc.free(fence_raw);
-    const fence_path = try alloc.dupeZ(u8, fence_raw);
+    const fence_path = try alloc.dupeSentinel(u8, fence_raw, 0);
     defer alloc.free(fence_path);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -29290,15 +29290,15 @@ test "data server applies routed HA replication records through standby write ga
     const nonce = platform_time.monotonicNs();
     const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-routed-apply-root-{d}", .{nonce});
     defer alloc.free(replica_root_raw);
-    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
     defer alloc.free(replica_root);
     const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-routed-apply-log-{d}", .{nonce});
     defer alloc.free(standby_log_raw);
-    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
     defer alloc.free(standby_log);
     const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-routed-apply-progress-{d}", .{nonce});
     defer alloc.free(standby_progress_raw);
-    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
     defer alloc.free(standby_progress);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -29487,23 +29487,23 @@ test "data server pulls and applies HA standby replication through internal HTTP
     const nonce = platform_time.monotonicNs();
     const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-root-{d}", .{nonce});
     defer alloc.free(replica_root_raw);
-    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
     defer alloc.free(replica_root);
     const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-primary-log-{d}", .{nonce});
     defer alloc.free(primary_log_raw);
-    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
     defer alloc.free(primary_log);
     const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-primary-slots-{d}", .{nonce});
     defer alloc.free(primary_slots_raw);
-    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
     defer alloc.free(primary_slots);
     const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-standby-log-{d}", .{nonce});
     defer alloc.free(standby_log_raw);
-    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
     defer alloc.free(standby_log);
     const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-standby-progress-{d}", .{nonce});
     defer alloc.free(standby_progress_raw);
-    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
     defer alloc.free(standby_progress);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -29696,23 +29696,23 @@ test "data server HA replication network wait leaves state mutex available" {
     const nonce = platform_time.monotonicNs();
     const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-root-{d}", .{nonce});
     defer alloc.free(replica_root_raw);
-    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
     defer alloc.free(replica_root);
     const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-primary-log-{d}", .{nonce});
     defer alloc.free(primary_log_raw);
-    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
     defer alloc.free(primary_log);
     const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-primary-slots-{d}", .{nonce});
     defer alloc.free(primary_slots_raw);
-    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
     defer alloc.free(primary_slots);
     const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-log-{d}", .{nonce});
     defer alloc.free(standby_log_raw);
-    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
     defer alloc.free(standby_log);
     const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-progress-{d}", .{nonce});
     defer alloc.free(standby_progress_raw);
-    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
     defer alloc.free(standby_progress);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -29862,15 +29862,15 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     const nonce = platform_time.monotonicNs();
     const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promoted-http-root-{d}", .{nonce});
     defer alloc.free(replica_root_raw);
-    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
     defer alloc.free(replica_root);
     const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promoted-http-log-{d}", .{nonce});
     defer alloc.free(standby_log_raw);
-    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
     defer alloc.free(standby_log);
     const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promoted-http-progress-{d}", .{nonce});
     defer alloc.free(standby_progress_raw);
-    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
     defer alloc.free(standby_progress);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -30041,23 +30041,23 @@ test "data server promotion open failure preserves retryable standby" {
     const nonce = platform_time.monotonicNs();
     const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-root-{d}", .{nonce});
     defer alloc.free(replica_root_raw);
-    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
     defer alloc.free(replica_root);
     const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-log-{d}", .{nonce});
     defer alloc.free(standby_log_raw);
-    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
     defer alloc.free(standby_log);
     const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-progress-{d}", .{nonce});
     defer alloc.free(standby_progress_raw);
-    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
     defer alloc.free(standby_progress);
     const wrong_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-wrong-log-{d}", .{nonce});
     defer alloc.free(wrong_log_raw);
-    const wrong_log = try alloc.dupeZ(u8, wrong_log_raw);
+    const wrong_log = try alloc.dupeSentinel(u8, wrong_log_raw, 0);
     defer alloc.free(wrong_log);
     const promoted_slots_raw = try std.fmt.allocPrint(alloc, "{s}.promoted-primary-slots", .{standby_progress});
     defer alloc.free(promoted_slots_raw);
-    const promoted_slots = try alloc.dupeZ(u8, promoted_slots_raw);
+    const promoted_slots = try alloc.dupeSentinel(u8, promoted_slots_raw, 0);
     defer alloc.free(promoted_slots);
     const standby_log_alias = try std.fmt.allocPrint(alloc, "./{s}", .{standby_log});
     defer alloc.free(standby_log_alias);
@@ -30220,23 +30220,23 @@ test "data server resumes HA standby replication from durable progress after res
     const nonce = platform_time.monotonicNs();
     const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-root-{d}", .{nonce});
     defer alloc.free(replica_root_raw);
-    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
     defer alloc.free(replica_root);
     const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-primary-log-{d}", .{nonce});
     defer alloc.free(primary_log_raw);
-    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
     defer alloc.free(primary_log);
     const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-primary-slots-{d}", .{nonce});
     defer alloc.free(primary_slots_raw);
-    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
     defer alloc.free(primary_slots);
     const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-standby-log-{d}", .{nonce});
     defer alloc.free(standby_log_raw);
-    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
     defer alloc.free(standby_log);
     const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-standby-progress-{d}", .{nonce});
     defer alloc.free(standby_progress_raw);
-    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
     defer alloc.free(standby_progress);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -30453,15 +30453,15 @@ test "data runtime records and backs off HA standby replication round failures" 
     const nonce = platform_time.monotonicNs();
     const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-failed-root-{d}", .{nonce});
     defer alloc.free(replica_root_raw);
-    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
     defer alloc.free(replica_root);
     const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-failed-standby-log-{d}", .{nonce});
     defer alloc.free(standby_log_raw);
-    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
     defer alloc.free(standby_log);
     const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-failed-standby-progress-{d}", .{nonce});
     defer alloc.free(standby_progress_raw);
-    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
     defer alloc.free(standby_progress);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -30594,23 +30594,23 @@ test "data runtime records HA standby apply failures without stopping run round"
     const nonce = platform_time.monotonicNs();
     const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-root-{d}", .{nonce});
     defer alloc.free(replica_root_raw);
-    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
     defer alloc.free(replica_root);
     const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-primary-log-{d}", .{nonce});
     defer alloc.free(primary_log_raw);
-    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
     defer alloc.free(primary_log);
     const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-primary-slots-{d}", .{nonce});
     defer alloc.free(primary_slots_raw);
-    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
     defer alloc.free(primary_slots);
     const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-standby-log-{d}", .{nonce});
     defer alloc.free(standby_log_raw);
-    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
     defer alloc.free(standby_log);
     const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-standby-progress-{d}", .{nonce});
     defer alloc.free(standby_progress_raw);
-    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
     defer alloc.free(standby_progress);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});

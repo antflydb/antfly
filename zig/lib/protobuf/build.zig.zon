@@ -16,7 +16,7 @@
     .name = .protobuf,
     .version = "0.1.0",
     .fingerprint = 0x99fac5be29b67647,
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.17.0-dev.1933",
     .dependencies = .{},
     .paths = .{
         "build.zig",

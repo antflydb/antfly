@@ -163,8 +163,9 @@ fn parseOptionalBackendType(value: ?[]const u8) !?inference.backends.BackendType
 }
 
 fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
-    inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
-        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(inference.server.WarmModelKind).@"enum";
+    inline for (info.field_names, info.field_values) |field_name, field_value| {
+        if (std.mem.eql(u8, value, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }

@@ -16,7 +16,7 @@
     .name = .objectstore,
     .version = "0.0.1",
     .fingerprint = 0x3f67147f7ca2cd24,
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.17.0-dev.1933",
     .dependencies = .{
         .httpx = .{
             .path = "../httpx",

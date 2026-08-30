@@ -13,6 +13,14 @@
 // limitations under the License.
 
 const std = @import("std");
+
+fn repeatBytesComptime(comptime bytes: []const u8, comptime count: usize) [bytes.len * count]u8 {
+    var repeated: [bytes.len * count]u8 = undefined;
+    for (0..count) |i| {
+        @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+    }
+    return repeated;
+}
 const syntax = @import("syntax.zig");
 const text_encoding = @import("text_encoding.zig");
 const jbig2 = @import("jbig2.zig");
@@ -303,9 +311,9 @@ const CodeSpaceRange = struct {
 const FontDecoder = struct {
     code_bytes: usize = 1,
     base_encoding: text_encoding.NamedEncoding = .pdf_doc,
-    differences: [256]?[]u8 = [_]?[]u8{null} ** 256,
-    difference_codepoints: [256]?u21 = [_]?u21{null} ** 256,
-    difference_defined: [256]bool = [_]bool{false} ** 256,
+    differences: [256]?[]u8 = @as([256]?[]u8, @splat(null)),
+    difference_codepoints: [256]?u21 = @as([256]?u21, @splat(null)),
+    difference_defined: [256]bool = @as([256]bool, @splat(false)),
     to_unicode: []ToUnicodeEntry = &.{},
     codespace_ranges: []CodeSpaceRange = &.{},
 
@@ -984,8 +992,8 @@ pub const PageRenderDiagnostics = struct {
     vector_text_runs: u32 = 0,
     fallback_text_runs: u32 = 0,
     first_fallback_reason: ?TextFallbackReason = null,
-    fallback_reason_counts: [@typeInfo(TextFallbackReason).@"enum".fields.len]u32 =
-        [_]u32{0} ** @typeInfo(TextFallbackReason).@"enum".fields.len,
+    fallback_reason_counts: [@typeInfo(TextFallbackReason).@"enum".field_names.len]u32 =
+        @as([@typeInfo(TextFallbackReason).@"enum".field_names.len]u32, @splat(0)),
     text_materialization_bytes: u64 = 0,
     peak_operator_materialization_bytes: u64 = 0,
     remaining_edge_tests: u64 = 0,
@@ -1001,7 +1009,7 @@ pub const PageRenderDiagnostics = struct {
     fn recordFallback(self: *PageRenderDiagnostics, reason: TextFallbackReason, run_count: usize) void {
         self.fallback_text_groups +|= 1;
         self.fallback_text_runs +|= @intCast(@min(run_count, std.math.maxInt(u32)));
-        self.fallback_reason_counts[@intFromEnum(reason)] +|= 1;
+        self.fallback_reason_counts[@backingInt(reason)] +|= 1;
         if (self.first_fallback_reason == null) self.first_fallback_reason = reason;
     }
 };
@@ -2934,7 +2942,7 @@ pub const Reader = struct {
         if (revision >= 3) {
             for (0..50) |_| digest = std.crypto.hash.Md5.hashResult(digest[0..file_key_len]);
         }
-        var file_key = [_]u8{0} ** 16;
+        var file_key = @as([16]u8, @splat(0));
         @memcpy(file_key[0..file_key_len], digest[0..file_key_len]);
 
         const user_key = switch ((encrypt.get("U") orelse return error.UnsupportedPdfEncryption).*) {
@@ -7714,7 +7722,7 @@ pub const Reader = struct {
         defer resolved_charprocs.deinit(self.alloc);
         if (resolved_charprocs != .dict) return font;
 
-        var code_to_name = [_]?[]const u8{null} ** 256;
+        var code_to_name = @as([256]?[]const u8, @splat(null));
         var resolved_encoding: ?syntax.Object = null;
         defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
         var resolved_differences: ?syntax.Object = null;
@@ -8022,7 +8030,7 @@ pub const Reader = struct {
             }
         } else {
             var base_encoding = SimpleCffBaseEncoding.embedded;
-            var code_to_name = [_]?[]const u8{null} ** 256;
+            var code_to_name = @as([256]?[]const u8, @splat(null));
             var resolved_encoding: ?syntax.Object = null;
             defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
             var resolved_differences: ?syntax.Object = null;
@@ -8497,7 +8505,7 @@ pub const Reader = struct {
         }
         try self.checkCancellation();
 
-        var code_to_name = [_]?[]const u8{null} ** 256;
+        var code_to_name = @as([256]?[]const u8, @splat(null));
         var base_encoding = text_encoding.NamedEncoding.standard;
         var resolved_encoding: ?syntax.Object = null;
         defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
@@ -15211,7 +15219,7 @@ test "content parsing and pixel conversion observe cancellation" {
     defer shapes.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.Canceled,
-        extractShapeRunsFromContentAppendCancelable(std.testing.allocator, &shapes, "0 " ** 300 ++ "m", &.{}, &.{}, content_cancellation),
+        extractShapeRunsFromContentAppendCancelable(std.testing.allocator, &shapes, repeatBytesComptime("0 ", 300) ++ "m", &.{}, &.{}, content_cancellation),
     );
     try std.testing.expectEqual(@as(usize, 2), content_cancel.checks);
 
@@ -15223,7 +15231,7 @@ test "content parsing and pixel conversion observe cancellation" {
     var rgba: [4097 * 4]u8 = undefined;
     try std.testing.expectError(
         error.Canceled,
-        Reader.decodeDeviceColorSpaceToRgba(&rgba, 4097, &([_]u8{0} ** 4097), "DeviceGray", null, pixel_cancellation),
+        Reader.decodeDeviceColorSpaceToRgba(&rgba, 4097, &(@as([4097]u8, @splat(0))), "DeviceGray", null, pixel_cancellation),
     );
     try std.testing.expectEqual(@as(usize, 2), pixel_cancel.checks);
 }
@@ -17164,7 +17172,7 @@ test "Type1 and Type3 spacing follows horizontal scaling in measurement and geom
 
 test "simple TrueType PDF widths fall back to MissingWidth" {
     const alloc = std.testing.allocator;
-    var widths = [_]f64{-1} ** 256;
+    var widths = @as([256]f64, @splat(-1));
     widths['A'] = 600;
     try std.testing.expectEqual(@as(?f64, 600), simpleTrueTypePdfWidth(&widths, 375, 'A'));
     try std.testing.expectEqual(@as(?f64, 375), simpleTrueTypePdfWidth(&widths, 375, 'B'));
@@ -19618,7 +19626,7 @@ test "JBIG2 coverage reduction polling scales with total sampled work" {
         }
     };
 
-    const encoded = [_]u8{0} ** (64 * 64 / 8);
+    const encoded = @as([(64 * 64 / 8)]u8, @splat(0));
     var probe_state = ProbeState{};
     const reduced = try reduceJbig2CoverageAlloc(
         std.testing.allocator,
@@ -20039,7 +20047,7 @@ test "resampled soft mask alpha updates multiple pixels" {
 }
 
 test "interpolated soft mask uses pixel-center bilinear sampling" {
-    var rgba = [_]u8{ 0, 0, 0, 255 } ** 3;
+    var rgba = [_]u8{ 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255 };
     const smask = [_]u8{
         0,   0,   0,   255,
         255, 255, 255, 255,
@@ -20134,7 +20142,7 @@ test "JP2 matrix ICC gray profile converts through PCS" {
             u32be(bytes, offset, @bitCast(signed));
         }
     };
-    var profile = [_]u8{0} ** 190;
+    var profile = @as([190]u8, @splat(0));
     Write.u32be(&profile, 0, profile.len);
     @memcpy(profile[16..20], "GRAY");
     @memcpy(profile[20..24], "XYZ ");
@@ -22200,7 +22208,7 @@ test "type1 RD parsers advance across slash and binary delimiters" {
     try std.testing.expectEqual(@as(usize, 1), subrs.len);
     try std.testing.expectEqualStrings("abc", subrs[0]);
 
-    var code_to_name = [_]?[]const u8{null} ** 256;
+    var code_to_name = @as([256]?[]const u8, @splat(null));
     code_to_name['A'] = "A";
     const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{}, 375);
     defer {
@@ -22221,7 +22229,7 @@ test "type1 RD parser accepts compact charstrings without dup" {
         "/B 3 RD abc ND\n" ++
         "end\n";
 
-    var code_to_name = [_]?[]const u8{null} ** 256;
+    var code_to_name = @as([256]?[]const u8, @splat(null));
     code_to_name['A'] = "A";
     code_to_name['B'] = "B";
     const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{}, 0);
@@ -22243,7 +22251,7 @@ test "type1 aliases share programs and only seac-reachable helpers survive" {
         "/unreachable 3 RD def ND\n" ++
         "end\n";
 
-    var code_to_name = [_]?[]const u8{null} ** 256;
+    var code_to_name = @as([256]?[]const u8, @splat(null));
     code_to_name['A'] = "A";
     code_to_name['B'] = "A";
     code_to_name[194] = "different";
@@ -22512,7 +22520,7 @@ test "dense low complexity Type1 text remains native within measured budget" {
         .decoder = .{},
         .type1 = .{ .glyphs = &glyphs },
     }};
-    var text = [_]u8{'A'} ** 32;
+    var text = @as([32]u8, @splat('A'));
     var run = TextRun{
         .text = &text,
         .raw_text = &text,
@@ -23212,7 +23220,7 @@ test "type1 font parsing is allocation-failure safe" {
                 if (subrs.len > 0) alloc.free(subrs);
             }
 
-            var code_to_name = [_]?[]const u8{null} ** 256;
+            var code_to_name = @as([256]?[]const u8, @splat(null));
             code_to_name['A'] = "A";
             code_to_name[194] = "different";
             const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{}, 0);

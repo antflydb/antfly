@@ -232,7 +232,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0-dev.1933+e19a73c2d
           use-cache: false
 
       - name: Run backup listing against MinIO
@@ -257,7 +257,7 @@ jobs:
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 20
     env:
-      ZIG_VERSION: "0.16.0"
+      ZIG_VERSION: "0.17.0-dev.1933+e19a73c2d"
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-arm64-codec
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-arm64-codec
     steps:
@@ -276,7 +276,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ca-certificates curl xz-utils
           curl -fsSL \
-            "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
+            "https://ziglang.org/builds/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
             -o "$RUNNER_TEMP/zig.tar.xz"
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" \
@@ -321,7 +321,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0-dev.1933+e19a73c2d
           use-cache: false
 
       - name: Restore ARC Zig cache dirs
@@ -594,7 +594,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0-dev.1933+e19a73c2d
           use-cache: false
 
       - name: Restore ARC Zig cache dirs
@@ -789,7 +789,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0-dev.1933+e19a73c2d
           use-cache: false
 
       - name: Restore ARC Zig cache dirs
@@ -847,7 +847,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0-dev.1933+e19a73c2d
           use-cache: false
 
       - name: Restore ARC cache dirs
@@ -955,7 +955,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0-dev.1933+e19a73c2d
           use-cache: false
 
       - name: Restore ARC cache dirs

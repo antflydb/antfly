@@ -43,7 +43,7 @@ class RegenCudaArtifactsTest(unittest.TestCase):
 
     def test_default_zig_resolution_prefers_the_repo_pinned_toolchain(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
-        pinned = 'elif [ -x "$repo_dir/.tools/zig-x86_64-linux-0.16.0/zig" ]'
+        pinned = 'elif [ -x "$repo_dir/.tools/zig-x86_64-linux-0.17.0-dev.1933+e19a73c2d/zig" ]'
         path_lookup = "elif command -v zig >/dev/null 2>&1"
         self.assertIn(pinned, source)
         self.assertIn(path_lookup, source)

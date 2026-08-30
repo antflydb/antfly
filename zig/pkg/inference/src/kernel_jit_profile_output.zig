@@ -54,16 +54,16 @@ const ProfileBundleManifest = struct {
 
 pub const LoadedProfileBundle = struct {
     allocator: std.mem.Allocator,
-    paths: [@typeInfo(BundleComponent).@"enum".fields.len]?[]u8 = @splat(null),
-    has_qualified_kernels: [@typeInfo(BundleComponent).@"enum".fields.len]bool = @splat(false),
+    paths: [@typeInfo(BundleComponent).@"enum".field_names.len]?[]u8 = @splat(null),
+    has_qualified_kernels: [@typeInfo(BundleComponent).@"enum".field_names.len]bool = @splat(false),
 
     pub fn deinit(self: *LoadedProfileBundle) void {
         for (self.paths) |maybe_path| if (maybe_path) |owned| self.allocator.free(owned);
         self.* = undefined;
     }
 
-    pub fn profilePaths(self: *const LoadedProfileBundle) [@typeInfo(BundleComponent).@"enum".fields.len]?[]const u8 {
-        var result: [@typeInfo(BundleComponent).@"enum".fields.len]?[]const u8 = @splat(null);
+    pub fn profilePaths(self: *const LoadedProfileBundle) [@typeInfo(BundleComponent).@"enum".field_names.len]?[]const u8 {
+        var result: [@typeInfo(BundleComponent).@"enum".field_names.len]?[]const u8 = @splat(null);
         for (self.paths, 0..) |maybe_path, index| result[index] = maybe_path;
         return result;
     }
@@ -94,11 +94,11 @@ pub const LoadedProfileBundle = struct {
     }
 
     pub fn hasQualifiedKernels(self: *const LoadedProfileBundle, component: BundleComponent) bool {
-        return self.has_qualified_kernels[@intFromEnum(component)];
+        return self.has_qualified_kernels[@backingInt(component)];
     }
 
     fn path(self: *const LoadedProfileBundle, component: BundleComponent) ?[]const u8 {
-        return self.paths[@intFromEnum(component)];
+        return self.paths[@backingInt(component)];
     }
 };
 
@@ -266,12 +266,12 @@ pub fn writeBundle(
     reports: []const BundleReport,
 ) !void {
     try validateOutputPath(bundle_path);
-    var names: [@typeInfo(BundleComponent).@"enum".fields.len]?[]u8 = @splat(null);
+    var names: [@typeInfo(BundleComponent).@"enum".field_names.len]?[]u8 = @splat(null);
     defer for (names) |name| if (name) |owned| allocator.free(owned);
 
     const bundle_dir = std.fs.path.dirname(bundle_path) orelse ".";
     for (reports) |item| {
-        const index = @intFromEnum(item.component);
+        const index = @backingInt(item.component);
         if (names[index] != null) return error.DuplicateKernelJitProfileBundleComponent;
         const profile_json = try renderAlloc(allocator, item.report);
         defer allocator.free(profile_json);
@@ -288,16 +288,16 @@ pub fn writeBundle(
         defer allocator.free(member_path);
         try writeFileAtomic(allocator, io, member_path, profile_json);
     }
-    const primary = names[@intFromEnum(BundleComponent.primary)] orelse
+    const primary = names[@backingInt(BundleComponent.primary)] orelse
         return error.MissingKernelJitProfileBundlePrimary;
     const manifest = ProfileBundleManifest{
         .schema = bundle_schema_name,
         .primary = primary,
-        .vision = names[@intFromEnum(BundleComponent.vision)],
-        .audio = names[@intFromEnum(BundleComponent.audio)],
-        .text_projection = names[@intFromEnum(BundleComponent.text_projection)],
-        .visual_projection = names[@intFromEnum(BundleComponent.visual_projection)],
-        .audio_projection = names[@intFromEnum(BundleComponent.audio_projection)],
+        .vision = names[@backingInt(BundleComponent.vision)],
+        .audio = names[@backingInt(BundleComponent.audio)],
+        .text_projection = names[@backingInt(BundleComponent.text_projection)],
+        .visual_projection = names[@backingInt(BundleComponent.visual_projection)],
+        .audio_projection = names[@backingInt(BundleComponent.audio_projection)],
     };
     const json = try std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 });
     defer allocator.free(json);

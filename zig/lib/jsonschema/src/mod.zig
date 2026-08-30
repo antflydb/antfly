@@ -316,7 +316,7 @@ const SchemaContext = struct {
 const RuntimeValidationContext = struct {
     alloc: std.mem.Allocator,
     root_property: ?*const DocumentProperty = null,
-    active_root_ref_values: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0 },
+    active_root_ref_values: std.ArrayListUnmanaged(usize) = .empty,
 
     fn deinit(self: *RuntimeValidationContext) void {
         self.active_root_ref_values.deinit(self.alloc);

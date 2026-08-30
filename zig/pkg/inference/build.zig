@@ -14,7 +14,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const build_test_filters = @import("build/test_filters.zig");
 const runtime_build = @import("build/runtime.zig");
 const finetune_common = @import("build/finetune/common.zig");
 const finetune_tests = @import("build/finetune/tests.zig");
@@ -33,12 +32,8 @@ fn resolveSharedLibRoot(b: *std.Build) []const u8 {
     ) orelse "../..";
 }
 
-fn selectTestFilters(b: *std.Build, default_filters: []const []const u8) []const []const u8 {
-    return build_test_filters.select(
-        b.allocator,
-        b.args orelse &.{},
-        default_filters,
-    );
+fn selectTestFilters(test_filters: []const []const u8, default_filters: []const []const u8) []const []const u8 {
+    return if (test_filters.len == 0) default_filters else test_filters;
 }
 
 fn defaultOnnxRuntimeRoot(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
@@ -70,8 +65,7 @@ fn targetRunsOnBuildHost(b: *std.Build, target: std.Build.ResolvedTarget) bool {
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = b.sysroot orelse
-        b.graph.environ_map.get("SDK_PATH") orelse
+    const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse
         std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
         return;
     module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
@@ -160,6 +154,11 @@ pub fn build(b: *std.Build) void {
         .{};
     const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Compile-time unit test name filter (repeatable)",
+    ) orelse &.{};
     const shared_lib_root = resolveSharedLibRoot(b);
 
     // Backend options
@@ -282,9 +281,7 @@ pub fn build(b: *std.Build) void {
 
     const run_exe = b.addRunArtifact(exe);
     run_exe.step.dependOn(&install_exe.step);
-    if (b.args) |args| {
-        run_exe.addArgs(args);
-    }
+    run_exe.addPassthruArgs();
     const run_step = b.step("run", "Run the Antfly inference server");
     run_step.dependOn(&run_exe.step);
 
@@ -314,7 +311,7 @@ pub fn build(b: *std.Build) void {
         break :blk host_exe;
     };
     const run_kernel_jit_package = b.addRunArtifact(kernel_jit_package_runner);
-    if (b.args) |args| run_kernel_jit_package.addArgs(args);
+    run_kernel_jit_package.addPassthruArgs();
     const kernel_jit_package_step = b.step(
         "kernel-jit-package",
         "Export, verify, or import exact-match JIT qualification packages",
@@ -333,11 +330,8 @@ pub fn build(b: *std.Build) void {
     quant_kernel_codegen_exe.root_module.addImport("build_options", build_options_mod);
     quant_kernel_codegen_exe.root_module.link_libc = link_libc;
     const quant_kernel_codegen_check = b.addRunArtifact(quant_kernel_codegen_exe);
-    if (b.args) |args| {
-        quant_kernel_codegen_check.addArgs(args);
-    } else {
-        quant_kernel_codegen_check.addArg("--check");
-    }
+    quant_kernel_codegen_check.addArg("--check");
+    quant_kernel_codegen_check.addPassthruArgs();
     const quant_kernel_codegen_test_check = b.addRunArtifact(quant_kernel_codegen_exe);
     quant_kernel_codegen_test_check.addArg("--check");
     const quant_kernel_codegen_step = b.step("quant-kernel-codegen", "Verify dev-generated quant kernel sources are fresh");
@@ -386,7 +380,7 @@ pub fn build(b: *std.Build) void {
         configureMetal(b, a4b_metal_id_replay_exe.root_module, target, true);
         a4b_metal_id_replay_exe.root_module.link_libc = true;
         const run_a4b_metal_id_replay = b.addRunArtifact(a4b_metal_id_replay_exe);
-        if (b.args) |args| run_a4b_metal_id_replay.addArgs(args);
+        run_a4b_metal_id_replay.addPassthruArgs();
         a4b_metal_id_replay_step.dependOn(&run_a4b_metal_id_replay.step);
 
         const a4b_metal_common_q4_replay_exe = b.addExecutable(.{
@@ -400,7 +394,7 @@ pub fn build(b: *std.Build) void {
         configureMetal(b, a4b_metal_common_q4_replay_exe.root_module, target, true);
         a4b_metal_common_q4_replay_exe.root_module.link_libc = true;
         const run_a4b_metal_common_q4_replay = b.addRunArtifact(a4b_metal_common_q4_replay_exe);
-        if (b.args) |args| run_a4b_metal_common_q4_replay.addArgs(args);
+        run_a4b_metal_common_q4_replay.addPassthruArgs();
         a4b_metal_common_q4_replay_step.dependOn(&run_a4b_metal_common_q4_replay.step);
 
         const a4b_metal_route_select_replay_exe = b.addExecutable(.{
@@ -414,7 +408,7 @@ pub fn build(b: *std.Build) void {
         configureMetal(b, a4b_metal_route_select_replay_exe.root_module, target, true);
         a4b_metal_route_select_replay_exe.root_module.link_libc = true;
         const run_a4b_metal_route_select_replay = b.addRunArtifact(a4b_metal_route_select_replay_exe);
-        if (b.args) |args| run_a4b_metal_route_select_replay.addArgs(args);
+        run_a4b_metal_route_select_replay.addPassthruArgs();
         a4b_metal_route_select_replay_step.dependOn(&run_a4b_metal_route_select_replay.step);
 
         const a4b_metal_router_projection_replay_exe = b.addExecutable(.{
@@ -428,7 +422,7 @@ pub fn build(b: *std.Build) void {
         configureMetal(b, a4b_metal_router_projection_replay_exe.root_module, target, true);
         a4b_metal_router_projection_replay_exe.root_module.link_libc = true;
         const run_a4b_metal_router_projection_replay = b.addRunArtifact(a4b_metal_router_projection_replay_exe);
-        if (b.args) |args| run_a4b_metal_router_projection_replay.addArgs(args);
+        run_a4b_metal_router_projection_replay.addPassthruArgs();
         a4b_metal_router_projection_replay_step.dependOn(&run_a4b_metal_router_projection_replay.step);
 
         const a4b_metal_lm_head_replay_exe = b.addExecutable(.{
@@ -442,7 +436,7 @@ pub fn build(b: *std.Build) void {
         configureMetal(b, a4b_metal_lm_head_replay_exe.root_module, target, true);
         a4b_metal_lm_head_replay_exe.root_module.link_libc = true;
         const run_a4b_metal_lm_head_replay = b.addRunArtifact(a4b_metal_lm_head_replay_exe);
-        if (b.args) |args| run_a4b_metal_lm_head_replay.addArgs(args);
+        run_a4b_metal_lm_head_replay.addPassthruArgs();
         a4b_metal_lm_head_replay_step.dependOn(&run_a4b_metal_lm_head_replay.step);
 
         const quant_kernel_metal_runtime_check_exe = b.addExecutable(.{
@@ -456,9 +450,7 @@ pub fn build(b: *std.Build) void {
         configureMetal(b, quant_kernel_metal_runtime_check_exe.root_module, target, true);
         quant_kernel_metal_runtime_check_exe.root_module.link_libc = true;
         const run_quant_kernel_metal_runtime_check = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
-        if (b.args) |args| {
-            run_quant_kernel_metal_runtime_check.addArgs(args);
-        }
+        run_quant_kernel_metal_runtime_check.addPassthruArgs();
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             run_quant_kernel_metal_runtime_check.step.dependOn(metal_artifact_check_step);
         }
@@ -480,9 +472,7 @@ pub fn build(b: *std.Build) void {
 
         const run_quant_kernel_metal_sweep = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
         run_quant_kernel_metal_sweep.addArg("--sweep");
-        if (b.args) |args| {
-            run_quant_kernel_metal_sweep.addArgs(args);
-        }
+        run_quant_kernel_metal_sweep.addPassthruArgs();
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             run_quant_kernel_metal_sweep.step.dependOn(metal_artifact_check_step);
         }
@@ -491,7 +481,7 @@ pub fn build(b: *std.Build) void {
         const run_quant_kernel_metal_runtime_route_all = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
         run_quant_kernel_metal_runtime_route_all.has_side_effects = true;
         run_quant_kernel_metal_runtime_route_all.addArg("--evidence-out");
-        const route_all_evidence_name = b.fmt("antfly-quant-metal-runtime-route-all-evidence-{x}.json", .{b.graph.random_seed});
+        const route_all_evidence_name = "antfly-quant-metal-runtime-route-all-evidence.json";
         const route_all_evidence = run_quant_kernel_metal_runtime_route_all.addOutputFileArg(route_all_evidence_name);
         run_quant_kernel_metal_runtime_route_all.addArg("--runtime-route-all");
         const check_quant_kernel_metal_runtime_route_all = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
@@ -508,7 +498,7 @@ pub fn build(b: *std.Build) void {
         const run_quant_kernel_metal_production_regression = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
         run_quant_kernel_metal_production_regression.has_side_effects = true;
         run_quant_kernel_metal_production_regression.addArg("--evidence-out");
-        const production_regression_evidence_name = b.fmt("antfly-quant-metal-production-regression-evidence-{x}.json", .{b.graph.random_seed});
+        const production_regression_evidence_name = "antfly-quant-metal-production-regression-evidence.json";
         _ = run_quant_kernel_metal_production_regression.addOutputFileArg(production_regression_evidence_name);
         run_quant_kernel_metal_production_regression.addArgs(&.{
             "--repeat-runs",
@@ -529,7 +519,7 @@ pub fn build(b: *std.Build) void {
             "--refresh-blocker-evidence",
             "--blocker-evidence-dir",
         });
-        const blocker_evidence_dir_name = b.fmt("antfly-quant-metal-blocker-evidence-{x}", .{b.graph.random_seed});
+        const blocker_evidence_dir_name = "antfly-quant-metal-blocker-evidence";
         const blocker_evidence_dir = refresh_quant_kernel_metal_blocker_evidence.addOutputDirectoryArg(blocker_evidence_dir_name);
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             refresh_quant_kernel_metal_blocker_evidence.step.dependOn(metal_artifact_check_step);
@@ -625,7 +615,7 @@ pub fn build(b: *std.Build) void {
         quant_kernel_cuda_attention_diff_exe.root_module.addImport("build_options", build_options_mod);
         quant_kernel_cuda_attention_diff_exe.root_module.link_libc = true;
         const run_quant_kernel_cuda_attention_diff = b.addRunArtifact(quant_kernel_cuda_attention_diff_exe);
-        if (b.args) |args| run_quant_kernel_cuda_attention_diff.addArgs(args);
+        run_quant_kernel_cuda_attention_diff.addPassthruArgs();
         run_quant_kernel_cuda_attention_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
         quant_kernel_cuda_attention_diff_step.dependOn(&run_quant_kernel_cuda_attention_diff.step);
     } else {
@@ -679,7 +669,7 @@ pub fn build(b: *std.Build) void {
         run_quant_kernel_cuda_paged_attention_diff.addFileArg(score_prework_hd256_cubin);
         run_quant_kernel_cuda_paged_attention_diff.addArg("--candidate-hd512");
         run_quant_kernel_cuda_paged_attention_diff.addFileArg(score_prework_hd512_cubin);
-        if (b.args) |args| run_quant_kernel_cuda_paged_attention_diff.addArgs(args);
+        run_quant_kernel_cuda_paged_attention_diff.addPassthruArgs();
         run_quant_kernel_cuda_paged_attention_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
         run_quant_kernel_cuda_paged_attention_diff.step.dependOn(&run_quant_kernel_cuda_paged_attention_diff_tests.step);
         quant_kernel_cuda_paged_attention_diff_step.dependOn(&run_quant_kernel_cuda_paged_attention_diff.step);
@@ -716,7 +706,7 @@ pub fn build(b: *std.Build) void {
         quant_kernel_cuda_paged_prefill_diff_tests.root_module.link_libc = true;
         const run_quant_kernel_cuda_paged_prefill_diff_tests = b.addRunArtifact(quant_kernel_cuda_paged_prefill_diff_tests);
         const run_quant_kernel_cuda_paged_prefill_diff = b.addRunArtifact(quant_kernel_cuda_paged_prefill_diff_exe);
-        if (b.args) |args| run_quant_kernel_cuda_paged_prefill_diff.addArgs(args);
+        run_quant_kernel_cuda_paged_prefill_diff.addPassthruArgs();
         run_quant_kernel_cuda_paged_prefill_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
         run_quant_kernel_cuda_paged_prefill_diff.step.dependOn(&cuda_artifacts_freshness_check.step);
         run_quant_kernel_cuda_paged_prefill_diff.step.dependOn(&run_quant_kernel_cuda_paged_prefill_diff_tests.step);
@@ -744,7 +734,7 @@ pub fn build(b: *std.Build) void {
         quant_kernel_cuda_ffn_diff_exe.root_module.addImport("build_options", build_options_mod);
         quant_kernel_cuda_ffn_diff_exe.root_module.link_libc = true;
         const run_quant_kernel_cuda_ffn_diff = b.addRunArtifact(quant_kernel_cuda_ffn_diff_exe);
-        if (b.args) |args| run_quant_kernel_cuda_ffn_diff.addArgs(args);
+        run_quant_kernel_cuda_ffn_diff.addPassthruArgs();
         run_quant_kernel_cuda_ffn_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
         quant_kernel_cuda_ffn_diff_step.dependOn(&run_quant_kernel_cuda_ffn_diff.step);
     } else {
@@ -1009,9 +999,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_metal_prefill_bucket_bench = b.addRunArtifact(metal_prefill_bucket_bench_exe);
     run_metal_prefill_bucket_bench.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_metal_prefill_bucket_bench.addArgs(args);
-    }
+    run_metal_prefill_bucket_bench.addPassthruArgs();
     const metal_prefill_bucket_bench_step = b.step(
         "bench-metal-prefill-buckets",
         "Run Metal Gemma4 pp10/pp128/pp512 prefill plus tg16 decode bucket benchmarks",
@@ -1032,9 +1020,7 @@ pub fn build(b: *std.Build) void {
     // Metal again here compiles metal_kernels.m twice into this executable.
     metal_bench_exe.root_module.link_libc = true;
     const run_metal_bench = b.addRunArtifact(metal_bench_exe);
-    if (b.args) |args| {
-        run_metal_bench.addArgs(args);
-    }
+    run_metal_bench.addPassthruArgs();
     const metal_bench_step = b.step(
         "inference-metal-bench",
         "Run the focused Metal kernel benchmark; pass --mode and shape filters after --",
@@ -1192,9 +1178,7 @@ pub fn build(b: *std.Build) void {
     const run_finetune = b.addRunArtifact(exe);
     run_finetune.step.dependOn(b.getInstallStep());
     run_finetune.addArg("finetune");
-    if (b.args) |args| {
-        run_finetune.addArgs(args);
-    }
+    run_finetune.addPassthruArgs();
     const finetune_step = b.step("finetune", "Run Antfly inference finetune");
     finetune_step.dependOn(&run_finetune.step);
 
@@ -1215,9 +1199,7 @@ pub fn build(b: *std.Build) void {
     bench_exe.root_module.link_libc = true;
 
     const run_bench = b.addRunArtifact(bench_exe);
-    if (b.args) |args| {
-        run_bench.addArgs(args);
-    }
+    run_bench.addPassthruArgs();
     const bench_step = b.step("bench-paged-attention", "Run the native paged-attention benchmark");
     bench_step.dependOn(&run_bench.step);
 
@@ -1230,9 +1212,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_turboquant_distortion_bench = b.addRunArtifact(turboquant_distortion_bench_exe);
-    if (b.args) |args| {
-        run_turboquant_distortion_bench.addArgs(args);
-    }
+    run_turboquant_distortion_bench.addPassthruArgs();
     const turboquant_distortion_bench_step = b.step("bench-turboquant-distortion", "Run TurboQuant dot-product distortion benchmark");
     turboquant_distortion_bench_step.dependOn(&run_turboquant_distortion_bench.step);
 
@@ -1256,16 +1236,12 @@ pub fn build(b: *std.Build) void {
     training_bench_exe.root_module.addImport("ml", ml_mod);
     configureNativeTool(b, training_bench_exe, target, enable_system_blas, blas_root, enable_metal);
     const run_training_bench = b.addRunArtifact(training_bench_exe);
-    if (b.args) |args| {
-        run_training_bench.addArgs(args);
-    }
+    run_training_bench.addPassthruArgs();
     const training_bench_step = b.step("bench-training", "Run the native training benchmark");
     training_bench_step.dependOn(&run_training_bench.step);
     linalg_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
     const run_linalg_bench = b.addRunArtifact(linalg_bench_exe);
-    if (b.args) |args| {
-        run_linalg_bench.addArgs(args);
-    }
+    run_linalg_bench.addPassthruArgs();
     const linalg_bench_step = b.step("bench-linalg", "Run the shared linalg benchmark");
     linalg_bench_step.dependOn(&run_linalg_bench.step);
 
@@ -1284,9 +1260,7 @@ pub fn build(b: *std.Build) void {
     }
     clipclap_bench_exe.root_module.link_libc = true;
     const run_clipclap_bench = b.addRunArtifact(clipclap_bench_exe);
-    if (b.args) |args| {
-        run_clipclap_bench.addArgs(args);
-    }
+    run_clipclap_bench.addPassthruArgs();
     const clipclap_bench_step = b.step("bench-clipclap-kernels", "Run the CLIPCLAP native kernel microbenchmark (baseline vs optimized)");
     clipclap_bench_step.dependOn(&run_clipclap_bench.step);
 
@@ -1315,10 +1289,9 @@ pub fn build(b: *std.Build) void {
     // duplicate Metal symbols in these standalone benchmark tools.
     gliner2_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, gliner2_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    runtime_build.applyCBindings(gliner2_bench_exe.root_module, runtime_graph.c_bindings);
     const run_gliner2_bench = b.addRunArtifact(gliner2_bench_exe);
-    if (b.args) |args| {
-        run_gliner2_bench.addArgs(args);
-    }
+    run_gliner2_bench.addPassthruArgs();
     const gliner2_bench_step = b.step("bench-gliner2-native", "Run an end-to-end GLiNER2 bench against the native backend with random weights");
     gliner2_bench_step.dependOn(&run_gliner2_bench.step);
 
@@ -1342,10 +1315,9 @@ pub fn build(b: *std.Build) void {
     gliner2_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     gliner2_e2e_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, gliner2_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    runtime_build.applyCBindings(gliner2_e2e_bench_exe.root_module, runtime_graph.c_bindings);
     const run_gliner2_e2e_bench = b.addRunArtifact(gliner2_e2e_bench_exe);
-    if (b.args) |args| {
-        run_gliner2_e2e_bench.addArgs(args);
-    }
+    run_gliner2_e2e_bench.addPassthruArgs();
     const gliner2_e2e_bench_step = b.step("bench-gliner2-e2e", "Run real-bundle GLiNER2 recognition E2E benchmarks");
     gliner2_e2e_bench_step.dependOn(&run_gliner2_e2e_bench.step);
 
@@ -1370,10 +1342,9 @@ pub fn build(b: *std.Build) void {
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, clipclap_native_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, clipclap_native_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    runtime_build.applyCBindings(clipclap_native_bench_exe.root_module, runtime_graph.c_bindings);
     const run_clipclap_native_bench = b.addRunArtifact(clipclap_native_bench_exe);
-    if (b.args) |args| {
-        run_clipclap_native_bench.addArgs(args);
-    }
+    run_clipclap_native_bench.addPassthruArgs();
     const clipclap_native_bench_step = b.step("bench-clipclap-native", "Run end-to-end CLIP/CLAP native encoder benches with random quantized weights");
     clipclap_native_bench_step.dependOn(&run_clipclap_native_bench.step);
 
@@ -1398,10 +1369,9 @@ pub fn build(b: *std.Build) void {
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, clipclap_e2e_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, clipclap_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    runtime_build.applyCBindings(clipclap_e2e_bench_exe.root_module, runtime_graph.c_bindings);
     const run_clipclap_e2e_bench = b.addRunArtifact(clipclap_e2e_bench_exe);
-    if (b.args) |args| {
-        run_clipclap_e2e_bench.addArgs(args);
-    }
+    run_clipclap_e2e_bench.addPassthruArgs();
     const clipclap_e2e_bench_step = b.step("bench-clipclap-e2e", "Run real-bundle CLIP/CLAP embedding E2E benchmarks");
     clipclap_e2e_bench_step.dependOn(&run_clipclap_e2e_bench.step);
 
@@ -1426,10 +1396,9 @@ pub fn build(b: *std.Build) void {
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, bge_m3_e2e_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, bge_m3_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    runtime_build.applyCBindings(bge_m3_e2e_bench_exe.root_module, runtime_graph.c_bindings);
     const run_bge_m3_e2e_bench = b.addRunArtifact(bge_m3_e2e_bench_exe);
-    if (b.args) |args| {
-        run_bge_m3_e2e_bench.addArgs(args);
-    }
+    run_bge_m3_e2e_bench.addPassthruArgs();
     const bge_m3_e2e_bench_step = b.step("bench-bge-m3-e2e", "Run pretokenized BGE-M3 encoder E2E benchmarks");
     bge_m3_e2e_bench_step.dependOn(&run_bge_m3_e2e_bench.step);
 
@@ -1453,10 +1422,9 @@ pub fn build(b: *std.Build) void {
     reranker_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     reranker_e2e_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, reranker_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    runtime_build.applyCBindings(reranker_e2e_bench_exe.root_module, runtime_graph.c_bindings);
     const run_reranker_e2e_bench = b.addRunArtifact(reranker_e2e_bench_exe);
-    if (b.args) |args| {
-        run_reranker_e2e_bench.addArgs(args);
-    }
+    run_reranker_e2e_bench.addPassthruArgs();
     const reranker_e2e_bench_step = b.step("bench-reranker-e2e", "Run real-bundle text reranker E2E benchmarks");
     reranker_e2e_bench_step.dependOn(&run_reranker_e2e_bench.step);
 
@@ -1472,15 +1440,13 @@ pub fn build(b: *std.Build) void {
     audio_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
     audio_bench_exe.root_module.link_libc = true;
     const run_audio_bench = b.addRunArtifact(audio_bench_exe);
-    if (b.args) |args| {
-        run_audio_bench.addArgs(args);
-    }
+    run_audio_bench.addPassthruArgs();
     const audio_bench_step = b.step("bench-audio", "Run the checked-in audio decode and synthesis benchmark");
     audio_bench_step.dependOn(&run_audio_bench.step);
 
     // Tests
     const runtime_test_filter = b.option(bool, "runtime-test-filter", "Build unit tests with a simple runtime-filtering test runner") orelse false;
-    const selected_test_filters = selectTestFilters(b, &.{});
+    const selected_test_filters = selectTestFilters(test_filters, &.{});
     const main_test_filters = if (runtime_test_filter) &.{} else selected_test_filters;
     const runtime_filter_test_runner: std.Build.Step.Compile.TestRunner = .{
         .path = b.path("src/test_runner_filter.zig"),
@@ -1528,6 +1494,7 @@ pub fn build(b: *std.Build) void {
     }
     configureMetal(b, tests.root_module, target, enable_metal);
     configureOnnxRuntime(b, tests.root_module, enable_onnx, effective_onnx_root);
+    runtime_build.applyCBindings(tests.root_module, runtime_graph.c_bindings);
     tests.root_module.link_libc = link_libc;
 
     // Keep the standalone server's CLI and configuration parsing covered too.
@@ -1552,7 +1519,7 @@ pub fn build(b: *std.Build) void {
     for (selected_test_filters) |filter| {
         run_cli_tests.addArgs(&.{ "--test-filter", filter });
     }
-    build_test_filters.addRuntimeControls(run_cli_tests, b.args orelse &.{});
+    run_cli_tests.addPassthruArgs();
     const cli_test_step = b.step("test-cli", "Run standalone inference CLI and configuration tests");
     cli_test_step.dependOn(&run_cli_tests.step);
 
@@ -1584,7 +1551,7 @@ pub fn build(b: *std.Build) void {
     for (selected_test_filters) |filter| {
         run_tests.addArgs(&.{ "--test-filter", filter });
     }
-    build_test_filters.addRuntimeControls(run_tests, b.args orelse &.{});
+    run_tests.addPassthruArgs();
     const run_quant_kernel_compiler_tests = b.addRunArtifact(tests);
     run_quant_kernel_compiler_tests.addArg("--test-filter");
     run_quant_kernel_compiler_tests.addArg("quant kernel compiler");
@@ -1656,6 +1623,7 @@ pub fn build(b: *std.Build) void {
     }
     configureMetal(b, wasm_compute_tests.root_module, target, enable_metal);
     configureOnnxRuntime(b, wasm_compute_tests.root_module, enable_onnx, effective_onnx_root);
+    runtime_build.applyCBindings(wasm_compute_tests.root_module, runtime_graph.c_bindings);
     wasm_compute_tests.root_module.link_libc = true;
     const run_wasm_compute_tests = b.addRunArtifact(wasm_compute_tests);
     const test_wasm_compute_step = b.step("test-wasm-compute", "Run focused WasmCompute backend tests");
@@ -1711,6 +1679,7 @@ pub fn build(b: *std.Build) void {
     }
     configureMetal(b, web_projector_tests.root_module, target, enable_metal);
     configureOnnxRuntime(b, web_projector_tests.root_module, enable_onnx, effective_onnx_root);
+    runtime_build.applyCBindings(web_projector_tests.root_module, runtime_graph.c_bindings);
     web_projector_tests.root_module.link_libc = true;
     const run_web_projector_tests = b.addRunArtifact(web_projector_tests);
     const test_web_projector_step = b.step("test-web-projector", "Run focused web projector/runtime tests");
@@ -1782,7 +1751,7 @@ pub fn build(b: *std.Build) void {
     audio_open_corpus.root_module.addImport("build_options", audio_open_corpus_build_options_mod);
     audio_open_corpus.root_module.link_libc = true;
     const run_audio_open_corpus = b.addRunArtifact(audio_open_corpus);
-    if (b.args) |args| run_audio_open_corpus.addArgs(args);
+    run_audio_open_corpus.addPassthruArgs();
     const audio_open_corpus_step = b.step("audio-open-corpus", "Run the non-MP3 audio open corpus runner");
     audio_open_corpus_step.dependOn(&run_audio_open_corpus.step);
 

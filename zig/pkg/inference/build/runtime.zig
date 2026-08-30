@@ -122,6 +122,7 @@ pub const Graph = struct {
     extracting_mod: *std.Build.Module,
     inference_mod: *std.Build.Module,
     inference_internal_mod: *std.Build.Module,
+    c_bindings: CBindings,
 };
 
 pub fn create(config: Config) Graph {
@@ -316,6 +317,8 @@ pub fn create(config: Config) Graph {
     inference_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     inference_mod.addImport("antfly_extracting", extracting_mod);
     configureRuntimeLinks(b, inference_mod, target, backend, paths);
+    const c_bindings = createCBindings(b, target, backend, paths);
+    applyCBindings(inference_mod, c_bindings);
     inference_mod.link_libc = backend.link_libc;
 
     const inference_internal_mod = b.createModule(.{
@@ -338,6 +341,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("antfly_platform", platform_mod);
     inference_internal_mod.addImport("onnx_graph", onnx_graph_mod);
     configureRuntimeLinks(b, inference_internal_mod, target, backend, paths);
+    applyCBindings(inference_internal_mod, c_bindings);
     inference_internal_mod.link_libc = backend.link_libc;
 
     inference_mod.addImport("inference_internal", inference_mod);
@@ -378,7 +382,48 @@ pub fn create(config: Config) Graph {
         .extracting_mod = extracting_mod,
         .inference_mod = inference_mod,
         .inference_internal_mod = inference_internal_mod,
+        .c_bindings = c_bindings,
     };
+}
+
+pub const CBindings = struct {
+    onnx: *std.Build.Module,
+    ortgenai: *std.Build.Module,
+};
+
+fn createCBindings(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    backend: BackendOptions,
+    paths: Paths,
+) CBindings {
+    const empty = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/c_empty.zig")),
+        .target = target,
+    });
+    if (!backend.enable_onnx) return .{ .onnx = empty, .ortgenai = empty };
+
+    const include_dir = b.fmt("{s}/include", .{backend.onnx_root});
+    const onnx = b.addTranslateC(.{
+        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/onnx_c.h")),
+        .target = target,
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    onnx.addIncludePath(.{ .cwd_relative = include_dir });
+    const ortgenai = b.addTranslateC(.{
+        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/ortgenai_c.h")),
+        .target = target,
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    ortgenai.addIncludePath(.{ .cwd_relative = include_dir });
+    return .{ .onnx = onnx.createModule(), .ortgenai = ortgenai.createModule() };
+}
+
+pub fn applyCBindings(module: *std.Build.Module, bindings: CBindings) void {
+    module.addImport("onnx_c", bindings.onnx);
+    module.addImport("ortgenai_c", bindings.ortgenai);
 }
 
 pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
@@ -860,8 +905,7 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = b.sysroot orelse
-        b.graph.environ_map.get("SDK_PATH") orelse
+    const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse
         std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
         return;
     module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });

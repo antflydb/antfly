@@ -1531,7 +1531,7 @@ test "GLiNER2 CUDA checkpoint resume preserves resident AdamW trajectory" {
     defer allocator.free(expected_path);
     const actual_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/cuda_actual.safetensors", .{tmp.sub_path});
     defer allocator.free(actual_path);
-    const fingerprint = [_]u8{0xC7} ** 32;
+    const fingerprint = @as([32]u8, @splat(0xC7));
 
     var uninterrupted_loss: f32 = undefined;
     var uninterrupted_norm: f32 = undefined;

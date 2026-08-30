@@ -113,7 +113,7 @@ pub const MmapRegion = struct {
 
     /// Memory-map an entire file read-only. Returns borrowed bytes backed by the OS page cache.
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !MmapRegion {
-        const path_z = try allocator.dupeZ(u8, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_z);
 
         const fd = try openReadOnlyZ(path_z);
@@ -206,7 +206,7 @@ pub fn mmapTempCopy(allocator: std.mem.Allocator, prefix: []const u8, bytes: []c
         .{ prefix, std.posix.system.getpid(), nonce },
     );
     defer allocator.free(path);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = c.open(path_z.ptr, c.O_RDWR | c.O_CREAT | c.O_EXCL, @as(c.mode_t, 0o600));
@@ -235,7 +235,7 @@ pub fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
 /// Read an entire file with a custom max size limit.
 pub fn readFileMax(allocator: std.mem.Allocator, path: []const u8, max_size: usize) ![]u8 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try openReadOnlyZ(path_z);
@@ -260,7 +260,7 @@ pub fn readFileMax(allocator: std.mem.Allocator, path: []const u8, max_size: usi
 
 /// Return the byte size of a file.
 pub fn fileSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try openReadOnlyZ(path_z);
@@ -271,7 +271,7 @@ pub fn fileSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
 
 /// Read a byte range from a file using pread.
 pub fn readRegion(allocator: std.mem.Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try openReadOnlyZ(path_z);
@@ -290,7 +290,7 @@ pub fn readRegion(allocator: std.mem.Allocator, path: []const u8, offset: u64, l
 
 /// Read a byte range from a file into an existing buffer using pread.
 pub fn readRegionInto(allocator: std.mem.Allocator, path: []const u8, offset: u64, buf: []u8) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = try openReadOnlyZ(path_z);
@@ -319,7 +319,7 @@ pub const FileAdvice = enum { normal, sequential, random, will_need, dont_need, 
 pub fn adviseFileRange(allocator: std.mem.Allocator, path: []const u8, offset: u64, len: usize, advice: FileAdvice) void {
     if (!comptime build_options.link_libc) return;
     if (comptime builtin.os.tag != .linux) return;
-    const path_z = allocator.dupeZ(u8, path) catch return;
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return;
     defer allocator.free(path_z);
     const fd = openReadOnlyZ(path_z) catch return;
     defer closeFd(fd);
@@ -336,7 +336,7 @@ pub fn adviseFileRange(allocator: std.mem.Allocator, path: []const u8, offset: u
 
 /// Check if a file exists at the given path.
 pub fn fileExists(allocator: std.mem.Allocator, path: []const u8) bool {
-    const path_z = allocator.dupeZ(u8, path) catch return false;
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return false;
     defer allocator.free(path_z);
     return fileExistsZ(path_z);
 }

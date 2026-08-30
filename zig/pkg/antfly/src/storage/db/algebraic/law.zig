@@ -40,8 +40,9 @@ pub const Id = enum {
     hll,
 
     pub fn parse(text: []const u8) ?Id {
-        inline for (std.meta.fields(Id)) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        const info = @typeInfo(Id).@"enum";
+        inline for (info.field_names, info.field_values) |field_name, field_value| {
+            if (std.mem.eql(u8, text, field_name)) return @fromBackingInt(@intCast(field_value));
         }
         return null;
     }

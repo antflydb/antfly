@@ -1795,7 +1795,7 @@ fn isExpectedCdcRoundError(err: anyerror) bool {
 }
 
 test "metadata durable cutover acknowledgement is attempt scoped" {
-    const fingerprint = [_]u8{0x5a} ** std.crypto.hash.sha2.Sha256.digest_length;
+    const fingerprint = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x5a));
     const expected = metadata_table_manager.ReplicationSourceStatusRecord{
         .table_id = 41,
         .source_ordinal = 2,
@@ -1808,7 +1808,7 @@ test "metadata durable cutover acknowledgement is attempt scoped" {
         .cutover_intent_id = 99,
         .cutover_authority_id = 1001,
         .cutover_config_fingerprint = fingerprint,
-        .cutover_provider_identity = [_]u8{0x6b} ** std.crypto.hash.sha2.Sha256.digest_length,
+        .cutover_provider_identity = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x6b)),
     };
     try std.testing.expect(replicationCutoverIntentApplied(expected, expected));
 
@@ -3880,7 +3880,7 @@ pub const MetadataHttpService = struct {
     probe_ready: std.atomic.Value(bool) = .init(false),
     runtime_status_protocol_cache_mutex: std.Io.Mutex = .init,
     runtime_status_protocol_ready_fingerprint: RuntimeStatusMembershipFingerprint =
-        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+        @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
     runtime_status_protocol_probe_mutex: std.Io.Mutex = .init,
     runtime_status_protocol_activated_version: std.atomic.Value(u16) = .init(0),
     runtime_status_protocol_probe_in_flight: std.atomic.Value(bool) = .init(false),
@@ -6993,7 +6993,7 @@ test "metadata runtime status capability cache is scoped to incarnation and memb
     try std.testing.expect(!std.mem.eql(
         u8,
         &fingerprint,
-        &([_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length),
+        &(@as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0))),
     ));
 
     var changed_conf_state = conf_state;
@@ -8732,7 +8732,7 @@ const ServiceGroupMembership = struct {
     local_voter: bool = false,
     voter_count: u16 = 0,
     voter_set_known: bool = false,
-    voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint = [_]u8{0} ** metadata_table_manager.voter_set_fingerprint_len,
+    voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint = @as([metadata_table_manager.voter_set_fingerprint_len]u8, @splat(0)),
     joint_consensus: bool = false,
     raft_term: u64 = 0,
     raft_membership_index: u64 = 0,
@@ -10135,7 +10135,7 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
         hasher.update(std.mem.asBytes(&intent.record.group_id));
         hasher.update(std.mem.asBytes(&intent.record.replica_id));
         hasher.update(std.mem.asBytes(&intent.record.local_node_id));
-        hasher.update(std.mem.asBytes(&@intFromEnum(intent.record.bootstrap_mode)));
+        hasher.update(std.mem.asBytes(&@backingInt(intent.record.bootstrap_mode)));
         hasher.update(std.mem.asBytes(&intent.record.metadata_version));
         hasher.update(std.mem.asBytes(&intent.store_id));
         hasher.update(std.mem.asBytes(&@as(u64, intent.peer_node_ids.len)));

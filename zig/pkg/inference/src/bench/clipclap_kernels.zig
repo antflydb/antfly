@@ -71,7 +71,7 @@ const BenchConfig = struct {
     only_packed_qkv: bool = false,
     include_direct_variants: bool = false,
     filter_kind: ?tensor_types.KnownTensorType = null,
-    filter_kinds: [64]bool = [_]bool{false} ** 64,
+    filter_kinds: [64]bool = @as([64]bool, @splat(false)),
     has_filter_kinds: bool = false,
     filter_rows: ?usize = null,
     filter_in_dim: ?usize = null,
@@ -90,7 +90,7 @@ fn filterMatchesKind(cfg: BenchConfig, kind: tensor_types.KnownTensorType) bool 
     if (cfg.filter_kind) |value| {
         if (value == kind) return true;
     }
-    const idx: usize = @intFromEnum(kind);
+    const idx: usize = @backingInt(kind);
     return idx < cfg.filter_kinds.len and cfg.filter_kinds[idx];
 }
 
@@ -108,9 +108,10 @@ fn filterMatchesShape(cfg: BenchConfig, rows: usize, in_dim: usize, out_dim: usi
 }
 
 fn parseBenchKind(value: []const u8) !tensor_types.KnownTensorType {
-    inline for (@typeInfo(tensor_types.KnownTensorType).@"enum".fields) |field| {
-        if (std.mem.eql(u8, value, field.name)) {
-            return @enumFromInt(field.value);
+    const info = @typeInfo(tensor_types.KnownTensorType).@"enum";
+    inline for (info.field_names, info.field_values) |field_name, field_value| {
+        if (std.mem.eql(u8, value, field_name)) {
+            return @fromBackingInt(@intCast(field_value));
         }
     }
     return error.InvalidArgument;
@@ -118,7 +119,7 @@ fn parseBenchKind(value: []const u8) !tensor_types.KnownTensorType {
 
 fn addBenchKindFilter(cfg: *BenchConfig, value: []const u8) !void {
     const kind = try parseBenchKind(value);
-    const idx: usize = @intFromEnum(kind);
+    const idx: usize = @backingInt(kind);
     if (idx >= cfg.filter_kinds.len) return error.InvalidArgument;
     cfg.filter_kinds[idx] = true;
     cfg.has_filter_kinds = true;

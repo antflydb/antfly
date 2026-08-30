@@ -746,7 +746,7 @@ fn policyAllowedBackends(
 }
 
 const ComponentInspection = struct {
-    const backend_count = std.meta.fields(backends.BackendType).len;
+    const backend_count = @typeInfo(backends.BackendType).@"enum".field_names.len;
 
     allocator: std.mem.Allocator,
     base_summary: CompatibilitySummary,
@@ -755,7 +755,7 @@ const ComponentInspection = struct {
     has_native_component: bool = false,
     imported_graph_compatible: bool = true,
     native_backend_summaries: [backend_count]?CompatibilitySummary =
-        [_]?CompatibilitySummary{null} ** backend_count,
+        @as([backend_count]?CompatibilitySummary, @splat(null)),
     dependencies: std.ArrayListUnmanaged([]u8) = .empty,
 
     fn deinit(self: *ComponentInspection) void {
@@ -785,7 +785,7 @@ const ComponentInspection = struct {
         backend: backends.BackendType,
         summary: CompatibilitySummary,
     ) void {
-        const slot = &self.native_backend_summaries[@intFromEnum(backend)];
+        const slot = &self.native_backend_summaries[@backingInt(backend)];
         slot.* = selectWorseCompatibility(slot.*, summary);
     }
 
@@ -811,7 +811,7 @@ const ComponentInspection = struct {
                 .message = "a component ONNX graph cannot be converted and validated by the selected backend",
             };
         }
-        if (self.native_backend_summaries[@intFromEnum(backend)]) |native_summary| {
+        if (self.native_backend_summaries[@backingInt(backend)]) |native_summary| {
             return selectWorseCompatibility(self.base_summary, native_summary);
         }
         return self.base_summary;
@@ -907,10 +907,10 @@ fn componentPlanKey(
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     updateComponentPlanKeySlice(&hash, model_dir);
     hash.update(&.{
-        @intFromEnum(man.model_type),
-        @intFromEnum(man.model_type_origin),
-        @intFromEnum(man.native_arch_hint),
-        @intFromEnum(contract),
+        @backingInt(man.model_type),
+        @backingInt(man.model_type_origin),
+        @backingInt(man.native_arch_hint),
+        @backingInt(contract),
         @intFromBool(policy.allow_unknown),
         @intFromBool(manifestHasNativeAssets(man.*)),
         @intFromBool(man.hasIncompleteGlinerBundle()),
@@ -923,7 +923,7 @@ fn componentPlanKey(
     updateComponentPlanKeySlice(&hash, man.inference_bundle_family);
     const backend_count: u64 = @intCast(preferred_backends.len);
     hash.update(std.mem.asBytes(&backend_count));
-    for (preferred_backends) |backend| hash.update(&.{@intFromEnum(backend)});
+    for (preferred_backends) |backend| hash.update(&.{@backingInt(backend)});
     const component_count: u64 = @intCast(component_paths.len);
     hash.update(std.mem.asBytes(&component_count));
     for (component_paths) |path| {
@@ -2141,7 +2141,7 @@ const DeclaredOptionalSession = struct {
     path: ?[]const u8,
 };
 
-const declared_optional_session_count = @typeInfo(DeclaredOptionalSessionKind).@"enum".fields.len;
+const declared_optional_session_count = @typeInfo(DeclaredOptionalSessionKind).@"enum".field_names.len;
 
 fn declaredOptionalSessions(manifest: *const manifest_mod.ModelManifest) [declared_optional_session_count]DeclaredOptionalSession {
     return .{
@@ -3308,7 +3308,7 @@ pub const ModelManager = struct {
         tokenizer_cache_budget_source: TokenizerCacheBudgetSource = .none,
         external_tokenizer_cache_budget: ?hf_tokenizer.HfTokenizer.BpeCacheResourceBudget = null,
         tokenizer_cache_budget_shards: [tokenizer_cache_budget_shard_count]TokenizerCacheBudgetShard =
-            [_]TokenizerCacheBudgetShard{.{}} ** tokenizer_cache_budget_shard_count,
+            @as([tokenizer_cache_budget_shard_count]TokenizerCacheBudgetShard, @splat(.{})),
         references: std.atomic.Value(usize) = .init(1),
         closing: std.atomic.Value(bool) = .init(false),
         managed_mutex: std.atomic.Mutex = .unlocked,
@@ -4252,13 +4252,13 @@ pub const ModelManager = struct {
             .shared_unified => admissionAmountsPresent(reclaimable.amounts),
             .live_host => reclaimable.amounts.hostTotalBytes() > 0 or
                 (builtin.os.tag == .macos and reclaimable.amounts.backendTotalBytes() > 0),
-            .domain_host => |backend_class| reclaimable.amounts_by_backend[@intFromEnum(backend_class)].hostTotalBytes() > 0,
-            .domain_backend => |backend_class| reclaimable.amounts_by_backend[@intFromEnum(backend_class)].backendTotalBytes() > 0,
+            .domain_host => |backend_class| reclaimable.amounts_by_backend[@backingInt(backend_class)].hostTotalBytes() > 0,
+            .domain_backend => |backend_class| reclaimable.amounts_by_backend[@backingInt(backend_class)].backendTotalBytes() > 0,
             .domain_combined => |backend_class| admissionAmountsPresent(
-                reclaimable.amounts_by_backend[@intFromEnum(backend_class)],
+                reclaimable.amounts_by_backend[@backingInt(backend_class)],
             ),
-            .domain_kv => |backend_class| reclaimable.amounts_by_backend[@intFromEnum(backend_class)].kvTotalBytes() > 0,
-            .domain_scratch => |backend_class| reclaimable.amounts_by_backend[@intFromEnum(backend_class)].scratchTotalBytes() > 0,
+            .domain_kv => |backend_class| reclaimable.amounts_by_backend[@backingInt(backend_class)].kvTotalBytes() > 0,
+            .domain_scratch => |backend_class| reclaimable.amounts_by_backend[@backingInt(backend_class)].scratchTotalBytes() > 0,
             // The process-owner budget is intentionally opaque. Any resident
             // admission released from the aggregate can potentially satisfy it.
             .external_budget => admissionAmountsPresent(reclaimable.amounts),
@@ -5741,7 +5741,7 @@ pub const ModelManager = struct {
         const key = try self.allocator.alloc(u8, prefix.len + preferred_backends.len);
         @memcpy(key[0..prefix.len], prefix);
         for (preferred_backends, 0..) |backend, idx| {
-            key[prefix.len + idx] = @intCast(@intFromEnum(backend));
+            key[prefix.len + idx] = @intCast(@backingInt(backend));
         }
         return key;
     }
@@ -9098,11 +9098,11 @@ test "projector residency follows its request-scoped lifecycle" {
     const projector_bytes: usize = 4096;
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "model.gguf",
-        .data = &([_]u8{0x31} ** decoder_bytes),
+        .data = &(@as([decoder_bytes]u8, @splat(0x31))),
     });
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "mmproj.gguf",
-        .data = &([_]u8{0x32} ** projector_bytes),
+        .data = &(@as([projector_bytes]u8, @splat(0x32))),
     });
     const root = try std.fs.path.join(
         allocator,
@@ -9164,7 +9164,7 @@ test "directory-backed component admission charges native model artifacts" {
     const weight_bytes = 8192;
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "model.gguf",
-        .data = &([_]u8{0x5a} ** weight_bytes),
+        .data = &(@as([weight_bytes]u8, @splat(0x5a))),
     });
     const root = try std.fs.path.join(
         allocator,
@@ -10042,42 +10042,42 @@ fn appendTestString(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(
 
 fn appendTestMetadataString(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: []const u8) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.string));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.string));
     try appendTestString(allocator, data, value);
 }
 
 fn appendTestMetadataU32(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: u32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.u32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.u32));
     try appendTestLe(u32, allocator, data, value);
 }
 
 fn appendTestMetadataBool(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: bool) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.bool_));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.bool_));
     try appendTestLe(u8, allocator, data, @intFromBool(value));
 }
 
 fn appendTestMetadataStringArray(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const []const u8) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.string));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.string));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestString(allocator, data, value);
 }
 
 fn appendTestMetadataI32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const i32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.i32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.i32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(i32, allocator, data, value);
 }
 
 fn appendTestMetadataF32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const f32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.f32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(u32, allocator, data, @bitCast(value));
 }

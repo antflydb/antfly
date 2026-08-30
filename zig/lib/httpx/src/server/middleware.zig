@@ -36,7 +36,7 @@ pub const Middleware = struct {
             switch (@typeInfo(Instance)) {
                 .pointer => |pointer| {
                     if (pointer.size != .one) @compileError("httpx.Middleware.bind requires a single-item pointer");
-                    if (pointer.is_const) @compileError("httpx.Middleware.bind currently requires a mutable instance pointer");
+                    if (pointer.attrs.@"const") @compileError("httpx.Middleware.bind currently requires a mutable instance pointer");
                 },
                 else => @compileError("httpx.Middleware.bind requires an instance pointer"),
             }

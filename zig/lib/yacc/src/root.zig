@@ -1385,16 +1385,16 @@ fn emitZigMetadata(
         \\}
         \\
         \\pub fn terminalIdByName(name: []const u8) ?u16 {
-        \\    inline for (std.meta.fields(Token)) |field| {
-        \\        if (std.mem.eql(u8, field.name, name)) return @intFromEnum(@field(Token, field.name)) + 1;
+        \\    inline for (@typeInfo(Token).@"enum".field_names) |field_name| {
+        \\        if (std.mem.eql(u8, field_name, name)) return @intFromEnum(@field(Token, field_name)) + 1;
         \\    }
         \\    return null;
         \\}
         \\
         \\pub fn terminalName(terminal: u16) ?[]const u8 {
         \\    if (terminal == 0) return "$end";
-        \\    inline for (std.meta.fields(Token)) |field| {
-        \\        if (terminal == @intFromEnum(@field(Token, field.name)) + 1) return field.name;
+        \\    inline for (@typeInfo(Token).@"enum".field_names) |field_name| {
+        \\        if (terminal == @intFromEnum(@field(Token, field_name)) + 1) return field_name;
         \\    }
         \\    return null;
         \\}
@@ -2157,7 +2157,7 @@ fn lessThanItem(_: void, lhs: Item, rhs: Item) bool {
 fn lessThanAction(_: void, lhs: Action, rhs: Action) bool {
     if (lhs.state != rhs.state) return lhs.state < rhs.state;
     if (lhs.terminal != rhs.terminal) return lhs.terminal < rhs.terminal;
-    if (@intFromEnum(lhs.kind) != @intFromEnum(rhs.kind)) return @intFromEnum(lhs.kind) < @intFromEnum(rhs.kind);
+    if (@backingInt(lhs.kind) != @backingInt(rhs.kind)) return @backingInt(lhs.kind) < @backingInt(rhs.kind);
     return lhs.target < rhs.target;
 }
 
@@ -2699,7 +2699,7 @@ test "generateZigMetadata escapes untrusted labels metadata and Zig identifiers"
     try std.testing.expect(std.mem.indexOf(u8, generated, "    @\"while\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "    @\"switch\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, ".{ \"while\", .reserved }") != null);
-    const sentinel = try std.testing.allocator.dupeZ(u8, generated);
+    const sentinel = try std.testing.allocator.dupeSentinel(u8, generated, 0);
     defer std.testing.allocator.free(sentinel);
     var ast = try std.zig.Ast.parse(std.testing.allocator, sentinel, .zig);
     defer ast.deinit(std.testing.allocator);

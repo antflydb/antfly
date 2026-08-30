@@ -869,7 +869,7 @@ test "encode rgba cancellation bounds compression and IDAT work" {
     };
 
     // A single scanline wider than one work chunk must remain interruptible.
-    const wide_rgba = [_]u8{0x5a} ** (20_000 * 4);
+    const wide_rgba = @as([(20_000 * 4)]u8, @splat(0x5a));
     var during_compression = CancelAtCheck{ .cancel_at = 3 };
     try std.testing.expectError(
         error.Canceled,
@@ -879,7 +879,7 @@ test "encode rgba cancellation bounds compression and IDAT work" {
 
     // Cancellation remains active after Deflate while IDAT is copied and its
     // checksum is accumulated. The testing allocator verifies output cleanup.
-    const small_rgba = [_]u8{0xa5} ** (8 * 8 * 4);
+    const small_rgba = @as([(8 * 8 * 4)]u8, @splat(0xa5));
     var during_idat = CancelAtCheck{ .cancel_at = 13 };
     try std.testing.expectError(
         error.Canceled,
@@ -920,7 +920,7 @@ test "png adler32 fast path matches std adler32" {
     chunked = adler32FastUpdate(chunked, bytes[31..]);
     try std.testing.expectEqual(std.hash.Adler32.hash(bytes), chunked);
 
-    const long = [_]u8{0xf3} ** 7000;
+    const long = @as([7000]u8, @splat(0xf3));
     try std.testing.expectEqual(std.hash.Adler32.hash(&long), adler32FastUpdate(adler32FastInit(), &long));
 }
 

@@ -27,15 +27,15 @@ pub fn supportsType(comptime T: type) bool {
         .@"enum" => return true,
         .@"union" => |info| {
             if (info.tag_type == null) return false;
-            inline for (info.fields) |field| {
-                if (field.type != void and !supportsType(field.type)) return false;
+            inline for (info.field_types) |Field| {
+                if (Field != void and !supportsType(Field)) return false;
             }
             return true;
         },
         .@"struct" => |info| {
-            inline for (info.fields) |field| {
-                if (field.is_comptime) return false;
-                if (!supportsType(field.type)) return false;
+            inline for (info.field_types, info.field_attrs) |Field, attrs| {
+                if (attrs.@"comptime") return false;
+                if (!supportsType(Field)) return false;
             }
             return true;
         },
@@ -56,14 +56,14 @@ pub fn containsCustomJsonParseType(comptime T: type) bool {
     switch (@typeInfo(T)) {
         .optional => |info| return containsCustomJsonParseType(info.child),
         .@"struct" => |info| {
-            inline for (info.fields) |field| {
-                if (containsCustomJsonParseType(field.type)) return true;
+            inline for (info.field_types) |Field| {
+                if (containsCustomJsonParseType(Field)) return true;
             }
             return false;
         },
         .@"union" => |info| {
-            inline for (info.fields) |field| {
-                if (containsCustomJsonParseType(field.type)) return true;
+            inline for (info.field_types) |Field| {
+                if (containsCustomJsonParseType(Field)) return true;
             }
             return false;
         },
@@ -251,7 +251,7 @@ const Parser = struct {
         self.skipWhitespace();
 
         var result: T = undefined;
-        var seen = [_]bool{false} ** info.fields.len;
+        var seen = @as([_reflFields(info).len]bool, @splat(false));
 
         if (!self.atEnd() and self.input[self.pos] == '}') {
             self.pos += 1;
@@ -276,7 +276,7 @@ const Parser = struct {
             if (self.cachedStructFieldIndex(T, field_name.slice())) |i| {
                 try self.parseStructFieldAtIndex(T, info, &result, &seen, i);
                 matched = true;
-            } else inline for (info.fields, 0..) |field, i| {
+            } else inline for (_reflFields(info), 0..) |field, i| {
                 if (std.mem.eql(u8, field.name, field_name.slice())) {
                     self.rememberStructField(T, field.name, i);
                     if (seen[i]) {
@@ -330,7 +330,7 @@ const Parser = struct {
         seen: []bool,
         field_index: usize,
     ) json.ParseError(json.Scanner)!void {
-        inline for (info.fields, 0..) |field, i| {
+        inline for (_reflFields(info), 0..) |field, i| {
             if (field_index == i) {
                 if (seen[i]) {
                     switch (self.options.duplicate_field_behavior) {
@@ -387,7 +387,7 @@ const Parser = struct {
 
         var result: T = undefined;
 
-        inline for (info.fields, 0..) |field, i| {
+        inline for (_reflFields(info), 0..) |field, i| {
             if (self.atEnd()) return error.UnexpectedEndOfInput;
             if (i > 0) {
                 if (self.input[self.pos] != ',') return error.UnexpectedToken;
@@ -432,7 +432,7 @@ const Parser = struct {
         self.pos += 1;
         self.skipWhitespace();
 
-        inline for (info.fields) |field| {
+        inline for (_reflFields(info)) |field| {
             if (std.mem.eql(u8, field.name, field_name.slice())) {
                 const result = if (field.type == void)
                     try self.parseVoidPayloadUnion(T, field.name)
@@ -717,7 +717,7 @@ const Parser = struct {
         const closing_quote = try self.currentStringClosingQuote();
         const direct_content = self.input[self.pos + 1 .. closing_quote];
 
-        if (ptr_info.is_const and ptr_info.sentinel() == null and self.allocate_strings == .alloc_if_needed and self.canDirectCopyString(direct_content)) {
+        if (ptr_info.attrs.@"const" and ptr_info.sentinel() == null and self.allocate_strings == .alloc_if_needed and self.canDirectCopyString(direct_content)) {
             if (direct_content.len > self.max_value_len) return error.ValueTooLong;
             self.pos = closing_quote + 1;
             self.quote_cursor += 2;
@@ -1011,7 +1011,7 @@ fn validateNumberLikeSlice(slice: []const u8) json.ParseError(json.Scanner)!void
 
 fn fillDefaults(comptime T: type, result: *T, seen: []bool) json.ParseFromValueError!void {
     const info = @typeInfo(T).@"struct";
-    inline for (info.fields, 0..) |field, i| {
+    inline for (_reflFields(info), 0..) |field, i| {
         if (!seen[i]) {
             if (field.default_value_ptr) |ptr| {
                 const typed_ptr: *align(@alignOf(field.type)) const field.type = @ptrCast(@alignCast(ptr));
@@ -1023,6 +1023,32 @@ fn fillDefaults(comptime T: type, result: *T, seen: []bool) json.ParseFromValueE
             }
         }
     }
+}
+
+const ReflField = struct {
+    name: [:0]const u8,
+    type: type = void,
+    value: comptime_int = 0,
+    is_comptime: bool = false,
+    default_value_ptr: ?*const anyopaque = null,
+};
+
+fn _reflFields(comptime info: anytype) [info.field_names.len]ReflField {
+    const Info = @TypeOf(info);
+    var result: [info.field_names.len]ReflField = undefined;
+    if (@hasField(Info, "field_values")) {
+        for (info.field_names, info.field_values, 0..) |name, value, i| result[i] = .{ .name = name, .value = value };
+    } else if (@hasField(Info, "is_tuple")) {
+        for (info.field_names, info.field_types, info.field_attrs, 0..) |name, Field, attrs, i| result[i] = .{
+            .name = name,
+            .type = Field,
+            .is_comptime = attrs.@"comptime",
+            .default_value_ptr = attrs.default_value_ptr,
+        };
+    } else {
+        for (info.field_names, info.field_types, 0..) |name, Field, i| result[i] = .{ .name = name, .type = Field };
+    }
+    return result;
 }
 
 test "simd typed parser parses nested structs arrays and escapes natively" {

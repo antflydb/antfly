@@ -22,7 +22,7 @@ pub const RegexAutomaton = automaton.RegexAutomaton;
 pub const compile = automaton.compile;
 
 const CharClass = struct {
-    bytes: [256]bool = [_]bool{false} ** 256,
+    bytes: [256]bool = @as([256]bool, @splat(false)),
     negated: bool = false,
 
     fn matches(self: *const CharClass, b: u8) bool {

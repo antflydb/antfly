@@ -622,8 +622,8 @@ def provenance_errors(provenance: dict[str, Any]) -> list[str]:
         if tool.get("returncode") != 0 or not tool.get("path") or not tool.get("sha256") or not tool.get("version"):
             errors.append(f"{name} toolchain provenance is unavailable")
     zig_version = (toolchains.get("zig") or {}).get("version")
-    if zig_version and zig_version.strip() != "0.16.0":
-        errors.append(f"expected Zig 0.16.0, got {zig_version!r}")
+    if zig_version and zig_version.strip() != "0.17.0-dev.1933+e19a73c2d":
+        errors.append(f"expected Zig 0.17.0-dev.1933+e19a73c2d, got {zig_version!r}")
     nvcc_version = (toolchains.get("nvcc") or {}).get("version")
     if nvcc_version and "release 13.2" not in nvcc_version:
         errors.append("expected CUDA toolkit 13.2 in nvcc provenance")

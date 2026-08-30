@@ -16,7 +16,7 @@
     .fingerprint = 0xf5a7692b778008e6,
     .name = .termite_zig,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0-dev.1933",
     .dependencies = .{
         .openapi = .{
             .path = "../../lib/openapi",

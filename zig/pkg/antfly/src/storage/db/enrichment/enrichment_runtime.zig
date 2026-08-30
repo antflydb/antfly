@@ -273,7 +273,7 @@ const ForegroundCatchUpGuard = struct {
 };
 
 const CoverageOutcome = enum { produced, skipped, terminal_failed };
-const coverage_outcome_count = std.meta.fields(CoverageOutcome).len;
+const coverage_outcome_count = @typeInfo(CoverageOutcome).@"enum".field_names.len;
 
 const CoverageOutcomeTransition = struct {
     index_name: []u8,
@@ -889,7 +889,7 @@ fn updateFailureFingerprintBytes(hasher: *std.hash.Wyhash, value: []const u8) vo
 }
 
 fn updateFailureFingerprintForRequest(hasher: *std.hash.Wyhash, request: enrichment_types.GeneratedEnrichmentRequest) void {
-    const kind: u8 = @intFromEnum(request.kind);
+    const kind: u8 = @backingInt(request.kind);
     var sequence_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &sequence_bytes, request.sequence, .little);
     hasher.update(&.{kind});
@@ -6851,7 +6851,7 @@ const RuntimeDocumentExtractionResourceTracker = struct {
 
 test "document extraction working set accounts generated unit cache bytes" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = 100,
     };
@@ -6873,7 +6873,7 @@ test "document extraction working set accounts generated unit cache bytes" {
 
 test "budgeted document download composes with materialization accounting" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = 100,
     };
@@ -6904,7 +6904,7 @@ test "budgeted document download composes with materialization accounting" {
 
 test "retained document collection allocations compose with the hard working-set cap" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = 100,
     };
@@ -6932,7 +6932,7 @@ test "retained document collection allocations compose with the hard working-set
 test "document replay payloads are admitted before persistent allocation" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = 1024,
     };
@@ -6953,7 +6953,7 @@ test "document replay payloads are admitted before persistent allocation" {
 
 test "document extraction reserves PDF decoder peak memory atomically" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = 100,
     };
@@ -6973,7 +6973,7 @@ test "document extraction reserves PDF decoder peak memory atomically" {
 
 test "PDF decoder reservation composes with every live slice owner" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = 100,
     };
@@ -7002,7 +7002,7 @@ test "PDF decoder reservation composes with every live slice owner" {
 
 test "PDF decoder credit and OCR transient allocations compose without double charging" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = 100,
     };
@@ -7036,7 +7036,7 @@ test "PDF decoder credit and OCR transient allocations compose without double ch
 
 test "reserved PDF working set is bounded without duplicate resource charges" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = 100,
     };
@@ -12417,8 +12417,8 @@ fn keyInList(key: []const u8, keys: []const []const u8) bool {
 }
 
 fn enrichmentConfigLessThan(_: void, lhs: types.EnrichmentConfig, rhs: types.EnrichmentConfig) bool {
-    const lhs_kind = @intFromEnum(lhs.kind);
-    const rhs_kind = @intFromEnum(rhs.kind);
+    const lhs_kind = @backingInt(lhs.kind);
+    const rhs_kind = @backingInt(rhs.kind);
     if (lhs_kind != rhs_kind) return lhs_kind < rhs_kind;
     return std.mem.lessThan(u8, lhs.name, rhs.name);
 }
@@ -13068,7 +13068,7 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
             transition: CoverageOutcomeTransition,
             outcome: CoverageOutcome,
         ) !usize {
-            const outcome_index = @intFromEnum(outcome);
+            const outcome_index = @backingInt(outcome);
             const counter_key = transition.counter_keys[outcome_index];
             if (indexes.get(counter_key)) |index| return index;
             const current_count = (try loadDerivedCoverageOutcomeCounter(runtime_value, counter_key)) orelse
@@ -13256,32 +13256,32 @@ test "derived coverage outcome transitions are exclusive and idempotent" {
     const stored_outcome = try storeGetAlloc(&runtime, transition.marker_key);
     defer runtime.alloc.free(stored_outcome);
     try std.testing.expectEqualStrings("skipped", stored_outcome);
-    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
-    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.skipped)]));
+    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.produced)]));
+    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.skipped)]));
     try std.testing.expectEqual(@as(u64, 1), runtime.skipped_source_count);
 
     transition.outcome = .produced;
     try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{ transition, transition });
-    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
-    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.skipped)]));
+    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.produced)]));
+    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.skipped)]));
     try std.testing.expectEqual(@as(u64, 0), runtime.skipped_source_count);
 
     transition.outcome = .terminal_failed;
     try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
-    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
-    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.terminal_failed)]));
+    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.produced)]));
+    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.terminal_failed)]));
 
     transition.outcome = .skipped;
     try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
     const terminal_outcome = try storeGetAlloc(&runtime, transition.marker_key);
     defer runtime.alloc.free(terminal_outcome);
     try std.testing.expectEqualStrings("terminal_failed", terminal_outcome);
-    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.skipped)]));
+    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.skipped)]));
 
     transition.outcome = .produced;
     try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
-    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
-    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.terminal_failed)]));
+    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.produced)]));
+    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.terminal_failed)]));
 }
 
 test "enrichment applied checkpoint stays degraded until runtime status clears" {

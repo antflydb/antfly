@@ -76,7 +76,7 @@ pub fn exportPortableToWriter(alloc: Allocator, store: *DocStore, sink_writer: *
     defer scan.abort();
 
     // Write file header
-    const backup_id = [_]u8{0} ** 16; // zero UUID for now
+    const backup_id = @as([16]u8, @splat(0)); // zero UUID for now
     try out.writeHeader(.{
         .format_version = backup_codec.format_version,
         .flags = 0,
@@ -1654,7 +1654,7 @@ fn decodeEdgeBatch(alloc: Allocator, data: []const u8) !struct {
 fn openTestStore(alloc: Allocator, tmp: *std.testing.TmpDir) !DocStore {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     return DocStore.open(alloc, path_z, .{});
 }
@@ -1874,7 +1874,7 @@ test "file import rejects oversized portable blocks before allocation" {
         .shard_count = 1,
     });
     var env: [6]u8 = undefined;
-    env[0] = @intFromEnum(backup_codec.BlockType.document_batch);
+    env[0] = @backingInt(backup_codec.BlockType.document_batch);
     env[1] = 0;
     std.mem.writeInt(u32, env[2..6], backup_codec.max_block_payload_bytes + 1, .little);
     try encoded.appendSlice(alloc, &env);
@@ -1937,7 +1937,7 @@ test "import preflights logical block payloads before mutating destination" {
         .format_version = backup_codec.format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = [_]u8{0} ** 16,
+        .backup_id = @as([16]u8, @splat(0)),
         .table_count = 1,
         .shard_count = 1,
     });

@@ -254,7 +254,7 @@ const WikiHttpClient = struct {
         var transfer_buffer: [1024]u8 = undefined;
         const response_body = try response.reader(&transfer_buffer).allocRemaining(self.alloc, .limited(16 << 20));
         return .{
-            .status = @intFromEnum(response.head.status),
+            .status = @backingInt(response.head.status),
             .body = response_body,
         };
     }
@@ -891,7 +891,7 @@ fn runStandaloneWikiBench(alloc: std.mem.Allocator, io: std.Io, input_cfg: Stand
     if (cfg.health_port == 0) cfg.health_port = port_base + 1;
 
     var root_buf: [256]u8 = undefined;
-    const root_path = std.fmt.bufPrintZ(&root_buf, "/tmp/antfly-quickstart-wiki-{d}", .{platform_time.monotonicNs()}) catch unreachable;
+    const root_path = std.fmt.bufPrintSentinel(&root_buf, "/tmp/antfly-quickstart-wiki-{d}", .{platform_time.monotonicNs()}, 0) catch unreachable;
     defer cleanupTempDir(root_path);
 
     const cwd = try std.process.currentPathAlloc(io, alloc);

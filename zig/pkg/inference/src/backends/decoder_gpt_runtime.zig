@@ -22,7 +22,7 @@ const decoder_tail_runtime = @import("decoder_tail_runtime.zig");
 const metal_compute = @import("../ops/metal_compute.zig");
 const ops = @import("../ops/ops.zig");
 
-const c_std = @cImport(@cInclude("stdlib.h"));
+const c_std = std.c;
 
 fn dequantizeTensorToFloat32Generic(
     cb: *const ops.ComputeBackend,
@@ -408,54 +408,54 @@ pub fn prepareDecodeRuntime(
     for (0..prepared_layer_count) |layer| {
         var name_buf: [64]u8 = undefined;
 
-        const ln1_w = try cb.getWeight(try std.fmt.bufPrintZ(&name_buf, "h.{d}.ln_1.weight", .{layer}));
+        const ln1_w = try cb.getWeight(try std.fmt.bufPrintSentinel(&name_buf, "h.{d}.ln_1.weight", .{layer}, 0));
         defer cb.free(ln1_w);
-        const ln1_b = try cb.getWeight(try std.fmt.bufPrintZ(&name_buf, "h.{d}.ln_1.bias", .{layer}));
+        const ln1_b = try cb.getWeight(try std.fmt.bufPrintSentinel(&name_buf, "h.{d}.ln_1.bias", .{layer}, 0));
         defer cb.free(ln1_b);
         if (!(try prepareLayerNormSlot(cb, allocator, gpt_config, layerNormSlot(layer, false), ln1_w, ln1_b))) {
             if (prepareTraceRequested()) std.debug.print("prepare-trace: gpt2 ln1 failed layer={d}\n", .{layer});
             return false;
         }
 
-        const c_attn_w = try cb.getWeight(try std.fmt.bufPrintZ(&name_buf, "h.{d}.attn.c_attn.weight", .{layer}));
+        const c_attn_w = try cb.getWeight(try std.fmt.bufPrintSentinel(&name_buf, "h.{d}.attn.c_attn.weight", .{layer}, 0));
         defer cb.free(c_attn_w);
-        const c_attn_b = try cb.getWeight(try std.fmt.bufPrintZ(&name_buf, "h.{d}.attn.c_attn.bias", .{layer}));
+        const c_attn_b = try cb.getWeight(try std.fmt.bufPrintSentinel(&name_buf, "h.{d}.attn.c_attn.bias", .{layer}, 0));
         defer cb.free(c_attn_b);
         if (!(try prepareLinearSlot(cb, allocator, linearSlot(layer, .fused_attn), c_attn_w, c_attn_b, gpt_config.hidden_size, gpt_config.hidden_size * 3))) {
             if (prepareTraceRequested()) std.debug.print("prepare-trace: gpt2 c_attn failed layer={d}\n", .{layer});
             return false;
         }
 
-        const c_proj_w = try cb.getWeight(try std.fmt.bufPrintZ(&name_buf, "h.{d}.attn.c_proj.weight", .{layer}));
+        const c_proj_w = try cb.getWeight(try std.fmt.bufPrintSentinel(&name_buf, "h.{d}.attn.c_proj.weight", .{layer}, 0));
         defer cb.free(c_proj_w);
-        const c_proj_b = try cb.getWeight(try std.fmt.bufPrintZ(&name_buf, "h.{d}.attn.c_proj.bias", .{layer}));
+        const c_proj_b = try cb.getWeight(try std.fmt.bufPrintSentinel(&name_buf, "h.{d}.attn.c_proj.bias", .{layer}, 0));
         defer cb.free(c_proj_b);
         if (!(try prepareLinearSlot(cb, allocator, linearSlot(layer, .attn_out_proj), c_proj_w, c_proj_b, gpt_config.hidden_size, gpt_config.hidden_size))) {
             if (prepareTraceRequested()) std.debug.print("prepare-trace: gpt2 c_proj failed layer={d}\n", .{layer});
             return false;
         }
 
-        const ln2_w = try cb.getWeight(try std.fmt.bufPrintZ(&name_buf, "h.{d}.ln_2.weight", .{layer}));
+        const ln2_w = try cb.getWeight(try std.fmt.bufPrintSentinel(&name_buf, "h.{d}.ln_2.weight", .{layer}, 0));
         defer cb.free(ln2_w);
-        const ln2_b = try cb.getWeight(try std.fmt.bufPrintZ(&name_buf, "h.{d}.ln_2.bias", .{layer}));
+        const ln2_b = try cb.getWeight(try std.fmt.bufPrintSentinel(&name_buf, "h.{d}.ln_2.bias", .{layer}, 0));
         defer cb.free(ln2_b);
         if (!(try prepareLayerNormSlot(cb, allocator, gpt_config, layerNormSlot(layer, true), ln2_w, ln2_b))) {
             if (prepareTraceRequested()) std.debug.print("prepare-trace: gpt2 ln2 failed layer={d}\n", .{layer});
             return false;
         }
 
-        const mlp_fc1_w = try cb.getWeight(try std.fmt.bufPrintZ(&name_buf, "h.{d}.mlp.c_fc.weight", .{layer}));
+        const mlp_fc1_w = try cb.getWeight(try std.fmt.bufPrintSentinel(&name_buf, "h.{d}.mlp.c_fc.weight", .{layer}, 0));
         defer cb.free(mlp_fc1_w);
-        const mlp_fc1_b = try cb.getWeight(try std.fmt.bufPrintZ(&name_buf, "h.{d}.mlp.c_fc.bias", .{layer}));
+        const mlp_fc1_b = try cb.getWeight(try std.fmt.bufPrintSentinel(&name_buf, "h.{d}.mlp.c_fc.bias", .{layer}, 0));
         defer cb.free(mlp_fc1_b);
         if (!(try prepareLinearSlot(cb, allocator, linearSlot(layer, .mlp_fc1), mlp_fc1_w, mlp_fc1_b, gpt_config.hidden_size, gpt_config.intermediate_size))) {
             if (prepareTraceRequested()) std.debug.print("prepare-trace: gpt2 mlp_fc1 failed layer={d}\n", .{layer});
             return false;
         }
 
-        const mlp_fc2_w = try cb.getWeight(try std.fmt.bufPrintZ(&name_buf, "h.{d}.mlp.c_proj.weight", .{layer}));
+        const mlp_fc2_w = try cb.getWeight(try std.fmt.bufPrintSentinel(&name_buf, "h.{d}.mlp.c_proj.weight", .{layer}, 0));
         defer cb.free(mlp_fc2_w);
-        const mlp_fc2_b = try cb.getWeight(try std.fmt.bufPrintZ(&name_buf, "h.{d}.mlp.c_proj.bias", .{layer}));
+        const mlp_fc2_b = try cb.getWeight(try std.fmt.bufPrintSentinel(&name_buf, "h.{d}.mlp.c_proj.bias", .{layer}, 0));
         defer cb.free(mlp_fc2_b);
         if (!(try prepareLinearSlot(cb, allocator, linearSlot(layer, .mlp_fc2), mlp_fc2_w, mlp_fc2_b, gpt_config.intermediate_size, gpt_config.hidden_size))) {
             if (prepareTraceRequested()) std.debug.print("prepare-trace: gpt2 mlp_fc2 failed layer={d}\n", .{layer});

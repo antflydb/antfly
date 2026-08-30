@@ -2,7 +2,7 @@
     .fingerprint = 0xa924bc2e7af6a8f2,
     .name = .httpx,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0-dev.1933",
     .dependencies = .{},
     .paths = .{
         "build.zig",

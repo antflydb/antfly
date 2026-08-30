@@ -1579,13 +1579,13 @@ test "lite schema index and enrichment commands round trip catalogs" {
     const enrichment_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/catalog-enrichment.json", .{tmp.sub_path});
     defer allocator.free(enrichment_path);
 
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
-    const schema_path_z = try allocator.dupeZ(u8, schema_path);
+    const schema_path_z = try allocator.dupeSentinel(u8, schema_path, 0);
     defer allocator.free(schema_path_z);
-    const index_path_z = try allocator.dupeZ(u8, index_path);
+    const index_path_z = try allocator.dupeSentinel(u8, index_path, 0);
     defer allocator.free(index_path_z);
-    const enrichment_path_z = try allocator.dupeZ(u8, enrichment_path);
+    const enrichment_path_z = try allocator.dupeSentinel(u8, enrichment_path, 0);
     defer allocator.free(enrichment_path_z);
 
     {
@@ -1696,9 +1696,9 @@ test "lite query readonly runs while writer handle is open" {
     defer allocator.free(path);
     const query_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/query-readonly-active-writer.json", .{tmp.sub_path});
     defer allocator.free(query_path);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
-    const query_path_z = try allocator.dupeZ(u8, query_path);
+    const query_path_z = try allocator.dupeSentinel(u8, query_path, 0);
     defer allocator.free(query_path_z);
 
     var writer = try LiteDb.create(allocator, path, true);
@@ -1784,9 +1784,9 @@ test "lite backup command exports stable data while writer has open transaction"
     defer allocator.free(backup_path);
     const restored_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-active-writer-restored.aflite", .{tmp.sub_path});
     defer allocator.free(restored_path);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
-    const backup_path_z = try allocator.dupeZ(u8, backup_path);
+    const backup_path_z = try allocator.dupeSentinel(u8, backup_path, 0);
     defer allocator.free(backup_path_z);
 
     var writer = try LiteDb.create(allocator, path, true);
@@ -1844,9 +1844,9 @@ test "lite export subcommand dispatches portable backup alias" {
     defer allocator.free(backup_path);
     const restored_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/export-alias-restored.aflite", .{tmp.sub_path});
     defer allocator.free(restored_path);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
-    const backup_path_z = try allocator.dupeZ(u8, backup_path);
+    const backup_path_z = try allocator.dupeSentinel(u8, backup_path, 0);
     defer allocator.free(backup_path_z);
 
     {
@@ -1985,7 +1985,7 @@ test "lite check returns an error for invalid aflite files after writing report"
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("truncated_header", report.issue.?);
 
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const argv = [_][*:0]const u8{path_z.ptr};
     var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -2108,9 +2108,9 @@ test "lite backup output restores schema indexes enrichments and documents" {
         try source.db.runUntilIdle();
     }
 
-    const src_path_z = try allocator.dupeZ(u8, src_path);
+    const src_path_z = try allocator.dupeSentinel(u8, src_path, 0);
     defer allocator.free(src_path_z);
-    const backup_path_z = try allocator.dupeZ(u8, backup_path);
+    const backup_path_z = try allocator.dupeSentinel(u8, backup_path, 0);
     defer allocator.free(backup_path_z);
     const backup_argv = [_][*:0]const u8{ src_path_z.ptr, "--out", backup_path_z.ptr };
     var backup_args = std.process.Args.Iterator.init(.{ .vector = backup_argv[0..] });
@@ -2495,7 +2495,7 @@ test "lite restore malformed backup leaves target untouched" {
             .format_version = backup_codec.format_version,
             .flags = 0,
             .created_at_ns = 0,
-            .backup_id = [_]u8{0} ** 16,
+            .backup_id = @as([16]u8, @splat(0)),
             .table_count = 1,
             .shard_count = 1,
         });
@@ -2613,7 +2613,7 @@ test "lite status rejects internal bridge aflite files" {
 
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/status-internal-bridge.aflite", .{tmp.sub_path});
     defer allocator.free(path);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     {
@@ -2891,7 +2891,7 @@ test "lite promote helper stages backup then submits normal restore request" {
         try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
     }
 
-    const location_z = try allocator.dupeZ(u8, location);
+    const location_z = try allocator.dupeSentinel(u8, location, 0);
     defer allocator.free(location_z);
     const argv = [_][*:0]const u8{ "--target", "http://restore.test", "--table", "docs", "--connection", "local-reader", "--backup-id", "lite-promote-command", "--location", location_z.ptr };
     var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });

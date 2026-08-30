@@ -528,14 +528,14 @@ pub fn parseWindowUpdatePayload(payload: []const u8) !u31 {
 /// Builds an RST_STREAM frame payload.
 pub fn buildRstStreamPayload(error_code: http.Http2ErrorCode) [4]u8 {
     var buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &buf, @intFromEnum(error_code), .big);
+    std.mem.writeInt(u32, &buf, @backingInt(error_code), .big);
     return buf;
 }
 
 /// Parses an RST_STREAM frame payload.
 pub fn parseRstStreamPayload(payload: []const u8) !http.Http2ErrorCode {
     if (payload.len != 4) return error.InvalidFrame;
-    return @enumFromInt(std.mem.readInt(u32, payload[0..4], .big));
+    return @fromBackingInt(@intCast(std.mem.readInt(u32, payload[0..4], .big)));
 }
 
 /// Builds a PRIORITY frame payload.
@@ -561,7 +561,7 @@ pub fn parsePriorityPayload(payload: []const u8) !StreamPriority {
 
 /// Builds a GOAWAY frame payload.
 pub fn buildGoawayPayload(last_stream_id: u31, error_code: http.Http2ErrorCode, debug_data: ?[]const u8, allocator: Allocator) ![]u8 {
-    const code = @intFromEnum(error_code);
+    const code = @backingInt(error_code);
     const debug_len = if (debug_data) |d| d.len else 0;
     const payload = try allocator.alloc(u8, 8 + debug_len);
     errdefer allocator.free(payload);
@@ -585,7 +585,7 @@ pub fn parseGoawayPayload(payload: []const u8, allocator: Allocator) !struct {
     if (payload.len < 8) return error.InvalidFrame;
 
     const last_stream_id: u31 = @intCast(std.mem.readInt(u32, payload[0..4], .big) & 0x7FFFFFFF);
-    const error_code: http.Http2ErrorCode = @enumFromInt(std.mem.readInt(u32, payload[4..8], .big));
+    const error_code: http.Http2ErrorCode = @fromBackingInt(@intCast(std.mem.readInt(u32, payload[4..8], .big)));
 
     const debug_data = if (payload.len > 8)
         try allocator.dupe(u8, payload[8..])
@@ -688,7 +688,7 @@ test "compactDataBuf shifts remaining data to front" {
     defer s.deinit(allocator);
 
     // Append 128KB of data.
-    const chunk = "A" ** 1024;
+    const chunk = &@as([1024]u8, @splat('A'));
     for (0..128) |_| {
         try s.data_buf.appendSlice(allocator, chunk);
     }

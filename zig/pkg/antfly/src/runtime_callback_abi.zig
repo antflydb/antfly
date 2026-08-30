@@ -92,17 +92,18 @@ fn BoundaryImpl(comptime VTable: type) type {
         ) callconv(.c) error_abi.Status {
             if (contract.version != native_abi.abi_version)
                 return error_abi.statusFromError(error.UnsupportedVersion);
-            inline for (std.meta.fields(VTable)) |field| {
-                if (contract.method_id == native_abi.stableId(field.name)) {
-                    if (comptime isCallbackField(field.type)) {
-                        const Callback = callbackType(field.type);
+            const info = @typeInfo(VTable).@"struct";
+            inline for (info.field_names, info.field_types) |field_name, Field| {
+                if (contract.method_id == native_abi.stableId(field_name)) {
+                    if (comptime isCallbackField(Field)) {
+                        const Callback = callbackType(Field);
                         const Function = functionType(Callback);
                         const Args = std.meta.ArgsTuple(Function);
                         const Payload = payloadType(Callback);
-                        const expected = native_abi.CallContract.of(field.name, Callback, Args, Payload);
+                        const expected = native_abi.CallContract.of(field_name, Callback, Args, Payload);
                         if (!contract.matches(expected))
                             return error_abi.statusFromError(error.InvalidArgument);
-                        return invoke(field.type, callback, args, output);
+                        return invoke(Field, callback, args, output);
                     }
                     return error_abi.statusFromError(error.InvalidArgument);
                 }

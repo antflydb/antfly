@@ -1657,7 +1657,7 @@ fn allocCompletionId(allocator: std.mem.Allocator) ![]u8 {
     const value = std.mem.readInt(u64, &bytes, .little);
     var scratch: [16]u8 = undefined;
     const rendered = try std.fmt.bufPrint(&scratch, "{x}", .{value});
-    var padded = [_]u8{'0'} ** 16;
+    var padded = @as([16]u8, @splat('0'));
     @memcpy(padded[padded.len - rendered.len ..], rendered);
     return std.fmt.allocPrint(allocator, "chatcmpl-{s}", .{padded[0..]});
 }
@@ -2115,9 +2115,9 @@ fn addCompatibilityManifestFacts(
     signature: *std.crypto.hash.sha2.Sha256,
     man: *const manifest_mod.ModelManifest,
 ) void {
-    const model_type: u8 = @intFromEnum(man.model_type);
-    const model_type_origin: u8 = @intFromEnum(man.model_type_origin);
-    const native_arch_hint: u8 = @intFromEnum(man.native_arch_hint);
+    const model_type: u8 = @backingInt(man.model_type);
+    const model_type_origin: u8 = @backingInt(man.model_type_origin);
+    const native_arch_hint: u8 = @backingInt(man.native_arch_hint);
     signature.update(&.{ model_type, model_type_origin, native_arch_hint });
     updateCompatibilitySignatureSlice(signature, man.config_model_arch);
     updateCompatibilitySignatureSlice(signature, man.gliner_model_type);
@@ -5154,7 +5154,7 @@ pub const Node = struct {
             return null;
         }
 
-        const dir_z = self.allocator.dupeZ(u8, dir_path) catch return null;
+        const dir_z = self.allocator.dupeSentinel(u8, dir_path, 0) catch return null;
         defer self.allocator.free(dir_z);
 
         const cc = c_file.c;
@@ -5199,7 +5199,7 @@ pub const Node = struct {
             return null;
         }
 
-        const dir_z = self.allocator.dupeZ(u8, self.config.models_dir) catch return null;
+        const dir_z = self.allocator.dupeSentinel(u8, self.config.models_dir, 0) catch return null;
         defer self.allocator.free(dir_z);
 
         const cc = c_file.c;
@@ -13871,7 +13871,7 @@ test "direct generation image admission subtracts resident bytes from capacity" 
     var node = try Node.init(std.testing.allocator, .{ .max_concurrent_requests = 1 });
     defer node.deinit();
 
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
     std.mem.writeInt(u32, png[16..20], 1024, .big);
@@ -14298,7 +14298,7 @@ test "direct dense embed rejects borrowed image expansion before model loading" 
     const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
     std.mem.writeInt(u32, png[16..20], 800, .big);
@@ -14325,7 +14325,7 @@ test "read decoded image budget rejects aggregate expansion and overflow" {
     const admission = ReadRequestAdmission{ .units = 1, .byte_cap = 1024, .resident_byte_cap = 1024, .decoded_pixel_cap = 4 };
     var budget = ReadDecodedImageBudget.init(admission, 2);
 
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
     std.mem.writeInt(u32, png[16..20], 2, .big);
@@ -14391,7 +14391,7 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
 
     // Two 24-byte PNG headers each declare a modest 800x800 canvas. They fit
     // the encoded-media ceiling but together exceed one 16 MiB admission unit.
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
     std.mem.writeInt(u32, png[16..20], 800, .big);
@@ -14713,7 +14713,7 @@ test "read image preflight maps malformed dimension and aggregate errors before 
         try std.testing.expectEqual(@as(u16, 400), response.status.code);
     }
 
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
     std.mem.writeInt(u32, png[16..20], 2, .big);
@@ -16669,7 +16669,7 @@ fn dirContainsModel(path: []const u8) bool {
         return false;
     }
 
-    const path_z = std.heap.page_allocator.dupeZ(u8, path) catch return false;
+    const path_z = std.heap.page_allocator.dupeSentinel(u8, path, 0) catch return false;
     defer std.heap.page_allocator.free(path_z);
     const dir = c_file.c.opendir(path_z.ptr);
     if (dir == null) return false;

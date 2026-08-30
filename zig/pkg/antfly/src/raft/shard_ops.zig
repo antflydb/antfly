@@ -190,7 +190,7 @@ pub const OwnedShardOperationAdapter = struct {
     };
 
     var registry_buckets: [registry_bucket_count]RegistryBucket =
-        [_]RegistryBucket{.{}} ** registry_bucket_count;
+        @as([registry_bucket_count]RegistryBucket, @splat(.{}));
     var next_context_id: std.atomic.Value(u64) = .init(1);
 
     const AdmissionTest = if (builtin.is_test) struct {

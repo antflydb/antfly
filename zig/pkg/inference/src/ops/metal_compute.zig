@@ -129,7 +129,7 @@ const A4bProjectedArenaTelemetry = struct {
     }
 
     arenas: [capacity_count]ExpertSlotArena = initialArenas(),
-    token_all_hit: [capacity_count]bool = [_]bool{false} ** capacity_count,
+    token_all_hit: [capacity_count]bool = @as([capacity_count]bool, @splat(false)),
     token_active: bool = false,
     next_layer: usize = 0,
 
@@ -155,7 +155,7 @@ const A4bProjectedArenaTelemetry = struct {
         if (layer == 0) {
             self.token_active = true;
             self.next_layer = 0;
-            self.token_all_hit = [_]bool{true} ** capacity_count;
+            self.token_all_hit = @as([capacity_count]bool, @splat(true));
         } else if (!self.token_active or layer != self.next_layer) {
             self.token_active = false;
             return;
@@ -343,7 +343,7 @@ fn getenvBool(comptime name: [*:0]const u8) bool {
         var cached: ?bool = null;
     };
     if (S.cached) |cached| return cached;
-    const c = @cImport(@cInclude("stdlib.h"));
+    const c = std.c;
     const enabled = blk: {
         const value = c.getenv(S.cache_key) orelse break :blk false;
         const slice = std.mem.span(value);
@@ -430,7 +430,7 @@ test "all-hit expert routes keep an already published slot directory" {
 
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
-    const c = @cImport(@cInclude("stdlib.h"));
+    const c = std.c;
     const value = c.getenv(name) orelse return null;
     const slice = std.mem.span(value);
     if (slice.len == 0) return null;
@@ -1047,7 +1047,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     // copied into these slots and route-slot kernels can replay misses.
     a4b_expert_slot_arena: ?runtime_root.moe.expert_slot_arena.ExpertSlotArena = null,
     a4b_moe_slot_directory_published: [runtime_root.moe.expert_slot_arena.max_layers]bool =
-        [_]bool{false} ** runtime_root.moe.expert_slot_arena.max_layers,
+        @as([runtime_root.moe.expert_slot_arena.max_layers]bool, @splat(false)),
     a4b_projected_arena_telemetry_requested: ?bool = null,
     a4b_projected_arena_telemetry: ?*A4bProjectedArenaTelemetry = null,
     a4b_moe_checkpoint_active: bool = false,
@@ -1061,7 +1061,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// Immutable, model-scoped state for the high-memory A4B qLen=1 decoder.
     /// Packed descriptors alias the resident GGUF allocation; only the seven
     /// small f32 vectors per layer are separately retained.
-    a4b_prepared_moe_layers: [256]?PreparedA4bMoeLayer = [_]?PreparedA4bMoeLayer{null} ** 256,
+    a4b_prepared_moe_layers: [256]?PreparedA4bMoeLayer = @as([256]?PreparedA4bMoeLayer, @splat(null)),
     runtime_frame_begin_baseline: u64 = 0,
     runtime_frame_submit_baseline: u64 = 0,
     runtime_frame_wait_baseline: u64 = 0,
@@ -1415,7 +1415,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .ffn => .{ metal_runtime.ComputeSource.ffn, metal_runtime.ComputeRegion.ffn },
             .ple => .{ metal_runtime.ComputeSource.ple, metal_runtime.ComputeRegion.ple },
         };
-        metal_runtime.beginPlannedComputeScope(runtime, @intFromEnum(source), region) catch |err| switch (err) {
+        metal_runtime.beginPlannedComputeScope(runtime, @backingInt(source), region) catch |err| switch (err) {
             error.RuntimeUnavailable, error.FrameNotActive, error.PlannedScopeActive => {
                 if (scope.owns_frame) {
                     var active = true;
@@ -1688,7 +1688,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var lhs_init: usize = 0;
         var rhs_init: usize = 0;
         var out_init: usize = 0;
-        var out_moved: [8]bool = [_]bool{false} ** 8;
+        var out_moved: [8]bool = @as([8]bool, @splat(false));
         defer {
             for (lhs_mts[0..lhs_init]) |*tensor| tensor.deinit();
         }
@@ -4296,7 +4296,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         try metal_runtime.workloadProfileSetRegime(
             self.provider_impl.raw_decode_runtime,
-            @enumFromInt(@intFromEnum(regime)),
+            @fromBackingInt(@intCast(@backingInt(regime))),
         );
     }
 
@@ -4917,9 +4917,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .byte_offset = if (buf.metal_tensor) |*metal_tensor| metal_tensor.deviceByteOffset() else 0,
             .byte_len = if (buf.metal_tensor) |*metal_tensor| metal_tensor.deviceByteLen() else bufElemCount(buf) * @sizeOf(f32),
             .rank = in_shape.len,
-            .in_shape = [_]i64{0} ** metal_tensor_mod.max_dims,
-            .perm = [_]u8{0} ** metal_tensor_mod.max_dims,
-            .out_shape = [_]i64{0} ** metal_tensor_mod.max_dims,
+            .in_shape = @as([metal_tensor_mod.max_dims]i64, @splat(0)),
+            .perm = @as([metal_tensor_mod.max_dims]u8, @splat(0)),
+            .out_shape = @as([metal_tensor_mod.max_dims]i64, @splat(0)),
         };
         for (0..in_shape.len) |i| {
             key.in_shape[i] = in_shape[i];
@@ -5326,7 +5326,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         layer_index: usize,
         expert_count: usize,
     ) bool {
-        var expert_to_slot = [_]u32{std.math.maxInt(u32)} ** runtime_root.moe.expert_slot_arena.max_experts;
+        var expert_to_slot = @as([runtime_root.moe.expert_slot_arena.max_experts]u32, @splat(std.math.maxInt(u32)));
         arena.writeExpertToSlotMap(layer_index, expert_count, &expert_to_slot) catch return false;
         return metal_runtime.decoderRuntimePublishMoeExpertSlotMap(
             self.provider_impl,
@@ -6512,7 +6512,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn broadcastInDimIsMetadataOnly(input_shape: []const i64, target_shape: []const i64, broadcast_axes: []const u8) bool {
         if (broadcast_axes.len != input_shape.len) return false;
-        var mapped_output_axis = [_]bool{false} ** metal_tensor_mod.max_dims;
+        var mapped_output_axis = @as([metal_tensor_mod.max_dims]bool, @splat(false));
         var previous_axis: ?usize = null;
         for (broadcast_axes, 0..) |axis_u8, input_axis| {
             const axis: usize = axis_u8;
@@ -7102,9 +7102,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const out_rank = @max(result_shape.len, @max(lhs_shape_i64.len, rhs_shape_i64.len));
         if (out_rank > metal_tensor_mod.max_dims) return error.UnsupportedShape;
 
-        var out_shape: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
-        var a_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
-        var b_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
+        var out_shape: [metal_tensor_mod.max_dims]i64 = @as([metal_tensor_mod.max_dims]i64, @splat(1));
+        var a_aligned: [metal_tensor_mod.max_dims]i64 = @as([metal_tensor_mod.max_dims]i64, @splat(1));
+        var b_aligned: [metal_tensor_mod.max_dims]i64 = @as([metal_tensor_mod.max_dims]i64, @splat(1));
         for (0..result_shape.len) |i| out_shape[out_rank - result_shape.len + i] = result_shape[i];
         for (0..lhs_shape_i64.len) |i| a_aligned[out_rank - lhs_shape_i64.len + i] = lhs_shape_i64[i];
         for (0..rhs_shape_i64.len) |i| b_aligned[out_rank - rhs_shape_i64.len + i] = rhs_shape_i64[i];
@@ -7543,9 +7543,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (out_rank > metal_tensor_mod.max_dims) return error.UnsupportedShape;
 
         var out_shape: [metal_tensor_mod.max_dims]i64 = undefined;
-        var cond_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
-        var true_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
-        var false_aligned: [metal_tensor_mod.max_dims]i64 = [_]i64{1} ** metal_tensor_mod.max_dims;
+        var cond_aligned: [metal_tensor_mod.max_dims]i64 = @as([metal_tensor_mod.max_dims]i64, @splat(1));
+        var true_aligned: [metal_tensor_mod.max_dims]i64 = @as([metal_tensor_mod.max_dims]i64, @splat(1));
+        var false_aligned: [metal_tensor_mod.max_dims]i64 = @as([metal_tensor_mod.max_dims]i64, @splat(1));
 
         for (0..cond_shape.len) |i| cond_aligned[out_rank - cond_shape.len + i] = cond_shape[i];
         for (0..true_shape.len) |i| true_aligned[out_rank - true_shape.len + i] = true_shape[i];
@@ -8036,8 +8036,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         computeStrides(output_shape_i64, output_strides_usize[0..output_shape_i64.len]);
 
-        var out_strides = [_]u32{0} ** metal_tensor_mod.max_dims;
-        var input_strides_for_out = [_]u32{0} ** metal_tensor_mod.max_dims;
+        var out_strides = @as([metal_tensor_mod.max_dims]u32, @splat(0));
+        var input_strides_for_out = @as([metal_tensor_mod.max_dims]u32, @splat(0));
         for (output_shape_i64, 0..) |_, i| {
             if (output_strides_usize[i] > std.math.maxInt(u32) or input_strides_usize[i] > std.math.maxInt(u32)) {
                 if (trace) std.debug.print("metal_reduce_prim: decline=axis_stride_limit op={s} dim={d} out_stride={d} in_stride={d}\n", .{ @tagName(op_kind), i, output_strides_usize[i], input_strides_usize[i] });
@@ -8348,9 +8348,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         computeStrides(in_shape, in_strides_usize[0..in_shape.len]);
         computeStrides(out_shape, out_strides_usize[0..out_shape.len]);
 
-        var mapped_out_axes = [_]bool{false} ** metal_tensor_mod.max_dims;
-        var out_strides = [_]u32{0} ** metal_tensor_mod.max_dims;
-        var input_strides_for_out = [_]u32{0} ** metal_tensor_mod.max_dims;
+        var mapped_out_axes = @as([metal_tensor_mod.max_dims]bool, @splat(false));
+        var out_strides = @as([metal_tensor_mod.max_dims]u32, @splat(0));
+        var input_strides_for_out = @as([metal_tensor_mod.max_dims]u32, @splat(0));
         for (out_shape, 0..) |_, axis| {
             if (out_strides_usize[axis] > std.math.maxInt(u32)) {
                 if (trace) std.debug.print("metal_broadcast_prim: decline=general_out_stride axis={d} stride={d}\n", .{ axis, out_strides_usize[axis] });
@@ -13146,7 +13146,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.operator_plan,
         );
         const planned_dispatch = switch (request.operator_plan) {
-            .quant_matmul => |quant| @as(u8, @intFromEnum(quant.dispatch)),
+            .quant_matmul => |quant| @as(u8, @backingInt(quant.dispatch)),
             else => return error.InvalidPartitionPlan,
         };
         return linearNoBiasOpWithPlannedDispatch(
@@ -13254,7 +13254,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.operator_plan,
         );
         const planned_dispatch = switch (request.operator_plan) {
-            .quant_matmul => |quant| @as(u8, @intFromEnum(quant.dispatch)),
+            .quant_matmul => |quant| @as(u8, @backingInt(quant.dispatch)),
             else => return error.InvalidPartitionPlan,
         };
         return linearOpWithPlannedDispatch(
@@ -17846,14 +17846,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.planned_frame_layer_window != null;
         const using_frame_layer_contract = plannedContractIsActive(request.planned_setup_contract) and
             plannedContractIsActive(request.planned_layer_contract);
-        var planned_setup_ops = [_]u16{0} ** 16;
-        var planned_setup_barriers = [_]u8{0} ** 16;
-        var planned_setup_quant_dispatches = [_]u8{255} ** 16;
-        var planned_setup_command_ops = [_]ops.PlannedCommandOp{.{}} ** 16;
-        var planned_block_ops = [_]u16{0} ** 16;
-        var planned_block_barriers = [_]u8{0} ** 16;
-        var planned_block_quant_dispatches = [_]u8{255} ** 16;
-        var planned_block_command_ops = [_]ops.PlannedCommandOp{.{}} ** 16;
+        var planned_setup_ops = @as([16]u16, @splat(0));
+        var planned_setup_barriers = @as([16]u8, @splat(0));
+        var planned_setup_quant_dispatches = @as([16]u8, @splat(255));
+        var planned_setup_command_ops = @as([16]ops.PlannedCommandOp, @splat(.{}));
+        var planned_block_ops = @as([16]u16, @splat(0));
+        var planned_block_barriers = @as([16]u8, @splat(0));
+        var planned_block_quant_dispatches = @as([16]u8, @splat(255));
+        var planned_block_command_ops = @as([16]ops.PlannedCommandOp, @splat(.{}));
         var planned_setup_contract: ops.PlannedLayerContract = .{};
         var planned_block_contract: ops.PlannedLayerContract = .{};
         var planned_frame_contract: ops.PlannedLayerContract = .{};
@@ -17884,8 +17884,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .attention_layer_index = attention.layer_index,
                 .value_norm = request.global_head_dim != 0 and !attention.skip_kv_write,
                 .kv_seed = false,
-                .source = @intFromEnum(metal_runtime.ComputeSource.layer),
-                .region = @intFromEnum(metal_runtime.ComputeRegion.layer),
+                .source = @backingInt(metal_runtime.ComputeSource.layer),
+                .region = @backingInt(metal_runtime.ComputeRegion.layer),
                 .rows = rows,
                 .hidden_size = request.hidden_size,
                 .attention_input_size = attention_input_size,
@@ -17927,8 +17927,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                     .ple_gate_linear_slot = request.ple_gate_linear_slot.?,
                                     .ple_proj_linear_slot = request.ple_proj_linear_slot.?,
                                     .ple_post_norm_slot = request.ple_post_norm_slot.?,
-                                    .source = @intFromEnum(metal_runtime.ComputeSource.layer),
-                                    .region = @intFromEnum(metal_runtime.ComputeRegion.layer),
+                                    .source = @backingInt(metal_runtime.ComputeSource.layer),
+                                    .region = @backingInt(metal_runtime.ComputeRegion.layer),
                                     .rows = rows,
                                     .kv_len = attention.kv_sequence_len,
                                     .hidden_size = request.hidden_size,
@@ -22687,8 +22687,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .ple_gate_linear_slot = if (layer_plan_has_ple) layer.ple_gate_linear_slot.? else 0,
                 .ple_proj_linear_slot = if (layer_plan_has_ple) layer.ple_proj_linear_slot.? else 0,
                 .ple_post_norm_slot = if (layer_plan_has_ple) layer.ple_post_norm_slot.? else 0,
-                .source = @intFromEnum(attention_setup_source),
-                .region = @intFromEnum(attention_setup_region),
+                .source = @backingInt(attention_setup_source),
+                .region = @backingInt(attention_setup_region),
                 .hidden_size = request.hidden_size,
                 .kv_len = attention.kv_sequence_len,
                 .attention_input_size = attention_input_size,
@@ -22716,8 +22716,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .attention_layer_index = attention.layer_index,
                 .value_norm = request.global_head_dim != 0,
                 .kv_seed = false,
-                .source = @intFromEnum(attention_setup_source),
-                .region = @intFromEnum(attention_setup_region),
+                .source = @backingInt(attention_setup_source),
+                .region = @backingInt(attention_setup_region),
             }) catch {};
             planned_command_view = setup_plan_storage.commandView();
             planned_view = planned_command_view.planView();
@@ -23128,10 +23128,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (k_for_block) |k| try self.maybeDumpDecodeStageTensor("k-rope", layer_index, k, kv_dim);
         if (v_for_block) |v| try self.maybeDumpDecodeStageTensor("v", layer_index, v, kv_dim);
 
-        var planned_layer_op_storage = [_]u16{0} ** 16;
-        var planned_layer_barrier_storage = [_]u8{0} ** 16;
-        var planned_layer_quant_dispatch_storage = [_]u8{255} ** 16;
-        var planned_layer_command_op_storage = [_]ops.PlannedCommandOp{.{}} ** 16;
+        var planned_layer_op_storage = @as([16]u16, @splat(0));
+        var planned_layer_barrier_storage = @as([16]u8, @splat(0));
+        var planned_layer_quant_dispatch_storage = @as([16]u8, @splat(255));
+        var planned_layer_command_op_storage = @as([16]ops.PlannedCommandOp, @splat(.{}));
         const planned_layer_contract = attention_setup_plan.exportActiveCommandContract(
             &planned_layer_op_storage,
             &planned_layer_barrier_storage,
@@ -23726,16 +23726,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             tail_plan_storage.build(.{
                 .final_norm_slot = request.final_norm_slot,
                 .lm_head_slot = request.final_lm_head_slot,
-                .source = @intFromEnum(metal_runtime.ComputeSource.tail),
-                .region = @intFromEnum(metal_runtime.ComputeRegion.tail),
+                .source = @backingInt(metal_runtime.ComputeSource.tail),
+                .region = @backingInt(metal_runtime.ComputeRegion.tail),
                 .hidden_size = request.hidden_size,
                 .vocab_size = request.vocab_size,
                 .quant_format = tail_quant_format,
             }) catch {};
-            var planned_tail_op_storage = [_]u16{0} ** 3;
-            var planned_tail_barrier_storage = [_]u8{0} ** 3;
-            var planned_tail_quant_dispatch_storage = [_]u8{255} ** 3;
-            var planned_tail_command_op_storage = [_]ops.PlannedCommandOp{.{}} ** 3;
+            var planned_tail_op_storage = @as([3]u16, @splat(0));
+            var planned_tail_barrier_storage = @as([3]u8, @splat(0));
+            var planned_tail_quant_dispatch_storage = @as([3]u8, @splat(255));
+            var planned_tail_command_op_storage = @as([3]ops.PlannedCommandOp, @splat(.{}));
             const planned_tail_contract = metal_runtime.plannedContractFromCommandPlan(
                 tail_plan_storage.commandView(),
                 &planned_tail_op_storage,
@@ -24235,7 +24235,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) bool {
         const runtime = self.provider_impl.raw_decode_runtime;
         if (!metal_runtime.hasActiveFrame(runtime)) return false;
-        metal_runtime.beginPlannedComputeScope(runtime, @intFromEnum(source), region) catch return false;
+        metal_runtime.beginPlannedComputeScope(runtime, @backingInt(source), region) catch return false;
         return true;
     }
 
@@ -24880,10 +24880,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .activation_dtype = if (request.contract == .qwen3_dense_text_embedding) .f32 else .f16,
                 .attention_storage = if (request.contract == .qwen3_dense_text_embedding) .dense else .paged,
                 .layers = layers,
-                .source = @intFromEnum(metal_runtime.ComputeSource.layer),
-                .layer_region = @intFromEnum(metal_runtime.ComputeRegion.layer),
-                .tail_source = @intFromEnum(metal_runtime.ComputeSource.tail),
-                .tail_region = @intFromEnum(metal_runtime.ComputeRegion.tail),
+                .source = @backingInt(metal_runtime.ComputeSource.layer),
+                .layer_region = @backingInt(metal_runtime.ComputeRegion.layer),
+                .tail_source = @backingInt(metal_runtime.ComputeSource.tail),
+                .tail_region = @backingInt(metal_runtime.ComputeRegion.tail),
             }) catch {
                 self.clearActivePrefillFramePlan();
                 return false;
@@ -25273,7 +25273,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 try metal_runtime.pushPlannedComputeBarrierSuppression(runtime);
                 try metal_runtime.beginPlannedComputeScope(
                     runtime,
-                    @intFromEnum(metal_runtime.ComputeSource.layer),
+                    @backingInt(metal_runtime.ComputeSource.layer),
                     .layer,
                 );
             }
@@ -25287,7 +25287,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) anyerror!void {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const runtime = self.provider_impl.raw_decode_runtime orelse return;
-        try metal_runtime.setActiveFrameRegime(runtime, @enumFromInt(@intFromEnum(regime)));
+        try metal_runtime.setActiveFrameRegime(runtime, @fromBackingInt(@intCast(@backingInt(regime))));
     }
 
     fn decoderRuntimePushComputeRegionOp(
@@ -25297,10 +25297,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
         if (!metal_runtime.hasActiveFrame(runtime)) return null;
-        var previous: usize = @intFromEnum(metal_runtime.ComputeRegion.other);
+        var previous: usize = @backingInt(metal_runtime.ComputeRegion.other);
         if (metal_runtime.termite_metal_decode_runtime_push_compute_region(
             runtime,
-            @intFromEnum(region),
+            @backingInt(region),
             &previous,
         ) != 0) return null;
         return previous;
@@ -28417,7 +28417,7 @@ test "metal_compute: metal kv geometric growth preserves f32 pages inside and ou
     defer metal_active_v.deinit();
     try metal_runtime.beginFrame(runtime);
     errdefer if (metal_runtime.hasActiveFrame(runtime)) metal_runtime.cancelFrame(runtime) catch {};
-    try metal_runtime.beginPlannedComputeScope(runtime, @intFromEnum(metal_runtime.ComputeSource.attention), .attention);
+    try metal_runtime.beginPlannedComputeScope(runtime, @backingInt(metal_runtime.ComputeSource.attention), .attention);
     try metal_storage.writeLayerKvSuffixDevice(
         .{
             .sequence_id = metal_seq,
@@ -29461,8 +29461,8 @@ test "metal_compute: multiply rejects incompatible non-broadcast shapes" {
 
     const lhs_shape = [_]i32{ 1, 2, 3, 4 };
     const rhs_shape = [_]i32{ 1, 6, 4, 3 };
-    const lhs_data = [_]f32{1} ** (1 * 2 * 3 * 4);
-    const rhs_data = [_]f32{1} ** (1 * 6 * 4 * 3);
+    const lhs_data = @as([(1 * 2 * 3 * 4)]f32, @splat(1));
+    const rhs_data = @as([(1 * 6 * 4 * 3)]f32, @splat(1));
 
     const lhs = try metal_cb.fromFloat32Shape(&lhs_data, &lhs_shape);
     defer metal_cb.free(lhs);
@@ -29506,7 +29506,7 @@ test "metal_compute: transpose resolves symbolic reshape target from buffer leng
     defer metal_compute.deinit();
     var metal_cb = metal_compute.computeBackend();
 
-    const base = try metal_cb.fromFloat32Shape(&([_]f32{1} ** (1 * 77 * 512)), &.{ 1, 77, 512 });
+    const base = try metal_cb.fromFloat32Shape(&(@as([(1 * 77 * 512)]f32, @splat(1))), &.{ 1, 77, 512 });
     defer metal_cb.free(base);
     const symbolic = try metal_compute.withLogicalShape(base, &.{ -1, -1, 512 });
 
@@ -33804,8 +33804,8 @@ test "metal_compute: training AdamW updates device-resident weights" {
     for (grad_b) |value| expected_grad_b_sumsq += value * value;
     try std.testing.expectApproxEqAbs(expected_sumsq, sumsq, 1e-6);
     try std.testing.expectApproxEqAbs(expected_sumsq + expected_grad_b_sumsq, batched_sumsq, 1e-6);
-    var expected_m = [_]f32{0.0} ** initial.len;
-    var expected_v = [_]f32{0.0} ** initial.len;
+    var expected_m = @as([initial.len]f32, @splat(0.0));
+    var expected_v = @as([initial.len]f32, @splat(0.0));
     ml.graph.optimizers.stepSlices(.{ .adamw = cfg }, 1, 0.001, &expected, &expected_grad, &expected_m, &expected_v);
 
     const actual = try metal_cb.toFloat32(weight, allocator);
@@ -33877,8 +33877,8 @@ test "metal_compute: batched training AdamW applies per-item bias correction" {
 
     for ([_]CT{ weight_a, weight_b }, [_]CT{ grad_a, grad_b }, [_][4]f32{ grad_values_a, grad_values_b }, steps) |weight, grad, grad_values, step| {
         var expected = initial;
-        var expected_m = [_]f32{0.0} ** initial.len;
-        var expected_v = [_]f32{0.0} ** initial.len;
+        var expected_m = @as([initial.len]f32, @splat(0.0));
+        var expected_v = @as([initial.len]f32, @splat(0.0));
         ml.graph.optimizers.stepSlices(.{ .adamw = cfg }, step, 0.001, &expected, &grad_values, &expected_m, &expected_v);
 
         const actual = try metal_cb.toFloat32(weight, allocator);
@@ -34030,8 +34030,8 @@ test "metal_compute: gliner word embeddings gather matches CPU semantics on ragg
     try std.testing.expectEqual(batch * num_words * hidden_size, actual.len);
 
     // CPU reference: first token of each word wins; missing words stay zero.
-    var expected = [_]f32{0.0} ** (batch * num_words * hidden_size);
-    var seen = [_]bool{false} ** (batch * num_words);
+    var expected = @as([(batch * num_words * hidden_size)]f32, @splat(0.0));
+    var seen = @as([(batch * num_words)]bool, @splat(false));
     for (0..batch) |b| {
         for (0..seq_len) |t| {
             const word_id = words_mask[b * seq_len + t];

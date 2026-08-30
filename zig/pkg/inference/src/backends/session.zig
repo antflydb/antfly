@@ -467,7 +467,7 @@ fn deinitTensorSlice(tensors: []Tensor, allocator: std.mem.Allocator) void {
 test "session vtable layout" {
     // Ensure the vtable has all required function pointers.
     const info = @typeInfo(Session.VTable);
-    try std.testing.expectEqual(@as(usize, 7), info.@"struct".fields.len);
+    try std.testing.expectEqual(@as(usize, 7), info.@"struct".field_names.len);
 }
 
 const AdmissionProbeSession = struct {
@@ -518,7 +518,7 @@ const AdmissionProbeSession = struct {
 
 test "run admission scales dynamic outputs and honors reserved backend workspace" {
     var controller = memory.AdmissionController{};
-    var input_bytes = [_]u8{0} ** 64;
+    var input_bytes = @as([64]u8, @splat(0));
     const input = Tensor{
         .data = &input_bytes,
         .dtype = .i64,

@@ -811,7 +811,7 @@ fn beginStagingGeneration(
 ) !StagedGeneration {
     const live_path = try alloc.dupe(u8, path);
     errdefer alloc.free(live_path);
-    const live_path_z = try alloc.dupeZ(u8, path);
+    const live_path_z = try alloc.dupeSentinel(u8, path, 0);
     errdefer alloc.free(live_path_z);
     // The basename is also the durable publication/cleanup identity. Mix wall
     // and monotonic time so an intent surviving a process or host restart does
@@ -819,7 +819,7 @@ fn beginStagingGeneration(
     const nonce = platform.time.realtimeNs() ^ std.math.rotl(u64, platform.time.monotonicNs(), 23);
     const staging_path = try std.fmt.allocPrint(alloc, "{s}.restore-stage-{x}-{x}", .{ path, transition_id, nonce });
     errdefer alloc.free(staging_path);
-    const staging_path_z = try alloc.dupeZ(u8, staging_path);
+    const staging_path_z = try alloc.dupeSentinel(u8, staging_path, 0);
     errdefer alloc.free(staging_path_z);
 
     if (io_override) |io| {
@@ -1567,9 +1567,9 @@ fn rollbackPreparedPublishedGeneration(
         var retained_marker = try readPublicationMarker(alloc, io, retained_path);
         defer if (retained_marker) |*value| value.deinit(alloc);
         if (retained_marker != null) return error.InvalidGenerationRollbackRoot;
-        const live_path_z = try alloc.dupeZ(u8, live_path);
+        const live_path_z = try alloc.dupeSentinel(u8, live_path, 0);
         defer alloc.free(live_path_z);
-        const retained_path_z = try alloc.dupeZ(u8, retained_path);
+        const retained_path_z = try alloc.dupeSentinel(u8, retained_path, 0);
         defer alloc.free(retained_path_z);
         if (!exchangeDirectoriesAtomicSentinel(live_path_z, retained_path_z)) {
             return error.AtomicGenerationExchangeUnavailable;
@@ -1834,9 +1834,9 @@ fn syncPublishedParent(io: std.Io, parent: []const u8) PublicationOutcome {
 }
 
 fn exchangeDirectoriesAtomic(alloc: Allocator, left: []const u8, right: []const u8) !bool {
-    const left_z = try alloc.dupeZ(u8, left);
+    const left_z = try alloc.dupeSentinel(u8, left, 0);
     defer alloc.free(left_z);
-    const right_z = try alloc.dupeZ(u8, right);
+    const right_z = try alloc.dupeSentinel(u8, right, 0);
     defer alloc.free(right_z);
     return exchangeDirectoriesAtomicSentinel(left_z, right_z);
 }

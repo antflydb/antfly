@@ -4,7 +4,7 @@
 
 We want an oapi-codegen equivalent for Zig — a tool that reads OpenAPI 3.0.x JSON specs and generates typed Zig client/server code targeting httpx.zig. The antfly2 OpenAPI specs serve as the primary test case, covering complex patterns: `oneOf`/`allOf` with discriminators, cross-file `$ref`, enums, nullable fields, `additionalProperties`, SSE streaming, and multiple auth schemes.
 
-The tool lives at `/Users/ajroetker/go/src/github.com/antflydb/openapi-zig/` and builds with `~/bin/zig` (0.16.0-dev).
+The tool lives at `/Users/ajroetker/go/src/github.com/antflydb/openapi-zig/` and builds with Zig `0.17.0-dev.1933+e19a73c2d`.
 
 ## Project Structure
 

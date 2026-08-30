@@ -43,9 +43,7 @@ pub fn build(b: *std.Build) void {
 
     const run_exe = b.addRunArtifact(exe);
     run_exe.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_exe.addArgs(args);
-    }
+    run_exe.addPassthruArgs();
     const run_step = b.step("run", "Run the openapi-zig code generator");
     run_step.dependOn(&run_exe.step);
 
@@ -117,7 +115,7 @@ pub const OpenApiModuleOptions = struct {
 pub fn addOpenApiModule(dep: *std.Build.Dependency, b: *std.Build, opts: OpenApiModuleOptions) *std.Build.Module {
     const codegen = b.addRunArtifact(dep.artifact("openapi-zig"));
 
-    codegen.addArgs(&.{ "--spec" });
+    codegen.addArgs(&.{"--spec"});
     codegen.addFileArg(opts.spec);
     codegen.addArgs(&.{ "--package", opts.package_name });
 
@@ -147,7 +145,7 @@ pub fn addOpenApiModule(dep: *std.Build.Dependency, b: *std.Build, opts: OpenApi
         codegen.addArgs(&.{ "--import-mapping", arg });
     }
 
-    codegen.addArgs(&.{ "--output" });
+    codegen.addArgs(&.{"--output"});
     const gen_dir = codegen.addOutputDirectoryArg(opts.package_name);
 
     return b.addModule(opts.package_name, .{

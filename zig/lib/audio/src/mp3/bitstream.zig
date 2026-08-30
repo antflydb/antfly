@@ -636,7 +636,7 @@ test "joint stereo helpers reflect mode extension bits" {
 }
 
 test "skip id3v2 header" {
-    const bytes = [_]u8{ 'I', 'D', '3', 4, 0, 0, 0, 0, 0, 16 } ++ ([_]u8{0} ** 16);
+    const bytes = [_]u8{ 'I', 'D', '3', 4, 0, 0, 0, 0, 0, 16 } ++ (@as([16]u8, @splat(0)));
     try std.testing.expectEqual(@as(usize, 26), skipId3v2(&bytes));
 }
 

@@ -79,7 +79,7 @@ pub fn encodedSize(segment: graph_types.Segment) !usize {
 }
 
 test "lake graph segment codec rejects forged adjacency counts before allocation" {
-    var payload = [_]u8{0} ** header_len;
+    var payload = @as([header_len]u8, @splat(0));
     @memcpy(payload[0..4], wire_magic);
     std.mem.writeInt(u16, payload[4..6], wire_version, .little);
     std.mem.writeInt(u32, payload[6..10], std.math.maxInt(u32), .little);

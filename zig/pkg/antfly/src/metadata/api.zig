@@ -288,7 +288,7 @@ pub const CatalogProjectionIndex = struct {
             self.table_indexes.putAssumeCapacity(table.table_id, index);
             self.table_topologies.putAssumeCapacity(table.table_id, .{
                 .range_count = 0,
-                .digest = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+                .digest = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
             });
         }
         for (ranges, 0..) |range, index| {
@@ -432,7 +432,7 @@ pub fn catalogTableTopologyResolution(
     table_id: u64,
     ranges: []const table_manager.RangeRecord,
 ) CatalogTableTopologyResolution {
-    var accumulator = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+    var accumulator = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));
     var range_count: u64 = 0;
     var single_group_id: ?u64 = null;
     for (ranges) |range| {

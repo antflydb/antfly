@@ -2413,7 +2413,7 @@ fn zipEntriesAlloc(alloc: Allocator, bytes: []const u8) ![]ZipEntry {
         if (!std.mem.eql(u8, bytes[cursor .. cursor + 4], &std.zip.central_file_header_sig)) return error.ZipBadCdOffset;
         const flags = std.mem.readInt(u16, bytes[cursor + 8 ..][0..2], .little);
         if ((flags & 0x0001) != 0) return error.ZipEncryptionUnsupported;
-        const compression_method: std.zip.CompressionMethod = @enumFromInt(std.mem.readInt(u16, bytes[cursor + 10 ..][0..2], .little));
+        const compression_method: std.zip.CompressionMethod = @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[cursor + 10 ..][0..2], .little)));
         const compressed_size_u32 = std.mem.readInt(u32, bytes[cursor + 20 ..][0..4], .little);
         const uncompressed_size_u32 = std.mem.readInt(u32, bytes[cursor + 24 ..][0..4], .little);
         const name_len = std.mem.readInt(u16, bytes[cursor + 28 ..][0..2], .little);
@@ -3324,7 +3324,7 @@ fn buildStoredZipAlloc(alloc: Allocator, entries: []const TestZipEntry) ![]u8 {
 
     for (entries) |entry| {
         const offset = out.items.len;
-        const crc = std.hash.crc.Crc32.hash(entry.data);
+        const crc = std.hash.crc.@"CRC-32/ISO-HDLC".hash(entry.data);
         try appendZipLe32(alloc, &out, 0x04034b50);
         try appendZipLe16(alloc, &out, 20);
         try appendZipLe16(alloc, &out, 0);
