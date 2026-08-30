@@ -2171,6 +2171,12 @@ pub const MultiRaft = struct {
         if (self.pending_outbox.isEmpty()) return;
         if (self.hooks.transport == null and self.hooks.snapshot_transport == null) return;
 
+        var synchronous_completions = std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotCompletion).empty;
+        defer {
+            for (synchronous_completions.items) |completion|
+                self.processSnapshotTransportCompletion(completion);
+            synchronous_completions.deinit(self.alloc);
+        }
         const stats = try self.pending_outbox.flushBudgeted(
             self.alloc,
             self.hooks,
@@ -2179,6 +2185,7 @@ pub const MultiRaft = struct {
             self.cfg.max_snapshot_submissions_per_round,
             self.cfg.max_snapshot_submission_scans_per_round,
             clock.monotonicNs(),
+            &synchronous_completions,
         );
         self.recordTransportFlush(stats);
         self.drainSnapshotTransportCompletions();
@@ -2190,50 +2197,56 @@ pub const MultiRaft = struct {
         while (true) {
             const count = snapshot_transport.drainCompletions(&completions);
             if (count == 0) return;
-            for (completions[0..count]) |completion| {
-                if (self.group_incarnations.get(completion.group_id) != completion.incarnation) {
-                    self.metrics.transport_snapshot_stale_completions += 1;
-                    continue;
-                }
-                const grp = self.group(completion.group_id) orelse {
-                    self.metrics.transport_snapshot_stale_completions += 1;
-                    continue;
-                };
-                if (completion.from != grp.localNodeId()) {
-                    self.metrics.transport_snapshot_stale_completions += 1;
-                    continue;
-                }
-                const status = grp.status();
-                if (status.soft.role != .leader or status.hard.current_term != completion.term) {
-                    self.metrics.transport_snapshot_stale_completions += 1;
-                    continue;
-                }
-                const matched = switch (completion.status) {
-                    .failed => grp.reportSnapshotFailure(
-                        completion.to,
-                        completion.term,
-                        completion.snapshot_index,
-                        completion.snapshot_term,
-                        completion.attempt_generation,
-                    ),
-                    .delivered => grp.reportSnapshotDelivered(
-                        completion.to,
-                        completion.term,
-                        completion.snapshot_index,
-                        completion.snapshot_term,
-                        completion.attempt_generation,
-                    ),
-                };
-                if (!matched) {
-                    self.metrics.transport_snapshot_stale_completions += 1;
-                    continue;
-                }
-                if (completion.status == .failed)
-                    self.metrics.transport_snapshot_completion_failures += 1;
-                self.metrics.transport_snapshot_completions += 1;
-            }
+            for (completions[0..count]) |completion|
+                self.processSnapshotTransportCompletion(completion);
             if (count < completions.len) return;
         }
+    }
+
+    fn processSnapshotTransportCompletion(
+        self: *MultiRaft,
+        completion: snapshot_transport_iface.SnapshotCompletion,
+    ) void {
+        if (self.group_incarnations.get(completion.group_id) != completion.incarnation) {
+            self.metrics.transport_snapshot_stale_completions += 1;
+            return;
+        }
+        const grp = self.group(completion.group_id) orelse {
+            self.metrics.transport_snapshot_stale_completions += 1;
+            return;
+        };
+        if (completion.from != grp.localNodeId()) {
+            self.metrics.transport_snapshot_stale_completions += 1;
+            return;
+        }
+        const status = grp.status();
+        if (status.soft.role != .leader or status.hard.current_term != completion.term) {
+            self.metrics.transport_snapshot_stale_completions += 1;
+            return;
+        }
+        const matched = switch (completion.status) {
+            .failed => grp.reportSnapshotFailure(
+                completion.to,
+                completion.term,
+                completion.snapshot_index,
+                completion.snapshot_term,
+                completion.attempt_generation,
+            ),
+            .delivered => grp.reportSnapshotDelivered(
+                completion.to,
+                completion.term,
+                completion.snapshot_index,
+                completion.snapshot_term,
+                completion.attempt_generation,
+            ),
+        };
+        if (!matched) {
+            self.metrics.transport_snapshot_stale_completions += 1;
+            return;
+        }
+        if (completion.status == .failed)
+            self.metrics.transport_snapshot_completion_failures += 1;
+        self.metrics.transport_snapshot_completions += 1;
     }
 
     fn consumePendingApplyPrefix(self: *MultiRaft, count: usize) void {
@@ -2761,11 +2774,16 @@ const TransportOutbox = struct {
         max_submissions: usize,
         max_scans: usize,
         now_ns: u64,
+        synchronous_completions: *std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotCompletion),
     ) !TransportFlushStats {
         var stats: TransportFlushStats = .{};
         if (self.snapshot_items.items.len == 0 or max_submissions == 0 or max_scans == 0)
             return stats;
         const transport = hooks.snapshot_transport orelse return stats;
+        try synchronous_completions.ensureUnusedCapacity(
+            alloc,
+            @min(max_submissions, self.snapshot_items.items.len),
+        );
 
         var submissions: usize = 0;
         var scans: usize = 0;
@@ -2798,7 +2816,20 @@ const TransportOutbox = struct {
             });
             submissions += 1;
             switch (outcome) {
-                .accepted, .duplicate => {
+                .delivered, .accepted, .duplicate => {
+                    if (outcome == .delivered) {
+                        synchronous_completions.appendAssumeCapacity(.{
+                            .group_id = item.group_id,
+                            .incarnation = item.incarnation,
+                            .from = item.message.from,
+                            .to = item.message.to,
+                            .term = item.message.term,
+                            .attempt_generation = item.message.snapshot_attempt_generation,
+                            .snapshot_index = snapshot.metadata.index,
+                            .snapshot_term = snapshot.metadata.term,
+                            .status = .delivered,
+                        });
+                    }
                     const item_bytes = approxMessagesSize(&.{item.message});
                     // Snapshot attempts are independent across groups. Use a
                     // swap removal so accepting one item remains O(1) even
@@ -2806,7 +2837,7 @@ const TransportOutbox = struct {
                     var accepted = self.snapshot_items.swapRemove(self.snapshot_cursor);
                     accepted.message.deinit(alloc);
                     self.approx_bytes -= item_bytes;
-                    if (std.meta.activeTag(outcome) == .accepted) stats.snapshot_sends += 1;
+                    if (outcome != .duplicate) stats.snapshot_sends += 1;
                     if (self.snapshot_items.items.len == 0)
                         self.snapshot_cursor = 0
                     else
@@ -2832,6 +2863,7 @@ const TransportOutbox = struct {
         max_snapshot_submissions: usize,
         max_snapshot_scans: usize,
         now_ns: u64,
+        synchronous_completions: *std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotCompletion),
     ) !TransportFlushStats {
         if (self.isEmpty()) return .{};
 
@@ -2852,6 +2884,7 @@ const TransportOutbox = struct {
             max_snapshot_submissions,
             max_snapshot_scans,
             now_ns,
+            synchronous_completions,
         ));
         return stats;
     }
@@ -2979,6 +3012,8 @@ test "snapshot submission backpressure cannot starve control traffic and honors 
     var recorder: Recorder = .{};
     var outbox: TransportOutbox = .{};
     defer outbox.deinit(std.testing.allocator);
+    var synchronous_completions = std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotCompletion).empty;
+    defer synchronous_completions.deinit(std.testing.allocator);
     for (0..70) |index| {
         try outbox.appendMessage(std.testing.allocator, @intCast(index + 1), 1, .{
             .msg_type = .snapshot,
@@ -3008,6 +3043,7 @@ test "snapshot submission backpressure cannot starve control traffic and honors 
         2,
         32,
         1_000,
+        &synchronous_completions,
     );
     try std.testing.expectEqual(@as(usize, 1), recorder.control_messages);
     try std.testing.expectEqual(@as(usize, 2), recorder.snapshot_submissions);
@@ -3037,6 +3073,7 @@ test "snapshot submission backpressure cannot starve control traffic and honors 
         1,
         1,
         5_000,
+        &synchronous_completions,
     );
     const early = try deadline_outbox.flushBudgeted(
         std.testing.allocator,
@@ -3046,6 +3083,7 @@ test "snapshot submission backpressure cannot starve control traffic and honors 
         1,
         1,
         5_000 + 999 * std.time.ns_per_ms,
+        &synchronous_completions,
     );
     try std.testing.expectEqual(@as(usize, 1), deadline_recorder.snapshot_submissions);
     try std.testing.expectEqual(@as(usize, 1), early.snapshot_backoff_skips);
@@ -3057,9 +3095,71 @@ test "snapshot submission backpressure cannot starve control traffic and honors 
         1,
         1,
         5_000 + std.time.ns_per_s,
+        &synchronous_completions,
     );
     try std.testing.expectEqual(@as(usize, 2), deadline_recorder.snapshot_submissions);
     try std.testing.expect(deadline_outbox.isEmpty());
+}
+
+test "synchronous snapshot submission emits an exact delivery completion" {
+    const Recorder = struct {
+        sends: usize = 0,
+
+        fn snapshotTransport(self: *@This()) snapshot_transport_iface.SnapshotTransport {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .send_snapshot = sendSnapshot },
+            };
+        }
+
+        fn sendSnapshot(
+            ptr: *anyopaque,
+            _: snapshot_transport_iface.SnapshotSendRequest,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.sends += 1;
+        }
+    };
+
+    var recorder = Recorder{};
+    var outbox = TransportOutbox{};
+    defer outbox.deinit(std.testing.allocator);
+    try outbox.appendMessage(std.testing.allocator, 41, 9, .{
+        .msg_type = .snapshot,
+        .from = 1,
+        .to = 2,
+        .term = 7,
+        .snapshot_attempt_generation = 13,
+        .snapshot = .{
+            .metadata = .{ .index = 101, .term = 6 },
+            .data = @constCast("snapshot"),
+        },
+    });
+    var completions = std.ArrayListUnmanaged(snapshot_transport_iface.SnapshotCompletion).empty;
+    defer completions.deinit(std.testing.allocator);
+
+    const stats = try outbox.flushBudgeted(
+        std.testing.allocator,
+        .{ .snapshot_transport = recorder.snapshotTransport() },
+        0,
+        0,
+        1,
+        1,
+        0,
+        &completions,
+    );
+
+    try std.testing.expect(outbox.isEmpty());
+    try std.testing.expectEqual(@as(usize, 1), recorder.sends);
+    try std.testing.expectEqual(@as(usize, 1), stats.snapshot_sends);
+    try std.testing.expectEqual(@as(usize, 1), completions.items.len);
+    const completion = completions.items[0];
+    try std.testing.expectEqual(@as(core.types.GroupId, 41), completion.group_id);
+    try std.testing.expectEqual(@as(u64, 9), completion.incarnation);
+    try std.testing.expectEqual(@as(core.types.Term, 7), completion.term);
+    try std.testing.expectEqual(@as(u64, 13), completion.attempt_generation);
+    try std.testing.expectEqual(@as(core.types.Index, 101), completion.snapshot_index);
+    try std.testing.expectEqual(snapshot_transport_iface.SnapshotCompletionStatus.delivered, completion.status);
 }
 
 test "multi raft owns real groups" {

@@ -44,10 +44,14 @@ pub const SnapshotSendRequest = struct {
     locator: ?SnapshotLocator = null,
 };
 
-/// Submission is an ownership boundary, not a delivery completion boundary.
-/// `accepted` and `duplicate` allow the caller to release its reference;
+/// Submission is an ownership boundary. Asynchronous transports return
+/// `accepted` (or `duplicate` for an already-owned exact attempt) and must
+/// eventually publish one terminal completion. Synchronous transports return
+/// `delivered`, allowing the runtime to start the Raft acknowledgement
+/// watchdog immediately without requiring a synthetic completion queue.
 /// `retry_later` guarantees that the transport retained nothing.
 pub const SnapshotSubmitResult = union(enum) {
+    delivered,
     accepted,
     duplicate,
     retry_later: struct {
@@ -152,7 +156,7 @@ pub const SnapshotTransport = struct {
         if (self.vtable.submit_snapshot) |submit_snapshot|
             return try submit_snapshot(self.ptr, req);
         try self.sendSnapshot(req);
-        return .accepted;
+        return .delivered;
     }
 
     pub fn drainCompletions(self: SnapshotTransport, out: []SnapshotCompletion) usize {

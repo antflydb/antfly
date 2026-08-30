@@ -52,6 +52,14 @@ pub const FileSnapshotStoreConfig = struct {
     artifact_policy: SnapshotArtifactPolicy = .{},
 };
 
+pub const SnapshotArtifactUsageSnapshot = struct {
+    durable_bytes: u64,
+    durable_count: usize,
+    reserved_bytes: u64,
+    reserved_count: usize,
+    reconciliations: u64,
+};
+
 pub const FileSnapshotStore = struct {
     const artifact_maintenance_interval_ns: u64 = std.time.ns_per_min;
     const FetchLease = struct {
@@ -70,7 +78,10 @@ pub const FileSnapshotStore = struct {
     io_impl: std.Io.Threaded,
     root_dir: []u8,
     upload_locks: [1024]std.atomic.Mutex = [_]std.atomic.Mutex{.unlocked} ** 1024,
-    artifact_lifecycle_mutex: std.atomic.Mutex = .unlocked,
+    artifact_ledger_mutex: std.atomic.Mutex = .unlocked,
+    artifact_usage: ArtifactUsage = .{},
+    artifact_reserved: ArtifactUsage = .{},
+    artifact_usage_reconciliations: std.atomic.Value(u64) = .init(0),
     next_artifact_maintenance_ns: std.atomic.Value(u64) = .init(0),
     fetch_lease_mutex: std.atomic.Mutex = .unlocked,
     fetch_leases: std.StringHashMapUnmanaged(FetchLease) = .empty,
@@ -92,6 +103,7 @@ pub const FileSnapshotStore = struct {
             self.alloc.free(self.root_dir);
             self.io_impl.deinit();
         }
+        self.artifact_usage = try self.scanArtifactUsage();
         self.cleanupExpiredArtifacts() catch |err| {
             std.log.warn("raft snapshot artifact startup cleanup deferred root={s} err={s}", .{
                 self.root_dir,
@@ -131,6 +143,21 @@ pub const FileSnapshotStore = struct {
         };
     }
 
+    /// Constant-time operational view of durable and in-flight quota usage.
+    /// The filesystem is reconciled once at startup and thereafter mutations
+    /// update this ledger at their publication boundaries.
+    pub fn artifactUsageSnapshot(self: *FileSnapshotStore) SnapshotArtifactUsageSnapshot {
+        platform_sync.lockYielding(&self.artifact_ledger_mutex);
+        defer self.artifact_ledger_mutex.unlock();
+        return .{
+            .durable_bytes = self.artifact_usage.bytes,
+            .durable_count = self.artifact_usage.count,
+            .reserved_bytes = self.artifact_reserved.bytes,
+            .reserved_count = self.artifact_reserved.count,
+            .reconciliations = self.artifact_usage_reconciliations.load(.monotonic),
+        };
+    }
+
     fn maxChunkBytes(ptr: *anyopaque) usize {
         const self: *FileSnapshotStore = @ptrCast(@alignCast(ptr));
         return self.cfg.max_chunk_bytes;
@@ -141,9 +168,7 @@ pub const FileSnapshotStore = struct {
         const self: *FileSnapshotStore = @ptrCast(@alignCast(ptr));
         try validateSnapshotId(snapshot_id);
         if (body.len > self.cfg.max_snapshot_bytes) return error.SnapshotTooLarge;
-        try self.cleanupExpiredArtifacts();
-        platform_sync.lockYielding(&self.artifact_lifecycle_mutex);
-        defer self.artifact_lifecycle_mutex.unlock();
+        self.maybeRunArtifactMaintenance();
         const lock = self.uploadLock(snapshot_id);
         platform_sync.lockYielding(lock);
         defer lock.unlock();
@@ -165,7 +190,12 @@ pub const FileSnapshotStore = struct {
             error.FileNotFound => {},
             else => return err,
         }
-        try self.admitArtifact(staging_path, body.len);
+        const reservation = try self.reserveArtifactWithPressureCleanup(staging_path, body.len);
+        var reservation_live = true;
+        errdefer if (reservation_live) {
+            std.Io.Dir.cwd().deleteFile(io_ctx, staging_path) catch {};
+            self.rollbackArtifactReservation(reservation);
+        };
         var file = try fs_paths.createFilePortable(io_ctx, staging_path, .{ .truncate = true });
         var file_open = true;
         errdefer if (file_open) file.close(io_ctx);
@@ -180,6 +210,8 @@ pub const FileSnapshotStore = struct {
         // Rename is the publication point: readers see the previous complete
         // artifact or the new complete artifact, never a torn body.
         try std.Io.Dir.rename(std.Io.Dir.cwd(), staging_path, std.Io.Dir.cwd(), committed_path, io_ctx);
+        self.commitArtifactReservation(reservation);
+        reservation_live = false;
         try fs_paths.syncDirPortable(io_ctx, self.root_dir);
     }
 
@@ -226,13 +258,20 @@ pub const FileSnapshotStore = struct {
         defer lock.unlock();
         const path = try self.snapshotPath(snapshot_id);
         defer self.alloc.free(path);
+        const existing = std.Io.Dir.cwd().statFile(io(self), path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
         const deleted = if (std.Io.Dir.cwd().deleteFile(io(self), path))
             true
         else |err| switch (err) {
             error.FileNotFound => false,
             else => return err,
         };
-        if (deleted) try fs_paths.syncDirPortable(io(self), self.root_dir);
+        if (deleted) {
+            self.recordArtifactDeleted(existing.size);
+            try fs_paths.syncDirPortable(io(self), self.root_dir);
+        }
     }
 
     fn beginChunkedSnapshot(
@@ -245,9 +284,7 @@ pub const FileSnapshotStore = struct {
         if (manifest.data_len > self.cfg.max_snapshot_bytes) return error.SnapshotTooLarge;
         const encoded = try snapshot_transfer.encode(self.alloc, manifest);
         defer self.alloc.free(encoded);
-        try self.cleanupExpiredArtifacts();
-        platform_sync.lockYielding(&self.artifact_lifecycle_mutex);
-        defer self.artifact_lifecycle_mutex.unlock();
+        self.maybeRunArtifactMaintenance();
         const lock = self.uploadLock(snapshot_id);
         platform_sync.lockYielding(lock);
         defer lock.unlock();
@@ -293,7 +330,12 @@ pub const FileSnapshotStore = struct {
             error.InvalidSnapshotManifest => return err,
             else => return err,
         }
-        try self.admitArtifact(path, total_len);
+        const reservation = try self.reserveArtifactWithPressureCleanup(path, total_len);
+        var reservation_live = true;
+        errdefer if (reservation_live) {
+            std.Io.Dir.cwd().deleteFile(io(self), path) catch {};
+            self.rollbackArtifactReservation(reservation);
+        };
 
         var file = try fs_paths.createFilePortable(io(self), path, .{ .truncate = true });
         defer file.close(io(self));
@@ -303,6 +345,8 @@ pub const FileSnapshotStore = struct {
         try file.writePositionalAll(io(self), encoded, encoded_len.len);
         try file.setLength(io(self), total_len);
         try file.sync(io(self));
+        self.commitArtifactReservation(reservation);
+        reservation_live = false;
         try fs_paths.syncDirPortable(io(self), self.root_dir);
     }
 
@@ -563,13 +607,17 @@ pub const FileSnapshotStore = struct {
             else => return err,
         };
         try requireGeneration(generation, current_generation);
+        const existing = try std.Io.Dir.cwd().statFile(io(self), path, .{});
         const deleted = if (std.Io.Dir.cwd().deleteFile(io(self), path))
             true
         else |err| switch (err) {
             error.FileNotFound => false,
             else => return err,
         };
-        if (deleted) try fs_paths.syncDirPortable(io(self), self.root_dir);
+        if (deleted) {
+            self.recordArtifactDeleted(existing.size);
+            try fs_paths.syncDirPortable(io(self), self.root_dir);
+        }
     }
 
     fn releaseChunkedSnapshot(
@@ -587,13 +635,17 @@ pub const FileSnapshotStore = struct {
         const current_generation = try self.readGeneration(self.alloc, path);
         try requireGeneration(generation, current_generation);
         self.clearFetchLease(snapshot_id, generation);
+        const existing = try std.Io.Dir.cwd().statFile(io(self), path, .{});
         const deleted = if (std.Io.Dir.cwd().deleteFile(io(self), path))
             true
         else |err| switch (err) {
             error.FileNotFound => false,
             else => return err,
         };
-        if (deleted) try fs_paths.syncDirPortable(io(self), self.root_dir);
+        if (deleted) {
+            self.recordArtifactDeleted(existing.size);
+            try fs_paths.syncDirPortable(io(self), self.root_dir);
+        }
     }
 
     const ArtifactUsage = struct {
@@ -601,26 +653,85 @@ pub const FileSnapshotStore = struct {
         count: usize = 0,
     };
 
-    fn admitArtifact(self: *FileSnapshotStore, staging_path: []const u8, requested_bytes: u64) !void {
-        var usage = try self.artifactUsage();
+    const ArtifactReservation = struct {
+        bytes: u64,
+    };
+
+    fn reserveArtifactWithPressureCleanup(
+        self: *FileSnapshotStore,
+        staging_path: []const u8,
+        requested_bytes: u64,
+    ) !ArtifactReservation {
+        return self.reserveArtifact(staging_path, requested_bytes) catch |err| switch (err) {
+            error.SnapshotArtifactQuotaExceeded => {
+                // Quota pressure is the only request-path reason to sweep.
+                // Retrying once keeps the fast path O(1) while promptly
+                // reclaiming expired artifacts for a waiting transfer.
+                try self.cleanupExpiredArtifacts();
+                return try self.reserveArtifact(staging_path, requested_bytes);
+            },
+            else => return err,
+        };
+    }
+
+    fn reserveArtifact(
+        self: *FileSnapshotStore,
+        staging_path: []const u8,
+        requested_bytes: u64,
+    ) !ArtifactReservation {
         const existing = std.Io.Dir.cwd().statFile(io(self), staging_path, .{}) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
-        if (existing) |stat| {
-            usage.bytes -|= stat.size;
-        } else {
-            usage.count += 1;
-        }
-        if (usage.count > self.cfg.artifact_policy.max_count or
-            usage.bytes > self.cfg.artifact_policy.max_bytes or
-            requested_bytes > self.cfg.artifact_policy.max_bytes - usage.bytes)
+        platform_sync.lockYielding(&self.artifact_ledger_mutex);
+        defer self.artifact_ledger_mutex.unlock();
+        const durable_bytes = self.artifact_usage.bytes -| if (existing) |stat| stat.size else 0;
+        const durable_count = self.artifact_usage.count -| @as(usize, if (existing == null) 0 else 1);
+        const occupied_bytes = durable_bytes +| self.artifact_reserved.bytes;
+        const occupied_count = durable_count +| self.artifact_reserved.count;
+        if (occupied_count >= self.cfg.artifact_policy.max_count or
+            occupied_bytes > self.cfg.artifact_policy.max_bytes or
+            requested_bytes > self.cfg.artifact_policy.max_bytes - occupied_bytes)
         {
             return error.SnapshotArtifactQuotaExceeded;
         }
+        self.artifact_usage = .{ .bytes = durable_bytes, .count = durable_count };
+        self.artifact_reserved.bytes += requested_bytes;
+        self.artifact_reserved.count += 1;
+        return .{ .bytes = requested_bytes };
+    }
+
+    fn commitArtifactReservation(self: *FileSnapshotStore, reservation: ArtifactReservation) void {
+        platform_sync.lockYielding(&self.artifact_ledger_mutex);
+        defer self.artifact_ledger_mutex.unlock();
+        std.debug.assert(self.artifact_reserved.count > 0 and self.artifact_reserved.bytes >= reservation.bytes);
+        self.artifact_reserved.count -= 1;
+        self.artifact_reserved.bytes -= reservation.bytes;
+        self.artifact_usage.count += 1;
+        self.artifact_usage.bytes += reservation.bytes;
+    }
+
+    fn rollbackArtifactReservation(self: *FileSnapshotStore, reservation: ArtifactReservation) void {
+        platform_sync.lockYielding(&self.artifact_ledger_mutex);
+        defer self.artifact_ledger_mutex.unlock();
+        std.debug.assert(self.artifact_reserved.count > 0 and self.artifact_reserved.bytes >= reservation.bytes);
+        self.artifact_reserved.count -= 1;
+        self.artifact_reserved.bytes -= reservation.bytes;
+    }
+
+    fn recordArtifactDeleted(self: *FileSnapshotStore, bytes: u64) void {
+        platform_sync.lockYielding(&self.artifact_ledger_mutex);
+        defer self.artifact_ledger_mutex.unlock();
+        self.artifact_usage.count -|= 1;
+        self.artifact_usage.bytes -|= bytes;
     }
 
     fn artifactUsage(self: *FileSnapshotStore) !ArtifactUsage {
+        return self.scanArtifactUsage();
+    }
+
+    fn scanArtifactUsage(self: *FileSnapshotStore) !ArtifactUsage {
+        _ = self.artifact_usage_reconciliations.fetchAdd(1, .monotonic);
         var dir = std.Io.Dir.cwd().openDir(io(self), self.root_dir, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => return .{},
             else => return err,
@@ -641,8 +752,6 @@ pub const FileSnapshotStore = struct {
     }
 
     fn cleanupExpiredArtifacts(self: *FileSnapshotStore) !void {
-        platform_sync.lockYielding(&self.artifact_lifecycle_mutex);
-        defer self.artifact_lifecycle_mutex.unlock();
         var dir = std.Io.Dir.cwd().openDir(io(self), self.root_dir, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
@@ -689,6 +798,7 @@ pub const FileSnapshotStore = struct {
                     error.FileNotFound => break :removed false,
                     else => return err,
                 };
+                self.recordArtifactDeleted(current.size);
                 break :removed true;
             };
             deleted = deleted or removed;
@@ -948,6 +1058,38 @@ test "file snapshot store persists snapshot bodies" {
     );
 }
 
+test "file snapshot admission uses its constant-time quota ledger" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/raft-snaps-ledger",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root_dir);
+    var store = try FileSnapshotStore.init(std.testing.allocator, .{ .root_dir = root_dir });
+    defer store.deinit();
+    const iface = store.store();
+
+    try iface.putSnapshot(std.testing.allocator, "one", "1234");
+    try iface.putSnapshot(std.testing.allocator, "two", "56789");
+    var usage = store.artifactUsageSnapshot();
+    try std.testing.expectEqual(@as(u64, 9), usage.durable_bytes);
+    try std.testing.expectEqual(@as(usize, 2), usage.durable_count);
+    try std.testing.expectEqual(@as(u64, 0), usage.reserved_bytes);
+    try std.testing.expectEqual(@as(usize, 0), usage.reserved_count);
+    // Startup reconstruction is the only full usage scan on the healthy
+    // admission path; each upload updates the ledger in constant time.
+    try std.testing.expectEqual(@as(u64, 1), usage.reconciliations);
+
+    try iface.vtable.release_snapshot.?(iface.ptr, "one");
+    usage = store.artifactUsageSnapshot();
+    try std.testing.expectEqual(@as(u64, 5), usage.durable_bytes);
+    try std.testing.expectEqual(@as(usize, 1), usage.durable_count);
+    try std.testing.expectEqual(@as(u64, 1), usage.reconciliations);
+}
+
 test "file snapshot store rejects invalid snapshot ids" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1004,6 +1146,43 @@ test "legacy snapshot artifacts share quota and expiry lifecycle" {
         iface.getSnapshot(std.testing.allocator, "expires"),
     );
     try std.testing.expectEqual(@as(usize, 0), (try store.artifactUsage()).count);
+}
+
+test "snapshot quota pressure reclaims expired artifacts before rejecting admission" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/raft-snaps-pressure-cleanup",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root_dir);
+    var store = try FileSnapshotStore.init(std.testing.allocator, .{
+        .root_dir = root_dir,
+        .artifact_policy = .{
+            .max_bytes = 4,
+            .max_count = 1,
+            .committed_ttl_ns = std.time.ns_per_ms,
+        },
+    });
+    defer store.deinit();
+    const iface = store.store();
+
+    try iface.putSnapshot(std.testing.allocator, "expired", "1234");
+    try store.io().sleep(.fromMilliseconds(2), .awake);
+    // Periodic maintenance remains deferred. The failed O(1) reservation
+    // triggers one sweep and one retry, giving callers useful progress instead
+    // of a stale quota error.
+    try iface.putSnapshot(std.testing.allocator, "replacement", "5678");
+    const usage = store.artifactUsageSnapshot();
+    try std.testing.expectEqual(@as(u64, 4), usage.durable_bytes);
+    try std.testing.expectEqual(@as(usize, 1), usage.durable_count);
+    try std.testing.expectEqual(@as(usize, 0), usage.reserved_count);
+    try std.testing.expectError(
+        error.FileNotFound,
+        iface.getSnapshot(std.testing.allocator, "expired"),
+    );
 }
 
 test "file snapshot store resumes chunks and atomically verifies commit" {

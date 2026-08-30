@@ -909,7 +909,7 @@ pub const HttpSnapshotTransport = struct {
     ) !void {
         const result = try self.trySubmitSnapshot(req);
         switch (result) {
-            .accepted, .duplicate => {},
+            .delivered, .accepted, .duplicate => {},
             .retry_later => return error.AsyncSnapshotSendQueueFull,
         }
     }
