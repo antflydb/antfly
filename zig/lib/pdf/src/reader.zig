@@ -44,6 +44,13 @@ const ImageSourceSamples = struct {
     stride: usize,
     bits_per_component: u8,
     component_offsets: [4]u8 = .{ 0, 1, 2, 3 },
+
+    fn liveBytes(self: ImageSourceSamples) usize {
+        return switch (self.data) {
+            .u8 => |bytes| bytes.len,
+            .u16 => |words| std.math.mul(usize, words.len, @sizeOf(u16)) catch std.math.maxInt(usize),
+        };
+    }
 };
 
 const MaskImageMetadata = struct {
@@ -89,6 +96,11 @@ const ResolvedIndexedPalette = struct {
         if (self.lookup_owner) |*owner| owner.deinit(alloc);
         self.* = undefined;
     }
+};
+
+const IndexedPaletteReserve = union(enum) {
+    palette_rgba,
+    matte_scratch: usize,
 };
 
 const JpxAlphaMode = enum {
@@ -7224,12 +7236,13 @@ pub const Reader = struct {
             const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
             var resolved_color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
             defer resolved_color_space.deinit(self.alloc);
+            const indexed_color_space = isIndexedColorSpace(&resolved_color_space);
             var source_samples: ?[]u8 = null;
             defer if (source_samples) |samples| self.alloc.free(samples);
             var source_view: ?ImageSourceSamples = null;
             if (resolved_color_space.asName()) |color_space| {
                 if (!std.mem.eql(u8, color_space, "DeviceGray")) return error.UnsupportedPdfRendering;
-                if (transparency_plan.needsNativeSamples()) {
+                if (transparency_plan.needsNativeSamples() or indexed_color_space) {
                     source_samples = try unpackPackedJbig2SamplesAlloc(self.alloc, source_bitmap, render_width, render_height);
                     source_view = .{
                         .data = .{ .u8 = source_samples.? },
@@ -7243,7 +7256,7 @@ pub const Reader = struct {
                 try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ input_live_bytes, decoded.pixels.len, render_rgba_len, render_pixel_count });
                 source_samples = try unpackPackedJbig2SamplesAlloc(self.alloc, source_bitmap, render_width, render_height);
                 const samples = source_samples.?;
-                if (transparency_plan.needsNativeSamples()) {
+                if (transparency_plan.needsNativeSamples() or indexed_color_space) {
                     const component_count = try self.colorSpaceInputComponentCount(&resolved_color_space);
                     if (component_count != 1) return error.UnsupportedPdfRendering;
                     source_view = .{
@@ -7496,7 +7509,15 @@ pub const Reader = struct {
                         transparency_live_bytes,
                     );
                 } else if (indexed_color_space)
-                    try self.jpeg2000IndexedU16ToRgbaAlloc(decoded_u16.pixels, width, height, decoded_u16.components, header.bits_per_component, decoded_u16.jp2_color, obj, jpx_alpha_mode)
+                    try self.jpeg2000IndexedSourceToRgbaAlloc(
+                        source_view,
+                        width,
+                        height,
+                        decoded_u16.jp2_color,
+                        obj,
+                        jpx_alpha_mode,
+                        transparency_live_bytes,
+                    )
                 else blk: {
                     const normalized = try normalizeU16SamplesToU8Alloc(self.alloc, decoded_u16.pixels, header.bits_per_component, self.cancellation);
                     defer self.alloc.free(normalized);
@@ -7544,7 +7565,7 @@ pub const Reader = struct {
                 &.{ encoded.len, decoded_u8.pixels.len, decoded_rgba_len, renderer_scratch_len },
             );
             var source_view: ?ImageSourceSamples = null;
-            if (transparency_plan.needsNativeSamples()) {
+            if (transparency_plan.needsNativeSamples() or indexed_color_space) {
                 const layout = try self.jpeg2000SourceLayout(obj, decoded_u8.components, decoded_u8.jp2_color);
                 source_view = .{
                     .data = .{ .u8 = decoded_u8.pixels },
@@ -7579,7 +7600,15 @@ pub const Reader = struct {
                     mask_plan.metadata.interpolate,
                     transparency_live_bytes,
                 );
-            } else try self.jpeg2000SamplesToRgbaAlloc(decoded_u8.pixels, decoded_u8.width, decoded_u8.height, decoded_u8.components, decoded_u8.jp2_color, obj, jpx_alpha_mode);
+            } else if (indexed_color_space) try self.jpeg2000IndexedSourceToRgbaAlloc(
+                source_view orelse return error.UnsupportedPdfRendering,
+                decoded_u8.width,
+                decoded_u8.height,
+                decoded_u8.jp2_color,
+                obj,
+                jpx_alpha_mode,
+                transparency_live_bytes,
+            ) else try self.jpeg2000SamplesToRgbaAlloc(decoded_u8.pixels, decoded_u8.width, decoded_u8.height, decoded_u8.components, decoded_u8.jp2_color, obj, jpx_alpha_mode);
             errdefer self.alloc.free(rgba);
             try self.applyImageTransparencyPlanAlloc(rgba, decoded_u8.width, decoded_u8.height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth, if (prepared_matte) |*prepared| prepared else null);
             return .{ .rgba = rgba, .width = decoded_u8.width, .height = decoded_u8.height };
@@ -7589,6 +7618,7 @@ pub const Reader = struct {
             const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
             var color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
             defer color_space.deinit(self.alloc);
+            const indexed_color_space = isIndexedColorSpace(&color_space);
             const source_component_count = try self.colorSpaceInputComponentCount(&color_space);
             const direct_device_space = if (color_space.asName()) |name|
                 colorSpaceKindFromName(name) != .unsupported
@@ -7649,7 +7679,7 @@ pub const Reader = struct {
                         source_samples.?[source_offset + 2] = jpeg_decoded.rgba[rgba_offset + 2];
                     }
                 }
-                if (transparency_plan.needsNativeSamples()) source_view = .{
+                if (transparency_plan.needsNativeSamples() or indexed_color_space) source_view = .{
                     .data = .{ .u8 = source_samples.? },
                     .pixel_count = pixel_count,
                     .component_count = source_component_count,
@@ -7671,11 +7701,7 @@ pub const Reader = struct {
             // afterward, matching the ordinary image pipeline and avoiding a
             // second decode transform during soft-mask processing.
             if (source_samples) |samples| {
-                const indexed_matte = if (transparency_plan.nativeMatte()) |matte|
-                    matte.indexed_matte_index != null
-                else
-                    false;
-                if (indexed_matte) {
+                if (indexed_color_space) {
                     if (color_space != .array) return error.UnsupportedPdfRendering;
                     try self.decodeIndexedImageWithOptionalMatteToRgba(
                         jpeg_decoded.rgba,
@@ -7720,26 +7746,29 @@ pub const Reader = struct {
         const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
         var resolved_color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
         defer resolved_color_space.deinit(self.alloc);
+        const indexed_color_space = isIndexedColorSpace(&resolved_color_space);
         var unpacked: ?[]u8 = null;
         defer if (unpacked) |bytes| self.alloc.free(bytes);
         const samples = if (bits_i == 8)
             decoded
         else blk: {
             // Packed low-bit images are only unambiguous here for one-component
-            // gray spaces (the common soft-mask representation).
-            const gray_space = if (resolved_color_space.asName()) |name|
+            // gray spaces or discrete Indexed samples.
+            const one_component_space = if (indexed_color_space)
+                true
+            else if (resolved_color_space.asName()) |name|
                 std.mem.eql(u8, name, "DeviceGray") or std.mem.eql(u8, name, "G")
             else if (resolved_color_space == .array and resolved_color_space.array.len > 0)
                 try self.isOneComponentColorSpace(&resolved_color_space)
             else
                 false;
-            if (!gray_space) return error.UnsupportedPdfRendering;
+            if (!one_component_space) return error.UnsupportedPdfRendering;
             try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ decoded.len, rgba_len, pixel_count });
             unpacked = try unpackPackedGraySamplesAlloc(self.alloc, decoded, width, height, @intCast(bits_i));
             break :blk unpacked.?;
         };
         const component_count = try self.colorSpaceInputComponentCount(&resolved_color_space);
-        const source_view: ?ImageSourceSamples = if (transparency_plan.needsNativeSamples()) .{
+        const source_view: ?ImageSourceSamples = if (transparency_plan.needsNativeSamples() or indexed_color_space) .{
             .data = .{ .u8 = samples },
             .pixel_count = pixel_count,
             .component_count = component_count,
@@ -7841,42 +7870,69 @@ pub const Reader = struct {
         if (pixels.len != sample_count) return error.UnsupportedPdfRendering;
         const layout = try self.jpeg2000SourceLayout(image_obj, components, jp2_color);
         if (layout.component_count != 1) return error.UnsupportedPdfRendering;
-        const alpha_layout = jp2_color.alphaLayout(components);
+        const rgba_len = std.math.mul(usize, pixel_count, 4) catch
+            return error.PdfDecodeWorkingSetTooLarge;
+        const sample_bytes = std.math.mul(usize, pixels.len, @sizeOf(u16)) catch
+            return error.PdfDecodeWorkingSetTooLarge;
+        const parent_live_bytes = try decodeWorkingSetTotal(
+            self.decode_limits.max_working_set_bytes,
+            0,
+            &.{ sample_bytes, rgba_len },
+        );
+        return try self.jpeg2000IndexedSourceToRgbaAlloc(.{
+            .data = .{ .u16 = @constCast(pixels) },
+            .pixel_count = pixel_count,
+            .component_count = 1,
+            .stride = components,
+            .bits_per_component = bits_per_component,
+            .component_offsets = layout.offsets,
+        }, width, height, jp2_color, image_obj, alpha_mode, parent_live_bytes);
+    }
+
+    fn jpeg2000IndexedSourceToRgbaAlloc(
+        self: *const Reader,
+        samples: ImageSourceSamples,
+        width: u32,
+        height: u32,
+        jp2_color: image_lib.jpeg2000.Jp2ColorMetadata,
+        image_obj: *const syntax.Object,
+        alpha_mode: JpxAlphaMode,
+        parent_live_bytes: usize,
+    ) ![]u8 {
+        const pixel_count = std.math.mul(usize, width, height) catch return error.UnsupportedPdfRendering;
+        if (samples.pixel_count != pixel_count or samples.component_count != 1 or samples.bits_per_component == 0 or samples.bits_per_component > 16)
+            return error.UnsupportedPdfRendering;
+        const alpha_layout = jp2_color.alphaLayout(@intCast(samples.stride));
         if (alpha_mode != .ignore and alpha_layout == null) return error.UnsupportedPdfRendering;
         // An associated-alpha transform cannot be meaningfully inverted in
         // palette-index space. Reject it rather than selecting the wrong entry.
         if (alpha_mode == .premultiplied) return error.UnsupportedPdfRendering;
 
         const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
-        const sample_bytes = std.math.mul(usize, pixels.len, @sizeOf(u16)) catch return error.PdfDecodeWorkingSetTooLarge;
-        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ sample_bytes, pixel_count, rgba_len });
-        const indexes = try self.alloc.alloc(u8, pixel_count);
-        defer self.alloc.free(indexes);
-        const max_sample: u32 = (@as(u32, 1) << @intCast(bits_per_component)) - 1;
-        for (indexes, 0..) |*index, pixel| {
-            if (pixel & 4095 == 0) try self.checkCancellation();
-            const sample = pixels[pixel * components + layout.offsets[0]];
-            if (sample > max_sample or sample > std.math.maxInt(u8)) return error.UnsupportedPdfRendering;
-            index.* = @intCast(sample);
-        }
-
+        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ samples.liveBytes(), rgba_len });
+        const rgba = try self.alloc.alloc(u8, rgba_len);
+        errdefer self.alloc.free(rgba);
         const color_space_obj = image_obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
         var color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
         defer color_space.deinit(self.alloc);
-        const rgba = try self.alloc.alloc(u8, rgba_len);
-        errdefer self.alloc.free(rgba);
-        try self.decodeResolvedImageColorSpaceToRgba(rgba, pixel_count, indexes, &color_space, null);
-        if (alpha_layout) |embedded| {
+        if (color_space != .array) return error.UnsupportedPdfRendering;
+        try self.decodeIndexedImageSourceToRgbaGuarded(
+            rgba,
+            samples,
+            color_space.array,
+            null,
+            parent_live_bytes,
+            0,
+        );
+
+        if (alpha_layout) |embedded| if (alpha_mode != .ignore) {
+            const max_sample: u32 = (@as(u32, 1) << @intCast(samples.bits_per_component)) - 1;
             for (0..pixel_count) |pixel| {
                 if (pixel & 4095 == 0) try self.checkCancellation();
-                const alpha = pixels[pixel * components + embedded.alpha];
-                if (alpha > max_sample) return error.UnsupportedPdfRendering;
-                rgba[pixel * 4 + 3] = if (alpha_mode == .ignore)
-                    0xff
-                else
-                    @intCast((@as(u32, alpha) * 255 + max_sample / 2) / max_sample);
+                const alpha = try rawImageSourceSample(samples, pixel, embedded.alpha, max_sample);
+                rgba[pixel * 4 + 3] = @intCast((alpha * 255 + max_sample / 2) / max_sample);
             }
-        }
+        };
         return rgba;
     }
 
@@ -8306,7 +8362,12 @@ pub const Reader = struct {
             return error.UnsupportedPdfRendering;
 
         if (samples.len() < pixel_count) return error.UnsupportedPdfRendering;
-        var palette = try self.resolveIndexedPaletteAlloc(color_space);
+        const palette_parent_live = try decodeWorkingSetTotal(
+            self.decode_limits.max_working_set_bytes,
+            0,
+            &.{ rgba.len, samples.liveBytes() },
+        );
+        var palette = try self.resolveIndexedPaletteAlloc(color_space, palette_parent_live, .palette_rgba);
         defer palette.deinit(self.alloc);
         const palette_rgba_len = std.math.mul(usize, palette.entry_count, 4) catch return error.UnsupportedPdfRendering;
         try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ rgba.len, samples.liveBytes(), palette.ownedBytes(), palette_rgba_len });
@@ -8331,9 +8392,61 @@ pub const Reader = struct {
         }
     }
 
+    fn decodeIndexedImageSourceToRgbaGuarded(
+        self: *const Reader,
+        rgba: []u8,
+        samples: ImageSourceSamples,
+        color_space: []const syntax.Object,
+        decode_obj: ?*const syntax.Object,
+        parent_live_bytes: usize,
+        depth: u8,
+    ) !void {
+        if (rgba.len % 4 != 0 or samples.component_count != 1 or samples.stride == 0)
+            return error.UnsupportedPdfRendering;
+        const pixel_count = rgba.len / 4;
+        if (samples.pixel_count != pixel_count or samples.bits_per_component == 0 or samples.bits_per_component > 16)
+            return error.UnsupportedPdfRendering;
+        const required_samples = std.math.mul(usize, pixel_count, samples.stride) catch
+            return error.UnsupportedPdfRendering;
+        switch (samples.data) {
+            .u8 => |bytes| if (bytes.len < required_samples or samples.bits_per_component > 8)
+                return error.UnsupportedPdfRendering,
+            .u16 => |words| if (words.len < required_samples) return error.UnsupportedPdfRendering,
+        }
+        if (samples.component_offsets[0] >= samples.stride) return error.UnsupportedPdfRendering;
+
+        var palette = try self.resolveIndexedPaletteAlloc(color_space, parent_live_bytes, .palette_rgba);
+        defer palette.deinit(self.alloc);
+        const palette_rgba_len = std.math.mul(usize, palette.entry_count, 4) catch
+            return error.PdfDecodeWorkingSetTooLarge;
+        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{
+            parent_live_bytes,
+            palette.ownedBytes(),
+            palette_rgba_len,
+        });
+        const palette_rgba = try self.alloc.alloc(u8, palette_rgba_len);
+        defer self.alloc.free(palette_rgba);
+        try self.decodeResolvedImageColorSpaceToRgbaGuarded(
+            palette_rgba,
+            palette.entry_count,
+            .{ .source = .{ .encoded = palette.lookup } },
+            &color_space[1],
+            depth + 1,
+        );
+
+        for (0..pixel_count) |pixel| {
+            if (pixel & 4095 == 0) try self.checkCancellation();
+            const index = try indexedImageSourceValue(samples, pixel, decode_obj, palette.entry_count);
+            const source = @as(usize, index) * 4;
+            @memcpy(rgba[pixel * 4 ..][0..4], palette_rgba[source..][0..4]);
+        }
+    }
+
     fn resolveIndexedPaletteAlloc(
         self: *const Reader,
         color_space: []const syntax.Object,
+        parent_live_bytes: usize,
+        reserve: IndexedPaletteReserve,
     ) !ResolvedIndexedPalette {
         if (color_space.len < 4) return error.UnsupportedPdfRendering;
         const indexed_name = color_space[0].asName() orelse return error.UnsupportedPdfRendering;
@@ -8353,6 +8466,22 @@ pub const Reader = struct {
             .component_count = component_count,
         };
         errdefer result.deinit(self.alloc);
+        const lookup_len = std.math.mul(usize, result.entry_count, component_count) catch
+            return error.UnsupportedPdfRendering;
+        const reserve_bytes = switch (reserve) {
+            .palette_rgba => std.math.mul(usize, result.entry_count, 4) catch
+                return error.PdfDecodeWorkingSetTooLarge,
+            .matte_scratch => |pixel_count| std.math.mul(
+                usize,
+                @min(pixel_count, 16 * 1024),
+                component_count,
+            ) catch return error.PdfDecodeWorkingSetTooLarge,
+        };
+        const retained_live_bytes = try decodeWorkingSetTotal(
+            self.decode_limits.max_working_set_bytes,
+            parent_live_bytes,
+            &.{reserve_bytes},
+        );
         const lookup_obj: *const syntax.Object = blk: {
             const candidate = &color_space[3];
             if (candidate.* == .obj_ref) {
@@ -8364,13 +8493,16 @@ pub const Reader = struct {
         const lookup = switch (lookup_obj.*) {
             .string => lookup_obj.string,
             .stream => blk: {
-                result.decoded_lookup = try self.readDecodedStreamData(lookup_obj);
+                if (retained_live_bytes >= self.decode_limits.max_working_set_bytes)
+                    return error.PdfDecodeWorkingSetTooLarge;
+                result.decoded_lookup = try self.readDecodedStreamDataWithLimits(lookup_obj, .{
+                    .max_decoded_stream_bytes = @min(self.decode_limits.max_decoded_stream_bytes, lookup_len),
+                    .max_working_set_bytes = self.decode_limits.max_working_set_bytes - retained_live_bytes,
+                });
                 break :blk result.decoded_lookup.?;
             },
             else => return error.UnsupportedPdfRendering,
         };
-        const lookup_len = std.math.mul(usize, result.entry_count, component_count) catch
-            return error.UnsupportedPdfRendering;
         if (lookup.len < lookup_len) return error.UnsupportedPdfRendering;
         result.lookup = lookup[0..lookup_len];
         return result;
@@ -8409,6 +8541,16 @@ pub const Reader = struct {
                 0,
             );
         };
+        if (source_view) |samples| {
+            return try self.decodeIndexedImageSourceToRgbaGuarded(
+                rgba,
+                samples,
+                color_space,
+                decode_obj,
+                parent_live_bytes,
+                0,
+            );
+        }
         return try self.decodeIndexedImageToRgba(rgba, @as(usize, width) * height, decoded, color_space, decode_obj);
     }
 
@@ -8476,11 +8618,19 @@ pub const Reader = struct {
         if (prepared.image.rgba.len != @as(usize, prepared.image.width) * prepared.image.height * 4)
             return error.InvalidPdfImageMask;
 
-        var palette = try self.resolveIndexedPaletteAlloc(color_space);
+        const palette_parent_live = try decodeWorkingSetTotal(
+            self.decode_limits.max_working_set_bytes,
+            parent_live_bytes,
+            &.{prepared.image.rgba.len},
+        );
+        var palette = try self.resolveIndexedPaletteAlloc(
+            color_space,
+            palette_parent_live,
+            .{ .matte_scratch = pixel_count },
+        );
         defer palette.deinit(self.alloc);
         const matte_index = matte.indexed_matte_index orelse return error.UnsupportedPdfRendering;
         if (matte_index >= palette.entry_count) return error.InvalidPdfImageMask;
-        const max_sample: u32 = (@as(u32, 1) << @intCast(samples.bits_per_component)) - 1;
         const chunk_capacity = @min(pixel_count, 16 * 1024);
         const scratch_len = std.math.mul(usize, chunk_capacity, palette.component_count) catch
             return error.PdfDecodeWorkingSetTooLarge;
@@ -8494,8 +8644,6 @@ pub const Reader = struct {
         defer self.alloc.free(scratch);
 
         const matte_base = @as(usize, matte_index) * palette.component_count;
-        const explicit_decode = decodeRange(decode_obj, 0);
-        const max_index = @as(f64, @floatFromInt(palette.entry_count - 1));
         const x_template = MaskAxisIterator.init(width, prepared.image.width, interpolate);
         var y_iterator = MaskAxisIterator.init(height, prepared.image.height, interpolate);
         var chunk_start: usize = 0;
@@ -8511,22 +8659,13 @@ pub const Reader = struct {
                     bilinearMaskValue(prepared.image.rgba, prepared.image.width, 0, xs, ys)
                 else
                     prepared.image.rgba[(ys.low * @as(usize, prepared.image.width) + xs.low) * 4];
-                const source_index = pixel * samples.stride + samples.component_offsets[0];
-                const raw_sample: u32 = switch (samples.data) {
-                    .u8 => |bytes| if (samples.bits_per_component == 8)
-                        bytes[source_index]
-                    else
-                        (@as(u32, bytes[source_index]) * max_sample + 127) / 255,
-                    .u16 => |words| words[source_index],
-                };
-                if (raw_sample > max_sample) return error.UnsupportedPdfRendering;
-                const decoded_index = if (explicit_decode) |range|
-                    range.min + (@as(f64, @floatFromInt(raw_sample)) / @as(f64, @floatFromInt(max_sample))) * (range.max - range.min)
-                else
-                    @as(f64, @floatFromInt(raw_sample));
-                if (!std.math.isFinite(decoded_index)) return error.UnsupportedPdfRendering;
-                const palette_index: usize = @intFromFloat(@round(std.math.clamp(decoded_index, 0, max_index)));
-                const palette_base = palette_index * palette.component_count;
+                const palette_index = try indexedImageSourceValue(
+                    samples,
+                    pixel,
+                    decode_obj,
+                    palette.entry_count,
+                );
+                const palette_base = @as(usize, palette_index) * palette.component_count;
                 const scratch_base = chunk_pixels * palette.component_count;
                 for (0..palette.component_count) |component| {
                     const preblended = @as(f64, @floatFromInt(palette.lookup[palette_base + component])) / 255.0;
@@ -16314,6 +16453,12 @@ fn isDeviceOrCieBasedColorSpace(color_space: *const syntax.Object) bool {
         std.mem.eql(u8, family, "ICCBased");
 }
 
+fn isIndexedColorSpace(color_space: *const syntax.Object) bool {
+    if (color_space.* != .array or color_space.array.len == 0) return false;
+    const family = color_space.array[0].asName() orelse return false;
+    return std.mem.eql(u8, family, "Indexed") or std.mem.eql(u8, family, "I");
+}
+
 fn colorFromComponents(color_space_name: []const u8, components: [4]u8, count: usize) ?[4]u8 {
     if (std.mem.eql(u8, color_space_name, "DeviceGray") and count >= 1) {
         return .{ components[0], components[0], components[0], 0xff };
@@ -16351,16 +16496,65 @@ fn applyDecodeUnit(value: u8, decode_obj: ?*const syntax.Object, component_index
 }
 
 fn applyIndexedDecode(value: u8, decode_obj: ?*const syntax.Object, palette_entries: usize) !u8 {
-    if (palette_entries == 0) return error.UnsupportedPdfRendering;
+    if (palette_entries == 0 or palette_entries > 256) return error.UnsupportedPdfRendering;
     const max_index = @as(f64, @floatFromInt(palette_entries - 1));
     const unit = @as(f64, @floatFromInt(value)) / 255.0;
-    const range = decodeRange(decode_obj, 0) orelse return value;
+    const range = decodeRange(decode_obj, 0) orelse return @min(value, @as(u8, @intCast(palette_entries - 1)));
     const mapped = std.math.clamp(range.min + unit * (range.max - range.min), 0.0, max_index);
     return @intFromFloat(@round(mapped));
 }
 
+fn rawImageSourceSample(
+    samples: ImageSourceSamples,
+    pixel: usize,
+    component_offset: u8,
+    max_sample: u32,
+) !u32 {
+    if (component_offset >= samples.stride) return error.UnsupportedPdfRendering;
+    const sample_index = std.math.add(
+        usize,
+        std.math.mul(usize, pixel, samples.stride) catch return error.UnsupportedPdfRendering,
+        component_offset,
+    ) catch return error.UnsupportedPdfRendering;
+    const raw: u32 = switch (samples.data) {
+        .u8 => |bytes| blk: {
+            if (sample_index >= bytes.len or samples.bits_per_component > 8)
+                return error.UnsupportedPdfRendering;
+            break :blk if (samples.bits_per_component == 8)
+                bytes[sample_index]
+            else
+                (@as(u32, bytes[sample_index]) * max_sample + 127) / 255;
+        },
+        .u16 => |words| blk: {
+            if (sample_index >= words.len) return error.UnsupportedPdfRendering;
+            break :blk words[sample_index];
+        },
+    };
+    if (raw > max_sample) return error.UnsupportedPdfRendering;
+    return raw;
+}
+
+fn indexedImageSourceValue(
+    samples: ImageSourceSamples,
+    pixel: usize,
+    decode_obj: ?*const syntax.Object,
+    palette_entries: usize,
+) !u8 {
+    if (palette_entries == 0 or palette_entries > 256 or samples.bits_per_component == 0 or samples.bits_per_component > 16)
+        return error.UnsupportedPdfRendering;
+    const max_sample: u32 = (@as(u32, 1) << @intCast(samples.bits_per_component)) - 1;
+    const raw_sample = try rawImageSourceSample(samples, pixel, samples.component_offsets[0], max_sample);
+    const decoded_index = if (decodeRange(decode_obj, 0)) |range|
+        range.min + (@as(f64, @floatFromInt(raw_sample)) / @as(f64, @floatFromInt(max_sample))) * (range.max - range.min)
+    else
+        @as(f64, @floatFromInt(raw_sample));
+    if (!std.math.isFinite(decoded_index)) return error.UnsupportedPdfRendering;
+    const max_index = @as(f64, @floatFromInt(palette_entries - 1));
+    return @intFromFloat(@round(std.math.clamp(decoded_index, 0, max_index)));
+}
+
 fn applyIndexedSampleDecode(value: u8, sample_decode: ImageSampleDecode, palette_entries: usize) !u8 {
-    if (palette_entries == 0) return error.UnsupportedPdfRendering;
+    if (palette_entries == 0 or palette_entries > 256) return error.UnsupportedPdfRendering;
     if (sample_decode.default_decode == null and
         sample_decode.clamp_count == 0)
         return try applyIndexedDecode(value, sample_decode.decode_obj, palette_entries);
@@ -19888,10 +20082,22 @@ test "indexed Decode preserves the complete palette index range" {
     try std.testing.expectEqual(@as(u8, 0), try applyIndexedDecode(0, &decode, 3));
     try std.testing.expectEqual(@as(u8, 1), try applyIndexedDecode(128, &decode, 3));
     try std.testing.expectEqual(@as(u8, 2), try applyIndexedDecode(255, &decode, 3));
+    try std.testing.expectEqual(@as(u8, 2), try applyIndexedDecode(255, null, 3));
     try std.testing.expectEqual(
         @as(u8, 2),
         try applyIndexedSampleDecode(255, .{ .decode_obj = &decode }, 3),
     );
+
+    const packed_samples = ImageSourceSamples{
+        .data = .{ .u8 = @constCast(&[_]u8{ 0, 85, 255 }) },
+        .pixel_count = 3,
+        .component_count = 1,
+        .stride = 1,
+        .bits_per_component = 2,
+    };
+    try std.testing.expectEqual(@as(u8, 0), try indexedImageSourceValue(packed_samples, 0, &decode, 3));
+    try std.testing.expectEqual(@as(u8, 1), try indexedImageSourceValue(packed_samples, 1, &decode, 3));
+    try std.testing.expectEqual(@as(u8, 2), try indexedImageSourceValue(packed_samples, 2, &decode, 3));
 }
 
 test "spot tint transforms preserve non-unit Lab alternate values" {
@@ -20409,6 +20615,30 @@ test "reader decodes indexed image with indirect stream lookup" {
     try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[2]);
 }
 
+test "reader preserves packed native Indexed samples and clamps hival" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 3 /Height 1 /ColorSpace [/Indexed /DeviceRGB 2 <FF000000FF000000FF>] /BitsPerComponent 2 /Length 1 >>\nstream\n\x1c\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+    const decoded = try reader.decodeImageToRgbaAlloc(&image);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqualSlices(u8, &.{
+        255, 0,   0,   255,
+        0,   255, 0,   255,
+        0,   0,   255, 255,
+    }, decoded.rgba);
+}
+
 test "reader decodes Lab image xobject draw" {
     const alloc = std.testing.allocator;
     const pixel = [_]u8{ 200, 128, 128 };
@@ -20881,12 +21111,12 @@ test "reader resolves indirect predictor parameters before JPXDecode" {
 
 test "reader preserves native JPX samples for Indexed color spaces" {
     const alloc = std.testing.allocator;
-    const pixels = [_]u16{ 0, 1, 2 };
+    const pixels = [_]u16{ 0, 1, 4095 };
     const params = image_lib.jpeg2000.EncodeParams{
         .width = 3,
         .height = 1,
         .components = 1,
-        .bits_per_component = 4,
+        .bits_per_component = 12,
         .decomposition_levels = 0,
         .wavelet_transform = 1,
         .multiple_component_transform = false,
@@ -20901,7 +21131,7 @@ test "reader preserves native JPX samples for Indexed color spaces" {
         "4 0 obj\nnull\nendobj\n",
         try std.fmt.allocPrint(
             alloc,
-            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 3 /Height 1 /ColorSpace [/Indexed /DeviceRGB 2 <FF000000FF000000FF>] /BitsPerComponent 4 /Filter /JPXDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 3 /Height 1 /ColorSpace [/Indexed /DeviceRGB 2 <FF000000FF000000FF>] /BitsPerComponent 12 /Filter /JPXDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
             .{ jp2_bytes.len, jp2_bytes },
         ),
     };
@@ -21986,6 +22216,33 @@ test "reader applies soft mask image alpha" {
     var image = try constrained.readIndirectObject(.{ .id = 5, .gen = 0 });
     defer image.deinit(alloc);
     try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, constrained.decodeImageToRgbaAlloc(&image));
+}
+
+test "Indexed palette stream decode reserves retained image working set" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        "3 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.initWithDecodeLimits(alloc, sample, .{
+        .max_decoded_stream_bytes = 32,
+        .max_working_set_bytes = 32,
+    });
+    defer reader.deinit();
+    var scanner = syntax.Scanner.init(alloc, "[/Indexed /DeviceRGB 0 3 0 R]");
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    // The retained image consumes 28 bytes and the palette RGBA reserve uses
+    // the remaining four, so stream decoding must fail before allocating.
+    try std.testing.expectError(
+        error.PdfDecodeWorkingSetTooLarge,
+        reader.resolveIndexedPaletteAlloc(color_space.array, 28, .palette_rgba),
+    );
 }
 
 fn buildImageDecodeTestPdfAlloc(alloc: Allocator, objects: []const []const u8) ![]u8 {
