@@ -2887,7 +2887,29 @@ test "multi raft validates catalog admission before durability and fences config
             .storage = store.storage(),
         },
     });
-    try std.testing.expectError(error.ReplicaAdmissionConfigMismatch, host.ensureReplica(.{
+    // Transport reachability and desired membership may expand while the live
+    // replica remains installed. Admission must remain idempotent and, just as
+    // importantly, must not smuggle that topology into observed ConfState.
+    var relocation_peers = [_]core.types.NodeId{ 1, 2 };
+    _ = try host.ensureReplica(.{
+        .group = .{
+            .group_id = 146,
+            .local_node_id = 1,
+            .raft_config = .{
+                .id = 1,
+                .group_id = 146,
+                .peers = relocation_peers[0..],
+            },
+            .storage = store.storage(),
+        },
+    });
+    try std.testing.expectEqualSlices(
+        core.types.NodeId,
+        &.{1},
+        host.group(146).?.status().conf_state.voters,
+    );
+
+    const policy_conflict_descriptor: runtime.ReplicaDescriptor = .{
         .group = .{
             .group_id = 146,
             .local_node_id = 1,
@@ -2899,7 +2921,20 @@ test "multi raft validates catalog admission before durability and fences config
             },
             .storage = store.storage(),
         },
-    }));
+    };
+    const conflict = host.replicaAdmissionConflict(policy_conflict_descriptor) orelse
+        return error.ExpectedReplicaAdmissionConflict;
+    switch (conflict) {
+        .runtime_policy => |field| try std.testing.expectEqual(
+            runtime.group.ReplicaRuntimePolicyField.election_tick,
+            field,
+        ),
+        .local_node_id => return error.UnexpectedReplicaIdentityConflict,
+    }
+    try std.testing.expectError(
+        error.ReplicaRuntimePolicyMismatch,
+        host.ensureReplica(policy_conflict_descriptor),
+    );
     const records = try catalog.catalog().listReplicas(std.testing.allocator);
     defer {
         for (records) |*record| record.deinit(std.testing.allocator);

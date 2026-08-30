@@ -11900,6 +11900,11 @@ pub const DataServer = struct {
             // leader maintenance and status publication while skipping
             // restore, descriptor rebuild, peer replacement, and catalog
             // fsync for identical topology.
+            {
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                _ = try raft.host.reconcileMembershipOnly(local_intents.items);
+            }
             const status_fingerprint = self.maintainDataRaftLeadership(snapshot, local_intents.items, registration.node_id);
             self.observeDataRaftStatusFingerprint(status_fingerprint);
             // The common stable-topology path remains allocation-free. Retry

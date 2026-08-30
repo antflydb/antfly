@@ -33,6 +33,26 @@ pub const PlacementIntent = struct {
     relocation_disk_bytes_watermark: u64 = 0,
     relocation_target_sequence: u64 = 0,
     relocation_applied_sequence: u64 = 0,
+
+    pub fn desiredMembership(self: PlacementIntent) DesiredMembership {
+        return .{
+            .voters = self.peer_node_ids,
+            .learners = self.learner_node_ids,
+        };
+    }
+};
+
+/// Mutable topology intent. It is deliberately independent from replica
+/// admission: reconciliation may revisit this value many times for one live
+/// replica without rebuilding storage or rewriting runtime policy.
+pub const DesiredMembership = struct {
+    voters: []const u64,
+    learners: []const u64,
+
+    pub fn validate(self: DesiredMembership) !void {
+        try validateNodeSet(self.voters);
+        try validateNodeSet(self.learners);
+    }
 };
 
 pub const PlacementServingState = enum(u8) {
@@ -266,7 +286,41 @@ pub const ReconcileResult = struct {
     ensured: usize = 0,
     removed: usize = 0,
     refreshed_peers: usize = 0,
+    admission_blocked: usize = 0,
     membership_proposals: usize = 0,
+    membership_converged: usize = 0,
+    membership_waiting_for_replica: usize = 0,
+    membership_waiting_for_leader: usize = 0,
+    membership_waiting_for_local_voter: usize = 0,
+    membership_waiting_for_pending_change: usize = 0,
+    membership_waiting_for_policy: usize = 0,
+    membership_leader_transfers: usize = 0,
+
+    fn recordMembership(self: *ReconcileResult, outcome: MembershipConvergence) void {
+        switch (outcome) {
+            .converged => self.membership_converged += 1,
+            .waiting_for_replica => self.membership_waiting_for_replica += 1,
+            .waiting_for_leader => self.membership_waiting_for_leader += 1,
+            .waiting_for_local_voter => self.membership_waiting_for_local_voter += 1,
+            .waiting_for_pending_change => self.membership_waiting_for_pending_change += 1,
+            .waiting_for_policy => self.membership_waiting_for_policy += 1,
+            .leader_transfer_started => self.membership_leader_transfers += 1,
+            .proposal_submitted => self.membership_proposals += 1,
+        }
+    }
+};
+
+/// Operator-facing reason that desired membership has or has not converged.
+/// These are normal lifecycle states, not generic server-round failures.
+pub const MembershipConvergence = enum {
+    converged,
+    waiting_for_replica,
+    waiting_for_leader,
+    waiting_for_local_voter,
+    waiting_for_pending_change,
+    waiting_for_policy,
+    leader_transfer_started,
+    proposal_submitted,
 };
 
 const PreparedEnsure = struct {
@@ -274,6 +328,7 @@ const PreparedEnsure = struct {
     intent_hash: u64,
     prepare_bootstrap: bool,
     replica: ?host_mod.PreparedReplica = null,
+    restart_policy_blocked: bool = false,
 };
 
 /// An immutable desired-state snapshot split into a blocking durability phase
@@ -321,6 +376,14 @@ pub const PreparedReconcile = struct {
         for (self.ensures, 0..) |*entry, index| {
             const record = self.intents[entry.intent_index].record;
             entry.replica = self.owner.host.prepareReplicaUnpublished(record, entry.prepare_bootstrap) catch |err| {
+                if (err == error.ReplicaRuntimePolicyMismatch) {
+                    // The live group remains safe and can continue membership
+                    // convergence. Record desired catalog state and expose the
+                    // restart-scoped conflict instead of failing the process's
+                    // entire control round.
+                    entry.restart_policy_blocked = true;
+                    continue;
+                }
                 self.failed_ensure_index = index;
                 return err;
             };
@@ -352,6 +415,20 @@ pub const PreparedReconcile = struct {
         var result: ReconcileResult = .{};
         for (self.ensures) |*entry| {
             const intent = self.intents[entry.intent_index];
+            if (entry.restart_policy_blocked) {
+                result.admission_blocked += 1;
+                result.refreshed_peers += try self.owner.refreshPeerEndpoints(intent);
+                // The desired record is durable and will take effect on the
+                // next replica restart. Remember its fingerprint so an
+                // unchanged restart-scoped policy does not fsync the catalog
+                // on every control round.
+                try self.owner.last_intent_hashes.put(
+                    self.owner.alloc,
+                    intent.record.group_id,
+                    entry.intent_hash,
+                );
+                continue;
+            }
             const prepared = if (entry.replica) |*replica| replica else return error.InvalidReconcilePhase;
             _ = try self.owner.host.installPreparedReplica(intent.record, prepared);
             result.ensured += 1;
@@ -363,11 +440,14 @@ pub const PreparedReconcile = struct {
             );
         }
         for (self.intents) |intent| {
-            if (try self.owner.reconcileRaftMembership(intent)) result.membership_proposals += 1;
+            const outcome = try self.owner.reconcileRaftMembership(intent);
+            self.owner.membership_convergence.putAssumeCapacity(intent.record.group_id, outcome);
+            result.recordMembership(outcome);
         }
         for (self.removals) |group_id| {
             try self.owner.host.removePreparedReplica(group_id);
             _ = self.owner.last_intent_hashes.remove(group_id);
+            _ = self.owner.membership_convergence.remove(group_id);
             result.removed += 1;
         }
         self.owner.host.metrics.reconcile_rounds += 1;
@@ -394,10 +474,17 @@ pub const Reconciler = struct {
     provider: PlacementProvider,
     membership_change_permit: ?MembershipChangePermit = null,
     last_intent_hashes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    membership_convergence: std.AutoHashMapUnmanaged(u64, MembershipConvergence) = .empty,
 
     pub fn deinit(self: *Reconciler) void {
         self.last_intent_hashes.deinit(self.alloc);
         self.last_intent_hashes = .empty;
+        self.membership_convergence.deinit(self.alloc);
+        self.membership_convergence = .empty;
+    }
+
+    pub fn membershipStatus(self: *const Reconciler, group_id: u64) ?MembershipConvergence {
+        return self.membership_convergence.get(group_id);
     }
 
     pub fn prepare(self: *Reconciler) !PreparedReconcile {
@@ -414,6 +501,7 @@ pub const Reconciler = struct {
         errdefer removals.deinit(self.alloc);
 
         for (intents, 0..) |intent, intent_index| {
+            try intent.desiredMembership().validate();
             try desired_group_ids.put(self.alloc, intent.record.group_id, {});
 
             const intent_hash = hashIntent(intent);
@@ -457,6 +545,11 @@ pub const Reconciler = struct {
             self.host.replicaCatalogRevision()
         else
             null;
+        const convergence_capacity = std.math.cast(
+            u32,
+            @as(usize, self.membership_convergence.count()) +| intents.len,
+        ) orelse return error.TooManyPlacementIntents;
+        try self.membership_convergence.ensureTotalCapacity(self.alloc, convergence_capacity);
         return .{
             .owner = self,
             .intents = intents,
@@ -478,6 +571,29 @@ pub const Reconciler = struct {
         return try prepared.commit();
     }
 
+    /// Advances only mutable Raft membership. It performs no descriptor
+    /// construction, catalog write, restore, or filesystem work, so callers
+    /// can safely run it for an unchanged metadata epoch until ConfState
+    /// converges through leader changes and joint-consensus boundaries.
+    pub fn reconcileMembershipOnly(
+        self: *Reconciler,
+        intents: []const PlacementIntent,
+    ) !ReconcileResult {
+        const convergence_capacity = std.math.cast(
+            u32,
+            @as(usize, self.membership_convergence.count()) +| intents.len,
+        ) orelse return error.TooManyPlacementIntents;
+        try self.membership_convergence.ensureTotalCapacity(self.alloc, convergence_capacity);
+        var result: ReconcileResult = .{};
+        for (intents) |intent| {
+            try intent.desiredMembership().validate();
+            const outcome = try self.reconcileRaftMembership(intent);
+            self.membership_convergence.putAssumeCapacity(intent.record.group_id, outcome);
+            result.recordMembership(outcome);
+        }
+        return result;
+    }
+
     fn refreshPeerEndpoints(self: *Reconciler, intent: PlacementIntent) !usize {
         var refreshed: usize = 0;
         for (intent.peer_node_ids) |node_id| {
@@ -497,34 +613,48 @@ pub const Reconciler = struct {
         return refreshed;
     }
 
-    fn reconcileRaftMembership(self: *Reconciler, intent: PlacementIntent) !bool {
-        const status = self.host.raftStatus(intent.record.group_id) orelse return false;
-        if (status.soft.role != .leader or status.soft.leader_id != status.id) return false;
-        if (!localNodeCanProposeMembership(status)) return false;
+    fn reconcileRaftMembership(self: *Reconciler, intent: PlacementIntent) !MembershipConvergence {
+        const status = self.host.raftStatus(intent.record.group_id) orelse return .waiting_for_replica;
+        if (status.soft.role != .leader or status.soft.leader_id != status.id)
+            return .waiting_for_leader;
+        if (!localNodeCanProposeMembership(status)) return .waiting_for_local_voter;
 
         // A new change cannot be proposed while joint consensus is active. Leave
         // the committed joint configuration first; the next reconcile round will
         // calculate any remaining delta from the resulting stable voter set.
         if (status.conf_state.voters_outgoing.len > 0) {
             if (self.membership_change_permit) |permit| {
-                if (!permit.allows(intent)) return false;
+                if (!permit.allows(intent)) return .waiting_for_policy;
             }
             self.host.proposeConfChangeV2(intent.record.group_id, .{}) catch |err| return switch (err) {
                 error.PendingConfChange,
                 error.NotInJointState,
-                error.NotLeader,
                 error.ProposalDropped,
                 error.LeaderTransferInProgress,
-                => false,
+                => .waiting_for_pending_change,
+                error.NotLeader => .waiting_for_leader,
                 else => err,
             };
-            return true;
+            return .proposal_submitted;
         }
 
         if (retirementLeaderTransferTarget(status, intent)) |transferee| {
-            try self.host.transferLeader(intent.record.group_id, transferee);
-            return true;
+            self.host.transferLeader(intent.record.group_id, transferee) catch |err| return switch (err) {
+                error.NotLeader => .waiting_for_leader,
+                error.LeaderTransferInProgress => .waiting_for_pending_change,
+                else => err,
+            };
+            return .leader_transfer_started;
         }
+
+        if (!membershipChangesRequiredWithLocalPolicy(
+            status.conf_state.voters,
+            status.conf_state.learners,
+            intent.record.local_node_id,
+            intent.peer_node_ids,
+            intent.learner_node_ids,
+            intent.serving_state != .retiring,
+        )) return .converged;
 
         const changes = try allocMembershipChangesWithLocalPolicy(
             self.alloc,
@@ -536,21 +666,21 @@ pub const Reconciler = struct {
             intent.serving_state != .retiring,
         );
         defer self.alloc.free(changes);
-        if (changes.len == 0) return false;
+        if (changes.len == 0) return .converged;
         if (self.membership_change_permit) |permit| {
-            if (!permit.allows(intent)) return false;
+            if (!permit.allows(intent)) return .waiting_for_policy;
         }
 
         self.host.proposeConfChangeV2(intent.record.group_id, .{ .changes = changes }) catch |err| return switch (err) {
             error.PendingConfChange,
             error.MustLeaveJointFirst,
-            error.NotLeader,
             error.ProposalDropped,
             error.LeaderTransferInProgress,
-            => false,
+            => .waiting_for_pending_change,
+            error.NotLeader => .waiting_for_leader,
             else => err,
         };
-        return true;
+        return .proposal_submitted;
     }
 };
 
@@ -657,6 +787,86 @@ fn allocMembershipChangesWithLocalPolicy(
     return try changes.toOwnedSlice(alloc);
 }
 
+/// Allocation-free convergence check for the common steady-state path. Its
+/// classification mirrors `allocMembershipChangesWithLocalPolicy`: a stale
+/// learner intent never demotes an existing voter, while an existing learner
+/// named as a voter still requires promotion.
+fn membershipChangesRequiredWithLocalPolicy(
+    current_voters: []const u64,
+    current_learners: []const u64,
+    local_node_id: u64,
+    voter_node_ids: []const u64,
+    learner_node_ids: []const u64,
+    retain_local_voter: bool,
+) bool {
+    for (current_voters) |node_id| {
+        if (!isDesiredVoter(
+            node_id,
+            current_voters,
+            local_node_id,
+            voter_node_ids,
+            learner_node_ids,
+            retain_local_voter,
+        )) return true;
+    }
+    for (current_learners) |node_id| {
+        if (isDesiredVoter(
+            node_id,
+            current_voters,
+            local_node_id,
+            voter_node_ids,
+            learner_node_ids,
+            retain_local_voter,
+        ) or !isDesiredLearner(node_id, current_voters, learner_node_ids)) return true;
+    }
+    for (voter_node_ids) |node_id| {
+        if (isDesiredVoter(
+            node_id,
+            current_voters,
+            local_node_id,
+            voter_node_ids,
+            learner_node_ids,
+            retain_local_voter,
+        ) and !containsNodeId(current_voters, node_id)) return true;
+    }
+    for (learner_node_ids) |node_id| {
+        if (isDesiredLearner(node_id, current_voters, learner_node_ids) and
+            !containsNodeId(current_learners, node_id)) return true;
+    }
+    if (retain_local_voter and isDesiredVoter(
+        local_node_id,
+        current_voters,
+        local_node_id,
+        voter_node_ids,
+        learner_node_ids,
+        true,
+    ) and !containsNodeId(current_voters, local_node_id)) return true;
+    return false;
+}
+
+fn isDesiredLearner(
+    node_id: u64,
+    current_voters: []const u64,
+    learner_node_ids: []const u64,
+) bool {
+    return containsNodeId(learner_node_ids, node_id) and
+        !containsNodeId(current_voters, node_id);
+}
+
+fn isDesiredVoter(
+    node_id: u64,
+    current_voters: []const u64,
+    local_node_id: u64,
+    voter_node_ids: []const u64,
+    learner_node_ids: []const u64,
+    retain_local_voter: bool,
+) bool {
+    if (isDesiredLearner(node_id, current_voters, learner_node_ids)) return false;
+    return containsNodeId(voter_node_ids, node_id) or
+        (retain_local_voter and node_id == local_node_id) or
+        (containsNodeId(learner_node_ids, node_id) and containsNodeId(current_voters, node_id));
+}
+
 fn appendUniqueNodeId(alloc: std.mem.Allocator, node_ids: *std.ArrayListUnmanaged(u64), node_id: u64) !void {
     if (!containsNodeId(node_ids.items, node_id)) try node_ids.append(alloc, node_id);
 }
@@ -666,6 +876,13 @@ fn containsNodeId(node_ids: []const u64, node_id: u64) bool {
         if (candidate == node_id) return true;
     }
     return false;
+}
+
+fn validateNodeSet(node_ids: []const u64) !void {
+    for (node_ids, 0..) |node_id, index| {
+        if (node_id == 0) return error.InvalidTopologyNodeId;
+        if (containsNodeId(node_ids[0..index], node_id)) return error.DuplicateTopologyNodeId;
+    }
 }
 
 fn hashIntent(intent: PlacementIntent) u64 {
@@ -684,10 +901,8 @@ fn hashIntent(intent: PlacementIntent) u64 {
     hashU64(&hasher, intent.relocation_disk_bytes_watermark);
     hashU64(&hasher, intent.relocation_target_sequence);
     hashU64(&hasher, intent.relocation_applied_sequence);
-    hashU64(&hasher, @intCast(intent.peer_node_ids.len));
-    for (intent.peer_node_ids) |node_id| hashU64(&hasher, node_id);
-    hashU64(&hasher, @intCast(intent.learner_node_ids.len));
-    for (intent.learner_node_ids) |node_id| hashU64(&hasher, node_id);
+    hashNodeSet(&hasher, intent.peer_node_ids);
+    hashNodeSet(&hasher, intent.learner_node_ids);
     if (intent.record.snapshot_bootstrap) |snapshot| {
         hashU64(&hasher, 1);
         hashU64(&hasher, snapshot.from_node_id);
@@ -706,6 +921,23 @@ fn hashIntent(intent: PlacementIntent) u64 {
         hashU64(&hasher, 0);
     }
     return hasher.final();
+}
+
+/// Order-independent, allocation-free set fingerprint. Metadata serializers
+/// may reorder equivalent topology rows; that must not trigger descriptor
+/// rebuilds or catalog fsyncs.
+fn hashNodeSet(hasher: *std.hash.Wyhash, node_ids: []const u64) void {
+    var xor: u64 = 0;
+    var sum: u64 = 0;
+    for (node_ids) |node_id| {
+        var numeric = node_id;
+        const digest = std.hash.Wyhash.hash(0x9e3779b97f4a7c15, std.mem.asBytes(&numeric));
+        xor ^= digest;
+        sum +%= digest;
+    }
+    hashU64(hasher, @intCast(node_ids.len));
+    hashU64(hasher, xor);
+    hashU64(hasher, sum);
 }
 
 fn hashU64(hasher: *std.hash.Wyhash, value: u64) void {
@@ -759,6 +991,7 @@ fn freeIntentSlice(alloc: std.mem.Allocator, intents: []PlacementIntent) void {
 const StagedReconcileTestFactory = struct {
     alloc: std.mem.Allocator,
     stores: [2]*raft_engine.core.MemoryStorage,
+    election_tick: u32 = 5,
 
     fn iface(self: *@This()) host_mod.ReplicaDescriptorFactory {
         return .{
@@ -785,7 +1018,7 @@ const StagedReconcileTestFactory = struct {
                     .id = record.local_node_id,
                     .group_id = record.group_id,
                     .peers = peers,
-                    .election_tick = 5,
+                    .election_tick = self.election_tick,
                     .heartbeat_tick = 1,
                     .pre_vote = false,
                 },
@@ -925,6 +1158,81 @@ test "prepared reconcile rejects catalog races without clobbering concurrent adm
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.active, host.status(501));
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.absent, host.status(502));
     try std.testing.expectError(error.InvalidReconcilePhase, prepared.commit());
+}
+
+test "restart-scoped policy conflicts are isolated and durably deduplicated" {
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var factory = StagedReconcileTestFactory{
+        .alloc = std.testing.allocator,
+        .stores = .{ &store_a, &store_b },
+    };
+    var replica_catalog = catalog.MemoryReplicaCatalog.init(std.testing.allocator);
+    defer replica_catalog.deinit();
+    const catalog_iface = replica_catalog.catalog();
+    var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .descriptor_factory = factory.iface(),
+        .replica_catalog = catalog_iface,
+    });
+    defer host.deinit();
+    var provider = MemoryPlacementProvider.init(std.testing.allocator);
+    defer provider.deinit();
+    try provider.replaceAll(&.{.{
+        .record = .{
+            .group_id = 504,
+            .replica_id = 1,
+            .local_node_id = 1,
+            .metadata_version = 1,
+        },
+        .peer_node_ids = &.{1},
+    }});
+    var owner = Reconciler{
+        .alloc = std.testing.allocator,
+        .host = &host,
+        .provider = provider.provider(),
+    };
+    defer owner.deinit();
+
+    const initial = try owner.reconcileOnce();
+    try std.testing.expectEqual(@as(usize, 1), initial.ensured);
+
+    factory.election_tick = 6;
+    try provider.replaceAll(&.{.{
+        .record = .{
+            .group_id = 504,
+            .replica_id = 1,
+            .local_node_id = 1,
+            .metadata_version = 2,
+        },
+        .peer_node_ids = &.{1},
+    }});
+    const blocked = try owner.reconcileOnce();
+    try std.testing.expectEqual(@as(usize, 0), blocked.ensured);
+    try std.testing.expectEqual(@as(usize, 1), blocked.admission_blocked);
+    try std.testing.expectEqual(host_mod.HostedReplicaStatus.active, host.status(504));
+    const conflict = host.replicaAdmissionConflict(504) orelse
+        return error.ExpectedReplicaAdmissionConflict;
+    switch (conflict) {
+        .runtime_policy => |field| try std.testing.expectEqual(
+            raft_engine.runtime.group.ReplicaRuntimePolicyField.election_tick,
+            field,
+        ),
+        .local_node_id => return error.UnexpectedReplicaIdentityConflict,
+    }
+    {
+        const records = try catalog_iface.listReplicas(std.testing.allocator);
+        defer catalog.freeReplicaRecords(std.testing.allocator, records);
+        try std.testing.expectEqual(@as(usize, 1), records.len);
+        try std.testing.expectEqual(@as(u64, 2), records[0].metadata_version);
+    }
+
+    const durable_revision = catalog_iface.revision();
+    const unchanged = try owner.reconcileOnce();
+    try std.testing.expectEqual(@as(usize, 0), unchanged.ensured);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.admission_blocked);
+    try std.testing.expectEqual(durable_revision, catalog_iface.revision());
 }
 
 test "prepared reconcile failure never publishes an unprepared replica" {
@@ -1309,6 +1617,102 @@ test "membership reconciliation expands before removing obsolete voters" {
         .{ .change_type = .add_node, .node_id = 4 },
         .{ .change_type = .remove_node, .node_id = 5 },
     }, changes);
+}
+
+test "membership convergence check preserves steady-state and monotonic promotion semantics" {
+    try std.testing.expect(!membershipChangesRequiredWithLocalPolicy(
+        &.{ 1, 2 },
+        &.{3},
+        1,
+        &.{ 1, 2 },
+        &.{3},
+        true,
+    ));
+    // A replayed learner row must not demote voter 2.
+    try std.testing.expect(!membershipChangesRequiredWithLocalPolicy(
+        &.{ 1, 2 },
+        &.{3},
+        1,
+        &.{1},
+        &.{ 2, 3 },
+        true,
+    ));
+    // Removing 3 from learner intent requires a change.
+    try std.testing.expect(membershipChangesRequiredWithLocalPolicy(
+        &.{ 1, 2 },
+        &.{3},
+        1,
+        &.{ 1, 2 },
+        &.{},
+        true,
+    ));
+    // Naming an existing learner only as a voter requires promotion.
+    try std.testing.expect(membershipChangesRequiredWithLocalPolicy(
+        &.{ 1, 2 },
+        &.{3},
+        1,
+        &.{ 1, 2, 3 },
+        &.{},
+        true,
+    ));
+    // A retiring local voter can be removed once another desired voter exists.
+    try std.testing.expect(membershipChangesRequiredWithLocalPolicy(
+        &.{ 1, 2 },
+        &.{},
+        1,
+        &.{2},
+        &.{},
+        false,
+    ));
+}
+
+test "desired membership rejects ambiguous topology" {
+    try std.testing.expectError(
+        error.DuplicateTopologyNodeId,
+        (DesiredMembership{ .voters = &.{ 1, 1 }, .learners = &.{} }).validate(),
+    );
+    try std.testing.expectError(
+        error.InvalidTopologyNodeId,
+        (DesiredMembership{ .voters = &.{0}, .learners = &.{} }).validate(),
+    );
+}
+
+test "intent fingerprint is topology order independent" {
+    const lhs: PlacementIntent = .{
+        .record = .{ .group_id = 51, .replica_id = 1, .local_node_id = 1 },
+        .peer_node_ids = &.{ 1, 2, 3 },
+        .learner_node_ids = &.{ 4, 5 },
+    };
+    const rhs: PlacementIntent = .{
+        .record = lhs.record,
+        .peer_node_ids = &.{ 3, 1, 2 },
+        .learner_node_ids = &.{ 5, 4 },
+    };
+    try std.testing.expectEqual(hashIntent(lhs), hashIntent(rhs));
+}
+
+test "membership-only reconciliation exposes normal waiting state" {
+    var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{});
+    defer host.deinit();
+    var provider = MemoryPlacementProvider.init(std.testing.allocator);
+    defer provider.deinit();
+    var reconciler = Reconciler{
+        .alloc = std.testing.allocator,
+        .host = &host,
+        .provider = provider.provider(),
+    };
+    defer reconciler.deinit();
+
+    const intents = [_]PlacementIntent{.{
+        .record = .{ .group_id = 52, .replica_id = 1, .local_node_id = 1 },
+        .peer_node_ids = &.{1},
+    }};
+    const result = try reconciler.reconcileMembershipOnly(&intents);
+    try std.testing.expectEqual(@as(usize, 1), result.membership_waiting_for_replica);
+    try std.testing.expectEqual(
+        MembershipConvergence.waiting_for_replica,
+        reconciler.membershipStatus(52).?,
+    );
 }
 
 test "membership reconciliation normalizes duplicate and missing local voters" {

@@ -137,6 +137,33 @@ pub const ReplicaDescriptor = struct {
     initial_voters: ?[]const core.types.NodeId = null,
     bootstrap: ReplicaBootstrap = .persisted,
 
+    pub const Topology = struct {
+        /// Nodes that must be reachable while reconciling. This is not an
+        /// assertion that every node is already a voter.
+        transport_nodes: []const core.types.NodeId,
+        /// Authoritative voters used only when persistent storage has no
+        /// ConfState. Existing replicas always use their observed ConfState.
+        bootstrap_voters: []const core.types.NodeId,
+    };
+
+    pub fn identity(self: ReplicaDescriptor) group_mod.ReplicaIdentity {
+        return .{
+            .group_id = self.group.group_id,
+            .local_node_id = self.group.local_node_id,
+        };
+    }
+
+    pub fn runtimePolicy(self: ReplicaDescriptor) group_mod.ReplicaRuntimePolicy {
+        return .fromConfig(self.group.raft_config);
+    }
+
+    pub fn topology(self: ReplicaDescriptor) Topology {
+        return .{
+            .transport_nodes = self.group.raft_config.peers,
+            .bootstrap_voters = self.initial_voters orelse self.group.raft_config.peers,
+        };
+    }
+
     pub fn validateForAdmission(self: ReplicaDescriptor) !void {
         try group_mod.Group.validateConfig(self.group);
         switch (self.bootstrap) {

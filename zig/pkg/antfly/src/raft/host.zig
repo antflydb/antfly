@@ -179,6 +179,7 @@ pub const HostMetrics = struct {
     remove_replica_calls: usize = 0,
     endpoint_refreshes: usize = 0,
     endpoint_removals: usize = 0,
+    replica_admission_conflicts: usize = 0,
     inbound_message_enqueues: usize = 0,
     inbound_message_drains: usize = 0,
     quarantined_inbound_message_drops: usize = 0,
@@ -355,6 +356,7 @@ pub const Host = struct {
     metrics: HostMetrics = .{},
     runtime_host: raft_engine.runtime.MultiRaft,
     bootstrap_statuses: std.AutoHashMapUnmanaged(u64, OwnedBootstrapStatus) = .empty,
+    admission_conflicts: std.AutoHashMapUnmanaged(u64, raft_engine.runtime.group.ReplicaAdmissionConflict) = .empty,
     inbound_mutex: std.atomic.Mutex = .unlocked,
     pending_inbound: std.ArrayListUnmanaged(PendingInboundMessage) = .empty,
 
@@ -383,6 +385,7 @@ pub const Host = struct {
         var bootstrap_it = self.bootstrap_statuses.valueIterator();
         while (bootstrap_it.next()) |bootstrap_status| bootstrap_status.deinit(self.alloc);
         self.bootstrap_statuses.deinit(self.alloc);
+        self.admission_conflicts.deinit(self.alloc);
         self.runtime_host.deinit();
         self.* = undefined;
     }
@@ -450,7 +453,23 @@ pub const Host = struct {
         // This check must precede the durable catalog mutation: overwriting
         // desired state and then rejecting a conflicting live descriptor would
         // leave restart behavior different from the running process.
-        try self.runtime_host.validateReplicaAdmission(descriptor);
+        descriptor.validateForAdmission() catch |err| return err;
+        if (self.runtime_host.replicaAdmissionConflict(descriptor)) |conflict| {
+            const previous = self.admission_conflicts.get(record.group_id);
+            if (previous == null or !std.meta.eql(previous.?, conflict)) {
+                try self.admission_conflicts.put(self.alloc, record.group_id, conflict);
+                self.metrics.replica_admission_conflicts +|= 1;
+                std.log.warn(
+                    "replica admission blocked group_id={d} local_node_id={d} field={s}",
+                    .{ record.group_id, record.local_node_id, conflict.fieldName() },
+                );
+            }
+            return switch (conflict) {
+                .local_node_id => error.LocalNodeIdMismatch,
+                .runtime_policy => error.ReplicaRuntimePolicyMismatch,
+            };
+        }
+        _ = self.admission_conflicts.remove(record.group_id);
 
         // Persist admission before publication. A crash between these steps
         // leaves a recoverable catalog entry instead of an untracked live group.
@@ -462,6 +481,13 @@ pub const Host = struct {
             .descriptor = descriptor,
             .bootstrap_prepared = should_prepare_bootstrap,
         };
+    }
+
+    pub fn replicaAdmissionConflict(
+        self: *Host,
+        group_id: u64,
+    ) ?raft_engine.runtime.group.ReplicaAdmissionConflict {
+        return self.admission_conflicts.get(group_id);
     }
 
     /// Publishes a fully prepared descriptor into the single-owner runtime.
@@ -534,6 +560,7 @@ pub const Host = struct {
         try self.runtime_host.removeReplica(group_id);
         self.metrics.remove_replica_calls += 1;
         self.clearBootstrapStatus(group_id);
+        _ = self.admission_conflicts.remove(group_id);
     }
 
     pub fn restoreReplicasFromCatalog(self: *Host, alloc: std.mem.Allocator) !usize {
@@ -581,6 +608,7 @@ pub const Host = struct {
         try self.runtime_host.removeReplica(group_id);
         self.metrics.remove_replica_calls += 1;
         self.clearBootstrapStatus(group_id);
+        _ = self.admission_conflicts.remove(group_id);
     }
 
     pub fn refreshPeerEndpoints(self: *Host, group_id: u64, node_id: u64) !usize {

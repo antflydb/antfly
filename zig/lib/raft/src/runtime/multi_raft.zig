@@ -638,11 +638,19 @@ pub const MultiRaft = struct {
     pub fn validateReplicaAdmission(self: *MultiRaft, desc: replica_mod.ReplicaDescriptor) !void {
         try desc.validateForAdmission();
         if (self.group(desc.group.group_id)) |existing| {
-            if (existing.localNodeId() != desc.group.local_node_id)
-                return error.LocalNodeIdMismatch;
-            if (!existing.admissionConfigEql(desc.group))
-                return error.ReplicaAdmissionConfigMismatch;
+            switch (existing.admissionConflict(desc.group) orelse return) {
+                .local_node_id => return error.LocalNodeIdMismatch,
+                .runtime_policy => return error.ReplicaRuntimePolicyMismatch,
+            }
         }
+    }
+
+    pub fn replicaAdmissionConflict(
+        self: *MultiRaft,
+        desc: replica_mod.ReplicaDescriptor,
+    ) ?group_mod.ReplicaAdmissionConflict {
+        const existing = self.group(desc.group.group_id) orelse return null;
+        return existing.admissionConflict(desc.group);
     }
 
     /// Reconstructs a replica from an already-durable catalog record. Restore

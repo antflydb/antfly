@@ -247,6 +247,17 @@ pub const ManagedHost = struct {
         return try self.reconciler_loop.prepare();
     }
 
+    pub fn reconcileMembershipOnly(
+        self: *ManagedHost,
+        intents: []const reconciler.PlacementIntent,
+    ) !reconciler.ReconcileResult {
+        return try self.reconciler_loop.reconcileMembershipOnly(intents);
+    }
+
+    pub fn membershipStatus(self: *const ManagedHost, group_id: u64) ?reconciler.MembershipConvergence {
+        return self.reconciler_loop.membershipStatus(group_id);
+    }
+
     pub fn replacePlacementIntents(self: *ManagedHost, intents: []const reconciler.PlacementIntent) !void {
         try self.view.replaceReplicaIntents(intents);
     }
@@ -528,6 +539,17 @@ pub const ManagedHttpHost = struct {
 
     pub fn prepareReconcile(self: *ManagedHttpHost) !reconciler.PreparedReconcile {
         return try self.reconciler_loop.prepare();
+    }
+
+    pub fn reconcileMembershipOnly(
+        self: *ManagedHttpHost,
+        intents: []const reconciler.PlacementIntent,
+    ) !reconciler.ReconcileResult {
+        return try self.reconciler_loop.reconcileMembershipOnly(intents);
+    }
+
+    pub fn membershipStatus(self: *const ManagedHttpHost, group_id: u64) ?reconciler.MembershipConvergence {
+        return self.reconciler_loop.membershipStatus(group_id);
     }
 
     pub fn replacePlacementIntents(self: *ManagedHttpHost, intents: []const reconciler.PlacementIntent) !void {

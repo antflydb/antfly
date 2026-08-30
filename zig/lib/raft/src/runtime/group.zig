@@ -22,6 +22,85 @@ pub const GroupConfig = struct {
     storage: core.Storage,
 };
 
+/// Stable identity of one locally hosted replica. Desired membership is
+/// deliberately absent: voter, learner, and transport topology evolve while
+/// this identity remains installed.
+pub const ReplicaIdentity = struct {
+    group_id: core.types.GroupId,
+    local_node_id: core.types.NodeId,
+};
+
+/// Restart-scoped Raft behavior captured when a live group is admitted.
+/// Bootstrap position, membership, and diagnostic hooks are intentionally not
+/// part of this value: they are either durable observed state or independently
+/// mutable control-plane state.
+pub const ReplicaRuntimePolicy = struct {
+    election_tick: u32,
+    heartbeat_tick: u32,
+    random_seed: ?u64,
+    max_size_per_msg: usize,
+    max_committed_size_per_ready: usize,
+    max_inflight_msgs: u32,
+    max_inflight_bytes: usize,
+    max_uncommitted_entries_size: usize,
+    async_storage_writes: bool,
+    check_quorum: bool,
+    pre_vote: bool,
+    step_down_on_removal: bool,
+    disable_proposal_forwarding: bool,
+    disable_conf_change_validation: bool,
+    read_only_option: core.types.ReadOnlyOption,
+
+    pub fn fromConfig(cfg: core.Config) ReplicaRuntimePolicy {
+        const normalized = cfg.withNormalizedDefaults();
+        return .{
+            .election_tick = normalized.election_tick,
+            .heartbeat_tick = normalized.heartbeat_tick,
+            .random_seed = normalized.random_seed,
+            .max_size_per_msg = normalized.max_size_per_msg,
+            .max_committed_size_per_ready = normalized.max_committed_size_per_ready,
+            .max_inflight_msgs = normalized.max_inflight_msgs,
+            .max_inflight_bytes = normalized.max_inflight_bytes,
+            .max_uncommitted_entries_size = normalized.max_uncommitted_entries_size,
+            .async_storage_writes = normalized.async_storage_writes,
+            .check_quorum = normalized.check_quorum,
+            .pre_vote = normalized.pre_vote,
+            .step_down_on_removal = normalized.step_down_on_removal,
+            .disable_proposal_forwarding = normalized.disable_proposal_forwarding,
+            .disable_conf_change_validation = normalized.disable_conf_change_validation,
+            .read_only_option = normalized.read_only_option,
+        };
+    }
+
+    pub fn firstConflict(
+        self: ReplicaRuntimePolicy,
+        desired: ReplicaRuntimePolicy,
+    ) ?ReplicaRuntimePolicyField {
+        inline for (std.meta.fields(ReplicaRuntimePolicy)) |field| {
+            if (!std.meta.eql(@field(self, field.name), @field(desired, field.name)))
+                return @field(ReplicaRuntimePolicyField, field.name);
+        }
+        return null;
+    }
+};
+
+pub const ReplicaRuntimePolicyField = std.meta.FieldEnum(ReplicaRuntimePolicy);
+
+pub const ReplicaAdmissionConflict = union(enum) {
+    local_node_id: struct {
+        installed: core.types.NodeId,
+        desired: core.types.NodeId,
+    },
+    runtime_policy: ReplicaRuntimePolicyField,
+
+    pub fn fieldName(self: ReplicaAdmissionConflict) []const u8 {
+        return switch (self) {
+            .local_node_id => "local_node_id",
+            .runtime_policy => |field| @tagName(field),
+        };
+    }
+};
+
 pub const Group = struct {
     const max_tracked_proposal_receipts: usize = 4096;
 
@@ -79,35 +158,30 @@ pub const Group = struct {
         return self.cfg.local_node_id;
     }
 
-    /// Catalog-backed `ensureReplica` is idempotent only for the descriptor
-    /// that originally admitted this live group. Membership evolution remains
-    /// a Raft operation; it must not be smuggled in by overwriting the catalog.
-    /// `applied` is deliberately excluded because durable providers refresh it
-    /// from storage while the live group's bootstrap value remains unchanged.
+    pub fn identity(self: *const Group) ReplicaIdentity {
+        return .{ .group_id = self.cfg.group_id, .local_node_id = self.cfg.local_node_id };
+    }
+
+    pub fn runtimePolicy(self: *const Group) ReplicaRuntimePolicy {
+        return .fromConfig(self.cfg.raft_config);
+    }
+
+    /// Admission idempotence covers stable identity and restart-scoped policy
+    /// only. `raft_config.peers` is a bootstrap/transport reachability input;
+    /// live membership is authoritative in ConfState and changes exclusively
+    /// through committed ConfChange entries.
+    pub fn admissionConflict(self: *const Group, cfg: GroupConfig) ?ReplicaAdmissionConflict {
+        if (self.cfg.local_node_id != cfg.local_node_id) return .{ .local_node_id = .{
+            .installed = self.cfg.local_node_id,
+            .desired = cfg.local_node_id,
+        } };
+        if (self.runtimePolicy().firstConflict(.fromConfig(cfg.raft_config))) |field|
+            return .{ .runtime_policy = field };
+        return null;
+    }
+
     pub fn admissionConfigEql(self: *const Group, cfg: GroupConfig) bool {
-        if (self.cfg.group_id != cfg.group_id or self.cfg.local_node_id != cfg.local_node_id)
-            return false;
-        const lhs = self.cfg.raft_config;
-        const rhs = cfg.raft_config.withNormalizedDefaults();
-        if (lhs.id != rhs.id or lhs.group_id != rhs.group_id or
-            lhs.election_tick != rhs.election_tick or lhs.heartbeat_tick != rhs.heartbeat_tick or
-            lhs.random_seed != rhs.random_seed or
-            lhs.max_size_per_msg != rhs.max_size_per_msg or
-            lhs.max_committed_size_per_ready != rhs.max_committed_size_per_ready or
-            lhs.max_inflight_msgs != rhs.max_inflight_msgs or
-            lhs.max_inflight_bytes != rhs.max_inflight_bytes or
-            lhs.max_uncommitted_entries_size != rhs.max_uncommitted_entries_size or
-            lhs.async_storage_writes != rhs.async_storage_writes or
-            lhs.check_quorum != rhs.check_quorum or lhs.pre_vote != rhs.pre_vote or
-            lhs.step_down_on_removal != rhs.step_down_on_removal or
-            lhs.disable_proposal_forwarding != rhs.disable_proposal_forwarding or
-            lhs.disable_conf_change_validation != rhs.disable_conf_change_validation or
-            lhs.read_only_option != rhs.read_only_option or lhs.peers.len != rhs.peers.len)
-            return false;
-        for (lhs.peers) |peer| {
-            if (std.mem.indexOfScalar(core.types.NodeId, rhs.peers, peer) == null) return false;
-        }
-        return true;
+        return self.admissionConflict(cfg) == null;
     }
 
     pub fn asyncStorageWrites(self: *const Group) bool {
