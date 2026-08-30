@@ -603,9 +603,23 @@ def _wait_for_standby_lookup(
     raise AssertionError(f"standby lookup for {key!r} did not become visible; last_error={last_error}\n{cluster.debug_logs()}")
 
 
-def _primary_lsn(cluster: HACluster) -> int:
-    status = cluster.primary.admin_get("/primary/status")
-    return int(status["snapshot"]["current_lsn"])
+def _primary_lsn(cluster: HACluster, *, timeout_s: float = 20.0) -> int:
+    deadline = time.monotonic() + timeout_s
+    last_response: requests.Response | None = None
+    while time.monotonic() < deadline:
+        response = cluster.primary.admin_get_response("/primary/status")
+        last_response = response
+        if response.status_code == 200:
+            status = cluster.primary._check(response)
+            return int(status["snapshot"]["current_lsn"])
+        if response.status_code == 503 and response.text == "HAStateTransitionBusy":
+            time.sleep(0.1)
+            continue
+        cluster.primary._check(response)
+    raise AssertionError(
+        "primary status remained transition-busy before the deadline; "
+        f"last_response={last_response}\n{cluster.debug_logs()}"
+    )
 
 
 def _wait_for_primary_slot_applied(
