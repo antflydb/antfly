@@ -150,8 +150,12 @@ pub const FileReplicaCatalog = struct {
     fn loadRecords(self: *FileReplicaCatalog, alloc: std.mem.Allocator) ![]replica.ReplicaRecord {
         self.loaded_from_backup = false;
         return self.loadRecordsAtPath(alloc, self.path) catch |primary_err| {
-            if (primary_err == error.OutOfMemory or primary_err == error.AccessDenied)
-                return primary_err;
+            // A backup is evidence for torn/corrupt catalog recovery, not an
+            // availability substitute for the primary filesystem. Serving an
+            // older desired-state generation after EIO, descriptor exhaustion,
+            // or resource pressure can resurrect retired replicas. Preserve
+            // those operational errors verbatim and fail closed.
+            if (!isRecoverablePrimaryCatalogError(primary_err)) return primary_err;
             const backup_path = try std.fmt.allocPrint(alloc, "{s}.bak", .{self.path});
             defer alloc.free(backup_path);
             const records = self.loadRecordsAtPath(alloc, backup_path) catch |backup_err| switch (backup_err) {
@@ -278,6 +282,26 @@ pub const FileReplicaCatalog = struct {
         alloc.free(records);
     }
 };
+
+fn isRecoverablePrimaryCatalogError(err: anyerror) bool {
+    return switch (err) {
+        error.FileNotFound,
+        error.EndOfStream,
+        error.StreamTooLong,
+        error.InvalidReplicaCatalogMagic,
+        error.ReplicaCatalogTooManyRecords,
+        error.InvalidReplicaCatalogFooter,
+        error.InvalidReplicaCatalogChecksum,
+        error.ReplicaCatalogPeerSetTooLarge,
+        error.ReplicaCatalogFieldTooLarge,
+        error.InvalidReplicaCatalogBoolean,
+        error.InvalidReplicaCatalogEnum,
+        error.InvalidReplicaCatalogBootstrap,
+        error.InvalidReplicaCatalogReadOnlyOption,
+        => true,
+        else => false,
+    };
+}
 
 fn lockCatalog(mutex: *std.atomic.Mutex) void {
     var attempts: usize = 0;
@@ -804,4 +828,12 @@ test "file replica catalog detects torn primary and restores last-known-good gen
         std.testing.allocator.free(healed);
     }
     try std.testing.expectEqual(@as(u64, 13), healed[0].raft.applied);
+}
+
+test "file replica catalog fallback is limited to integrity failures" {
+    try std.testing.expect(isRecoverablePrimaryCatalogError(error.InvalidReplicaCatalogChecksum));
+    try std.testing.expect(isRecoverablePrimaryCatalogError(error.EndOfStream));
+    try std.testing.expect(!isRecoverablePrimaryCatalogError(error.InputOutput));
+    try std.testing.expect(!isRecoverablePrimaryCatalogError(error.SystemResources));
+    try std.testing.expect(!isRecoverablePrimaryCatalogError(error.NoSpaceLeft));
 }

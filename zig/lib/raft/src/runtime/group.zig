@@ -40,22 +40,27 @@ pub const Group = struct {
     raw_node: core.RawNode,
     tracked_proposal_receipts: std.AutoHashMapUnmanaged(ProposalReceiptKey, ProposalReceiptProof) = .empty,
 
-    pub fn init(alloc: std.mem.Allocator, cfg: GroupConfig) !Group {
+    pub fn validateConfig(cfg: GroupConfig) !void {
         if (cfg.group_id == 0) return error.InvalidGroupId;
         if (cfg.local_node_id == 0) return error.InvalidLocalNodeId;
         if (cfg.raft_config.group_id != cfg.group_id) return error.GroupIdMismatch;
         if (cfg.raft_config.id != cfg.local_node_id) return error.LocalNodeIdMismatch;
+        try cfg.raft_config.validate();
+    }
 
-        const owned_peers = try alloc.dupe(core.types.NodeId, cfg.raft_config.peers);
-        errdefer alloc.free(owned_peers);
+    pub fn init(alloc: std.mem.Allocator, cfg: GroupConfig) !Group {
+        try validateConfig(cfg);
 
         var owned_cfg = cfg;
+        owned_cfg.raft_config = cfg.raft_config.withNormalizedDefaults();
+        const owned_peers = try alloc.dupe(core.types.NodeId, owned_cfg.raft_config.peers);
+        errdefer alloc.free(owned_peers);
         owned_cfg.raft_config.peers = owned_peers;
 
         return .{
             .alloc = alloc,
             .cfg = owned_cfg,
-            .raw_node = try core.RawNode.init(alloc, cfg.raft_config, cfg.storage),
+            .raw_node = try core.RawNode.init(alloc, owned_cfg.raft_config, cfg.storage),
         };
     }
 
@@ -72,6 +77,37 @@ pub const Group = struct {
 
     pub fn localNodeId(self: *const Group) core.types.NodeId {
         return self.cfg.local_node_id;
+    }
+
+    /// Catalog-backed `ensureReplica` is idempotent only for the descriptor
+    /// that originally admitted this live group. Membership evolution remains
+    /// a Raft operation; it must not be smuggled in by overwriting the catalog.
+    /// `applied` is deliberately excluded because durable providers refresh it
+    /// from storage while the live group's bootstrap value remains unchanged.
+    pub fn admissionConfigEql(self: *const Group, cfg: GroupConfig) bool {
+        if (self.cfg.group_id != cfg.group_id or self.cfg.local_node_id != cfg.local_node_id)
+            return false;
+        const lhs = self.cfg.raft_config;
+        const rhs = cfg.raft_config.withNormalizedDefaults();
+        if (lhs.id != rhs.id or lhs.group_id != rhs.group_id or
+            lhs.election_tick != rhs.election_tick or lhs.heartbeat_tick != rhs.heartbeat_tick or
+            lhs.random_seed != rhs.random_seed or
+            lhs.max_size_per_msg != rhs.max_size_per_msg or
+            lhs.max_committed_size_per_ready != rhs.max_committed_size_per_ready or
+            lhs.max_inflight_msgs != rhs.max_inflight_msgs or
+            lhs.max_inflight_bytes != rhs.max_inflight_bytes or
+            lhs.max_uncommitted_entries_size != rhs.max_uncommitted_entries_size or
+            lhs.async_storage_writes != rhs.async_storage_writes or
+            lhs.check_quorum != rhs.check_quorum or lhs.pre_vote != rhs.pre_vote or
+            lhs.step_down_on_removal != rhs.step_down_on_removal or
+            lhs.disable_proposal_forwarding != rhs.disable_proposal_forwarding or
+            lhs.disable_conf_change_validation != rhs.disable_conf_change_validation or
+            lhs.read_only_option != rhs.read_only_option or lhs.peers.len != rhs.peers.len)
+            return false;
+        for (lhs.peers) |peer| {
+            if (std.mem.indexOfScalar(core.types.NodeId, rhs.peers, peer) == null) return false;
+        }
+        return true;
     }
 
     pub fn asyncStorageWrites(self: *const Group) bool {

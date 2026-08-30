@@ -16088,9 +16088,8 @@ const RemoteMetadataSource = struct {
         const deadline_ns = platform_time.monotonicNs() +|
             @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
         const discovery_budget = antfly.metadata_http_client.RequestBudget{ .deadline_ns = deadline_ns };
-        var forwarding_hops_remaining = antfly.public_api.raft_mutation_forwarding.max_forwards;
+        var mutation_driver = antfly.public_api.raft_mutation_forwarding.AbsoluteDriver.init(deadline_ns);
         var last_pre_admission_err: anyerror = error.MissingMetadataApi;
-        var mutation_attempted = false;
         for (0..self.base_uris.len) |attempt| {
             if (platform_time.monotonicNs() >= deadline_ns)
                 return error.NotLeader;
@@ -16109,14 +16108,11 @@ const RemoteMetadataSource = struct {
                 last_pre_admission_err = err;
                 continue;
             };
-            if (forwarding_hops_remaining == 0)
+            if (mutation_driver.forwards_remaining == 0)
                 return error.NotLeader;
-            const forwarding = antfly.public_api.raft_mutation_forwarding.contextForDeadline(
+            const forwarding = mutation_driver.nextContext(
                 platform_time.monotonicNs(),
-                deadline_ns,
                 50 * std.time.ns_per_ms,
-                forwarding_hops_remaining,
-                !mutation_attempted,
             ) orelse return error.NotLeader;
             const result = callFn(
                 self,
@@ -16132,14 +16128,12 @@ const RemoteMetadataSource = struct {
                     last_pre_admission_err = error.NotLeader;
                     continue;
                 }
-                forwarding_hops_remaining = forwarding.forwards_remaining;
-                mutation_attempted = true;
+                mutation_driver.recordDelivered(forwarding);
                 if (!remoteMetadataMutationRetryable(err)) return err;
                 last_pre_admission_err = err;
                 continue;
             };
-            forwarding_hops_remaining = forwarding.forwards_remaining;
-            mutation_attempted = true;
+            mutation_driver.recordDelivered(forwarding);
             self.noteMetadataAuthoritySuccess(index);
             return result;
         }

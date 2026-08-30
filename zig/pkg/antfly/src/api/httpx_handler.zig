@@ -107,6 +107,7 @@ const RaftQuarantineView = struct {
     observed_bytes: usize,
     configured_limit_at_detection: usize,
     current_limit_bytes: usize,
+    max_recovery_bytes: usize,
     first_observed_round: u64,
     last_observed_round: u64,
     occurrences: u64,
@@ -122,6 +123,7 @@ const RaftQuarantineView = struct {
             .observed_bytes = quarantine.observed_bytes,
             .configured_limit_at_detection = quarantine.configured_limit,
             .current_limit_bytes = status.current_limit,
+            .max_recovery_bytes = status.max_recovery_bytes,
             .first_observed_round = quarantine.first_observed_round,
             .last_observed_round = quarantine.last_observed_round,
             .occurrences = quarantine.occurrences,
@@ -129,7 +131,7 @@ const RaftQuarantineView = struct {
             .suggested_action = if (status.can_resume)
                 "resume with the current incident_id"
             else
-                "raise the matching Ready safety limit to at least observed_bytes, then resume with the current incident_id",
+                "authorize a one-shot recovery allowance of at least observed_bytes for the current incident_id",
         };
     }
 };
@@ -1253,7 +1255,7 @@ pub const AntflyApiHandler = struct {
             return switch (err) {
                 error.UnknownGroup, error.GroupNotQuarantined => textResponse(ctx, 404, "raft group is not quarantined on this node"),
                 error.QuarantineIncidentChanged => textResponse(ctx, 409, "quarantine incident changed; refresh status before retrying"),
-                error.InvalidQuarantineRecoveryLimit => textResponse(ctx, 422, "new_limit_bytes must be monotonic and cover observed_bytes"),
+                error.InvalidQuarantineRecoveryLimit => textResponse(ctx, 422, "new_limit_bytes must cover observed_bytes and remain within the configured recovery ceiling"),
                 error.QuarantineLimitStillExceeded => textResponse(ctx, 409, "current safety limit still does not cover the retained Ready"),
                 else => textResponse(ctx, 503, "raft quarantine recovery unavailable"),
             };
@@ -7484,6 +7486,7 @@ test "httpx raft quarantine administration is authenticated and incident fenced"
     try std.testing.expect(std.mem.indexOf(u8, listed.body.?, "\"incident_id\":77") != null);
     try std.testing.expect(std.mem.indexOf(u8, listed.body.?, "\"can_resume\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, listed.body.?, "\"suggested_action\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body.?, "\"max_recovery_bytes\"") != null);
 
     const resume_url = try std.fmt.allocPrint(
         alloc,

@@ -42,6 +42,11 @@ pub const RuntimeConfig = struct {
     /// is empty. Operators should size this above the largest accepted entry
     /// or snapshot representation while keeping it below an OOM-scale value.
     max_single_apply_ready_bytes: usize = std.math.maxInt(usize),
+    /// Absolute ceiling for an operator-authorized, incident-local Ready
+    /// recovery permit. The normal per-Ready limits remain immutable.
+    max_quarantine_recovery_bytes: usize = 1 << 30,
+    /// Recovery permits are deliberately short lived and single use.
+    quarantine_recovery_permit_rounds: u64 = 6_000,
     /// Aggregate snapshot payload ownership retained by fetch, Raft Ready,
     /// persistence, and apply. This is intentionally separate from apply queue
     /// pressure because an accepted snapshot may still be pending in Raft.
@@ -193,14 +198,27 @@ pub const GroupQuarantineStatus = struct {
     group_id: core.types.GroupId,
     quarantine: scheduler_mod.GroupQuarantine,
     current_limit: usize,
+    max_recovery_bytes: usize,
     can_resume: bool,
 };
 
 pub const ResumeQuarantineOptions = struct {
     expected_incident_id: u64,
-    /// Optional live safety-limit increase. It must be monotonic and cover the
-    /// retained Ready before the group can be resumed.
+    /// Optional one-shot allowance for this incident's retained Ready. The
+    /// process-wide safety limit is never changed.
     new_limit_bytes: ?usize = null,
+};
+
+const RecoveryPermitKey = struct {
+    group_id: core.types.GroupId,
+    reason: QuarantineReason,
+};
+
+const RecoveryPermit = struct {
+    incident_id: u64,
+    observed_bytes: usize,
+    allowance_bytes: usize,
+    expires_after_round: u64,
 };
 
 const PendingApplyTask = struct {
@@ -460,6 +478,7 @@ pub const MultiRaft = struct {
     // are admitted so the consensus hot path never allocates merely to record
     // hard-limit quarantines.
     oversized_ready_scratch: std.ArrayListUnmanaged(OversizedReadyGroup) = .empty,
+    recovery_permits: std.AutoHashMapUnmanaged(RecoveryPermitKey, RecoveryPermit) = .empty,
     snapshot_candidates: std.AutoHashMapUnmanaged(core.types.GroupId, SnapshotCandidate) = .empty,
     next_snapshot_candidate_sequence: u64 = 1,
     snapshot_worker: ?*SnapshotBuildWorker = null,
@@ -494,6 +513,7 @@ pub const MultiRaft = struct {
         for (self.pending_apply.items) |*task| task.deinit(self.alloc);
         self.pending_apply.deinit(self.alloc);
         self.oversized_ready_scratch.deinit(self.alloc);
+        self.recovery_permits.deinit(self.alloc);
         var snapshot_candidates = self.snapshot_candidates.valueIterator();
         while (snapshot_candidates.next()) |candidate| candidate.deinit(self.alloc);
         self.snapshot_candidates.deinit(self.alloc);
@@ -540,13 +560,10 @@ pub const MultiRaft = struct {
     }
 
     pub fn ensureReplica(self: *MultiRaft, desc: replica_mod.ReplicaDescriptor) !replica_mod.EnsureReplicaResult {
+        try self.validateReplicaAdmission(desc);
         // Reject deterministic conflicts before changing desired state. The
         // runtime is single-owner, so this check and publication cannot race
         // another local admission.
-        if (self.group(desc.group.group_id)) |existing| {
-            if (existing.localNodeId() != desc.group.local_node_id)
-                return error.LocalNodeIdMismatch;
-        }
         // The catalog is durable desired state. Validate and publish admission
         // before exposing a live group or fetching bytes. A later runtime
         // failure intentionally leaves retryable admission debt for restart or
@@ -555,11 +572,31 @@ pub const MultiRaft = struct {
         return try self.installReplicaDescriptor(desc);
     }
 
+    /// Publishes a descriptor whose admission is owned by an outer durable
+    /// catalog transaction. This is the production Host/Reconciler boundary;
+    /// it deliberately cannot write the runtime's optional standalone catalog.
+    pub fn installDurableReplica(self: *MultiRaft, desc: replica_mod.ReplicaDescriptor) !replica_mod.EnsureReplicaResult {
+        try self.validateReplicaAdmission(desc);
+        return try self.installReplicaDescriptor(desc);
+    }
+
+    /// Validates both the descriptor and its idempotence against any live
+    /// replica. Durable catalog owners call this before committing admission.
+    pub fn validateReplicaAdmission(self: *MultiRaft, desc: replica_mod.ReplicaDescriptor) !void {
+        try desc.validateForAdmission();
+        if (self.group(desc.group.group_id)) |existing| {
+            if (existing.localNodeId() != desc.group.local_node_id)
+                return error.LocalNodeIdMismatch;
+            if (!existing.admissionConfigEql(desc.group))
+                return error.ReplicaAdmissionConfigMismatch;
+        }
+    }
+
     /// Reconstructs a replica from an already-durable catalog record. Restore
     /// must never rewrite that record: decoder-first releases may legitimately
     /// read a format that their predecessor-compatible writer cannot emit.
     pub fn restoreReplica(self: *MultiRaft, desc: replica_mod.ReplicaDescriptor) !replica_mod.EnsureReplicaResult {
-        return try self.installReplicaDescriptor(desc);
+        return try self.installDurableReplica(desc);
     }
 
     fn installReplicaDescriptor(self: *MultiRaft, desc: replica_mod.ReplicaDescriptor) !replica_mod.EnsureReplicaResult {
@@ -643,6 +680,8 @@ pub const MultiRaft = struct {
         }
         self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
         self.removePendingAppliesForGroup(group_id);
+        _ = self.recovery_permits.remove(.{ .group_id = group_id, .reason = .outbound_ready_too_large });
+        _ = self.recovery_permits.remove(.{ .group_id = group_id, .reason = .apply_ready_too_large });
         var grp = removed.value;
         grp.deinit();
         _ = self.scheduler.unregisterGroup(group_id);
@@ -689,18 +728,51 @@ pub const MultiRaft = struct {
             .apply_ready_too_large => self.cfg.max_single_apply_ready_bytes,
         };
         if (options.new_limit_bytes) |new_limit| {
-            if (new_limit < configured_limit or new_limit < quarantine.observed_bytes)
+            if (new_limit < quarantine.observed_bytes or
+                new_limit > self.cfg.max_quarantine_recovery_bytes)
                 return error.InvalidQuarantineRecoveryLimit;
-            switch (quarantine.reason) {
-                .outbound_ready_too_large => self.cfg.max_single_outbound_ready_bytes = new_limit,
-                .apply_ready_too_large => self.cfg.max_single_apply_ready_bytes = new_limit,
-            }
+            try self.recovery_permits.put(self.alloc, .{
+                .group_id = group_id,
+                .reason = quarantine.reason,
+            }, .{
+                .incident_id = quarantine.incident_id,
+                .observed_bytes = quarantine.observed_bytes,
+                .allowance_bytes = new_limit,
+                .expires_after_round = self.scheduler.round() +|
+                    self.cfg.quarantine_recovery_permit_rounds,
+            });
         } else if (configured_limit < quarantine.observed_bytes) {
             return error.QuarantineLimitStillExceeded;
         }
         _ = try self.scheduler.resumeQuarantinedGroup(group_id, options.expected_incident_id);
         self.metrics.quarantine_resume_successes +|= 1;
         self.refreshMetricsTopology();
+    }
+
+    fn recoveryPermitAllows(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        reason: QuarantineReason,
+        observed_bytes: usize,
+    ) bool {
+        const key = RecoveryPermitKey{ .group_id = group_id, .reason = reason };
+        const permit = self.recovery_permits.get(key) orelse return false;
+        if (self.scheduler.round() > permit.expires_after_round or
+            permit.observed_bytes != observed_bytes or
+            observed_bytes > permit.allowance_bytes)
+        {
+            _ = self.recovery_permits.remove(key);
+            return false;
+        }
+        return true;
+    }
+
+    fn consumeRecoveryPermit(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        reason: QuarantineReason,
+    ) void {
+        _ = self.recovery_permits.remove(.{ .group_id = group_id, .reason = reason });
     }
 
     pub fn listQuarantines(self: *const MultiRaft, alloc: std.mem.Allocator) ![]GroupQuarantineStatus {
@@ -717,6 +789,7 @@ pub const MultiRaft = struct {
                 .group_id = group_id.*,
                 .quarantine = quarantine,
                 .current_limit = configured_limit,
+                .max_recovery_bytes = self.cfg.max_quarantine_recovery_bytes,
                 .can_resume = configured_limit >= quarantine.observed_bytes,
             };
             initialized += 1;
@@ -1319,6 +1392,12 @@ pub const MultiRaft = struct {
             outbox.items.items.len +| ready_pressure.message_count,
             outbox.approxBytes() +| ready_pressure.message_bytes,
         );
+        const outbound_recovery_permit = ready_pressure.message_bytes >
+            self.cfg.max_single_outbound_ready_bytes and self.recoveryPermitAllows(
+            group_id,
+            .outbound_ready_too_large,
+            ready_pressure.message_bytes,
+        );
         // A byte ceiling must bound backlog, not make a single bounded Ready
         // impossible forever. When both queues are empty, admit one oversized
         // Ready so Raft can make progress; subsequent groups remain gated until
@@ -1327,8 +1406,11 @@ pub const MultiRaft = struct {
             self.pending_outbox.items.items.len == 0 and
             outbox.items.items.len == 0 and
             ready_pressure.message_count <= self.cfg.max_pending_outbound_messages and
-            ready_pressure.message_bytes <= self.cfg.max_single_outbound_ready_bytes;
-        if (ready_pressure.message_bytes > self.cfg.max_single_outbound_ready_bytes) {
+            (ready_pressure.message_bytes <= self.cfg.max_single_outbound_ready_bytes or
+                outbound_recovery_permit);
+        if (ready_pressure.message_bytes > self.cfg.max_single_outbound_ready_bytes and
+            !outbound_recovery_permit)
+        {
             if (diagnostics) |diag| {
                 diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
                 diag.rejected_oversized_outbound_ready = true;
@@ -1366,10 +1448,19 @@ pub const MultiRaft = struct {
             new_apply_tasks,
             apply_ready_bytes,
         );
+        const apply_recovery_permit = apply_ready_bytes >
+            self.cfg.max_single_apply_ready_bytes and self.recoveryPermitAllows(
+            group_id,
+            .apply_ready_too_large,
+            apply_ready_bytes,
+        );
         const apply_single_ready_progress = self.pending_apply.items.len == 0 and
             new_apply_tasks <= self.cfg.max_pending_apply_tasks and
-            apply_ready_bytes <= self.cfg.max_single_apply_ready_bytes;
-        if (apply_ready_bytes > self.cfg.max_single_apply_ready_bytes) {
+            (apply_ready_bytes <= self.cfg.max_single_apply_ready_bytes or
+                apply_recovery_permit);
+        if (apply_ready_bytes > self.cfg.max_single_apply_ready_bytes and
+            !apply_recovery_permit)
+        {
             if (diagnostics) |diag| {
                 diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
                 diag.rejected_oversized_apply_ready = true;
@@ -1489,6 +1580,10 @@ pub const MultiRaft = struct {
             if (diagnostics) |diag| diag.inline_transport_flush_elapsed_ns = clock.elapsedSinceNs(inline_transport_flush_start_ns);
         }
         const has_more_ready = grp.hasReady();
+        if (outbound_recovery_permit)
+            self.consumeRecoveryPermit(group_id, .outbound_ready_too_large);
+        if (apply_recovery_permit)
+            self.consumeRecoveryPermit(group_id, .apply_ready_too_large);
         if (diagnostics) |diag| diag.has_more_ready = has_more_ready;
         self.scheduler.completeReady(group_id, has_more_ready);
         return true;

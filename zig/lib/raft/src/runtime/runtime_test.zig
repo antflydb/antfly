@@ -2414,6 +2414,14 @@ test "multi raft drainReady quarantines an impossible outbound Ready hard ceilin
     try std.testing.expectEqual(@as(usize, 2), host.metricsSnapshot().quarantine_resume_attempts);
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().quarantine_resume_successes);
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().quarantine_resume_conflicts);
+    // The permit is scoped to the retained Ready and consumed when it
+    // advances; the process-wide one-byte ceiling remains unchanged.
+    try std.testing.expectEqual(@as(usize, 1), (try host.drainReady(1)).processed_ready_steps);
+    try host.campaignGroup(258);
+    try std.testing.expectEqual(@as(usize, 0), (try host.drainReady(1)).processed_ready_steps);
+    const next_incident = host.groupQuarantine(258).?;
+    try std.testing.expectEqual(@as(usize, 1), next_incident.configured_limit);
+    try std.testing.expect(next_incident.incident_id != quarantine.incident_id);
 }
 
 test "multi raft drainReady quarantines an impossible apply Ready hard ceiling" {
@@ -2706,6 +2714,82 @@ test "multi raft restoreReplicasFromCatalog reconstructs persisted replica" {
     try std.testing.expect(host.group(141) != null);
     try std.testing.expectEqual(@as(core.types.Index, 7), host.group(141).?.status().hard.commit_index);
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().restored_replicas);
+}
+
+test "multi raft validates catalog admission before durability and fences config replacement" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var catalog = runtime.MemoryReplicaCatalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
+        .replica_catalog = catalog.catalog(),
+    });
+    defer host.deinit();
+
+    const empty_peers = [_]core.types.NodeId{};
+    try std.testing.expectError(error.EmptyPeerSet, host.ensureReplica(.{
+        .group = .{
+            .group_id = 146,
+            .local_node_id = 1,
+            .raft_config = .{
+                .id = 1,
+                .group_id = 146,
+                .peers = empty_peers[0..],
+            },
+            .storage = store.storage(),
+        },
+    }));
+    try std.testing.expect(!catalog.contains(146));
+
+    var peers = [_]core.types.NodeId{1};
+    _ = try host.ensureReplica(.{
+        .group = .{
+            .group_id = 146,
+            .local_node_id = 1,
+            .raft_config = .{
+                .id = 1,
+                .group_id = 146,
+                .peers = peers[0..],
+            },
+            .storage = store.storage(),
+        },
+    });
+    // Explicit and implicit defaults describe the same admission and must be
+    // idempotent across mixed-version descriptor producers.
+    _ = try host.ensureReplica(.{
+        .group = .{
+            .group_id = 146,
+            .local_node_id = 1,
+            .raft_config = .{
+                .id = 1,
+                .group_id = 146,
+                .peers = peers[0..],
+                .max_committed_size_per_ready = std.math.maxInt(usize),
+                .max_inflight_bytes = std.math.maxInt(usize),
+            },
+            .storage = store.storage(),
+        },
+    });
+    try std.testing.expectError(error.ReplicaAdmissionConfigMismatch, host.ensureReplica(.{
+        .group = .{
+            .group_id = 146,
+            .local_node_id = 1,
+            .raft_config = .{
+                .id = 1,
+                .group_id = 146,
+                .peers = peers[0..],
+                .election_tick = 11,
+            },
+            .storage = store.storage(),
+        },
+    }));
+    const records = try catalog.catalog().listReplicas(std.testing.allocator);
+    defer {
+        for (records) |*record| record.deinit(std.testing.allocator);
+        std.testing.allocator.free(records);
+    }
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(@as(u32, 10), records[0].raft.election_tick);
 }
 
 test "multi raft restore is read-only across decoder-first catalog upgrades" {

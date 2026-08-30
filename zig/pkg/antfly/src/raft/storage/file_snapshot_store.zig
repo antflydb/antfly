@@ -13,12 +13,26 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
 const fs_paths = @import("../../common/fs_paths.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const http_server = @import("../transport/http_server.zig");
 const snapshot_transfer = @import("../transport/snapshot_transfer.zig");
+const raft_engine = @import("raft_engine");
+
+const MappedSnapshotOwner = struct {
+    alloc: std.mem.Allocator,
+    mapped: []align(std.heap.page_size_min) u8,
+
+    fn release(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const alloc = self.alloc;
+        std.posix.munmap(self.mapped);
+        alloc.destroy(self);
+    }
+};
 
 pub const SnapshotArtifactPolicy = struct {
     max_bytes: u64 = 4 * 1024 * 1024 * 1024,
@@ -55,7 +69,7 @@ pub const FileSnapshotStore = struct {
     cfg: FileSnapshotStoreConfig,
     io_impl: std.Io.Threaded,
     root_dir: []u8,
-    upload_locks: [64]std.atomic.Mutex = [_]std.atomic.Mutex{.unlocked} ** 64,
+    upload_locks: [1024]std.atomic.Mutex = [_]std.atomic.Mutex{.unlocked} ** 1024,
     artifact_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     next_artifact_maintenance_ns: std.atomic.Value(u64) = .init(0),
     fetch_lease_mutex: std.atomic.Mutex = .unlocked,
@@ -317,7 +331,7 @@ pub const FileSnapshotStore = struct {
         snapshot_id: []const u8,
         generation: snapshot_transfer.Generation,
         materialize: bool,
-    ) !?@import("raft_engine").core.types.Snapshot {
+    ) !?raft_engine.core.types.Snapshot {
         const self: *FileSnapshotStore = @ptrCast(@alignCast(ptr));
         try validateSnapshotId(snapshot_id);
         const lock = self.uploadLock(snapshot_id);
@@ -340,11 +354,6 @@ pub const FileSnapshotStore = struct {
         errdefer manifest.deinit(alloc);
         const artifact_path = if (publish) staging_path else committed_path;
         const data_offset = try self.dataOffset(artifact_path);
-        const materialized_data: ?[]u8 = if (materialize) blk: {
-            const data_len = std.math.cast(usize, manifest.data_len) orelse return error.SnapshotTooLarge;
-            break :blk try alloc.alloc(u8, data_len);
-        } else null;
-        errdefer if (materialized_data) |data| alloc.free(data);
         var file = try std.Io.Dir.cwd().openFile(io(self), artifact_path, .{ .mode = .read_write });
         var file_open = true;
         defer if (file_open) file.close(io(self));
@@ -355,10 +364,7 @@ pub const FileSnapshotStore = struct {
         var read_offset: u64 = 0;
         while (read_offset < manifest.data_len) {
             const wanted: usize = @intCast(@min(buffer.len, manifest.data_len - read_offset));
-            const chunk = if (materialized_data) |data|
-                data[@intCast(read_offset)..][0..wanted]
-            else
-                buffer[0..wanted];
+            const chunk = buffer[0..wanted];
             const read = try file.readPositionalAll(io(self), chunk, data_offset + read_offset);
             if (read != wanted) return error.SnapshotArtifactTruncated;
             hasher.update(chunk[0..read]);
@@ -381,10 +387,53 @@ pub const FileSnapshotStore = struct {
             manifest.deinit(alloc);
             return null;
         }
+        const snapshot_data_len = manifest.data_len;
         const metadata = manifest.metadata;
         manifest.metadata = .{};
         manifest.deinit(alloc);
-        return .{ .metadata = metadata, .data = materialized_data.? };
+        var snapshot: raft_engine.core.types.Snapshot = .{ .metadata = metadata };
+        errdefer snapshot.metadata.deinit(alloc);
+        const data_len = std.math.cast(usize, snapshot_data_len) orelse
+            return error.SnapshotTooLarge;
+        if (data_len == 0) return snapshot;
+
+        if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi and
+            builtin.os.tag != .freestanding)
+        {
+            var mapped_file = try std.Io.Dir.cwd().openFile(io(self), committed_path, .{});
+            defer mapped_file.close(io(self));
+            const file_len = std.math.cast(usize, try mapped_file.length(io(self))) orelse
+                return error.SnapshotTooLarge;
+            const mapped = try std.posix.mmap(
+                null,
+                file_len,
+                .{ .READ = true },
+                .{ .TYPE = .SHARED },
+                mapped_file.handle,
+                0,
+            );
+            errdefer std.posix.munmap(mapped);
+            std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
+            const owner = try alloc.create(MappedSnapshotOwner);
+            errdefer alloc.destroy(owner);
+            owner.* = .{ .alloc = alloc, .mapped = mapped };
+            snapshot.data = mapped[@intCast(data_offset)..][0..data_len];
+            try snapshot.shareExternalData(alloc, .{
+                .ptr = owner,
+                .release = MappedSnapshotOwner.release,
+            }, null);
+            return snapshot;
+        }
+
+        // Platforms without POSIX mappings keep the same ownership contract
+        // with a bounded compatibility copy.
+        snapshot.data = try alloc.alloc(u8, data_len);
+        errdefer alloc.free(snapshot.data);
+        var committed = try std.Io.Dir.cwd().openFile(io(self), committed_path, .{});
+        defer committed.close(io(self));
+        const read = try committed.readPositionalAll(io(self), snapshot.data, data_offset);
+        if (read != data_len) return error.SnapshotArtifactTruncated;
+        return snapshot;
     }
 
     fn getSnapshotManifest(

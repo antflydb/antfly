@@ -70,6 +70,46 @@ pub const Config = struct {
     read_only_option: types.ReadOnlyOption = .safe,
     logger: ?logger_mod.Logger = null,
     trace_logger: ?logger_mod.TraceLogger = null,
+
+    /// Performs every deterministic admission check without consulting
+    /// storage or allocating. Callers that publish durable desired state must
+    /// run this before the catalog write so invalid configuration can never
+    /// become permanent reconciliation debt.
+    pub fn withNormalizedDefaults(self: Config) Config {
+        var effective = self;
+        if (effective.max_committed_size_per_ready == 0)
+            effective.max_committed_size_per_ready = effective.max_size_per_msg;
+        if (effective.max_uncommitted_entries_size == 0)
+            effective.max_uncommitted_entries_size = std.math.maxInt(usize);
+        if (effective.max_inflight_bytes == 0)
+            effective.max_inflight_bytes = std.math.maxInt(usize);
+        return effective;
+    }
+
+    pub fn validate(self: Config) !void {
+        const normalized = self.withNormalizedDefaults();
+
+        if (normalized.id == 0) return error.InvalidNodeId;
+        if (message.isLocalStorageThread(normalized.id)) return error.InvalidLocalNodeId;
+        if (normalized.heartbeat_tick == 0) return error.InvalidHeartbeatTick;
+        if (normalized.election_tick <= normalized.heartbeat_tick) return error.InvalidElectionTick;
+        if (normalized.peers.len == 0) return error.EmptyPeerSet;
+        if (normalized.max_inflight_msgs == 0) return error.InvalidMaxInflightMsgs;
+        if (normalized.max_inflight_bytes < normalized.max_size_per_msg)
+            return error.InvalidMaxInflightBytes;
+        if (normalized.read_only_option == .lease_based and !normalized.check_quorum)
+            return error.LeaseBasedReadRequiresCheckQuorum;
+
+        var local_found = false;
+        for (normalized.peers, 0..) |peer, index| {
+            if (peer == 0 or message.isLocalStorageThread(peer)) return error.InvalidPeerNodeId;
+            if (peer == normalized.id) local_found = true;
+            for (normalized.peers[0..index]) |previous| {
+                if (peer == previous) return error.DuplicatePeerNodeId;
+            }
+        }
+        if (!local_found) return error.LocalNodeNotInPeerSet;
+    }
 };
 
 pub const Raft = struct {
@@ -103,36 +143,15 @@ pub const Raft = struct {
     messages: std.ArrayListUnmanaged(message.Message) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, cfg: Config, storage: storage_mod.Storage) !Raft {
-        var normalized_cfg = cfg;
-        if (normalized_cfg.id == 0) return error.InvalidNodeId;
-        if (message.isLocalStorageThread(normalized_cfg.id)) return error.InvalidLocalNodeId;
-        if (normalized_cfg.heartbeat_tick == 0) return error.InvalidHeartbeatTick;
-        if (normalized_cfg.election_tick <= normalized_cfg.heartbeat_tick) return error.InvalidElectionTick;
-        if (normalized_cfg.max_committed_size_per_ready == 0) {
-            normalized_cfg.max_committed_size_per_ready = normalized_cfg.max_size_per_msg;
-        }
-        if (normalized_cfg.max_uncommitted_entries_size == 0) {
-            normalized_cfg.max_uncommitted_entries_size = std.math.maxInt(usize);
-        }
-        if (normalized_cfg.max_inflight_bytes == 0) {
-            normalized_cfg.max_inflight_bytes = std.math.maxInt(usize);
-        }
+        var normalized_cfg = cfg.withNormalizedDefaults();
         if (normalized_cfg.logger == null) {
             normalized_cfg.logger = logger_mod.defaultLogger();
         }
-
-        if (normalized_cfg.peers.len == 0) return error.EmptyPeerSet;
-        if (normalized_cfg.max_inflight_msgs == 0) return error.InvalidMaxInflightMsgs;
-        if (normalized_cfg.max_inflight_bytes < normalized_cfg.max_size_per_msg) {
-            return error.InvalidMaxInflightBytes;
-        }
-        if (normalized_cfg.read_only_option == .lease_based and !normalized_cfg.check_quorum) {
-            return error.LeaseBasedReadRequiresCheckQuorum;
-        }
+        try normalized_cfg.validate();
 
         var peers = try alloc.dupe(types.NodeId, normalized_cfg.peers);
         errdefer alloc.free(peers);
-        if (peerIndex(peers, normalized_cfg.id) == null) return error.LocalNodeNotInPeerSet;
+        std.debug.assert(peerIndex(peers, normalized_cfg.id) != null);
 
         var raft_log = try log_mod.RaftLog.init(alloc, storage);
         errdefer raft_log.deinit();

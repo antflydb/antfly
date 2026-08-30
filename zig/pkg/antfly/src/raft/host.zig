@@ -424,6 +424,10 @@ pub const Host = struct {
         errdefer factory.freeDescriptor(self.alloc, &descriptor);
         descriptor.group.raft_config.trace_logger = self.cfg.trace_logger orelse
             if (comptime build_options.with_tla) tracing.stderrRaftTraceLogger() else null;
+        // This check must precede the durable catalog mutation: overwriting
+        // desired state and then rejecting a conflicting live descriptor would
+        // leave restart behavior different from the running process.
+        try self.runtime_host.validateReplicaAdmission(descriptor);
 
         // Persist admission before publication. A crash between these steps
         // leaves a recoverable catalog entry instead of an untracked live group.
@@ -444,7 +448,7 @@ pub const Host = struct {
         record: catalog.ReplicaRecord,
         prepared: *PreparedReplica,
     ) !raft_engine.runtime.EnsureReplicaResult {
-        const result = self.runtime_host.ensureReplica(prepared.descriptor) catch |err| {
+        const result = self.runtime_host.installDurableReplica(prepared.descriptor) catch |err| {
             if (prepared.bootstrap_prepared) {
                 self.noteBootstrapFailure(record.group_id, .backup_db_snapshot_restore, err, record.backup_restore_bootstrap);
             }
@@ -526,7 +530,14 @@ pub const Host = struct {
                 );
                 continue;
             }
-            const result = try self.ensureReplica(record);
+            const prepare_bootstrap = record.backup_restore_bootstrap != null;
+            if (prepare_bootstrap) self.noteReplicaBootstrapPreparing(record);
+            var prepared = self.prepareReplicaWithCatalog(record, prepare_bootstrap, false) catch |err| {
+                if (prepare_bootstrap) self.noteReplicaBootstrapPreparationFailure(record, err);
+                return err;
+            };
+            defer prepared.deinit(self.alloc);
+            const result = try self.installPreparedReplica(record, &prepared);
             if (result.created or result.resumed or result.fetched_snapshot) restored += 1;
         }
         return restored;

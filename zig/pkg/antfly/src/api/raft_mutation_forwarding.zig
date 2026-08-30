@@ -12,6 +12,7 @@
 // License for the specific language governing permissions and limitations.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 
 pub const max_forwards: u8 = 2;
 pub const max_remaining_ms: u32 = 5_000;
@@ -49,6 +50,113 @@ pub const Limits = struct {
     max_remaining_ms: u32,
     max_forwards: u8,
 };
+
+pub const AbsoluteDriver = struct {
+    deadline_ns: u64,
+    forwards_remaining: u8 = max_forwards,
+    mutation_attempted: bool = false,
+
+    pub fn init(deadline_ns: u64) AbsoluteDriver {
+        return .{ .deadline_ns = deadline_ns };
+    }
+
+    pub fn nextContext(self: AbsoluteDriver, now_ns: u64, response_reserve_ns: u64) ?Context {
+        return contextForDeadline(
+            now_ns,
+            self.deadline_ns,
+            response_reserve_ns,
+            self.forwards_remaining,
+            !self.mutation_attempted,
+        );
+    }
+
+    /// Consume a hop and the unique campaign privilege only after delivery may
+    /// have crossed the process boundary. Proven `not_sent` failures do not
+    /// call this method and retain both.
+    pub fn recordDelivered(self: *AbsoluteDriver, child: Context) void {
+        self.forwards_remaining = child.forwards_remaining;
+        self.mutation_attempted = true;
+    }
+};
+
+pub const RoutedMutationOptions = struct {
+    max_attempts: usize = 3,
+    initial_remaining_ms: u32 = max_remaining_ms,
+    initial_forwards: u8 = max_forwards,
+    response_reserve_ms: u32 = 50,
+};
+
+/// Shared local-or-forwarded mutation state machine. `router` resolves either
+/// `.local` or `.forward`; `ops` supplies `local()` and `forward(peer, Context)`.
+/// The driver is intentionally strict: only NotLeader and a delivery-proven
+/// RaftMutationRequestNotSent are replayable.
+pub fn runRoutedMutation(
+    router: anytype,
+    ops: anytype,
+    options: RoutedMutationOptions,
+) !void {
+    var attempts: usize = 0;
+    var forwarding = Context{
+        .remaining_ms = options.initial_remaining_ms,
+        .forwards_remaining = options.initial_forwards,
+        .campaign_allowed = true,
+    };
+    var campaign_allowed = true;
+    var attempt_started_ns = platform_time.monotonicNs();
+    while (true) {
+        attempts += 1;
+        const route = if (comptime @hasDecl(@TypeOf(router.*), "resolveTableMutationRouteWithCampaign"))
+            try router.resolveTableMutationRouteWithCampaign(&campaign_allowed, forwarding.remaining_ms)
+        else
+            try router.resolveTableMutationRoute();
+        switch (route) {
+            .local => {
+                ops.local() catch |err| switch (err) {
+                    error.NotLeader => {
+                        if (attempts >= options.max_attempts) return error.NotLeader;
+                        const elapsed_ms = elapsedMsSince(attempt_started_ns);
+                        if (elapsed_ms >= forwarding.remaining_ms) return error.NotLeader;
+                        forwarding.remaining_ms -= elapsed_ms;
+                        attempt_started_ns = platform_time.monotonicNs();
+                        continue;
+                    },
+                    else => return err,
+                };
+                return;
+            },
+            .forward => |peer| {
+                const parent_attempt_started_ns = attempt_started_ns;
+                const child_forwarding = forwarding.child(
+                    elapsedMsSince(attempt_started_ns),
+                    options.response_reserve_ms,
+                ) catch return error.NotLeader;
+                attempt_started_ns = platform_time.monotonicNs();
+                ops.forward(peer, child_forwarding) catch |err| switch (err) {
+                    error.RaftMutationRequestNotSent => {
+                        if (attempts >= options.max_attempts) return error.NotLeader;
+                        const total_elapsed_ms = elapsedMsSince(parent_attempt_started_ns);
+                        if (total_elapsed_ms >= forwarding.remaining_ms) return error.NotLeader;
+                        forwarding.remaining_ms -= total_elapsed_ms;
+                        attempt_started_ns = platform_time.monotonicNs();
+                        continue;
+                    },
+                    error.NotLeader => {
+                        forwarding = child_forwarding;
+                        if (attempts >= options.max_attempts) return error.NotLeader;
+                        continue;
+                    },
+                    else => return err,
+                };
+                return;
+            },
+        }
+    }
+}
+
+fn elapsedMsSince(started_ns: u64) u32 {
+    const elapsed_ns = platform_time.monotonicNs() -| started_ns;
+    return @intCast(@min(elapsed_ns / std.time.ns_per_ms, std.math.maxInt(u32)));
+}
 
 /// Builds the next-hop relative budget from a process-local absolute deadline.
 /// This is shared by data and metadata Raft groups so response reserve and hop
@@ -200,4 +308,19 @@ test "raft mutation deadline context reserves response time and one hop" {
     try std.testing.expect(!context.campaign_allowed);
     try std.testing.expect(contextForDeadline(1_500, 1_500, 0, 2, true) == null);
     try std.testing.expect(contextForDeadline(0, 10 * std.time.ns_per_ms, 9 * std.time.ns_per_ms, 2, true) == null);
+}
+
+test "absolute mutation driver consumes only delivered hops" {
+    var driver = AbsoluteDriver.init(2_000 * std.time.ns_per_ms);
+    const first = driver.nextContext(1_000 * std.time.ns_per_ms, 50 * std.time.ns_per_ms).?;
+    try std.testing.expectEqual(@as(u8, 1), first.forwards_remaining);
+    try std.testing.expect(!driver.mutation_attempted);
+    // A not-sent result deliberately leaves the driver unchanged.
+    const retry = driver.nextContext(1_100 * std.time.ns_per_ms, 50 * std.time.ns_per_ms).?;
+    try std.testing.expectEqual(@as(u8, 1), retry.forwards_remaining);
+    driver.recordDelivered(retry);
+    try std.testing.expect(driver.mutation_attempted);
+    const final = driver.nextContext(1_200 * std.time.ns_per_ms, 50 * std.time.ns_per_ms).?;
+    try std.testing.expectEqual(@as(u8, 0), final.forwards_remaining);
+    try std.testing.expect(!final.campaign_allowed);
 }

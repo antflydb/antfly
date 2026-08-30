@@ -136,6 +136,17 @@ pub const ReplicaDescriptor = struct {
     /// relocation targets needed for transport before they become voters.
     initial_voters: ?[]const core.types.NodeId = null,
     bootstrap: ReplicaBootstrap = .persisted,
+
+    pub fn validateForAdmission(self: ReplicaDescriptor) !void {
+        try group_mod.Group.validateConfig(self.group);
+        switch (self.bootstrap) {
+            .empty, .persisted => {},
+            .fetch_snapshot => |snapshot| {
+                if (snapshot.from == 0) return error.InvalidSnapshotSourceNodeId;
+                if (snapshot.locator.snapshot_id.len == 0) return error.InvalidSnapshotId;
+            },
+        }
+    }
 };
 
 pub const ReplicaRecord = struct {

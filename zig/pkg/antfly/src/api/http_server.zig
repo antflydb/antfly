@@ -1522,7 +1522,7 @@ pub const StatusSource = struct {
             req: tables_api.CreateTableRequest,
             body: []const u8,
 
-            fn local(self: @This()) anyerror!void {
+            pub fn local(self: @This()) anyerror!void {
                 try metadata_table_topology_mutations.create(
                     self.svc,
                     self.alloc,
@@ -1532,7 +1532,7 @@ pub const StatusSource = struct {
                 );
             }
 
-            fn forward(
+            pub fn forward(
                 self: @This(),
                 peer: metadata_service.ReallocationProtocolPeer,
                 forwarding: raft_mutation_forwarding.Context,
@@ -1560,7 +1560,7 @@ pub const StatusSource = struct {
             table_name: []const u8,
             result: *?metadata_table_topology_mutations.DropResult,
 
-            fn local(self: @This()) anyerror!void {
+            pub fn local(self: @This()) anyerror!void {
                 self.result.* = try metadata_table_topology_mutations.drop(
                     self.svc,
                     self.alloc,
@@ -1569,7 +1569,7 @@ pub const StatusSource = struct {
                 );
             }
 
-            fn forward(
+            pub fn forward(
                 self: @This(),
                 peer: metadata_service.ReallocationProtocolPeer,
                 forwarding: raft_mutation_forwarding.Context,
@@ -1658,76 +1658,9 @@ const max_table_mutation_route_attempts: usize = 3;
 /// Ambiguous transport or server failures surface unchanged and are never
 /// replayed; callers converge through an exact state probe.
 fn runRoutedTableMutation(router: anytype, ops: anytype) !void {
-    var attempts: usize = 0;
-    var forwarding = raft_mutation_forwarding.Context{
-        .remaining_ms = raft_mutation_forwarding.max_remaining_ms,
-        .forwards_remaining = raft_mutation_forwarding.max_forwards,
-        .campaign_allowed = true,
-    };
-    var campaign_allowed = true;
-    var attempt_started_ns = platform_time.monotonicNs();
-    while (true) {
-        attempts += 1;
-        const route = if (comptime @hasDecl(@TypeOf(router.*), "resolveTableMutationRouteWithCampaign"))
-            try router.resolveTableMutationRouteWithCampaign(&campaign_allowed, forwarding.remaining_ms)
-        else
-            try router.resolveTableMutationRoute();
-        switch (route) {
-            .local => {
-                ops.local() catch |err| switch (err) {
-                    error.NotLeader => {
-                        if (attempts >= max_table_mutation_route_attempts) return error.NotLeader;
-                        const elapsed_ns = platform_time.monotonicNs() -| attempt_started_ns;
-                        const elapsed_ms: u32 = @intCast(@min(
-                            elapsed_ns / std.time.ns_per_ms,
-                            std.math.maxInt(u32),
-                        ));
-                        if (elapsed_ms >= forwarding.remaining_ms) return error.NotLeader;
-                        forwarding.remaining_ms -= elapsed_ms;
-                        attempt_started_ns = platform_time.monotonicNs();
-                        continue;
-                    },
-                    else => return err,
-                };
-                return;
-            },
-            .forward => |peer| {
-                const parent_attempt_started_ns = attempt_started_ns;
-                const elapsed_ns = platform_time.monotonicNs() -| attempt_started_ns;
-                const elapsed_ms: u32 = @intCast(@min(
-                    elapsed_ns / std.time.ns_per_ms,
-                    std.math.maxInt(u32),
-                ));
-                // Consume the hop before it crosses the process boundary, as
-                // the shared data-Raft path does. The receiver must observe
-                // the remaining allowance, never the sender's parent budget.
-                const child_forwarding = forwarding.child(elapsed_ms, 50) catch
-                    return error.NotLeader;
-                attempt_started_ns = platform_time.monotonicNs();
-                ops.forward(peer, child_forwarding) catch |err| switch (err) {
-                    error.RaftMutationRequestNotSent => {
-                        if (attempts >= max_table_mutation_route_attempts) return error.NotLeader;
-                        const total_elapsed_ns = platform_time.monotonicNs() -| parent_attempt_started_ns;
-                        const total_elapsed_ms: u32 = @intCast(@min(
-                            total_elapsed_ns / std.time.ns_per_ms,
-                            std.math.maxInt(u32),
-                        ));
-                        if (total_elapsed_ms >= forwarding.remaining_ms) return error.NotLeader;
-                        forwarding.remaining_ms -= total_elapsed_ms;
-                        attempt_started_ns = platform_time.monotonicNs();
-                        continue;
-                    },
-                    error.NotLeader => {
-                        forwarding = child_forwarding;
-                        if (attempts >= max_table_mutation_route_attempts) return error.NotLeader;
-                        continue;
-                    },
-                    else => return err,
-                };
-                return;
-            },
-        }
-    }
+    return raft_mutation_forwarding.runRoutedMutation(router, ops, .{
+        .max_attempts = max_table_mutation_route_attempts,
+    });
 }
 
 test "routed table mutation runs locally on the metadata leader" {
@@ -1857,14 +1790,14 @@ const RoutedTableMutationScript = struct {
     forward_calls: usize = 0,
     last_forwarding: ?raft_mutation_forwarding.Context = null,
 
-    fn resolveTableMutationRoute(self: *@This()) !metadata_service.MetadataHttpService.TableMutationRoute {
+    pub fn resolveTableMutationRoute(self: *@This()) !metadata_service.MetadataHttpService.TableMutationRoute {
         if (self.resolve_error) |err| return err;
         const index = @min(self.route_resolutions, self.routes.len - 1);
         self.route_resolutions += 1;
         return self.routes[index];
     }
 
-    fn resolveTableMutationRouteWithCampaign(
+    pub fn resolveTableMutationRouteWithCampaign(
         self: *@This(),
         campaign_allowed: *bool,
         _: u32,
@@ -1882,13 +1815,13 @@ const RoutedTableMutationScript = struct {
     const Ops = struct {
         script: *RoutedTableMutationScript,
 
-        fn local(self: @This()) anyerror!void {
+        pub fn local(self: @This()) anyerror!void {
             const index = self.script.local_calls;
             self.script.local_calls += 1;
             if (index < self.script.local_errors.len) return self.script.local_errors[index];
         }
 
-        fn forward(
+        pub fn forward(
             self: @This(),
             peer: metadata_service.ReallocationProtocolPeer,
             forwarding: raft_mutation_forwarding.Context,
