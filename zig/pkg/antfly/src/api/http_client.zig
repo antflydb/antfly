@@ -830,6 +830,25 @@ pub const ApiHttpClient = struct {
         });
     }
 
+    /// Execute the public global multi-query route. Each non-empty NDJSON
+    /// line names its own table; preserving the raw response lets callers
+    /// verify fail-closed status and response ordering across table owners.
+    pub fn fetchGlobalMultiQueryRaw(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        body: []const u8,
+    ) !http_common.HttpResponse {
+        const uri = try self.joinRoute(base_uri, routes.Routes.query_suffix);
+        defer self.alloc.free(uri);
+
+        return try self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/x-ndjson",
+            .body = body,
+        });
+    }
+
     pub fn fetchRetrievalAgent(
         self: *ApiHttpClient,
         base_uri: []const u8,

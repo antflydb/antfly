@@ -235,6 +235,10 @@ pub const Fixture = struct {
         "{\"inserts\":{\"doc:x\":{\"title\":\"production-right\"}},\"sync_level\":\"full_index\"}";
     const tenant_batch_body =
         "{\"inserts\":{\"tenant:q\":{\"title\":\"production-tenant\",\"body\":\"production join left\",\"customer_id\":\"doc:c\"},\"tenant:r\":{\"title\":\"production-tenant\",\"body\":\"production join left\",\"customer_id\":\"doc:x\"}},\"sync_level\":\"full_index\"}";
+    const global_query_body =
+        \\{"table":"docs","query":{"match_all":{}},"fields":["title"],"limit":10}
+        \\{"table":"tenant_b_docs","query":{"match_all":{}},"fields":["title"],"limit":10}
+    ;
     const join_query_body =
         "{\"query\":{\"match_all\":{}},\"fields\":[\"title\"],\"limit\":10,\"profile\":true,\"join\":{\"right_table\":\"docs\",\"join_type\":\"inner\",\"on\":{\"left_field\":\"customer_id\",\"right_field\":\"_id\",\"operator\":\"eq\"},\"right_fields\":[\"title\"]}}";
     const durable_join_row_count: usize = 64;
@@ -340,6 +344,9 @@ pub const Fixture = struct {
     write_sound: bool = false,
     read_sound: bool = false,
     tenant_sound: bool = false,
+    global_query_sound: bool = false,
+    global_query_status: u16 = 0,
+    global_query_response_count: usize = 0,
     join_sound: bool = false,
     split_join_sound: bool = false,
     post_split_join_sound: bool = false,
@@ -527,6 +534,7 @@ pub const Fixture = struct {
     graph_inflight_authorization_revocation_enabled: bool = false,
     graph_stale_snapshot_retry_exhaustion_enabled: bool = false,
     join_enabled: bool = false,
+    global_query_enabled: bool = false,
     join_cancellation_enabled: bool = false,
     join_cancellation_overlap_enabled: bool = false,
     join_cancellation_owner_restart_enabled: bool = false,
@@ -586,6 +594,11 @@ pub const Fixture = struct {
     pub fn setJoinEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.join_enabled = enabled;
+    }
+
+    pub fn setGlobalQueryEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.global_query_enabled = enabled;
     }
 
     pub fn setJoinCancellationEnabled(self: *Fixture, enabled: bool) void {
@@ -2178,13 +2191,13 @@ pub const Fixture = struct {
             graph_authorization_left_batch_body
         else if (self.graph_enabled)
             left_batch_body
-        else if (self.join_enabled)
+        else if (self.join_enabled or self.global_query_enabled)
             join_left_batch_body
         else
             ordinary_left_batch_body;
         const right_body = if (self.graph_enabled)
             right_batch_body
-        else if (self.join_enabled)
+        else if (self.join_enabled or self.global_query_enabled)
             join_right_batch_body
         else
             ordinary_right_batch_body;
@@ -2289,6 +2302,15 @@ pub const Fixture = struct {
         self.phase = .reads_complete;
         if (!self.write_sound or !self.read_sound or !self.tenant_sound)
             return error.ProductionDataPublicRoundTripFailed;
+
+        if (self.global_query_enabled) {
+            if (!try self.waitForDocIdentityReady("docs", 64) or
+                !try self.waitForDocIdentityReady("tenant_b_docs", 64))
+                return error.ProductionDataGlobalQueryIdentityPublicationTimeout;
+            self.global_query_sound = try self.runGlobalMultiQuery();
+            if (!self.global_query_sound)
+                return error.ProductionDataGlobalQueryFailed;
+        }
 
         if (self.join_enabled) {
             if (!try self.waitForDocIdentityReady("tenant_b_docs", 64) or
@@ -3064,6 +3086,73 @@ pub const Fixture = struct {
             successful_group == .integer and successful_group.integer != failed_group.integer and
             successful_ok == .bool and successful_ok.bool;
         return self.durable_join_takeover_sound;
+    }
+
+    fn queryResponseHasExactHitIds(response: std.json.Value, expected_ids: []const []const u8) bool {
+        const response_object = switch (response) {
+            .object => |object| object,
+            else => return false,
+        };
+        const hits_container = response_object.get("hits") orelse return false;
+        const hits_object = switch (hits_container) {
+            .object => |object| object,
+            else => return false,
+        };
+        const hits_value = hits_object.get("hits") orelse return false;
+        const hits = switch (hits_value) {
+            .array => |array| array.items,
+            else => return false,
+        };
+        if (hits.len != expected_ids.len) return false;
+
+        for (expected_ids) |expected_id| {
+            var found = false;
+            for (hits) |hit| {
+                const hit_object = switch (hit) {
+                    .object => |object| object,
+                    else => return false,
+                };
+                const id_value = hit_object.get("_id") orelse return false;
+                const id = switch (id_value) {
+                    .string => |value| value,
+                    else => return false,
+                };
+                if (std.mem.eql(u8, id, expected_id)) found = true;
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    fn runGlobalMultiQuery(self: *Fixture) !bool {
+        var response = try self.client.fetchGlobalMultiQueryRaw(
+            self.data_api_uris[1],
+            global_query_body,
+        );
+        defer response.deinit(self.alloc);
+        self.global_query_status = response.status;
+        if (response.status != 200) return false;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, response.body, .{
+            .allocate = .alloc_always,
+        }) catch return false;
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |object| object,
+            else => return false,
+        };
+        const responses_value = root.get("responses") orelse return false;
+        const responses = switch (responses_value) {
+            .array => |array| array.items,
+            else => return false,
+        };
+        self.global_query_response_count = responses.len;
+        if (responses.len != 2) return false;
+
+        // Flattened responses must preserve NDJSON line order. Exact ID sets
+        // also prove that no result crossed the docs/tenant boundary.
+        return queryResponseHasExactHitIds(responses[0], &.{ "doc:c", "doc:k", "doc:x" }) and
+            queryResponseHasExactHitIds(responses[1], &.{ "tenant:q", "tenant:r" });
     }
 
     fn runGraphQuery(
@@ -4385,6 +4474,9 @@ pub const Fixture = struct {
     pub fn healthSnapshot(self: *const Fixture) struct {
         requests_ok: bool,
         topology_ok: bool,
+        global_query_ok: bool,
+        global_query_status: u16,
+        global_query_response_count: usize,
         join_query_ok: bool,
         split_join_query_ok: bool,
         post_split_join_query_ok: bool,
@@ -4520,6 +4612,7 @@ pub const Fixture = struct {
             .requests_ok = self.write_sound and
                 self.read_sound and
                 self.tenant_sound and
+                (!self.global_query_enabled or self.global_query_sound) and
                 (!self.join_enabled or self.join_sound) and
                 (!self.join_cancellation_enabled or self.join_cancellation_sound) and
                 (!self.join_worker_retry_enabled or self.join_worker_retry_sound) and
@@ -4533,6 +4626,9 @@ pub const Fixture = struct {
                 (!self.active_split_enabled or self.split_sound) and
                 self.failure == null,
             .topology_ok = self.topology_sound,
+            .global_query_ok = self.global_query_sound,
+            .global_query_status = self.global_query_status,
+            .global_query_response_count = self.global_query_response_count,
             .join_query_ok = self.join_sound,
             .split_join_query_ok = self.split_join_sound,
             .post_split_join_query_ok = self.post_split_join_sound,

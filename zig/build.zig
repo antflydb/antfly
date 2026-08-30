@@ -7460,6 +7460,18 @@ pub fn build(b: *std.Build) void {
     );
     production_cluster_graph_stale_snapshot_vopr_test_step.dependOn(&run_production_cluster_graph_stale_snapshot_vopr_tests.step);
 
+    const production_cluster_global_query_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production public global query exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_production_cluster_global_query_vopr_tests = b.addRunArtifact(production_cluster_global_query_vopr_tests);
+    const production_cluster_global_query_vopr_test_step = b.step(
+        "production-cluster-global-query-vopr-test",
+        "Run ordered, table-isolated public global NDJSON query dispatch through production owners",
+    );
+    production_cluster_global_query_vopr_test_step.dependOn(&run_production_cluster_global_query_vopr_tests.step);
+
     const production_cluster_baseline_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane baseline exact replay"},
@@ -7611,6 +7623,7 @@ pub fn build(b: *std.Build) void {
         run_production_cluster_graph_cancellation_transport_vopr_tests,
         run_production_cluster_graph_inflight_authorization_vopr_tests,
         run_production_cluster_graph_stale_snapshot_vopr_tests,
+        run_production_cluster_global_query_vopr_tests,
     }) |run_production_cluster_test| {
         // addRunArtifact appends cache-dir, seed, and --listen arguments after
         // the artifact; simple mode needs only the artifact itself.
@@ -7710,7 +7723,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_graph_split_socket_pressure_vopr_test_step.dependOn(&run_production_cluster_graph_split_socket_pressure_vopr_tests.step);
     const production_cluster_vopr_test_step = b.step(
         "production-cluster-vopr-test",
-        "Run every focused production DataServer cluster history through v35",
+        "Run every focused production DataServer cluster history through v36",
     );
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_deep_test_step);
@@ -7736,6 +7749,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_cancellation_transport_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_inflight_authorization_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_stale_snapshot_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_global_query_vopr_test_step);
 
     const generation_reranking_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
