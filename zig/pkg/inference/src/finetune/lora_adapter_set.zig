@@ -323,11 +323,87 @@ pub const LoRAAdapterSet = struct {
         applyLayerDelta(layer, hidden, self.config.alpha, self.config.scaling);
     }
 
-    // TODO(lora-io): save/load were written against Zig 0.15 file APIs
-    // (file.writer(), file.reader(), std.fs.cwd().makeOpenPath) that the
-    // 0.16 Io refactor removed. The canonical checkpoint path is
-    // safetensors_checkpoint.zig; this binary format is unused outside its
-    // own unit test. Disabled pending rewrite against std.Io.File.
+    /// Save all adapter tensors to `dir_path/adapters.bin`.
+    ///
+    /// The binary format remains compatible with the original implementation:
+    /// each tensor is encoded as a name, element count, and little-endian f32
+    /// payload. DoRA adapters append their magnitude tensor after A and B.
+    pub fn save(self: *const LoRAAdapterSet, io: std.Io, dir_path: []const u8) !void {
+        try std.Io.Dir.cwd().createDirPath(io, dir_path);
+        var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+        defer dir.close(io);
+
+        var file = try dir.createFile(io, "adapters.bin", .{ .truncate = true });
+        defer file.close(io);
+        var write_buffer: [4096]u8 = undefined;
+        var file_writer = file.writer(io, &write_buffer);
+        const writer = &file_writer.interface;
+
+        var name_buf: [256]u8 = undefined;
+        for (self.layers) |*layer| {
+            const a_name = try std.fmt.bufPrint(
+                &name_buf,
+                "lora.{d}.{s}.A",
+                .{ layer.layer_idx, layer.module_name },
+            );
+            try writeTensor(writer, a_name, layer.A);
+
+            const b_name = try std.fmt.bufPrint(
+                &name_buf,
+                "lora.{d}.{s}.B",
+                .{ layer.layer_idx, layer.module_name },
+            );
+            try writeTensor(writer, b_name, layer.B);
+
+            if (layer.magnitude) |magnitude| {
+                const magnitude_name = try std.fmt.bufPrint(
+                    &name_buf,
+                    "lora.{d}.{s}.magnitude",
+                    .{ layer.layer_idx, layer.module_name },
+                );
+                try writeTensor(writer, magnitude_name, magnitude);
+            }
+        }
+        try writer.flush();
+    }
+
+    /// Load tensors written by `save` into an identically configured adapter.
+    pub fn load(self: *LoRAAdapterSet, io: std.Io, dir_path: []const u8) !void {
+        var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+        defer dir.close(io);
+
+        var file = try dir.openFile(io, "adapters.bin", .{});
+        defer file.close(io);
+        var read_buffer: [4096]u8 = undefined;
+        var file_reader = file.reader(io, &read_buffer);
+        const reader = &file_reader.interface;
+
+        var name_buf: [256]u8 = undefined;
+        for (self.layers) |*layer| {
+            const expected_a = try std.fmt.bufPrint(
+                &name_buf,
+                "lora.{d}.{s}.A",
+                .{ layer.layer_idx, layer.module_name },
+            );
+            try readTensor(reader, expected_a, layer.A);
+
+            const expected_b = try std.fmt.bufPrint(
+                &name_buf,
+                "lora.{d}.{s}.B",
+                .{ layer.layer_idx, layer.module_name },
+            );
+            try readTensor(reader, expected_b, layer.B);
+
+            if (layer.magnitude) |magnitude| {
+                const expected_magnitude = try std.fmt.bufPrint(
+                    &name_buf,
+                    "lora.{d}.{s}.magnitude",
+                    .{ layer.layer_idx, layer.module_name },
+                );
+                try readTensor(reader, expected_magnitude, magnitude);
+            }
+        }
+    }
 };
 
 fn applyLayerDelta(layer: *const LoRALayer, hidden: []f32, alpha: f32, scaling: lora.ScalingMode) void {
@@ -395,7 +471,7 @@ fn dimensionsForModule(
 
 /// Write one tensor to a writer in the checkpoint binary format:
 ///   [name_len: u32 LE][name bytes][elem_count: u32 LE][f32 data as u32 LE...]
-fn writeTensor(w: anytype, name: []const u8, data: []const f32) !void {
+fn writeTensor(w: *std.Io.Writer, name: []const u8, data: []const f32) !void {
     try w.writeInt(u32, @intCast(name.len), .little);
     try w.writeAll(name);
     try w.writeInt(u32, @intCast(data.len), .little);
@@ -405,18 +481,18 @@ fn writeTensor(w: anytype, name: []const u8, data: []const f32) !void {
 }
 
 /// Read one tensor from a reader and validate name + length, then overwrite dest.
-fn readTensor(r: anytype, expected_name: []const u8, dest: []f32) !void {
-    const name_len = try r.readInt(u32, .little);
+fn readTensor(r: *std.Io.Reader, expected_name: []const u8, dest: []f32) !void {
+    const name_len = try r.takeInt(u32, .little);
     if (name_len > 256) return error.InvalidCheckpoint;
     var name_buf: [256]u8 = undefined;
-    try r.readNoEof(name_buf[0..name_len]);
+    try r.readSliceAll(name_buf[0..name_len]);
     const name = name_buf[0..name_len];
     if (!std.mem.eql(u8, name, expected_name)) return error.CheckpointNameMismatch;
 
-    const elem_count = try r.readInt(u32, .little);
+    const elem_count = try r.takeInt(u32, .little);
     if (elem_count != dest.len) return error.CheckpointSizeMismatch;
     for (dest) |*val| {
-        val.* = @bitCast(try r.readInt(u32, .little));
+        val.* = @bitCast(try r.takeInt(u32, .little));
     }
 }
 
@@ -542,5 +618,45 @@ test "DoRA magnitude initializes from row-major base weight rows" {
     try std.testing.expectApproxEqAbs(@as(f32, 13), layer.magnitude.?[1], 1e-5);
 }
 
-// The save/load round-trip test was removed alongside the save/load methods.
-// See TODO(lora-io) at the LoRAAdapterSet end.
+test "LoRAAdapterSet save and load round trips standard and DoRA tensors" {
+    const allocator = std.testing.allocator;
+    const config = LoRAConfig{
+        .rank = 2,
+        .alpha = 4.0,
+        .target_modules = &.{"query_proj"},
+        .num_layers = 2,
+        .use_dora = true,
+    };
+
+    var original = try LoRAAdapterSet.init(allocator, config, 8, 32);
+    defer original.deinit();
+    for (original.layers, 0..) |*layer, layer_index| {
+        for (layer.A, 0..) |*value, i| value.* = @as(f32, @floatFromInt(layer_index * 100 + i)) * 0.1 + 1.0;
+        for (layer.B, 0..) |*value, i| value.* = @as(f32, @floatFromInt(layer_index * 100 + i)) * -0.05;
+        for (layer.magnitude.?, 0..) |*value, i| value.* = @as(f32, @floatFromInt(layer_index * 10 + i)) + 0.5;
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const checkpoint_dir = try std.fs.path.join(
+        allocator,
+        &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "lora-checkpoint" },
+    );
+    defer allocator.free(checkpoint_dir);
+    try original.save(std.testing.io, checkpoint_dir);
+
+    var loaded = try LoRAAdapterSet.init(allocator, config, 8, 32);
+    defer loaded.deinit();
+    for (loaded.layers) |*layer| {
+        @memset(layer.A, 0);
+        @memset(layer.B, 0);
+        @memset(layer.magnitude.?, 0);
+    }
+    try loaded.load(std.testing.io, checkpoint_dir);
+
+    for (original.layers, loaded.layers) |expected, actual| {
+        try std.testing.expectEqualSlices(f32, expected.A, actual.A);
+        try std.testing.expectEqualSlices(f32, expected.B, actual.B);
+        try std.testing.expectEqualSlices(f32, expected.magnitude.?, actual.magnitude.?);
+    }
+}
