@@ -1986,6 +1986,47 @@ fn freeAllocatedKVPairs(alloc: Allocator, pairs: *std.ArrayListUnmanaged(KVPair)
     pairs.deinit(alloc);
 }
 
+const PortableBatchInspection = struct {
+    alloc: Allocator,
+    expected_type: backup_codec.BlockType,
+    expected_prefix: []const u8,
+    observed_count: usize = 0,
+
+    fn visit(self: *@This(), block_type: backup_codec.BlockType, payload: []const u8) !void {
+        if (block_type != self.expected_type) return;
+        const entries = try backup_codec.decodeKeyValueBatch(self.alloc, payload);
+        defer freeKeyValueEntries(self.alloc, entries);
+        self.observed_count += entries.len;
+        for (entries) |entry| {
+            try std.testing.expect(std.mem.startsWith(u8, entry.key, self.expected_prefix));
+        }
+    }
+};
+
+const PortableTimestampInspection = struct {
+    alloc: Allocator,
+    expected_key: []const u8,
+    expected_timestamp_ns: u64,
+    found: bool = false,
+
+    fn visit(self: *@This(), block_type: backup_codec.BlockType, payload: []const u8) !void {
+        if (block_type != .document_batch) return;
+        const entries = try backup_codec.decodeDocumentBatch(self.alloc, payload);
+        defer {
+            for (entries) |entry| {
+                self.alloc.free(entry.key);
+                self.alloc.free(entry.value);
+            }
+            self.alloc.free(entries);
+        }
+        for (entries) |entry| {
+            if (!std.mem.eql(u8, entry.key, self.expected_key)) continue;
+            try std.testing.expectEqual(self.expected_timestamp_ns, entry.timestamp_ns);
+            self.found = true;
+        }
+    }
+};
+
 test "exportPortable empty store" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2311,28 +2352,13 @@ test "export and import documents preserve timestamps" {
     defer out.deinit(alloc);
     try exportPortable(alloc, &src, &out);
 
-    var saw_timestamp = false;
-    var reader = backup_codec.SliceReader.init(out.items);
-    _ = try reader.readHeader();
-    while (reader.pos < reader.data.len) {
-        const block = try reader.readBlock(alloc);
-        defer alloc.free(block.payload);
-        if (block.block_type != .document_batch) continue;
-        const entries = try backup_codec.decodeDocumentBatch(alloc, block.payload);
-        defer {
-            for (entries) |entry| {
-                alloc.free(entry.key);
-                alloc.free(entry.value);
-            }
-            alloc.free(entries);
-        }
-        for (entries) |entry| {
-            if (!std.mem.eql(u8, entry.key, doc_key)) continue;
-            try std.testing.expectEqual(timestamp_ns, entry.timestamp_ns);
-            saw_timestamp = true;
-        }
-    }
-    try std.testing.expect(saw_timestamp);
+    var timestamp_inspection = PortableTimestampInspection{
+        .alloc = alloc,
+        .expected_key = doc_key,
+        .expected_timestamp_ns = timestamp_ns,
+    };
+    try visitPortableBlocks(alloc, out.items, &timestamp_inspection, PortableTimestampInspection.visit);
+    try std.testing.expect(timestamp_inspection.found);
 
     var tmp_dst = std.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
@@ -2736,22 +2762,13 @@ test "export and import chunk artifacts round trip with public artifact ids" {
     defer out.deinit(alloc);
     try exportPortable(alloc, &src, &out);
 
-    var saw_chunk_batch = false;
-    var reader = backup_codec.SliceReader.init(out.items);
-    _ = try reader.readHeader();
-    while (reader.pos < reader.data.len) {
-        const block = try reader.readBlock(alloc);
-        defer alloc.free(block.payload);
-        if (block.block_type != .chunk_batch) continue;
-        saw_chunk_batch = true;
-        const entries = try backup_codec.decodeKeyValueBatch(alloc, block.payload);
-        defer freeKeyValueEntries(alloc, entries);
-        try std.testing.expectEqual(@as(usize, 2), entries.len);
-        for (entries) |entry| {
-            try std.testing.expect(std.mem.startsWith(u8, entry.key, "af1:chunk:"));
-        }
-    }
-    try std.testing.expect(saw_chunk_batch);
+    var batch_inspection = PortableBatchInspection{
+        .alloc = alloc,
+        .expected_type = .chunk_batch,
+        .expected_prefix = "af1:chunk:",
+    };
+    try visitPortableBlocks(alloc, out.items, &batch_inspection, PortableBatchInspection.visit);
+    try std.testing.expectEqual(@as(usize, 2), batch_inspection.observed_count);
 
     var tmp_dst = std.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
@@ -2793,22 +2810,13 @@ test "export and import asset artifacts round trip with public artifact ids" {
     defer out.deinit(alloc);
     try exportPortable(alloc, &src, &out);
 
-    var saw_artifact_batch = false;
-    var reader = backup_codec.SliceReader.init(out.items);
-    _ = try reader.readHeader();
-    while (reader.pos < reader.data.len) {
-        const block = try reader.readBlock(alloc);
-        defer alloc.free(block.payload);
-        if (block.block_type != .artifact_batch) continue;
-        saw_artifact_batch = true;
-        const entries = try backup_codec.decodeKeyValueBatch(alloc, block.payload);
-        defer freeKeyValueEntries(alloc, entries);
-        try std.testing.expectEqual(@as(usize, 2), entries.len);
-        for (entries) |entry| {
-            try std.testing.expect(std.mem.startsWith(u8, entry.key, "af1:asset:"));
-        }
-    }
-    try std.testing.expect(saw_artifact_batch);
+    var batch_inspection = PortableBatchInspection{
+        .alloc = alloc,
+        .expected_type = .artifact_batch,
+        .expected_prefix = "af1:asset:",
+    };
+    try visitPortableBlocks(alloc, out.items, &batch_inspection, PortableBatchInspection.visit);
+    try std.testing.expectEqual(@as(usize, 2), batch_inspection.observed_count);
 
     var tmp_dst = std.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
@@ -2845,20 +2853,13 @@ test "export and import resolution artifacts round trip with public artifact ids
     defer out.deinit(alloc);
     try exportPortable(alloc, &src, &out);
 
-    var saw_resolution_batch = false;
-    var reader = backup_codec.SliceReader.init(out.items);
-    _ = try reader.readHeader();
-    while (reader.pos < reader.data.len) {
-        const block = try reader.readBlock(alloc);
-        defer alloc.free(block.payload);
-        if (block.block_type != .resolution_batch) continue;
-        saw_resolution_batch = true;
-        const entries = try backup_codec.decodeKeyValueBatch(alloc, block.payload);
-        defer freeKeyValueEntries(alloc, entries);
-        try std.testing.expectEqual(@as(usize, 1), entries.len);
-        try std.testing.expect(std.mem.startsWith(u8, entries[0].key, resolution_public_id_prefix));
-    }
-    try std.testing.expect(saw_resolution_batch);
+    var batch_inspection = PortableBatchInspection{
+        .alloc = alloc,
+        .expected_type = .resolution_batch,
+        .expected_prefix = resolution_public_id_prefix,
+    };
+    try visitPortableBlocks(alloc, out.items, &batch_inspection, PortableBatchInspection.visit);
+    try std.testing.expectEqual(@as(usize, 1), batch_inspection.observed_count);
 
     var tmp_dst = std.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
