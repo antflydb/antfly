@@ -1443,6 +1443,7 @@ const FanoutPlanReason = enum {
     no_io,
     single_group,
     small_request,
+    graph_memory_bound,
     parallel,
 };
 
@@ -1471,6 +1472,7 @@ pub const ParallelFanoutMetricsSnapshot = struct {
     query_plan_no_io_total: u64 = 0,
     query_plan_single_group_total: u64 = 0,
     query_plan_small_request_total: u64 = 0,
+    query_plan_graph_memory_bound_total: u64 = 0,
     preflight_parallel_total: u64 = 0,
     preflight_parallel_ns_total: u64 = 0,
     preflight_fallback_total: u64 = 0,
@@ -1500,6 +1502,7 @@ var planned_width_query_total: std.atomic.Value(u64) = .init(0);
 var planned_no_io_query_total: std.atomic.Value(u64) = .init(0);
 var planned_single_group_query_total: std.atomic.Value(u64) = .init(0);
 var planned_small_request_query_total: std.atomic.Value(u64) = .init(0);
+var planned_graph_memory_bound_query_total: std.atomic.Value(u64) = .init(0);
 var parallel_preflight_total: std.atomic.Value(u64) = .init(0);
 var parallel_preflight_ns_total: std.atomic.Value(u64) = .init(0);
 var fallback_preflight_total: std.atomic.Value(u64) = .init(0);
@@ -1523,6 +1526,7 @@ fn recordFanoutPlan(kind: ParallelFanoutKind, plan: FanoutPlan) void {
                 .no_io => _ = planned_no_io_text_stats_total.fetchAdd(1, .monotonic),
                 .single_group => _ = planned_single_group_text_stats_total.fetchAdd(1, .monotonic),
                 .small_request => _ = planned_small_request_text_stats_total.fetchAdd(1, .monotonic),
+                .graph_memory_bound => {},
                 .parallel => {},
             }
         },
@@ -1537,6 +1541,7 @@ fn recordFanoutPlan(kind: ParallelFanoutKind, plan: FanoutPlan) void {
                 .no_io => _ = planned_no_io_query_total.fetchAdd(1, .monotonic),
                 .single_group => _ = planned_single_group_query_total.fetchAdd(1, .monotonic),
                 .small_request => _ = planned_small_request_query_total.fetchAdd(1, .monotonic),
+                .graph_memory_bound => _ = planned_graph_memory_bound_query_total.fetchAdd(1, .monotonic),
                 .parallel => {},
             }
         },
@@ -1551,6 +1556,7 @@ fn recordFanoutPlan(kind: ParallelFanoutKind, plan: FanoutPlan) void {
                 .no_io => _ = planned_no_io_preflight_total.fetchAdd(1, .monotonic),
                 .single_group => _ = planned_single_group_preflight_total.fetchAdd(1, .monotonic),
                 .small_request => _ = planned_small_request_preflight_total.fetchAdd(1, .monotonic),
+                .graph_memory_bound => {},
                 .parallel => {},
             }
         },
@@ -1602,6 +1608,7 @@ pub fn parallelFanoutMetricsSnapshot() ParallelFanoutMetricsSnapshot {
         .query_plan_no_io_total = planned_no_io_query_total.load(.monotonic),
         .query_plan_single_group_total = planned_single_group_query_total.load(.monotonic),
         .query_plan_small_request_total = planned_small_request_query_total.load(.monotonic),
+        .query_plan_graph_memory_bound_total = planned_graph_memory_bound_query_total.load(.monotonic),
         .preflight_parallel_total = parallel_preflight_total.load(.monotonic),
         .preflight_parallel_ns_total = parallel_preflight_ns_total.load(.monotonic),
         .preflight_fallback_total = fallback_preflight_total.load(.monotonic),
@@ -1666,6 +1673,18 @@ fn planQueryFanout(
         .parallel = false,
         .width = 1,
         .reason = .single_group,
+    };
+    // Search fanout retains every completed slot until the final merge. The
+    // current std.Io.Group API reports only whole-batch completion, so a
+    // parallel graph batch cannot charge the request-wide retained-state and
+    // exact-distinct budgets before several results coexist. Keep graph phases
+    // sequential until completion-aware admission is available; ordinary
+    // search fanout remains parallel and graph execution inside each shard is
+    // unaffected.
+    if (req.graph_queries.len > 0) return .{
+        .parallel = false,
+        .width = 1,
+        .reason = .graph_memory_bound,
     };
     if (group_count <= 2 and req.limit > 0 and req.limit <= 32) return .{
         .parallel = false,
@@ -20053,6 +20072,22 @@ test "fanout planner uses io cap and request shape" {
     try std.testing.expect(larger_query_plan.parallel);
     try std.testing.expectEqual(@as(usize, 6), larger_query_plan.width);
     try std.testing.expectEqual(FanoutPlanReason.parallel, larger_query_plan.reason);
+
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "walk",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{} },
+        },
+    }};
+    const graph_query_plan = planQueryFanout(&io_impl, 6, .{
+        .graph_queries = &graph_queries,
+        .limit = 100,
+    });
+    try std.testing.expect(!graph_query_plan.parallel);
+    try std.testing.expectEqual(@as(usize, 1), graph_query_plan.width);
+    try std.testing.expectEqual(FanoutPlanReason.graph_memory_bound, graph_query_plan.reason);
 }
 
 test "provisioned table read source merges query results across ranges" {

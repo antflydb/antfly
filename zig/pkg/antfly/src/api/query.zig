@@ -397,9 +397,16 @@ fn mergeHierarchyUnitSearchResults(
     candidates = .empty;
     defer coalesced.deinit();
 
+    // The synthetic result contains only the globally coalesced hierarchy hit
+    // page. Graph results still belong to the original shard responses and
+    // are merged exactly once below. Passing graph operations through this
+    // synthetic merge would require graph_results that coalesced deliberately
+    // does not own and would reject an otherwise valid mixed request.
+    var hit_merge_req = req;
+    hit_merge_req.clearGraphQueries();
     var merged = try mergeGenericSearchResultsWithRuntimeSchema(
         alloc,
-        req,
+        hit_merge_req,
         &.{coalesced},
         offset,
         limit,
@@ -3319,6 +3326,79 @@ test "query merge globally coalesces hierarchy unit groups and bounded chunks" {
     try std.testing.expectEqual(@as(usize, 2), merged.hits[0].chunk_hits.len);
     try std.testing.expectEqualStrings("chunk:b", merged.hits[0].chunk_hits[0].id);
     try std.testing.expectEqualStrings("chunk:a", merged.hits[0].chunk_hits[1].id);
+}
+
+test "query merge composes hierarchy unit groups with canonical graph results" {
+    const alloc = std.testing.allocator;
+    const cloneOneGraphResult = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            source: db_mod.types.GraphSearchResult,
+        ) ![]db_mod.types.GraphSearchResult {
+            const out = try allocator.alloc(db_mod.types.GraphSearchResult, 1);
+            errdefer allocator.free(out);
+            out[0] = try cloneGraphSearchResult(allocator, source);
+            return out;
+        }
+    }.run;
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    left_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{});
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    right_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.9, &.{});
+
+    var left_node = [_]graph_query_mod.GraphResultNode{.{
+        .key = "left",
+        .depth = 1,
+        .distance = 1,
+    }};
+    var right_node = [_]graph_query_mod.GraphResultNode{.{
+        .key = "right",
+        .depth = 1,
+        .distance = 1,
+    }};
+    const left_graph = db_mod.types.GraphSearchResult{
+        .name = @constCast("walk"),
+        .nodes = &left_node,
+        .hits = &.{},
+        .total_hits = 1,
+    };
+    const right_graph = db_mod.types.GraphSearchResult{
+        .name = @constCast("walk"),
+        .nodes = &right_node,
+        .hits = &.{},
+        .total_hits = 1,
+    };
+
+    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
+    defer left.deinit();
+    left.graph_results = try cloneOneGraphResult(alloc, left_graph);
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+    defer right.deinit();
+    right.graph_results = try cloneOneGraphResult(alloc, right_graph);
+
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "walk",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{} },
+        },
+    }};
+    var merged = try mergeSearchResults(alloc, .{
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .graph_queries = &graph_queries,
+        .return_mode = .unit,
+        .hierarchy_group_level = .unit,
+        .limit = 10,
+    }, &.{ left, right }, 0, 10);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_results.len);
+    try std.testing.expectEqualStrings("walk", merged.graph_results[0].name);
+    try std.testing.expectEqual(@as(usize, 2), merged.graph_results[0].nodes.len);
+    try std.testing.expectEqualStrings("left", merged.graph_results[0].nodes[0].key);
+    try std.testing.expectEqualStrings("right", merged.graph_results[0].nodes[1].key);
 }
 
 test "query merge treats conflicting hierarchy unit identities as retryable" {
