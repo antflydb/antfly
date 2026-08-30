@@ -972,6 +972,7 @@ pub const AntflyApiHandler = struct {
                 .subject = authenticated.username,
             } else null,
             .destination_authorization_principal = http_server_mod.storedDestinationPrincipal(identity),
+            .catalog_route_fence_json = ctx.header(metadata_api.catalog_route_fence_header) orelse "",
         };
     }
 

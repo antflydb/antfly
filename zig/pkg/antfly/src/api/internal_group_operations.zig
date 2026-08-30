@@ -105,6 +105,20 @@ pub const Operations = struct {
     repair_cancellation_lookup: ?RepairCancellationLookup = null,
     routed_raft_batch_writer: ?RoutedRaftBatchWriter = null,
 
+    fn routedReads(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+    ) Error!table_reads.TableReadSource {
+        var reads = self.reads orelse return error.NotFound;
+        reads.bindCatalogRouteFenceJson(alloc, request.catalog_route_fence_json, group_id) catch |err| switch (err) {
+            error.UnsupportedCatalogRouteFence => return error.Unsupported,
+            else => return error.InvalidArgument,
+        };
+        return reads;
+    }
+
     pub fn corruptEmbeddingArtifact(
         self: Operations,
         alloc: std.mem.Allocator,
@@ -571,7 +585,7 @@ pub const Operations = struct {
         input: LookupInput,
     ) Error!table_reads.LookupResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
+        const reads = try self.routedReads(alloc, request, input.group_id);
         var options = input.options;
         options.execution_deadline_ns = request.deadline_ns;
         options.cancellation = request.cancellation;
@@ -606,7 +620,7 @@ pub const Operations = struct {
         artifact_name: []const u8,
     ) Error!db_mod.types.DocumentArtifactManifest {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
+        const reads = try self.routedReads(alloc, request, group_id);
         return (reads.documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .read_index) catch |err| switch (err) {
             error.TopologyChanged => return error.TopologyChanged,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
@@ -628,7 +642,7 @@ pub const Operations = struct {
         doc_key: []const u8,
     ) Error!db_mod.types.DocumentArtifactManifestList {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
+        const reads = try self.routedReads(alloc, request, group_id);
         return (reads.documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, .read_index) catch |err| switch (err) {
             error.TopologyChanged => return error.TopologyChanged,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
@@ -651,7 +665,7 @@ pub const Operations = struct {
         options: db_mod.types.ScanOptions,
     ) Error!table_reads.ScanResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
+        const reads = try self.routedReads(alloc, request, group_id);
         return (reads.scanGroupLocal(alloc, group_id, table_name, from, to, options, .read_index) catch |err| switch (err) {
             error.TopologyChanged => return error.TopologyChanged,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
@@ -672,7 +686,7 @@ pub const Operations = struct {
         input: db_mod.types.SearchRequest,
     ) Error!query_api.QueryResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
+        const reads = try self.routedReads(alloc, request, group_id);
         return (reads.queryGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return error.InvalidArgument,
@@ -698,7 +712,7 @@ pub const Operations = struct {
         max_work: u32,
     ) Error!runtime_preflight.RuntimePreflightSummary {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
+        const reads = try self.routedReads(alloc, request, group_id);
         return (reads.preflightQueryGroupLocal(alloc, group_id, table_name, input, .read_index, max_work) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return error.InvalidArgument,
             error.TopologyChanged => return error.TopologyChanged,
@@ -712,7 +726,7 @@ pub const Operations = struct {
 
     pub fn graphExpand(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphExpandRequest) Error!distributed_graph.GraphExpandResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
+        const reads = try self.routedReads(alloc, request, group_id);
         return (reads.graphExpandGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return error.InvalidArgument,
             error.TopologyChanged => return error.TopologyChanged,
@@ -726,7 +740,7 @@ pub const Operations = struct {
 
     pub fn graphHydrate(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphHydrateRequest) Error!distributed_graph.GraphHydrateResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
+        const reads = try self.routedReads(alloc, request, group_id);
         return (reads.graphHydrateGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
             error.TopologyChanged => return error.TopologyChanged,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
@@ -739,7 +753,7 @@ pub const Operations = struct {
 
     pub fn graphEdges(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphEdgesRequest) Error!distributed_graph.GraphEdgesResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
+        const reads = try self.routedReads(alloc, request, group_id);
         return (reads.graphEdgesGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
             error.InvalidQueryRequest, error.IndexNotFound => return error.InvalidArgument,
             error.TopologyChanged => return error.TopologyChanged,
@@ -753,7 +767,7 @@ pub const Operations = struct {
 
     pub fn textStats(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, body: []const u8) Error!query_api.QueryResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
+        const reads = try self.routedReads(alloc, request, group_id);
         return (reads.textStatsGroupLocal(alloc, group_id, table_name, body) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidArgument,
             error.TableNotFound, error.UnknownGroup => return error.NotFound,
@@ -767,7 +781,7 @@ pub const Operations = struct {
 
     pub fn algebraicPartials(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, body: []const u8) Error!query_api.QueryResponse {
         try request.ensureActive();
-        const reads = self.reads orelse return error.NotFound;
+        const reads = try self.routedReads(alloc, request, group_id);
         return (reads.algebraicPartialsGroupLocal(alloc, group_id, table_name, body) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidArgument,
             error.TableNotFound, error.UnknownGroup => return error.NotFound,

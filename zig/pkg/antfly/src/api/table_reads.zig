@@ -1318,6 +1318,11 @@ const RoutePinnedCatalog = struct {
     base: table_catalog.CatalogSource,
     table_name: []const u8,
     routes: []const table_catalog.CatalogGroupRoute,
+    metadata_group_id: u64,
+    metadata_incarnation: ?metadata_api.MetadataClusterIncarnation,
+    catalog_revision: u64,
+    table_id: u64,
+    topology_epoch: u64,
 
     fn source(self: *@This()) table_catalog.CatalogSource {
         return .{ .ptr = self, .vtable = &vtable };
@@ -1330,6 +1335,7 @@ const RoutePinnedCatalog = struct {
         .linearizable_routing_snapshot = linearizableRoutingSnapshot,
         .free_routing_snapshot = freeRoutingSnapshot,
         .route_identity = routeIdentity,
+        .route_fence = routeFence,
         .wait_for_routing_change = waitForRoutingChange,
         .await_route = awaitRoute,
         .requires_linearizable_publication_fence = true,
@@ -1381,6 +1387,22 @@ const RoutePinnedCatalog = struct {
         return null;
     }
 
+    fn routeFence(ptr: *anyopaque, group_id: u64) !?metadata_api.CatalogRouteFence {
+        const self = cast(ptr);
+        for (self.routes) |route| {
+            if (route.group_id != group_id) continue;
+            return .{
+                .metadata_group_id = self.metadata_group_id,
+                .metadata_incarnation = self.metadata_incarnation,
+                .catalog_revision = self.catalog_revision,
+                .table_id = self.table_id,
+                .topology_epoch = self.topology_epoch,
+                .route = route,
+            };
+        }
+        return null;
+    }
+
     fn waitForRoutingChange(
         ptr: *anyopaque,
         token: metadata_api.CatalogRoutingChangeToken,
@@ -1416,6 +1438,25 @@ const RoutePinnedCatalog = struct {
         return try validate(self.base.ptr, contract);
     }
 };
+
+fn routePinnedCatalogForFence(
+    base: table_catalog.CatalogSource,
+    table_name: []const u8,
+    fence: metadata_api.CatalogRouteFence,
+    route_storage: *[1]table_catalog.CatalogGroupRoute,
+) RoutePinnedCatalog {
+    route_storage[0] = fence.route;
+    return .{
+        .base = base,
+        .table_name = table_name,
+        .routes = route_storage,
+        .metadata_group_id = fence.metadata_group_id,
+        .metadata_incarnation = fence.metadata_incarnation,
+        .catalog_revision = fence.catalog_revision,
+        .table_id = fence.table_id,
+        .topology_epoch = fence.topology_epoch,
+    };
+}
 
 const LocalQueryDbOwner = union(enum) {
     resident: struct {
@@ -2685,11 +2726,16 @@ pub const ProvisionedTableReadSource = struct {
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    expected_route_fence: ?metadata_api.CatalogRouteFence = null,
+    expected_route_fence_catalog: ?table_catalog.CatalogSource = null,
 
     const topology_read_attempt_limit: usize = 4;
 
     const PreparedKeyRead = struct {
         route: ?table_catalog.CatalogGroupRoute,
+        metadata_group_id: u64,
+        metadata_incarnation: ?metadata_api.MetadataClusterIncarnation,
+        table_id: u64,
         catalog_revision: u64,
         topology_epoch: u64,
         activity: ?ReadPreparation.Activity,
@@ -2708,6 +2754,9 @@ pub const ProvisionedTableReadSource = struct {
         alloc: std.mem.Allocator,
         routes: []table_catalog.CatalogGroupRoute,
         group_ids: []u64,
+        metadata_group_id: u64,
+        metadata_incarnation: ?metadata_api.MetadataClusterIncarnation,
+        table_id: u64,
         catalog_revision: u64,
         topology_epoch: u64,
         routing_deadline_ns: ?u64 = null,
@@ -2817,26 +2866,38 @@ pub const ProvisionedTableReadSource = struct {
                 .query = query,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
+                .preflight_query_group_local_routed = preflightQueryGroupLocalRouted,
                 .lookup_group_local = lookupGroupLocal,
+                .lookup_group_local_routed = lookupGroupLocalRouted,
                 .scan_group_local = scanGroupLocal,
+                .scan_group_local_routed = scanGroupLocalRouted,
                 .query_group_local = queryGroupLocal,
+                .query_group_local_routed = queryGroupLocalRouted,
                 .search_result_group_local = searchResultGroupLocal,
+                .search_result_group_local_routed = searchResultGroupLocalRouted,
                 .text_stats_group_local = textStatsGroupLocal,
+                .text_stats_group_local_routed = textStatsGroupLocalRouted,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
+                .algebraic_partials_group_local_routed = algebraicPartialsGroupLocalRouted,
                 .join_partition_group_local = null,
                 .join_rows_group_local = null,
                 .join_unmatched_group_local = null,
                 .join_finalize_group_local = null,
                 .graph_expand_group_local = graphExpandGroupLocal,
+                .graph_expand_group_local_routed = graphExpandGroupLocalRouted,
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
+                .graph_hydrate_group_local_routed = graphHydrateGroupLocalRouted,
                 .graph_edges_group_local = graphEdgesGroupLocal,
+                .graph_edges_group_local_routed = graphEdgesGroupLocalRouted,
                 .local_runtime_statuses = localRuntimeStatuses,
                 .lsm_storage_stats = lsmStorageStats,
                 .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
                 .document_artifact_manifest = documentArtifactManifest,
                 .document_artifact_manifests = documentArtifactManifests,
                 .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
+                .document_artifact_manifest_group_local_routed = documentArtifactManifestGroupLocalRouted,
                 .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocal,
+                .document_artifact_manifests_group_local_routed = documentArtifactManifestsGroupLocalRouted,
                 .bind_incoming_graph_routes = bindIncomingGraphRoutes,
             },
         };
@@ -2983,7 +3044,7 @@ pub const ProvisionedTableReadSource = struct {
                     },
                     else => return err,
                 };
-                return .{ .route = route.route, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .activity = activity };
+                return .{ .route = route.route, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = if (route.route) |value| value.identity_namespace.table_id else 0, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .activity = activity };
             }
 
             const route = try table_catalog.routedGroupSnapshotUntil(alloc, self.catalog, table_name, key, deadline_ns);
@@ -2999,7 +3060,7 @@ pub const ProvisionedTableReadSource = struct {
                 },
                 else => return err,
             };
-            return .{ .route = route.route, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .activity = activity };
+            return .{ .route = route.route, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = if (route.route) |value| value.identity_namespace.table_id else 0, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .activity = activity };
         }
         unreachable;
     }
@@ -3038,7 +3099,7 @@ pub const ProvisionedTableReadSource = struct {
                     else => return err,
                 };
                 route_owned = false;
-                return .{ .alloc = alloc, .routes = routes, .group_ids = group_ids, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .routing_deadline_ns = deadline_ns, .activity = activity };
+                return .{ .alloc = alloc, .routes = routes, .group_ids = group_ids, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = route.table_id, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .routing_deadline_ns = deadline_ns, .activity = activity };
             }
 
             const route = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, from_key, to_key, deadline_ns);
@@ -3062,7 +3123,7 @@ pub const ProvisionedTableReadSource = struct {
                 else => return err,
             };
             route_owned = false;
-            return .{ .alloc = alloc, .routes = routes, .group_ids = group_ids, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .routing_deadline_ns = deadline_ns, .activity = activity };
+            return .{ .alloc = alloc, .routes = routes, .group_ids = group_ids, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = route.table_id, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .routing_deadline_ns = deadline_ns, .activity = activity };
         }
         unreachable;
     }
@@ -3078,6 +3139,22 @@ pub const ProvisionedTableReadSource = struct {
         expected_epoch: u64,
     ) !?ReadPreparation.Activity {
         const deadline_ns = if (request) |value| provisionedConsistencyDeadline(value) else null;
+        if (self.expected_route_fence) |fence| {
+            if (fence.route.group_id != group_id) return error.TopologyChanged;
+            if (consistency != .stale) {
+                if (request) |gate_request| try self.prepareGroupsForReadAdmission(alloc, &.{group_id}, gate_request, consistency);
+            }
+            var activity = self.beginPreparedRead(table_name, kind);
+            errdefer if (activity) |*held| held.deinit();
+            try table_catalog.validateCatalogRouteFenceUntil(
+                alloc,
+                self.expected_route_fence_catalog orelse self.catalog,
+                table_name,
+                fence,
+                deadline_ns,
+            );
+            return activity;
+        }
         if (consistency == .stale) {
             var activity = self.beginPreparedRead(table_name, kind);
             errdefer if (activity) |*held| held.deinit();
@@ -3289,7 +3366,7 @@ pub const ProvisionedTableReadSource = struct {
         defer prepared.deinit();
         const group_ids = prepared.group_ids;
         if (group_ids.len == 0) return null;
-        var pinned_catalog = RoutePinnedCatalog{ .base = self.catalog, .table_name = table_name, .routes = prepared.routes };
+        var pinned_catalog = RoutePinnedCatalog{ .base = self.catalog, .table_name = table_name, .routes = prepared.routes, .metadata_group_id = prepared.metadata_group_id, .metadata_incarnation = prepared.metadata_incarnation, .catalog_revision = prepared.catalog_revision, .table_id = prepared.table_id, .topology_epoch = prepared.topology_epoch };
         var routed_source = self.*;
         routed_source.catalog = pinned_catalog.source();
         const routed = &routed_source;
@@ -3419,7 +3496,7 @@ pub const ProvisionedTableReadSource = struct {
             defer prepared.deinit();
             const group_ids = prepared.group_ids;
             if (group_ids.len == 0) return null;
-            var pinned_catalog = RoutePinnedCatalog{ .base = self.catalog, .table_name = table_name, .routes = prepared.routes };
+            var pinned_catalog = RoutePinnedCatalog{ .base = self.catalog, .table_name = table_name, .routes = prepared.routes, .metadata_group_id = prepared.metadata_group_id, .metadata_incarnation = prepared.metadata_incarnation, .catalog_revision = prepared.catalog_revision, .table_id = prepared.table_id, .topology_epoch = prepared.topology_epoch };
             var routed_source = self.*;
             routed_source.catalog = pinned_catalog.source();
             const routed = &routed_source;
@@ -3444,6 +3521,130 @@ pub const ProvisionedTableReadSource = struct {
             };
         }
         unreachable;
+    }
+
+    fn bindRouteFence(
+        self: *ProvisionedTableReadSource,
+        table_name: []const u8,
+        fence: metadata_api.CatalogRouteFence,
+        route_storage: *[1]table_catalog.CatalogGroupRoute,
+        pinned: *RoutePinnedCatalog,
+        routed: *ProvisionedTableReadSource,
+    ) !void {
+        try fence.validate();
+        pinned.* = routePinnedCatalogForFence(self.catalog, table_name, fence, route_storage);
+        routed.* = self.*;
+        routed.expected_route_fence_catalog = self.catalog;
+        routed.catalog = pinned.source();
+        routed.expected_route_fence = fence;
+    }
+
+    fn lookupGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?LookupResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try lookupGroupLocal(&routed, alloc, group_id, table_name, key, opts, consistency);
+    }
+
+    fn documentArtifactManifestGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, doc_key: []const u8, artifact_name: []const u8, consistency: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try documentArtifactManifestGroupLocal(&routed, alloc, group_id, table_name, doc_key, artifact_name, consistency);
+    }
+
+    fn documentArtifactManifestsGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, doc_key: []const u8, consistency: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try documentArtifactManifestsGroupLocal(&routed, alloc, group_id, table_name, doc_key, consistency);
+    }
+
+    fn preflightQueryGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency, max_work: u32) !?db_mod.RuntimePreflightSummary {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try preflightQueryGroupLocal(&routed, alloc, group_id, table_name, req, consistency, max_work);
+    }
+
+    fn scanGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?ScanResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try scanGroupLocal(&routed, alloc, group_id, table_name, from_key, to_key, opts, consistency);
+    }
+
+    fn queryGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try queryGroupLocal(&routed, alloc, group_id, table_name, req, consistency);
+    }
+
+    fn searchResultGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?db_mod.types.SearchResult {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try searchResultGroupLocal(&routed, alloc, group_id, table_name, req, consistency);
+    }
+
+    fn textStatsGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try textStatsGroupLocal(&routed, alloc, group_id, table_name, body);
+    }
+
+    fn algebraicPartialsGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try algebraicPartialsGroupLocal(&routed, alloc, group_id, table_name, body);
+    }
+
+    fn graphExpandGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: distributed_graph.GraphExpandRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphExpandResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try graphExpandGroupLocal(&routed, alloc, group_id, table_name, req, consistency);
+    }
+
+    fn graphHydrateGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: distributed_graph.GraphHydrateRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphHydrateResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try graphHydrateGroupLocal(&routed, alloc, group_id, table_name, req, consistency);
+    }
+
+    fn graphEdgesGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: distributed_graph.GraphEdgesRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphEdgesResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try graphEdgesGroupLocal(&routed, alloc, group_id, table_name, req, consistency);
     }
 
     fn lookupGroupLocal(
@@ -4088,7 +4289,40 @@ pub const HostedProvisionedTableReadSource = struct {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var client = http_client.ApiHttpClient.init(alloc, self.executor);
         _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
-        return client.executeRequest(request);
+        var routed_request = request;
+        var encoded_fence: ?[]u8 = null;
+        defer if (encoded_fence) |value| alloc.free(value);
+        var owned_headers: ?[]http_common.RequestHeader = null;
+        defer if (owned_headers) |value| alloc.free(value);
+        if (internalGroupIdFromUri(request.uri)) |group_id| {
+            if (self.catalog.vtable.route_fence) |resolve| {
+                const fence = (try resolve(self.catalog.ptr, group_id)) orelse return error.CatalogRouteFenceRequired;
+                encoded_fence = try std.json.Stringify.valueAlloc(alloc, fence, .{});
+                const headers = try alloc.alloc(http_common.RequestHeader, request.headers.len + 1);
+                @memcpy(headers[0..request.headers.len], request.headers);
+                headers[request.headers.len] = .{
+                    .name = metadata_api.catalog_route_fence_header,
+                    .value = encoded_fence.?,
+                };
+                owned_headers = headers;
+                routed_request.headers = headers;
+            } else if (!std.mem.endsWith(u8, request.uri, http_routes.Routes.join_job_state_suffix)) {
+                // Every first-party storage read must carry the route selected
+                // by its coordinator. Only join job-state polling is scoped to
+                // a group without opening table storage.
+                return error.CatalogRouteFenceRequired;
+            }
+        }
+        return client.executeRequest(routed_request);
+    }
+
+    fn internalGroupIdFromUri(uri: []const u8) ?u64 {
+        const marker = "/internal/v1/groups/";
+        const start = (std.mem.indexOf(u8, uri, marker) orelse return null) + marker.len;
+        var end = start;
+        while (end < uri.len and std.ascii.isDigit(uri[end])) : (end += 1) {}
+        if (end == start) return null;
+        return std.fmt.parseUnsigned(u64, uri[start..end], 10) catch null;
     }
 
     pub fn withGroupVisibleRootGeneration(self: *HostedProvisionedTableReadSource, generation_source: ?GroupVisibleRootGenerationSource) *HostedProvisionedTableReadSource {
@@ -4100,6 +4334,130 @@ pub const HostedProvisionedTableReadSource = struct {
         return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else backend_current_root_generation;
     }
 
+    fn bindRouteFence(
+        self: *HostedProvisionedTableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        fence: metadata_api.CatalogRouteFence,
+        route_storage: *[1]table_catalog.CatalogGroupRoute,
+        pinned: *RoutePinnedCatalog,
+        routed: *HostedProvisionedTableReadSource,
+    ) !void {
+        try fence.validate();
+        try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, null);
+        pinned.* = routePinnedCatalogForFence(self.catalog, table_name, fence, route_storage);
+        routed.* = self.*;
+        routed.catalog = pinned.source();
+    }
+
+    fn lookupGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?LookupResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try lookupGroupLocal(&routed, alloc, group_id, table_name, key, opts, consistency);
+    }
+
+    fn documentArtifactManifestGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, doc_key: []const u8, artifact_name: []const u8, consistency: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try documentArtifactManifestGroupLocal(&routed, alloc, group_id, table_name, doc_key, artifact_name, consistency);
+    }
+
+    fn documentArtifactManifestsGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, doc_key: []const u8, consistency: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try documentArtifactManifestsGroupLocal(&routed, alloc, group_id, table_name, doc_key, consistency);
+    }
+
+    fn preflightQueryGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency, max_work: u32) !?db_mod.RuntimePreflightSummary {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try preflightQueryGroupLocal(&routed, alloc, group_id, table_name, req, consistency, max_work);
+    }
+
+    fn scanGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?ScanResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try scanGroupLocal(&routed, alloc, group_id, table_name, from_key, to_key, opts, consistency);
+    }
+
+    fn queryGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try queryGroupLocal(&routed, alloc, group_id, table_name, req, consistency);
+    }
+
+    fn searchResultGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?db_mod.types.SearchResult {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try searchResultGroupLocal(&routed, alloc, group_id, table_name, req, consistency);
+    }
+
+    fn textStatsGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try textStatsGroupLocal(&routed, alloc, group_id, table_name, body);
+    }
+
+    fn algebraicPartialsGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try algebraicPartialsGroupLocal(&routed, alloc, group_id, table_name, body);
+    }
+
+    fn graphExpandGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: distributed_graph.GraphExpandRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphExpandResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try graphExpandGroupLocal(&routed, alloc, group_id, table_name, req, consistency);
+    }
+
+    fn graphHydrateGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: distributed_graph.GraphHydrateRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphHydrateResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try graphHydrateGroupLocal(&routed, alloc, group_id, table_name, req, consistency);
+    }
+
+    fn graphEdgesGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: distributed_graph.GraphEdgesRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphEdgesResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try graphEdgesGroupLocal(&routed, alloc, group_id, table_name, req, consistency);
+    }
+
     pub fn source(self: *HostedProvisionedTableReadSource) TableReadSource {
         return .{
             .ptr = self,
@@ -4109,25 +4467,37 @@ pub const HostedProvisionedTableReadSource = struct {
                 .query = query,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
+                .preflight_query_group_local_routed = preflightQueryGroupLocalRouted,
                 .lookup_group_local = lookupGroupLocal,
+                .lookup_group_local_routed = lookupGroupLocalRouted,
                 .scan_group_local = scanGroupLocal,
+                .scan_group_local_routed = scanGroupLocalRouted,
                 .query_group_local = queryGroupLocal,
+                .query_group_local_routed = queryGroupLocalRouted,
                 .search_result_group_local = searchResultGroupLocal,
+                .search_result_group_local_routed = searchResultGroupLocalRouted,
                 .text_stats_group_local = textStatsGroupLocal,
+                .text_stats_group_local_routed = textStatsGroupLocalRouted,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
+                .algebraic_partials_group_local_routed = algebraicPartialsGroupLocalRouted,
                 .join_partition_group_local_with_timeout = joinPartitionGroupLocal,
                 .join_rows_group_local_with_timeout = joinRowsGroupLocal,
                 .join_unmatched_group_local_with_timeout = joinUnmatchedGroupLocal,
                 .join_finalize_group_local_with_timeout = joinFinalizeGroupLocal,
                 .join_job_state_group_local = joinJobStateGroupLocal,
                 .graph_expand_group_local = graphExpandGroupLocal,
+                .graph_expand_group_local_routed = graphExpandGroupLocalRouted,
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
+                .graph_hydrate_group_local_routed = graphHydrateGroupLocalRouted,
                 .graph_edges_group_local = graphEdgesGroupLocal,
+                .graph_edges_group_local_routed = graphEdgesGroupLocalRouted,
                 .local_runtime_statuses = localRuntimeStatuses,
                 .document_artifact_manifest = documentArtifactManifest,
                 .document_artifact_manifests = documentArtifactManifests,
                 .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
+                .document_artifact_manifest_group_local_routed = documentArtifactManifestGroupLocalRouted,
                 .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocal,
+                .document_artifact_manifests_group_local_routed = documentArtifactManifestsGroupLocalRouted,
                 .bind_incoming_graph_routes = bindIncomingGraphRoutes,
             },
         };
@@ -4146,17 +4516,22 @@ pub const HostedProvisionedTableReadSource = struct {
         opts: db_mod.types.LookupOptions,
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
-        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try checkLookupOptionsActive(opts);
-        const group_id = (try table_catalog.resolveGroupForKeyUntil(
+        const routed = try table_catalog.routedGroupSnapshotUntil(
             alloc,
-            self.catalog,
+            hosted.catalog,
             table_name,
             key,
             opts.execution_deadline_ns,
-        )) orelse {
-            return null;
-        };
+        );
+        const fence = routed.fence() orelse return null;
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned = routePinnedCatalogForFence(hosted.catalog, table_name, fence, &route_storage);
+        var routed_source = hosted.*;
+        routed_source.catalog = pinned.source();
+        const self = &routed_source;
+        const group_id = fence.route.group_id;
         try checkLookupOptionsActive(opts);
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse {
             return null;
@@ -4176,8 +4551,15 @@ pub const HostedProvisionedTableReadSource = struct {
         artifact_name: []const u8,
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
-        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
+        const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const routed = try table_catalog.routedGroupSnapshotUntil(alloc, hosted.catalog, table_name, doc_key, null);
+        const fence = routed.fence() orelse return null;
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned = routePinnedCatalogForFence(hosted.catalog, table_name, fence, &route_storage);
+        var routed_source = hosted.*;
+        routed_source.catalog = pinned.source();
+        const self = &routed_source;
+        const group_id = fence.route.group_id;
         return try documentArtifactManifestHostedRoute(self, alloc, group_id, table_name, doc_key, artifact_name, consistency);
     }
 
@@ -4188,8 +4570,15 @@ pub const HostedProvisionedTableReadSource = struct {
         doc_key: []const u8,
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifestList {
-        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
+        const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const routed = try table_catalog.routedGroupSnapshotUntil(alloc, hosted.catalog, table_name, doc_key, null);
+        const fence = routed.fence() orelse return null;
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned = routePinnedCatalogForFence(hosted.catalog, table_name, fence, &route_storage);
+        var routed_source = hosted.*;
+        routed_source.catalog = pinned.source();
+        const self = &routed_source;
+        const group_id = fence.route.group_id;
         return try documentArtifactManifestsHostedRoute(self, alloc, group_id, table_name, doc_key, consistency);
     }
 
@@ -4327,9 +4716,14 @@ pub const HostedProvisionedTableReadSource = struct {
         opts: db_mod.types.ScanOptions,
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
-        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, from_key, to_key);
-        defer alloc.free(group_ids);
+        const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, hosted.catalog, table_name, from_key, to_key, null);
+        defer route_snapshot.deinit(alloc);
+        var pinned = RoutePinnedCatalog{ .base = hosted.catalog, .table_name = table_name, .routes = route_snapshot.routes, .metadata_group_id = route_snapshot.metadata_group_id, .metadata_incarnation = route_snapshot.metadata_incarnation, .catalog_revision = route_snapshot.catalog_revision, .table_id = route_snapshot.table_id, .topology_epoch = route_snapshot.topology_epoch };
+        var routed_source = hosted.*;
+        routed_source.catalog = pinned.source();
+        const self = &routed_source;
+        const group_ids = route_snapshot.group_ids;
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
 
@@ -4366,17 +4760,22 @@ pub const HostedProvisionedTableReadSource = struct {
         req: db_mod.types.SearchRequest,
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
-        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try checkQueryDeadline(req);
-        const group_ids = try table_catalog.resolveGroupsForSpanUntil(
+        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(
             alloc,
-            self.catalog,
+            hosted.catalog,
             table_name,
             "",
             "",
             req.execution_deadline_ns,
         );
-        defer alloc.free(group_ids);
+        defer route_snapshot.deinit(alloc);
+        var pinned = RoutePinnedCatalog{ .base = hosted.catalog, .table_name = table_name, .routes = route_snapshot.routes, .metadata_group_id = route_snapshot.metadata_group_id, .metadata_incarnation = route_snapshot.metadata_incarnation, .catalog_revision = route_snapshot.catalog_revision, .table_id = route_snapshot.table_id, .topology_epoch = route_snapshot.topology_epoch };
+        var routed_source = hosted.*;
+        routed_source.catalog = pinned.source();
+        const self = &routed_source;
+        const group_ids = route_snapshot.group_ids;
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
         const start_ns = platform_time.monotonicNs();
@@ -4452,9 +4851,14 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
-        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
-        defer alloc.free(group_ids);
+        const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, hosted.catalog, table_name, "", "", req.execution_deadline_ns);
+        defer route_snapshot.deinit(alloc);
+        var pinned = RoutePinnedCatalog{ .base = hosted.catalog, .table_name = table_name, .routes = route_snapshot.routes, .metadata_group_id = route_snapshot.metadata_group_id, .metadata_incarnation = route_snapshot.metadata_incarnation, .catalog_revision = route_snapshot.catalog_revision, .table_id = route_snapshot.table_id, .topology_epoch = route_snapshot.topology_epoch };
+        var routed_source = hosted.*;
+        routed_source.catalog = pinned.source();
+        const self = &routed_source;
+        const group_ids = route_snapshot.group_ids;
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
         try validateResolvedDocFilterForGroups(alloc, self.catalog, table_name, group_ids, req);
@@ -4639,12 +5043,18 @@ pub const HostedProvisionedTableReadSource = struct {
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(timeout_ms));
+        const fence = route_snapshot.fence() orelse return null;
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned = routePinnedCatalogForFence(self.catalog, table_name, fence, &route_storage);
+        var routed = self.*;
+        routed.catalog = pinned.source();
+        var route = (try table_router.resolveGroupRoute(alloc, routed.catalog, routed.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinPartitionRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinPartitionRemote(routed.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4660,12 +5070,18 @@ pub const HostedProvisionedTableReadSource = struct {
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(timeout_ms));
+        const fence = route_snapshot.fence() orelse return null;
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned = routePinnedCatalogForFence(self.catalog, table_name, fence, &route_storage);
+        var routed = self.*;
+        routed.catalog = pinned.source();
+        var route = (try table_router.resolveGroupRoute(alloc, routed.catalog, routed.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinRowsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinRowsRemote(routed.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4681,12 +5097,18 @@ pub const HostedProvisionedTableReadSource = struct {
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(timeout_ms));
+        const fence = route_snapshot.fence() orelse return null;
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned = routePinnedCatalogForFence(self.catalog, table_name, fence, &route_storage);
+        var routed = self.*;
+        routed.catalog = pinned.source();
+        var route = (try table_router.resolveGroupRoute(alloc, routed.catalog, routed.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinUnmatchedRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinUnmatchedRemote(routed.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4702,12 +5124,18 @@ pub const HostedProvisionedTableReadSource = struct {
         timeout_ms: ?u32,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        const route_snapshot = try table_catalog.routedGroupIdSnapshotUntil(alloc, self.catalog, table_name, group_id, routeDeadlineFromTimeoutMs(timeout_ms));
+        const fence = route_snapshot.fence() orelse return null;
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned = routePinnedCatalogForFence(self.catalog, table_name, fence, &route_storage);
+        var routed = self.*;
+        routed.catalog = pinned.source();
+        var route = (try table_router.resolveGroupRoute(alloc, routed.catalog, routed.router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
         defer route.deinit(alloc);
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinFinalizeRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinFinalizeRemote(routed.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4842,6 +5270,11 @@ fn routePolicyForConsistency(consistency: raft_mod.ReadConsistency) table_router
         .stale => .any_active,
         .leader_lease, .read_index => .prefer_leader,
     };
+}
+
+fn routeDeadlineFromTimeoutMs(timeout_ms: ?u32) ?u64 {
+    const duration_ms = timeout_ms orelse return null;
+    return platform_time.monotonicNs() +| @as(u64, duration_ms) * std.time.ns_per_ms;
 }
 
 const ManagedReadRuntimeConfig = struct {
@@ -7874,25 +8307,40 @@ fn queryHostedAcrossGroupsAtGenerations(
     consistency: raft_mod.ReadConsistency,
     required_identity_generations: ?[]const ?u64,
 ) !db_mod.types.SearchResult {
+    var route_snapshot = try table_catalog.routedGroupsSnapshotUntil(alloc, self.catalog, table_name, group_ids, req.execution_deadline_ns);
+    defer route_snapshot.deinit(alloc);
+    var pinned = RoutePinnedCatalog{
+        .base = self.catalog,
+        .table_name = table_name,
+        .routes = route_snapshot.routes,
+        .metadata_group_id = route_snapshot.metadata_group_id,
+        .metadata_incarnation = route_snapshot.metadata_incarnation,
+        .catalog_revision = route_snapshot.catalog_revision,
+        .table_id = route_snapshot.table_id,
+        .topology_epoch = route_snapshot.topology_epoch,
+    };
+    var routed_self = self.*;
+    routed_self.catalog = pinned.source();
+    const active_self = &routed_self;
     if (!db_mod.types.canonicalHierarchyExecutionWithinBudget(req)) return error.InvalidQueryRequest;
-    try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-    try validateResolvedDocFilterForGroups(alloc, self.catalog, table_name, group_ids, req);
-    try rejectHostedRemoteResolvedDocFilter(self, alloc, group_ids, table_name, req, consistency);
-    const distributed_text_stats = try collectHostedSearchRequestTextStats(self, alloc, group_ids, req, table_name, consistency, required_identity_generations);
+    try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, active_self.catalog, table_name, group_ids.len);
+    try validateResolvedDocFilterForGroups(alloc, active_self.catalog, table_name, group_ids, req);
+    try rejectHostedRemoteResolvedDocFilter(active_self, alloc, group_ids, table_name, req, consistency);
+    const distributed_text_stats = try collectHostedSearchRequestTextStats(active_self, alloc, group_ids, req, table_name, consistency, required_identity_generations);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
     const selected_generations = try alloc.alloc(?u64, group_ids.len);
     defer alloc.free(selected_generations);
     @memset(selected_generations, null);
-    var selected = try queryHostedAcrossGroupsPhase(self, alloc, group_ids, req, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
+    var selected = try queryHostedAcrossGroupsPhase(active_self, alloc, group_ids, req, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
     errdefer selected.deinit();
     if (req.hierarchy_children != null) {
-        if (req.include_stored) try hydrateHostedHierarchyNavigationHits(self, alloc, table_name, req, &selected, consistency);
+        if (req.include_stored) try hydrateHostedHierarchyNavigationHits(active_self, alloc, table_name, req, &selected, consistency);
         return selected;
     }
     if (!req.hierarchy_grouped_matches or selected.hits.len == 0) {
         try hydrateDistributedGroupedUnitHits(
             HostedProvisionedTableReadSource,
-            self,
+            active_self,
             alloc,
             table_name,
             req,
@@ -7908,12 +8356,12 @@ fn queryHostedAcrossGroupsAtGenerations(
     const expanded_generations = try alloc.alloc(?u64, group_ids.len);
     defer alloc.free(expanded_generations);
     @memset(expanded_generations, null);
-    var expanded = try queryHostedAcrossGroupsPhase(self, alloc, group_ids, expansion.request, table_name, consistency, distributed_text_stats, true, selected_generations, expanded_generations);
+    var expanded = try queryHostedAcrossGroupsPhase(active_self, alloc, group_ids, expansion.request, table_name, consistency, distributed_text_stats, true, selected_generations, expanded_generations);
     defer expanded.deinit();
     try applyCanonicalGroupedMatchExpansion(alloc, &selected, &expanded);
     try hydrateDistributedGroupedUnitHits(
         HostedProvisionedTableReadSource,
-        self,
+        active_self,
         alloc,
         table_name,
         req,
@@ -19556,7 +20004,7 @@ test "route-pinned catalog prevents a stale admin namespace from replacing routi
         .identity_namespace = .{ .table_id = 8, .shard_id = 9001, .range_id = 22 },
     };
     var stale = StaleCatalog{};
-    var pinned = RoutePinnedCatalog{ .base = stale.iface(), .table_name = "docs", .routes = &.{route} };
+    var pinned = RoutePinnedCatalog{ .base = stale.iface(), .table_name = "docs", .routes = &.{route}, .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 1, .table_id = 8, .topology_epoch = 1 };
     const namespace = try requireTableIdentityNamespaceForGroup(
         std.testing.allocator,
         pinned.source(),
@@ -19565,6 +20013,16 @@ test "route-pinned catalog prevents a stale admin namespace from replacing routi
     );
     try std.testing.expect(namespace.eql(.{ .table_id = 8, .shard_id = 9001, .range_id = 22 }));
     try std.testing.expectEqual(@as(usize, 0), stale.admin_calls);
+    const pinned_source = pinned.source();
+    const fence = (try pinned_source.vtable.route_fence.?(pinned_source.ptr, 7001)).?;
+    try std.testing.expectEqual(@as(u64, 8), fence.table_id);
+    try std.testing.expectEqual(@as(u64, 22), fence.route.range_id);
+    try std.testing.expect(std.meta.eql(fence.route.identity_namespace, table_catalog.CatalogIdentityNamespace{ .table_id = 8, .shard_id = 9001, .range_id = 22 }));
+    try std.testing.expectError(
+        error.TopologyChanged,
+        table_catalog.validateCatalogRouteFenceUntil(std.testing.allocator, stale.iface(), "docs", fence, null),
+    );
+    try std.testing.expectEqual(@as(usize, 1), stale.admin_calls);
     const related_namespace = try requireTableIdentityNamespaceForGroup(
         std.testing.allocator,
         pinned.source(),
@@ -19572,7 +20030,7 @@ test "route-pinned catalog prevents a stale admin namespace from replacing routi
         8001,
     );
     try std.testing.expect(related_namespace.eql(.{ .table_id = 9, .shard_id = 8001, .range_id = 31 }));
-    try std.testing.expectEqual(@as(usize, 1), stale.admin_calls);
+    try std.testing.expectEqual(@as(usize, 2), stale.admin_calls);
 }
 
 const MutableReadTopologyCatalog = struct {
@@ -21693,6 +22151,22 @@ test "hosted hierarchy navigation routes projection-safe hydration and advances 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const group_7_query = std.mem.endsWith(u8, request.uri, "/internal/v1/groups/7/tables/docs/query");
             const group_8_query = std.mem.endsWith(u8, request.uri, "/internal/v1/groups/8/tables/docs/query");
+            if (HostedProvisionedTableReadSource.internalGroupIdFromUri(request.uri)) |expected_group_id| {
+                var encoded_fence: ?[]const u8 = null;
+                for (request.headers) |header| {
+                    if (std.ascii.eqlIgnoreCase(header.name, metadata_api.catalog_route_fence_header)) encoded_fence = header.value;
+                }
+                var parsed_fence = try std.json.parseFromSlice(
+                    metadata_api.CatalogRouteFence,
+                    inner_alloc,
+                    encoded_fence orelse return error.MissingCatalogRouteFence,
+                    .{},
+                );
+                defer parsed_fence.deinit();
+                try parsed_fence.value.validate();
+                try std.testing.expectEqual(expected_group_id, parsed_fence.value.route.group_id);
+                try std.testing.expectEqual(@as(u64, 7), parsed_fence.value.table_id);
+            }
             if (request.method == .POST and (group_7_query or group_8_query)) {
                 const is_replay = std.mem.indexOf(u8, request.body, "\"search_after\"") != null;
                 self.query_calls += 1;
@@ -27166,6 +27640,7 @@ test "provisioned primary lookup lease fails on identity namespace mismatch" {
         "doc:a",
         .{},
         .stale,
+        null,
     ));
 }
 

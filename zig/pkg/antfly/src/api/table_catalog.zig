@@ -47,6 +47,9 @@ pub const CatalogSource = struct {
         /// callback. When present, consumers must not re-derive identity from
         /// an admin snapshot.
         route_identity: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64) anyerror!?metadata_api.CatalogIdentityNamespace = null,
+        /// Request-scoped sources expose the complete authority capability so
+        /// internal HTTP fanout can preserve it without re-reading metadata.
+        route_fence: ?*const fn (ptr: *anyopaque, group_id: u64) anyerror!?metadata_api.CatalogRouteFence = null,
         wait_for_routing_change: *const fn (ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, probe_interval_ns: u64) anyerror!CatalogChangeWaitResult = defaultWaitForRoutingChange,
         await_route: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, deadline_ns: u64, probe_interval_ns: u64) anyerror!AwaitRouteResult = null,
         /// Production sources must fail closed when either linearizable
@@ -295,7 +298,16 @@ pub fn TestAdminRoutingAdapter(
                 ranges[index] = try metadata_table_manager.cloneRange(std.testing.allocator, range);
                 range_count = index + 1;
             }
-            return .{ .tables = tables, .ranges = ranges };
+            return .{
+                .metadata_group_id = admin.status.metadata_group_id,
+                .metadata_incarnation = admin.status.metadata_incarnation,
+                .change_token = .{
+                    .metadata_group_id = admin.status.metadata_group_id,
+                    .metadata_incarnation = admin.status.metadata_incarnation,
+                },
+                .tables = tables,
+                .ranges = ranges,
+            };
         }
 
         pub fn linearizableSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
@@ -388,8 +400,22 @@ pub fn resolveGroupForKeyUntil(
 
 pub const RoutedGroupSnapshot = struct {
     route: ?CatalogGroupRoute,
+    metadata_group_id: u64,
+    metadata_incarnation: ?metadata_api.MetadataClusterIncarnation,
     catalog_revision: u64,
     topology_epoch: u64,
+
+    pub fn fence(self: @This()) ?metadata_api.CatalogRouteFence {
+        const route = self.route orelse return null;
+        return .{
+            .metadata_group_id = self.metadata_group_id,
+            .metadata_incarnation = self.metadata_incarnation,
+            .catalog_revision = self.catalog_revision,
+            .table_id = route.identity_namespace.table_id,
+            .topology_epoch = self.topology_epoch,
+            .route = route,
+        };
+    }
 };
 
 /// Resolve a key and compute the routing epoch from one catalog snapshot.
@@ -417,11 +443,113 @@ pub fn routedGroupSnapshotUntil(
     return switch (result) {
         .found => |plan| .{
             .route = plan.groups[0],
+            .metadata_group_id = plan.metadata_group_id,
+            .metadata_incarnation = plan.metadata_incarnation,
             .catalog_revision = plan.catalog_revision,
             .topology_epoch = plan.topology_epoch,
         },
-        .not_found => .{ .route = null, .catalog_revision = 0, .topology_epoch = 0 },
+        .not_found => .{ .route = null, .metadata_group_id = 0, .metadata_incarnation = null, .catalog_revision = 0, .topology_epoch = 0 },
         .timed_out => error.CatalogRoutingSnapshotTimeout,
+    };
+}
+
+/// Resolve an already-selected group from the same compact projection used
+/// for key routing. Distributed workers use this to retain the exact catalog
+/// identity when their coordinator has selected the group before dispatch.
+pub fn routedGroupIdSnapshotUntil(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    deadline_ns: ?u64,
+) !RoutedGroupSnapshot {
+    var result = try resolveCatalogRoute(alloc, catalog, table_name, .{ .group = group_id }, deadline_ns);
+    defer result.deinit(alloc);
+    return switch (result) {
+        .found => |plan| .{
+            .route = plan.groups[0],
+            .metadata_group_id = plan.metadata_group_id,
+            .metadata_incarnation = plan.metadata_incarnation,
+            .catalog_revision = plan.catalog_revision,
+            .topology_epoch = plan.topology_epoch,
+        },
+        .not_found => .{ .route = null, .metadata_group_id = 0, .metadata_incarnation = null, .catalog_revision = 0, .topology_epoch = 0 },
+        .timed_out => error.CatalogRoutingSnapshotTimeout,
+    };
+}
+
+/// Capture exact routes for an already-planned fanout. Request-scoped pinned
+/// catalogs are preferred so nested phases retain the original decision;
+/// ordinary catalogs resolve all requested groups from one compact snapshot.
+pub fn routedGroupsSnapshotUntil(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_ids: []const u64,
+    deadline_ns: ?u64,
+) !RoutedSpanSnapshot {
+    if (catalog.vtable.route_fence) |route_fence| {
+        const routes = try alloc.alloc(CatalogGroupRoute, group_ids.len);
+        errdefer alloc.free(routes);
+        var first: ?metadata_api.CatalogRouteFence = null;
+        for (group_ids, routes) |group_id, *route| {
+            const fence = (try route_fence(catalog.ptr, group_id)) orelse return error.TopologyChanged;
+            try fence.validate();
+            if (first) |expected| {
+                if (fence.metadata_group_id != expected.metadata_group_id or
+                    !std.meta.eql(fence.metadata_incarnation, expected.metadata_incarnation) or
+                    fence.catalog_revision != expected.catalog_revision or
+                    fence.table_id != expected.table_id or
+                    fence.topology_epoch != expected.topology_epoch)
+                {
+                    return error.TopologyChanged;
+                }
+            } else {
+                first = fence;
+            }
+            route.* = fence.route;
+        }
+        const ids = try alloc.dupe(u64, group_ids);
+        const authority = first orelse return .{
+            .routes = routes,
+            .group_ids = ids,
+            .metadata_group_id = 0,
+            .metadata_incarnation = null,
+            .table_id = 0,
+            .catalog_revision = 0,
+            .topology_epoch = 0,
+        };
+        return .{
+            .routes = routes,
+            .group_ids = ids,
+            .metadata_group_id = authority.metadata_group_id,
+            .metadata_incarnation = authority.metadata_incarnation,
+            .table_id = authority.table_id,
+            .catalog_revision = authority.catalog_revision,
+            .topology_epoch = authority.topology_epoch,
+        };
+    }
+
+    var result = try resolveCatalogRoute(alloc, catalog, table_name, .all_ranges, deadline_ns);
+    defer result.deinit(alloc);
+    const plan = switch (result) {
+        .found => |value| value,
+        .not_found => return error.TopologyChanged,
+        .timed_out => return error.CatalogRoutingSnapshotTimeout,
+    };
+    const routes = try alloc.alloc(CatalogGroupRoute, group_ids.len);
+    errdefer alloc.free(routes);
+    for (group_ids, routes) |group_id, *route| {
+        route.* = plan.group(group_id) orelse return error.TopologyChanged;
+    }
+    return .{
+        .routes = routes,
+        .group_ids = try alloc.dupe(u64, group_ids),
+        .metadata_group_id = plan.metadata_group_id,
+        .metadata_incarnation = plan.metadata_incarnation,
+        .table_id = plan.table_id,
+        .catalog_revision = plan.catalog_revision,
+        .topology_epoch = plan.topology_epoch,
     };
 }
 
@@ -942,17 +1070,8 @@ pub fn resolveGroupsForSpanPinnedUntil(
     };
 }
 
-pub const CatalogIdentityNamespace = struct {
-    table_id: u64,
-    shard_id: u64,
-    range_id: u64,
-};
-
-pub const CatalogGroupRoute = struct {
-    group_id: u64,
-    range_id: u64,
-    identity_namespace: CatalogIdentityNamespace,
-};
+pub const CatalogIdentityNamespace = metadata_api.CatalogIdentityNamespace;
+pub const CatalogGroupRoute = metadata_api.CatalogGroupRoute;
 
 /// A complete routing decision derived from one immutable catalog projection.
 /// Group selection and database identity must never be looked up separately.
@@ -1194,6 +1313,9 @@ pub fn routePlanFromSnapshot(
 pub const RoutedSpanSnapshot = struct {
     routes: []CatalogGroupRoute,
     group_ids: []u64,
+    metadata_group_id: u64,
+    metadata_incarnation: ?metadata_api.MetadataClusterIncarnation,
+    table_id: u64,
     catalog_revision: u64,
     topology_epoch: u64,
 
@@ -1202,7 +1324,44 @@ pub const RoutedSpanSnapshot = struct {
         alloc.free(self.group_ids);
         self.* = undefined;
     }
+
+    pub fn fenceAt(self: @This(), index: usize) metadata_api.CatalogRouteFence {
+        return .{
+            .metadata_group_id = self.metadata_group_id,
+            .metadata_incarnation = self.metadata_incarnation,
+            .catalog_revision = self.catalog_revision,
+            .table_id = self.table_id,
+            .topology_epoch = self.topology_epoch,
+            .route = self.routes[index],
+        };
+    }
 };
+
+pub fn validateCatalogRouteFenceUntil(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    fence: metadata_api.CatalogRouteFence,
+    deadline_ns: ?u64,
+) !void {
+    try fence.validate();
+    var result = try resolveCatalogRoute(alloc, catalog, table_name, .{ .group = fence.route.group_id }, deadline_ns);
+    defer result.deinit(alloc);
+    const plan = switch (result) {
+        .found => |value| value,
+        .not_found => return error.TopologyChanged,
+        .timed_out => return error.CatalogRoutingSnapshotTimeout,
+    };
+    if (plan.metadata_group_id != fence.metadata_group_id or
+        !std.meta.eql(plan.metadata_incarnation, fence.metadata_incarnation) or
+        plan.table_id != fence.table_id or
+        plan.topology_epoch != fence.topology_epoch or
+        plan.groups.len != 1 or
+        !std.meta.eql(plan.groups[0], fence.route))
+    {
+        return error.TopologyChanged;
+    }
+}
 
 /// Resolve a span and compute the routing epoch from one catalog snapshot.
 pub fn routedSpanSnapshot(
@@ -1235,6 +1394,9 @@ pub fn routedSpanSnapshotUntil(
             break :blk .{
                 .routes = routes,
                 .group_ids = try plan.groupIdsAlloc(alloc),
+                .metadata_group_id = plan.metadata_group_id,
+                .metadata_incarnation = plan.metadata_incarnation,
+                .table_id = plan.table_id,
                 .catalog_revision = plan.catalog_revision,
                 .topology_epoch = plan.topology_epoch,
             };
@@ -1245,6 +1407,9 @@ pub fn routedSpanSnapshotUntil(
             break :blk .{
                 .routes = routes,
                 .group_ids = try alloc.alloc(u64, 0),
+                .metadata_group_id = 0,
+                .metadata_incarnation = null,
+                .table_id = 0,
                 .catalog_revision = 0,
                 .topology_epoch = 0,
             };

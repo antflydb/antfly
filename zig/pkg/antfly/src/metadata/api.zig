@@ -315,6 +315,29 @@ pub const CatalogGroupRoute = struct {
     identity_namespace: CatalogIdentityNamespace,
 };
 
+pub const catalog_route_fence_protocol_current: u16 = 1;
+pub const catalog_route_fence_header = "X-Antfly-Catalog-Route-Fence";
+
+/// Immutable authority and identity carried with every first-party
+/// group-local read. The receiver validates this against its compact routing
+/// projection before opening storage, so an independently cached admin
+/// snapshot can never select a different table generation.
+pub const CatalogRouteFence = struct {
+    protocol: u16 = catalog_route_fence_protocol_current,
+    metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
+    catalog_revision: u64,
+    table_id: u64,
+    topology_epoch: u64,
+    route: CatalogGroupRoute,
+
+    pub fn validate(self: @This()) !void {
+        if (self.protocol != catalog_route_fence_protocol_current) return error.UnsupportedCatalogRouteFence;
+        if (self.metadata_group_id == 0 or self.table_id == 0 or self.route.group_id == 0) return error.InvalidCatalogRouteFence;
+        if (self.route.identity_namespace.table_id != self.table_id) return error.InvalidCatalogRouteFence;
+    }
+};
+
 pub const CatalogRoutePlan = struct {
     metadata_group_id: u64,
     metadata_incarnation: ?MetadataClusterIncarnation,

@@ -6142,6 +6142,7 @@ pub fn build(b: *std.Build) void {
             "provisioned consistency read reroutes after topology changes before admission",
             "route-pinned catalog prevents a stale admin namespace from replacing routing identity",
             "routing topology epoch fences identity-only changes",
+            "catalog route fence dispatch is strict and fail closed",
             "provisioned stale read admits before routing without a redundant catalog validation",
             "distributed graph source read rejects topology change before aggregation",
             "hosted cross-range graph query expands explicit local start keys",
