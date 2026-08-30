@@ -62,6 +62,33 @@ const NativeMatte = struct {
     /// Native component domains used to map an image Decode array into the
     /// unit domain where PDF's preblending equation is affine.
     ranges: [4]ColorComponentRange = .{ .{}, .{}, .{}, .{} },
+    /// Indexed images are preblended in the base color space stored by their
+    /// lookup table, not in the discrete index domain. Retain the Matte index
+    /// so that path can expand and unblend palette components per pixel.
+    indexed_matte_index: ?u8 = null,
+};
+
+const ResolvedIndexedPalette = struct {
+    lookup: []const u8 = &.{},
+    lookup_owner: ?syntax.Object = null,
+    decoded_lookup: ?[]u8 = null,
+    entry_count: usize = 0,
+    component_count: usize = 0,
+
+    fn ownedBytes(self: *const ResolvedIndexedPalette) usize {
+        if (self.decoded_lookup) |bytes| return bytes.len;
+        if (self.lookup_owner) |owner| return switch (owner) {
+            .string => |bytes| bytes.len,
+            else => 0,
+        };
+        return 0;
+    }
+
+    fn deinit(self: *ResolvedIndexedPalette, alloc: Allocator) void {
+        if (self.decoded_lookup) |bytes| alloc.free(bytes);
+        if (self.lookup_owner) |*owner| owner.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 const JpxAlphaMode = enum {
@@ -7259,7 +7286,18 @@ pub const Reader = struct {
                 } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, render_pixel_count, samples, resolved_color_space.array, obj.get("Decode"))) {
                     // handled
                 } else {
-                    try self.decodeIndexedImageToRgba(rgba, render_pixel_count, samples, resolved_color_space.array, obj.get("Decode"));
+                    try self.decodeIndexedImageWithOptionalMatteToRgba(
+                        rgba,
+                        render_width,
+                        render_height,
+                        samples,
+                        source_view,
+                        resolved_color_space.array,
+                        obj.get("Decode"),
+                        &transparency_plan,
+                        if (prepared_matte) |*prepared| prepared else null,
+                        transparency_live_bytes,
+                    );
                 }
             }
             try self.applyImageTransparencyPlanAlloc(rgba, render_width, render_height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth, if (prepared_matte) |*prepared| prepared else null);
@@ -7307,7 +7345,18 @@ pub const Reader = struct {
                 } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, pixel_count, gray, resolved_color_space.array, obj.get("Decode"))) {
                     // handled
                 } else {
-                    try self.decodeIndexedImageToRgba(rgba, pixel_count, gray, resolved_color_space.array, obj.get("Decode"));
+                    try self.decodeIndexedImageWithOptionalMatteToRgba(
+                        rgba,
+                        width,
+                        height,
+                        gray,
+                        source_view,
+                        resolved_color_space.array,
+                        obj.get("Decode"),
+                        &transparency_plan,
+                        if (prepared_matte) |*prepared| prepared else null,
+                        transparency_live_bytes,
+                    );
                 }
             } else {
                 return error.UnsupportedPdfRendering;
@@ -7427,7 +7476,26 @@ pub const Reader = struct {
                 // preblended samples therefore stay in the JPX component domain.
                 var prepared_matte = try self.prepareMatteSoftMaskAlloc(&transparency_plan, source_view, null, width, height, context, transparency_live_bytes, mask_depth);
                 defer if (prepared_matte) |*prepared| prepared.deinit(self.alloc);
-                const rgba = if (indexed_color_space)
+                const indexed_matte = if (transparency_plan.nativeMatte()) |matte|
+                    matte.indexed_matte_index != null
+                else
+                    false;
+                const rgba = if (indexed_color_space and indexed_matte) blk: {
+                    const mask_plan = switch (transparency_plan) {
+                        .soft_mask => |value| value,
+                        else => return error.UnsupportedPdfRendering,
+                    };
+                    break :blk try self.decodeIndexedMatteImageAlloc(
+                        width,
+                        height,
+                        source_view,
+                        obj,
+                        if (prepared_matte) |*prepared| prepared else return error.UnsupportedPdfRendering,
+                        transparency_plan.nativeMatte().?,
+                        mask_plan.metadata.interpolate,
+                        transparency_live_bytes,
+                    );
+                } else if (indexed_color_space)
                     try self.jpeg2000IndexedU16ToRgbaAlloc(decoded_u16.pixels, width, height, decoded_u16.components, header.bits_per_component, decoded_u16.jp2_color, obj, jpx_alpha_mode)
                 else blk: {
                     const normalized = try normalizeU16SamplesToU8Alloc(self.alloc, decoded_u16.pixels, header.bits_per_component, self.cancellation);
@@ -7492,7 +7560,26 @@ pub const Reader = struct {
             else
                 null;
             defer if (prepared_matte) |*prepared| prepared.deinit(self.alloc);
-            const rgba = try self.jpeg2000SamplesToRgbaAlloc(decoded_u8.pixels, decoded_u8.width, decoded_u8.height, decoded_u8.components, decoded_u8.jp2_color, obj, jpx_alpha_mode);
+            const indexed_matte = if (transparency_plan.nativeMatte()) |matte|
+                matte.indexed_matte_index != null
+            else
+                false;
+            const rgba = if (indexed_color_space and indexed_matte) blk: {
+                const mask_plan = switch (transparency_plan) {
+                    .soft_mask => |value| value,
+                    else => return error.UnsupportedPdfRendering,
+                };
+                break :blk try self.decodeIndexedMatteImageAlloc(
+                    decoded_u8.width,
+                    decoded_u8.height,
+                    source_view orelse return error.UnsupportedPdfRendering,
+                    obj,
+                    if (prepared_matte) |*prepared| prepared else return error.UnsupportedPdfRendering,
+                    transparency_plan.nativeMatte().?,
+                    mask_plan.metadata.interpolate,
+                    transparency_live_bytes,
+                );
+            } else try self.jpeg2000SamplesToRgbaAlloc(decoded_u8.pixels, decoded_u8.width, decoded_u8.height, decoded_u8.components, decoded_u8.jp2_color, obj, jpx_alpha_mode);
             errdefer self.alloc.free(rgba);
             try self.applyImageTransparencyPlanAlloc(rgba, decoded_u8.width, decoded_u8.height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth, if (prepared_matte) |*prepared| prepared else null);
             return .{ .rgba = rgba, .width = decoded_u8.width, .height = decoded_u8.height };
@@ -7583,13 +7670,35 @@ pub const Reader = struct {
             // Matte reversal mutates encoded parent samples. Apply /Decode only
             // afterward, matching the ordinary image pipeline and avoiding a
             // second decode transform during soft-mask processing.
-            if (source_samples) |samples| try self.decodeResolvedImageColorSpaceToRgba(
-                jpeg_decoded.rgba,
-                pixel_count,
-                samples,
-                &color_space,
-                obj.get("Decode"),
-            );
+            if (source_samples) |samples| {
+                const indexed_matte = if (transparency_plan.nativeMatte()) |matte|
+                    matte.indexed_matte_index != null
+                else
+                    false;
+                if (indexed_matte) {
+                    if (color_space != .array) return error.UnsupportedPdfRendering;
+                    try self.decodeIndexedImageWithOptionalMatteToRgba(
+                        jpeg_decoded.rgba,
+                        width,
+                        height,
+                        samples,
+                        source_view,
+                        color_space.array,
+                        obj.get("Decode"),
+                        &transparency_plan,
+                        if (prepared_matte) |*prepared| prepared else null,
+                        transparency_live_bytes,
+                    );
+                } else {
+                    try self.decodeResolvedImageColorSpaceToRgba(
+                        jpeg_decoded.rgba,
+                        pixel_count,
+                        samples,
+                        &color_space,
+                        obj.get("Decode"),
+                    );
+                }
+            }
             try self.applyImageTransparencyPlanAlloc(jpeg_decoded.rgba, width, height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth, if (prepared_matte) |*prepared| prepared else null);
             return .{
                 .rgba = jpeg_decoded.rgba,
@@ -7658,7 +7767,18 @@ pub const Reader = struct {
             } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, pixel_count, samples, resolved_color_space.array, obj.get("Decode"))) {
                 // handled
             } else {
-                try self.decodeIndexedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, obj.get("Decode"));
+                try self.decodeIndexedImageWithOptionalMatteToRgba(
+                    rgba,
+                    width,
+                    height,
+                    samples,
+                    source_view,
+                    resolved_color_space.array,
+                    obj.get("Decode"),
+                    &transparency_plan,
+                    if (prepared_matte) |*prepared| prepared else null,
+                    transparency_live_bytes,
+                );
             }
         } else {
             return error.UnsupportedPdfRendering;
@@ -8185,44 +8305,17 @@ pub const Reader = struct {
         if (!std.mem.eql(u8, indexed_name, "Indexed") and !std.mem.eql(u8, indexed_name, "I"))
             return error.UnsupportedPdfRendering;
 
-        const hi_val = color_space[2].asInteger() orelse return error.UnsupportedPdfRendering;
-        if (hi_val < 0 or hi_val > std.math.maxInt(u8) or samples.len() < pixel_count)
-            return error.UnsupportedPdfRendering;
-        const comps = try self.colorSpaceInputComponentCount(&color_space[1]);
-        if (comps == 0 or comps > 32) return error.UnsupportedPdfRendering;
-
-        var lookup_holder: ?syntax.Object = null;
-        defer if (lookup_holder) |*obj| obj.deinit(self.alloc);
-        const lookup_obj: *const syntax.Object = blk: {
-            const candidate = &color_space[3];
-            if (candidate.* == .obj_ref) {
-                lookup_holder = try self.resolveValue(candidate);
-                break :blk &lookup_holder.?;
-            }
-            break :blk candidate;
-        };
-        var decoded_lookup: ?[]u8 = null;
-        defer if (decoded_lookup) |bytes| self.alloc.free(bytes);
-        const lookup = switch (lookup_obj.*) {
-            .string => lookup_obj.string,
-            .stream => blk: {
-                decoded_lookup = try self.readDecodedStreamData(lookup_obj);
-                break :blk decoded_lookup.?;
-            },
-            else => return error.UnsupportedPdfRendering,
-        };
-        const palette_entries: usize = @intCast(hi_val + 1);
-        const palette_sample_len = std.math.mul(usize, palette_entries, comps) catch return error.UnsupportedPdfRendering;
-        if (lookup.len < palette_sample_len) return error.UnsupportedPdfRendering;
-        const palette_rgba_len = std.math.mul(usize, palette_entries, 4) catch return error.UnsupportedPdfRendering;
-        const owned_lookup_len = if (decoded_lookup != null) lookup.len else 0;
-        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ rgba.len, samples.liveBytes(), owned_lookup_len, palette_rgba_len });
+        if (samples.len() < pixel_count) return error.UnsupportedPdfRendering;
+        var palette = try self.resolveIndexedPaletteAlloc(color_space);
+        defer palette.deinit(self.alloc);
+        const palette_rgba_len = std.math.mul(usize, palette.entry_count, 4) catch return error.UnsupportedPdfRendering;
+        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ rgba.len, samples.liveBytes(), palette.ownedBytes(), palette_rgba_len });
         const palette_rgba = try self.alloc.alloc(u8, palette_rgba_len);
         defer self.alloc.free(palette_rgba);
         try self.decodeResolvedImageColorSpaceToRgbaGuarded(
             palette_rgba,
-            palette_entries,
-            .{ .source = .{ .encoded = lookup[0..palette_sample_len] } },
+            palette.entry_count,
+            .{ .source = .{ .encoded = palette.lookup } },
             &color_space[1],
             depth + 1,
         );
@@ -8230,11 +8323,231 @@ pub const Reader = struct {
         var i: usize = 0;
         while (i < pixel_count) : (i += 1) {
             if (i & 4095 == 0) try self.checkCancellation();
-            const idx = try samples.indexedValue(i, palette_entries);
-            if (idx >= palette_entries) return error.UnsupportedPdfRendering;
+            const idx = try samples.indexedValue(i, palette.entry_count);
+            if (idx >= palette.entry_count) return error.UnsupportedPdfRendering;
             const src = @as(usize, idx) * 4;
             const dst = i * 4;
             @memcpy(rgba[dst..][0..4], palette_rgba[src..][0..4]);
+        }
+    }
+
+    fn resolveIndexedPaletteAlloc(
+        self: *const Reader,
+        color_space: []const syntax.Object,
+    ) !ResolvedIndexedPalette {
+        if (color_space.len < 4) return error.UnsupportedPdfRendering;
+        const indexed_name = color_space[0].asName() orelse return error.UnsupportedPdfRendering;
+        if (!std.mem.eql(u8, indexed_name, "Indexed") and !std.mem.eql(u8, indexed_name, "I"))
+            return error.UnsupportedPdfRendering;
+        if (!isDeviceOrCieBasedColorSpace(&color_space[1]))
+            return error.UnsupportedPdfRendering;
+
+        const hi_val = (try self.resolvedIntegerObjectValue(&color_space[2])) orelse
+            return error.UnsupportedPdfRendering;
+        if (hi_val < 0 or hi_val > std.math.maxInt(u8)) return error.UnsupportedPdfRendering;
+        const component_count = try self.colorSpaceInputComponentCount(&color_space[1]);
+        if (component_count == 0 or component_count > 4) return error.UnsupportedPdfRendering;
+
+        var result = ResolvedIndexedPalette{
+            .entry_count = @intCast(hi_val + 1),
+            .component_count = component_count,
+        };
+        errdefer result.deinit(self.alloc);
+        const lookup_obj: *const syntax.Object = blk: {
+            const candidate = &color_space[3];
+            if (candidate.* == .obj_ref) {
+                result.lookup_owner = try self.resolveValue(candidate);
+                break :blk &result.lookup_owner.?;
+            }
+            break :blk candidate;
+        };
+        const lookup = switch (lookup_obj.*) {
+            .string => lookup_obj.string,
+            .stream => blk: {
+                result.decoded_lookup = try self.readDecodedStreamData(lookup_obj);
+                break :blk result.decoded_lookup.?;
+            },
+            else => return error.UnsupportedPdfRendering,
+        };
+        const lookup_len = std.math.mul(usize, result.entry_count, component_count) catch
+            return error.UnsupportedPdfRendering;
+        if (lookup.len < lookup_len) return error.UnsupportedPdfRendering;
+        result.lookup = lookup[0..lookup_len];
+        return result;
+    }
+
+    fn decodeIndexedImageWithOptionalMatteToRgba(
+        self: *const Reader,
+        rgba: []u8,
+        width: u32,
+        height: u32,
+        decoded: []const u8,
+        source_view: ?ImageSourceSamples,
+        color_space: []const syntax.Object,
+        decode_obj: ?*const syntax.Object,
+        plan: *const ImageTransparencyPlan,
+        prepared_matte: ?*const PreparedMatteMask,
+        parent_live_bytes: usize,
+    ) !void {
+        if (plan.nativeMatte()) |matte| if (matte.indexed_matte_index != null) {
+            const mask_plan = switch (plan.*) {
+                .soft_mask => |value| value,
+                else => return error.UnsupportedPdfRendering,
+            };
+            const prepared = prepared_matte orelse return error.UnsupportedPdfRendering;
+            return try self.decodeIndexedMatteImageToRgba(
+                rgba,
+                width,
+                height,
+                source_view orelse return error.UnsupportedPdfRendering,
+                color_space,
+                decode_obj,
+                prepared,
+                matte,
+                mask_plan.metadata.interpolate,
+                parent_live_bytes,
+                0,
+            );
+        };
+        return try self.decodeIndexedImageToRgba(rgba, @as(usize, width) * height, decoded, color_space, decode_obj);
+    }
+
+    fn decodeIndexedMatteImageAlloc(
+        self: *const Reader,
+        width: u32,
+        height: u32,
+        samples: ImageSourceSamples,
+        image_obj: *const syntax.Object,
+        prepared: *const PreparedMatteMask,
+        matte: NativeMatte,
+        interpolate: bool,
+        parent_live_bytes: usize,
+    ) ![]u8 {
+        const rgba_len = std.math.mul(usize, @as(usize, width) * height, 4) catch
+            return error.PdfDecodeWorkingSetTooLarge;
+        const rgba = try self.alloc.alloc(u8, rgba_len);
+        errdefer self.alloc.free(rgba);
+        const color_space_obj = image_obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
+        var color_space = try self.resolveImageColorSpaceForDecodeAlloc(color_space_obj);
+        defer color_space.deinit(self.alloc);
+        if (color_space != .array) return error.UnsupportedPdfRendering;
+        try self.decodeIndexedMatteImageToRgba(
+            rgba,
+            width,
+            height,
+            samples,
+            color_space.array,
+            null,
+            prepared,
+            matte,
+            interpolate,
+            parent_live_bytes,
+            0,
+        );
+        return rgba;
+    }
+
+    fn decodeIndexedMatteImageToRgba(
+        self: *const Reader,
+        rgba: []u8,
+        width: u32,
+        height: u32,
+        samples: ImageSourceSamples,
+        color_space: []const syntax.Object,
+        decode_obj: ?*const syntax.Object,
+        prepared: *const PreparedMatteMask,
+        matte: NativeMatte,
+        interpolate: bool,
+        parent_live_bytes: usize,
+        depth: u8,
+    ) !void {
+        const pixel_count = std.math.mul(usize, width, height) catch return error.UnsupportedPdfRendering;
+        const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
+        if (rgba.len != rgba_len or samples.pixel_count != pixel_count or samples.component_count != 1 or samples.stride == 0)
+            return error.UnsupportedPdfRendering;
+        if (samples.bits_per_component == 0 or samples.bits_per_component > 16 or samples.component_offsets[0] >= samples.stride)
+            return error.UnsupportedPdfRendering;
+        const required_samples = std.math.mul(usize, pixel_count, samples.stride) catch return error.UnsupportedPdfRendering;
+        switch (samples.data) {
+            .u8 => |bytes| if (bytes.len < required_samples or samples.bits_per_component > 8)
+                return error.UnsupportedPdfRendering,
+            .u16 => |words| if (words.len < required_samples) return error.UnsupportedPdfRendering,
+        }
+        if (prepared.image.rgba.len != @as(usize, prepared.image.width) * prepared.image.height * 4)
+            return error.InvalidPdfImageMask;
+
+        var palette = try self.resolveIndexedPaletteAlloc(color_space);
+        defer palette.deinit(self.alloc);
+        const matte_index = matte.indexed_matte_index orelse return error.UnsupportedPdfRendering;
+        if (matte_index >= palette.entry_count) return error.InvalidPdfImageMask;
+        const max_sample: u32 = (@as(u32, 1) << @intCast(samples.bits_per_component)) - 1;
+        const chunk_capacity = @min(pixel_count, 16 * 1024);
+        const scratch_len = std.math.mul(usize, chunk_capacity, palette.component_count) catch
+            return error.PdfDecodeWorkingSetTooLarge;
+        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{
+            parent_live_bytes,
+            prepared.image.rgba.len,
+            palette.ownedBytes(),
+            scratch_len,
+        });
+        const scratch = try self.alloc.alloc(u8, scratch_len);
+        defer self.alloc.free(scratch);
+
+        const matte_base = @as(usize, matte_index) * palette.component_count;
+        const explicit_decode = decodeRange(decode_obj, 0);
+        const max_index = @as(f64, @floatFromInt(palette.entry_count - 1));
+        const x_template = MaskAxisIterator.init(width, prepared.image.width, interpolate);
+        var y_iterator = MaskAxisIterator.init(height, prepared.image.height, interpolate);
+        var chunk_start: usize = 0;
+        var chunk_pixels: usize = 0;
+        var pixel: usize = 0;
+        for (0..height) |_| {
+            const ys = y_iterator.next();
+            var x_iterator = x_template;
+            for (0..width) |_| {
+                if (pixel & 4095 == 0) try self.checkCancellation();
+                const xs = x_iterator.next();
+                const alpha = if (interpolate)
+                    bilinearMaskValue(prepared.image.rgba, prepared.image.width, 0, xs, ys)
+                else
+                    prepared.image.rgba[(ys.low * @as(usize, prepared.image.width) + xs.low) * 4];
+                const source_index = pixel * samples.stride + samples.component_offsets[0];
+                const raw_sample: u32 = switch (samples.data) {
+                    .u8 => |bytes| if (samples.bits_per_component == 8)
+                        bytes[source_index]
+                    else
+                        (@as(u32, bytes[source_index]) * max_sample + 127) / 255,
+                    .u16 => |words| words[source_index],
+                };
+                if (raw_sample > max_sample) return error.UnsupportedPdfRendering;
+                const decoded_index = if (explicit_decode) |range|
+                    range.min + (@as(f64, @floatFromInt(raw_sample)) / @as(f64, @floatFromInt(max_sample))) * (range.max - range.min)
+                else
+                    @as(f64, @floatFromInt(raw_sample));
+                if (!std.math.isFinite(decoded_index)) return error.UnsupportedPdfRendering;
+                const palette_index: usize = @intFromFloat(@round(std.math.clamp(decoded_index, 0, max_index)));
+                const palette_base = palette_index * palette.component_count;
+                const scratch_base = chunk_pixels * palette.component_count;
+                for (0..palette.component_count) |component| {
+                    const preblended = @as(f64, @floatFromInt(palette.lookup[palette_base + component])) / 255.0;
+                    const matte_component = @as(f64, @floatFromInt(palette.lookup[matte_base + component])) / 255.0;
+                    scratch[scratch_base + component] = floatChannel(unblendNativeComponent(preblended, alpha, matte_component));
+                }
+                chunk_pixels += 1;
+                pixel += 1;
+                if (chunk_pixels == chunk_capacity or pixel == pixel_count) {
+                    const sample_len = chunk_pixels * palette.component_count;
+                    try self.decodeResolvedImageColorSpaceToRgbaGuarded(
+                        rgba[chunk_start * 4 ..][0 .. chunk_pixels * 4],
+                        chunk_pixels,
+                        ImageComponentSamples.encoded(scratch[0..sample_len], null),
+                        &color_space[1],
+                        depth + 1,
+                    );
+                    chunk_start = pixel;
+                    chunk_pixels = 0;
+                }
+            }
         }
     }
 
@@ -8282,6 +8595,8 @@ pub const Reader = struct {
         }
 
         if (samples.len() < pixel_count * tint_components) return error.UnsupportedPdfRendering;
+        if (!isDeviceOrCieBasedColorSpace(&color_space[alt_index]))
+            return error.UnsupportedPdfRendering;
         const alt_components = try self.colorSpaceInputComponentCount(&color_space[alt_index]);
         if (alt_components == 0 or alt_components > 32) return error.UnsupportedPdfRendering;
 
@@ -8322,10 +8637,24 @@ pub const Reader = struct {
             else => return error.UnsupportedPdfRendering,
         };
 
-        const fn_type = dictGetInteger(dict, "FunctionType") orelse return error.UnsupportedPdfRendering;
+        const fn_type_obj = dictGetObject(dict, "FunctionType") orelse return error.UnsupportedPdfRendering;
+        const fn_type = (try self.resolvedIntegerObjectValue(fn_type_obj)) orelse return error.UnsupportedPdfRendering;
         if (fn_type != 2) return error.UnsupportedPdfRendering;
-        const exponent = dictGetNumber(dict, "N") orelse return error.UnsupportedPdfRendering;
+        const exponent_obj = dictGetObject(dict, "N") orelse return error.UnsupportedPdfRendering;
+        const exponent = (try self.resolvedNumericObjectValue(exponent_obj)) orelse return error.UnsupportedPdfRendering;
         if (!std.math.isFinite(exponent) or exponent <= 0) return error.UnsupportedPdfRendering;
+
+        const domain_obj = dictGetObject(dict, "Domain") orelse return error.UnsupportedPdfRendering;
+        var domain = try self.resolveValue(domain_obj);
+        defer domain.deinit(self.alloc);
+        if (domain != .array or domain.array.len != 2) return error.UnsupportedPdfRendering;
+        const domain_min = (try self.resolvedNumericObjectValue(&domain.array[0])) orelse return error.UnsupportedPdfRendering;
+        const domain_max = (try self.resolvedNumericObjectValue(&domain.array[1])) orelse return error.UnsupportedPdfRendering;
+        // Separation and DeviceN tint transforms have the fixed [0, 1]
+        // domain. Reject a mismatched function instead of evaluating it with
+        // the wrong implicit clamp.
+        if (!std.math.isFinite(domain_min) or !std.math.isFinite(domain_max) or domain_min != 0 or domain_max != 1)
+            return error.UnsupportedPdfRendering;
 
         var c0 = try self.alloc.alloc(f64, alt_components);
         errdefer self.alloc.free(c0);
@@ -8336,29 +8665,35 @@ pub const Reader = struct {
             c1[i] = 1.0;
         }
 
-        if (dictGetArray(dict, "C0")) |values| {
-            if (values.len < alt_components) return error.UnsupportedPdfRendering;
+        if (dictGetObject(dict, "C0")) |values_obj| {
+            var values = try self.resolveValue(values_obj);
+            defer values.deinit(self.alloc);
+            if (values != .array or values.array.len != alt_components) return error.UnsupportedPdfRendering;
             for (0..alt_components) |i| {
-                c0[i] = numericObjectValue(&values[i]) orelse return error.UnsupportedPdfRendering;
+                c0[i] = (try self.resolvedNumericObjectValue(&values.array[i])) orelse return error.UnsupportedPdfRendering;
                 if (!std.math.isFinite(c0[i])) return error.UnsupportedPdfRendering;
             }
         }
-        if (dictGetArray(dict, "C1")) |values| {
-            if (values.len < alt_components) return error.UnsupportedPdfRendering;
+        if (dictGetObject(dict, "C1")) |values_obj| {
+            var values = try self.resolveValue(values_obj);
+            defer values.deinit(self.alloc);
+            if (values != .array or values.array.len != alt_components) return error.UnsupportedPdfRendering;
             for (0..alt_components) |i| {
-                c1[i] = numericObjectValue(&values[i]) orelse return error.UnsupportedPdfRendering;
+                c1[i] = (try self.resolvedNumericObjectValue(&values.array[i])) orelse return error.UnsupportedPdfRendering;
                 if (!std.math.isFinite(c1[i])) return error.UnsupportedPdfRendering;
             }
         }
 
         var ranges: ?[]ColorComponentRange = null;
-        if (dictGetArray(dict, "Range")) |values| {
-            if (values.len != alt_components * 2) return error.UnsupportedPdfRendering;
+        if (dictGetObject(dict, "Range")) |values_obj| {
+            var values = try self.resolveValue(values_obj);
+            defer values.deinit(self.alloc);
+            if (values != .array or values.array.len != alt_components * 2) return error.UnsupportedPdfRendering;
             ranges = try self.alloc.alloc(ColorComponentRange, alt_components);
             errdefer self.alloc.free(ranges.?);
             for (ranges.?, 0..) |*range, component| {
-                const min = numericObjectValue(&values[component * 2]) orelse return error.UnsupportedPdfRendering;
-                const max = numericObjectValue(&values[component * 2 + 1]) orelse return error.UnsupportedPdfRendering;
+                const min = (try self.resolvedNumericObjectValue(&values.array[component * 2])) orelse return error.UnsupportedPdfRendering;
+                const max = (try self.resolvedNumericObjectValue(&values.array[component * 2 + 1])) orelse return error.UnsupportedPdfRendering;
                 if (!std.math.isFinite(min) or !std.math.isFinite(max) or min > max)
                     return error.UnsupportedPdfRendering;
                 range.* = .{ .min = min, .max = max };
@@ -8633,11 +8968,31 @@ pub const Reader = struct {
         const component_count = try self.colorSpaceInputComponentCount(&color_space);
         if (component_count == 0 or component_count > 4) return error.UnsupportedPdfRendering;
         if (matte.len != component_count) return error.InvalidPdfImageMask;
+
+        if (color_space == .array and color_space.array.len >= 3) {
+            const family = color_space.array[0].asName() orelse return error.UnsupportedPdfRendering;
+            if (std.mem.eql(u8, family, "Indexed") or std.mem.eql(u8, family, "I")) {
+                if (!isDeviceOrCieBasedColorSpace(&color_space.array[1]))
+                    return error.UnsupportedPdfRendering;
+                const hi_val = (try self.resolvedIntegerObjectValue(&color_space.array[2])) orelse
+                    return error.UnsupportedPdfRendering;
+                if (hi_val < 0 or hi_val > std.math.maxInt(u8)) return error.UnsupportedPdfRendering;
+                const component = (try self.resolvedNumericObjectValue(&matte[0])) orelse
+                    return error.InvalidPdfImageMask;
+                if (!std.math.isFinite(component) or component < 0 or component > @as(f64, @floatFromInt(hi_val)))
+                    return error.InvalidPdfImageMask;
+                return .{
+                    .component_count = 1,
+                    .components = .{ 0, 0, 0, 0 },
+                    .indexed_matte_index = @intFromFloat(@round(component)),
+                };
+            }
+        }
         const ranges = try self.nativeColorSpaceComponentRanges(&color_space, component_count);
 
         var components: [4]f64 = .{ 0, 0, 0, 0 };
         for (matte, 0..) |value, index| {
-            const component = numericObjectValue(&value) orelse return error.InvalidPdfImageMask;
+            const component = (try self.resolvedNumericObjectValue(&value)) orelse return error.InvalidPdfImageMask;
             if (!std.math.isFinite(component)) return error.InvalidPdfImageMask;
             const range = ranges[index];
             const span = range.max - range.min;
@@ -8692,13 +9047,6 @@ pub const Reader = struct {
             }
             return ranges;
         }
-        if (std.mem.eql(u8, family, "Indexed") or std.mem.eql(u8, family, "I")) {
-            if (component_count != 1 or color_space.array.len < 3) return error.UnsupportedPdfRendering;
-            const hi_val = color_space.array[2].asInteger() orelse return error.UnsupportedPdfRendering;
-            if (hi_val < 0 or hi_val > std.math.maxInt(u8)) return error.UnsupportedPdfRendering;
-            ranges[0].max = @floatFromInt(hi_val);
-            return ranges;
-        }
         if (std.mem.eql(u8, family, "CalGray") or
             std.mem.eql(u8, family, "CalRGB") or
             std.mem.eql(u8, family, "Separation") or
@@ -8727,17 +9075,19 @@ pub const Reader = struct {
         const mask = try self.decodeImageToRgbaGuardedAlloc(&mask_plan.object, context, parent_live_bytes, mask_depth + 1);
         errdefer self.alloc.free(mask.rgba);
         if (!decodedMaskDimensionsValid(mask.width, mask.height, mask_plan.metadata, self.image_decode_target)) return error.InvalidPdfImageMask;
-        try applyResampledMatteToSamples(
-            samples,
-            width,
-            height,
-            mask.rgba,
-            mask.width,
-            mask.height,
-            mask_plan.metadata.interpolate,
-            matte,
-            parent_decode,
-        );
+        if (matte.indexed_matte_index == null) {
+            try applyResampledMatteToSamples(
+                samples,
+                width,
+                height,
+                mask.rgba,
+                mask.width,
+                mask.height,
+                mask_plan.metadata.interpolate,
+                matte,
+                parent_decode,
+            );
+        }
         return .{ .image = mask };
     }
 
@@ -15947,6 +16297,23 @@ fn dictGetObject(dict: []const syntax.DictEntry, key: []const u8) ?*const syntax
     return null;
 }
 
+fn isDeviceOrCieBasedColorSpace(color_space: *const syntax.Object) bool {
+    if (color_space.asName()) |name| {
+        return std.mem.eql(u8, name, "DeviceGray") or
+            std.mem.eql(u8, name, "G") or
+            std.mem.eql(u8, name, "DeviceRGB") or
+            std.mem.eql(u8, name, "RGB") or
+            std.mem.eql(u8, name, "DeviceCMYK") or
+            std.mem.eql(u8, name, "CMYK");
+    }
+    if (color_space.* != .array or color_space.array.len == 0) return false;
+    const family = color_space.array[0].asName() orelse return false;
+    return std.mem.eql(u8, family, "CalGray") or
+        std.mem.eql(u8, family, "CalRGB") or
+        std.mem.eql(u8, family, "Lab") or
+        std.mem.eql(u8, family, "ICCBased");
+}
+
 fn colorFromComponents(color_space_name: []const u8, components: [4]u8, count: usize) ?[4]u8 {
     if (std.mem.eql(u8, color_space_name, "DeviceGray") and count >= 1) {
         return .{ components[0], components[0], components[0], 0xff };
@@ -19527,7 +19894,7 @@ test "indexed Decode preserves the complete palette index range" {
     );
 }
 
-test "spot tint transforms preserve non-unit alternate values" {
+test "spot tint transforms preserve non-unit Lab alternate values" {
     const alloc = std.testing.allocator;
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
@@ -19540,7 +19907,7 @@ test "spot tint transforms preserve non-unit alternate values" {
 
     var scanner = syntax.Scanner.init(
         alloc,
-        "[/Separation /Spot [/Indexed /DeviceRGB 2 <ff000000ff000000ff>] << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [2] /N 1 >>]",
+        "[/Separation /Spot [/Lab << /WhitePoint [1 1 1] /Range [-100 100 -100 100] >>] << /FunctionType 2 /Domain [0 1] /C0 [0 -100 -100] /C1 [100 100 100] /N 1 >>]",
     );
     defer scanner.deinit();
     var color_space = try scanner.readObject();
@@ -19548,7 +19915,62 @@ test "spot tint transforms preserve non-unit alternate values" {
 
     var rgba: [4]u8 = undefined;
     try std.testing.expect(try reader.tryDecodeSpotColorSpaceToRgba(&rgba, 1, &.{255}, color_space.array, null));
-    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, &rgba);
+    const expected = labColor(100, 100, 100, .{ 1, 1, 1 });
+    try std.testing.expectEqualSlices(u8, &expected, &rgba);
+}
+
+test "spot tint transforms reject special alternate color spaces" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    var scanner = syntax.Scanner.init(
+        alloc,
+        "[/Separation /Spot [/Indexed /DeviceRGB 1 <000000ffffff>] << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >>]",
+    );
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    var rgba: [4]u8 = undefined;
+    try std.testing.expectError(
+        error.UnsupportedPdfRendering,
+        reader.tryDecodeSpotColorSpaceToRgba(&rgba, 1, &.{255}, color_space.array, null),
+    );
+}
+
+test "type 2 tint transform resolves indirect numeric arrays" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        "3 0 obj\n[0 1]\nendobj\n",
+        "4 0 obj\n[0 0 0]\nendobj\n",
+        "5 0 obj\n[1 2 3]\nendobj\n",
+        "6 0 obj\n[0 0.5 0 1 0 2]\nendobj\n",
+        "7 0 obj\n2\nendobj\n",
+        "8 0 obj\n1\nendobj\n",
+        "9 0 obj\n<< /FunctionType 7 0 R /Domain 3 0 R /C0 4 0 R /C1 5 0 R /Range 6 0 R /N 8 0 R >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    const function = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+    var transform = try reader.parseExponentialTintTransform(&function, 3);
+    defer transform.deinit(alloc);
+    try std.testing.expectEqualSlices(f64, &.{ 0, 0, 0 }, transform.c0);
+    try std.testing.expectEqualSlices(f64, &.{ 1, 2, 3 }, transform.c1);
+    try std.testing.expectEqual(@as(f64, 0.5), transform.ranges.?[0].max);
+    try std.testing.expectEqual(@as(f64, 2), transform.ranges.?[2].max);
+    try std.testing.expectEqual(@as(f64, 2), evalExponentialTintComponent(&transform, 1, 2));
 }
 
 test "ICCBased Lab alternate consumes native component values once" {
@@ -21725,6 +22147,27 @@ test "soft-mask Matte reverses parent sample preblending" {
         "4 0 obj\nnull\nendobj\n",
         "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R /Length 3 >>\nstream\n\x80\x00\x00\nendstream\nendobj\n",
         "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [0 0 0] /Length 1 >>\nstream\n\x80\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+    const decoded = try reader.decodeImageToRgbaAlloc(&image);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 0x00, 0x80 }, decoded.rgba);
+}
+
+test "soft-mask Matte reverses Indexed lookup colors before base conversion" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace [/Indexed /DeviceRGB 1 <000000800000>] /BitsPerComponent 8 /SMask 6 0 R /Length 1 >>\nstream\n\x01\nendstream\nendobj\n",
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [0] /Length 1 >>\nstream\n\x80\nendstream\nendobj\n",
     };
     const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
     defer alloc.free(sample);
