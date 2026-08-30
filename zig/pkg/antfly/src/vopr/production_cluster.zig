@@ -358,6 +358,15 @@ pub const Fixture = struct {
     global_query_cancellation_no_partial: bool = false,
     global_query_cancellation_recovered: bool = false,
     global_query_cancellation_sound: bool = false,
+    global_query_authorization_revocation_armed: bool = false,
+    global_query_authorization_boundary_observed: bool = false,
+    global_query_authorization_revoked: bool = false,
+    global_query_authorization_denied_without_leak: bool = false,
+    global_query_authorization_restored: bool = false,
+    global_query_authorization_recovered: bool = false,
+    global_query_authorization_denied_status: u16 = 0,
+    global_query_authorization_recovered_status: u16 = 0,
+    global_query_authorization_sound: bool = false,
     join_sound: bool = false,
     split_join_sound: bool = false,
     post_split_join_sound: bool = false,
@@ -547,6 +556,7 @@ pub const Fixture = struct {
     join_enabled: bool = false,
     global_query_enabled: bool = false,
     global_query_cancellation_enabled: bool = false,
+    global_query_authorization_revocation_enabled: bool = false,
     join_cancellation_enabled: bool = false,
     join_cancellation_overlap_enabled: bool = false,
     join_cancellation_owner_restart_enabled: bool = false,
@@ -616,6 +626,16 @@ pub const Fixture = struct {
     pub fn setGlobalQueryCancellationEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.global_query_cancellation_enabled = enabled;
+    }
+
+    pub fn setGlobalQueryAuthorizationRevocationEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.global_query_authorization_revocation_enabled = enabled;
+    }
+
+    fn liveAuthorizationEnabled(self: *const Fixture) bool {
+        return self.graph_inflight_authorization_revocation_enabled or
+            self.global_query_authorization_revocation_enabled;
     }
 
     pub fn setJoinCancellationEnabled(self: *Fixture, enabled: bool) void {
@@ -818,6 +838,9 @@ pub const Fixture = struct {
             return error.InvalidProductionClusterGraphCancellationMode;
         if (self.graph_inflight_authorization_revocation_enabled and !self.graph_enabled)
             return error.InvalidProductionClusterGraphAuthorizationMode;
+        if (self.global_query_authorization_revocation_enabled and
+            (!self.global_query_enabled or self.global_query_cancellation_enabled))
+            return error.InvalidProductionClusterGlobalQueryAuthorizationMode;
         if (self.graph_stale_snapshot_retry_exhaustion_enabled and
             (!self.graph_enabled or !self.active_split_enabled))
             return error.InvalidProductionClusterGraphStaleSnapshotMode;
@@ -907,7 +930,7 @@ pub const Fixture = struct {
             .pool_max_per_host = 8,
         });
         self.public_executor_live = true;
-        if (self.graph_inflight_authorization_revocation_enabled) {
+        if (self.liveAuthorizationEnabled()) {
             self.auth_store = usermgr.MemoryStore.init(alloc);
             self.auth_store_live = true;
             self.auth_policy_store = casbin.MemoryAdapter.init(alloc);
@@ -1020,7 +1043,7 @@ pub const Fixture = struct {
         try self.installExternalTransitionRouting();
         self.client = api_http_client.ApiHttpClient.init(
             alloc,
-            if (self.graph_inflight_authorization_revocation_enabled)
+            if (self.liveAuthorizationEnabled())
                 self.public_authorization_executor.iface()
             else
                 self.public_executor.executor(),
@@ -1053,8 +1076,8 @@ pub const Fixture = struct {
             .backend_runtime = self.backend_runtimes[index].ptr(),
             .h1_disconnect_probe = self.http_disconnect_probe.iface(),
             .api_server_cfg = .{
-                .auth_enabled = self.graph_inflight_authorization_revocation_enabled,
-                .user_manager = if (self.graph_inflight_authorization_revocation_enabled) &self.auth_manager else null,
+                .auth_enabled = self.liveAuthorizationEnabled(),
+                .user_manager = if (self.liveAuthorizationEnabled()) &self.auth_manager else null,
                 .internal_service_secret = internal_service_secret,
                 .internal_service_issuer = internal_service_issuer,
                 .distributed_join_lifecycle_hook = .{
@@ -1188,6 +1211,19 @@ pub const Fixture = struct {
                 self.global_query_cancellation_boundary_observed = true;
                 self.global_query_cancellation_boundary.post(self.sim.io());
                 try self.global_query_cancellation_release.wait(self.sim.io());
+            }
+            if (self.global_query_authorization_revocation_enabled and
+                self.global_query_authorization_revocation_armed and
+                std.mem.eql(u8, event.table_name, "docs"))
+            {
+                self.global_query_authorization_revocation_armed = false;
+                self.global_query_authorization_boundary_observed = true;
+                try self.auth_manager.removePermissionFromUser(
+                    graph_authorization_username,
+                    "tenant_b_docs",
+                    .table,
+                );
+                self.global_query_authorization_revoked = true;
             }
         }
     }
@@ -2341,6 +2377,8 @@ pub const Fixture = struct {
                 return error.ProductionDataGlobalQueryIdentityPublicationTimeout;
             self.global_query_sound = if (self.global_query_cancellation_enabled)
                 try self.runGlobalMultiQueryCancellation()
+            else if (self.global_query_authorization_revocation_enabled)
+                try self.runGlobalMultiQueryAuthorizationRevocation()
             else
                 try self.runGlobalMultiQuery();
             if (!self.global_query_sound)
@@ -3258,6 +3296,52 @@ pub const Fixture = struct {
             self.global_query_cancellation_no_partial and
             self.global_query_cancellation_recovered;
         return self.global_query_cancellation_sound;
+    }
+
+    fn runGlobalMultiQueryAuthorizationRevocation(self: *Fixture) !bool {
+        if (!self.auth_manager_live)
+            return error.ProductionGlobalQueryAuthorizationManagerMissing;
+        const results_before = self.global_query_result_assembled_count;
+        self.global_query_authorization_revocation_armed = true;
+
+        var denied = try self.client.fetchGlobalMultiQueryRaw(
+            self.data_api_uris[1],
+            global_query_body,
+        );
+        defer denied.deinit(self.alloc);
+        self.global_query_authorization_denied_status = denied.status;
+        self.global_query_authorization_denied_without_leak =
+            self.global_query_authorization_boundary_observed and
+            self.global_query_authorization_revoked and
+            self.global_query_result_assembled_count == results_before + 1 and
+            denied.status == 403 and
+            std.mem.eql(u8, denied.body, "{\"error\":\"forbidden\"}");
+        if (!self.global_query_authorization_denied_without_leak) return false;
+
+        var restored_permission = try usermgr.Permission.initOwned(
+            self.alloc,
+            .table,
+            "tenant_b_docs",
+            .read,
+        );
+        defer restored_permission.deinit(self.alloc);
+        try self.auth_manager.addPermissionToUser(
+            graph_authorization_username,
+            restored_permission,
+        );
+        self.global_query_authorization_restored = true;
+
+        const recovered = try self.runGlobalMultiQuery();
+        self.global_query_authorization_recovered_status = self.global_query_status;
+        self.global_query_authorization_recovered = recovered and
+            self.global_query_result_assembled_count == results_before + 3;
+        self.global_query_authorization_sound =
+            self.global_query_authorization_boundary_observed and
+            self.global_query_authorization_revoked and
+            self.global_query_authorization_denied_without_leak and
+            self.global_query_authorization_restored and
+            self.global_query_authorization_recovered;
+        return self.global_query_authorization_sound;
     }
 
     fn runGraphQuery(
@@ -4589,6 +4673,14 @@ pub const Fixture = struct {
         global_query_cancellation_no_partial: bool,
         global_query_cancellation_recovered: bool,
         global_query_cancellation_ok: bool,
+        global_query_authorization_boundary_observed: bool,
+        global_query_authorization_revoked: bool,
+        global_query_authorization_denied_without_leak: bool,
+        global_query_authorization_restored: bool,
+        global_query_authorization_recovered: bool,
+        global_query_authorization_denied_status: u16,
+        global_query_authorization_recovered_status: u16,
+        global_query_authorization_ok: bool,
         join_query_ok: bool,
         split_join_query_ok: bool,
         post_split_join_query_ok: bool,
@@ -4748,6 +4840,14 @@ pub const Fixture = struct {
             .global_query_cancellation_no_partial = self.global_query_cancellation_no_partial,
             .global_query_cancellation_recovered = self.global_query_cancellation_recovered,
             .global_query_cancellation_ok = self.global_query_cancellation_sound,
+            .global_query_authorization_boundary_observed = self.global_query_authorization_boundary_observed,
+            .global_query_authorization_revoked = self.global_query_authorization_revoked,
+            .global_query_authorization_denied_without_leak = self.global_query_authorization_denied_without_leak,
+            .global_query_authorization_restored = self.global_query_authorization_restored,
+            .global_query_authorization_recovered = self.global_query_authorization_recovered,
+            .global_query_authorization_denied_status = self.global_query_authorization_denied_status,
+            .global_query_authorization_recovered_status = self.global_query_authorization_recovered_status,
+            .global_query_authorization_ok = self.global_query_authorization_sound,
             .join_query_ok = self.join_sound,
             .split_join_query_ok = self.split_join_sound,
             .post_split_join_query_ok = self.post_split_join_sound,

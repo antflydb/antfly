@@ -5487,6 +5487,7 @@ pub fn build(b: *std.Build) void {
         "typed HA route operation requires exact bearer token for internal replication routes",
         "api http server forbids non-admin secret access when auth is enabled",
         "api http server query builder requires table read permission when auth is enabled",
+        "global multi-query rechecks live permission before each table result",
         "api http server restricts runtime schema debug to admins when auth is enabled",
         "api http server serves user management routes when auth is enabled",
         "api http server serves api key and row filter routes",
@@ -5548,6 +5549,7 @@ pub fn build(b: *std.Build) void {
 
     const authorization_sink_filters = [_][]const u8{
         "api http server document scan requires table read permission",
+        "global multi-query rechecks live permission before each table result",
         "transaction principals bind sessions to credential identity",
         "api transaction sessions enforce principal permissions and row filters",
         "stored destination admission requires write permission on every eventual sink",
@@ -5814,6 +5816,7 @@ pub fn build(b: *std.Build) void {
             "distributed graph rejects unstamped result refs before cross-range fanout",
             "api distributed graph preserves per-shard snapshots across result refs expansion and hydration",
             "distributed graph edge reader carries identity generation",
+            "graph hydrate response wire flattens index identity",
             "query merge preserves common identity read generation",
             "query merge applies distributed typed sort ordering and cursor paging",
             "match_all index sort uses doc values collector for selective native filters",
@@ -6334,6 +6337,22 @@ pub fn build(b: *std.Build) void {
     const run_lib_api_graph_snapshot_tests = addFilteredTestRunArtifact(b, lib_api_graph_snapshot_tests);
     const lib_api_graph_snapshot_test_step = b.step("lib-api-graph-snapshot-test", "Run distributed graph snapshot-vector regression tests");
     lib_api_graph_snapshot_test_step.dependOn(&run_lib_api_graph_snapshot_tests.step);
+    const lib_api_graph_wire_runtime_filters = &.{"graph hydrate response wire flattens index identity"};
+    const lib_api_graph_wire_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, lib_api_graph_wire_runtime_filters),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_graph_wire_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        lib_api_graph_wire_tests,
+        lib_api_graph_wire_runtime_filters,
+    );
+    const lib_api_graph_wire_test_step = b.step("lib-api-graph-wire-test", "Run canonical internal graph wire-contract regressions");
+    lib_api_graph_wire_test_step.dependOn(&run_lib_api_graph_wire_tests.step);
     const api_derived_coverage_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_derived_coverage_test_root.zig"),
         .target = target,
@@ -7485,6 +7504,18 @@ pub fn build(b: *std.Build) void {
     );
     production_cluster_global_query_cancellation_vopr_test_step.dependOn(&run_production_cluster_global_query_cancellation_vopr_tests.step);
 
+    const production_cluster_global_query_authorization_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production public global query inflight authorization revocation exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_production_cluster_global_query_authorization_vopr_tests = b.addRunArtifact(production_cluster_global_query_authorization_vopr_tests);
+    const production_cluster_global_query_authorization_vopr_test_step = b.step(
+        "production-cluster-global-query-authorization-vopr-test",
+        "Revoke live authority between global NDJSON results and prove fail-closed recovery",
+    );
+    production_cluster_global_query_authorization_vopr_test_step.dependOn(&run_production_cluster_global_query_authorization_vopr_tests.step);
+
     const production_cluster_baseline_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane baseline exact replay"},
@@ -7638,6 +7669,7 @@ pub fn build(b: *std.Build) void {
         run_production_cluster_graph_stale_snapshot_vopr_tests,
         run_production_cluster_global_query_vopr_tests,
         run_production_cluster_global_query_cancellation_vopr_tests,
+        run_production_cluster_global_query_authorization_vopr_tests,
     }) |run_production_cluster_test| {
         // addRunArtifact appends cache-dir, seed, and --listen arguments after
         // the artifact; simple mode needs only the artifact itself.
@@ -7737,7 +7769,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_graph_split_socket_pressure_vopr_test_step.dependOn(&run_production_cluster_graph_split_socket_pressure_vopr_tests.step);
     const production_cluster_vopr_test_step = b.step(
         "production-cluster-vopr-test",
-        "Run every focused production DataServer cluster history through v37",
+        "Run every focused production DataServer cluster history through v38",
     );
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_deep_test_step);
@@ -7765,6 +7797,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_stale_snapshot_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_global_query_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_global_query_cancellation_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_global_query_authorization_vopr_test_step);
 
     const generation_reranking_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,

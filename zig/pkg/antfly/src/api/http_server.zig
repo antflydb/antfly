@@ -8540,12 +8540,12 @@ pub const ApiHttpServer = struct {
     ) !bool {
         for (details.tables) |table| {
             if ((table.staged_read_count > 0 or table.staged_predicate_count > 0) and
-                !transactionTablePermissionAllowed(authenticated_identity, table.table_name, .read)) return false;
+                !admittedTablePermissionAllowed(authenticated_identity, table.table_name, .read)) return false;
             if ((table.staged_write_count > 0 or table.staged_delete_count > 0) and
-                !transactionTablePermissionAllowed(authenticated_identity, table.table_name, .write)) return false;
+                !admittedTablePermissionAllowed(authenticated_identity, table.table_name, .write)) return false;
         }
         for (details.read_snapshots) |snapshot| {
-            if (!transactionTablePermissionAllowed(authenticated_identity, snapshot.table_name, .read)) return false;
+            if (!admittedTablePermissionAllowed(authenticated_identity, snapshot.table_name, .read)) return false;
             if (!(try self.transactionReadSnapshotVisible(
                 authenticated_identity,
                 snapshot.table_name,
@@ -8569,7 +8569,7 @@ pub const ApiHttpServer = struct {
             ))) return false;
         }
         for (request.tables) |table| {
-            if (!transactionTablePermissionAllowed(authenticated_identity, table.table_name, .write)) return false;
+            if (!admittedTablePermissionAllowed(authenticated_identity, table.table_name, .write)) return false;
         }
         return true;
     }
@@ -8580,7 +8580,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         key: []const u8,
     ) !bool {
-        if (!transactionTablePermissionAllowed(authenticated_identity, table_name, .read)) return false;
+        if (!admittedTablePermissionAllowed(authenticated_identity, table_name, .read)) return false;
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
         const filter = row_filter_json orelse return true;
@@ -9653,14 +9653,8 @@ pub const ApiHttpServer = struct {
         const identity: *const AuthenticatedIdentity = @ptrCast(@alignCast(ctx orelse {
             return .{ .allowed = false };
         }));
-        if (!permissionsAllow(identity.permissions, .table, table_name, .read)) {
+        if (!try tablePermissionCurrentlyAllowed(identity.*, table_name, .read))
             return .{ .allowed = false };
-        }
-        if (identity.live_user_manager) |manager| {
-            if (!try manager.permissionCurrentlyAllowed(identity.username, .table, table_name, .read)) {
-                return .{ .allowed = false };
-            }
-        }
         return .{
             .allowed = true,
             .filter_query_json = try resolveEffectiveRowFilterJson(alloc, identity.*, table_name),
@@ -12630,7 +12624,7 @@ pub const ApiHttpServer = struct {
         // `/query` selects its table from the body, so path middleware cannot
         // establish this authorization boundary. Keep the check in the query
         // service so every transport and direct caller is covered.
-        if (!transactionTablePermissionAllowed(authenticated_identity, table_name, .read))
+        if (!admittedTablePermissionAllowed(authenticated_identity, table_name, .read))
             return try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
@@ -12701,9 +12695,12 @@ pub const ApiHttpServer = struct {
                 break :blk parsed_table.table_name;
             };
 
-            // Authorize every NDJSON line independently. A permitted decoy
-            // line must not lend authority to a later protected-table line.
-            if (!transactionTablePermissionAllowed(authenticated_identity, table_name, .read))
+            // Authorize every NDJSON line independently against both the
+            // request's admitted credential scope and current policy. A
+            // permitted decoy line must not lend authority to a later
+            // protected-table line, and a mid-request revoke must fail closed
+            // before another result is assembled.
+            if (!try tablePermissionCurrentlyAllowed(authenticated_identity, table_name, .read))
                 return try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
 
             const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
@@ -16901,13 +16898,48 @@ pub fn storedDestinationPrincipal(authenticated_identity: ?AuthenticatedIdentity
         identity.username;
 }
 
-fn transactionTablePermissionAllowed(
+/// Check the immutable credential scope captured when a request was admitted.
+/// Ordinary single-stage operations retain this authority for their lifetime;
+/// a later grant cannot broaden it.
+fn admittedTablePermissionAllowed(
     authenticated_identity: ?AuthenticatedIdentity,
     table_name: []const u8,
     permission_type: usermgr.PermissionType,
 ) bool {
     const identity = authenticated_identity orelse return true;
     return permissionsAllow(identity.permissions, .table, table_name, permission_type);
+}
+
+/// Intersect the authority admitted with a request with the credential's
+/// current policy. The snapshot prevents a later grant from broadening an
+/// in-flight request; the live check makes deletion, expiry, or revocation
+/// effective before the next protected table operation.
+fn tablePermissionCurrentlyAllowed(
+    authenticated_identity: ?AuthenticatedIdentity,
+    table_name: []const u8,
+    permission_type: usermgr.PermissionType,
+) !bool {
+    const identity = authenticated_identity orelse return true;
+    if (!permissionsAllow(identity.permissions, .table, table_name, permission_type))
+        return false;
+    const manager = identity.live_user_manager orelse return true;
+
+    if (std.mem.startsWith(u8, identity.credential_principal, "api-key:")) {
+        const key_id = identity.credential_principal["api-key:".len..];
+        const current = manager.effectiveApiKeyPermissions(key_id) catch |err| switch (err) {
+            error.ApiKeyNotFound, error.ApiKeyExpired, error.UserNotFound => return false,
+            else => return err,
+        };
+        defer freePermissions(manager.alloc, current);
+        return permissionsAllow(current, .table, table_name, permission_type);
+    }
+
+    return try manager.permissionCurrentlyAllowed(
+        identity.username,
+        .table,
+        table_name,
+        permission_type,
+    );
 }
 
 fn storedDestinationAllowedForIdentity(
@@ -31133,6 +31165,120 @@ test "api http server exposes operation-specific query result assembly" {
         try std.testing.expectEqualStrings("docs", event.table_name);
         try std.testing.expect(event.response_bytes > 0);
     }
+}
+
+test "global multi-query rechecks live permission before each table result" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+    };
+    const FakeReads = struct {
+        query_count: usize = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{
+                .lookup = lookup,
+                .scan = scan,
+                .query = query,
+            } };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.query_count += 1;
+            return .{ .json = try std.fmt.allocPrint(
+                inner_alloc,
+                "{{\"responses\":[{{\"hits\":[{{\"_id\":\"{s}:result\"}}]}}]}}",
+                .{table_name},
+            ) };
+        }
+    };
+    const Observer = struct {
+        manager: *usermgr.UserManager,
+        event_count: usize = 0,
+        revoked: bool = false,
+
+        fn hook(self: *@This()) QueryResultLifecycleHook {
+            return .{ .ptr = self, .reach_fn = reach };
+        }
+
+        fn reach(ptr: *anyopaque, event: QueryResultLifecycleEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.event_count += 1;
+            if (!self.revoked and
+                std.mem.eql(u8, event.operation_id, "public.global.multi_query") and
+                std.mem.eql(u8, event.table_name, "docs"))
+            {
+                try self.manager.removePermissionFromUser("reader", "tenant_b_docs", .table);
+                self.revoked = true;
+            }
+        }
+    };
+
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var docs_read = try usermgr.Permission.initOwned(alloc, .table, "docs", .read);
+    defer docs_read.deinit(alloc);
+    var tenant_read = try usermgr.Permission.initOwned(alloc, .table, "tenant_b_docs", .read);
+    defer tenant_read.deinit(alloc);
+    var reader = try auth.manager.createUser("reader", "secret", &.{ docs_read, tenant_read });
+    reader.deinit(alloc);
+
+    var reads = FakeReads{};
+    var observer = Observer{ .manager = &auth.manager };
+    var server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+        .query_result_lifecycle_hook = observer.hook(),
+    }, FakeSource.iface(), reads.source(), null);
+    defer server.deinit();
+    const authorization = try encodeBasicAuthorization(alloc, "reader", "secret");
+    defer alloc.free(authorization);
+    const body =
+        \\{"table":"docs","query":{"match_all":{}}}
+        \\{"table":"tenant_b_docs","query":{"match_all":{}}}
+    ;
+
+    var admitted = try server.authenticateRequest(.{ .authorization = authorization });
+    defer admitted.deinit(alloc);
+    var denied = try server.handlePublicGlobalMultiQuery(body, admitted);
+    defer denied.deinit(alloc);
+    try std.testing.expect(observer.revoked);
+    try std.testing.expectEqual(@as(u16, 403), denied.status);
+    try std.testing.expectEqualStrings("{\"error\":\"forbidden\"}", denied.body);
+    try std.testing.expectEqual(@as(usize, 1), reads.query_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.event_count);
+
+    var restored = try usermgr.Permission.initOwned(alloc, .table, "tenant_b_docs", .read);
+    defer restored.deinit(alloc);
+    try auth.manager.addPermissionToUser("reader", restored);
+    var recovered_identity = try server.authenticateRequest(.{ .authorization = authorization });
+    defer recovered_identity.deinit(alloc);
+    var recovered = try server.handlePublicGlobalMultiQuery(body, recovered_identity);
+    defer recovered.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), recovered.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, recovered.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("responses").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 3), reads.query_count);
+    try std.testing.expectEqual(@as(usize, 3), observer.event_count);
 }
 
 test "shared application admission covers MCP query and write operations" {

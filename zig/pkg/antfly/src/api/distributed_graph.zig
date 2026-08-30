@@ -5710,6 +5710,26 @@ pub fn parseGraphHydrateResponse(alloc: std.mem.Allocator, body: []const u8) !Gr
     };
 }
 
+test "graph hydrate response wire flattens index identity" {
+    const alloc = std.testing.allocator;
+    var response = GraphHydrateResponse{
+        .has_incoming = try alloc.dupe(bool, &.{ true, false }),
+        .incoming_index_identity = .{ .incarnation = 41, .config_hash = 99 },
+    };
+    defer response.deinit(alloc);
+
+    const encoded = try encodeGraphHydrateResponse(alloc, response);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"incoming_index_incarnation\":41") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"incoming_index_config_hash\":99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"incoming_index_identity\"") == null);
+
+    var decoded = try parseGraphHydrateResponse(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, decoded.has_incoming);
+    try std.testing.expect(decoded.incoming_index_identity.eql(response.incoming_index_identity));
+}
+
 fn identityGenerationFromResolvedFilterEnvelope(
     explicit_generation: ?u64,
     parsed_filter: ?*const db_mod.doc_filter_wire.ParsedResolvedDocFilter,
@@ -10685,7 +10705,9 @@ test "distributed graph retries once on topology change and succeeds" {
             const state: *TestState = @ptrCast(@alignCast(ptr));
             state.lifecycle_counts[@intFromEnum(event.phase)] += 1;
             switch (event.phase) {
-                .source_snapshot_acquired => state.lifecycle_valid = state.lifecycle_valid and event.group_count > 0,
+                // This fixture deliberately uses the scalar identity stamp,
+                // so it has no per-shard snapshot vector to count.
+                .source_snapshot_acquired => state.lifecycle_valid = state.lifecycle_valid and event.group_count == 0,
                 .snapshot_validated => {},
                 .target_authorization_started => state.lifecycle_valid = state.lifecycle_valid and event.table_name.len > 0,
                 .expand_round_completed => {
@@ -10694,7 +10716,8 @@ test "distributed graph retries once on topology change and succeeds" {
                         event.depth == 1 and event.result_count == 1;
                 },
                 .hydration_started, .hydration_completed => state.lifecycle_valid = state.lifecycle_valid and std.mem.eql(u8, "walk", event.query_name),
-                .hydration_fanout_started => state.lifecycle_valid = state.lifecycle_valid and event.group_count > 1,
+                // A scheduled fanout batch may contain one group.
+                .hydration_fanout_started => state.lifecycle_valid = state.lifecycle_valid and event.group_count > 0,
                 .attempt_failed => {
                     state.lifecycle_valid = state.lifecycle_valid and event.attempt == 0 and
                         event.error_code == @intFromError(error.TopologyChanged);
