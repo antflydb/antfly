@@ -5053,10 +5053,7 @@ fn queryProvisionedAcrossGroupsParallel(
     result_identity_generations: []?u64,
 ) !db_mod.types.SearchResult {
     const start_ns = platform_time.monotonicNs();
-    var graph_admission = query_api.GraphResultsAdmission.init(
-        req.graph_queries,
-        req.graph_execution_limits,
-    );
+    std.debug.assert(req.graph_queries.len == 0);
     const slots = try initSearchFanoutSlots(alloc, group_ids.len);
     defer deinitSearchFanoutSlots(alloc, slots);
 
@@ -5105,7 +5102,7 @@ fn queryProvisionedAcrossGroupsParallel(
         for (slots[start..end], start..end) |slot, i| {
             if (slot.err) |err| return err;
             const result = slot.result orelse return error.InvalidRemoteResponse;
-            try graph_admission.admit(result.graph_results);
+            if (result.graph_results.len != 0) return error.InvalidRemoteResponse;
             result_identity_generations[i] = result.identity_read_generation;
             if (required_identity_generations) |generations| {
                 if (result_identity_generations[i] != generations[i])
@@ -5138,10 +5135,7 @@ fn queryHostedAcrossGroupsParallel(
     result_identity_generations: []?u64,
 ) !db_mod.types.SearchResult {
     const start_ns = platform_time.monotonicNs();
-    var graph_admission = query_api.GraphResultsAdmission.init(
-        req.graph_queries,
-        req.graph_execution_limits,
-    );
+    std.debug.assert(req.graph_queries.len == 0);
     const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency);
     defer deinitHostedShardRoutes(alloc, routes);
 
@@ -5197,7 +5191,7 @@ fn queryHostedAcrossGroupsParallel(
         for (slots[start..end], start..end) |slot, i| {
             if (slot.err) |err| return err;
             const result = slot.result orelse return error.InvalidRemoteResponse;
-            try graph_admission.admit(result.graph_results);
+            if (result.graph_results.len != 0) return error.InvalidRemoteResponse;
             result_identity_generations[i] = result.identity_read_generation;
             if (required_identity_generations) |generations| {
                 if (result_identity_generations[i] != generations[i])
@@ -8218,10 +8212,11 @@ fn queryProvisionedAcrossGroupsPhase(
 
     var shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     var initialized: usize = 0;
-    var graph_admission = query_api.GraphResultsAdmission.init(
-        req.graph_queries,
-        req.graph_execution_limits,
-    );
+    var graph_accumulator: ?query_api.GraphSearchResultsAccumulator = if (req.graph_queries.len > 0)
+        try query_api.GraphSearchResultsAccumulator.init(alloc, req.graph_queries, req.graph_execution_limits)
+    else
+        null;
+    defer if (graph_accumulator) |*accumulator| accumulator.deinit();
     defer {
         for (shard_results[0..initialized]) |*result| result.deinit();
         alloc.free(shard_results);
@@ -8232,14 +8227,19 @@ fn queryProvisionedAcrossGroupsPhase(
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
         shard_results[i] = try queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, group_req, consistency);
         initialized += 1;
-        try graph_admission.admit(shard_results[i].graph_results);
+        if (graph_accumulator) |*accumulator|
+            try accumulator.appendOwned(shard_results[i].alloc, &shard_results[i].graph_results);
         result_identity_generations[i] = shard_results[i].identity_read_generation;
         if (required_identity_generations) |generations| {
             if (result_identity_generations[i] != generations[i]) return error.IdentityReadGenerationChanged;
         }
     }
-    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results[0..initialized], req.offset, req.limit);
+    var merge_req = req;
+    if (graph_accumulator != null) merge_req.clearGraphQueries();
+    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, merge_req, shard_results[0..initialized], req.offset, req.limit);
     errdefer merged.deinit();
+    if (graph_accumulator) |*accumulator|
+        merged.graph_results = try accumulator.toOwned();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
     return merged;
 }
@@ -8268,10 +8268,11 @@ fn queryHostedAcrossGroupsPhase(
 
     var shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     var initialized: usize = 0;
-    var graph_admission = query_api.GraphResultsAdmission.init(
-        req.graph_queries,
-        req.graph_execution_limits,
-    );
+    var graph_accumulator: ?query_api.GraphSearchResultsAccumulator = if (req.graph_queries.len > 0)
+        try query_api.GraphSearchResultsAccumulator.init(alloc, req.graph_queries, req.graph_execution_limits)
+    else
+        null;
+    defer if (graph_accumulator) |*accumulator| accumulator.deinit();
     defer {
         for (shard_results[0..initialized]) |*result| result.deinit();
         alloc.free(shard_results);
@@ -8287,14 +8288,19 @@ fn queryHostedAcrossGroupsPhase(
             .remote => |remote| try queryRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, group_req),
         };
         initialized += 1;
-        try graph_admission.admit(shard_results[i].graph_results);
+        if (graph_accumulator) |*accumulator|
+            try accumulator.appendOwned(shard_results[i].alloc, &shard_results[i].graph_results);
         result_identity_generations[i] = shard_results[i].identity_read_generation;
         if (required_identity_generations) |generations| {
             if (result_identity_generations[i] != generations[i]) return error.IdentityReadGenerationChanged;
         }
     }
-    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results[0..initialized], req.offset, req.limit);
+    var merge_req = req;
+    if (graph_accumulator != null) merge_req.clearGraphQueries();
+    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, merge_req, shard_results[0..initialized], req.offset, req.limit);
     errdefer merged.deinit();
+    if (graph_accumulator) |*accumulator|
+        merged.graph_results = try accumulator.toOwned();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
     return merged;
 }

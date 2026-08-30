@@ -422,6 +422,14 @@ pub const DistinctBudget = struct {
         self.remaining_state_bytes -= bytes;
     }
 
+    /// Release a transient retained-payload reservation. Persistent distinct
+    /// sets remain request-consumptive; this is only for an input lease whose
+    /// owner is destroyed before the next payload is admitted.
+    pub fn releaseRetainedBytes(self: *DistinctBudget, bytes: usize) void {
+        std.debug.assert(bytes <= self.max_state_bytes - self.remaining_state_bytes);
+        self.remaining_state_bytes += bytes;
+    }
+
     pub fn exhaust(self: *DistinctBudget, dimension: Dimension) error{GraphDistinctBudgetExceeded} {
         self.last_exhaustion = .{
             .dimension = dimension,

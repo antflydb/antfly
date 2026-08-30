@@ -1330,11 +1330,10 @@ pub fn graphResultsRetainedUsage(
     return usage;
 }
 
-/// Request-wide admission for graph payloads retained while distributed shard
-/// results are gathered. The merge path seeds its own allocation accounting
-/// with the admitted input, so shard payloads and cloned output coexist under
-/// one hard ceiling.
-pub const GraphResultsAdmission = struct {
+/// Input-payload accounting shared with the graph merge output budget. Batch
+/// callers retain every lease; incremental fanout releases each lease only
+/// after its shard has been folded and destroyed.
+const GraphPayloadAdmission = struct {
     queries: []const db_mod.types.NamedGraphQuery,
     work_budget: graph_work_budget.WorkBudget,
     distinct_budget: graph_pattern.DistinctBudget,
@@ -1342,7 +1341,7 @@ pub const GraphResultsAdmission = struct {
     pub fn init(
         queries: []const db_mod.types.NamedGraphQuery,
         limits: graph_work_budget.Limits,
-    ) GraphResultsAdmission {
+    ) GraphPayloadAdmission {
         return .{
             .queries = queries,
             .work_budget = .initWithLimits(limits),
@@ -1354,7 +1353,7 @@ pub const GraphResultsAdmission = struct {
     }
 
     pub fn admit(
-        self: *GraphResultsAdmission,
+        self: *GraphPayloadAdmission,
         results: []const db_mod.types.GraphSearchResult,
     ) !void {
         for (results, 0..) |result, i| {
@@ -1374,6 +1373,55 @@ pub const GraphResultsAdmission = struct {
                 usage.state_bytes,
             );
         }
+    }
+
+    const Lease = struct {
+        state_bytes: usize = 0,
+        distinct_state_bytes: usize = 0,
+    };
+
+    /// Reserve one transient shard payload against the same budgets used by
+    /// the merged output. The caller must release the lease only after the
+    /// payload has been folded into request-owned state and destroyed.
+    fn reserve(
+        self: *GraphPayloadAdmission,
+        results: []const db_mod.types.GraphSearchResult,
+    ) !Lease {
+        var lease = Lease{};
+        errdefer self.release(lease);
+        for (results, 0..) |result, i| {
+            const query = graphQueryByName(self.queries, result.name) orelse
+                return error.InvalidRemoteResponse;
+            const usage = graphResultsRetainedUsage(results[i..][0..1]);
+
+            self.distinct_budget.consumeRetainedBytes(usage.distinct_state_bytes) catch |err| {
+                if (err == error.GraphDistinctBudgetExceeded)
+                    graph_distinct_budget_diagnostic.recordBudget(result.name, &self.distinct_budget);
+                return err;
+            };
+            lease.distinct_state_bytes = std.math.add(
+                usize,
+                lease.distinct_state_bytes,
+                usage.distinct_state_bytes,
+            ) catch return error.GraphDistinctBudgetExceeded;
+            try retainGraphMergeBytes(
+                &self.work_budget,
+                result.name,
+                query,
+                usage.state_bytes,
+            );
+            lease.state_bytes = std.math.add(
+                usize,
+                lease.state_bytes,
+                usage.state_bytes,
+            ) catch return error.GraphWorkBudgetExceeded;
+        }
+        return lease;
+    }
+
+    fn release(self: *GraphPayloadAdmission, lease: Lease) void {
+        self.work_budget.releaseStateBytes(lease.state_bytes);
+        self.distinct_budget.releaseRetainedBytes(lease.distinct_state_bytes);
     }
 };
 
@@ -1400,7 +1448,7 @@ test "distributed graph result admission is cumulative across shard payloads" {
     const usage = graphResultsRetainedUsage(&graph_results);
     var limits = graph_work_budget.Limits{};
     limits.max_retained_state_bytes = usage.state_bytes * 2 - 1;
-    var admission = GraphResultsAdmission.init(&queries, limits);
+    var admission = GraphPayloadAdmission.init(&queries, limits);
     try admission.admit(&graph_results);
 
     var diagnostic: graph_work_budget_diagnostic.Storage = .{};
@@ -1431,47 +1479,99 @@ fn mergeGraphSearchResultsWithLimits(
     results: []const db_mod.types.SearchResult,
     limits: graph_work_budget.Limits,
 ) ![]db_mod.types.GraphSearchResult {
-    try limits.validate();
-    var admission = GraphResultsAdmission.init(queries, limits);
-    for (results) |result| try admission.admit(result.graph_results);
-    var merge_work_budget = admission.work_budget;
-    var distinct_budget = admission.distinct_budget;
-    var builders = std.ArrayListUnmanaged(GraphSearchResultBuilder).empty;
-    defer {
-        for (builders.items) |*builder| builder.deinit(alloc);
-        builders.deinit(alloc);
+    var accumulator = try GraphSearchResultsAccumulator.init(alloc, queries, limits);
+    defer accumulator.deinit();
+    // Batch callers already own every input simultaneously. Preserve the
+    // exact peak accounting used by the legacy batch merge while sharing the
+    // same folding implementation as incremental distributed fanout.
+    for (results) |result| try accumulator.admission.admit(result.graph_results);
+    for (results) |result| try accumulator.appendAdmitted(result.graph_results);
+    return accumulator.toOwned();
+}
+
+/// Request-wide graph merge state. Distributed coordinators append one shard
+/// at a time, then destroy that shard payload before fetching the next. This
+/// keeps both graph memory and count(distinct) identity admission independent
+/// of shard count while retaining one-pass O(total input) merge behavior.
+pub const GraphSearchResultsAccumulator = struct {
+    alloc: std.mem.Allocator,
+    queries: []const db_mod.types.NamedGraphQuery,
+    admission: GraphPayloadAdmission,
+    builders: std.ArrayListUnmanaged(GraphSearchResultBuilder) = .empty,
+    shard_count: usize = 0,
+    finished: bool = false,
+
+    pub fn init(
+        alloc: std.mem.Allocator,
+        queries: []const db_mod.types.NamedGraphQuery,
+        limits: graph_work_budget.Limits,
+    ) !GraphSearchResultsAccumulator {
+        try limits.validate();
+        return .{
+            .alloc = alloc,
+            .queries = queries,
+            .admission = GraphPayloadAdmission.init(queries, limits),
+        };
     }
 
-    for (results) |result| {
-        try validateGraphQueriesForShard(queries, result.graph_results);
-        for (result.graph_results) |graph_result| {
-            try validateGraphAggregateShard(queries, graph_result);
-            const merge_query = graphQueryByName(queries, graph_result.name) orelse
+    pub fn deinit(self: *GraphSearchResultsAccumulator) void {
+        for (self.builders.items) |*builder| builder.deinit(self.alloc);
+        self.builders.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn appendOwned(
+        self: *GraphSearchResultsAccumulator,
+        source_alloc: std.mem.Allocator,
+        graph_results: *[]db_mod.types.GraphSearchResult,
+    ) !void {
+        if (self.finished) return error.InvalidRemoteResponse;
+        const lease = try self.admission.reserve(graph_results.*);
+        defer self.admission.release(lease);
+        try self.appendAdmitted(graph_results.*);
+        for (graph_results.*) |*graph_result| graph_result.deinit(source_alloc);
+        if (graph_results.*.len > 0) source_alloc.free(graph_results.*);
+        graph_results.* = &.{};
+    }
+
+    fn appendAdmitted(
+        self: *GraphSearchResultsAccumulator,
+        graph_results: []const db_mod.types.GraphSearchResult,
+    ) !void {
+        if (self.finished) return error.InvalidRemoteResponse;
+        try validateGraphQueriesForShard(self.queries, graph_results);
+        self.shard_count = std.math.add(usize, self.shard_count, 1) catch
+            return error.InvalidRemoteResponse;
+        const merge_work_budget = &self.admission.work_budget;
+        const distinct_budget = &self.admission.distinct_budget;
+        for (graph_results) |graph_result| {
+            try validateGraphAggregateShard(self.queries, graph_result);
+            const merge_query = graphQueryByName(self.queries, graph_result.name) orelse
                 return error.InvalidRemoteResponse;
             const idx = blk: {
-                for (builders.items, 0..) |builder, i| {
+                for (self.builders.items, 0..) |builder, i| {
                     if (std.mem.eql(u8, builder.name, graph_result.name)) break :blk i;
                 }
                 try ensureGraphMergeListCapacity(
                     GraphSearchResultBuilder,
-                    alloc,
-                    &merge_work_budget,
+                    self.alloc,
+                    merge_work_budget,
                     graph_result.name,
                     merge_query,
-                    &builders,
-                    builders.items.len + 1,
+                    &self.builders,
+                    self.builders.items.len + 1,
                 );
                 try retainGraphMergeBytes(
-                    &merge_work_budget,
+                    merge_work_budget,
                     graph_result.name,
                     merge_query,
                     graph_result.name.len,
                 );
-                const name = try alloc.dupe(u8, graph_result.name);
-                builders.appendAssumeCapacity(.{ .name = name });
-                break :blk builders.items.len - 1;
+                const name = try self.alloc.dupe(u8, graph_result.name);
+                self.builders.appendAssumeCapacity(.{ .name = name });
+                break :blk self.builders.items.len - 1;
             };
-            var builder = &builders.items[idx];
+            var builder = &self.builders.items[idx];
             builder.total_hits +|= graph_result.total_hits;
             builder.truncated = builder.truncated or graph_result.truncated;
 
@@ -1480,20 +1580,20 @@ fn mergeGraphSearchResultsWithLimits(
                     return error.QueryCandidateBudgetExceeded;
                 try ensureGraphMergeListCapacity(
                     graph_query_mod.GraphResultNode,
-                    alloc,
-                    &merge_work_budget,
+                    self.alloc,
+                    merge_work_budget,
                     graph_result.name,
                     merge_query,
                     &builder.nodes,
                     builder.nodes.items.len + 1,
                 );
                 try retainGraphMergeBytes(
-                    &merge_work_budget,
+                    merge_work_budget,
                     graph_result.name,
                     merge_query,
                     graphResultNodeRetainedBytes(node),
                 );
-                const owned = try cloneGraphResultNode(alloc, node);
+                const owned = try cloneGraphResultNode(self.alloc, node);
                 builder.nodes.appendAssumeCapacity(owned);
             }
             for (graph_result.paths) |path| {
@@ -1501,24 +1601,24 @@ fn mergeGraphSearchResultsWithLimits(
                     return error.QueryCandidateBudgetExceeded;
                 try ensureGraphMergeListCapacity(
                     db_mod.types.GraphPath,
-                    alloc,
-                    &merge_work_budget,
+                    self.alloc,
+                    merge_work_budget,
                     graph_result.name,
                     merge_query,
                     &builder.paths,
                     builder.paths.items.len + 1,
                 );
                 try retainGraphMergeBytes(
-                    &merge_work_budget,
+                    merge_work_budget,
                     graph_result.name,
                     merge_query,
                     graphPathRetainedBytes(path),
                 );
-                const owned = try cloneGraphPath(alloc, path);
+                const owned = try cloneGraphPath(self.alloc, path);
                 builder.paths.appendAssumeCapacity(owned);
             }
             for (graph_result.matches) |match| {
-                const limit = graphQueryReturnLimit(queries, graph_result.name);
+                const limit = graphQueryReturnLimit(self.queries, graph_result.name);
                 const effective_limit = if (limit > 0)
                     @min(@as(usize, limit), public_limits.max_graph_result_items)
                 else
@@ -1529,33 +1629,33 @@ fn mergeGraphSearchResultsWithLimits(
                 }
                 try ensureGraphMergeListCapacity(
                     db_mod.types.GraphPatternMatch,
-                    alloc,
-                    &merge_work_budget,
+                    self.alloc,
+                    merge_work_budget,
                     graph_result.name,
                     merge_query,
                     &builder.matches,
                     builder.matches.items.len + 1,
                 );
                 try retainGraphMergeBytes(
-                    &merge_work_budget,
+                    merge_work_budget,
                     graph_result.name,
                     merge_query,
                     graphPatternMatchRetainedBytes(match),
                 );
-                const owned = try cloneGraphPatternMatch(alloc, match);
+                const owned = try cloneGraphPatternMatch(self.alloc, match);
                 builder.matches.appendAssumeCapacity(owned);
             }
             for (graph_result.aggregates) |aggregate| {
-                const distinct = graphAggregateIsDistinct(queries, graph_result.name, aggregate.name);
+                const distinct = graphAggregateIsDistinct(self.queries, graph_result.name, aggregate.name);
                 var found = false;
                 for (builder.aggregates.items) |*existing| {
                     if (!std.mem.eql(u8, existing.name, aggregate.name)) continue;
                     if (existing.distinct != distinct) return error.InvalidRemoteResponse;
                     existing.exact = existing.exact and aggregate.exact;
                     if (distinct) {
-                        existing.appendDistinctValues(alloc, aggregate) catch |err| {
+                        existing.appendDistinctValues(self.alloc, aggregate) catch |err| {
                             if (err == error.GraphDistinctBudgetExceeded) {
-                                graph_distinct_budget_diagnostic.recordBudget(graph_result.name, &distinct_budget);
+                                graph_distinct_budget_diagnostic.recordBudget(graph_result.name, distinct_budget);
                             }
                             return err;
                         };
@@ -1568,32 +1668,32 @@ fn mergeGraphSearchResultsWithLimits(
                 if (!found) {
                     try ensureGraphMergeListCapacity(
                         GraphAggregateResultBuilder,
-                        alloc,
-                        &merge_work_budget,
+                        self.alloc,
+                        merge_work_budget,
                         graph_result.name,
                         merge_query,
                         &builder.aggregates,
                         builder.aggregates.items.len + 1,
                     );
                     try retainGraphMergeBytes(
-                        &merge_work_budget,
+                        merge_work_budget,
                         graph_result.name,
                         merge_query,
                         aggregate.name.len,
                     );
-                    const name = try alloc.dupe(u8, aggregate.name);
+                    const name = try self.alloc.dupe(u8, aggregate.name);
                     var owned = GraphAggregateResultBuilder{
                         .name = name,
                         .value = if (distinct) 0 else aggregate.value,
                         .exact = aggregate.exact,
                         .distinct = distinct,
-                        .distinct_budget = &distinct_budget,
+                        .distinct_budget = distinct_budget,
                     };
                     var owned_active = true;
-                    errdefer if (owned_active) owned.deinit(alloc);
-                    if (distinct) owned.appendDistinctValues(alloc, aggregate) catch |err| {
+                    errdefer if (owned_active) owned.deinit(self.alloc);
+                    if (distinct) owned.appendDistinctValues(self.alloc, aggregate) catch |err| {
                         if (err == error.GraphDistinctBudgetExceeded) {
-                            graph_distinct_budget_diagnostic.recordBudget(graph_result.name, &distinct_budget);
+                            graph_distinct_budget_diagnostic.recordBudget(graph_result.name, distinct_budget);
                         }
                         return err;
                     };
@@ -1606,54 +1706,61 @@ fn mergeGraphSearchResultsWithLimits(
                     return error.QueryCandidateBudgetExceeded;
                 try ensureGraphMergeListCapacity(
                     db_mod.types.SearchHit,
-                    alloc,
-                    &merge_work_budget,
+                    self.alloc,
+                    merge_work_budget,
                     graph_result.name,
                     merge_query,
                     &builder.hits,
                     builder.hits.items.len + 1,
                 );
                 try retainGraphMergeBytes(
-                    &merge_work_budget,
+                    merge_work_budget,
                     graph_result.name,
                     merge_query,
                     graphHitRetainedBytes(hit),
                 );
-                const owned = try hit.clone(alloc);
+                const owned = try hit.clone(self.alloc);
                 builder.hits.appendAssumeCapacity(owned);
             }
         }
     }
 
-    for (builders.items) |builder| {
-        const query = graphQueryByName(queries, builder.name) orelse
-            return error.InvalidRemoteResponse;
-        try retainGraphMergeBytes(
-            &merge_work_budget,
-            builder.name,
-            query,
-            @sizeOf(db_mod.types.GraphSearchResult),
-        );
+    pub fn toOwned(self: *GraphSearchResultsAccumulator) ![]db_mod.types.GraphSearchResult {
+        if (self.finished) return error.InvalidRemoteResponse;
+        self.finished = true;
+        const merge_work_budget = &self.admission.work_budget;
+        const distinct_budget = &self.admission.distinct_budget;
+        for (self.builders.items) |builder| {
+            const query = graphQueryByName(self.queries, builder.name) orelse
+                return error.InvalidRemoteResponse;
+            try retainGraphMergeBytes(
+                merge_work_budget,
+                builder.name,
+                query,
+                @sizeOf(db_mod.types.GraphSearchResult),
+            );
+        }
+        const merged = try self.alloc.alloc(db_mod.types.GraphSearchResult, self.builders.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (merged[0..initialized]) |*graph_result| graph_result.deinit(self.alloc);
+            self.alloc.free(merged);
+        }
+        for (self.builders.items, 0..) |*builder, i| {
+            const query = graphQueryByName(self.queries, builder.name) orelse
+                return error.InvalidRemoteResponse;
+            merged[i] = builder.toOwned(self.alloc, merge_work_budget, query) catch |err| {
+                if (err == error.GraphDistinctBudgetExceeded) {
+                    graph_distinct_budget_diagnostic.recordBudget(builder.name, distinct_budget);
+                }
+                return err;
+            };
+            if (self.shard_count > 1) clearMergedDocOrdinals(merged[i].hits);
+            initialized += 1;
+        }
+        return merged;
     }
-    const merged = try alloc.alloc(db_mod.types.GraphSearchResult, builders.items.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (merged[0..initialized]) |*graph_result| graph_result.deinit(alloc);
-        alloc.free(merged);
-    }
-    for (builders.items, 0..) |*builder, i| {
-        const query = graphQueryByName(queries, builder.name) orelse
-            return error.InvalidRemoteResponse;
-        merged[i] = builder.toOwned(alloc, &merge_work_budget, query) catch |err| {
-            if (err == error.GraphDistinctBudgetExceeded) {
-                graph_distinct_budget_diagnostic.recordBudget(builder.name, &distinct_budget);
-            }
-            return err;
-        };
-        initialized += 1;
-    }
-    return merged;
-}
+};
 
 /// A shard graph response is operation-keyed just like the public contract.
 /// Empty operations are represented by an empty result, never by omitting the
@@ -4160,6 +4267,72 @@ test "graph coordinator distinct merge honors configured limits and records the 
         diagnostic.dimension,
     );
     try std.testing.expectEqual(@as(usize, 1), diagnostic.maximum);
+}
+
+test "incremental graph merge enforces distinct identities across released shards" {
+    const alloc = std.testing.allocator;
+    const aggregate_specs = [_]graph_query_mod.NamedCountAggregate{.{
+        .name = "unique",
+        .of = "person",
+        .distinct = true,
+    }};
+    const queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "people",
+        .query = .{
+            .query_type = .pattern,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{} },
+            .aggregates = &aggregate_specs,
+        },
+    }};
+    var first_values = [_]graph_node_identity.Ref{.{ .table = "people", .key = "one" }};
+    var second_values = [_]graph_node_identity.Ref{.{ .table = "people", .key = "two" }};
+    var first_aggregates = [_]db_mod.types.GraphAggregateResult{.{
+        .name = @constCast("unique"),
+        .value = 1,
+        .distinct_values = &first_values,
+    }};
+    var second_aggregates = [_]db_mod.types.GraphAggregateResult{.{
+        .name = @constCast("unique"),
+        .value = 1,
+        .distinct_values = &second_values,
+    }};
+    const first = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("people"),
+        .aggregates = &first_aggregates,
+        .hits = &.{},
+        .total_hits = 0,
+    }};
+    const second = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("people"),
+        .aggregates = &second_aggregates,
+        .hits = &.{},
+        .total_hits = 0,
+    }};
+
+    var accumulator = try GraphSearchResultsAccumulator.init(alloc, &queries, .{
+        .max_distinct_identities = 1,
+        .max_distinct_state_bytes = 4096,
+    });
+    defer accumulator.deinit();
+    var first_owned = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    first_owned[0] = try cloneGraphSearchResult(alloc, first[0]);
+    defer {
+        for (first_owned) |*graph_result| graph_result.deinit(alloc);
+        if (first_owned.len > 0) alloc.free(first_owned);
+    }
+    var second_owned = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    second_owned[0] = try cloneGraphSearchResult(alloc, second[0]);
+    defer {
+        for (second_owned) |*graph_result| graph_result.deinit(alloc);
+        if (second_owned.len > 0) alloc.free(second_owned);
+    }
+    try accumulator.appendOwned(alloc, &first_owned);
+    try std.testing.expectEqual(@as(usize, 0), first_owned.len);
+    try std.testing.expectError(
+        error.GraphDistinctBudgetExceeded,
+        accumulator.appendOwned(alloc, &second_owned),
+    );
 }
 
 test "graph coordinator admits list capacity and ownership transfer before allocation" {
