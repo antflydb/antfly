@@ -12108,6 +12108,14 @@ pub const DataServer = struct {
             };
         }
         if (reconcile_commit_error == null) {
+            reconcile.prepareRetirementsDurable() catch |err| {
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                reconcile.noteRetirementDurabilityFailure(err);
+                reconcile_commit_error = err;
+            };
+        }
+        if (reconcile_commit_error == null) {
             reconcile.commitRetirementsDurable() catch |err| {
                 lockAtomic(&self.data_raft_mutex);
                 defer self.data_raft_mutex.unlock();

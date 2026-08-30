@@ -684,6 +684,20 @@ pub const Host = struct {
         );
     }
 
+    pub fn prepareReplicaCatalog(
+        self: *Host,
+        expected_token: ?catalog.ReplicaCatalogToken,
+        upserts: []const catalog.ReplicaRecord,
+        removals: []const u64,
+    ) !?catalog.PreparedReplicaCatalogBatch {
+        const replica_catalog = self.deps.replica_catalog orelse return null;
+        return try replica_catalog.prepareBatch(
+            expected_token orelse return error.MissingReplicaCatalogRevision,
+            upserts,
+            removals,
+        );
+    }
+
     pub fn removePreparedReplica(self: *Host, group_id: u64) !void {
         if (self.runtime_host.group(group_id) == null) return error.UnknownGroup;
         try self.runtime_host.removeReplica(group_id);
@@ -1748,6 +1762,7 @@ test "host can ensure and remove a replica" {
     const RemovalCatalog = struct {
         fail_remove: bool = true,
         remove_calls: usize = 0,
+        prepared_active: bool = false,
 
         fn iface(self: *@This()) catalog.ReplicaCatalog {
             return .{
@@ -1760,6 +1775,7 @@ test "host can ensure and remove a replica" {
                     .snapshot_replicas = snapshotReplicas,
                     .revision = revision,
                     .apply_batch = applyBatch,
+                    .prepare_batch = prepareBatch,
                 },
             };
         }
@@ -1799,6 +1815,36 @@ test "host can ensure and remove a replica" {
             _: []const u64,
         ) !catalog.ReplicaCatalogToken {
             return .{ .revision = 1 };
+        }
+
+        fn prepareBatch(
+            ptr: *anyopaque,
+            _: catalog.ReplicaCatalogToken,
+            _: []const catalog.ReplicaRecord,
+            _: []const u64,
+        ) !catalog.PreparedReplicaCatalogBatch {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.prepared_active) return error.PreparedCatalogBatchInUse;
+            self.prepared_active = true;
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .commit = commitPrepared,
+                    .deinit = deinitPrepared,
+                },
+            };
+        }
+
+        fn commitPrepared(ptr: *anyopaque) !catalog.ReplicaCatalogToken {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.prepared_active) return error.InvalidPreparedCatalogBatch;
+            self.prepared_active = false;
+            return .{ .revision = 1 };
+        }
+
+        fn deinitPrepared(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.prepared_active = false;
         }
     };
 

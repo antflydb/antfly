@@ -21,6 +21,7 @@ pub const SnapshotBootstrapRecord = impl.SnapshotBootstrapRecord;
 pub const ReplicaRecord = impl.ReplicaRecord;
 pub const ReplicaCatalog = impl.ReplicaCatalog;
 pub const ReplicaCatalogToken = impl.ReplicaCatalogToken;
+pub const PreparedReplicaCatalogBatch = impl.PreparedReplicaCatalogBatch;
 pub const ReplicaCatalogSnapshot = impl.ReplicaCatalogSnapshot;
 pub const MemoryReplicaCatalog = impl.MemoryReplicaCatalog;
 pub const FileReplicaCatalog = impl.FileReplicaCatalog;

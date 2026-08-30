@@ -2836,8 +2836,11 @@ pub const MetadataService = struct {
         try store.addLifecycleListeners(
             .{
                 .ptr = self,
+                .commit_barrier_kind = .placement_intent,
                 .vtable = &.{
                     .on_projection_signal = metadataServiceProjectionSignal,
+                    .before_projection_commit = metadataServicePlacementCommitBegin,
+                    .after_projection_commit = metadataServicePlacementCommitEnd,
                 },
             },
             .{
@@ -2851,6 +2854,16 @@ pub const MetadataService = struct {
         self.lifecycle_listener_registered = true;
     }
 
+    fn metadataServicePlacementCommitBegin(ptr: *anyopaque) void {
+        const self: *MetadataService = @ptrCast(@alignCast(ptr));
+        self.placement_catalog_gate.lockUncancelable(std.Options.debug_io);
+    }
+
+    fn metadataServicePlacementCommitEnd(ptr: *anyopaque) void {
+        const self: *MetadataService = @ptrCast(@alignCast(ptr));
+        self.placement_catalog_gate.unlock(std.Options.debug_io);
+    }
+
     fn metadataServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataService = @ptrCast(@alignCast(ptr));
         if (projectionSignalChangesCatalog(signal.kind)) {
@@ -2858,11 +2871,7 @@ pub const MetadataService = struct {
         }
         switch (signal.kind) {
             .table, .range, .shuffle_join_lease, .restore_job => _ = self.projection_epoch.fetchAdd(1, .monotonic),
-            .placement_intent => {
-                self.placement_catalog_gate.lockUncancelable(std.Options.debug_io);
-                defer self.placement_catalog_gate.unlock(std.Options.debug_io);
-                _ = self.placement_epoch.fetchAdd(1, .release);
-            },
+            .placement_intent => _ = self.placement_epoch.fetchAdd(1, .release),
             .reconcile_lease => _ = self.reconcile_lease_epoch.fetchAdd(1, .monotonic),
             .split_transition, .merge_transition => _ = self.transition_epoch.fetchAdd(1, .monotonic),
             else => {},
@@ -4546,7 +4555,22 @@ pub const MetadataService = struct {
         };
         self.unlockRuntime();
 
+        reconcile.prepareRetirementsDurable() catch |err| {
+            self.lockRuntime();
+            reconcile.noteRetirementDurabilityFailure(err);
+            self.unlockRuntime();
+            return err;
+        };
+
         var retirement_error: ?anyerror = null;
+        var finish_error: ?anyerror = null;
+        var reconcile_result: ?raft_reconciler.ReconcileResult = null;
+        // Raft progress already owns runtime_mutex when the apply store enters
+        // the placement commit barrier. Use that same global lock order here
+        // so a placement apply and a retirement can never wait on each other.
+        // The prepared catalog image keeps this joint critical section to an
+        // atomic rename, directory sync, and live teardown.
+        self.lockRuntime();
         self.placement_catalog_gate.lockUncancelable(std.Options.debug_io);
         if (self.placement_epoch.load(.acquire) != current_epoch) {
             reconcile.suppressRetirements();
@@ -4555,21 +4579,29 @@ pub const MetadataService = struct {
         reconcile.commitRetirementsDurable() catch |err| {
             retirement_error = err;
         };
+        if (retirement_error == null) {
+            reconcile_result = reconcile.finish() catch |err| failed: {
+                finish_error = err;
+                break :failed null;
+            };
+            if (reconcile_result) |result| {
+                if (!result.hasPlacementFailures() and
+                    self.placement_epoch.load(.monotonic) == current_epoch)
+                {
+                    self.local_placement_epoch = current_epoch;
+                    self.last_local_placement_refresh_at_ms = nowMs();
+                }
+            }
+        }
         self.placement_catalog_gate.unlock(std.Options.debug_io);
         if (retirement_error) |err| {
-            self.lockRuntime();
             reconcile.noteRetirementDurabilityFailure(err);
             self.unlockRuntime();
             return err;
         }
-
-        self.lockRuntime();
-        defer self.unlockRuntime();
-        const reconcile_result = try reconcile.finish();
-        if (reconcile_result.hasPlacementFailures()) return error.ReplicaReconcileIncomplete;
-        if (self.placement_epoch.load(.monotonic) != current_epoch) return;
-        self.local_placement_epoch = current_epoch;
-        self.last_local_placement_refresh_at_ms = nowMs();
+        self.unlockRuntime();
+        if (finish_error) |err| return err;
+        if (reconcile_result.?.hasPlacementFailures()) return error.ReplicaReconcileIncomplete;
     }
 
     fn refreshLocalTransitions(self: *MetadataService) !void {
@@ -5228,8 +5260,11 @@ pub const MetadataHttpService = struct {
         try store.addLifecycleListeners(
             .{
                 .ptr = self,
+                .commit_barrier_kind = .placement_intent,
                 .vtable = &.{
                     .on_projection_signal = metadataHttpServiceProjectionSignal,
+                    .before_projection_commit = metadataHttpServicePlacementCommitBegin,
+                    .after_projection_commit = metadataHttpServicePlacementCommitEnd,
                 },
             },
             .{
@@ -5241,6 +5276,16 @@ pub const MetadataHttpService = struct {
             },
         );
         self.lifecycle_listener_registered = true;
+    }
+
+    fn metadataHttpServicePlacementCommitBegin(ptr: *anyopaque) void {
+        const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
+        self.placement_catalog_gate.lockUncancelable(std.Options.debug_io);
+    }
+
+    fn metadataHttpServicePlacementCommitEnd(ptr: *anyopaque) void {
+        const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
+        self.placement_catalog_gate.unlock(std.Options.debug_io);
     }
 
     fn metadataHttpServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
@@ -5258,11 +5303,7 @@ pub const MetadataHttpService = struct {
             .table, .range, .store, .shuffle_join_lease, .restore_job => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .schema_progress => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .restore_progress, .replication_source_status => _ = self.projection_epoch.fetchAdd(1, .monotonic),
-            .placement_intent => {
-                self.placement_catalog_gate.lockUncancelable(std.Options.debug_io);
-                defer self.placement_catalog_gate.unlock(std.Options.debug_io);
-                _ = self.placement_epoch.fetchAdd(1, .release);
-            },
+            .placement_intent => _ = self.placement_epoch.fetchAdd(1, .release),
             .reconcile_lease => _ = self.reconcile_lease_epoch.fetchAdd(1, .monotonic),
             .split_transition, .merge_transition => _ = self.transition_epoch.fetchAdd(1, .monotonic),
         }
@@ -8310,7 +8351,20 @@ pub const MetadataHttpService = struct {
         };
         self.unlockRuntime();
 
+        reconcile.prepareRetirementsDurable() catch |err| {
+            self.lockRuntime();
+            reconcile.noteRetirementDurabilityFailure(err);
+            self.unlockRuntime();
+            return err;
+        };
+
         var retirement_error: ?anyerror = null;
+        var finish_error: ?anyerror = null;
+        var reconcile_result: ?raft_reconciler.ReconcileResult = null;
+        // Match the lock order used by Raft apply: runtime ownership precedes
+        // the placement publication barrier. Preparation above keeps the
+        // jointly locked work bounded to publication and live teardown.
+        self.lockRuntime();
         self.placement_catalog_gate.lockUncancelable(std.Options.debug_io);
         if (self.placement_epoch.load(.acquire) != current_epoch) {
             reconcile.suppressRetirements();
@@ -8319,21 +8373,29 @@ pub const MetadataHttpService = struct {
         reconcile.commitRetirementsDurable() catch |err| {
             retirement_error = err;
         };
+        if (retirement_error == null) {
+            reconcile_result = reconcile.finish() catch |err| failed: {
+                finish_error = err;
+                break :failed null;
+            };
+            if (reconcile_result) |result| {
+                if (!result.hasPlacementFailures() and
+                    self.placement_epoch.load(.monotonic) == current_epoch)
+                {
+                    self.local_placement_epoch = current_epoch;
+                    self.last_local_placement_refresh_at_ms = nowMs();
+                }
+            }
+        }
         self.placement_catalog_gate.unlock(std.Options.debug_io);
         if (retirement_error) |err| {
-            self.lockRuntime();
             reconcile.noteRetirementDurabilityFailure(err);
             self.unlockRuntime();
             return err;
         }
-
-        self.lockRuntime();
-        defer self.unlockRuntime();
-        const reconcile_result = try reconcile.finish();
-        if (reconcile_result.hasPlacementFailures()) return error.ReplicaReconcileIncomplete;
-        if (self.placement_epoch.load(.monotonic) != current_epoch) return;
-        self.local_placement_epoch = current_epoch;
-        self.last_local_placement_refresh_at_ms = nowMs();
+        self.unlockRuntime();
+        if (finish_error) |err| return err;
+        if (reconcile_result.?.hasPlacementFailures()) return error.ReplicaReconcileIncomplete;
     }
 
     fn refreshLocalTransitions(self: *MetadataHttpService, round_inputs: ?*const LocalTransitionInputs) !void {

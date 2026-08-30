@@ -1700,13 +1700,36 @@ pub const ProjectionSignal = struct {
 pub const ProjectionListener = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// When set, the apply store brackets the durable commit and synchronous
+    /// notification for matching projection changes with this listener's
+    /// barrier callbacks. Correctness-sensitive consumers use this to
+    /// serialize a short external publication step with the authoritative
+    /// projection commit; ordinary listeners remain notification-only.
+    commit_barrier_kind: ?ProjectionSignalKind = null,
 
     pub const VTable = struct {
         on_projection_signal: *const fn (ptr: *anyopaque, signal: ProjectionSignal) void,
+        before_projection_commit: ?*const fn (ptr: *anyopaque) void = null,
+        after_projection_commit: ?*const fn (ptr: *anyopaque) void = null,
     };
 
     pub fn onProjectionSignal(self: ProjectionListener, signal: ProjectionSignal) void {
         self.vtable.on_projection_signal(self.ptr, signal);
+    }
+
+    fn beginCommitBarrier(self: ProjectionListener) void {
+        if (self.vtable.before_projection_commit) |begin| begin(self.ptr);
+    }
+
+    fn endCommitBarrier(self: ProjectionListener) void {
+        if (self.vtable.after_projection_commit) |end| end(self.ptr);
+    }
+
+    fn validate(self: ProjectionListener) !void {
+        const configured = self.commit_barrier_kind != null;
+        if ((self.vtable.before_projection_commit != null) != configured or
+            (self.vtable.after_projection_commit != null) != configured)
+            return error.InvalidProjectionCommitBarrier;
     }
 };
 
@@ -1761,6 +1784,7 @@ pub const CommittedApplyOutcome = struct {
     alloc: std.mem.Allocator,
     collect_transition_deltas: bool = true,
     projection_signals: std.ArrayListUnmanaged(OwnedProjectionSignal) = .empty,
+    projection_kinds: std.EnumSet(ProjectionSignalKind) = std.EnumSet(ProjectionSignalKind).initEmpty(),
     committed_keys: std.ArrayListUnmanaged(OwnedCommittedKeySignal) = .empty,
     transition_deltas: std.ArrayListUnmanaged(CommittedTransitionDelta) = .empty,
     failure: ?anyerror = null,
@@ -1784,6 +1808,7 @@ pub const CommittedApplyOutcome = struct {
             .signal = owned_signal,
             .table_name = table_name,
         });
+        self.projection_kinds.insert(signal.kind);
     }
 
     fn appendCommittedKey(self: *CommittedApplyOutcome, signal: CommittedKeySignal) !void {
@@ -1957,6 +1982,7 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn addProjectionListener(self: *RaftApplyStore, listener: ProjectionListener) !void {
+        try listener.validate();
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
@@ -1975,6 +2001,7 @@ pub const RaftApplyStore = struct {
         projection_listener: ProjectionListener,
         committed_key_listener: CommittedKeyListener,
     ) !void {
+        try projection_listener.validate();
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
@@ -3691,6 +3718,16 @@ pub const RaftApplyStore = struct {
         try txn.put(key, value);
         try self.projectEntriesTxn(&txn, group_id, entries_bytes);
         if (outcome.failure) |err| return err;
+
+        // A projection commit barrier begins only after every fallible
+        // projection step has succeeded. It spans the authoritative storage
+        // commit and its synchronous signal publication, allowing consumers
+        // to compare and mutate external live state without the historical
+        // commit-before-epoch-notification race.
+        self.beginProjectionCommitBarriers(&outcome);
+        var projection_barriers_active = true;
+        defer if (projection_barriers_active)
+            self.endProjectionCommitBarriers(&outcome);
         try txn.commit();
 
         if (self.batches.getPtr(group_id)) |existing| {
@@ -3707,6 +3744,8 @@ pub const RaftApplyStore = struct {
         }
         self.active_outcome = null;
         self.dispatchCommittedOutcome(&outcome);
+        self.endProjectionCommitBarriers(&outcome);
+        projection_barriers_active = false;
         self.apply_mutex.unlock(io);
         apply_locked = false;
         return outcome;
@@ -6011,6 +6050,40 @@ pub const RaftApplyStore = struct {
                 .key = owned.key,
             };
             for (self.committed_key_listeners.items) |listener| listener.onCommittedKey(signal);
+        }
+    }
+
+    fn outcomeContainsProjectionKind(
+        outcome: *const CommittedApplyOutcome,
+        kind: ProjectionSignalKind,
+    ) bool {
+        return outcome.projection_kinds.contains(kind);
+    }
+
+    fn beginProjectionCommitBarriers(
+        self: *RaftApplyStore,
+        outcome: *const CommittedApplyOutcome,
+    ) void {
+        for (self.projection_listeners.items) |listener| {
+            const kind = listener.commit_barrier_kind orelse continue;
+            if (!outcomeContainsProjectionKind(outcome, kind)) continue;
+            listener.beginCommitBarrier();
+        }
+    }
+
+    fn endProjectionCommitBarriers(
+        self: *RaftApplyStore,
+        outcome: *const CommittedApplyOutcome,
+    ) void {
+        // Release in reverse registration order so independently composed
+        // listeners retain ordinary nested-lock semantics.
+        var index = self.projection_listeners.items.len;
+        while (index > 0) {
+            index -= 1;
+            const listener = self.projection_listeners.items[index];
+            const kind = listener.commit_barrier_kind orelse continue;
+            if (!outcomeContainsProjectionKind(outcome, kind)) continue;
+            listener.endCommitBarrier();
         }
     }
 
@@ -11960,6 +12033,108 @@ test "metadata raft apply store notifies projection listeners for committed tabl
     try std.testing.expectEqual(@as(usize, 1), capture.range_signals);
     try std.testing.expectEqual(@as(u64, 77), capture.last_table_id);
     try std.testing.expectEqual(@as(u64, 1001), capture.last_range_group_id);
+}
+
+test "placement projection commit barrier brackets durability and notification" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/metadata-placement-commit-barrier",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root);
+
+    const Capture = struct {
+        barrier_active: bool = false,
+        began: usize = 0,
+        ended: usize = 0,
+        placement_signals: usize = 0,
+        signal_outside_barrier: bool = false,
+
+        fn begin(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.barrier_active) @panic("nested placement barrier");
+            self.barrier_active = true;
+            self.began += 1;
+        }
+
+        fn end(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.barrier_active) @panic("placement barrier released twice");
+            self.barrier_active = false;
+            self.ended += 1;
+        }
+
+        fn onSignal(ptr: *anyopaque, signal: ProjectionSignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (signal.kind != .placement_intent) return;
+            self.placement_signals += 1;
+            if (!self.barrier_active) self.signal_outside_barrier = true;
+        }
+    };
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    var capture = Capture{};
+    try std.testing.expectError(error.InvalidProjectionCommitBarrier, store.addProjectionListener(.{
+        .ptr = &capture,
+        .commit_barrier_kind = .placement_intent,
+        .vtable = &.{ .on_projection_signal = Capture.onSignal },
+    }));
+    try store.addProjectionListener(.{
+        .ptr = &capture,
+        .commit_barrier_kind = .placement_intent,
+        .vtable = &.{
+            .on_projection_signal = Capture.onSignal,
+            .before_projection_commit = Capture.begin,
+            .after_projection_commit = Capture.end,
+        },
+    });
+
+    const node = try encodeTransitionCommand(std.testing.allocator, .{ .register_node = .{
+        .node_id = 12,
+        .role = "data",
+        .lifecycle = metadata_table_manager.node_lifecycle_active,
+    } });
+    defer std.testing.allocator.free(node);
+    const registered_store = try encodeTransitionCommand(std.testing.allocator, .{ .register_store = .{
+        .store_id = 12,
+        .node_id = 12,
+        .role = "data",
+        .health_class = "healthy",
+        .live = true,
+    } });
+    defer std.testing.allocator.free(registered_store);
+    const placement = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_replica_intent = .{
+        .expected_metadata_version = null,
+        .expected_version_fence = 0,
+        .expected_target_drain_requested = false,
+        .replacement = .{
+            .record = .{ .group_id = 1201, .replica_id = 1, .local_node_id = 12 },
+            .store_id = 12,
+            .peer_node_ids = &.{12},
+        },
+    } });
+    defer std.testing.allocator.free(placement);
+    const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = node },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = registered_store },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = placement },
+    });
+    defer std.testing.allocator.free(entries);
+
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 41,
+        .commit_index = 3,
+        .entries_bytes = entries,
+    });
+    try std.testing.expectEqual(@as(usize, 1), capture.began);
+    try std.testing.expectEqual(@as(usize, 1), capture.ended);
+    try std.testing.expectEqual(@as(usize, 1), capture.placement_signals);
+    try std.testing.expect(!capture.signal_outside_barrier);
+    try std.testing.expect(!capture.barrier_active);
 }
 
 test "atomic table topology lifecycle notifications stay constant at the initial range limit" {
