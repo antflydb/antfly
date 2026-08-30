@@ -5638,6 +5638,9 @@ pub const DataServer = struct {
         const ha_primary_mirror = self.haPrimaryMirror();
         _ = try self.write_source.withHAWriteGate(ha_write_gate);
         _ = try self.write_source.withHAMirror(ha_primary_mirror);
+        if (comptime storage_kernel_experiment) {
+            _ = self.kernel_owner_source.?.withHAControls(ha_write_gate, ha_primary_mirror);
+        }
         if (self.data_raft_apply) |apply_sm| {
             apply_sm.attachProvisionedStorage(&self.provisioned_storage);
             if (comptime storage_kernel_experiment) {
@@ -5693,6 +5696,13 @@ pub const DataServer = struct {
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withEntitySink(entity_sink);
         }
+        if (comptime storage_kernel_experiment) {
+            _ = self.kernel_owner_source.?.withRuntimeHooks(
+                candidate_source,
+                entity_sink,
+                promotion_leadership,
+            );
+        }
         self.syncInferenceRuntimeConfig();
         // Request allocations must share identity with the process allocator
         // used by DB internals (c_allocator when libc is linked): search hits
@@ -5720,11 +5730,13 @@ pub const DataServer = struct {
         const route = try resolveHAReplicationRecordRoute(&snapshot, record);
         if (comptime storage_kernel_experiment) {
             const owner_source = try self.ensureKernelOwnerSource();
-            return try owner_source.applyHAReplicationRecordGroupLocal(
+            try owner_source.applyHAReplicationRecordGroupLocal(
                 route.group_id,
                 route.table_name,
                 record,
             );
+            self.write_source.publishStorageOwnerHAChange(self.alloc, route.table_name, record);
+            return;
         }
         try self.write_source.applyHAReplicationRecordGroupLocal(
             self.alloc,
@@ -6033,6 +6045,9 @@ pub const DataServer = struct {
     fn rewireHAPromotionMirrors(self: *DataServer) void {
         const ha_primary_mirror = self.haPrimaryMirror();
         _ = self.write_source.withPreparedHAMirror(ha_primary_mirror);
+        if (comptime storage_kernel_experiment) {
+            _ = self.kernel_owner_source.?.withHAControls(self.haWriteGate(), ha_primary_mirror);
+        }
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withPreparedHAMirror(ha_primary_mirror);
         }
@@ -29718,8 +29733,11 @@ test "data server mirrors managed primary writes into HA replication log" {
 
     const source_mirror = server.write_source.ha_async_mirror orelse return error.TestExpectedEqual;
     try std.testing.expect(source_mirror.primary == &primary);
-    const cache_mirror = server.provisioned_storage.write_cache.ha_async_mirror orelse return error.TestExpectedEqual;
-    try std.testing.expect(cache_mirror.primary == &primary);
+    const owner_mirror = if (comptime storage_kernel_experiment)
+        server.kernel_owner_source.?.ha_async_mirror orelse return error.TestExpectedEqual
+    else
+        server.provisioned_storage.write_cache.ha_async_mirror orelse return error.TestExpectedEqual;
+    try std.testing.expect(owner_mirror.primary == &primary);
 
     _ = try server.write_source.source().batch(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},

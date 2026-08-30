@@ -13296,12 +13296,32 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
     ) void {
+        self.publishStorageOwnerChange(alloc, table_name, .data);
+    }
+
+    /// Publish the same control-plane invalidation as the legacy HA apply
+    /// path after the compiled owner commits a replication record.
+    pub fn publishStorageOwnerHAChange(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        record: db_mod.HAReplicationRecordView,
+    ) void {
+        self.publishStorageOwnerChange(alloc, table_name, changeKindForHARecord(record));
+    }
+
+    fn publishStorageOwnerChange(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        kind: LocalChangeKind,
+    ) void {
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
         self.markWriteCacheDirty(table_name);
         self.local_db_mutex.unlock();
         self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
-        self.notifyLocalChange(table_name, .data);
+        self.notifyLocalChange(table_name, kind);
     }
 
     /// Publish a lifecycle-only wake after an owner-side visibility barrier.

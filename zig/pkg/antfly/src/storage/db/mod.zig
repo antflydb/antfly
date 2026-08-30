@@ -92,6 +92,7 @@ pub const documentExtractionStoredUnitFingerprintAlloc = @import("db.zig").docum
 pub const DocumentArtifactChildRangeApplyBatch = @import("db.zig").DocumentArtifactChildRangeApplyBatch;
 pub const DocumentArtifactChildRangeDispatch = @import("db.zig").DocumentArtifactChildRangeDispatch;
 pub const DocumentArtifactChildRangeDispatcher = @import("db.zig").DocumentArtifactChildRangeDispatcher;
+pub const CommittedBatchEffectsObserver = @import("db.zig").CommittedBatchEffectsObserver;
 pub const OpenOptions = @import("db.zig").OpenOptions;
 pub const NativeRestoreOpenPlan = @import("db.zig").NativeRestoreOpenPlan;
 pub const OpenMode = @import("db.zig").OpenMode;

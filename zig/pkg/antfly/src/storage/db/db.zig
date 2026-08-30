@@ -736,6 +736,19 @@ pub const DocumentArtifactChildRangeDispatcher = struct {
     }
 };
 
+/// Synchronous handoff of the exact durable derived replay payload produced by
+/// one committed batch. An empty payload means the batch intentionally elided
+/// derived replay, but the observer is still invoked so it can publish the
+/// corresponding coarse mutation record.
+pub const CommittedBatchEffectsObserver = struct {
+    ptr: *anyopaque,
+    apply: *const fn (ptr: *anyopaque, replay_payload: []const u8) anyerror!void,
+
+    fn observe(self: CommittedBatchEffectsObserver, replay_payload: []const u8) !void {
+        return try self.apply(self.ptr, replay_payload);
+    }
+};
+
 pub const ReplayProgressHook = *const fn (ctx: *anyopaque, index_name: []const u8, progress: ReplayProgress) anyerror!void;
 
 pub const QueryVisibilityChange = enum {
@@ -2025,6 +2038,7 @@ const BatchExecutionOptions = struct {
     wait_for_sync_level: bool = true,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
+    committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
     bypass_ha_write_gate: bool = false,
     ha_applied_lsn_marker: ?u64 = null,
     raft_applied_entry_marker: ?RaftAppliedEntryIdentity = null,
@@ -6248,6 +6262,27 @@ pub const DB = struct {
         }
     }
 
+    pub fn batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(
+        self: *DB,
+        req: types.BatchRequest,
+        dispatcher: ?DocumentArtifactChildRangeDispatcher,
+        observer: CommittedBatchEffectsObserver,
+    ) anyerror!void {
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(req, &profile, .{
+                .document_child_range_dispatcher = dispatcher,
+                .committed_batch_effects_observer = observer,
+            });
+            logBatchProfile(req, profile);
+        } else {
+            try self.batchInternal(req, null, .{
+                .document_child_range_dispatcher = dispatcher,
+                .committed_batch_effects_observer = observer,
+            });
+        }
+    }
+
     fn projectedBatchLsmAdmissionBytes(req: types.BatchRequest) u64 {
         var payload_bytes: u64 = 0;
         var operations: u64 = 0;
@@ -7603,6 +7638,9 @@ pub const DB = struct {
                 try self.mirrorHAReplayPayloadCommit(payload);
                 try self.core.clearTransactionHAOutbox(opts.transaction_resolution.?.txn_id, .replay);
             } else if (append_derived_replay) try self.mirrorHAReplayPayloadCommit(replay_payload);
+        }
+        if (opts.committed_batch_effects_observer) |observer| {
+            try observer.observe(if (append_derived_replay) replay_payload else "");
         }
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;

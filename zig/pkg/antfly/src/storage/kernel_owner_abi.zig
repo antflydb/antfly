@@ -842,6 +842,81 @@ pub const TransactionRecoveryConfig = extern struct {
     cleanup_transaction_fn: ?TransactionRecoveryCleanupFn = null,
 };
 
+/// One candidate entity borrowed for a synchronous resolution callback.
+/// The consumer must copy either byte slice before returning if it retains it.
+pub const ResolutionCandidateConsumeFn = *const fn (
+    ?*anyopaque,
+    BorrowedBytes,
+    BorrowedBytes,
+) callconv(.c) Status;
+pub const ResolutionCandidateGetFn = *const fn (
+    ?*anyopaque,
+    BorrowedBytes,
+    BorrowedBytes,
+    ?*anyopaque,
+    ResolutionCandidateConsumeFn,
+) callconv(.c) Status;
+pub const ResolutionCandidateScanPrefixFn = *const fn (
+    ?*anyopaque,
+    BorrowedBytes,
+    BorrowedBytes,
+    u64,
+    ?*anyopaque,
+    ResolutionCandidateConsumeFn,
+) callconv(.c) Status;
+pub const ResolutionCandidateNearestFn = *const fn (
+    ?*anyopaque,
+    BorrowedBytes,
+    BorrowedBytes,
+    ?[*]const f32,
+    u64,
+    u64,
+    ?*anyopaque,
+    ResolutionCandidateConsumeFn,
+) callconv(.c) Status;
+
+pub const ResolutionCandidateConfig = extern struct {
+    callback_ctx: ?*anyopaque = null,
+    get_fn: ?ResolutionCandidateGetFn = null,
+    scan_prefix_fn: ?ResolutionCandidateScanPrefixFn = null,
+    nearest_fn: ?ResolutionCandidateNearestFn = null,
+};
+
+pub const EntityUpsert = extern struct {
+    table: BorrowedBytes = .{},
+    key: BorrowedBytes = .{},
+    doc_json: BorrowedBytes = .{},
+};
+pub const EntityUpsertFn = *const fn (
+    ?*anyopaque,
+    BorrowedBytes,
+    BorrowedBytes,
+    BorrowedBytes,
+) callconv(.c) Status;
+pub const EntityUpsertBatchFn = *const fn (
+    ?*anyopaque,
+    ?[*]const EntityUpsert,
+    u64,
+) callconv(.c) Status;
+
+pub const EntitySinkConfig = extern struct {
+    callback_ctx: ?*anyopaque = null,
+    upsert_fn: ?EntityUpsertFn = null,
+    upsert_batch_fn: ?EntityUpsertBatchFn = null,
+};
+
+pub const PromotionOwnerFn = *const fn (?*anyopaque, u64) callconv(.c) u8;
+
+/// Distributed resolution/promotion callbacks retained by a live owner. All
+/// bytes are borrowed only for a synchronous callback; no allocator crosses
+/// the compiled-storage boundary.
+pub const RuntimeHooksConfig = extern struct {
+    resolution_candidates: ResolutionCandidateConfig = .{},
+    entity_sink: EntitySinkConfig = .{},
+    promotion_owner_ctx: ?*anyopaque = null,
+    promotion_owner_fn: ?PromotionOwnerFn = null,
+};
+
 pub const OpenRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
@@ -858,6 +933,7 @@ pub const OpenRequest = extern struct {
     schema_json: BorrowedBytes = .{},
     indexes_json: BorrowedBytes = .{},
     transaction_recovery: TransactionRecoveryConfig = .{},
+    runtime_hooks: RuntimeHooksConfig = .{},
 };
 
 pub const JsonOperationRequest = extern struct {
@@ -930,6 +1006,14 @@ pub const DocumentChildRangeDispatchFn = *const fn (
     BorrowedBytes,
 ) callconv(.c) Status;
 
+/// Invoked synchronously after the provider has durably committed a batch.
+/// The borrowed payload is the exact binary derived-change record committed
+/// with that batch, or empty when derived replay was intentionally elided.
+pub const CommittedBatchEffectsFn = *const fn (
+    ?*anyopaque,
+    BorrowedBytes,
+) callconv(.c) Status;
+
 pub const BatchJsonOperationRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
@@ -937,6 +1021,8 @@ pub const BatchJsonOperationRequest = extern struct {
     request_json: BorrowedBytes = .{},
     document_child_range_dispatch_ctx: ?*anyopaque = null,
     document_child_range_dispatch_fn: ?DocumentChildRangeDispatchFn = null,
+    committed_batch_effects_ctx: ?*anyopaque = null,
+    committed_batch_effects_fn: ?CommittedBatchEffectsFn = null,
 };
 
 /// Replace the catalog-owned physical schema/index contract on one resident

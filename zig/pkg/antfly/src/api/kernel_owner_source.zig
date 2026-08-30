@@ -26,8 +26,12 @@ const data_apply_client = @import("../storage/data_raft_apply_client.zig");
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const backend_types = @import("../storage/backend_types.zig");
 const db_types = @import("../storage/db/types.zig");
+const runtime_callbacks = @import("../storage/db/runtime_callbacks.zig");
+const ha_contract = @import("../storage/db/ha_contract.zig");
 const document_artifact_child_range = @import("../storage/db/document_artifact_child_range.zig");
 const text_memory = @import("../storage/db/text_memory_stats.zig");
+const ha_commit_gate = @import("../storage/ha/commit_gate.zig");
+const ha_effects = @import("../storage/ha/effects.zig");
 const ha_replication_record = @import("../storage/ha/replication_record.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -57,6 +61,11 @@ pub const ProvisionedKernelOwnerSource = struct {
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     transaction_recovery_source: ?transaction_recovery_source.Source = null,
     document_child_range_dispatch_source: ?table_write_source.TableWriteSource = null,
+    resolution_candidate_source: ?runtime_callbacks.CandidateSource = null,
+    entity_sink: ?runtime_callbacks.EntitySink = null,
+    promotion_leadership_source: ?table_writes.PromotionLeadershipSource = null,
+    ha_write_gate: ?ha_contract.WriteGate = null,
+    ha_async_mirror: ?ha_contract.AsyncEffectMirror = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     remote_content_configured: bool = false,
     context: client.Context = .{},
@@ -180,6 +189,35 @@ pub const ProvisionedKernelOwnerSource = struct {
         source: table_write_source.TableWriteSource,
     ) *ProvisionedKernelOwnerSource {
         self.document_child_range_dispatch_source = source;
+        return self;
+    }
+
+    /// Runtime callbacks are retained by every compiled owner and therefore
+    /// must be installed before the first owner is opened.
+    pub fn withRuntimeHooks(
+        self: *ProvisionedKernelOwnerSource,
+        candidate_source: ?runtime_callbacks.CandidateSource,
+        entity_sink: ?runtime_callbacks.EntitySink,
+        leadership_source: ?table_writes.PromotionLeadershipSource,
+    ) *ProvisionedKernelOwnerSource {
+        std.debug.assert(self.entries.items.len == 0);
+        self.resolution_candidate_source = candidate_source;
+        self.entity_sink = entity_sink;
+        self.promotion_leadership_source = leadership_source;
+        return self;
+    }
+
+    /// HA policy stays in distributed control. The compiled owner performs the
+    /// physical commit; this adapter fences before it and appends the exact
+    /// coarse batch plus its provider-produced derived effect only after that
+    /// commit succeeds.
+    pub fn withHAControls(
+        self: *ProvisionedKernelOwnerSource,
+        gate: ?ha_contract.WriteGate,
+        mirror: ?ha_contract.AsyncEffectMirror,
+    ) *ProvisionedKernelOwnerSource {
+        self.ha_write_gate = gate;
+        self.ha_async_mirror = mirror;
         return self;
     }
 
@@ -1250,6 +1288,155 @@ pub const ProvisionedKernelOwnerSource = struct {
         return kernel_error_identity.statusFromError(err);
     }
 
+    const CandidateConsumerBridge = struct {
+        ctx: ?*anyopaque,
+        consume: abi.ResolutionCandidateConsumeFn,
+
+        fn consumeCandidate(
+            ptr: *anyopaque,
+            entity_key: []const u8,
+            value: []const u8,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try kernel_error_identity.statusToError(self.consume(
+                self.ctx,
+                .fromSlice(entity_key),
+                .fromSlice(value),
+            ));
+        }
+    };
+
+    fn resolutionCandidateGet(
+        ptr: ?*anyopaque,
+        table: abi.BorrowedBytes,
+        key: abi.BorrowedBytes,
+        consume_ctx: ?*anyopaque,
+        consume: abi.ResolutionCandidateConsumeFn,
+    ) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const source = self.resolution_candidate_source orelse return .invalid_argument;
+        const value = source.get(self.alloc, table.slice(), key.slice()) catch |err|
+            return kernel_error_identity.statusFromError(err);
+        const bytes = value orelse return .not_found;
+        defer self.alloc.free(bytes);
+        return consume(consume_ctx, key, .fromSlice(bytes));
+    }
+
+    fn resolutionCandidateScanPrefix(
+        ptr: ?*anyopaque,
+        table: abi.BorrowedBytes,
+        prefix: abi.BorrowedBytes,
+        limit: u64,
+        consume_ctx: ?*anyopaque,
+        consume: abi.ResolutionCandidateConsumeFn,
+    ) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const source = self.resolution_candidate_source orelse return .invalid_argument;
+        var bridge = CandidateConsumerBridge{ .ctx = consume_ctx, .consume = consume };
+        source.scanPrefix(
+            self.alloc,
+            table.slice(),
+            prefix.slice(),
+            .{ .limit = @intCast(@min(limit, std.math.maxInt(usize))) },
+            &bridge,
+            CandidateConsumerBridge.consumeCandidate,
+        ) catch |err| return kernel_error_identity.statusFromError(err);
+        return .ok;
+    }
+
+    fn resolutionCandidateNearest(
+        ptr: ?*anyopaque,
+        table: abi.BorrowedBytes,
+        index_name: abi.BorrowedBytes,
+        embedding_ptr: ?[*]const f32,
+        embedding_len: u64,
+        k: u64,
+        consume_ctx: ?*anyopaque,
+        consume: abi.ResolutionCandidateConsumeFn,
+    ) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const source = self.resolution_candidate_source orelse return .invalid_argument;
+        if (embedding_len > 0 and embedding_ptr == null) return .invalid_argument;
+        const embedding = if (embedding_len == 0)
+            &.{}
+        else
+            embedding_ptr.?[0..@intCast(embedding_len)];
+        var bridge = CandidateConsumerBridge{ .ctx = consume_ctx, .consume = consume };
+        source.nearest(
+            self.alloc,
+            table.slice(),
+            .{
+                .index_name = index_name.slice(),
+                .embedding = embedding,
+                .k = @intCast(@min(k, std.math.maxInt(usize))),
+            },
+            &bridge,
+            CandidateConsumerBridge.consumeCandidate,
+        ) catch |err| return kernel_error_identity.statusFromError(err);
+        return .ok;
+    }
+
+    fn entityUpsert(
+        ptr: ?*anyopaque,
+        table: abi.BorrowedBytes,
+        key: abi.BorrowedBytes,
+        doc_json: abi.BorrowedBytes,
+    ) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const sink = self.entity_sink orelse return .invalid_argument;
+        sink.upsert(self.alloc, table.slice(), key.slice(), doc_json.slice()) catch |err|
+            return kernel_error_identity.statusFromError(err);
+        return .ok;
+    }
+
+    fn entityUpsertBatch(
+        ptr: ?*anyopaque,
+        entries_ptr: ?[*]const abi.EntityUpsert,
+        entry_count: u64,
+    ) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const sink = self.entity_sink orelse return .invalid_argument;
+        if (entry_count > 0 and entries_ptr == null) return .invalid_argument;
+        const encoded = if (entry_count == 0) &.{} else entries_ptr.?[0..@intCast(entry_count)];
+        const entries = self.alloc.alloc(runtime_callbacks.EntityUpsert, encoded.len) catch return .out_of_memory;
+        defer self.alloc.free(entries);
+        for (encoded, entries) |source, *destination| destination.* = .{
+            .table = source.table.slice(),
+            .key = source.key.slice(),
+            .doc_json = source.doc_json.slice(),
+        };
+        sink.upsertBatch(self.alloc, entries) catch |err|
+            return kernel_error_identity.statusFromError(err);
+        return .ok;
+    }
+
+    fn promotionOwner(
+        ptr: ?*anyopaque,
+        group_id: u64,
+    ) callconv(.c) u8 {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return 0));
+        const source = self.promotion_leadership_source orelse return 1;
+        return @intFromBool(source.isLocalLeader(group_id));
+    }
+
+    fn runtimeHooksConfig(self: *ProvisionedKernelOwnerSource) abi.RuntimeHooksConfig {
+        return .{
+            .resolution_candidates = if (self.resolution_candidate_source != null) .{
+                .callback_ctx = self,
+                .get_fn = resolutionCandidateGet,
+                .scan_prefix_fn = resolutionCandidateScanPrefix,
+                .nearest_fn = resolutionCandidateNearest,
+            } else .{},
+            .entity_sink = if (self.entity_sink != null) .{
+                .callback_ctx = self,
+                .upsert_fn = entityUpsert,
+                .upsert_batch_fn = entityUpsertBatch,
+            } else .{},
+            .promotion_owner_ctx = if (self.promotion_leadership_source != null) self else null,
+            .promotion_owner_fn = if (self.promotion_leadership_source != null) promotionOwner else null,
+        };
+    }
+
     fn transactionRecoveryResolve(
         ptr: ?*anyopaque,
         txn_id: *const abi.TxnId,
@@ -1491,6 +1678,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .schema_json = .fromSlice(descriptor.schema_json),
             .indexes_json = .fromSlice(descriptor.indexes_json),
             .transaction_recovery = self.transactionRecoveryConfig(),
+            .runtime_hooks = self.runtimeHooksConfig(),
         });
         errdefer owner.deinit();
         entry.* = .{
@@ -1771,10 +1959,24 @@ pub const ProvisionedKernelOwnerSource = struct {
         req: db_types.BatchRequest,
     ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        if (self.ha_write_gate) |gate| try gate.check();
+        var ha_mutation = if (self.ha_async_mirror) |mirror|
+            if (mirror.mutation_barrier) |barrier| barrier.acquireShared() else null
+        else
+            null;
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.preflightHAMirrorSyncCommit();
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
+        var callback_error_relay: kernel_error_identity.CallbackErrorRelay = .{};
+        var committed_effects_context = CommittedBatchEffectsContext{
+            .source = self,
+            .request = req,
+            .identity = lease.entry.identity,
+            .error_relay = &callback_error_relay,
+        };
         var dispatch_context = if (self.document_child_range_dispatch_source) |source|
             DocumentChildRangeDispatchContext{
                 .alloc = alloc,
@@ -1783,14 +1985,170 @@ pub const ProvisionedKernelOwnerSource = struct {
             }
         else
             null;
-        var response = try lease.owner().batchJsonWithDocumentChildRangeDispatcher(
+        var response: client.Response = .{};
+        const callback_status = lease.owner().batchJsonWithCallbacksStatus(
             table_name,
             request_json,
             if (dispatch_context) |*context| context else null,
             if (dispatch_context != null) dispatchDocumentChildRange else null,
+            &committed_effects_context,
+            committedBatchEffects,
+            &response,
         );
         defer response.deinit();
+        try callback_error_relay.finish(callback_status);
         return {};
+    }
+
+    fn preflightHAMirrorSyncCommit(self: *ProvisionedKernelOwnerSource) !void {
+        const mirror = self.ha_async_mirror orelse return;
+        if (mirror.sync_policy.mode == .async or mirror.sync_policy.failure_policy != .fail_closed) return;
+        const target_lsn = mirror.primary.nextLsn();
+        const decision = try mirror.primary.evaluateAppendDurability(target_lsn, mirror.sync_policy);
+        const gate = ha_commit_gate.GateResult{
+            .target_lsn = target_lsn,
+            .action = switch (decision.status) {
+                .satisfied => .acknowledge,
+                .would_block => .wait_for_standby,
+                .fail_closed => .reject,
+                .degraded_to_async => .acknowledge_degraded,
+            },
+            .decision = decision,
+        };
+        recordHAMirrorGate(mirror, gate);
+        if (gate.action == .reject) return error.SyncPolicyUnsatisfied;
+    }
+
+    const CommittedBatchEffectsContext = struct {
+        source: *ProvisionedKernelOwnerSource,
+        request: db_types.BatchRequest,
+        identity: Identity,
+        error_relay: *kernel_error_identity.CallbackErrorRelay,
+    };
+
+    fn committedBatchEffects(
+        ptr: ?*anyopaque,
+        replay_payload: abi.BorrowedBytes,
+    ) callconv(.c) abi.Status {
+        const context: *CommittedBatchEffectsContext = @ptrCast(@alignCast(ptr orelse
+            return .invalid_argument));
+        context.source.mirrorHABatchMutationCommit(context.request, context.identity) catch |err|
+            return context.error_relay.capture(err);
+        if (replay_payload.len != 0) {
+            context.source.mirrorHAReplayPayloadCommit(replay_payload.slice(), context.identity) catch |err|
+                return context.error_relay.capture(err);
+        }
+        return .ok;
+    }
+
+    fn mirrorHABatchMutationCommit(
+        self: *ProvisionedKernelOwnerSource,
+        req: db_types.BatchRequest,
+        identity: Identity,
+    ) !void {
+        const mirror = self.ha_async_mirror orelse return;
+        const transition_mutex = mirror.transition_mutex;
+        if (transition_mutex) |mutex| lock(mutex);
+        var transition_locked = transition_mutex != null;
+        defer if (transition_locked) transition_mutex.?.unlock();
+
+        const lsn = ha_effects.appendBatchMutationRequest(self.alloc, mirror.primary, req, .{
+            .shard_id = identity.shard_id,
+            .table_id = identity.table_id,
+        }) catch |err| {
+            noteHAMirrorFailure(mirror, err);
+            if (mirror.sync_policy.mode != .async) return err;
+            return;
+        };
+        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+
+        if (transition_mutex) |mutex| {
+            mutex.unlock();
+            transition_locked = false;
+        }
+        try evaluateHAMirrorCommitGate(mirror, lsn);
+        if (transition_mutex) |mutex| {
+            lock(mutex);
+            transition_locked = true;
+        }
+        if (self.ha_write_gate) |gate| try gate.check();
+    }
+
+    fn mirrorHAReplayPayloadCommit(
+        self: *ProvisionedKernelOwnerSource,
+        replay_payload: []const u8,
+        identity: Identity,
+    ) !void {
+        const mirror = self.ha_async_mirror orelse return;
+        const transition_mutex = mirror.transition_mutex;
+        if (transition_mutex) |mutex| lock(mutex);
+        var transition_locked = transition_mutex != null;
+        defer if (transition_locked) transition_mutex.?.unlock();
+
+        const lsn = ha_effects.appendEncodedDerivedChangeRecord(mirror.primary, replay_payload, .{
+            .shard_id = identity.shard_id,
+            .table_id = identity.table_id,
+        }) catch |err| {
+            noteHAMirrorFailure(mirror, err);
+            if (mirror.sync_policy.mode != .async) return err;
+            return;
+        };
+        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+
+        if (transition_mutex) |mutex| {
+            mutex.unlock();
+            transition_locked = false;
+        }
+        try evaluateHAMirrorCommitGate(mirror, lsn);
+        if (transition_mutex) |mutex| {
+            lock(mutex);
+            transition_locked = true;
+        }
+        if (self.ha_write_gate) |gate| try gate.check();
+    }
+
+    fn evaluateHAMirrorCommitGate(mirror: ha_contract.AsyncEffectMirror, lsn: u64) !void {
+        if (mirror.sync_policy.mode == .async) return;
+        var gate = try ha_commit_gate.evaluate(mirror.primary, lsn, mirror.sync_policy);
+        recordHAMirrorGate(mirror, gate);
+        switch (gate.action) {
+            .acknowledge, .acknowledge_degraded => return,
+            .reject => return error.SyncPolicyUnsatisfied,
+            .wait_for_standby => {
+                const wait_fn = mirror.sync_wait_fn orelse return error.HASyncCommitWouldBlock;
+                const wait_ctx = mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext;
+                try wait_fn(wait_ctx, mirror.primary, lsn, mirror.sync_policy);
+                gate = try ha_commit_gate.evaluate(mirror.primary, lsn, mirror.sync_policy);
+                recordHAMirrorGate(mirror, gate);
+                switch (gate.action) {
+                    .acknowledge, .acknowledge_degraded => return,
+                    .reject => return error.SyncPolicyUnsatisfied,
+                    .wait_for_standby => return error.HASyncCommitWouldBlock,
+                }
+            },
+        }
+    }
+
+    fn recordHAMirrorGate(mirror: ha_contract.AsyncEffectMirror, gate: ha_commit_gate.GateResult) void {
+        if (mirror.last_gate_lsn) |last_lsn| last_lsn.store(gate.target_lsn, .release);
+        if (mirror.last_gate_action) |last_action| last_action.store(@intFromEnum(gate.action), .release);
+        switch (gate.action) {
+            .acknowledge => {},
+            .acknowledge_degraded => {
+                if (mirror.sync_degraded_count) |counter| _ = counter.fetchAdd(1, .monotonic);
+            },
+            .reject => {
+                if (mirror.sync_reject_count) |counter| _ = counter.fetchAdd(1, .monotonic);
+            },
+            .wait_for_standby => {
+                if (mirror.sync_wait_count) |counter| _ = counter.fetchAdd(1, .monotonic);
+            },
+        }
+    }
+
+    fn noteHAMirrorFailure(mirror: ha_contract.AsyncEffectMirror, err: anyerror) void {
+        if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
+        std.log.warn("failed to mirror compiled-owner commit into HA stream: {s}", .{@errorName(err)});
     }
 
     const DocumentChildRangeDispatchContext = struct {

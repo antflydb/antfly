@@ -46,6 +46,7 @@ pub const CandidateSource = runtime_callbacks.CandidateSource;
 pub const EntityUpsert = runtime_callbacks.EntityUpsert;
 pub const EntitySink = runtime_callbacks.EntitySink;
 pub const PromotionOwner = runtime_callbacks.PromotionOwner;
+pub const HAReplicationRecordView = @import("../ha/replication_record.zig").RecordView;
 pub const HAAsyncEffectMirror = ha_contract.AsyncEffectMirror;
 pub const HAAsyncBatchMirror = ha_contract.AsyncBatchMirror;
 pub const HAAsyncMetadataMirror = ha_contract.AsyncMetadataMirror;

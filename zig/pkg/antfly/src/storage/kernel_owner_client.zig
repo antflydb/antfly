@@ -387,19 +387,46 @@ pub const Owner = struct {
         dispatch_ctx: ?*anyopaque,
         dispatch_fn: ?abi.DocumentChildRangeDispatchFn,
     ) !Response {
-        if ((dispatch_ctx == null) != (dispatch_fn == null)) return error.InvalidArgument;
         var response: Response = .{};
-        try statusToError(abi.antfly_storage_owner_batch_json(
+        try statusToError(self.batchJsonWithCallbacksStatus(
+            table_name,
+            request_json,
+            dispatch_ctx,
+            dispatch_fn,
+            null,
+            null,
+            &response,
+        ));
+        return response;
+    }
+
+    /// Raw status is exposed for callback consumers that retain an exact local
+    /// error relay across the compiled provider boundary.
+    pub fn batchJsonWithCallbacksStatus(
+        self: *Owner,
+        table_name: []const u8,
+        request_json: []const u8,
+        dispatch_ctx: ?*anyopaque,
+        dispatch_fn: ?abi.DocumentChildRangeDispatchFn,
+        committed_effects_ctx: ?*anyopaque,
+        committed_effects_fn: ?abi.CommittedBatchEffectsFn,
+        response: *Response,
+    ) abi.Status {
+        response.* = .{};
+        if ((dispatch_ctx == null) != (dispatch_fn == null)) return .invalid_argument;
+        if ((committed_effects_ctx == null) != (committed_effects_fn == null)) return .invalid_argument;
+        return abi.antfly_storage_owner_batch_json(
             self.handle,
             &.{
                 .table_name = .fromSlice(table_name),
                 .request_json = .fromSlice(request_json),
                 .document_child_range_dispatch_ctx = dispatch_ctx,
                 .document_child_range_dispatch_fn = dispatch_fn,
+                .committed_batch_effects_ctx = committed_effects_ctx,
+                .committed_batch_effects_fn = committed_effects_fn,
             },
             &response.buffer,
-        ));
-        return response;
+        );
     }
 
     pub fn replicatedBatchJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {

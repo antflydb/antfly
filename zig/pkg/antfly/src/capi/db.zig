@@ -336,6 +336,184 @@ const StorageOwnerTransactionRecovery = struct {
     }
 };
 
+const StorageOwnerRuntimeHooks = struct {
+    config: kernel_owner_abi.RuntimeHooksConfig,
+    group_id: u64,
+
+    const CandidateCapture = struct {
+        alloc: Allocator,
+        value: ?[]u8 = null,
+
+        fn consume(
+            ptr: ?*anyopaque,
+            _: kernel_owner_abi.BorrowedBytes,
+            value: kernel_owner_abi.BorrowedBytes,
+        ) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+            if (self.value != null) return .invalid_argument;
+            self.value = self.alloc.dupe(u8, value.slice()) catch return .out_of_memory;
+            return .ok;
+        }
+    };
+
+    const CandidateConsumerBridge = struct {
+        ctx: *anyopaque,
+        consume: db_mod.CandidateSource.Consume,
+
+        fn forward(
+            ptr: ?*anyopaque,
+            entity_key: kernel_owner_abi.BorrowedBytes,
+            value: kernel_owner_abi.BorrowedBytes,
+        ) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+            self.consume(self.ctx, entity_key.slice(), value.slice()) catch |err|
+                return kernel_error_identity.statusFromError(err);
+            return .ok;
+        }
+    };
+
+    fn candidateSource(self: *StorageOwnerRuntimeHooks) ?db_mod.CandidateSource {
+        if (self.config.resolution_candidates.get_fn == null) return null;
+        return .{ .ptr = self, .vtable = &candidate_vtable };
+    }
+
+    const candidate_vtable = db_mod.CandidateSource.VTable{
+        .get = candidateGet,
+        .scan_prefix = candidateScanPrefix,
+        .nearest = candidateNearest,
+    };
+
+    fn candidateGet(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        table: []const u8,
+        key: []const u8,
+    ) anyerror!?[]u8 {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.resolution_candidates.get_fn orelse return error.MissingResolutionCandidateSource;
+        var capture = CandidateCapture{ .alloc = alloc };
+        const status = callback(
+            self.config.resolution_candidates.callback_ctx,
+            .fromSlice(table),
+            .fromSlice(key),
+            &capture,
+            CandidateCapture.consume,
+        );
+        if (status == .not_found) return null;
+        try kernel_error_identity.statusToError(status);
+        return capture.value orelse return error.InvalidArgument;
+    }
+
+    fn candidateScanPrefix(
+        ptr: *anyopaque,
+        _: Allocator,
+        table: []const u8,
+        prefix: []const u8,
+        opts: db_mod.CandidateSource.ScanOptions,
+        ctx: *anyopaque,
+        consume: db_mod.CandidateSource.Consume,
+    ) anyerror!void {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.resolution_candidates.scan_prefix_fn orelse return error.ScanUnsupported;
+        var bridge = CandidateConsumerBridge{ .ctx = ctx, .consume = consume };
+        try kernel_error_identity.statusToError(callback(
+            self.config.resolution_candidates.callback_ctx,
+            .fromSlice(table),
+            .fromSlice(prefix),
+            @intCast(opts.limit),
+            &bridge,
+            CandidateConsumerBridge.forward,
+        ));
+    }
+
+    fn candidateNearest(
+        ptr: *anyopaque,
+        _: Allocator,
+        table: []const u8,
+        query: db_mod.CandidateSource.NearestQuery,
+        ctx: *anyopaque,
+        consume: db_mod.CandidateSource.Consume,
+    ) anyerror!void {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.resolution_candidates.nearest_fn orelse return error.NearestUnsupported;
+        var bridge = CandidateConsumerBridge{ .ctx = ctx, .consume = consume };
+        try kernel_error_identity.statusToError(callback(
+            self.config.resolution_candidates.callback_ctx,
+            .fromSlice(table),
+            .fromSlice(query.index_name),
+            if (query.embedding.len == 0) null else query.embedding.ptr,
+            @intCast(query.embedding.len),
+            @intCast(query.k),
+            &bridge,
+            CandidateConsumerBridge.forward,
+        ));
+    }
+
+    fn entitySink(self: *StorageOwnerRuntimeHooks) ?db_mod.EntitySink {
+        if (self.config.entity_sink.upsert_fn == null) return null;
+        return .{ .ptr = self, .vtable = &entity_sink_vtable };
+    }
+
+    const entity_sink_vtable = db_mod.EntitySink.VTable{
+        .upsert = entityUpsert,
+        .upsert_batch = entityUpsertBatch,
+    };
+
+    fn entityUpsert(
+        ptr: *anyopaque,
+        _: Allocator,
+        table: []const u8,
+        key: []const u8,
+        doc_json: []const u8,
+    ) anyerror!void {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.entity_sink.upsert_fn orelse return error.MissingEntitySink;
+        try kernel_error_identity.statusToError(callback(
+            self.config.entity_sink.callback_ctx,
+            .fromSlice(table),
+            .fromSlice(key),
+            .fromSlice(doc_json),
+        ));
+    }
+
+    fn entityUpsertBatch(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        entries: []const db_mod.EntityUpsert,
+    ) anyerror!void {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.entity_sink.upsert_batch_fn orelse {
+            for (entries) |entry| try entityUpsert(ptr, alloc, entry.table, entry.key, entry.doc_json);
+            return;
+        };
+        const encoded = try alloc.alloc(kernel_owner_abi.EntityUpsert, entries.len);
+        defer alloc.free(encoded);
+        for (entries, encoded) |source, *destination| destination.* = .{
+            .table = .fromSlice(source.table),
+            .key = .fromSlice(source.key),
+            .doc_json = .fromSlice(source.doc_json),
+        };
+        try kernel_error_identity.statusToError(callback(
+            self.config.entity_sink.callback_ctx,
+            if (encoded.len == 0) null else encoded.ptr,
+            @intCast(encoded.len),
+        ));
+    }
+
+    fn promotionOwner(self: *StorageOwnerRuntimeHooks) ?db_mod.PromotionOwner {
+        if (self.config.promotion_owner_fn == null) return null;
+        return .{ .ptr = self, .vtable = &promotion_owner_vtable };
+    }
+
+    const promotion_owner_vtable = db_mod.PromotionOwner.VTable{ .is_local_owner = isLocalPromotionOwner };
+
+    fn isLocalPromotionOwner(ptr: *anyopaque) bool {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.promotion_owner_fn orelse return true;
+        return callback(self.config.promotion_owner_ctx, self.group_id) != 0;
+    }
+};
+
 test "storage-owner reverse callbacks preserve semantic error identity" {
     try std.testing.expectError(
         error.WouldBlock,
@@ -397,6 +575,7 @@ const Handle = struct {
     storage_owner_group_id: u64 = 0,
     storage_owner_context: ?*StorageOwnerContext = null,
     storage_owner_transaction_recovery: ?*StorageOwnerTransactionRecovery = null,
+    storage_owner_runtime_hooks: ?*StorageOwnerRuntimeHooks = null,
 
     fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
         const hook = self.readable_lease_hook orelse return;
@@ -463,6 +642,7 @@ const StorageSnapshot = struct {
 fn closeHandle(handle: *Handle) void {
     const storage_owner_context = handle.storage_owner_context;
     const storage_owner_transaction_recovery = handle.storage_owner_transaction_recovery;
+    const storage_owner_runtime_hooks = handle.storage_owner_runtime_hooks;
     if (handle.owned_lite_backend != null and liteOpenModeCanWrite(handle.open_mode)) {
         handle.db.sync(true) catch {};
         handle.db.syncIndexes(true) catch {};
@@ -472,6 +652,7 @@ fn closeHandle(handle: *Handle) void {
         recovery.deinit();
         handle.alloc.destroy(recovery);
     }
+    if (storage_owner_runtime_hooks) |runtime_hooks| handle.alloc.destroy(runtime_hooks);
     if (handle.owned_lite_backend) |*backend| {
         backend.deinit();
     }
@@ -3789,6 +3970,23 @@ pub fn storageOwnerOpen(
                 recovery_config.cleanup_transaction_fn == null))
             return .invalid_argument;
     }
+    const runtime_hooks_config = request.runtime_hooks;
+    const candidate_configured = runtime_hooks_config.resolution_candidates.get_fn != null or
+        runtime_hooks_config.resolution_candidates.scan_prefix_fn != null or
+        runtime_hooks_config.resolution_candidates.nearest_fn != null;
+    if (candidate_configured and
+        (runtime_hooks_config.resolution_candidates.callback_ctx == null or
+            runtime_hooks_config.resolution_candidates.get_fn == null))
+        return .invalid_argument;
+    const entity_sink_configured = runtime_hooks_config.entity_sink.upsert_fn != null or
+        runtime_hooks_config.entity_sink.upsert_batch_fn != null;
+    if (entity_sink_configured and
+        (runtime_hooks_config.entity_sink.callback_ctx == null or
+            runtime_hooks_config.entity_sink.upsert_fn == null))
+        return .invalid_argument;
+    if ((runtime_hooks_config.promotion_owner_ctx == null) !=
+        (runtime_hooks_config.promotion_owner_fn == null))
+        return .invalid_argument;
     var recovery: ?*StorageOwnerTransactionRecovery = null;
     if (recovery_config.enabled != 0) {
         recovery = alloc.create(StorageOwnerTransactionRecovery) catch return .out_of_memory;
@@ -3801,6 +3999,12 @@ pub fn storageOwnerOpen(
         value.deinit();
         alloc.destroy(value);
     };
+    var runtime_hooks: ?*StorageOwnerRuntimeHooks = null;
+    if (candidate_configured or entity_sink_configured or runtime_hooks_config.promotion_owner_fn != null) {
+        runtime_hooks = alloc.create(StorageOwnerRuntimeHooks) catch return .out_of_memory;
+        runtime_hooks.?.* = .{ .config = runtime_hooks_config, .group_id = request.group_id };
+    }
+    errdefer if (runtime_hooks) |value| alloc.destroy(value);
     const owner_context = asStorageOwnerContext(request.context);
     if (owner_context) |context| context.acquire();
     var context_borrowed = owner_context != null;
@@ -3814,6 +4018,9 @@ pub fn storageOwnerOpen(
         .identity_namespace = identity_namespace,
         .prefer_existing_identity_namespace = identity_namespace != null,
         .transaction_recovery = if (recovery) |value| value.dbConfig() else .{},
+        .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() else null,
+        .entity_sink = if (runtime_hooks) |value| value.entitySink() else null,
+        .promotion_owner = if (runtime_hooks) |value| value.promotionOwner() else null,
         .remote_content = if (owner_context) |context| context.remoteContent() else null,
     };
     if (owner_context) |context| if (context.lite_backend) |*backend|
@@ -3843,6 +4050,7 @@ pub fn storageOwnerOpen(
         .storage_owner_group_id = request.group_id,
         .storage_owner_context = owner_context,
         .storage_owner_transaction_recovery = recovery,
+        .storage_owner_runtime_hooks = runtime_hooks,
     };
     out_owner.* = handle;
     context_borrowed = false;
@@ -4202,6 +4410,23 @@ const StorageOwnerDocumentChildRangeDispatch = struct {
     }
 };
 
+const StorageOwnerCommittedBatchEffects = struct {
+    callback_ctx: ?*anyopaque,
+    callback_fn: kernel_owner_abi.CommittedBatchEffectsFn,
+
+    fn observer(self: *@This()) db_mod.CommittedBatchEffectsObserver {
+        return .{ .ptr = self, .apply = apply };
+    }
+
+    fn apply(ptr: *anyopaque, replay_payload: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try storageOwnerCallbackStatusToError(self.callback_fn(
+            self.callback_ctx,
+            .fromSlice(replay_payload),
+        ));
+    }
+};
+
 fn storageOwnerCallbackStatusToError(status: kernel_owner_abi.Status) !void {
     return kernel_error_identity.statusToError(status);
 }
@@ -4224,9 +4449,18 @@ pub fn storageOwnerBatchJson(
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
     if ((request.document_child_range_dispatch_ctx == null) !=
         (request.document_child_range_dispatch_fn == null)) return .invalid_argument;
+    if ((request.committed_batch_effects_ctx == null) !=
+        (request.committed_batch_effects_fn == null)) return .invalid_argument;
     var dispatch = if (request.document_child_range_dispatch_fn) |callback_fn|
         StorageOwnerDocumentChildRangeDispatch{
             .callback_ctx = request.document_child_range_dispatch_ctx,
+            .callback_fn = callback_fn,
+        }
+    else
+        null;
+    var committed_effects = if (request.committed_batch_effects_fn) |callback_fn|
+        StorageOwnerCommittedBatchEffects{
+            .callback_ctx = request.committed_batch_effects_ctx,
             .callback_fn = callback_fn,
         }
     else
@@ -4235,7 +4469,7 @@ pub fn storageOwnerBatchJson(
     const status = batchStorageKernelJson(handle, .{
         .ptr = request.request_json.ptr,
         .len = @intCast(request.request_json.len),
-    }, if (dispatch) |*value| value.dispatcher() else null, &response);
+    }, if (dispatch) |*value| value.dispatcher() else null, if (committed_effects) |*value| value.observer() else null, &response);
     if (status != .ok) return status;
     out_response.* = .{
         .ptr = response.ptr,
@@ -4825,6 +5059,7 @@ fn batchStorageKernelJson(
     handle: *Handle,
     request_json: capi.Slice,
     document_child_range_dispatcher: ?db_mod.DocumentArtifactChildRangeDispatcher,
+    committed_batch_effects_observer: ?db_mod.CommittedBatchEffectsObserver,
     out_buf: *capi.Buffer,
 ) kernel_owner_abi.Status {
     // The group-local owner accepts the internal batch dialect so split
@@ -4834,7 +5069,13 @@ fn batchStorageKernelJson(
         return storageOwnerStatusFromError(err);
     defer owned.deinit(handle.alloc);
 
-    if (document_child_range_dispatcher) |dispatcher|
+    if (committed_batch_effects_observer) |observer|
+        handle.db.batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(
+            owned.req,
+            document_child_range_dispatcher,
+            observer,
+        ) catch |err| return storageOwnerStatusFromError(err)
+    else if (document_child_range_dispatcher) |dispatcher|
         handle.db.batchWithDocumentArtifactChildRangeDispatcher(owned.req, dispatcher) catch |err|
             return storageOwnerStatusFromError(err)
     else
