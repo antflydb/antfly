@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const reflection = @import("../common/reflection_compat.zig");
 const ant_json = @import("antfly-json");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -6090,8 +6089,8 @@ fn expectCreatedObjectAllowlistCovers(
     comptime T: type,
     shape: public_index_contract.CreatedObjectShape,
 ) !void {
-    inline for (reflection.fields(T)) |field| {
-        try std.testing.expect(public_index_contract.isAllowedCreatedObjectField(shape, field.name));
+    inline for (@typeInfo(T).@"struct".field_names) |field_name| {
+        try std.testing.expect(public_index_contract.isAllowedCreatedObjectField(shape, field_name));
     }
 }
 
@@ -6114,11 +6113,11 @@ test "created nested response allowlists cover generated schemas" {
     try expectCreatedObjectAllowlistCovers(indexes_openapi.IndexExecutionConfig, .index_execution);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.ExecutionPolicy, .execution_policy);
 
-    inline for (reflection.fields(indexes_openapi.GraphArtifactProducerConfig)) |field| {
-        try std.testing.expect(public_index_contract.isAllowedGraphArtifactRequestField(field.name));
+    inline for (@typeInfo(indexes_openapi.GraphArtifactProducerConfig).@"struct".field_names) |field_name| {
+        try std.testing.expect(public_index_contract.isAllowedGraphArtifactRequestField(field_name));
     }
-    inline for (reflection.fields(indexes_openapi.EnrichmentConfig)) |field| {
-        try std.testing.expect(public_index_contract.isAllowedEnrichmentRequestField(field.name));
+    inline for (@typeInfo(indexes_openapi.EnrichmentConfig).@"struct".field_names) |field_name| {
+        try std.testing.expect(public_index_contract.isAllowedEnrichmentRequestField(field_name));
     }
 
     inline for (.{

@@ -19,7 +19,6 @@
 //! user-controlled IDs never share a delimiter namespace with derived records.
 
 const std = @import("std");
-const reflection = @import("../common/reflection_compat.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -74,8 +73,8 @@ fn replayHintOrdinal(hint: change_journal_mod.TargetHint) u8 {
 
 fn replayHintFromSingleMask(mask: u8) ?change_journal_mod.TargetHint {
     if (mask == 0 or (mask & (mask - 1)) != 0) return null;
-    inline for (reflection.fields(change_journal_mod.TargetHint)) |field| {
-        if (mask == (@as(u8, 1) << @intCast(field.value))) return @fromBackingInt(@intCast(field.value));
+    inline for (@typeInfo(change_journal_mod.TargetHint).@"enum".field_values) |field_value| {
+        if (mask == (@as(u8, 1) << @intCast(field_value))) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }

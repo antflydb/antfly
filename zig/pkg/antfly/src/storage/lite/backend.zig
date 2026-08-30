@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const reflection = @import("../../common/reflection_compat.zig");
 const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
 const db_mod = @import("../db/db.zig");
@@ -862,10 +861,10 @@ test "lite backend capabilities contract is stable" {
         "object_storage_primary",
     };
 
-    const fields = reflection.fields(Capabilities);
-    try std.testing.expectEqual(expected_fields.len, fields.len);
-    inline for (fields, 0..) |field, i| {
-        try std.testing.expectEqualStrings(expected_fields[i], field.name);
+    const field_names = @typeInfo(Capabilities).@"struct".field_names;
+    try std.testing.expectEqual(expected_fields.len, field_names.len);
+    inline for (field_names, 0..) |field_name, i| {
+        try std.testing.expectEqualStrings(expected_fields[i], field_name);
     }
 
     const allocator = std.testing.allocator;
@@ -931,10 +930,10 @@ test "lite backend inference status reports disabled as clean state" {
         "no_inference_configured_ok",
     };
 
-    const fields = reflection.fields(InferenceStatus);
-    try std.testing.expectEqual(expected_fields.len, fields.len);
-    inline for (fields, 0..) |field, i| {
-        try std.testing.expectEqualStrings(expected_fields[i], field.name);
+    const field_names = @typeInfo(InferenceStatus).@"struct".field_names;
+    try std.testing.expectEqual(expected_fields.len, field_names.len);
+    inline for (field_names, 0..) |field_name, i| {
+        try std.testing.expectEqualStrings(expected_fields[i], field_name);
     }
 
     const status = inferenceStatusForProfile(.native);

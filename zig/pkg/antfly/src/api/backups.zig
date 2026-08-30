@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const reflection = @import("../common/reflection_compat.zig");
 const ant_json = @import("antfly-json");
 const platform_time = @import("antfly_platform").time;
 const metadata_openapi = @import("antfly_metadata_openapi");
@@ -5834,8 +5833,8 @@ fn currentGoAttemptTimestampOrder(
     lhs: CurrentGoAttemptTimestamp,
     rhs: CurrentGoAttemptTimestamp,
 ) std.math.Order {
-    inline for (reflection.fields(CurrentGoAttemptTimestamp)) |field| {
-        const order = std.math.order(@field(lhs, field.name), @field(rhs, field.name));
+    inline for (@typeInfo(CurrentGoAttemptTimestamp).@"struct".field_names) |field_name| {
+        const order = std.math.order(@field(lhs, field_name), @field(rhs, field_name));
         if (order != .eq) return order;
     }
     return .eq;

@@ -18,7 +18,6 @@
 //! Each language provides a comptime StaticStringMap for O(1) lookup.
 
 const std = @import("std");
-const reflection = @import("../common/reflection_compat.zig");
 
 pub const Language = enum {
     english,
@@ -466,8 +465,8 @@ const finnish_stops = std.StaticStringMap(void).initComptime(.{
 // ============================================================================
 
 test "all languages have non-empty stop word maps" {
-    inline for (reflection.fields(Language)) |field| {
-        const lang: Language = @fromBackingInt(@intCast(field.value));
+    inline for (@typeInfo(Language).@"enum".field_values) |field_value| {
+        const lang: Language = @fromBackingInt(@intCast(field_value));
         const stops = getStopWords(lang);
         try std.testing.expect(stops.keys().len > 0);
     }

@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const reflection = @import("../common/reflection_compat.zig");
 const builtin = @import("builtin");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
@@ -22074,8 +22073,8 @@ test "internal worker doc identity exchange audit covers every boundary" {
     var validates_generation_projection: usize = 0;
     var fail_closed_before_fanout: usize = 0;
 
-    inline for (reflection.fields(DocIdentityInternalWorkerBoundary)) |field| {
-        const boundary: DocIdentityInternalWorkerBoundary = @field(DocIdentityInternalWorkerBoundary, field.name);
+    inline for (@typeInfo(DocIdentityInternalWorkerBoundary).@"enum".field_names) |field_name| {
+        const boundary: DocIdentityInternalWorkerBoundary = @field(DocIdentityInternalWorkerBoundary, field_name);
         switch (docIdentityInternalWorkerPolicy(boundary)) {
             .carries_shard_doc_set => carries_shard_doc_set += 1,
             .validates_generation_projection => validates_generation_projection += 1,
