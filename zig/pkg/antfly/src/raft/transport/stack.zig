@@ -43,6 +43,8 @@ pub const HttpTransportStack = struct {
     ) !HttpTransportStack {
         if (cfg.snapshot.chunk_size < snapshot_transfer.min_chunk_bytes or
             cfg.snapshot.chunk_size > snapshot_transfer.max_chunk_bytes or
+            cfg.snapshot.max_parallel_chunks == 0 or
+            cfg.snapshot.max_parallel_chunks > 32 or
             cfg.snapshot.max_snapshot_bytes == 0 or
             cfg.snapshot.legacy_fallback_max_request_bytes == 0)
             return error.InvalidSnapshotTransferLimits;

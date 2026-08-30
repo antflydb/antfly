@@ -1524,6 +1524,20 @@ pub const MultiRaft = struct {
         } else ready.messages;
         if (diagnostics) |diag| diag.clone_messages_elapsed_ns = clock.elapsedSinceNs(clone_messages_start_ns);
 
+        // A recovery permit authorizes exactly one processing attempt for the
+        // retained Ready, not one successful attempt. Everything before this
+        // point is allocation/admission preflight and leaves the Ready wholly
+        // untouched. Configuration application, persistence, async local
+        // responses, and advance below can each cross an irreversible boundary
+        // before returning an error, so consume the incident permit before the
+        // first of them. A transient failure consequently re-quarantines the
+        // still-oversized Ready and requires an explicit, newly fenced retry
+        // instead of silently reusing an old operator authorization.
+        if (outbound_recovery_permit)
+            self.consumeRecoveryPermit(group_id, .outbound_ready_too_large);
+        if (apply_recovery_permit)
+            self.consumeRecoveryPermit(group_id, .apply_ready_too_large);
+
         if (try grp.applyCommittedConfChanges(ready.committed_entries)) {
             ready.conf_state = grp.status().conf_state;
         }
@@ -1580,10 +1594,6 @@ pub const MultiRaft = struct {
             if (diagnostics) |diag| diag.inline_transport_flush_elapsed_ns = clock.elapsedSinceNs(inline_transport_flush_start_ns);
         }
         const has_more_ready = grp.hasReady();
-        if (outbound_recovery_permit)
-            self.consumeRecoveryPermit(group_id, .outbound_ready_too_large);
-        if (apply_recovery_permit)
-            self.consumeRecoveryPermit(group_id, .apply_ready_too_large);
         if (diagnostics) |diag| diag.has_more_ready = has_more_ready;
         self.scheduler.completeReady(group_id, has_more_ready);
         return true;

@@ -27,6 +27,7 @@ const StorageRecorder = struct {
     persist_calls: usize = 0,
     persisted_entries: usize = 0,
     persisted_snapshots: usize = 0,
+    persist_failures_remaining: usize = 0,
     compact_failures_remaining: usize = 0,
     compact_failure_group: ?core.types.GroupId = null,
     compact_successes: usize = 0,
@@ -57,6 +58,10 @@ const StorageRecorder = struct {
         const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
         const store = self.stores.get(group_id) orelse return error.UnknownGroup;
         self.persist_calls += 1;
+        if (self.persist_failures_remaining > 0) {
+            self.persist_failures_remaining -= 1;
+            return error.InjectedReadyPersistenceFailure;
+        }
         self.persisted_entries += ready.entries.len;
         if (ready.snapshot != null) self.persisted_snapshots += 1;
 
@@ -2454,6 +2459,50 @@ test "multi raft drainReady quarantines an impossible apply Ready hard ceiling" 
         host.groupQuarantine(259).?.reason,
     );
     try std.testing.expect(host.group(259).?.hasReady());
+}
+
+test "multi raft recovery permit is consumed by a failed processing attempt" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(263, &store);
+
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .max_single_outbound_ready_bytes = 1,
+    }, .{ .group_storage = storage_recorder.iface() });
+    defer host.deinit();
+    var peers = [_]core.types.NodeId{ 1, 2 };
+    try host.addGroup(.{
+        .group_id = 263,
+        .local_node_id = 1,
+        .raft_config = .{
+            .id = 1,
+            .group_id = 263,
+            .peers = peers[0..],
+            .election_tick = 5,
+            .heartbeat_tick = 1,
+            .pre_vote = false,
+        },
+        .storage = store.storage(),
+    });
+    try host.campaignGroup(263);
+    _ = try host.drainReady(1);
+    const first = host.groupQuarantine(263).?;
+    try host.resumeQuarantinedGroup(263, .{
+        .expected_incident_id = first.incident_id,
+        .new_limit_bytes = first.observed_bytes,
+    });
+
+    storage_recorder.persist_failures_remaining = 1;
+    try std.testing.expectError(error.InjectedReadyPersistenceFailure, host.drainReady(1));
+
+    // The failed attempt crossed the permit's processing boundary. Retrying
+    // without a newly fenced operator action must quarantine the retained
+    // oversized Ready instead of reusing the old allowance.
+    _ = try host.drainReady(1);
+    const second = host.groupQuarantine(263).?;
+    try std.testing.expect(second.incident_id != first.incident_id);
 }
 
 test "multi raft oversized Ready isolation still flushes healthy groups in the batch" {

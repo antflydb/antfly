@@ -163,8 +163,17 @@ pub const StdHttpExecutor = struct {
             .ptr = self,
             .vtable = &.{
                 .execute = execute,
+                .supports_concurrent_requests = supportsConcurrentRequests,
             },
         };
+    }
+
+    fn supportsConcurrentRequests(ptr: *const anyopaque) bool {
+        const self: *const StdHttpExecutor = @ptrCast(@alignCast(ptr));
+        // Persistent clients intentionally serialize mutable connection state.
+        // Non-persistent calls use request-local clients and can safely power
+        // bounded parallel range transfers.
+        return !self.cfg.keep_alive;
     }
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
@@ -188,8 +197,16 @@ pub const StdHttpExecutor = struct {
 
     fn executeResolved(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
         const io = self.io_impl.io();
-        try self.resolved_client_mutex.lock(io);
-        defer self.resolved_client_mutex.unlock(io);
+        // Controlled callers rely on interruptible queueing before the opaque
+        // resolved exchange. Uncontrolled non-persistent transfers use
+        // request-local clients and may overlap safely.
+        const serialize = self.cfg.keep_alive or req.timeout_ms != null or req.cancellation != null;
+        if (serialize) try self.resolved_client_mutex.lock(io);
+        defer if (serialize) self.resolved_client_mutex.unlock(io);
+
+        var local_client = httpx.Client.initWithConfig(std.heap.page_allocator, io, resolvedClientConfig(self.cfg));
+        defer if (!self.cfg.keep_alive) local_client.deinit();
+        const client = if (self.cfg.keep_alive) &self.resolved_client else &local_client;
 
         const extra_count = @as(usize, @intFromBool(req.content_type != null)) +
             @as(usize, @intFromBool(req.authorization != null));
@@ -220,7 +237,7 @@ pub const StdHttpExecutor = struct {
         // header construction above can still prove `not_sent`; once this
         // boundary is crossed, any error must conservatively assume delivery.
         if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
-        var response = try self.resolved_client.request(method, req.uri, .{
+        var response = try client.request(method, req.uri, .{
             .headers = header_pairs,
             .body = if (req.body.len == 0) null else req.body,
             .timeout_ms = if (req.timeout_ms) |timeout_ms| timeout_ms else null,
@@ -458,7 +475,7 @@ pub const StdHttpExecutor = struct {
         // client must be serialized; non-persistent requests use request-local
         // state so callers can execute concurrently without sacrificing reuse.
         var local_client: std.http.Client = .{
-            .allocator = self.alloc,
+            .allocator = std.heap.page_allocator,
             .io = io,
             .read_buffer_size = self.cfg.read_buffer_size,
             .write_buffer_size = self.cfg.write_buffer_size,
