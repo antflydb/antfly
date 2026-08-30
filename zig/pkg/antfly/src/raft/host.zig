@@ -639,6 +639,14 @@ pub const Host = struct {
         return replica_catalog.revision();
     }
 
+    pub fn snapshotReplicaCatalog(
+        self: *Host,
+        alloc: std.mem.Allocator,
+    ) !?catalog.ReplicaCatalogSnapshot {
+        const replica_catalog = self.deps.replica_catalog orelse return null;
+        return try replica_catalog.snapshotReplicas(alloc);
+    }
+
     /// Returns the durable admission decision, independently of whether the
     /// live runtime has finished installing or removing the replica.
     pub fn replicaCatalogContains(self: *Host, group_id: u64) ?bool {
@@ -1732,6 +1740,7 @@ test "host can ensure and remove a replica" {
                     .remove_replica = removeReplica,
                     .contains_replica = containsReplica,
                     .list_replicas = listReplicas,
+                    .snapshot_replicas = snapshotReplicas,
                     .revision = revision,
                     .apply_batch = applyBatch,
                 },
@@ -1753,6 +1762,13 @@ test "host can ensure and remove a replica" {
 
         fn listReplicas(_: *anyopaque, alloc: std.mem.Allocator) ![]catalog.ReplicaRecord {
             return try alloc.alloc(catalog.ReplicaRecord, 0);
+        }
+
+        fn snapshotReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) !catalog.ReplicaCatalogSnapshot {
+            return .{
+                .revision = revision(ptr),
+                .records = try listReplicas(ptr, alloc),
+            };
         }
 
         fn revision(_: *anyopaque) u64 {

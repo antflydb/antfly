@@ -388,6 +388,7 @@ pub const ReplicaCatalog = struct {
         remove_replica: *const fn (ptr: *anyopaque, group_id: u64) anyerror!bool,
         contains_replica: *const fn (ptr: *anyopaque, group_id: u64) bool,
         list_replicas: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]ReplicaRecord,
+        snapshot_replicas: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!ReplicaCatalogSnapshot,
         revision: *const fn (ptr: *anyopaque) u64,
         apply_batch: *const fn (
             ptr: *anyopaque,
@@ -414,6 +415,14 @@ pub const ReplicaCatalog = struct {
         return try self.vtable.list_replicas(self.ptr, alloc);
     }
 
+    /// Captures membership and its revision under one catalog lock. Reconcilers
+    /// must use this instead of separately listing records and reading the
+    /// revision, which would allow an intervening writer to make a stale diff
+    /// pass the optimistic revision fence.
+    pub fn snapshotReplicas(self: ReplicaCatalog, alloc: std.mem.Allocator) !ReplicaCatalogSnapshot {
+        return try self.vtable.snapshot_replicas(self.ptr, alloc);
+    }
+
     pub fn revision(self: ReplicaCatalog) u64 {
         return self.vtable.revision(self.ptr);
     }
@@ -426,6 +435,16 @@ pub const ReplicaCatalog = struct {
     ) !void {
         for (upserts) |record| try validateReplicaRecord(record);
         return try self.vtable.apply_batch(self.ptr, expected_revision, upserts, removals);
+    }
+};
+
+pub const ReplicaCatalogSnapshot = struct {
+    revision: u64,
+    records: []ReplicaRecord,
+
+    pub fn deinit(self: *ReplicaCatalogSnapshot, alloc: std.mem.Allocator) void {
+        freeReplicaRecords(alloc, self.records);
+        self.* = undefined;
     }
 };
 
@@ -454,6 +473,7 @@ pub const MemoryReplicaCatalog = struct {
                 .remove_replica = removeReplica,
                 .contains_replica = containsReplica,
                 .list_replicas = listReplicas,
+                .snapshot_replicas = snapshotReplicas,
                 .revision = revision,
                 .apply_batch = applyBatch,
             },
@@ -508,6 +528,16 @@ pub const MemoryReplicaCatalog = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         return try cloneReplicaRecordsFromMap(alloc, &self.records);
+    }
+
+    fn snapshotReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) !ReplicaCatalogSnapshot {
+        const self: *MemoryReplicaCatalog = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return .{
+            .revision = self.current_revision,
+            .records = try cloneReplicaRecordsFromMap(alloc, &self.records),
+        };
     }
 
     fn revision(ptr: *anyopaque) u64 {
@@ -585,6 +615,7 @@ pub const FileReplicaCatalog = struct {
                 .remove_replica = removeReplica,
                 .contains_replica = containsReplica,
                 .list_replicas = listReplicas,
+                .snapshot_replicas = snapshotReplicas,
                 .revision = revision,
                 .apply_batch = applyBatch,
             },
@@ -656,6 +687,16 @@ pub const FileReplicaCatalog = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         return try cloneReplicaRecordsFromMap(alloc, &self.records);
+    }
+
+    fn snapshotReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) !ReplicaCatalogSnapshot {
+        const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return .{
+            .revision = self.current_revision,
+            .records = try cloneReplicaRecordsFromMap(alloc, &self.records),
+        };
     }
 
     fn revision(ptr: *anyopaque) u64 {

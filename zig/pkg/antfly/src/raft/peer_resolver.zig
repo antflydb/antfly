@@ -146,13 +146,22 @@ pub const MemoryPeerResolver = struct {
         const route = self.routes.get(key(group_id, node_id)) orelse return error.UnknownPeer;
         const endpoints = route.endpoints;
         var out = try alloc.alloc(PeerEndpoint, endpoints.len);
-        errdefer alloc.free(out);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |endpoint| {
+                alloc.free(endpoint.address);
+                alloc.free(endpoint.metadata);
+            }
+            alloc.free(out);
+        }
         for (endpoints, 0..) |endpoint, i| {
-            out[i] = .{
-                .protocol = endpoint.protocol,
-                .address = try alloc.dupe(u8, endpoint.address),
-                .metadata = try alloc.dupe(u8, endpoint.metadata),
+            const address = try alloc.dupe(u8, endpoint.address);
+            const metadata = alloc.dupe(u8, endpoint.metadata) catch |err| {
+                alloc.free(address);
+                return err;
             };
+            out[i] = .{ .protocol = endpoint.protocol, .address = address, .metadata = metadata };
+            initialized += 1;
         }
         return out;
     }
@@ -183,14 +192,20 @@ pub const MemoryPeerResolver = struct {
             self.alloc.free(out);
         }
         for (endpoints, 0..) |endpoint, i| {
-            out[i] = .{
-                .protocol = endpoint.protocol,
-                .address = try self.alloc.dupe(u8, endpoint.address),
-                .metadata = try self.alloc.dupe(u8, endpoint.metadata),
-            };
+            out[i] = try cloneEndpoint(self.alloc, endpoint);
             initialized += 1;
         }
         return out;
+    }
+
+    fn cloneEndpoint(alloc: std.mem.Allocator, endpoint: PeerEndpoint) !PeerEndpoint {
+        const address = try alloc.dupe(u8, endpoint.address);
+        errdefer alloc.free(address);
+        return .{
+            .protocol = endpoint.protocol,
+            .address = address,
+            .metadata = try alloc.dupe(u8, endpoint.metadata),
+        };
     }
 
     fn endpointsEqual(existing: []const PeerEndpoint, incoming: []const PeerEndpoint) bool {
@@ -254,6 +269,24 @@ test "memory peer resolver clones and resolves endpoints" {
     }
     try std.testing.expectEqual(@as(usize, 1), endpoints.len);
     try std.testing.expectEqualStrings("http://n2", endpoints[0].address);
+}
+
+test "memory peer resolver endpoint ownership is failure atomic" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var resolver = MemoryPeerResolver.init(alloc);
+            defer resolver.deinit();
+            try resolver.upsert(9, 2, &.{
+                .{ .protocol = .http, .address = "http://n2-a", .metadata = "zone=a" },
+                .{ .protocol = .http, .address = "http://n2-b", .metadata = "zone=b" },
+            });
+            const endpoints = try resolver.resolver().resolveGroupPeer(alloc, 9, 2);
+            defer MemoryPeerResolver.freeEndpoints(alloc, endpoints);
+            try std.testing.expectEqual(@as(usize, 2), endpoints.len);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "memory peer resolver can remove routes" {
