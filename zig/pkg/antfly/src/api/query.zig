@@ -1248,6 +1248,168 @@ fn graphHitRetainedBytes(hit: db_mod.types.SearchHit) usize {
     return total;
 }
 
+/// Logical owned payload retained by a set of shard graph results. Distributed
+/// coordinators use this before retaining another shard response so fanout
+/// cannot multiply the request's graph-memory ceilings. The accounting is
+/// intentionally allocation-shape aware and saturating: overflow is treated as
+/// an over-budget payload, never as permission to admit it.
+pub const GraphResultsRetainedUsage = struct {
+    state_bytes: usize = 0,
+    distinct_state_bytes: usize = 0,
+};
+
+pub fn graphResultsRetainedUsage(
+    results: []const db_mod.types.GraphSearchResult,
+) GraphResultsRetainedUsage {
+    var usage = GraphResultsRetainedUsage{
+        .state_bytes = retainedBytesForSlice(db_mod.types.GraphSearchResult, results.len),
+    };
+    for (results) |result| {
+        retainedAdd(&usage.state_bytes, result.name.len);
+
+        retainedAdd(
+            &usage.state_bytes,
+            retainedBytesForSlice(graph_query_mod.GraphResultNode, result.nodes.len),
+        );
+        for (result.nodes) |node| {
+            retainedAdd(&usage.state_bytes, graphResultNodeRetainedBytes(node));
+        }
+
+        retainedAdd(
+            &usage.state_bytes,
+            retainedBytesForSlice(db_mod.types.GraphPath, result.paths.len),
+        );
+        for (result.paths) |path| {
+            retainedAdd(&usage.state_bytes, graphPathRetainedBytes(path));
+        }
+
+        retainedAdd(
+            &usage.state_bytes,
+            retainedBytesForSlice(db_mod.types.GraphPatternMatch, result.matches.len),
+        );
+        for (result.matches) |match| {
+            retainedAdd(&usage.state_bytes, graphPatternMatchRetainedBytes(match));
+        }
+
+        retainedAdd(
+            &usage.state_bytes,
+            retainedBytesForSlice(db_mod.types.GraphAggregateResult, result.aggregates.len),
+        );
+        for (result.aggregates) |aggregate| {
+            retainedAdd(&usage.state_bytes, aggregate.name.len);
+            // Duplicate named aggregates can share an immutable distinct
+            // payload. Charge exactly once, following the allocation owner.
+            if (!aggregate.distinct_values_owned) continue;
+            var distinct_bytes = retainedBytesForSlice(
+                graph_node_identity.Ref,
+                aggregate.distinct_values.len,
+            );
+            for (aggregate.distinct_values) |identity| {
+                if (identity.table) |table| retainedAdd(&distinct_bytes, table.len);
+                retainedAdd(&distinct_bytes, identity.key.len);
+            }
+            retainedAdd(&usage.distinct_state_bytes, distinct_bytes);
+            retainedAdd(&usage.state_bytes, distinct_bytes);
+        }
+
+        retainedAdd(
+            &usage.state_bytes,
+            retainedBytesForSlice(db_mod.types.SearchHit, result.hits.len),
+        );
+        for (result.hits) |hit| {
+            retainedAdd(&usage.state_bytes, graphHitRetainedBytes(hit));
+        }
+    }
+    return usage;
+}
+
+/// Request-wide admission for graph payloads retained while distributed shard
+/// results are gathered. The merge path seeds its own allocation accounting
+/// with the admitted input, so shard payloads and cloned output coexist under
+/// one hard ceiling.
+pub const GraphResultsAdmission = struct {
+    queries: []const db_mod.types.NamedGraphQuery,
+    work_budget: graph_work_budget.WorkBudget,
+    distinct_budget: graph_pattern.DistinctBudget,
+
+    pub fn init(
+        queries: []const db_mod.types.NamedGraphQuery,
+        limits: graph_work_budget.Limits,
+    ) GraphResultsAdmission {
+        return .{
+            .queries = queries,
+            .work_budget = .initWithLimits(limits),
+            .distinct_budget = .init(
+                limits.max_distinct_identities,
+                limits.max_distinct_state_bytes,
+            ),
+        };
+    }
+
+    pub fn admit(
+        self: *GraphResultsAdmission,
+        results: []const db_mod.types.GraphSearchResult,
+    ) !void {
+        for (results, 0..) |result, i| {
+            const query = graphQueryByName(self.queries, result.name) orelse
+                return error.InvalidRemoteResponse;
+            const usage = graphResultsRetainedUsage(results[i..][0..1]);
+
+            self.distinct_budget.consumeRetainedBytes(usage.distinct_state_bytes) catch |err| {
+                if (err == error.GraphDistinctBudgetExceeded)
+                    graph_distinct_budget_diagnostic.recordBudget(result.name, &self.distinct_budget);
+                return err;
+            };
+            try retainGraphMergeBytes(
+                &self.work_budget,
+                result.name,
+                query,
+                usage.state_bytes,
+            );
+        }
+    }
+};
+
+test "distributed graph result admission is cumulative across shard payloads" {
+    var nodes = [_]graph_query_mod.GraphResultNode{.{
+        .key = @constCast("node"),
+        .depth = 0,
+        .distance = 0,
+    }};
+    var graph_results = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("walk"),
+        .nodes = &nodes,
+        .hits = &.{},
+        .total_hits = 1,
+    }};
+    const queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "walk",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{} },
+        },
+    }};
+    const usage = graphResultsRetainedUsage(&graph_results);
+    var limits = graph_work_budget.Limits{};
+    limits.max_retained_state_bytes = usage.state_bytes * 2 - 1;
+    var admission = GraphResultsAdmission.init(&queries, limits);
+    try admission.admit(&graph_results);
+
+    var diagnostic: graph_work_budget_diagnostic.Storage = .{};
+    const binding = graph_work_budget_diagnostic.bind(&diagnostic);
+    defer binding.deinit();
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        admission.admit(&graph_results),
+    );
+    try std.testing.expectEqualStrings("walk", diagnostic.diagnostic.?.operation);
+    try std.testing.expectEqual(
+        graph_work_budget.Dimension.retained_state_bytes,
+        diagnostic.diagnostic.?.dimension,
+    );
+}
+
 fn mergeGraphSearchResults(
     alloc: std.mem.Allocator,
     queries: []const db_mod.types.NamedGraphQuery,
@@ -1263,11 +1425,10 @@ fn mergeGraphSearchResultsWithLimits(
     limits: graph_work_budget.Limits,
 ) ![]db_mod.types.GraphSearchResult {
     try limits.validate();
-    var merge_work_budget = graph_work_budget.WorkBudget.initWithLimits(limits);
-    var distinct_budget = graph_pattern.DistinctBudget.init(
-        limits.max_distinct_identities,
-        limits.max_distinct_state_bytes,
-    );
+    var admission = GraphResultsAdmission.init(queries, limits);
+    for (results) |result| try admission.admit(result.graph_results);
+    var merge_work_budget = admission.work_budget;
+    var distinct_budget = admission.distinct_budget;
     var builders = std.ArrayListUnmanaged(GraphSearchResultBuilder).empty;
     defer {
         for (builders.items) |*builder| builder.deinit(alloc);

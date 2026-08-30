@@ -83,6 +83,12 @@ function nonemptyString(value: unknown, path: string, maxBytes?: number): string
   return value;
 }
 
+function tableQualifier(value: unknown, path: string): string {
+  const result = nonemptyString(value, path);
+  if (!/[^ \t\r\n]/.test(result)) invalid(path, "must contain a non-whitespace character");
+  return result;
+}
+
 function boundedInteger(value: unknown, path: string, minimum: number, maximum: number): number {
   if (!Number.isSafeInteger(value) || (value as number) < minimum || (value as number) > maximum) {
     return invalid(path, `must be an integer between ${minimum} and ${maximum}`);
@@ -109,7 +115,7 @@ function endpoint(value: unknown, path: string): JsonObject {
   const result = object(value, path);
   exactKeys(result, path, ["key"], ["table"]);
   nonemptyString(result.key, `${path}.key`);
-  if (result.table !== undefined) nonemptyString(result.table, `${path}.table`);
+  if (result.table !== undefined) tableQualifier(result.table, `${path}.table`);
   return result;
 }
 
@@ -358,7 +364,7 @@ function resultNode(value: unknown, path: string): JsonObject {
   );
   nonemptyString(node.key, `${path}.key`);
   boundedInteger(node.depth, `${path}.depth`, 0, MAX_EDGES);
-  if (node.table !== undefined) nonemptyString(node.table, `${path}.table`);
+  if (node.table !== undefined) tableQualifier(node.table, `${path}.table`);
   if (node.document !== undefined) object(node.document, `${path}.document`);
   if (node.evidence !== undefined) object(node.evidence, `${path}.evidence`);
   if (node.provenance !== undefined) {
@@ -467,7 +473,7 @@ function canonicalResult(value: unknown, path: string, contract: CanonicalResult
         const binding = object(rawBinding, `${rowPath}.${alias}`);
         exactKeys(binding, `${rowPath}.${alias}`, ["key"], ["table", "document"]);
         nonemptyString(binding.key, `${rowPath}.${alias}.key`);
-        if (binding.table !== undefined) nonemptyString(binding.table, `${rowPath}.${alias}.table`);
+        if (binding.table !== undefined) tableQualifier(binding.table, `${rowPath}.${alias}.table`);
         if (binding.document !== undefined)
           object(binding.document, `${rowPath}.${alias}.document`);
         if (!contract.includeDocuments && binding.document !== undefined)

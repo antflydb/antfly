@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"slices"
 	"sort"
@@ -21,6 +22,8 @@ import (
 
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	querydsl "github.com/antflydb/antfly/go/pkg/sdk/query"
+	jsonv2 "github.com/go-json-experiment/json"
+	"github.com/go-json-experiment/json/jsontext"
 )
 
 // GraphBindingsOptions controls row count and optional document projection.
@@ -469,18 +472,6 @@ func (value *graphOptionalNonNullString) pointer() *string {
 	return &value.value
 }
 
-type graphBindingNodeValidation struct {
-	Document graphOpaqueJSONObject      `json:"document,omitempty"`
-	Key      string                     `json:"key"`
-	Table    graphOptionalNonNullString `json:"table,omitempty"`
-}
-
-type graphBindingsResultValidation struct {
-	Kind  GraphBindingsResultKind                  `json:"kind"`
-	Rows  []map[string]*graphBindingNodeValidation `json:"rows"`
-	Stats GraphResultStats                         `json:"stats"`
-}
-
 type graphAggregatesResultValidation struct {
 	Aggregates map[string]GraphAggregateValue `json:"aggregates"`
 	Kind       GraphAggregatesResultKind      `json:"kind"`
@@ -553,45 +544,181 @@ func validateCanonicalGraphResultPayload(
 }
 
 func validateBindingsResultPayload(contract canonicalGraphResultContract, result strictGraphResultDecoder, envelope graphQueryResultEnvelope) error {
-	var value graphBindingsResultValidation
-	if err := result.DecodeStrictInto(&value); err != nil {
+	// Protocol-object duplicates are tracked below with fixed-size state. Let
+	// opaque hydrated documents remain opaque and avoid the decoder's per-name
+	// namespace allocations for up to 640,000 binding members.
+	decoder := jsontext.NewDecoder(result.RawJSONReader(), jsontext.AllowDuplicateNames(true))
+	if token, err := decoder.ReadToken(); err != nil || token.Kind() != '{' {
+		return fmt.Errorf("antfly: invalid bindings graph result: expected an object")
+	}
+	var kindPresent, rowsPresent, statsPresent bool
+	rowCount := 0
+	for decoder.PeekKind() != '}' {
+		member, err := decoder.ReadToken()
+		if err != nil || member.Kind() != '"' {
+			return fmt.Errorf("antfly: invalid bindings graph result: expected an object member")
+		}
+		switch member.String() {
+		case "kind":
+			if kindPresent {
+				return fmt.Errorf("antfly: invalid bindings graph result: duplicate member %q", "kind")
+			}
+			var kind GraphBindingsResultKind
+			if err := jsonv2.UnmarshalDecode(decoder, &kind); err != nil || kind != GraphBindingsResultKindBindings {
+				return fmt.Errorf("antfly: bindings graph result requires kind %q", GraphBindingsResultKindBindings)
+			}
+			kindPresent = true
+		case "rows":
+			if rowsPresent {
+				return fmt.Errorf("antfly: invalid bindings graph result: duplicate member %q", "rows")
+			}
+			if token, err := decoder.ReadToken(); err != nil || token.Kind() != '[' {
+				return fmt.Errorf("antfly: bindings graph result requires rows")
+			}
+			for decoder.PeekKind() != ']' {
+				if rowCount >= contract.maxItems {
+					return fmt.Errorf("antfly: bindings graph result exceeds the requested limit of %d rows", contract.maxItems)
+				}
+				if err := validateBindingRowStream(decoder, contract, rowCount); err != nil {
+					return err
+				}
+				rowCount++
+			}
+			if _, err := decoder.ReadToken(); err != nil {
+				return fmt.Errorf("antfly: invalid bindings graph result rows: %w", err)
+			}
+			rowsPresent = true
+		case "stats":
+			if statsPresent {
+				return fmt.Errorf("antfly: invalid bindings graph result: duplicate member %q", "stats")
+			}
+			var stats GraphResultStats
+			encodedStats, err := decoder.ReadValue()
+			if err != nil {
+				return fmt.Errorf("antfly: invalid bindings graph result stats: %w", err)
+			}
+			if err := jsonv2.Unmarshal(encodedStats, &stats, jsonv2.RejectUnknownMembers(true)); err != nil {
+				return fmt.Errorf("antfly: invalid bindings graph result stats: %w", err)
+			}
+			statsPresent = true
+		default:
+			return fmt.Errorf("antfly: invalid bindings graph result: unknown member %q", member.String())
+		}
+	}
+	if _, err := decoder.ReadToken(); err != nil {
 		return fmt.Errorf("antfly: invalid bindings graph result: %w", err)
 	}
-	if value.Kind != GraphBindingsResultKindBindings || value.Rows == nil {
-		return fmt.Errorf("antfly: bindings graph result requires kind and rows")
+	if !kindPresent || !rowsPresent || !statsPresent {
+		return fmt.Errorf("antfly: bindings graph result requires kind, rows, and stats")
 	}
-	if len(value.Rows) > contract.maxItems {
-		return fmt.Errorf("antfly: bindings graph result exceeds the requested limit of %d rows", contract.maxItems)
+	return validateDecodedGraphStats(envelope, rowCount, true)
+}
+
+func validateBindingRowStream(decoder *jsontext.Decoder, contract canonicalGraphResultContract, rowIndex int) error {
+	if token, err := decoder.ReadToken(); err != nil || token.Kind() != '{' {
+		return fmt.Errorf("antfly: bindings graph result row %d must be an object", rowIndex)
 	}
-	expected := make(map[string]struct{}, len(contract.names))
-	for _, name := range contract.names {
-		expected[name] = struct{}{}
-	}
-	for rowIndex, row := range value.Rows {
-		if len(row) == 0 || len(row) > maxGraphMatchNodes {
+	bindings := 0
+	var seenAliases uint64
+	for decoder.PeekKind() != '}' {
+		aliasToken, err := decoder.ReadToken()
+		if err != nil || aliasToken.Kind() != '"' {
+			return fmt.Errorf("antfly: bindings graph result row %d has an invalid alias", rowIndex)
+		}
+		alias := aliasToken.String()
+		bindings++
+		if bindings > maxGraphMatchNodes {
 			return fmt.Errorf("antfly: bindings graph result row %d must contain between 1 and %d properties", rowIndex, maxGraphMatchNodes)
 		}
-		if len(row) != len(expected) {
-			return fmt.Errorf("antfly: bindings graph result row %d does not match the requested projection", rowIndex)
+		requestedIndex := -1
+		for index, name := range contract.names {
+			if alias == name {
+				requestedIndex = index
+				break
+			}
 		}
-		for alias, binding := range row {
-			if !validGraphIdentifier(alias) {
-				return fmt.Errorf("antfly: bindings graph result row %d has an invalid alias", rowIndex)
+		if requestedIndex < 0 {
+			return fmt.Errorf("antfly: bindings graph result row %d contains unrequested alias %q", rowIndex, alias)
+		}
+		aliasBit := uint64(1) << requestedIndex
+		if seenAliases&aliasBit != 0 {
+			return fmt.Errorf("antfly: bindings graph result row %d contains duplicate alias %q", rowIndex, alias)
+		}
+		seenAliases |= aliasBit
+		if decoder.PeekKind() == 'n' {
+			if _, err := decoder.ReadToken(); err != nil {
+				return fmt.Errorf("antfly: bindings graph result row %d alias %q: %w", rowIndex, alias, err)
 			}
-			if _, ok := expected[alias]; !ok {
-				return fmt.Errorf("antfly: bindings graph result row %d contains unrequested alias %q", rowIndex, alias)
-			}
-			if binding != nil {
-				if err := validateDecodedGraphIdentity(binding.Key, binding.Table.pointer()); err != nil {
-					return fmt.Errorf("antfly: bindings graph result row %d alias %q: %w", rowIndex, alias, err)
-				}
-				if !contract.includeDocuments && binding.Document.present {
-					return fmt.Errorf("antfly: bindings graph result row %d alias %q contains a document that was not requested", rowIndex, alias)
-				}
-			}
+			continue
+		}
+		documentPresent, err := validateBindingNodeStream(decoder)
+		if err != nil {
+			return fmt.Errorf("antfly: bindings graph result row %d alias %q: %w", rowIndex, alias, err)
+		}
+		if !contract.includeDocuments && documentPresent {
+			return fmt.Errorf("antfly: bindings graph result row %d alias %q contains a document that was not requested", rowIndex, alias)
 		}
 	}
-	return validateDecodedGraphStats(envelope, len(value.Rows), true)
+	if _, err := decoder.ReadToken(); err != nil {
+		return fmt.Errorf("antfly: invalid bindings graph result row %d: %w", rowIndex, err)
+	}
+	if bindings == 0 || bindings != len(contract.names) {
+		return fmt.Errorf("antfly: bindings graph result row %d does not match the requested projection", rowIndex)
+	}
+	return nil
+}
+
+func validateBindingNodeStream(decoder *jsontext.Decoder) (bool, error) {
+	if token, err := decoder.ReadToken(); err != nil || token.Kind() != '{' {
+		return false, fmt.Errorf("binding must be an object")
+	}
+	var keyPresent, tablePresent, documentPresent bool
+	for decoder.PeekKind() != '}' {
+		member, err := decoder.ReadToken()
+		if err != nil || member.Kind() != '"' {
+			return false, fmt.Errorf("binding has an invalid member")
+		}
+		switch member.String() {
+		case "key":
+			if keyPresent {
+				return false, fmt.Errorf("binding contains duplicate member %q", "key")
+			}
+			key, err := decoder.ReadToken()
+			if err != nil || key.Kind() != '"' || key.String() == "" {
+				return false, fmt.Errorf("graph node key must be a non-empty string")
+			}
+			keyPresent = true
+		case "table":
+			if tablePresent {
+				return false, fmt.Errorf("binding contains duplicate member %q", "table")
+			}
+			table, err := decoder.ReadToken()
+			if err != nil || table.Kind() != '"' || !validGraphTableQualifier(table.String()) {
+				return false, fmt.Errorf("graph node table must contain a non-whitespace character")
+			}
+			tablePresent = true
+		case "document":
+			if documentPresent {
+				return false, fmt.Errorf("binding contains duplicate member %q", "document")
+			}
+			if decoder.PeekKind() != '{' {
+				return false, fmt.Errorf("graph node document must be an object")
+			}
+			if err := decoder.SkipValue(); err != nil {
+				return false, err
+			}
+			documentPresent = true
+		default:
+			return false, fmt.Errorf("binding contains unknown member %q", member.String())
+		}
+	}
+	if _, err := decoder.ReadToken(); err != nil {
+		return false, err
+	}
+	if !keyPresent {
+		return false, fmt.Errorf("binding requires key")
+	}
+	return documentPresent, nil
 }
 
 func validateAggregatesResultPayload(contract canonicalGraphResultContract, result strictGraphResultDecoder, envelope graphQueryResultEnvelope) error {
@@ -1056,6 +1183,7 @@ type graphQueryStatsPresenceProbe struct {
 
 type strictGraphResultDecoder interface {
 	DecodeStrictInto(any) error
+	RawJSONReader() io.Reader
 }
 
 func decodeCanonicalGraphResult(

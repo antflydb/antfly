@@ -15,6 +15,7 @@ const NS_PER_SECOND = 1_000_000_000n;
 const MAX_GRAPH_EDGE_TYPES = 64;
 const MAX_GRAPH_EDGE_TYPE_UTF8_BYTES = 64 * 1024;
 const MAX_GRAPH_MATCH_QUERIES = 8;
+const MAX_GRAPH_HYDRATED_BINDINGS = 10_000;
 
 function object(value: unknown): JSONObject | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -27,6 +28,30 @@ function requireIdentifier(value: unknown, path: string): asserts value is strin
     throw new TypeError(
       `${path} must satisfy the versioned GraphIdentifier policy ` +
         "(1-128 Unicode code points; no reserved, boundary-space, non-ASCII whitespace, control, or format characters)"
+    );
+  }
+}
+
+function requireTableQualifier(value: unknown, path: string): asserts value is string {
+  if (typeof value !== "string" || !/[^ \t\r\n]/.test(value)) {
+    throw new TypeError(`${path} must contain a non-whitespace character`);
+  }
+}
+
+function validateHydration(value: JSONObject, path: string, bindingCount?: number): void {
+  if (value.fields !== undefined && value.include_documents !== true) {
+    throw new TypeError(`${path}.fields requires include_documents=true`);
+  }
+  if (bindingCount === undefined || value.include_documents !== true) return;
+  const limit = value.limit ?? 100;
+  if (
+    typeof limit === "number" &&
+    Number.isSafeInteger(limit) &&
+    limit * bindingCount > MAX_GRAPH_HYDRATED_BINDINGS
+  ) {
+    throw new TypeError(
+      `${path} hydration requests ${limit * bindingCount} binding documents; ` +
+        `the maximum is ${MAX_GRAPH_HYDRATED_BINDINGS}`
     );
   }
 }
@@ -397,7 +422,13 @@ function validateMatch(query: JSONObject, path: string): void {
 
   const nodes = object(match.nodes);
   if (nodes) {
-    for (const alias of Object.keys(nodes)) requireIdentifier(alias, `${path}.match.nodes key`);
+    for (const [alias, candidate] of Object.entries(nodes)) {
+      requireIdentifier(alias, `${path}.match.nodes key`);
+      const node = object(candidate);
+      if (node?.table !== undefined) {
+        requireTableQualifier(node.table, `${path}.match.nodes[${JSON.stringify(alias)}].table`);
+      }
+    }
   }
   validateEdges(match.edges, `${path}.match.edges`);
   validateWhere(match.where, `${path}.match.where`);
@@ -409,8 +440,15 @@ function validateMatch(query: JSONObject, path: string): void {
       const optionalPath = `${path}.match.optional[${index}]`;
       const optionalNodes = object(optional.nodes);
       if (optionalNodes) {
-        for (const alias of Object.keys(optionalNodes)) {
+        for (const [alias, candidate] of Object.entries(optionalNodes)) {
           requireIdentifier(alias, `${optionalPath}.nodes key`);
+          const node = object(candidate);
+          if (node?.table !== undefined) {
+            requireTableQualifier(
+              node.table,
+              `${optionalPath}.nodes[${JSON.stringify(alias)}].table`
+            );
+          }
         }
       }
       validateEdges(optional.edges, `${optionalPath}.edges`);
@@ -424,6 +462,7 @@ function validateMatch(query: JSONObject, path: string): void {
     result.bindings.forEach((alias, index) => {
       requireIdentifier(alias, `${path}.return.bindings[${index}]`);
     });
+    validateHydration(result, `${path}.return`, result.bindings.length);
   }
   const aggregates = object(result.aggregates);
   if (aggregates) {
@@ -463,6 +502,15 @@ function validateTraverse(query: JSONObject, path: string): void {
   validateEdgeTypes(traverse?.edge_types, `${path}.traverse.edge_types`);
   if (traverse) validateEdgeWeight(traverse, `${path}.traverse`);
   const start = object(traverse?.start);
+  if (Array.isArray(start?.identities)) {
+    start.identities.forEach((candidate, index) => {
+      const identity = object(candidate);
+      if (identity && identity.table !== undefined) {
+        requireTableQualifier(identity.table, `${path}.traverse.start.identities[${index}].table`);
+      }
+    });
+  }
+  if (traverse) validateHydration(traverse, `${path}.traverse`);
   if (!start || !("result_ref" in start)) return;
 
   const resultRef = start.result_ref;
@@ -494,6 +542,13 @@ function validatePathOptions(query: JSONObject, path: string): void {
     if (body) {
       validateEdgeWeight(body, `${path}.${operation}`);
       validatePathObjective(body, `${path}.${operation}`);
+      for (const endpoint of ["from", "to"] as const) {
+        const identity = object(body[endpoint]);
+        if (identity?.table !== undefined) {
+          requireTableQualifier(identity.table, `${path}.${operation}.${endpoint}.table`);
+        }
+      }
+      validateHydration(body, `${path}.${operation}`);
     }
   }
 }

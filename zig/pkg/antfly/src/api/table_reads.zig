@@ -5034,6 +5034,10 @@ fn queryProvisionedAcrossGroupsParallel(
     result_identity_generations: []?u64,
 ) !db_mod.types.SearchResult {
     const start_ns = platform_time.monotonicNs();
+    var graph_admission = query_api.GraphResultsAdmission.init(
+        req.graph_queries,
+        req.graph_execution_limits,
+    );
     const slots = try initSearchFanoutSlots(alloc, group_ids.len);
     defer deinitSearchFanoutSlots(alloc, slots);
 
@@ -5079,21 +5083,21 @@ fn queryProvisionedAcrossGroupsParallel(
             group.async(io, Fiber.run, .{ self, &slots[i], group_id, table_name, shard_req, consistency, required_generation });
         }
         group.await(io) catch {};
-    }
-
-    for (slots) |slot| {
-        if (slot.err) |err| return err;
+        for (slots[start..end], start..end) |slot, i| {
+            if (slot.err) |err| return err;
+            const result = slot.result orelse return error.InvalidRemoteResponse;
+            try graph_admission.admit(result.graph_results);
+            result_identity_generations[i] = result.identity_read_generation;
+            if (required_identity_generations) |generations| {
+                if (result_identity_generations[i] != generations[i])
+                    return error.IdentityReadGenerationChanged;
+            }
+        }
     }
 
     const shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     defer alloc.free(shard_results);
-    for (slots, 0..) |slot, i| {
-        shard_results[i] = slot.result.?;
-        result_identity_generations[i] = shard_results[i].identity_read_generation;
-        if (required_identity_generations) |generations| {
-            if (result_identity_generations[i] != generations[i]) return error.IdentityReadGenerationChanged;
-        }
-    }
+    for (slots, 0..) |slot, i| shard_results[i] = slot.result.?;
     var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, req.offset, req.limit);
     errdefer merged.deinit();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
@@ -5115,6 +5119,10 @@ fn queryHostedAcrossGroupsParallel(
     result_identity_generations: []?u64,
 ) !db_mod.types.SearchResult {
     const start_ns = platform_time.monotonicNs();
+    var graph_admission = query_api.GraphResultsAdmission.init(
+        req.graph_queries,
+        req.graph_execution_limits,
+    );
     const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency);
     defer deinitHostedShardRoutes(alloc, routes);
 
@@ -5167,21 +5175,21 @@ fn queryHostedAcrossGroupsParallel(
             group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, shard_req, consistency, required_generation });
         }
         group.await(io) catch {};
-    }
-
-    for (slots) |slot| {
-        if (slot.err) |err| return err;
+        for (slots[start..end], start..end) |slot, i| {
+            if (slot.err) |err| return err;
+            const result = slot.result orelse return error.InvalidRemoteResponse;
+            try graph_admission.admit(result.graph_results);
+            result_identity_generations[i] = result.identity_read_generation;
+            if (required_identity_generations) |generations| {
+                if (result_identity_generations[i] != generations[i])
+                    return error.IdentityReadGenerationChanged;
+            }
+        }
     }
 
     const shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     defer alloc.free(shard_results);
-    for (slots, 0..) |slot, i| {
-        shard_results[i] = slot.result.?;
-        result_identity_generations[i] = shard_results[i].identity_read_generation;
-        if (required_identity_generations) |generations| {
-            if (result_identity_generations[i] != generations[i]) return error.IdentityReadGenerationChanged;
-        }
-    }
+    for (slots, 0..) |slot, i| shard_results[i] = slot.result.?;
     var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, req.offset, req.limit);
     errdefer merged.deinit();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
@@ -8191,6 +8199,10 @@ fn queryProvisionedAcrossGroupsPhase(
 
     var shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     var initialized: usize = 0;
+    var graph_admission = query_api.GraphResultsAdmission.init(
+        req.graph_queries,
+        req.graph_execution_limits,
+    );
     defer {
         for (shard_results[0..initialized]) |*result| result.deinit();
         alloc.free(shard_results);
@@ -8201,6 +8213,7 @@ fn queryProvisionedAcrossGroupsPhase(
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
         shard_results[i] = try queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, group_req, consistency);
         initialized += 1;
+        try graph_admission.admit(shard_results[i].graph_results);
         result_identity_generations[i] = shard_results[i].identity_read_generation;
         if (required_identity_generations) |generations| {
             if (result_identity_generations[i] != generations[i]) return error.IdentityReadGenerationChanged;
@@ -8236,6 +8249,10 @@ fn queryHostedAcrossGroupsPhase(
 
     var shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     var initialized: usize = 0;
+    var graph_admission = query_api.GraphResultsAdmission.init(
+        req.graph_queries,
+        req.graph_execution_limits,
+    );
     defer {
         for (shard_results[0..initialized]) |*result| result.deinit();
         alloc.free(shard_results);
@@ -8251,6 +8268,7 @@ fn queryHostedAcrossGroupsPhase(
             .remote => |remote| try queryRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, group_req),
         };
         initialized += 1;
+        try graph_admission.admit(shard_results[i].graph_results);
         result_identity_generations[i] = shard_results[i].identity_read_generation;
         if (required_identity_generations) |generations| {
             if (result_identity_generations[i] != generations[i]) return error.IdentityReadGenerationChanged;

@@ -798,6 +798,36 @@ class TestAntflyClient:
         with pytest.raises(AntflyException, match="at most 8 match operations"):
             client.query(table="docs", graph_queries=graph_queries)
 
+    def test_query_graph_hydration_and_table_qualifiers_fail_before_io(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        with pytest.raises(AntflyException, match="table must contain a non-whitespace"):
+            client.query(
+                table="docs",
+                graph_queries={
+                    "match": {
+                        "index": "graph",
+                        "match": {"anchor": "a", "nodes": {"a": {"table": " \t"}}, "edges": []},
+                        "return": {"bindings": ["a"]},
+                    }
+                },
+            )
+        with pytest.raises(AntflyException, match="fields requires include_documents=true"):
+            client.query(
+                table="docs",
+                graph_queries={"walk": {"index": "graph", "traverse": {"start": {"keys": ["a"]}, "fields": ["title"]}}},
+            )
+        with pytest.raises(AntflyException, match="maximum is 10000"):
+            client.query(
+                table="docs",
+                graph_queries={
+                    "match": {
+                        "index": "graph",
+                        "match": {"anchor": "a", "nodes": {"a": {}, "b": {}}, "edges": []},
+                        "return": {"bindings": ["a", "b"], "limit": 5001, "include_documents": True},
+                    }
+                },
+            )
+
     @pytest.mark.parametrize(
         ("start", "error"),
         [

@@ -38,6 +38,13 @@ func (t GraphResult) DecodeStrictInto(value any) error {
 	return decodeStrictJSON(t.union, value)
 }
 
+// RawJSONReader returns a read-only view over the retained union payload.
+// Streaming SDK validators use it to inspect large canonical graph results
+// without copying the raw bytes or materializing the entire result shape.
+func (t GraphResult) RawJSONReader() io.Reader {
+	return bytes.NewReader(t.union)
+}
+
 // DecodeStrictInto decodes an opaque graph request union into its selected
 // concrete generated type without an intermediate JSON copy.
 func (t GraphQuery) DecodeStrictInto(value any) error {

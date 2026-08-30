@@ -85,6 +85,26 @@ _CREATED_INDEX_TYPES = {
     "algebraic": CreatedAlgebraicIndex,
 }
 
+MAX_GRAPH_HYDRATED_BINDINGS = 10_000
+
+
+def _require_graph_table_qualifier(value: object, path: str) -> None:
+    if not isinstance(value, str) or not any(char not in " \t\r\n" for char in value):
+        raise AntflyException(f"{path} must contain a non-whitespace character")
+
+
+def _validate_graph_hydration(value: Mapping[str, Any], path: str, *, binding_count: int | None = None) -> None:
+    if "fields" in value and value.get("include_documents") is not True:
+        raise AntflyException(f"{path}.fields requires include_documents=true")
+    if binding_count is None or value.get("include_documents") is not True:
+        return
+    raw_limit = value.get("limit", 100)
+    if type(raw_limit) is int and raw_limit * binding_count > MAX_GRAPH_HYDRATED_BINDINGS:
+        raise AntflyException(
+            f"{path} hydration requests {raw_limit * binding_count} binding documents; "
+            f"the maximum is {MAX_GRAPH_HYDRATED_BINDINGS}"
+        )
+
 
 def _require_graph_edge_types(value: object, path: str) -> None:
     if value is None:
@@ -169,8 +189,10 @@ def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, 
 
     nodes = match.get("nodes")
     if isinstance(nodes, Mapping):
-        for alias in nodes:
+        for alias, node in nodes.items():
             _require_graph_identifier(alias, f"{path}.match.nodes key")
+            if isinstance(node, Mapping) and "table" in node:
+                _require_graph_table_qualifier(node["table"], f"{path}.match.nodes[{alias!r}].table")
 
     edge_groups: list[tuple[object, str]] = [(match.get("edges"), f"{path}.match.edges")]
     where_groups: list[tuple[object, str, int]] = [(match.get("where"), f"{path}.match.where", 0)]
@@ -182,8 +204,10 @@ def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, 
             optional_path = f"{path}.match.optional[{index}]"
             optional_nodes = optional_match.get("nodes")
             if isinstance(optional_nodes, Mapping):
-                for alias in optional_nodes:
+                for alias, node in optional_nodes.items():
                     _require_graph_identifier(alias, f"{optional_path}.nodes key")
+                    if isinstance(node, Mapping) and "table" in node:
+                        _require_graph_table_qualifier(node["table"], f"{optional_path}.nodes[{alias!r}].table")
             edge_groups.append((optional_match.get("edges"), f"{optional_path}.edges"))
             where_groups.append((optional_match.get("where"), f"{optional_path}.where", 0))
 
@@ -217,6 +241,7 @@ def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, 
     if isinstance(bindings, list):
         for index, alias in enumerate(bindings):
             _require_graph_identifier(alias, f"{path}.return.bindings[{index}]")
+        _validate_graph_hydration(result, f"{path}.return", binding_count=len(bindings))
     aggregates = result.get("aggregates")
     if isinstance(aggregates, Mapping):
         for name, aggregate in aggregates.items():
@@ -262,6 +287,13 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
             _require_graph_edge_types(traverse.get("edge_types"), f"graph_queries[{name!r}].traverse.edge_types")
             _validate_graph_edge_weight(traverse, f"graph_queries[{name!r}].traverse")
             start = traverse.get("start")
+            if isinstance(start, Mapping) and isinstance(start.get("identities"), list):
+                for index, identity in enumerate(start["identities"]):
+                    if isinstance(identity, Mapping) and "table" in identity:
+                        _require_graph_table_qualifier(
+                            identity["table"],
+                            f"graph_queries[{name!r}].traverse.start.identities[{index}].table",
+                        )
             if isinstance(start, Mapping) and "result_ref" in start:
                 path = f"graph_queries[{name!r}].traverse.start"
                 result_ref = start.get("result_ref")
@@ -277,6 +309,7 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
                     if result_ref == "$query_results":
                         raise AntflyException(f"{path}.binding requires a $graph_results.<query-name> reference")
                     _require_graph_identifier(binding, f"{path}.binding")
+            _validate_graph_hydration(traverse, f"graph_queries[{name!r}].traverse")
         for operation in ("shortest_path", "k_shortest_paths"):
             path_query = encoded_query.get(operation)
             if isinstance(path_query, Mapping):
@@ -288,6 +321,14 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
                     path_query.get("edge_types"),
                     f"graph_queries[{name!r}].{operation}.edge_types",
                 )
+                for endpoint in ("from", "to"):
+                    identity = path_query.get(endpoint)
+                    if isinstance(identity, Mapping) and "table" in identity:
+                        _require_graph_table_qualifier(
+                            identity["table"],
+                            f"graph_queries[{name!r}].{operation}.{endpoint}.table",
+                        )
+                _validate_graph_hydration(path_query, operation_path)
         encoded[name] = encoded_query
     return encoded
 

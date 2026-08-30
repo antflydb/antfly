@@ -142,7 +142,6 @@ def test_canonical_query_decoder_binds_result_shape_to_request() -> None:
             ),
             expected_graph_queries=path_query,
         )
-
     with pytest.raises(ValueError, match="must be auto, canonical, or none"):
         decode_query_responses(
             _query_response(
@@ -210,6 +209,23 @@ def test_canonical_query_decoder_binds_result_shape_to_request() -> None:
             ),
             graph_dialect="canonical",
             expected_graph_queries=aggregates_query,
+        )
+
+
+@pytest.mark.parametrize("table", [" ", "\t\r\n"])
+def test_canonical_query_decoder_rejects_ascii_whitespace_table_qualifiers(table: str) -> None:
+    query = {"walk": {"index": "graph", "traverse": {"start": {"result_ref": "$query_results"}}}}
+    with pytest.raises(AntflyException, match="table: must contain a non-whitespace character"):
+        decode_query_responses(
+            _query_response(
+                {
+                    "kind": "nodes",
+                    "nodes": [{"key": "a", "table": table, "depth": 0}],
+                    "stats": {"returned_items": 1, "truncated": False},
+                },
+                operation="walk",
+            ),
+            expected_graph_queries=query,
         )
 
 

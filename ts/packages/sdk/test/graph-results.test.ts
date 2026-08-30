@@ -141,6 +141,27 @@ describe("graph result admission", () => {
     );
   });
 
+  it.each([" ", "\t\r\n"])("rejects ASCII-whitespace table qualifiers", (table) => {
+    const request = {
+      graph_queries: {
+        walk: { index: "graph", traverse: { start: { result_ref: "$query_results" } } },
+      },
+    };
+    expect(() =>
+      validateGraphQueryResponses(
+        responses(
+          {
+            kind: "nodes",
+            nodes: [{ key: "a", table, depth: 0 }],
+            stats: { returned_items: 1, truncated: false },
+          },
+          "walk"
+        ),
+        [request]
+      )
+    ).toThrow("table: must contain a non-whitespace character");
+  });
+
   it("binds canonical result kinds and projections to the requested operation", () => {
     expect(() =>
       validateGraphQueryResponses(

@@ -88,6 +88,32 @@ describe("graph identifier policy", () => {
     expect(() => validateGraphQueryIdentifiers({})).toThrow("at least one named operation");
   });
 
+  it("preflights table qualifiers and document hydration", () => {
+    expect(() =>
+      validateGraphQueryIdentifiers({
+        matched: {
+          index: "graph",
+          match: { anchor: "a", nodes: { a: { table: " \t" } }, edges: [] },
+          return: { bindings: ["a"] },
+        },
+      })
+    ).toThrow("table must contain a non-whitespace character");
+    expect(() =>
+      validateGraphQueryIdentifiers({
+        walk: { index: "graph", traverse: { start: { keys: ["a"] }, fields: ["title"] } },
+      })
+    ).toThrow("fields requires include_documents=true");
+    expect(() =>
+      validateGraphQueryIdentifiers({
+        matched: {
+          index: "graph",
+          match: { anchor: "a", nodes: { a: {}, b: {} }, edges: [] },
+          return: { bindings: ["a", "b"], limit: 5001, include_documents: true },
+        },
+      })
+    ).toThrow("maximum is 10000");
+  });
+
   it.each([
     [["bad\ud800"], "valid UTF-8"],
     [["links", "links"], "duplicate edge types"],

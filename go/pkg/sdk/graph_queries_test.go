@@ -9,6 +9,7 @@
 package sdk
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -17,6 +18,50 @@ import (
 
 	querydsl "github.com/antflydb/antfly/go/pkg/sdk/query"
 )
+
+func BenchmarkValidateBindingsGraphResultWorstCase(b *testing.B) {
+	aliases := make([]string, maxGraphMatchNodes)
+	for i := range aliases {
+		aliases[i] = fmt.Sprintf("a%d", i)
+	}
+	var encoded bytes.Buffer
+	encoded.WriteString(`{"kind":"bindings","rows":[`)
+	for row := 0; row < maxGraphHydratedBindings; row++ {
+		if row > 0 {
+			encoded.WriteByte(',')
+		}
+		encoded.WriteByte('{')
+		for i, alias := range aliases {
+			if i > 0 {
+				encoded.WriteByte(',')
+			}
+			fmt.Fprintf(&encoded, `%q:{"key":"k"}`, alias)
+		}
+		encoded.WriteByte('}')
+	}
+	fmt.Fprintf(&encoded, `],"stats":{"returned_items":%d,"truncated":false}}`, maxGraphHydratedBindings)
+	var result GraphResult
+	if err := json.Unmarshal(encoded.Bytes(), &result); err != nil {
+		b.Fatal(err)
+	}
+	contract := canonicalGraphResultContract{
+		kind:     string(GraphBindingsResultKindBindings),
+		names:    aliases,
+		maxItems: maxGraphHydratedBindings,
+	}
+	envelope, _, err := canonicalGraphResultEnvelope(result)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(encoded.Len()))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := validateBindingsResultPayload(contract, result, envelope); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
 
 func TestGraphQueryConstructors(t *testing.T) {
 	notEqual, err := NewGraphNotEqual("a", "b")

@@ -91,6 +91,13 @@ def _nonempty_string(value: object, path: str, *, max_utf8_bytes: int | None = N
     return value
 
 
+def _table_qualifier(value: object, path: str) -> str:
+    result = _nonempty_string(value, path)
+    if not any(char not in " \t\r\n" for char in result):
+        _invalid(path, "must contain a non-whitespace character")
+    return result
+
+
 def _bounded_integer(value: object, path: str, minimum: int, maximum: int) -> int:
     if type(value) is not int or value < minimum or value > maximum:
         _invalid(path, f"must be an integer between {minimum} and {maximum}")
@@ -130,7 +137,7 @@ def _validate_endpoint(value: object, path: str) -> Mapping[str, Any]:
     _exact_keys(endpoint, path, required=frozenset({"key"}), optional=frozenset({"table"}))
     _nonempty_string(endpoint["key"], f"{path}.key")
     if "table" in endpoint:
-        _nonempty_string(endpoint["table"], f"{path}.table")
+        _table_qualifier(endpoint["table"], f"{path}.table")
     return endpoint
 
 
@@ -371,7 +378,7 @@ def _validate_result_node(value: object, path: str) -> Mapping[str, Any]:
     _nonempty_string(node["key"], f"{path}.key")
     _bounded_integer(node["depth"], f"{path}.depth", 0, _MAX_GRAPH_EDGES)
     if "table" in node:
-        _nonempty_string(node["table"], f"{path}.table")
+        _table_qualifier(node["table"], f"{path}.table")
     if "document" in node:
         _object(node["document"], f"{path}.document")
     if "provenance" in node:
@@ -471,7 +478,7 @@ def _validate_bindings_result(value: Mapping[str, Any], path: str) -> None:
             )
             _nonempty_string(binding["key"], f"{binding_path}.key")
             if "table" in binding:
-                _nonempty_string(binding["table"], f"{binding_path}.table")
+                _table_qualifier(binding["table"], f"{binding_path}.table")
             if "document" in binding:
                 _object(binding["document"], f"{binding_path}.document")
     _validate_stats(value["stats"], f"{path}.stats", len(rows), bounded=True)
