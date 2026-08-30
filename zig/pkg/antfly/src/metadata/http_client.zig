@@ -1088,7 +1088,7 @@ test "metadata linearizable routing client uses compact internal endpoint" {
     try std.testing.expectEqual(@as(u64, 9), result.value.catalog_revision);
 }
 
-test "metadata routing change client forwards a replica-scoped long poll" {
+test "metadata routing change client forwards an authority-scoped long poll" {
     const Executor = struct {
         fn executor(self: *@This()) http_common.RequestExecutor {
             return .{ .ptr = self, .vtable = &.{ .execute = execute } };
@@ -1100,11 +1100,12 @@ test "metadata routing change client forwards a replica-scoped long poll" {
             _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
             const parsed = try std.json.parseFromSlice(metadata_api.CatalogRoutingChangeRequest, alloc, req.body, .{});
             defer parsed.deinit();
+            try std.testing.expectEqual(@as(u64, 7), parsed.value.observed_token.metadata_group_id);
             try std.testing.expectEqual(@as(u64, 17), parsed.value.observed_token.revision);
             return .{
                 .status = 200,
                 .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8, "{\"token\":{\"source_id\":0,\"revision\":18},\"changed\":true}"),
+                .body = try alloc.dupe(u8, "{\"token\":{\"metadata_group_id\":7,\"revision\":18},\"disposition\":\"advanced\",\"changed\":true}"),
             };
         }
     };
@@ -1113,11 +1114,12 @@ test "metadata routing change client forwards a replica-scoped long poll" {
     var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
     var result = try client.waitForRoutingChange(
         "http://127.0.0.1:9000",
-        .{ .source_id = 3, .revision = 17 },
+        .{ .metadata_group_id = 7, .revision = 17 },
         .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
     );
     defer result.deinit();
     try std.testing.expect(result.value.changed);
+    try std.testing.expectEqual(metadata_api.CatalogRoutingChangeResult.Disposition.advanced, result.value.effectiveDisposition());
     try std.testing.expectEqual(@as(u64, 18), result.value.token.revision);
 }
 

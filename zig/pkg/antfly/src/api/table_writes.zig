@@ -130,6 +130,7 @@ const native_snapshot_attempt_marker_directory = ".native-backup-attempts";
 const native_snapshot_attempt_stale_ns: i128 = 24 * std.time.ns_per_hour;
 const native_snapshot_attempt_reclaim_limit: usize = 8;
 const native_snapshot_attempt_scan_limit: usize = 8192;
+const create_structural_publication_retry_limit: usize = 3;
 
 const NativeSnapshotAttemptMarker = struct {
     snapshot_token: []const u8,
@@ -920,6 +921,7 @@ var test_before_restore_repair_retry_sleep_hook: ?TestExecutionHook = null;
 var test_before_restore_repair_step_hook: ?TestRestoreRepairStepHook = null;
 var test_before_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_after_runtime_status_publish_hook: ?TestExecutionHook = null;
+var test_before_create_structural_publish_hook: ?TestExecutionHook = null;
 var test_before_post_create_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_before_startup_catch_up_replay_hook: ?TestStartupCatchUpReplayPassHook = null;
 var test_after_startup_catch_up_replay_pass_hook: ?TestStartupCatchUpReplayPassHook = null;
@@ -1051,6 +1053,12 @@ fn runTestAfterRuntimeStatusPublishHook() void {
 fn runTestBeforePostCreateRuntimeStatusPublishHook() void {
     if (comptime builtin.is_test) {
         if (test_before_post_create_runtime_status_publish_hook) |hook| hook.run(hook.ptr);
+    }
+}
+
+fn runTestBeforeCreateStructuralPublishHook() void {
+    if (comptime builtin.is_test) {
+        if (test_before_create_structural_publish_hook) |hook| hook.run(hook.ptr);
     }
 }
 
@@ -15310,110 +15318,138 @@ pub const ProvisionedTableWriteSource = struct {
             self.beginLocalStructuralCachedDbMutation(table_name);
             errdefer self.abortLocalStructuralCachedDbMutation(table_name);
 
-            var cached_groups = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
-            defer {
-                for (cached_groups.items) |*cached| cached.deinit(alloc);
-                cached_groups.deinit(alloc);
-            }
-            try cached_groups.ensureTotalCapacity(alloc, group_ids.len);
-            const target_generations = try alloc.alloc(u64, group_ids.len);
-            defer alloc.free(target_generations);
-
-            for (group_ids, 0..) |group_id, group_index| {
-                std.log.info("provisioned create table local group begin table={s} group_id={d}", .{ table_name, group_id });
-                const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-                defer alloc.free(path);
-                const group_route = route.group(group_id) orelse return error.CatalogChanged;
-                const identity_namespace = docIdentityNamespaceFromCatalog(group_route.identity_namespace);
-
-                const visible_generation = self.visibleRootGeneration(group_id);
-                {
-                    var cached = try self.getOrOpenCachedDbForLocalMutationWithOptions(
-                        alloc,
-                        cache,
-                        path,
-                        group_id,
-                        visible_generation,
-                        table_name,
-                        false,
-                        .{ .identity_namespace_override = identity_namespace },
-                    );
-                    errdefer cached.deinit(alloc);
-                    const entry = cached.entry orelse return error.StaleCachedDbLease;
-                    if (entry.retired) return error.StaleCachedDbLease;
-                    target_generations[group_index] = entry.lsm_root_generation;
-                    try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
-                    try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
-                    // Catalog admission and local create can race an earlier
-                    // startup/status open of this generation. The entry
-                    // fingerprint is publication metadata, not proof that the
-                    // resident DB successfully installed the same producer
-                    // set: an adopted/opened writer can carry the new catalog
-                    // fingerprint while still owning the old (often empty)
-                    // runtime. Create is the authoritative, one-shot commit
-                    // boundary, so always install its requested runtime before
-                    // reconciling durable indexes. Publish the matching
-                    // fingerprint only after every group commits.
-                    try reconfigureManagedDbEnrichmentRuntime(
-                        alloc,
-                        cached.db,
-                        indexes_json,
-                        self.backend_runtime,
-                        self.antfly_provider,
-                        self.inference_api_url,
-                        self.secret_store,
-                        self.remote_content,
-                    );
-                    _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
-                        .drain_resolver_backfill = false,
-                        .embedding_options = .{
-                            .antfly_provider = self.antfly_provider,
-                            .inference_api_url = self.inference_api_url,
-                        },
-                        .source_table = table_name,
-                        .destination_authorizer = self.destination_authorizer,
-                    });
-                    cached_groups.appendAssumeCapacity(cached);
+            var structural_attempt: usize = 0;
+            cached_retry: while (true) {
+                structural_attempt += 1;
+                defer self.drainWriteCachePendingCloses();
+                var cached_groups = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
+                defer {
+                    for (cached_groups.items) |*cached| cached.deinit(alloc);
+                    cached_groups.deinit(alloc);
                 }
-                std.log.info("provisioned create table local group ready table={s} group_id={d}", .{ table_name, group_id });
-            }
+                try cached_groups.ensureTotalCapacity(alloc, group_ids.len);
+                const target_generations = try alloc.alloc(u64, group_ids.len);
+                defer alloc.free(target_generations);
 
-            var publication = try cache.prepareStructuralPublication(
-                table_name,
-                indexes_json,
-                schema_json,
-                cached_groups.items.len,
-            );
-            defer publication.deinit(cache.alloc);
-            lockAtomic(&self.local_db_mutex);
-            cache.publishStructuralMutationLocked(cached_groups.items, target_generations, &publication) catch |err| {
-                self.local_db_mutex.unlock();
-                return err;
-            };
-            self.local_db_mutex.unlock();
+                for (group_ids, 0..) |group_id, group_index| {
+                    std.log.info("provisioned create table local group begin table={s} group_id={d}", .{ table_name, group_id });
+                    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+                    defer alloc.free(path);
+                    const group_route = route.group(group_id) orelse return error.CatalogChanged;
+                    const identity_namespace = docIdentityNamespaceFromCatalog(group_route.identity_namespace);
 
-            self.finishLocalStructuralCachedDbMutation(table_name);
-            std.log.info("provisioned create table local notify table={s}", .{table_name});
-            self.notifyLocalChange(table_name, .structural);
-            // Structural publication is the create commit point. Runtime
-            // status is observational and may be fenced by the invalidation
-            // emitted above or by a concurrent refresh; it must never turn an
-            // already-committed create into an HTTP failure.
-            runTestBeforePostCreateRuntimeStatusPublishHook();
-            for (group_ids, cached_groups.items) |group_id, cached| {
-                publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| switch (err) {
-                    error.RuntimeStatusPublicationFenced => std.log.debug(
-                        "post-create runtime status publication deferred table={s} group_id={d} err={s}",
-                        .{ table_name, group_id, @errorName(err) },
-                    ),
-                    else => std.log.warn(
-                        "post-create runtime status publication failed after commit table={s} group_id={d} err={s}",
-                        .{ table_name, group_id, @errorName(err) },
-                    ),
+                    const visible_generation = self.visibleRootGeneration(group_id);
+                    {
+                        var cached = self.getOrOpenCachedDbForLocalMutationWithOptions(
+                            alloc,
+                            cache,
+                            path,
+                            group_id,
+                            visible_generation,
+                            table_name,
+                            false,
+                            .{ .identity_namespace_override = identity_namespace },
+                        ) catch |err| {
+                            if (err == error.LsmRootWriterAlreadyOpen) {
+                                if (structural_attempt < create_structural_publication_retry_limit) continue :cached_retry;
+                                return err;
+                            }
+                            return err;
+                        };
+                        errdefer cached.deinit(alloc);
+                        const entry = cached.entry orelse {
+                            if (structural_attempt < create_structural_publication_retry_limit) {
+                                cached.deinit(alloc);
+                                continue :cached_retry;
+                            }
+                            return error.TopologyChanged;
+                        };
+                        if (entry.retired) {
+                            if (structural_attempt < create_structural_publication_retry_limit) {
+                                cached.deinit(alloc);
+                                continue :cached_retry;
+                            }
+                            return error.TopologyChanged;
+                        }
+                        target_generations[group_index] = entry.lsm_root_generation;
+                        try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
+                        try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+                        // Catalog admission and local create can race an earlier
+                        // startup/status open of this generation. The entry
+                        // fingerprint is publication metadata, not proof that the
+                        // resident DB successfully installed the same producer
+                        // set: an adopted/opened writer can carry the new catalog
+                        // fingerprint while still owning the old (often empty)
+                        // runtime. Create is the authoritative, one-shot commit
+                        // boundary, so always install its requested runtime before
+                        // reconciling durable indexes. Publish the matching
+                        // fingerprint only after every group commits.
+                        try reconfigureManagedDbEnrichmentRuntime(
+                            alloc,
+                            cached.db,
+                            indexes_json,
+                            self.backend_runtime,
+                            self.antfly_provider,
+                            self.inference_api_url,
+                            self.secret_store,
+                            self.remote_content,
+                        );
+                        _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
+                            .drain_resolver_backfill = false,
+                            .embedding_options = .{
+                                .antfly_provider = self.antfly_provider,
+                                .inference_api_url = self.inference_api_url,
+                            },
+                            .source_table = table_name,
+                            .destination_authorizer = self.destination_authorizer,
+                        });
+                        cached_groups.appendAssumeCapacity(cached);
+                    }
+                    std.log.info("provisioned create table local group ready table={s} group_id={d}", .{ table_name, group_id });
+                }
+
+                var publication = try cache.prepareStructuralPublication(
+                    table_name,
+                    indexes_json,
+                    schema_json,
+                    cached_groups.items.len,
+                );
+                defer publication.deinit(cache.alloc);
+                runTestBeforeCreateStructuralPublishHook();
+                lockAtomic(&self.local_db_mutex);
+                cache.publishStructuralMutationLocked(cached_groups.items, target_generations, &publication) catch |err| {
+                    self.local_db_mutex.unlock();
+                    if (err == error.StaleCachedDbLease) {
+                        if (structural_attempt < create_structural_publication_retry_limit) continue :cached_retry;
+                        return error.TopologyChanged;
+                    }
+                    return err;
                 };
+                self.local_db_mutex.unlock();
+
+                self.finishLocalStructuralCachedDbMutation(table_name);
+                std.log.info("provisioned create table local notify table={s}", .{table_name});
+                self.notifyLocalChange(table_name, .structural);
+                // Structural publication is the create commit point. Runtime
+                // status is observational and may be fenced by the invalidation
+                // emitted above or by a concurrent refresh; it must never turn an
+                // already-committed create into an HTTP failure.
+                runTestBeforePostCreateRuntimeStatusPublishHook();
+                for (group_ids, cached_groups.items) |group_id, cached| {
+                    publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| switch (err) {
+                        error.RuntimeStatusPublicationFenced => std.log.debug(
+                            "post-create runtime status publication deferred table={s} group_id={d} err={s}",
+                            .{ table_name, group_id, @errorName(err) },
+                        ),
+                        else => std.log.warn(
+                            "post-create runtime status publication failed after commit table={s} group_id={d} err={s}",
+                            .{ table_name, group_id, @errorName(err) },
+                        ),
+                    };
+                }
+                std.log.info("provisioned create table local done table={s}", .{table_name});
+                return {};
             }
-            std.log.info("provisioned create table local done table={s}", .{table_name});
-            return {};
         }
 
         self.beginLocalStructuralMutation(table_name);
@@ -45722,6 +45758,117 @@ test "provisioned table write source create table provisions local indexes and s
     var enrichment = (try cached_db.getEnrichment(alloc, .asset, "document_units_v1")) orelse return error.TestUnexpectedResult;
     defer enrichment.deinit(alloc);
     try std.testing.expectEqualStrings("title", enrichment.field);
+}
+
+test "provisioned create retries a retired cache lease before structural publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/create-structural-publication-race",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+
+    const Catalog = struct {
+        var tables = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = tables_api.default_indexes_json,
+            .placement_role = "data",
+        }};
+        var ranges = [_]metadata_table_manager.RangeRecord{.{
+            .group_id = 7001,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        }};
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = tables[0..],
+                .ranges = ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    const PublicationRace = struct {
+        source: *ProvisionedTableWriteSource,
+        calls: usize = 0,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) self.source.invalidateWriteCacheForTable("docs");
+        }
+    };
+    var publication_race = PublicationRace{ .source = &source };
+    {
+        const previous_hook = test_before_create_structural_publish_hook;
+        test_before_create_structural_publish_hook = .{ .ptr = &publication_race, .run = PublicationRace.run };
+        defer test_before_create_structural_publish_hook = previous_hook;
+        const handled = try source.source().createTable(alloc, "docs", .{});
+        try std.testing.expect(handled != null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), publication_race.calls);
+
+    {
+        lockAtomic(&source.local_db_mutex);
+        defer source.local_db_mutex.unlock();
+        try std.testing.expect(
+            write_cache.getLocked(7001, source.visibleRootGeneration(7001), "docs") != null,
+        );
+        try std.testing.expect(write_cache.tableMetadataLocked("docs") != null);
+    }
+
+    const PersistentRace = struct {
+        source: *ProvisionedTableWriteSource,
+        calls: usize = 0,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.source.invalidateWriteCacheForTable("docs");
+        }
+    };
+    var persistent_race = PersistentRace{ .source = &source };
+    {
+        const previous_hook = test_before_create_structural_publish_hook;
+        test_before_create_structural_publish_hook = .{ .ptr = &persistent_race, .run = PersistentRace.run };
+        defer test_before_create_structural_publish_hook = previous_hook;
+        try std.testing.expectError(
+            error.TopologyChanged,
+            source.source().createTable(alloc, "docs", .{}),
+        );
+    }
+    try std.testing.expectEqual(create_structural_publication_retry_limit, persistent_race.calls);
 }
 
 test "provisioned create succeeds when post-commit runtime status is fenced" {

@@ -45,6 +45,11 @@ pub const CatalogProjectionSnapshot = struct {
     ranges: []metadata.RangeRecord,
 };
 
+pub const CatalogCursor = struct {
+    metadata_incarnation: ?metadata_incarnation.MetadataClusterIncarnation,
+    revision: u64,
+};
+
 pub const ExtensionMemberKey = struct {
     extension_name: []const u8,
     object_kind: extension_domain.ExtensionObjectKind,
@@ -761,6 +766,9 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     var reopened = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
     defer reopened.deinit();
     try std.testing.expectEqual(first, (try reopened.getMetadataIncarnation(group_id)).?);
+    const reopened_cursor = try reopened.captureCatalogCursor(group_id);
+    try std.testing.expectEqual(first, reopened_cursor.metadata_incarnation.?);
+    try std.testing.expectEqual(@as(u64, 4), reopened_cursor.revision);
     try std.testing.expectEqual(
         runtime_status_protocol.current_record_version,
         try reopened.getRuntimeStatusProtocolActivationVersion(group_id),
@@ -770,6 +778,9 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     defer target.deinit();
     try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 4, snapshot));
     try std.testing.expectEqual(first, (try target.getMetadataIncarnation(group_id)).?);
+    const installed_cursor = try target.captureCatalogCursor(group_id);
+    try std.testing.expectEqual(first, installed_cursor.metadata_incarnation.?);
+    try std.testing.expectEqual(@as(u64, 4), installed_cursor.revision);
     try std.testing.expectEqual(
         runtime_status_protocol.current_record_version,
         try target.getRuntimeStatusProtocolActivationVersion(group_id),
@@ -1676,6 +1687,39 @@ pub const RaftApplyStore = struct {
             .catalog_revision = catalog_revision,
             .tables = tables,
             .ranges = ranges,
+        };
+    }
+
+    /// Read the durable authority and applied revision from one storage
+    /// transaction. Unlike listener epochs, this cursor survives restarts and
+    /// is comparable across replicas of the same metadata group.
+    pub fn captureCatalogCursor(self: *RaftApplyStore, group_id: u64) !CatalogCursor {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+
+        var apply_key_buf: [128]u8 = undefined;
+        const apply_key = try keyForGroup(&apply_key_buf, group_id);
+        const applied = txn.get(apply_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const revision = if (applied) |encoded| blk: {
+            if (encoded.len < @sizeOf(u64)) return error.InvalidMetadataApplyBatch;
+            break :blk std.mem.readInt(u64, encoded[0..8], .little);
+        } else 0;
+
+        var incarnation_key_buf: [160]u8 = undefined;
+        const incarnation_key = try metadataIncarnationKeyForGroup(&incarnation_key_buf, group_id);
+        const encoded_incarnation = txn.get(incarnation_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        return .{
+            .metadata_incarnation = if (encoded_incarnation) |encoded|
+                (try decodeMetadataIncarnationRecord(encoded)).incarnation
+            else
+                null,
+            .revision = revision,
         };
     }
 
@@ -7921,6 +7965,8 @@ test "metadata raft apply store persists batches across reopen" {
             .commit_index = 13,
             .entries_bytes = "metadata-batch",
         });
+        const cursor = try store.captureCatalogCursor(21);
+        try std.testing.expectEqual(@as(u64, 13), cursor.revision);
     }
 
     {
@@ -7929,6 +7975,9 @@ test "metadata raft apply store persists batches across reopen" {
         const batch = (try store.latestBatch(21)) orelse return error.MissingMetadataBatch;
         try std.testing.expectEqual(@as(u64, 13), batch.commit_index);
         try std.testing.expectEqualStrings("metadata-batch", batch.entries_bytes);
+        const cursor = try store.captureCatalogCursor(21);
+        try std.testing.expectEqual(@as(u64, 13), cursor.revision);
+        try std.testing.expectEqual(@as(?metadata_incarnation.MetadataClusterIncarnation, null), cursor.metadata_incarnation);
     }
 }
 

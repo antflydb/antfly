@@ -1070,6 +1070,44 @@ fn projectionSignalChangesCatalog(kind: metadata_storage.raft_apply_store.Projec
     };
 }
 
+fn durableCatalogRoutingToken(
+    metadata_group_id: u64,
+    store: ?*metadata_storage.RaftApplyStore,
+) !metadata_api.CatalogRoutingChangeToken {
+    const projected_store = store orelse return .{ .metadata_group_id = metadata_group_id };
+    const cursor = try projected_store.captureCatalogCursor(metadata_group_id);
+    return .{
+        .metadata_group_id = metadata_group_id,
+        .metadata_incarnation = cursor.metadata_incarnation,
+        .revision = cursor.revision,
+    };
+}
+
+fn catalogRoutingDisposition(
+    observed: metadata_api.CatalogRoutingChangeToken,
+    current: metadata_api.CatalogRoutingChangeToken,
+) ?metadata_api.CatalogRoutingChangeResult.Disposition {
+    // A zero group is the rolling-upgrade representation emitted by older
+    // clients; revision comparison remains safe on the server they selected.
+    if (observed.metadata_group_id != 0 and !observed.authorityEql(current)) {
+        return .authority_changed;
+    }
+    if (current.revision > observed.revision) return .advanced;
+    if (current.revision < observed.revision) return .replica_behind;
+    return null;
+}
+
+fn catalogRoutingChangeResult(
+    token: metadata_api.CatalogRoutingChangeToken,
+    disposition: metadata_api.CatalogRoutingChangeResult.Disposition,
+) metadata_api.CatalogRoutingChangeResult {
+    return .{
+        .token = token,
+        .disposition = disposition,
+        .changed = disposition != .unchanged,
+    };
+}
+
 fn projectionSignalChangesProjectedCore(kind: metadata_storage.raft_apply_store.ProjectionSignalKind) bool {
     return switch (kind) {
         .store, .shuffle_join_lease, .schema_progress, .restore_progress, .replication_source_status => true,
@@ -1111,6 +1149,34 @@ test "metadata service catalog validation epoch ignores non-catalog projection t
     try std.testing.expect(!projectionSignalChangesProjectedCore(.split_transition));
     try std.testing.expect(!projectionSignalChangesProjectedCore(.merge_transition));
     try std.testing.expect(!projectionSignalChangesProjectedCore(.restore_job));
+}
+
+test "catalog routing disposition is authority scoped and restart stable" {
+    const first_incarnation: metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    const second_incarnation: metadata_api.MetadataClusterIncarnation = "22222222222222222222222222222222".*;
+    const observed: metadata_api.CatalogRoutingChangeToken = .{
+        .metadata_group_id = 7,
+        .metadata_incarnation = first_incarnation,
+        .revision = 41,
+    };
+
+    try std.testing.expectEqual(
+        @as(?metadata_api.CatalogRoutingChangeResult.Disposition, null),
+        catalogRoutingDisposition(observed, observed),
+    );
+    var advanced = observed;
+    advanced.revision += 1;
+    try std.testing.expectEqual(
+        metadata_api.CatalogRoutingChangeResult.Disposition.advanced,
+        catalogRoutingDisposition(observed, advanced).?,
+    );
+    var restarted = observed;
+    restarted.metadata_incarnation = second_incarnation;
+    restarted.revision = 1;
+    try std.testing.expectEqual(
+        metadata_api.CatalogRoutingChangeResult.Disposition.authority_changed,
+        catalogRoutingDisposition(observed, restarted).?,
+    );
 }
 
 // Backfill marker discovery does not need sub-second polling when the system is
@@ -2165,23 +2231,33 @@ pub const MetadataService = struct {
         self.lifecycle_signal.wait(observed, timeout_ns);
     }
 
-    pub fn catalogRoutingChangeToken(self: *const MetadataService) u64 {
-        return self.catalog_epoch.load(.acquire);
+    pub fn catalogRoutingChangeToken(self: *MetadataService) !metadata_api.CatalogRoutingChangeToken {
+        return try durableCatalogRoutingToken(self.metadata_group_id, self.projectedStore());
     }
 
-    /// Wait for an actual table/range projection change. Lifecycle wakes for
-    /// unrelated metadata are filtered by the catalog epoch, and the epoch is
-    /// checked on both sides of signal capture to avoid a lost wakeup.
-    pub fn waitForCatalogRoutingChange(self: *MetadataService, observed_epoch: u64, deadline_ns: u64) !bool {
+    /// Wait for the durable applied cursor to advance. The cursor is checked
+    /// on both sides of signal capture to avoid a lost wakeup; unrelated
+    /// metadata commits may cause a harmless re-resolution.
+    pub fn waitForCatalogRoutingChange(
+        self: *MetadataService,
+        observed_token: metadata_api.CatalogRoutingChangeToken,
+        deadline_ns: u64,
+    ) !metadata_api.CatalogRoutingChangeResult {
         try self.ensureLifecycleListenerRegistered();
-        while (self.catalog_epoch.load(.acquire) == observed_epoch) {
+        while (true) {
+            const current = try self.catalogRoutingChangeToken();
+            if (catalogRoutingDisposition(observed_token, current)) |disposition| {
+                return catalogRoutingChangeResult(current, disposition);
+            }
             const now_ns = platform_time.monotonicNs();
-            if (now_ns >= deadline_ns) return false;
+            if (now_ns >= deadline_ns) return catalogRoutingChangeResult(current, .unchanged);
             const signal = self.lifecycle_signal.snapshot(null);
-            if (self.catalog_epoch.load(.acquire) != observed_epoch) return true;
+            const after_capture = try self.catalogRoutingChangeToken();
+            if (catalogRoutingDisposition(observed_token, after_capture)) |disposition| {
+                return catalogRoutingChangeResult(after_capture, disposition);
+            }
             self.lifecycle_signal.wait(signal, deadline_ns - now_ns);
         }
-        return true;
     }
 
     pub fn setLifecycleReconcileHook(self: *MetadataService, hook: ?LifecycleReconcileHook) void {
@@ -3981,20 +4057,30 @@ pub const MetadataHttpService = struct {
         self.lifecycle_signal.wait(observed, timeout_ns);
     }
 
-    pub fn catalogRoutingChangeToken(self: *const MetadataHttpService) u64 {
-        return self.catalog_epoch.load(.acquire);
+    pub fn catalogRoutingChangeToken(self: *MetadataHttpService) !metadata_api.CatalogRoutingChangeToken {
+        return try durableCatalogRoutingToken(self.metadata_group_id, self.projectedStore());
     }
 
-    pub fn waitForCatalogRoutingChange(self: *MetadataHttpService, observed_epoch: u64, deadline_ns: u64) !bool {
+    pub fn waitForCatalogRoutingChange(
+        self: *MetadataHttpService,
+        observed_token: metadata_api.CatalogRoutingChangeToken,
+        deadline_ns: u64,
+    ) !metadata_api.CatalogRoutingChangeResult {
         try self.ensureLifecycleListenerRegistered();
-        while (self.catalog_epoch.load(.acquire) == observed_epoch) {
+        while (true) {
+            const current = try self.catalogRoutingChangeToken();
+            if (catalogRoutingDisposition(observed_token, current)) |disposition| {
+                return catalogRoutingChangeResult(current, disposition);
+            }
             const now_ns = platform_time.monotonicNs();
-            if (now_ns >= deadline_ns) return false;
+            if (now_ns >= deadline_ns) return catalogRoutingChangeResult(current, .unchanged);
             const signal = self.lifecycle_signal.snapshot(null);
-            if (self.catalog_epoch.load(.acquire) != observed_epoch) return true;
+            const after_capture = try self.catalogRoutingChangeToken();
+            if (catalogRoutingDisposition(observed_token, after_capture)) |disposition| {
+                return catalogRoutingChangeResult(after_capture, disposition);
+            }
             self.lifecycle_signal.wait(signal, deadline_ns - now_ns);
         }
-        return true;
     }
 
     pub fn setLifecycleReconcileHook(self: *MetadataHttpService, hook: ?LifecycleReconcileHook) void {

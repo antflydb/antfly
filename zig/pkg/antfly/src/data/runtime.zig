@@ -15112,6 +15112,13 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
 
+fn catalogRoutingProbeDeadline(now_ns: u64, deadline_ns: u64, probe_interval_ns: u64) u64 {
+    return @min(
+        deadline_ns,
+        now_ns +| @max(probe_interval_ns, std.time.ns_per_ms),
+    );
+}
+
 fn haContextPrimaryIsFenced(ctx: antfly.ha.admin_exec.Context) bool {
     const primary = ctx.primary orelse return false;
     const fence_store = ctx.fence_store orelse return false;
@@ -15479,6 +15486,14 @@ const RemoteMetadataSource = struct {
     fn noteMetadataReadSuccess(self: *RemoteMetadataSource, index: usize) void {
         lockAtomic(&self.cache_mutex);
         self.preferred_read_uri_index = index;
+        self.cache_mutex.unlock();
+    }
+
+    fn noteMetadataReadProbeMiss(self: *RemoteMetadataSource, index: usize) void {
+        lockAtomic(&self.cache_mutex);
+        if (self.preferred_read_uri_index % self.base_uris.len == index) {
+            self.preferred_read_uri_index = (index + 1) % self.base_uris.len;
+        }
         self.cache_mutex.unlock();
     }
 
@@ -16089,8 +16104,9 @@ const RemoteMetadataSource = struct {
                 .metadata_incarnation = parsed.value.metadata_incarnation,
                 .catalog_revision = parsed.value.catalog_revision,
                 .change_token = .{
-                    .source_id = index + 1,
-                    .revision = parsed.value.change_token.revision,
+                    .metadata_group_id = parsed.value.metadata_group_id,
+                    .metadata_incarnation = parsed.value.metadata_incarnation,
+                    .revision = parsed.value.catalog_revision,
                 },
                 .tables = tables,
                 .ranges = try cloneRangesOwned(self.alloc, parsed.value.ranges),
@@ -16111,39 +16127,48 @@ const RemoteMetadataSource = struct {
 
     fn remoteWaitForRoutingChange(ptr: *anyopaque, observed_token: antfly.metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, probe_interval_ns: u64) !antfly.public_api.table_catalog.CatalogChangeWaitResult {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
-        const budget = antfly.metadata_http_client.RequestBudget{ .deadline_ns = deadline_ns };
-        const index = if (observed_token.source_id > 0 and observed_token.source_id <= self.base_uris.len)
-            observed_token.source_id - 1
-        else
-            self.preferred_read_uri_index;
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= deadline_ns) return .deadline_reached;
+        const probe_deadline_ns = catalogRoutingProbeDeadline(now_ns, deadline_ns, probe_interval_ns);
+        const final_probe = probe_deadline_ns == deadline_ns;
+        const budget = antfly.metadata_http_client.RequestBudget{ .deadline_ns = probe_deadline_ns };
+        const index = self.metadataReadApiIndexForAttempt(0);
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         var metadata_client = self.metadataClient(arena.allocator());
         var parsed = metadata_client.waitForRoutingChange(
             self.base_uris[index],
-            .{ .revision = observed_token.revision },
+            observed_token,
             budget,
         ) catch |err| {
-            if (err != error.UnsupportedOperation and
-                err != error.Timeout and err != error.DeadlineExceeded and
-                err != error.Cancelled and err != error.CatalogRoutingSnapshotTimeout)
-            {
-                // Re-resolve through normal replica failover rather than
-                // comparing this process-local token on another replica.
-                return .changed;
+            if (err == error.UnsupportedOperation) {
+                const fallback_now_ns = platform_time.monotonicNs();
+                if (fallback_now_ns < probe_deadline_ns) {
+                    const wait_ns = probe_deadline_ns - fallback_now_ns;
+                    platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
+                }
             }
-            if (err != error.UnsupportedOperation) return .deadline_reached;
-            // Rolling upgrades retain bounded probing until this replica
-            // advertises the long-poll endpoint.
-            const now_ns = platform_time.monotonicNs();
-            if (now_ns >= deadline_ns) return .deadline_reached;
-            const wait_ns = @min(deadline_ns - now_ns, @max(probe_interval_ns, std.time.ns_per_ms));
-            platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
-            return if (platform_time.monotonicNs() >= deadline_ns) .deadline_reached else .changed;
+            self.noteMetadataReadProbeMiss(index);
+            // Only a completed unchanged watch can confirm absence. Transport
+            // failure at the outer deadline is contention/unavailability and
+            // must remain a timeout rather than becoming not_found.
+            return if (err == error.UnsupportedOperation and final_probe) .deadline_reached else .retry;
         };
         defer parsed.deinit();
-        self.noteMetadataReadSuccess(index);
-        return if (parsed.value.changed) .changed else .deadline_reached;
+        return switch (parsed.value.effectiveDisposition()) {
+            .advanced, .authority_changed => blk: {
+                self.noteMetadataReadSuccess(index);
+                break :blk .changed;
+            },
+            .unchanged => blk: {
+                self.noteMetadataReadProbeMiss(index);
+                break :blk if (final_probe) .deadline_reached else .retry;
+            },
+            .replica_behind => blk: {
+                self.noteMetadataReadProbeMiss(index);
+                break :blk .retry;
+            },
+        };
     }
 
     fn remoteCachedAdminSnapshot(ptr: *anyopaque) !?antfly.metadata_api.AdminSnapshot {
@@ -31578,4 +31603,24 @@ test "data raft batch forwarding bounds routing campaigns deadlines and determin
 test "remote metadata catalog source provides compact routing" {
     var metadata: RemoteMetadataSource = undefined;
     _ = try metadata.catalogSource().routingSource();
+}
+
+test "remote catalog watches reserve the outer deadline for replica failover" {
+    const now_ns = 10 * std.time.ns_per_s;
+    try std.testing.expectEqual(
+        now_ns + 25 * std.time.ns_per_ms,
+        catalogRoutingProbeDeadline(
+            now_ns,
+            now_ns + std.time.ns_per_s,
+            25 * std.time.ns_per_ms,
+        ),
+    );
+    try std.testing.expectEqual(
+        now_ns + 5 * std.time.ns_per_ms,
+        catalogRoutingProbeDeadline(
+            now_ns,
+            now_ns + 5 * std.time.ns_per_ms,
+            25 * std.time.ns_per_ms,
+        ),
+    );
 }

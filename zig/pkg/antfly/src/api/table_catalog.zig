@@ -187,6 +187,9 @@ pub const OwnedRoutingSnapshot = struct {
 
 pub const CatalogChangeWaitResult = enum {
     changed,
+    /// The bounded watch completed without proving that the caller's overall
+    /// deadline expired. Re-resolve so replica selection can make progress.
+    retry,
     deadline_reached,
 };
 
@@ -1041,7 +1044,7 @@ pub fn awaitRoute(
     probe_interval_ns: u64,
 ) !AwaitRouteResult {
     while (true) {
-        if (platform_time.monotonicNs() >= deadline_ns) return .publication_not_observed;
+        if (platform_time.monotonicNs() >= deadline_ns) return .timed_out;
         var resolved = try resolveRouteObserved(alloc, routing, table_name, query, deadline_ns);
         switch (resolved) {
             .found => |plan| {
@@ -1052,6 +1055,7 @@ pub fn awaitRoute(
             .not_found => |observed_token| {
                 switch (try routing.waitForChange(observed_token, deadline_ns, probe_interval_ns)) {
                     .changed => continue,
+                    .retry => continue,
                     .deadline_reached => return .publication_not_observed,
                 }
             },
@@ -1225,7 +1229,8 @@ fn metadataServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.C
 
 fn metadataServiceWaitForRoutingChange(ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, _: u64) !CatalogChangeWaitResult {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-    return if (try svc.waitForCatalogRoutingChange(observed_token.revision, deadline_ns)) .changed else .deadline_reached;
+    const result = try svc.waitForCatalogRoutingChange(observed_token, deadline_ns);
+    return if (result.effectiveDisposition() == .unchanged) .deadline_reached else .changed;
 }
 
 fn metadataServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -1267,7 +1272,8 @@ fn metadataHttpServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_a
 
 fn metadataHttpServiceWaitForRoutingChange(ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, _: u64) !CatalogChangeWaitResult {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    return if (try svc.waitForCatalogRoutingChange(observed_token.revision, deadline_ns)) .changed else .deadline_reached;
+    const result = try svc.waitForCatalogRoutingChange(observed_token, deadline_ns);
+    return if (result.effectiveDisposition() == .unchanged) .deadline_reached else .changed;
 }
 
 fn metadataHttpServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -1309,7 +1315,8 @@ fn metadataServerFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Ca
 
 fn metadataServerWaitForRoutingChange(ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, _: u64) !CatalogChangeWaitResult {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
-    return if (try srv.svc.waitForCatalogRoutingChange(observed_token.revision, deadline_ns)) .changed else .deadline_reached;
+    const result = try srv.svc.waitForCatalogRoutingChange(observed_token, deadline_ns);
+    return if (result.effectiveDisposition() == .unchanged) .deadline_reached else .changed;
 }
 
 fn metadataServerValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -1945,6 +1952,47 @@ test "await route distinguishes persistent absence from capture timeout" {
     );
     try std.testing.expectEqual(AwaitRouteResult.publication_not_observed, result);
     try std.testing.expectEqual(@as(usize, 1), state.waits);
+}
+
+test "await route reports an expired pre-capture deadline as timed out" {
+    const State = struct { snapshots: usize = 0 };
+    const FakeCatalog = struct {
+        fn iface(state: *State) CatalogSource {
+            return .{ .ptr = state, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = routingSnapshot,
+                .linearizable_routing_snapshot = routingSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
+            } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.AdminSnapshotUsedForRouting;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn routingSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.snapshots += 1;
+            return .{ .tables = &.{}, .ranges = &.{} };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+    };
+
+    var state = State{};
+    const result = try awaitRoute(
+        std.testing.allocator,
+        try FakeCatalog.iface(&state).routingSource(),
+        "missing",
+        .all_ranges,
+        platform_time.monotonicNs() -| 1,
+        std.time.ns_per_ms,
+    );
+    try std.testing.expectEqual(AwaitRouteResult.timed_out, result);
+    try std.testing.expectEqual(@as(usize, 0), state.snapshots);
 }
 
 test "catalog doc identity readiness checks table range health" {

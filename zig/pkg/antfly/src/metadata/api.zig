@@ -215,18 +215,35 @@ pub const CatalogRoutingSnapshot = struct {
     metadata_group_id: u64 = 0,
     metadata_incarnation: ?MetadataClusterIncarnation = null,
     catalog_revision: u64 = 0,
-    /// Opaque publication observation used only to wait for a newer routing
-    /// projection. Remote adapters assign `source_id` to the replica that
-    /// produced the snapshot so process-local revisions are never compared
-    /// across replicas.
+    /// Durable authority-scoped publication observation used to wait for a
+    /// newer routing projection. It is safe to compare across replicas and
+    /// process restarts.
     change_token: CatalogRoutingChangeToken = .{},
     tables: []table_manager.TableRecord,
     ranges: []table_manager.RangeRecord,
 };
 
 pub const CatalogRoutingChangeToken = struct {
-    source_id: u64 = 0,
+    metadata_group_id: u64 = 0,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
     revision: u64 = 0,
+
+    pub fn fromSnapshot(snapshot: CatalogRoutingSnapshot) @This() {
+        return .{
+            .metadata_group_id = snapshot.metadata_group_id,
+            .metadata_incarnation = snapshot.metadata_incarnation,
+            .revision = snapshot.catalog_revision,
+        };
+    }
+
+    pub fn authorityEql(a: @This(), b: @This()) bool {
+        return a.metadata_group_id == b.metadata_group_id and
+            std.meta.eql(a.metadata_incarnation, b.metadata_incarnation);
+    }
+
+    pub fn eql(a: @This(), b: @This()) bool {
+        return a.authorityEql(b) and a.revision == b.revision;
+    }
 };
 
 pub const CatalogRoutingChangeRequest = struct {
@@ -235,7 +252,20 @@ pub const CatalogRoutingChangeRequest = struct {
 
 pub const CatalogRoutingChangeResult = struct {
     token: CatalogRoutingChangeToken,
-    changed: bool,
+    disposition: ?Disposition = null,
+    /// Retained while old and new metadata/data nodes may coexist.
+    changed: bool = false,
+
+    pub const Disposition = enum {
+        advanced,
+        unchanged,
+        authority_changed,
+        replica_behind,
+    };
+
+    pub fn effectiveDisposition(self: @This()) Disposition {
+        return self.disposition orelse if (self.changed) .advanced else .unchanged;
+    }
 };
 
 /// Compact catalog values consumed while staging one data-Raft generation.
