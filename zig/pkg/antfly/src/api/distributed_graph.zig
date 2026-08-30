@@ -1803,11 +1803,12 @@ fn validateSourceSnapshotGroupSet(
     catalog: table_catalog.CatalogSource,
     table_name: []const u8,
     base_result: db_mod.types.SearchResult,
+    deadline_ns: ?u64,
 ) !void {
     const tokens = base_result.shard_identity_read_generations;
     if (tokens.len == 0) return;
 
-    const group_ids = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
+    const group_ids = try table_catalog.resolveGroupsForSpanUntil(alloc, catalog, table_name, "", "", deadline_ns);
     defer alloc.free(group_ids);
     if (group_ids.len != tokens.len) return error.TopologyChanged;
     for (group_ids) |group_id| {
@@ -1857,7 +1858,7 @@ fn executeCrossRangeOnce(
 ) ![]db_mod.types.GraphSearchResult {
     if (!supportsCrossRange(req)) return error.UnsupportedQueryRequest;
     try table_catalog.validateDocIdentityReadyForTableStrict(alloc, catalog, table_name);
-    try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result);
+    try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result, worker.execution_deadline_ns);
 
     const results = try alloc.alloc(db_mod.types.GraphSearchResult, req.graph_queries.len);
     var initialized: usize = 0;
@@ -2122,9 +2123,9 @@ const GraphNodeAdmissionContext = struct {
                 db_mod.types.GraphTableReadAuthorization{ .allowed = true };
             defer authorization.deinit(self.alloc);
             const exists = authorization.allowed and
-                try table_catalog.tableExists(self.catalog, table_name);
+                try table_catalog.tableExistsUntil(self.alloc, self.catalog, table_name, self.worker.execution_deadline_ns);
             topology_epoch = if (exists)
-                try table_catalog.topologyEpoch(self.alloc, self.catalog, table_name)
+                try table_catalog.topologyEpochUntil(self.alloc, self.catalog, table_name, self.worker.execution_deadline_ns)
             else
                 0;
             allowed = exists;
@@ -2332,7 +2333,7 @@ fn executeSingleCrossRange(
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
 ) !db_mod.types.GraphSearchResult {
-    const topology_epoch = try table_catalog.topologyEpoch(alloc, catalog, table_name);
+    const topology_epoch = try table_catalog.topologyEpochUntil(alloc, catalog, table_name, worker.execution_deadline_ns);
     var admission = GraphNodeAdmissionContext.init(
         alloc,
         catalog,
@@ -2418,21 +2419,28 @@ const DistributedEdgeReader = struct {
         const table_name = table orelse self.source_table;
         const table_state = try self.admission.ensureTable(table_name);
         if (!table_state.allowed) return try a.alloc(graph_mod.Edge, 0);
-        const owner_group_id = (try table_catalog.resolveGroupForKeyPinned(
+        const owner_group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
             a,
             self.catalog,
             table_name,
             key,
             table_state.topology_epoch,
+            self.worker.execution_deadline_ns,
         )) orelse return error.TableNotFound;
         if (direction == .out) {
             return try self.getEdgesFromGroup(a, table_state, owner_group_id, key, edge_types, .out);
         }
 
-        try table_catalog.validateTopologyEpoch(a, self.catalog, table_name, table_state.topology_epoch);
-        const group_ids = try table_catalog.resolveGroupsForSpan(a, self.catalog, table_name, "", "");
+        const group_ids = try table_catalog.resolveGroupsForSpanPinnedUntil(
+            a,
+            self.catalog,
+            table_name,
+            "",
+            "",
+            table_state.topology_epoch,
+            self.worker.execution_deadline_ns,
+        );
         defer if (group_ids.len > 0) a.free(group_ids);
-        try table_catalog.validateTopologyEpoch(a, self.catalog, table_name, table_state.topology_epoch);
         if (group_ids.len == 0) return error.TableNotFound;
 
         var positive = GraphExpandBatches.empty;
@@ -3417,12 +3425,13 @@ fn findDistributedShortestPath(
         const expansion_table = item.table orelse table_name;
         const table_state = try admission.ensureTable(expansion_table);
         if (!table_state.allowed) return error.TableNotFound;
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(
+        const group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
             alloc,
             catalog,
             expansion_table,
             item.key,
             table_state.topology_epoch,
+            worker.execution_deadline_ns,
         )) orelse return error.TableNotFound;
         const frontier_ids = [_]u32{0};
         const exclude_node_refs = try collectCombinedExcludeNodes(alloc, &settled, excluded_nodes);
@@ -3577,12 +3586,13 @@ fn batchFrontierByGroup(
         if (!table_state.allowed) return error.TableNotFound;
         switch (direction) {
             .out => {
-                const group_id = (try table_catalog.resolveGroupForKeyPinned(
+                const group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
                     alloc,
                     catalog,
                     table_name,
                     item.key,
                     table_state.topology_epoch,
+                    worker.execution_deadline_ns,
                 )) orelse return error.TableNotFound;
                 try appendFrontierBatch(alloc, &batches, table_state, group_id, @intCast(i));
             },
@@ -3590,12 +3600,13 @@ fn batchFrontierByGroup(
                 // Preserve the target-owner route for `.both` so outgoing
                 // adjacency is read even when that shard has no reverse row.
                 if (direction == .both) {
-                    const owner_group_id = (try table_catalog.resolveGroupForKeyPinned(
+                    const owner_group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
                         alloc,
                         catalog,
                         table_name,
                         item.key,
                         table_state.topology_epoch,
+                        worker.execution_deadline_ns,
                     )) orelse return error.TableNotFound;
                     try appendFrontierBatch(alloc, &batches, table_state, owner_group_id, @intCast(i));
                 }
@@ -3614,10 +3625,16 @@ fn batchFrontierByGroup(
     while (incoming_it.next()) |entry| {
         const table_name = entry.key_ptr.*;
         const table_state = try admission.ensureTable(table_name);
-        try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, table_state.topology_epoch);
-        const group_ids = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
+        const group_ids = try table_catalog.resolveGroupsForSpanPinnedUntil(
+            alloc,
+            catalog,
+            table_name,
+            "",
+            "",
+            table_state.topology_epoch,
+            worker.execution_deadline_ns,
+        );
         defer if (group_ids.len > 0) alloc.free(group_ids);
-        try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, table_state.topology_epoch);
         if (group_ids.len == 0) return error.TableNotFound;
 
         const frontier_ids = entry.value_ptr.items;
@@ -4932,7 +4949,14 @@ fn hydrateHitsForKeys(
             _ = unique.remove(key);
             return err;
         };
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(alloc, catalog, table_name, key, topology_epoch)) orelse return error.TableNotFound;
+        const group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
+            alloc,
+            catalog,
+            table_name,
+            key,
+            topology_epoch,
+            worker.execution_deadline_ns,
+        )) orelse return error.TableNotFound;
         const batch = try batches.getOrPut(alloc, group_id);
         if (!batch.found_existing) batch.value_ptr.* = .empty;
         try batch.value_ptr.append(alloc, key);
@@ -5113,12 +5137,18 @@ pub fn probeIncomingEdgesForKeys(
     defer alloc.free(route_resolved);
     @memset(route_resolved, false);
 
-    try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, topology_epoch);
     const index_identity = (try catalogGraphIndexIdentity(alloc, catalog, table_name, index_name)) orelse
         return error.IndexNotFound;
-    const group_ids = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
+    const group_ids = try table_catalog.resolveGroupsForSpanPinnedUntil(
+        alloc,
+        catalog,
+        table_name,
+        "",
+        "",
+        topology_epoch,
+        worker.execution_deadline_ns,
+    );
     defer if (group_ids.len > 0) alloc.free(group_ids);
-    try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, topology_epoch);
     if (group_ids.len == 0) return error.TableNotFound;
 
     var route_projection_available = true;
@@ -9950,7 +9980,7 @@ pub fn testPerShardSnapshotsAcrossGraphPhases(alloc: std.mem.Allocator) !void {
     incomplete_result.shard_identity_read_generations = @constCast(tokens[0..1]);
     try std.testing.expectError(
         error.TopologyChanged,
-        validateSourceSnapshotGroupSet(alloc, FakeCatalog.iface(), "docs", incomplete_result),
+        validateSourceSnapshotGroupSet(alloc, FakeCatalog.iface(), "docs", incomplete_result, null),
     );
 
     var state = TestState{};

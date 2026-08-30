@@ -141,17 +141,11 @@ pub const CatalogProjectionReader = struct {
         defer self.unlock();
 
         const snapshot = try self.validationSnapshotLocked(alloc, metadata_group_id, source, deadline_ns);
-        // Incarnation is immutable after first publication, but its projection
-        // signal is intentionally outside table/range cache invalidation. Read
-        // it on every exported snapshot so a cache populated during bootstrap
-        // cannot retain a pre-incarnation null authority forever.
-        const store = source.projectedStore() orelse return error.MissingMetadataStore;
-        const incarnation = try store.getMetadataIncarnation(metadata_group_id);
         const tables = try cloneTables(alloc, snapshot.tables, deadline_ns);
         errdefer freeTables(alloc, tables);
         return .{
             .metadata_group_id = metadata_group_id,
-            .metadata_incarnation = incarnation,
+            .metadata_incarnation = snapshot.metadata_incarnation,
             .catalog_revision = snapshot.catalog_revision,
             .tables = tables,
             .ranges = try cloneRanges(alloc, snapshot.ranges, deadline_ns),

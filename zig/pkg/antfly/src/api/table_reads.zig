@@ -2483,6 +2483,14 @@ const ProvisionedConsistencyRequest = union(enum) {
     },
 };
 
+fn provisionedConsistencyDeadline(request: ProvisionedConsistencyRequest) ?u64 {
+    return switch (request) {
+        .search => |req| req.execution_deadline_ns,
+        .lookup => |lookup| lookup.opts.execution_deadline_ns,
+        .scan => null,
+    };
+}
+
 fn prepareProvisionedGroupConsistency(
     requester: raft_mod.ReadableLeaseRequester,
     group_id: u64,
@@ -2547,6 +2555,7 @@ pub const ProvisionedTableReadSource = struct {
         alloc: std.mem.Allocator,
         group_ids: []u64,
         topology_epoch: u64,
+        routing_deadline_ns: ?u64 = null,
         activity: ?ReadPreparation.Activity,
 
         fn releaseActivity(self: *PreparedSpanRead) void {
@@ -2801,13 +2810,14 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
         kind: ReadPreparation.Kind,
     ) !PreparedKeyRead {
+        const deadline_ns = provisionedConsistencyDeadline(request);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             if (consistency == .stale) {
                 var activity = self.beginPreparedRead(table_name, kind);
                 errdefer if (activity) |*held| held.deinit();
-                const route = try table_catalog.routedGroupSnapshot(alloc, self.catalog, table_name, key);
-                if (activity == null) table_catalog.validatePinnedTopologyEpoch(alloc, self.catalog, table_name, route.topology_epoch) catch |err| switch (err) {
+                const route = try table_catalog.routedGroupSnapshotUntil(alloc, self.catalog, table_name, key, deadline_ns);
+                if (activity == null) table_catalog.validatePinnedTopologyEpochUntil(alloc, self.catalog, table_name, route.topology_epoch, deadline_ns) catch |err| switch (err) {
                     error.TopologyChanged => {
                         if (activity) |*held| held.deinit();
                         activity = null;
@@ -2819,11 +2829,11 @@ pub const ProvisionedTableReadSource = struct {
                 return .{ .group_id = route.group_id, .topology_epoch = route.topology_epoch, .activity = activity };
             }
 
-            const route = try table_catalog.routedGroupSnapshot(alloc, self.catalog, table_name, key);
+            const route = try table_catalog.routedGroupSnapshotUntil(alloc, self.catalog, table_name, key, deadline_ns);
             if (route.group_id) |id| try self.prepareGroupsForReadAdmission(alloc, &.{id}, request, consistency);
             var activity = self.beginPreparedRead(table_name, kind);
             errdefer if (activity) |*held| held.deinit();
-            table_catalog.validatePinnedTopologyEpoch(alloc, self.catalog, table_name, route.topology_epoch) catch |err| switch (err) {
+            table_catalog.validatePinnedTopologyEpochUntil(alloc, self.catalog, table_name, route.topology_epoch, deadline_ns) catch |err| switch (err) {
                 error.TopologyChanged => {
                     if (activity) |*held| held.deinit();
                     activity = null;
@@ -2847,15 +2857,16 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
         kind: ReadPreparation.Kind,
     ) !PreparedSpanRead {
+        const deadline_ns = provisionedConsistencyDeadline(request);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             if (consistency == .stale) {
                 var activity = self.beginPreparedRead(table_name, kind);
                 errdefer if (activity) |*held| held.deinit();
-                const route = try table_catalog.routedSpanSnapshot(alloc, self.catalog, table_name, from_key, to_key);
+                const route = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, from_key, to_key, deadline_ns);
                 var group_ids = route.group_ids;
                 errdefer alloc.free(group_ids);
-                if (activity == null) table_catalog.validatePinnedTopologyEpoch(alloc, self.catalog, table_name, route.topology_epoch) catch |err| switch (err) {
+                if (activity == null) table_catalog.validatePinnedTopologyEpochUntil(alloc, self.catalog, table_name, route.topology_epoch, deadline_ns) catch |err| switch (err) {
                     error.TopologyChanged => {
                         alloc.free(group_ids);
                         group_ids = &.{};
@@ -2866,16 +2877,16 @@ pub const ProvisionedTableReadSource = struct {
                     },
                     else => return err,
                 };
-                return .{ .alloc = alloc, .group_ids = group_ids, .topology_epoch = route.topology_epoch, .activity = activity };
+                return .{ .alloc = alloc, .group_ids = group_ids, .topology_epoch = route.topology_epoch, .routing_deadline_ns = deadline_ns, .activity = activity };
             }
 
-            const route = try table_catalog.routedSpanSnapshot(alloc, self.catalog, table_name, from_key, to_key);
+            const route = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, from_key, to_key, deadline_ns);
             var group_ids = route.group_ids;
             errdefer alloc.free(group_ids);
             try self.prepareGroupsForReadAdmission(alloc, group_ids, request, consistency);
             var activity = self.beginPreparedRead(table_name, kind);
             errdefer if (activity) |*held| held.deinit();
-            table_catalog.validatePinnedTopologyEpoch(alloc, self.catalog, table_name, route.topology_epoch) catch |err| switch (err) {
+            table_catalog.validatePinnedTopologyEpochUntil(alloc, self.catalog, table_name, route.topology_epoch, deadline_ns) catch |err| switch (err) {
                 error.TopologyChanged => {
                     alloc.free(group_ids);
                     group_ids = &.{};
@@ -2886,7 +2897,7 @@ pub const ProvisionedTableReadSource = struct {
                 },
                 else => return err,
             };
-            return .{ .alloc = alloc, .group_ids = group_ids, .topology_epoch = route.topology_epoch, .activity = activity };
+            return .{ .alloc = alloc, .group_ids = group_ids, .topology_epoch = route.topology_epoch, .routing_deadline_ns = deadline_ns, .activity = activity };
         }
         unreachable;
     }
@@ -2901,13 +2912,14 @@ pub const ProvisionedTableReadSource = struct {
         kind: ReadPreparation.Kind,
         expected_epoch: u64,
     ) !?ReadPreparation.Activity {
+        const deadline_ns = if (request) |value| provisionedConsistencyDeadline(value) else null;
         if (consistency == .stale) {
             var activity = self.beginPreparedRead(table_name, kind);
             errdefer if (activity) |*held| held.deinit();
             if (expected_epoch != 0) {
-                try table_catalog.validatePinnedGroupTopology(alloc, self.catalog, table_name, group_id, expected_epoch);
+                try table_catalog.validatePinnedGroupTopologyUntil(alloc, self.catalog, table_name, group_id, expected_epoch, deadline_ns);
             } else {
-                _ = try table_catalog.groupTopologyEpoch(alloc, self.catalog, table_name, group_id);
+                _ = try table_catalog.groupTopologyEpochUntil(alloc, self.catalog, table_name, group_id, deadline_ns);
             }
             return activity;
         }
@@ -2915,12 +2927,12 @@ pub const ProvisionedTableReadSource = struct {
         const epoch = if (expected_epoch != 0)
             expected_epoch
         else
-            try table_catalog.groupTopologyEpoch(alloc, self.catalog, table_name, group_id);
-        if (expected_epoch != 0) try table_catalog.validatePinnedGroupTopology(alloc, self.catalog, table_name, group_id, epoch);
+            try table_catalog.groupTopologyEpochUntil(alloc, self.catalog, table_name, group_id, deadline_ns);
+        if (expected_epoch != 0) try table_catalog.validatePinnedGroupTopologyUntil(alloc, self.catalog, table_name, group_id, epoch, deadline_ns);
         if (request) |gate_request| try self.prepareGroupsForReadAdmission(alloc, &.{group_id}, gate_request, consistency);
         var activity = self.beginPreparedRead(table_name, kind);
         errdefer if (activity) |*held| held.deinit();
-        try table_catalog.validatePinnedGroupTopology(alloc, self.catalog, table_name, group_id, epoch);
+        try table_catalog.validatePinnedGroupTopologyUntil(alloc, self.catalog, table_name, group_id, epoch, deadline_ns);
         return activity;
     }
 
@@ -2934,7 +2946,13 @@ pub const ProvisionedTableReadSource = struct {
         std.debug.assert(prepared.activity == null);
         prepared.activity = self.beginPreparedRead(table_name, kind);
         errdefer prepared.releaseActivity();
-        try table_catalog.validatePinnedTopologyEpoch(alloc, self.catalog, table_name, prepared.topology_epoch);
+        try table_catalog.validatePinnedTopologyEpochUntil(
+            alloc,
+            self.catalog,
+            table_name,
+            prepared.topology_epoch,
+            prepared.routing_deadline_ns,
+        );
     }
 
     fn lookup(
@@ -3954,7 +3972,13 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try checkLookupOptionsActive(opts);
-        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, key)) orelse {
+        const group_id = (try table_catalog.resolveGroupForKeyUntil(
+            alloc,
+            self.catalog,
+            table_name,
+            key,
+            opts.execution_deadline_ns,
+        )) orelse {
             return null;
         };
         try checkLookupOptionsActive(opts);
@@ -4168,7 +4192,14 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try checkQueryDeadline(req);
-        const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
+        const group_ids = try table_catalog.resolveGroupsForSpanUntil(
+            alloc,
+            self.catalog,
+            table_name,
+            "",
+            "",
+            req.execution_deadline_ns,
+        );
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
@@ -5778,6 +5809,8 @@ test "hosted distributed grouped hierarchy expands the globally selected shard p
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -6007,6 +6040,8 @@ test "table read distributed sorted merge uses catalog runtime schema and reject
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -18725,6 +18760,8 @@ test "provisioned table read source routes lookup and scan across ranges" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -18808,6 +18845,8 @@ test "provisioned standby read gate permits stale reads and routes non-stale rea
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -18936,6 +18975,8 @@ test "provisioned table read source merges query results across ranges" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -19037,6 +19078,8 @@ test "provisioned table read source serves dense queries for explicit external e
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -19137,6 +19180,8 @@ test "provisioned local query execution returns stamped identity request" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -19193,6 +19238,8 @@ const SingleGroupReadTestCatalog = struct {
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
             },
         };
     }
@@ -19231,6 +19278,7 @@ const single_group_read_test_namespace: db_mod.DocIdentityNamespace = .{
 const MutableReadTopologyCatalog = struct {
     group_id: u64 = 7001,
     snapshot_count: usize = 0,
+    last_routing_deadline_ns: ?u64 = null,
     tables: [1]metadata_table_manager.TableRecord = .{.{
         .table_id = 7,
         .name = "docs",
@@ -19255,6 +19303,8 @@ const MutableReadTopologyCatalog = struct {
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = routingSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
             },
         };
     }
@@ -19274,6 +19324,12 @@ const MutableReadTopologyCatalog = struct {
     }
 
     fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+    fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.last_routing_deadline_ns = deadline_ns;
+        return try table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot(ptr, deadline_ns);
+    }
 };
 
 const TopologyReadAdmissionTracker = struct {
@@ -19339,6 +19395,7 @@ const TopologyGateTracker = struct {
 
 test "provisioned consistency read reroutes after topology changes before admission" {
     const alloc = std.testing.allocator;
+    const routing_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
     var catalog = MutableReadTopologyCatalog{};
     var admission = TopologyReadAdmissionTracker{ .catalog = &catalog };
     var gate = TopologyGateTracker{
@@ -19353,7 +19410,7 @@ test "provisioned consistency read reroutes after topology changes before admiss
         alloc,
         "docs",
         "doc:a",
-        .{ .lookup = .{ .key = "doc:a", .opts = .{} } },
+        .{ .lookup = .{ .key = "doc:a", .opts = .{ .execution_deadline_ns = routing_deadline_ns } } },
         .read_index,
         .general,
     );
@@ -19363,6 +19420,7 @@ test "provisioned consistency read reroutes after topology changes before admiss
     try std.testing.expectEqual(@as(usize, 2), admission.begins);
     try std.testing.expectEqual(@as(usize, 1), admission.ends);
     try std.testing.expectEqual(@as(usize, 1), admission.active);
+    try std.testing.expectEqual(routing_deadline_ns, catalog.last_routing_deadline_ns.?);
 }
 
 test "provisioned stale read admits before routing without a redundant catalog validation" {
@@ -19929,6 +19987,8 @@ test "provisioned table read source serves public dense query requests with read
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20006,6 +20066,8 @@ test "provisioned table read source serves profiled public dense query requests 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20087,6 +20149,8 @@ test "provisioned table read source serves public dense query requests without e
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20164,6 +20228,8 @@ test "provisioned table read source serves benchmark-shaped packed dense query w
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20259,6 +20325,8 @@ test "provisioned table read source preflights every local group" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20336,6 +20404,8 @@ test "provisioned local runtime statuses reconcile empty managed embeddings inde
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20481,6 +20551,8 @@ test "provisioned query db installs asset producer from indexes_json and replays
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20550,6 +20622,8 @@ test "provisioned table read source runtime status stays cache-only without shar
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20583,6 +20657,8 @@ test "provisioned table read source runtime status stays cache-only without shar
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20615,6 +20691,8 @@ test "provisioned table read source runtime status falls back to shared snapshot
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20685,6 +20763,8 @@ test "provisioned table read source runtime status prefers shared snapshot cache
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20718,6 +20798,8 @@ test "provisioned table read source runtime status prefers shared snapshot cache
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -20798,6 +20880,8 @@ test "provisioned table read source falls back from read_index to stale on not l
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -21180,6 +21264,8 @@ test "hosted hierarchy navigation routes projection-safe hydration and advances 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -21982,6 +22068,8 @@ test "distributed table reads reject stale doc identity before multigroup fanout
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -23523,6 +23611,8 @@ test "aggregation text analysis selects the named full text index" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -23685,6 +23775,8 @@ test "provisioned distributed aggregations collect path terms nested cardinality
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -25210,6 +25302,8 @@ test "hosted textStatsGroupLocal serves only the local group" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -25341,6 +25435,8 @@ test "hosted table read source preflights query locally" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -25472,6 +25568,8 @@ test "hosted table read source preflights every local group" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -25605,6 +25703,8 @@ test "hosted table read source preflights mixed local and remote groups" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -25831,6 +25931,8 @@ test "hosted cross-range graph query expands explicit local start keys" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -25970,6 +26072,8 @@ test "provisioned read cache keys entries by lsm root generation" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26050,6 +26154,8 @@ test "provisioned read cache keys entries by identity namespace" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26128,6 +26234,8 @@ test "provisioned read cache invalidates repeated ownership moves with pinned le
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26211,6 +26319,8 @@ test "graph edge local read rejects stale identity generation" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26310,6 +26420,8 @@ test "graph edge local read rejects stale identity namespace" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26488,6 +26600,8 @@ test "provisioned query runtime db opens with catalog identity namespace" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26565,6 +26679,8 @@ test "provisioned query runtime db rejects stale identity namespace" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26626,6 +26742,8 @@ test "provisioned primary lookup lease fails on identity namespace mismatch" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26749,6 +26867,8 @@ test "provisioned read cache invalidate removes entries without dropping pending
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26821,6 +26941,8 @@ test "provisioned read cache retires invalidated entries until the last lease is
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26899,6 +27021,8 @@ test "provisioned read cache exclusive access drains active read leases" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -26995,6 +27119,8 @@ test "provisioned read cache group exclusive drains only the published group" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -27090,6 +27216,8 @@ test "provisioned read cache retirement is allocation-free after entry installat
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -27187,6 +27315,8 @@ test "provisioned storage inspection uses table read admission" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }

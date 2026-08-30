@@ -3619,6 +3619,8 @@ pub fn build(b: *std.Build) void {
         "metadata status JSON preserves compact managed repair admission state",
         "catalog sources without compact routing fail closed",
         "span routing uses compact catalog snapshot when available",
+        "span routing confirms eventual misses with a linearizable compact snapshot",
+        "route resolver confirms a table-present range miss linearly",
         "eventual span routing distinguishes snapshot timeout",
         "remote runtime status reports replay debt separately from active catch-up",
         "table storage status sums complete fresh shard disk usage",

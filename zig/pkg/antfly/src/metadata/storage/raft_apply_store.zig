@@ -679,6 +679,14 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     const group_id = group_ids.main_metadata_group_id;
     const first: metadata_incarnation.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
     const competing: metadata_incarnation.MetadataClusterIncarnation = "22222222222222222222222222222222".*;
+    const Capture = struct {
+        incarnation_signals: usize = 0,
+
+        fn onProjection(ptr: *anyopaque, signal: ProjectionSignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (signal.kind == .metadata_incarnation) self.incarnation_signals += 1;
+        }
+    };
 
     const initialize = try encodeTransitionCommand(std.testing.allocator, .{ .initialize_metadata_incarnation = first });
     defer std.testing.allocator.free(initialize);
@@ -691,8 +699,11 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     defer std.testing.allocator.free(entries);
 
     var source = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = source_root });
+    var capture = Capture{};
+    try source.addProjectionListener(.{ .ptr = &capture, .vtable = &.{ .on_projection_signal = Capture.onProjection } });
     try source.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 2, .entries_bytes = entries });
     try std.testing.expectEqual(first, (try source.getMetadataIncarnation(group_id)).?);
+    try std.testing.expectEqual(@as(usize, 1), capture.incarnation_signals);
     try std.testing.expectEqual(@as(u16, 0), try source.getRuntimeStatusProtocolActivationVersion(group_id));
 
     var repair_indexes = [_]metadata.RuntimeIndexStatusReport{.{
@@ -974,6 +985,7 @@ pub const RaftApplyStoreConfig = struct {
 };
 
 pub const ProjectionSignalKind = enum {
+    metadata_incarnation,
     table,
     range,
     store,
@@ -2349,6 +2361,7 @@ pub const RaftApplyStore = struct {
 
     fn notifyMetadataSnapshotInstalled(self: *RaftApplyStore, group_id: u64) void {
         const kinds = [_]ProjectionSignalKind{
+            .metadata_incarnation,
             .table,
             .range,
             .store,
@@ -2498,6 +2511,10 @@ pub const RaftApplyStore = struct {
                 const existing = txn.get(key) catch |err| switch (err) {
                     error.NotFound => {
                         try txn.put(key, &incarnation);
+                        self.notifyProjectionListeners(.{
+                            .kind = .metadata_incarnation,
+                            .metadata_group_id = group_id,
+                        });
                         return;
                     },
                     else => return err,

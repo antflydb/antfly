@@ -1065,7 +1065,7 @@ const LinearizableMetadataReadTracker = struct {
 
 fn projectionSignalChangesCatalog(kind: metadata_storage.raft_apply_store.ProjectionSignalKind) bool {
     return switch (kind) {
-        .table, .range => true,
+        .metadata_incarnation, .table, .range => true,
         else => false,
     };
 }
@@ -1085,6 +1085,7 @@ fn projectionSignalChangesTransitionReadiness(kind: metadata_storage.raft_apply_
 }
 
 test "metadata service catalog validation epoch ignores non-catalog projection traffic" {
+    try std.testing.expect(projectionSignalChangesCatalog(.metadata_incarnation));
     try std.testing.expect(projectionSignalChangesCatalog(.table));
     try std.testing.expect(projectionSignalChangesCatalog(.range));
     try std.testing.expect(!projectionSignalChangesCatalog(.store));
@@ -4048,7 +4049,7 @@ pub const MetadataHttpService = struct {
             _ = self.transition_readiness_epoch.fetchAdd(1, .release);
         }
         switch (signal.kind) {
-            .table, .range, .store, .shuffle_join_lease, .restore_job => _ = self.projection_epoch.fetchAdd(1, .monotonic),
+            .metadata_incarnation, .table, .range, .store, .shuffle_join_lease, .restore_job => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .schema_progress => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .restore_progress, .replication_source_status => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .placement_intent => _ = self.placement_epoch.fetchAdd(1, .monotonic),
