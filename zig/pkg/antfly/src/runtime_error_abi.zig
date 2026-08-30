@@ -297,6 +297,8 @@ pub const Detail = enum(c_int) {
     enrichment_wait_canceled,
     enrichment_wait_timeout,
     enrichment_worker_failed,
+    deadline_exceeded,
+    pre_decision_deadline_exceeded,
     graph_metric_action_partial_outcome,
 };
 
@@ -396,6 +398,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidTableIndexMetadata => status(.invalid_argument, .invalid_table_index_metadata),
         error.InvalidEnrichmentConfig => status(.invalid_argument, .invalid_enrichment_config),
         error.UnsupportedQueryRequest => status(.unsupported, .unsupported_query_request),
+        error.UnsupportedHierarchyGrouping => status(.unsupported, .unsupported_query_request),
         error.UnsupportedFilterQueryRequest => status(.unsupported, .unsupported_filter_query_request),
         error.UnsupportedExclusionQueryRequest => status(.unsupported, .unsupported_exclusion_query_request),
         error.UnsupportedSyncLevel => status(.unsupported, .unsupported_sync_level),
@@ -403,6 +406,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedVersion => status(.unsupported, .unsupported_version),
         error.UnsupportedPlatform => status(.unsupported, .unsupported_platform),
         error.Timeout => status(.timeout, .timeout),
+        error.DeadlineExceeded => status(.timeout, .deadline_exceeded),
+        error.PreDecisionDeadlineExceeded => status(.timeout, .pre_decision_deadline_exceeded),
         error.ConnectionTimeout => status(.timeout, .connection_timeout),
         error.ConnectionTimedOut => status(.timeout, .connection_timed_out),
         error.Cancelled => status(.cancelled, .cancelled),
@@ -884,6 +889,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .enrichment_wait_canceled => "EnrichmentWaitCanceled",
         .enrichment_wait_timeout => "EnrichmentWaitTimeout",
         .enrichment_worker_failed => "EnrichmentWorkerFailed",
+        .deadline_exceeded => "DeadlineExceeded",
+        .pre_decision_deadline_exceeded => "PreDecisionDeadlineExceeded",
         .graph_metric_action_partial_outcome => "GraphMetricActionPartialOutcome",
     };
 }
@@ -903,6 +910,8 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.EnrichmentWaitCanceled, errorFromStatus(statusFromError(error.EnrichmentWaitCanceled)));
     try std.testing.expectEqual(error.EnrichmentWaitTimeout, errorFromStatus(statusFromError(error.EnrichmentWaitTimeout)));
     try std.testing.expectEqual(error.EnrichmentWorkerFailed, errorFromStatus(statusFromError(error.EnrichmentWorkerFailed)));
+    try std.testing.expectEqual(error.DeadlineExceeded, errorFromStatus(statusFromError(error.DeadlineExceeded)));
+    try std.testing.expectEqual(error.PreDecisionDeadlineExceeded, errorFromStatus(statusFromError(error.PreDecisionDeadlineExceeded)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));

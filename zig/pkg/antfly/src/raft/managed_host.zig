@@ -277,6 +277,16 @@ pub const ManagedHost = struct {
         return round;
     }
 
+    pub fn runProgressRoundBounded(
+        self: *ManagedHost,
+        max_inbound_messages: usize,
+        max_ready_steps: usize,
+    ) !raft_engine.runtime.multi_raft.HostRound {
+        const round = try self.host.runProgressRoundBounded(max_inbound_messages, max_ready_steps);
+        _ = try self.pollLeadership();
+        return round;
+    }
+
     pub fn status(self: *ManagedHost, group_id: u64) host_mod.HostedReplicaStatus {
         return self.host.status(group_id);
     }
@@ -312,6 +322,20 @@ pub const ManagedHost = struct {
     ) !ManagedSyncResult {
         const reconcile_result = try self.applyAndReconcile(updates);
         const runtime_round = try self.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_steps);
+        return .{
+            .reconcile = reconcile_result,
+            .runtime = runtime_round,
+        };
+    }
+
+    pub fn syncOnceProgressBounded(
+        self: *ManagedHost,
+        updates: []const metadata_view.MetadataUpdate,
+        max_inbound_messages: usize,
+        max_ready_steps: usize,
+    ) !ManagedSyncResult {
+        const reconcile_result = try self.applyAndReconcile(updates);
+        const runtime_round = try self.runProgressRoundBounded(max_inbound_messages, max_ready_steps);
         return .{
             .reconcile = reconcile_result,
             .runtime = runtime_round,
@@ -535,6 +559,16 @@ pub const ManagedHttpHost = struct {
         return round;
     }
 
+    pub fn runProgressRoundBounded(
+        self: *ManagedHttpHost,
+        max_inbound_messages: usize,
+        max_ready_steps: usize,
+    ) !raft_engine.runtime.multi_raft.HostRound {
+        const round = try self.http_host.runProgressRoundBounded(max_inbound_messages, max_ready_steps);
+        _ = try self.pollLeadership();
+        return round;
+    }
+
     pub fn status(self: *ManagedHttpHost, group_id: u64) host_mod.HostedReplicaStatus {
         return self.http_host.status(group_id);
     }
@@ -570,6 +604,20 @@ pub const ManagedHttpHost = struct {
     ) !ManagedSyncResult {
         const reconcile_result = try self.applyAndReconcile(updates);
         const runtime_round = try self.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_steps);
+        return .{
+            .reconcile = reconcile_result,
+            .runtime = runtime_round,
+        };
+    }
+
+    pub fn syncOnceProgressBounded(
+        self: *ManagedHttpHost,
+        updates: []const metadata_view.MetadataUpdate,
+        max_inbound_messages: usize,
+        max_ready_steps: usize,
+    ) !ManagedSyncResult {
+        const reconcile_result = try self.applyAndReconcile(updates);
+        const runtime_round = try self.runProgressRoundBounded(max_inbound_messages, max_ready_steps);
         return .{
             .reconcile = reconcile_result,
             .runtime = runtime_round,

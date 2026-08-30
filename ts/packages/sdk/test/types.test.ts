@@ -13,6 +13,7 @@ import type {
   BatchRequest,
   BooleanQuery,
   BoolFieldQuery,
+  ClusterStatus,
   ConjunctionQuery,
   CreateIndexRequest,
   DisjunctionQuery,
@@ -20,6 +21,7 @@ import type {
   GraphMetricBuildPageStatus,
   GraphMetricQuery,
   GraphMetricRuntimeStats,
+  IndexRuntimeCapabilities,
   MatchQuery,
   NumericRangeQuery,
   QueryRequest,
@@ -59,12 +61,38 @@ describe("Antfly Query Type Integration", () => {
     expect(page.range_kind).toBe("summary");
   });
 
+  describe("cluster status capabilities", () => {
+    it("exports the typed artifact-source capability contract", () => {
+      const capabilities: IndexRuntimeCapabilities = {
+        artifact_sources: true,
+        artifact_sources_state: "available",
+      };
+      const status: ClusterStatus = {
+        health: "healthy",
+        deployment_mode: "standalone",
+        index_capabilities: capabilities,
+      };
+      type CreatedEmbeddings = components["schemas"]["CreatedEmbeddingsIndexConfig"];
+      const created: CreatedEmbeddings = {
+        sources: [{ artifact: "document_dense_v1" }],
+        embedding_name: "document_dense_v1",
+        source_artifact_name: "document_chunks_v1",
+      };
+
+      expect(status.index_capabilities?.artifact_sources).toBe(true);
+      expect(status.index_capabilities?.artifact_sources_state).toBe("available");
+      expect(created.embedding_name).toBe("document_dense_v1");
+    });
+  });
+
   describe("Backup metadata availability responses", () => {
     it("types both retryable 503 variants", () => {
       type BackupUnavailable = components["schemas"]["BackupMetadataUnavailableError"];
       type Backup503 = operations["backup"]["responses"][503]["content"]["application/json"];
-      type BackupTable503 = operations["backupTable"]["responses"][503]["content"]["application/json"];
-      type BackupTable409 = operations["backupTable"]["responses"][409]["content"]["application/json"];
+      type BackupTable503 =
+        operations["backupTable"]["responses"][503]["content"]["application/json"];
+      type BackupTable409 =
+        operations["backupTable"]["responses"][409]["content"]["application/json"];
       type ClusterBackup = components["schemas"]["ClusterBackupResponse"];
 
       const capability: BackupUnavailable = {
@@ -85,7 +113,8 @@ describe("Antfly Query Type Integration", () => {
       const ambiguous: BackupTable409 = {
         code: "backup_outcome_ambiguous",
         error: "backup outcome is ambiguous; inspect the backup id before retrying",
-        message: "backup outcome is ambiguous; inspect the backup id and artifact id before retrying",
+        message:
+          "backup outcome is ambiguous; inspect the backup id and artifact id before retrying",
         retryable: false,
         backup_id: "snap",
         artifact_backup_id: "generation-7",
@@ -93,14 +122,16 @@ describe("Antfly Query Type Integration", () => {
       const ambiguousCluster: ClusterBackup = {
         backup_id: "nightly",
         status: "ambiguous",
-        tables: [{
-          name: "docs",
-          status: "ambiguous",
-          code: "backup_outcome_ambiguous",
-          retryable: false,
-          backup_id: "attempt-t-0",
-          artifact_backup_id: "attempt-a-0",
-        }],
+        tables: [
+          {
+            name: "docs",
+            status: "ambiguous",
+            code: "backup_outcome_ambiguous",
+            retryable: false,
+            backup_id: "attempt-t-0",
+            artifact_backup_id: "attempt-a-0",
+          },
+        ],
       };
 
       expectTypeOf<Backup503>().toEqualTypeOf<BackupUnavailable>();
@@ -137,9 +168,18 @@ describe("Antfly Query Type Integration", () => {
       const graph: CreateIndexRequest = {
         type: "graph",
         source: {
-          kind: "artifact",
           artifact: "relations_v1",
           format: "extraction_graph",
+          nodes: {
+            model: "document",
+            target: "{{ _item.target.text }}",
+          },
+          edge: {
+            type: "{{ _item.type }}",
+            weight: 0.75,
+            metadata: { source: "extractor" },
+          },
+          context: { doc_fields: ["title", "body"] },
         },
         artifact: {
           name: "relations_v1",
@@ -147,17 +187,6 @@ describe("Antfly Query Type Integration", () => {
           source: { type: "template", value: "{{ body }}" },
           execution: { batch_items: 8 },
         },
-        nodes: {
-          model: "document",
-          source: "{{ _doc.key }}",
-          target: "{{ _item.target.text }}",
-        },
-        edge: {
-          type: "{{ _item.type }}",
-          weight: 0.75,
-          metadata: { source: "extractor" },
-        },
-        context: { doc_fields: ["title", "body"] },
         algebraic_planning: {
           bounded_traversal: {
             law: "provenance_semiring",
@@ -165,7 +194,7 @@ describe("Antfly Query Type Integration", () => {
         },
       };
 
-      expect(graph.edge?.weight).toBe(0.75);
+      expect(graph.source?.edge?.weight).toBe(0.75);
       expect(graph.artifact?.execution?.batch_items).toBe(8);
       expect(graph.algebraic_planning?.bounded_traversal?.law).toBe("provenance_semiring");
     });
@@ -207,6 +236,7 @@ describe("Antfly Query Type Integration", () => {
     it("should accept valid MatchQuery in full_text_search", () => {
       const query: QueryRequest = {
         table: "products",
+        full_text_index: "product_text",
         full_text_search: {
           match: "laptop",
           field: "name",
@@ -215,6 +245,7 @@ describe("Antfly Query Type Integration", () => {
       };
 
       expect(query.full_text_search).toBeDefined();
+      expect(query.full_text_index).toBe("product_text");
       expectTypeOf(query.full_text_search).toMatchTypeOf<AntflyQuery | undefined>();
     });
 

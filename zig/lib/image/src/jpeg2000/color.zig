@@ -14,5 +14,5 @@
 
 pub fn supportsOutputU8(components: u16, bits_per_component: u8, is_signed: bool) bool {
     _ = is_signed;
-    return (components == 1 or components == 3 or components == 4) and bits_per_component >= 1 and bits_per_component <= 16;
+    return components >= 1 and components <= 5 and bits_per_component >= 1 and bits_per_component <= 16;
 }

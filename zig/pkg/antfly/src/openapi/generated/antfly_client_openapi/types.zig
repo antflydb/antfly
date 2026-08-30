@@ -721,6 +721,12 @@ pub const ApiKeyWithSecret = struct {
     encoded: []const u8,
 };
 
+/// Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment.
+pub const ArtifactIndexSource = struct {
+    /// Stable name of a generated artifact stream.
+    artifact: []const u8,
+};
+
 /// Kind of stored artifact tracked by the repair queue.
 pub const ArtifactRepairKind = enum {
     embedding,
@@ -765,6 +771,7 @@ pub const ArtifactRepairReason = enum {
     corrupt_artifact,
     unreadable_artifact,
     enrichment_failed,
+    resource_limit_exceeded,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -772,6 +779,7 @@ pub const ArtifactRepairReason = enum {
             .corrupt_artifact => "corrupt_artifact",
             .unreadable_artifact => "unreadable_artifact",
             .enrichment_failed => "enrichment_failed",
+            .resource_limit_exceeded => "resource_limit_exceeded",
         };
         try jw.write(s);
     }
@@ -786,6 +794,36 @@ pub const ArtifactRepairReason = enum {
             .{ "corrupt_artifact", .corrupt_artifact },
             .{ "unreadable_artifact", .unreadable_artifact },
             .{ "enrichment_failed", .enrichment_failed },
+            .{ "resource_limit_exceeded", .resource_limit_exceeded },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Whether artifact-backed index mutations are accepted now, temporarily fenced during a distributed rolling upgrade, or permanently unsupported by this deployment.
+pub const ArtifactSourcesCapabilityState = enum {
+    available,
+    upgrade_pending,
+    unsupported,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .available => "available",
+            .upgrade_pending => "upgrade_pending",
+            .unsupported => "unsupported",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "available", .available },
+            .{ "upgrade_pending", .upgrade_pending },
+            .{ "unsupported", .unsupported },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -1528,6 +1566,7 @@ pub const ClusterStatus = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
     storage: ?StorageRuntimeStatus = null,
@@ -1541,6 +1580,7 @@ pub const ClusterTopology = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
     storage: ?StorageRuntimeStatus = null,
@@ -1864,9 +1904,11 @@ pub const CreateEmbeddingsIndexRequest = struct {
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
-    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    sources: ?[]const ArtifactIndexSource = null,
+    /// Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    /// Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name is required and this value must exactly match the source_artifact_name on the authoritative embedding enrichment. New clients should declare the relationship only on that enrichment.
     source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
@@ -1898,11 +1940,13 @@ pub const CreateFullTextIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    sources: ?[]const FullTextArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
-    /// Document field indexed as text. Omit for the table's default full-document text index.
+    /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection.
     field: ?[]const u8 = null,
-    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     artifact_name: ?[]const u8 = null,
     type: []const u8,
 };
@@ -1915,19 +1959,20 @@ pub const CreateGraphIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    sources: ?[]const GraphArtifactSourceConfig = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
     summarizer: ?GeneratorConfig = null,
     /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
     template: ?[]const u8 = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
-    /// Maximum number of edges per document (0 = unlimited)
+    /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
     max_edges_per_document: ?i64 = null,
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     source: ?GraphArtifactSourceConfig = null,
+    /// Single asset-producer shorthand. It must be paired with exactly one source selecting the same artifact name.
     artifact: ?GraphArtifactProducerConfig = null,
-    nodes: ?GraphArtifactNodeMappingConfig = null,
-    edge: ?GraphArtifactEdgeMappingConfig = null,
-    context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
     type: []const u8,
@@ -2041,7 +2086,11 @@ pub const CreatedEmbeddingsIndex = struct {
     sparse: ?bool = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
+    /// Embedding artifact streams indexed together as independent vector members.
+    sources: ?[]const ArtifactIndexSource = null,
+    /// Released v0.2 single-source read field, preserved when that request form created the index. Canonical source identity is also returned through sources.
     embedding_name: ?[]const u8 = null,
+    /// Deprecated v0.2 descriptive source read field, preserved when supplied with embedding_name. The matching enrichment is authoritative.
     source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
@@ -2056,7 +2105,7 @@ pub const CreatedEmbeddingsIndex = struct {
     type: []const u8,
 };
 
-/// Credential-free normalized embeddings configuration returned after creation.
+/// Credential-free normalized embeddings configuration returned after creation. Single-source v0.2 fields are preserved alongside canonical sources for read compatibility.
 pub const CreatedEmbeddingsIndexConfig = struct {
     publication_policy: ?IndexPublicationPolicy = null,
     coverage_policy: ?DerivedCoveragePolicy = null,
@@ -2064,7 +2113,11 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     sparse: ?bool = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
+    /// Embedding artifact streams indexed together as independent vector members.
+    sources: ?[]const ArtifactIndexSource = null,
+    /// Released v0.2 single-source read field, preserved when that request form created the index. Canonical source identity is also returned through sources.
     embedding_name: ?[]const u8 = null,
+    /// Deprecated v0.2 descriptive source read field, preserved when supplied with embedding_name. The matching enrichment is authoritative.
     source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
@@ -2086,6 +2139,8 @@ pub const CreatedEnrichmentConfig = struct {
     template: ?[]const u8 = null,
     source_artifact_name: ?[]const u8 = null,
     expected_dims: ?i64 = null,
+    /// Optional stable model/token-space identifier asserted for this embedding artifact.
+    vector_space: ?[]const u8 = null,
     chunk_size: ?i64 = null,
     chunk_overlap: ?i64 = null,
     chunker_json: ?[]const u8 = null,
@@ -2104,13 +2159,17 @@ pub const CreatedFullTextIndex = struct {
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
     enrichments: ?[]const CreatedEnrichmentConfig = null,
-    /// Whether to use memory-only storage
+    sources: ?[]const FullTextArtifactIndexSource = null,
     mem_only: ?bool = null,
-    /// Document field indexed as text. Omit for the table's default full-document text index.
     field: ?[]const u8 = null,
-    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
-    artifact_name: ?[]const u8 = null,
     type: []const u8,
+};
+
+/// Canonical full-text configuration returned after creation. Single-source alternative request forms are represented through sources.
+pub const CreatedFullTextIndexConfig = struct {
+    sources: ?[]const FullTextArtifactIndexSource = null,
+    mem_only: ?bool = null,
+    field: ?[]const u8 = null,
 };
 
 /// Credential-free graph artifact producer configuration returned after creation.
@@ -2120,6 +2179,17 @@ pub const CreatedGraphArtifactProducerConfig = struct {
     source: GraphArtifactProducerSourceConfig,
     content_type: ?[]const u8 = null,
     execution: ?ExecutionPolicy = null,
+};
+
+/// Canonical artifact stream materialized into graph edges.
+pub const CreatedGraphArtifactSourceConfig = struct {
+    artifact: []const u8,
+    path: ?[]const u8 = null,
+    format: ?[]const u8 = null,
+    mention_edge_type: ?[]const u8 = null,
+    nodes: ?GraphArtifactNodeMappingConfig = null,
+    edge: ?GraphArtifactEdgeMappingConfig = null,
+    context: ?GraphArtifactContextConfig = null,
 };
 
 /// Normalized effective graph index configuration returned after creation.
@@ -2135,12 +2205,10 @@ pub const CreatedGraphIndex = struct {
     summarizer: ?CreatedProviderConfig = null,
     template: ?[]const u8 = null,
     edge_types: ?[]const EdgeTypeConfig = null,
+    /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
     max_edges_per_document: ?i64 = null,
-    source: ?GraphArtifactSourceConfig = null,
+    sources: ?[]const CreatedGraphArtifactSourceConfig = null,
     artifact: ?CreatedGraphArtifactProducerConfig = null,
-    nodes: ?GraphArtifactNodeMappingConfig = null,
-    edge: ?GraphArtifactEdgeMappingConfig = null,
-    context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
     type: []const u8,
@@ -2151,12 +2219,10 @@ pub const CreatedGraphIndexConfig = struct {
     summarizer: ?CreatedProviderConfig = null,
     template: ?[]const u8 = null,
     edge_types: ?[]const EdgeTypeConfig = null,
+    /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
     max_edges_per_document: ?i64 = null,
-    source: ?GraphArtifactSourceConfig = null,
+    sources: ?[]const CreatedGraphArtifactSourceConfig = null,
     artifact: ?CreatedGraphArtifactProducerConfig = null,
-    nodes: ?GraphArtifactNodeMappingConfig = null,
-    edge: ?GraphArtifactEdgeMappingConfig = null,
-    context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
 };
@@ -3013,9 +3079,11 @@ pub const EmbeddingsIndexConfig = struct {
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
-    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    sources: ?[]const ArtifactIndexSource = null,
+    /// Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    /// Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name is required and this value must exactly match the source_artifact_name on the authoritative embedding enrichment. New clients should declare the relationship only on that enrichment.
     source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
@@ -3162,6 +3230,8 @@ pub const EnrichmentConfig = struct {
     source_artifact_name: ?[]const u8 = null,
     /// Expected embedding dimension for embedding enrichments.
     expected_dims: ?i64 = null,
+    /// Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently.
+    vector_space: ?[]const u8 = null,
     /// Chunk size for chunk enrichments.
     chunk_size: ?i64 = null,
     /// Chunk overlap for chunk enrichments.
@@ -3172,7 +3242,7 @@ pub const EnrichmentConfig = struct {
     full_text_index: ?bool = null,
     /// Produced asset content type for asset enrichments.
     content_type: ?[]const u8 = null,
-    /// Write-only serialized asset producer configuration. It may contain provider credentials and is never returned.
+    /// Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
     producer_json: ?[]const u8 = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
@@ -3982,12 +4052,22 @@ pub const ForeignSource = struct {
     columns: ?[]const ForeignColumn = null,
 };
 
+/// Textual artifact stream consumed by a full-text index, with an optional source-local projection.
+pub const FullTextArtifactIndexSource = struct {
+    /// Stable name of a chunk or textual asset artifact stream. Artifact names must be unique within the index.
+    artifact: []const u8,
+    /// Optional field selected from this artifact's records. When omitted, the index-level field is inherited; when both are omitted, Antfly indexes the default text projection.
+    field: ?[]const u8 = null,
+};
+
 pub const FullTextIndexConfig = struct {
+    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    sources: ?[]const FullTextArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
-    /// Document field indexed as text. Omit for the table's default full-document text index.
+    /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection.
     field: ?[]const u8 = null,
-    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     artifact_name: ?[]const u8 = null,
 };
 
@@ -4309,7 +4389,6 @@ pub const GraphArtifactEdgeMappingConfig = struct {
 /// Maps each artifact item to graph node identifiers.
 pub const GraphArtifactNodeMappingConfig = struct {
     model: ?[]const u8 = null,
-    source: ?GraphTemplateValue = null,
     target: ?GraphTemplateValue = null,
 };
 
@@ -4330,13 +4409,16 @@ pub const GraphArtifactProducerSourceConfig = struct {
     value: []const u8,
 };
 
-/// Artifact stream materialized into graph edges.
+/// Artifact stream materialized into graph edges. Each source artifact is limited to 16 MiB and 1,000,000 relation items so live apply, repair, split, and restore share one bounded admission contract. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are rejected by serverless deployments.
 pub const GraphArtifactSourceConfig = struct {
-    kind: []const u8,
     artifact: []const u8,
+    /// Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`.
     path: ?[]const u8 = null,
     format: ?[]const u8 = null,
     mention_edge_type: ?[]const u8 = null,
+    nodes: ?GraphArtifactNodeMappingConfig = null,
+    edge: ?GraphArtifactEdgeMappingConfig = null,
+    context: ?GraphArtifactContextConfig = null,
 };
 
 /// Algebraic law used to combine bounded graph traversal provenance.
@@ -4346,19 +4428,20 @@ pub const GraphBoundedTraversalConfig = struct {
 
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
+    /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    sources: ?[]const GraphArtifactSourceConfig = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
     summarizer: ?GeneratorConfig = null,
     /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
     template: ?[]const u8 = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
-    /// Maximum number of edges per document (0 = unlimited)
+    /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
     max_edges_per_document: ?i64 = null,
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     source: ?GraphArtifactSourceConfig = null,
+    /// Single asset-producer shorthand. It must be paired with exactly one source selecting the same artifact name.
     artifact: ?GraphArtifactProducerConfig = null,
-    nodes: ?GraphArtifactNodeMappingConfig = null,
-    edge: ?GraphArtifactEdgeMappingConfig = null,
-    context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
 };
@@ -4869,7 +4952,7 @@ pub const GraphResultNode = struct {
     edges: ?[]const Edge = null,
 };
 
-/// A literal numeric value or a Handlebars template evaluated for each materialized graph item.
+/// A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item.
 pub const GraphTemplateValue = std.json.Value;
 
 /// Ground truth data for evaluation
@@ -5026,11 +5109,13 @@ pub const IndexConfig = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    sources: ?[]const FullTextArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
-    /// Document field indexed as text. Omit for the table's default full-document text index.
+    /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection.
     field: ?[]const u8 = null,
-    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     artifact_name: ?[]const u8 = null,
     publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
@@ -5041,9 +5126,9 @@ pub const IndexConfig = struct {
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
-    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    /// Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    /// Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name is required and this value must exactly match the source_artifact_name on the authoritative embedding enrichment. New clients should declare the relationship only on that enrichment.
     source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
@@ -5064,13 +5149,12 @@ pub const IndexConfig = struct {
     execution: ?IndexExecutionConfig = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
-    /// Maximum number of edges per document (0 = unlimited)
+    /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
     max_edges_per_document: ?i64 = null,
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     source: ?GraphArtifactSourceConfig = null,
+    /// Single asset-producer shorthand. It must be paired with exactly one source selecting the same artifact name.
     artifact: ?GraphArtifactProducerConfig = null,
-    nodes: ?GraphArtifactNodeMappingConfig = null,
-    edge: ?GraphArtifactEdgeMappingConfig = null,
-    context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
     /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
@@ -5092,6 +5176,10 @@ pub const IndexConfig = struct {
         }
         if (self.enrichments) |value| {
             try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.sources) |value| {
+            try jw.objectField("sources");
             try jw.write(value);
         }
         if (self.mem_only) |value| {
@@ -5186,18 +5274,6 @@ pub const IndexConfig = struct {
             try jw.objectField("artifact");
             try jw.write(value);
         }
-        if (self.nodes) |value| {
-            try jw.objectField("nodes");
-            try jw.write(value);
-        }
-        if (self.edge) |value| {
-            try jw.objectField("edge");
-            try jw.write(value);
-        }
-        if (self.context) |value| {
-            try jw.objectField("context");
-            try jw.write(value);
-        }
         if (self.algebraic_planning) |value| {
             try jw.objectField("algebraic_planning");
             try jw.write(value);
@@ -5220,6 +5296,13 @@ pub const IndexExecutionConfig = struct {
     chunking: ?ExecutionPolicy = null,
     /// Embedding producer batching for shorthand-created embedding enrichments.
     embedding: ?ExecutionPolicy = null,
+};
+
+/// A retryable index mutation failure, including a distributed artifact-source protocol fence or a temporarily unavailable model probe.
+pub const IndexMutationServiceUnavailableError = struct {
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
 };
 
 /// Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
@@ -5248,7 +5331,60 @@ pub const IndexPublicationPolicy = enum {
     }
 };
 
-/// Authoritative query-readiness and completeness state for the desired index incarnation.
+/// Stable machine-readable reason why an index is pending, partial, or failed.
+pub const IndexReadinessReason = enum {
+    load_failure,
+    enrichment_failure,
+    runtime_unavailable,
+    shard_observation_incomplete,
+    incarnation_pending,
+    source_publication,
+    repair,
+    backfill,
+    coverage,
+    replay,
+    publication,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .load_failure => "load_failure",
+            .enrichment_failure => "enrichment_failure",
+            .runtime_unavailable => "runtime_unavailable",
+            .shard_observation_incomplete => "shard_observation_incomplete",
+            .incarnation_pending => "incarnation_pending",
+            .source_publication => "source_publication",
+            .repair => "repair",
+            .backfill => "backfill",
+            .coverage => "coverage",
+            .replay => "replay",
+            .publication => "publication",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "load_failure", .load_failure },
+            .{ "enrichment_failure", .enrichment_failure },
+            .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "shard_observation_incomplete", .shard_observation_incomplete },
+            .{ "incarnation_pending", .incarnation_pending },
+            .{ "source_publication", .source_publication },
+            .{ "repair", .repair },
+            .{ "backfill", .backfill },
+            .{ "coverage", .coverage },
+            .{ "replay", .replay },
+            .{ "publication", .publication },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans.
 pub const IndexReadinessState = enum {
     pending,
     queryable_partial,
@@ -5292,8 +5428,10 @@ pub const IndexReadinessStatus = struct {
     target_revision: ?i64 = null,
     /// Highest revision published to the query-visible index represented by this observation.
     published_revision: ?i64 = null,
-    /// Stable, machine-readable blockers. Empty when state is ready.
-    pending_reasons: []const []const u8,
+    /// Stable, machine-readable blockers or failure reasons. Empty when state is ready.
+    pending_reasons: []const IndexReadinessReason,
+    /// Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order.
+    sources: ?[]const IndexSourceReadinessStatus = null,
 };
 
 /// Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics.
@@ -5302,6 +5440,70 @@ pub const IndexRepairStatus = struct {
     state: []const u8,
     /// Whether an operator must resume, retry, reconfigure, or drop the affected index.
     action_required: bool,
+    /// Whether this repair currently prevents the proven serving incarnation from answering queries.
+    blocks_queryable: bool,
+    /// Whether this repair prevents the desired incarnation from satisfying the complete milestone.
+    blocks_complete: bool,
+    /// Diagnostic reason automation stopped. Present only when action_required is true.
+    reason: ?[]const u8 = null,
+};
+
+/// Deployment-level index capabilities clients can inspect before submitting index mutations.
+pub const IndexRuntimeCapabilities = struct {
+    /// Whether full-text, embedding, and graph indexes may currently consume generated artifact streams through either single-source or multi-source request forms. Equivalent to artifact_sources_state=available.
+    artifact_sources: bool,
+    artifact_sources_state: ArtifactSourcesCapabilityState,
+};
+
+/// Stable machine-readable reason why an artifact source is pending or failed.
+pub const IndexSourceReadinessReason = enum {
+    index_failed,
+    enrichment_failure,
+    repair,
+    runtime_unavailable,
+    shard_observation_incomplete,
+    source_observation_incomplete,
+    publication,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .index_failed => "index_failed",
+            .enrichment_failure => "enrichment_failure",
+            .repair => "repair",
+            .runtime_unavailable => "runtime_unavailable",
+            .shard_observation_incomplete => "shard_observation_incomplete",
+            .source_observation_incomplete => "source_observation_incomplete",
+            .publication => "publication",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "index_failed", .index_failed },
+            .{ "enrichment_failure", .enrichment_failure },
+            .{ "repair", .repair },
+            .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "shard_observation_incomplete", .shard_observation_incomplete },
+            .{ "source_observation_incomplete", .source_observation_incomplete },
+            .{ "publication", .publication },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const IndexSourceReadinessStatus = struct {
+    /// Configured artifact stream identity.
+    artifact: []const u8,
+    state: []const u8,
+    /// Whether this source is fully observed and published on every expected shard.
+    complete: bool,
+    /// Stable, machine-readable blockers or failure reasons for this source. Empty when state is ready.
+    pending_reasons: []const IndexSourceReadinessReason,
 };
 
 /// Statistics for an index
@@ -5350,7 +5552,7 @@ pub const IndexStats = union(enum) {
 
 pub const IndexStatus = struct {
     shard_status: std.json.ArrayHashMap(IndexStats),
-    config: IndexConfig,
+    config: CreatedIndex,
     status: IndexStats,
 };
 
@@ -7948,7 +8150,18 @@ pub const QueryBuilderResult = struct {
     warnings: ?[]const []const u8 = null,
 };
 
-/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+/// A public filter or exclusion query contains an invalid or unsupported node.
+pub const QueryFilterError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    field: []const u8,
+    /// Stable name of the first invalid or unsupported filter node.
+    offending_node: []const u8,
+    retryable: bool,
+};
+
+/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit source-grouped result shape.
 pub const QueryHierarchy = struct {
     group_by: ?HierarchyGroupBy = null,
     ancestors: ?HierarchyAncestors = null,
@@ -7968,7 +8181,7 @@ pub const QueryHit = struct {
     /// Optional explain-style score provenance for score features applied to this hit.
     _score_details: ?QueryScoreDetails = null,
     _source: ?std.json.Value = null,
-    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. Legacy rollup requests continue to use `chunks` instead of `matches`.
+    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. V0.2-compatible implicit rollup requests continue to use the deprecated `chunks` field instead of `matches`.
     hierarchy: ?QueryHitHierarchy = null,
     /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
     _sort: ?[]const std.json.Value = null,
@@ -7982,6 +8195,8 @@ pub const QueryHitHierarchy = struct {
     /// Unit identifier when the hit is attached to a document unit.
     parent_unit_id: ?[]const u8 = null,
     artifact: ?HierarchyArtifact = null,
+    /// Artifact member that supplied the score for a source-level grouped hit.
+    matched_artifact: ?HierarchyArtifact = null,
     ancestors: ?QueryHitHierarchyAncestors = null,
     evidence: ?HierarchyEvidence = null,
     /// Matching descendant hits attached by the canonical hierarchy.group_by request.
@@ -7990,7 +8205,7 @@ pub const QueryHitHierarchy = struct {
     position: ?[]const u8 = null,
     /// Composite source hierarchy revision to which the position and cursor are bound.
     revision: ?[]const u8 = null,
-    /// Legacy child chunk hits included for source-level rollups.
+    /// Deprecated child chunk hits included by the v0.2-compatible implicit source rollup.
     chunks: ?[]const HierarchyMatchHit = null,
 };
 
@@ -8076,11 +8291,13 @@ pub const QueryRequest = struct {
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?RawQuery = null,
+    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index. This selector is invalid without `full_text_search` or a scoring text clause in `query` and receives HTTP 422. This semantic relationship is enforced after the recursive query AST is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses from filter-only or exclusion-only trees.
+    full_text_index: ?[]const u8 = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
     /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
-    /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
+    /// Embedding index names selected for `semantic_search` or explicit `embeddings`. Dense and sparse indexes are supported when the corresponding query representation is supplied. Provisioned deployments require at least one index for `semantic_search`; serverless may infer its single published dense index when this field is omitted. When `embeddings` is supplied without this field, the embedding map keys select the indexes. Provisioned results from multiple indexes are merged using RRF. Serverless currently executes at most one dense and one sparse index per request; it rejects multiple same-kind selectors and omitted selectors when more than one corresponding index is published rather than choosing an index by catalog order.
     indexes: ?[]const []const u8 = null,
     /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
     filter_prefix: ?[]const u8 = null,
@@ -8643,11 +8860,13 @@ pub const RetrievalQueryRequest = struct {
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?RawQuery = null,
+    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index. This selector is invalid without `full_text_search` or a scoring text clause in `query` and receives HTTP 422. This semantic relationship is enforced after the recursive query AST is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses from filter-only or exclusion-only trees.
+    full_text_index: ?[]const u8 = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
     /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
-    /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
+    /// Embedding index names selected for `semantic_search` or explicit `embeddings`. Dense and sparse indexes are supported when the corresponding query representation is supplied. Provisioned deployments require at least one index for `semantic_search`; serverless may infer its single published dense index when this field is omitted. When `embeddings` is supplied without this field, the embedding map keys select the indexes. Provisioned results from multiple indexes are merged using RRF. Serverless currently executes at most one dense and one sparse index per request; it rejects multiple same-kind selectors and omitted selectors when more than one corresponding index is published rather than choosing an index by catalog order.
     indexes: ?[]const []const u8 = null,
     /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
     filter_prefix: ?[]const u8 = null,
@@ -9239,7 +9458,7 @@ pub const Table = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
-    indexes: std.json.ArrayHashMap(IndexConfig),
+    indexes: std.json.ArrayHashMap(CreatedIndex),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?TableSchema = null,
     /// Present only when the table is migrating between schema versions. Absent means the table is stable.
@@ -9338,6 +9557,8 @@ pub const TableRepairIssue = struct {
     parent_doc_key: ?[]const u8 = null,
     /// Unit identifier for unit-scoped artifacts, when applicable.
     unit_id: ?[]const u8 = null,
+    /// Canonical artifact stream configured on the affected index. This is the authoritative source-readiness identity and is distinct from the producer input and the derived artifact being repaired.
+    index_source_artifact_name: ?[]const u8 = null,
     /// Source artifact stream used to produce this artifact, when applicable.
     source_artifact_name: ?[]const u8 = null,
     /// Derived artifact name that must be reprocessed or made readable.
@@ -9527,7 +9748,7 @@ pub const TableStatus = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
-    indexes: std.json.ArrayHashMap(IndexConfig),
+    indexes: std.json.ArrayHashMap(CreatedIndex),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?TableSchema = null,
     /// Present only when the table is migrating between schema versions. Absent means the table is stable.
@@ -9963,6 +10184,41 @@ pub const TreeSearchConfig = struct {
     max_depth: ?i64 = null,
     /// Number of branches to explore at each level
     beam_width: ?i64 = null,
+};
+
+/// A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity.
+pub const UnsupportedHierarchyGroupingError = struct {
+    status: i32,
+    /// Stable machine-readable error code.
+    @"error": []const u8,
+    /// Human-readable remediation using only public query fields.
+    message: []const u8,
+    /// Stable reason the requested hierarchy level is unavailable.
+    reason: []const u8,
+    /// Public request field that selected the unsupported grouping level.
+    field: []const u8,
+    /// Select source grouping, omit group_by for direct members, or use an index whose every source is unit-backed.
+    action: []const u8,
+    /// Retrying the same request cannot succeed without changing its hierarchy grouping.
+    retryable: bool,
+};
+
+/// The requested index depends on a capability unavailable in the current deployment.
+pub const UnsupportedIndexCapabilityError = struct {
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
+/// A query requests an unsupported feature without a more specific structured diagnostic.
+pub const UnsupportedQueryError = struct {
+    status: i32,
+    /// Stable machine-readable error code.
+    @"error": []const u8,
+    /// Human-readable error summary.
+    message: []const u8,
+    /// Retrying the same request cannot succeed without changing it.
+    retryable: bool,
 };
 
 pub const UpdateExtensionRequest = struct {

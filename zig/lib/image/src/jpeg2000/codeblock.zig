@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const arithmetic = @import("arithmetic.zig");
+const decode_control = @import("decode_control.zig");
 const tile = @import("tile.zig");
 
 pub const native_port_available = true;
@@ -659,10 +660,25 @@ pub fn executeContributionPassPlanMq(
     context_init_policy: ContextInitPolicy,
     code_block_style: CodeBlockStyle,
 ) !void {
+    return executeContributionPassPlanMqWithCancellation(allocator, grid, plan, body, sign_policy, refinement_policy, magnitude_policy, context_init_policy, code_block_style, .{});
+}
+
+pub fn executeContributionPassPlanMqWithCancellation(
+    allocator: std.mem.Allocator,
+    grid: *CoefficientGrid,
+    plan: *const ContributionPassPlan,
+    body: []const u8,
+    sign_policy: SignPolicy,
+    refinement_policy: RefinementPolicy,
+    magnitude_policy: MagnitudePolicy,
+    context_init_policy: ContextInitPolicy,
+    code_block_style: CodeBlockStyle,
+    cancellation: decode_control.CancellationProbe,
+) !void {
     _ = allocator;
     var decoder = arithmetic.MqDecoder.init(body);
     var source: MqSymbolSource = .{ .decoder = &decoder };
-    try executeContributionPassPlanGeneric(&source, grid, plan, sign_policy, refinement_policy, magnitude_policy, context_init_policy, code_block_style);
+    try executeContributionPassPlanGeneric(&source, grid, plan, sign_policy, refinement_policy, magnitude_policy, context_init_policy, code_block_style, cancellation);
 }
 
 pub fn traceContributionPassPlanMq(
@@ -679,7 +695,7 @@ pub fn traceContributionPassPlanMq(
     _ = allocator;
     var decoder = arithmetic.MqDecoder.init(body);
     var source: TracingMqSymbolSource = .{ .decoder = &decoder };
-    try executeContributionPassPlanGeneric(&source, grid, plan, sign_policy, refinement_policy, magnitude_policy, context_init_policy, code_block_style);
+    try executeContributionPassPlanGeneric(&source, grid, plan, sign_policy, refinement_policy, magnitude_policy, context_init_policy, code_block_style, .{});
     return .{
         .symbol_count = source.symbol_count,
         .preview = source.preview,
@@ -745,7 +761,7 @@ pub fn executeContributionPassPlanScripted(
     code_block_style: CodeBlockStyle,
 ) !void {
     var source: ScriptedSymbolSource = .{ .symbols = symbols };
-    try executeContributionPassPlanGeneric(&source, grid, plan, sign_policy, refinement_policy, magnitude_policy, context_init_policy, code_block_style);
+    try executeContributionPassPlanGeneric(&source, grid, plan, sign_policy, refinement_policy, magnitude_policy, context_init_policy, code_block_style, .{});
 }
 
 /// Execute a contribution pass plan where BYPASS (0x01), TERMALL (0x04), or
@@ -769,12 +785,29 @@ pub fn executeContributionPassPlanMqWithSegments(
     context_init_policy: ContextInitPolicy,
     code_block_style: CodeBlockStyle,
 ) !void {
+    return executeContributionPassPlanMqWithSegmentsAndCancellation(allocator, grid, plan, body, segment_lengths, sign_policy, refinement_policy, magnitude_policy, context_init_policy, code_block_style, .{});
+}
+
+pub fn executeContributionPassPlanMqWithSegmentsAndCancellation(
+    allocator: std.mem.Allocator,
+    grid: *CoefficientGrid,
+    plan: *const ContributionPassPlan,
+    body: []const u8,
+    segment_lengths: []const u32,
+    sign_policy: SignPolicy,
+    refinement_policy: RefinementPolicy,
+    magnitude_policy: MagnitudePolicy,
+    context_init_policy: ContextInitPolicy,
+    code_block_style: CodeBlockStyle,
+    cancellation: decode_control.CancellationProbe,
+) !void {
     _ = allocator;
+    try cancellation.check();
     if (!code_block_style.bypass and !code_block_style.termination) {
         // Fast path: no segment boundaries matter.
         var decoder = arithmetic.MqDecoder.init(body);
         var source: MqSymbolSource = .{ .decoder = &decoder };
-        try executeContributionPassPlanGeneric(&source, grid, plan, sign_policy, refinement_policy, magnitude_policy, context_init_policy, code_block_style);
+        try executeContributionPassPlanGeneric(&source, grid, plan, sign_policy, refinement_policy, magnitude_policy, context_init_policy, code_block_style, cancellation);
         return;
     }
 
@@ -787,6 +820,7 @@ pub fn executeContributionPassPlanMqWithSegments(
         if (segment_lengths.len != plan.passes.len) return error.PassLengthMismatch;
         var i: usize = 0;
         while (i < plan.passes.len) : (i += 1) {
+            try cancellation.check();
             const pass = plan.passes[i];
             if (current_bitplane == null or current_bitplane.? != pass.bitplane) {
                 grid.resetVisited();
@@ -829,6 +863,7 @@ pub fn executeContributionPassPlanMqWithSegments(
                 magnitude_policy,
                 context_init_policy,
                 code_block_style,
+                cancellation,
             );
             return;
         }
@@ -837,6 +872,7 @@ pub fn executeContributionPassPlanMqWithSegments(
         var previous_segment_max: usize = 0;
         var pass_index: usize = 0;
         while (pass_index < plan.passes.len) : (segment_index += 1) {
+            try cancellation.check();
             if (!lengths_are_cumulative and segment_index >= segment_lengths.len) return error.PassLengthMismatch;
             const max_passes = bypassSegmentMaxPasses(segment_index, previous_segment_max);
             const pass_count = @min(max_passes, plan.passes.len - pass_index);
@@ -852,6 +888,7 @@ pub fn executeContributionPassPlanMqWithSegments(
                 var source: RawBitSymbolSource = .{ .reader = &bit_reader };
                 var local_pass: usize = 0;
                 while (local_pass < pass_count) : (local_pass += 1) {
+                    try cancellation.check();
                     const pass = plan.passes[pass_index + local_pass];
                     if (current_bitplane == null or current_bitplane.? != pass.bitplane) {
                         grid.resetVisited();
@@ -864,6 +901,7 @@ pub fn executeContributionPassPlanMqWithSegments(
                 var source: MqSymbolSource = .{ .decoder = &decoder };
                 var local_pass: usize = 0;
                 while (local_pass < pass_count) : (local_pass += 1) {
+                    try cancellation.check();
                     const pass = plan.passes[pass_index + local_pass];
                     if (current_bitplane == null or current_bitplane.? != pass.bitplane) {
                         grid.resetVisited();
@@ -936,6 +974,7 @@ fn executeContributionPassPlanMqWithCumulativePassEnds(
     magnitude_policy: MagnitudePolicy,
     context_init_policy: ContextInitPolicy,
     code_block_style: CodeBlockStyle,
+    cancellation: decode_control.CancellationProbe,
 ) !void {
     var contexts = Tier1Contexts.init(context_init_policy);
     var current_bitplane: ?i16 = null;
@@ -946,6 +985,7 @@ fn executeContributionPassPlanMqWithCumulativePassEnds(
 
     var i: usize = 0;
     while (i < plan.passes.len) : (i += 1) {
+        try cancellation.check();
         const pass = plan.passes[i];
         if (current_bitplane == null or current_bitplane.? != pass.bitplane) {
             grid.resetVisited();
@@ -1108,10 +1148,12 @@ fn executeContributionPassPlanGeneric(
     magnitude_policy: MagnitudePolicy,
     context_init_policy: ContextInitPolicy,
     code_block_style: CodeBlockStyle,
+    cancellation: decode_control.CancellationProbe,
 ) !void {
     var contexts = Tier1Contexts.init(context_init_policy);
     var current_bitplane: ?i16 = null;
     for (plan.passes) |pass| {
+        try cancellation.check();
         if (current_bitplane == null or current_bitplane.? != pass.bitplane) {
             grid.resetVisited();
             current_bitplane = pass.bitplane;

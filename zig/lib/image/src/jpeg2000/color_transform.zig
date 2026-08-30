@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const decode_control = @import("decode_control.zig");
 
 pub const native_port_available = true;
 
@@ -30,11 +31,17 @@ const U5x8 = @Vector(simd_lanes_i32, u5);
 ///   B = Cb + G
 /// Operates in-place on the three component planes.
 pub fn inverseRct(y_plane: []i32, cb_plane: []i32, cr_plane: []i32) void {
+    inverseRctWithCancellation(y_plane, cb_plane, cr_plane, .{}) catch unreachable;
+}
+
+pub fn inverseRctWithCancellation(y_plane: []i32, cb_plane: []i32, cr_plane: []i32, cancellation: decode_control.CancellationProbe) !void {
     std.debug.assert(y_plane.len == cb_plane.len and cb_plane.len == cr_plane.len);
+    try cancellation.check();
 
     var i: usize = 0;
     const v_shift_2: U5x8 = @splat(2);
     while (i + simd_lanes_i32 <= y_plane.len) : (i += simd_lanes_i32) {
+        if (i & 4095 == 0) try cancellation.check();
         const yv: I32x8 = y_plane[i..][0..simd_lanes_i32].*;
         const cbv: I32x8 = cb_plane[i..][0..simd_lanes_i32].*;
         const crv: I32x8 = cr_plane[i..][0..simd_lanes_i32].*;
@@ -82,7 +89,12 @@ pub fn forwardRct(r_plane: []i32, g_plane: []i32, b_plane: []i32) void {
 ///   G = Y - 0.34413 * Cb - 0.71414 * Cr
 ///   B = Y + 1.772 * Cb
 pub fn inverseIct(y_plane: []f32, cb_plane: []f32, cr_plane: []f32) void {
+    inverseIctWithCancellation(y_plane, cb_plane, cr_plane, .{}) catch unreachable;
+}
+
+pub fn inverseIctWithCancellation(y_plane: []f32, cb_plane: []f32, cr_plane: []f32, cancellation: decode_control.CancellationProbe) !void {
     std.debug.assert(y_plane.len == cb_plane.len and cb_plane.len == cr_plane.len);
+    try cancellation.check();
 
     var i: usize = 0;
     const v_1_402: F32x8 = @splat(1.402);
@@ -90,6 +102,7 @@ pub fn inverseIct(y_plane: []f32, cb_plane: []f32, cr_plane: []f32) void {
     const v_0_71414: F32x8 = @splat(0.71414);
     const v_1_772: F32x8 = @splat(1.772);
     while (i + simd_lanes_f32 <= y_plane.len) : (i += simd_lanes_f32) {
+        if (i & 4095 == 0) try cancellation.check();
         const yv: F32x8 = y_plane[i..][0..simd_lanes_f32].*;
         const cbv: F32x8 = cb_plane[i..][0..simd_lanes_f32].*;
         const crv: F32x8 = cr_plane[i..][0..simd_lanes_f32].*;
@@ -157,6 +170,8 @@ pub const CustomMctError = error{
     TooManyComponents,
     DimensionMismatch,
     SingularMatrix,
+    NonFiniteMatrix,
+    NonFiniteResult,
     ShiftTooLarge,
 };
 
@@ -183,6 +198,9 @@ pub const CustomMctMatrix = struct {
         if (self.forward.len != n * n) return error.DimensionMismatch;
         if (self.inverse.len != n * n) return error.DimensionMismatch;
         if (self.offsets.len != n) return error.DimensionMismatch;
+        for (self.forward) |value| if (!std.math.isFinite(value)) return error.NonFiniteMatrix;
+        for (self.inverse) |value| if (!std.math.isFinite(value)) return error.NonFiniteMatrix;
+        for (self.offsets) |value| if (!std.math.isFinite(value)) return error.NonFiniteMatrix;
     }
 };
 
@@ -242,12 +260,14 @@ pub fn applyCustomMctForward(matrix: CustomMctMatrix, planes: []const []f32) Cus
         }
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            var acc: f32 = 0.0;
+            var acc: f64 = 0.0;
             var k: usize = 0;
             while (k < n) : (k += 1) {
-                acc += matrix.forward[i * n + k] * in_buf[k];
+                acc += @as(f64, matrix.forward[i * n + k]) * @as(f64, in_buf[k]);
             }
-            out_buf[i] = acc;
+            if (!std.math.isFinite(acc) or @abs(acc) > std.math.floatMax(f32))
+                return error.NonFiniteResult;
+            out_buf[i] = @floatCast(acc);
         }
         i = 0;
         while (i < n) : (i += 1) planes[i][p] = out_buf[i];
@@ -256,6 +276,13 @@ pub fn applyCustomMctForward(matrix: CustomMctMatrix, planes: []const []f32) Cus
 
 /// Apply the inverse custom MCT in place across `planes`.
 pub fn applyCustomMctInverse(matrix: CustomMctMatrix, planes: []const []f32) CustomMctError!void {
+    applyCustomMctInverseWithCancellation(matrix, planes, .{}) catch |err| switch (err) {
+        error.Canceled => unreachable,
+        else => return @errorCast(err),
+    };
+}
+
+pub fn applyCustomMctInverseWithCancellation(matrix: CustomMctMatrix, planes: []const []f32, cancellation: decode_control.CancellationProbe) !void {
     try matrix.validate();
     const n = matrix.num_components;
     const px_count = try validatePlanes(planes, n);
@@ -263,18 +290,22 @@ pub fn applyCustomMctInverse(matrix: CustomMctMatrix, planes: []const []f32) Cus
     var in_buf: [custom_mct_max_components]f32 = undefined;
     var out_buf: [custom_mct_max_components]f32 = undefined;
 
+    try cancellation.check();
     var p: usize = 0;
     while (p < px_count) : (p += 1) {
+        if (p & 4095 == 0) try cancellation.check();
         var j: usize = 0;
         while (j < n) : (j += 1) in_buf[j] = planes[j][p];
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            var acc: f32 = 0.0;
+            var acc: f64 = matrix.offsets[i];
             var k: usize = 0;
             while (k < n) : (k += 1) {
-                acc += matrix.inverse[i * n + k] * in_buf[k];
+                acc += @as(f64, matrix.inverse[i * n + k]) * @as(f64, in_buf[k]);
             }
-            out_buf[i] = acc + matrix.offsets[i];
+            if (!std.math.isFinite(acc) or @abs(acc) > std.math.floatMax(f32))
+                return error.NonFiniteResult;
+            out_buf[i] = @floatCast(acc);
         }
         i = 0;
         while (i < n) : (i += 1) planes[i][p] = out_buf[i];
@@ -343,9 +374,11 @@ pub fn applyCustomMctInverseI32(matrix: CustomMctMatrixI32, planes: []const []i3
     }
 }
 
-/// Invert an N×N row-major matrix via Gauss-Jordan elimination with partial
-/// pivoting. Caller owns returned slice. Returns `error.SingularMatrix` when
-/// the matrix is (numerically) singular.
+/// Invert an N×N row-major matrix via Gauss-Jordan elimination with scaled
+/// partial pivoting. Working in f64 avoids overflow during elimination while
+/// the scale-relative pivot test accepts uniformly small, well-conditioned
+/// f32 matrices. The returned f32 inverse is checked against both A·A⁻¹ and
+/// A⁻¹·A before it is exposed to reconstruction.
 pub fn invertMctMatrixGaussJordan(
     forward: []const f32,
     n: u8,
@@ -355,34 +388,44 @@ pub fn invertMctMatrixGaussJordan(
     const nn: usize = n;
     if (forward.len != nn * nn) return error.DimensionMismatch;
 
-    // Build augmented [A | I] matrix with 2N columns.
+    // Build augmented [A | I] in wider working precision and retain each
+    // original row's scale for scale-invariant pivot selection.
     const cols: usize = 2 * nn;
-    const aug = try allocator.alloc(f32, nn * cols);
+    const aug = try allocator.alloc(f64, nn * cols);
     defer allocator.free(aug);
+    const row_scales = try allocator.alloc(f64, nn);
+    defer allocator.free(row_scales);
 
     for (0..nn) |i| {
+        var row_scale: f64 = 0.0;
         for (0..nn) |j| {
-            aug[i * cols + j] = forward[i * nn + j];
-            aug[i * cols + nn + j] = if (i == j) @as(f32, 1.0) else @as(f32, 0.0);
+            const value = forward[i * nn + j];
+            if (!std.math.isFinite(value)) return error.NonFiniteMatrix;
+            const wide: f64 = value;
+            aug[i * cols + j] = wide;
+            row_scale = @max(row_scale, @abs(wide));
+            aug[i * cols + nn + j] = if (i == j) 1.0 else 0.0;
         }
+        if (row_scale == 0.0) return error.SingularMatrix;
+        row_scales[i] = row_scale;
     }
 
-    // f32 singular-pivot threshold. 1e-12 is below f32 epsilon and never triggers; 1e-6 is a
-    // reasonable default for matrices with entries near unit magnitude.
-    const eps: f32 = 1e-6;
+    const relative_pivot_tolerance: f64 = 64.0 * std.math.floatEps(f32);
     for (0..nn) |col| {
-        // Partial pivot: find largest magnitude in column `col` at/below row `col`.
+        // Scaled partial pivot: compare each candidate to the largest original
+        // coefficient in its row, not to an absolute constant.
         var pivot_row: usize = col;
-        var pivot_mag: f32 = @abs(aug[col * cols + col]);
+        var pivot_score: f64 = @abs(aug[col * cols + col]) / row_scales[col];
         var r: usize = col + 1;
         while (r < nn) : (r += 1) {
-            const m = @abs(aug[r * cols + col]);
-            if (m > pivot_mag) {
-                pivot_mag = m;
+            const score = @abs(aug[r * cols + col]) / row_scales[r];
+            if (score > pivot_score) {
+                pivot_score = score;
                 pivot_row = r;
             }
         }
-        if (pivot_mag <= eps) return error.SingularMatrix;
+        if (!std.math.isFinite(pivot_score) or pivot_score <= relative_pivot_tolerance)
+            return error.SingularMatrix;
 
         if (pivot_row != col) {
             // Swap rows.
@@ -392,12 +435,19 @@ pub fn invertMctMatrixGaussJordan(
                 aug[col * cols + c] = aug[pivot_row * cols + c];
                 aug[pivot_row * cols + c] = tmp;
             }
+            const scale_tmp = row_scales[col];
+            row_scales[col] = row_scales[pivot_row];
+            row_scales[pivot_row] = scale_tmp;
         }
 
         // Scale pivot row to make pivot == 1.
         const pivot = aug[col * cols + col];
+        if (!std.math.isFinite(pivot) or pivot == 0.0) return error.SingularMatrix;
         var c: usize = 0;
-        while (c < cols) : (c += 1) aug[col * cols + c] /= pivot;
+        while (c < cols) : (c += 1) {
+            aug[col * cols + c] /= pivot;
+            if (!std.math.isFinite(aug[col * cols + c])) return error.NonFiniteMatrix;
+        }
 
         // Eliminate other rows.
         var rr: usize = 0;
@@ -408,14 +458,41 @@ pub fn invertMctMatrixGaussJordan(
             var cc: usize = 0;
             while (cc < cols) : (cc += 1) {
                 aug[rr * cols + cc] -= factor * aug[col * cols + cc];
+                if (!std.math.isFinite(aug[rr * cols + cc])) return error.NonFiniteMatrix;
             }
         }
     }
 
     const result = try allocator.alloc(f32, nn * nn);
+    errdefer allocator.free(result);
     for (0..nn) |i| {
-        for (0..nn) |j| result[i * nn + j] = aug[i * cols + nn + j];
+        for (0..nn) |j| {
+            const value = aug[i * cols + nn + j];
+            if (!std.math.isFinite(value) or @abs(value) > std.math.floatMax(f32))
+                return error.NonFiniteMatrix;
+            result[i * nn + j] = @floatCast(value);
+        }
     }
+
+    // A small absolute residual on the dimensionless identity product proves
+    // the f32 inverse survived narrowing with enough accuracy for pixel work.
+    var max_residual: f64 = 0.0;
+    for (0..nn) |i| {
+        for (0..nn) |j| {
+            var forward_product: f64 = 0.0;
+            var inverse_product: f64 = 0.0;
+            for (0..nn) |k| {
+                forward_product += @as(f64, forward[i * nn + k]) * @as(f64, result[k * nn + j]);
+                inverse_product += @as(f64, result[i * nn + k]) * @as(f64, forward[k * nn + j]);
+            }
+            const expected: f64 = if (i == j) 1.0 else 0.0;
+            max_residual = @max(max_residual, @abs(forward_product - expected));
+            max_residual = @max(max_residual, @abs(inverse_product - expected));
+        }
+    }
+    const residual_tolerance: f64 = 256.0 * std.math.floatEps(f32) * @as(f64, @floatFromInt(nn));
+    if (!std.math.isFinite(max_residual) or max_residual > residual_tolerance)
+        return error.SingularMatrix;
     return result;
 }
 
@@ -578,6 +655,52 @@ test "Gauss-Jordan invert 3x3 yields identity product" {
             try std.testing.expectApproxEqAbs(expected, out[i * n + j], tol);
         }
     }
+}
+
+test "Gauss-Jordan accepts uniformly scaled well-conditioned matrix" {
+    const allocator = std.testing.allocator;
+    const scale: f32 = 1e-7;
+    const scaled_identity = [_]f32{
+        scale, 0,     0,
+        0,     scale, 0,
+        0,     0,     scale,
+    };
+    const inverse = try invertMctMatrixGaussJordan(&scaled_identity, 3, allocator);
+    defer allocator.free(inverse);
+
+    for (0..3) |i| {
+        for (0..3) |j| {
+            const expected: f32 = if (i == j) 1.0 / scale else 0.0;
+            try std.testing.expectApproxEqRel(expected, inverse[i * 3 + j], 4 * std.math.floatEps(f32));
+        }
+    }
+}
+
+test "custom MCT reports finite input overflow" {
+    const huge = std.math.floatMax(f32);
+    const tiny = 1.0 / huge;
+    const forward = [_]f32{
+        huge, 0,    0,
+        0,    huge, 0,
+        0,    0,    huge,
+    };
+    const inverse = [_]f32{
+        tiny, 0,    0,
+        0,    tiny, 0,
+        0,    0,    tiny,
+    };
+    const offsets = [_]f32{ 0, 0, 0 };
+    const matrix = CustomMctMatrix{
+        .num_components = 3,
+        .forward = &forward,
+        .inverse = &inverse,
+        .offsets = &offsets,
+    };
+    var p0 = [_]f32{2};
+    var p1 = [_]f32{2};
+    var p2 = [_]f32{2};
+    const planes = [_][]f32{ &p0, &p1, &p2 };
+    try std.testing.expectError(error.NonFiniteResult, applyCustomMctForward(matrix, &planes));
 }
 
 test "Gauss-Jordan reports singular matrix" {
