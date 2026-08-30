@@ -7713,7 +7713,7 @@ test "standalone unified server lifecycle propagates startup failure" {
 
 test "standalone metadata catalog source provides compact routing" {
     var metadata: LocalStandaloneMetadata = undefined;
-    try std.testing.expect(metadata.catalogSource().hasRoutingCapability());
+    _ = try metadata.catalogSource().routingSource();
 }
 
 test "runtime lease watchdog fetch and validation failures publish no bootstrap capability" {
