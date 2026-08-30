@@ -520,17 +520,18 @@ const SnapshotTransportRecorder = struct {
     fn iface(self: *SnapshotTransportRecorder) runtime.snapshot_transport_iface.SnapshotTransport {
         return .{
             .ptr = self,
-            .vtable = &.{
-                .send_snapshot = sendSnapshot,
+            .sender = .{ .asynchronous = .{
                 .submit_snapshot = submitSnapshot,
-            },
+                .drain_completions = drainCompletions,
+            } },
+            .vtable = &.{},
         };
     }
 
     fn submitSnapshot(
         ptr: *anyopaque,
         req: runtime.snapshot_transport_iface.SnapshotSendRequest,
-    ) !runtime.snapshot_transport_iface.SnapshotSubmitResult {
+    ) !runtime.snapshot_transport_iface.AsyncSnapshotSubmitResult {
         const self: *SnapshotTransportRecorder = @ptrCast(@alignCast(ptr));
         self.submit_calls += 1;
         if (self.deferrals_remaining > 0) {
@@ -539,6 +540,10 @@ const SnapshotTransportRecorder = struct {
         }
         try sendSnapshot(ptr, req);
         return .accepted;
+    }
+
+    fn drainCompletions(_: *anyopaque, _: []runtime.snapshot_transport_iface.SnapshotCompletion) usize {
+        return 0;
     }
 
     fn sendSnapshot(ptr: *anyopaque, req: runtime.snapshot_transport_iface.SnapshotSendRequest) !void {

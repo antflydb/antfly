@@ -169,6 +169,20 @@ pub const FileSnapshotStore = struct {
         try validateSnapshotId(snapshot_id);
         if (body.len > self.cfg.max_snapshot_bytes) return error.SnapshotTooLarge;
         self.maybeRunArtifactMaintenance();
+        return self.putSnapshotLocked(snapshot_id, body) catch |err| switch (err) {
+            error.SnapshotArtifactQuotaExceeded => {
+                // Reclamation must never run while this identity's stripe is
+                // held: an unrelated expired identity may hash to the same
+                // stripe. Retry the entire immutable-generation check after
+                // cleanup because another writer could publish meanwhile.
+                try self.cleanupExpiredArtifacts();
+                return try self.putSnapshotLocked(snapshot_id, body);
+            },
+            else => return err,
+        };
+    }
+
+    fn putSnapshotLocked(self: *FileSnapshotStore, snapshot_id: []const u8, body: []const u8) !void {
         const lock = self.uploadLock(snapshot_id);
         platform_sync.lockYielding(lock);
         defer lock.unlock();
@@ -190,7 +204,7 @@ pub const FileSnapshotStore = struct {
             error.FileNotFound => {},
             else => return err,
         }
-        const reservation = try self.reserveArtifactWithPressureCleanup(staging_path, body.len);
+        const reservation = try self.reserveArtifact(staging_path, body.len);
         var reservation_live = true;
         errdefer if (reservation_live) {
             std.Io.Dir.cwd().deleteFile(io_ctx, staging_path) catch {};
@@ -284,7 +298,26 @@ pub const FileSnapshotStore = struct {
         if (manifest.data_len > self.cfg.max_snapshot_bytes) return error.SnapshotTooLarge;
         const encoded = try snapshot_transfer.encode(self.alloc, manifest);
         defer self.alloc.free(encoded);
+        const total_len = std.math.add(u64, @sizeOf(u32) + encoded.len, manifest.data_len) catch
+            return error.SnapshotTooLarge;
         self.maybeRunArtifactMaintenance();
+        return self.beginChunkedSnapshotLocked(snapshot_id, encoded, total_len) catch |err| switch (err) {
+            error.SnapshotArtifactQuotaExceeded => {
+                // Drop the identity stripe before sweeping, then restart all
+                // generation checks under the reacquired stripe.
+                try self.cleanupExpiredArtifacts();
+                return try self.beginChunkedSnapshotLocked(snapshot_id, encoded, total_len);
+            },
+            else => return err,
+        };
+    }
+
+    fn beginChunkedSnapshotLocked(
+        self: *FileSnapshotStore,
+        snapshot_id: []const u8,
+        encoded: []const u8,
+        total_len: u64,
+    ) !void {
         const lock = self.uploadLock(snapshot_id);
         platform_sync.lockYielding(lock);
         defer lock.unlock();
@@ -293,8 +326,6 @@ pub const FileSnapshotStore = struct {
         const committed_path = try self.transferPath(snapshot_id, ".v2");
         defer self.alloc.free(committed_path);
         try fs_paths.createDirPathPortable(io(self), self.root_dir);
-        const total_len = std.math.add(u64, @sizeOf(u32) + encoded.len, manifest.data_len) catch
-            return error.SnapshotTooLarge;
 
         // Snapshot IDs are immutable artifact identities. An exact begin
         // resumes a sparse staging file; replacement requires the owner to
@@ -330,7 +361,7 @@ pub const FileSnapshotStore = struct {
             error.InvalidSnapshotManifest => return err,
             else => return err,
         }
-        const reservation = try self.reserveArtifactWithPressureCleanup(path, total_len);
+        const reservation = try self.reserveArtifact(path, total_len);
         var reservation_live = true;
         errdefer if (reservation_live) {
             std.Io.Dir.cwd().deleteFile(io(self), path) catch {};
@@ -656,23 +687,6 @@ pub const FileSnapshotStore = struct {
     const ArtifactReservation = struct {
         bytes: u64,
     };
-
-    fn reserveArtifactWithPressureCleanup(
-        self: *FileSnapshotStore,
-        staging_path: []const u8,
-        requested_bytes: u64,
-    ) !ArtifactReservation {
-        return self.reserveArtifact(staging_path, requested_bytes) catch |err| switch (err) {
-            error.SnapshotArtifactQuotaExceeded => {
-                // Quota pressure is the only request-path reason to sweep.
-                // Retrying once keeps the fast path O(1) while promptly
-                // reclaiming expired artifacts for a waiting transfer.
-                try self.cleanupExpiredArtifacts();
-                return try self.reserveArtifact(staging_path, requested_bytes);
-            },
-            else => return err,
-        };
-    }
 
     fn reserveArtifact(
         self: *FileSnapshotStore,
@@ -1034,6 +1048,20 @@ fn testManifestGeneration(manifest: snapshot_transfer.Manifest) !snapshot_transf
     return try snapshot_transfer.generationFromEncodedManifest(encoded);
 }
 
+fn testCollidingSnapshotId(
+    store: *FileSnapshotStore,
+    existing_id: []const u8,
+    buffer: []u8,
+) ![]const u8 {
+    const existing_lock = store.uploadLock(existing_id);
+    for (0..100_000) |candidate_index| {
+        const candidate = try std.fmt.bufPrint(buffer, "collision-{d}", .{candidate_index});
+        if (!std.mem.eql(u8, existing_id, candidate) and store.uploadLock(candidate) == existing_lock)
+            return candidate;
+    }
+    return error.SnapshotLockCollisionNotFound;
+}
+
 test "file snapshot store persists snapshot bodies" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1169,19 +1197,68 @@ test "snapshot quota pressure reclaims expired artifacts before rejecting admiss
     defer store.deinit();
     const iface = store.store();
 
-    try iface.putSnapshot(std.testing.allocator, "expired", "1234");
+    const expired_id = "expired";
+    var replacement_buffer: [64]u8 = undefined;
+    const replacement_id = try testCollidingSnapshotId(&store, expired_id, &replacement_buffer);
+    try iface.putSnapshot(std.testing.allocator, expired_id, "1234");
     try store.io().sleep(.fromMilliseconds(2), .awake);
     // Periodic maintenance remains deferred. The failed O(1) reservation
-    // triggers one sweep and one retry, giving callers useful progress instead
-    // of a stale quota error.
-    try iface.putSnapshot(std.testing.allocator, "replacement", "5678");
+    // triggers one sweep outside the colliding identity stripe and one full
+    // validation retry, giving callers progress instead of a stale quota error.
+    try iface.putSnapshot(std.testing.allocator, replacement_id, "5678");
     const usage = store.artifactUsageSnapshot();
     try std.testing.expectEqual(@as(u64, 4), usage.durable_bytes);
     try std.testing.expectEqual(@as(usize, 1), usage.durable_count);
     try std.testing.expectEqual(@as(usize, 0), usage.reserved_count);
     try std.testing.expectError(
         error.FileNotFound,
-        iface.getSnapshot(std.testing.allocator, "expired"),
+        iface.getSnapshot(std.testing.allocator, expired_id),
+    );
+}
+
+test "chunked quota pressure reclaims expired artifact sharing its lock stripe" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/raft-snaps-chunked-pressure-cleanup",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root_dir);
+    var store = try FileSnapshotStore.init(std.testing.allocator, .{
+        .root_dir = root_dir,
+        .artifact_policy = .{
+            .max_count = 1,
+            .committed_ttl_ns = std.time.ns_per_ms,
+        },
+    });
+    defer store.deinit();
+    const iface = store.store();
+    const expired_id = "expired-chunked-pressure";
+    var replacement_buffer: [64]u8 = undefined;
+    const replacement_id = try testCollidingSnapshotId(&store, expired_id, &replacement_buffer);
+    try iface.putSnapshot(std.testing.allocator, expired_id, "old");
+    try store.io().sleep(.fromMilliseconds(2), .awake);
+
+    const body = "new";
+    const manifest: snapshot_transfer.Manifest = .{
+        .group_id = 91,
+        .from = 1,
+        .to = 2,
+        .request_term = 4,
+        .metadata = .{ .index = 12, .term = 3 },
+        .data_len = body.len,
+        .digest = snapshot_transfer.digest(body),
+    };
+    try iface.vtable.begin_chunked_snapshot.?(iface.ptr, manifest, replacement_id);
+
+    const usage = store.artifactUsageSnapshot();
+    try std.testing.expectEqual(@as(usize, 1), usage.durable_count);
+    try std.testing.expectEqual(@as(usize, 0), usage.reserved_count);
+    try std.testing.expectError(
+        error.FileNotFound,
+        iface.getSnapshot(std.testing.allocator, expired_id),
     );
 }
 

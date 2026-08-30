@@ -2981,10 +2981,11 @@ test "snapshot submission backpressure cannot starve control traffic and honors 
         fn snapshotTransport(self: *@This()) snapshot_transport_iface.SnapshotTransport {
             return .{
                 .ptr = self,
-                .vtable = &.{
-                    .send_snapshot = sendSnapshot,
+                .sender = .{ .asynchronous = .{
                     .submit_snapshot = submitSnapshot,
-                },
+                    .drain_completions = drainCompletions,
+                } },
+                .vtable = &.{},
             };
         }
 
@@ -2993,12 +2994,10 @@ test "snapshot submission backpressure cannot starve control traffic and honors 
             self.control_messages += messages.len;
         }
 
-        fn sendSnapshot(_: *anyopaque, _: snapshot_transport_iface.SnapshotSendRequest) !void {}
-
         fn submitSnapshot(
             ptr: *anyopaque,
             _: snapshot_transport_iface.SnapshotSendRequest,
-        ) !snapshot_transport_iface.SnapshotSubmitResult {
+        ) !snapshot_transport_iface.AsyncSnapshotSubmitResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.snapshot_submissions += 1;
             if (self.deferrals_remaining > 0) {
@@ -3006,6 +3005,10 @@ test "snapshot submission backpressure cannot starve control traffic and honors 
                 return .{ .retry_later = .{ .retry_after_ms = self.retry_after_ms } };
             }
             return .accepted;
+        }
+
+        fn drainCompletions(_: *anyopaque, _: []snapshot_transport_iface.SnapshotCompletion) usize {
+            return 0;
         }
     };
 
@@ -3108,7 +3111,8 @@ test "synchronous snapshot submission emits an exact delivery completion" {
         fn snapshotTransport(self: *@This()) snapshot_transport_iface.SnapshotTransport {
             return .{
                 .ptr = self,
-                .vtable = &.{ .send_snapshot = sendSnapshot },
+                .sender = .{ .synchronous = sendSnapshot },
+                .vtable = &.{},
             };
         }
 

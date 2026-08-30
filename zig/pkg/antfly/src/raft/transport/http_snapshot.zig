@@ -448,8 +448,8 @@ pub const HttpSnapshotTransport = struct {
     pub fn transport(self: *HttpSnapshotTransport) raft_engine.runtime.SnapshotTransport {
         return .{
             .ptr = self,
+            .sender = .{ .synchronous = publishSnapshotCallback },
             .vtable = &.{
-                .send_snapshot = publishSnapshotCallback,
                 .fetch_snapshot = fetchSnapshot,
             },
         };
@@ -461,10 +461,11 @@ pub const HttpSnapshotTransport = struct {
     pub fn submissionTransport(self: *HttpSnapshotTransport) raft_engine.runtime.SnapshotTransport {
         return .{
             .ptr = self,
-            .vtable = &.{
-                .send_snapshot = submitSnapshotCallback,
+            .sender = .{ .asynchronous = .{
                 .submit_snapshot = trySubmitSnapshotCallback,
                 .drain_completions = drainCompletionsCallback,
+            } },
+            .vtable = &.{
                 .fetch_snapshot = fetchSnapshot,
             },
         };
@@ -612,7 +613,7 @@ pub const HttpSnapshotTransport = struct {
     fn enqueueSnapshot(
         self: *HttpSnapshotTransport,
         req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
-    ) !raft_engine.runtime.snapshot_transport_iface.SnapshotSubmitResult {
+    ) !raft_engine.runtime.snapshot_transport_iface.AsyncSnapshotSubmitResult {
         if (req.snapshot.data.len > self.cfg.max_snapshot_bytes) return error.SnapshotTooLarge;
 
         // Reserve every bounded resource before retaining or copying payload
@@ -909,7 +910,7 @@ pub const HttpSnapshotTransport = struct {
     ) !void {
         const result = try self.trySubmitSnapshot(req);
         switch (result) {
-            .delivered, .accepted, .duplicate => {},
+            .accepted, .duplicate => {},
             .retry_later => return error.AsyncSnapshotSendQueueFull,
         }
     }
@@ -917,7 +918,7 @@ pub const HttpSnapshotTransport = struct {
     pub fn trySubmitSnapshot(
         self: *HttpSnapshotTransport,
         req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
-    ) !raft_engine.runtime.snapshot_transport_iface.SnapshotSubmitResult {
+    ) !raft_engine.runtime.snapshot_transport_iface.AsyncSnapshotSubmitResult {
         return self.enqueueSnapshot(req);
     }
 
@@ -926,15 +927,10 @@ pub const HttpSnapshotTransport = struct {
         return self.publishSnapshotAndWait(req);
     }
 
-    fn submitSnapshotCallback(ptr: *anyopaque, req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest) !void {
-        const self: *HttpSnapshotTransport = @ptrCast(@alignCast(ptr));
-        return self.submitSnapshot(req);
-    }
-
     fn trySubmitSnapshotCallback(
         ptr: *anyopaque,
         req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
-    ) !raft_engine.runtime.snapshot_transport_iface.SnapshotSubmitResult {
+    ) !raft_engine.runtime.snapshot_transport_iface.AsyncSnapshotSubmitResult {
         const self: *HttpSnapshotTransport = @ptrCast(@alignCast(ptr));
         return self.trySubmitSnapshot(req);
     }
@@ -2173,11 +2169,11 @@ test "async snapshot send lane deduplicates and applies retained ownership bound
         .snapshot = .{ .metadata = .{ .index = 11, .term = 3 }, .data = @constCast("payload") },
     };
     try std.testing.expectEqual(
-        raft_engine.runtime.snapshot_transport_iface.SnapshotSubmitResult.accepted,
+        raft_engine.runtime.snapshot_transport_iface.AsyncSnapshotSubmitResult.accepted,
         try transport.enqueueSnapshot(first),
     );
     try std.testing.expectEqual(
-        raft_engine.runtime.snapshot_transport_iface.SnapshotSubmitResult.duplicate,
+        raft_engine.runtime.snapshot_transport_iface.AsyncSnapshotSubmitResult.duplicate,
         try transport.enqueueSnapshot(first),
     );
     var second = first;

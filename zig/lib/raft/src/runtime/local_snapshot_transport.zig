@@ -38,8 +38,8 @@ pub const LocalSnapshotTransport = struct {
     pub fn transport(self: *LocalSnapshotTransport) snapshot_transport_iface.SnapshotTransport {
         return .{
             .ptr = self,
+            .sender = .{ .synchronous = sendSnapshot },
             .vtable = &.{
-                .send_snapshot = sendSnapshot,
                 .fetch_snapshot = fetchSnapshot,
                 .cancel_snapshot = cancelSnapshot,
             },

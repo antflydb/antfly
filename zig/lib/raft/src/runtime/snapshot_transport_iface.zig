@@ -44,14 +44,23 @@ pub const SnapshotSendRequest = struct {
     locator: ?SnapshotLocator = null,
 };
 
-/// Submission is an ownership boundary. Asynchronous transports return
-/// `accepted` (or `duplicate` for an already-owned exact attempt) and must
-/// eventually publish one terminal completion. Synchronous transports return
-/// `delivered`, allowing the runtime to start the Raft acknowledgement
-/// watchdog immediately without requiring a synthetic completion queue.
-/// `retry_later` guarantees that the transport retained nothing.
+/// Result exposed to the runtime after dispatch through the transport's
+/// structurally valid sender mode. `delivered` is produced only by the
+/// synchronous adapter; asynchronous callbacks cannot claim delivery without
+/// publishing an exact terminal completion.
 pub const SnapshotSubmitResult = union(enum) {
     delivered,
+    accepted,
+    duplicate,
+    retry_later: struct {
+        retry_after_ms: u64 = 1,
+    },
+};
+
+/// Submission is an ownership boundary. `accepted` (or `duplicate` for an
+/// already-owned exact attempt) obligates the asynchronous sender to publish
+/// one terminal completion. `retry_later` guarantees that it retained nothing.
+pub const AsyncSnapshotSubmitResult = union(enum) {
     accepted,
     duplicate,
     retry_later: struct {
@@ -138,30 +147,66 @@ pub const SnapshotReceiver = struct {
 
 pub const SnapshotTransport = struct {
     ptr: *anyopaque,
+    sender: Sender,
     vtable: *const VTable,
 
+    pub const SynchronousSender = *const fn (
+        ptr: *anyopaque,
+        req: SnapshotSendRequest,
+    ) anyerror!void;
+
+    pub const AsynchronousSender = struct {
+        submit_snapshot: *const fn (
+            ptr: *anyopaque,
+            req: SnapshotSendRequest,
+        ) anyerror!AsyncSnapshotSubmitResult,
+        drain_completions: *const fn (
+            ptr: *anyopaque,
+            out: []SnapshotCompletion,
+        ) usize,
+    };
+
+    /// The tagged sender makes the asynchronous ownership contract total:
+    /// callers cannot provide submission without also providing completion
+    /// draining, while synchronous implementations need no synthetic queue.
+    pub const Sender = union(enum) {
+        synchronous: SynchronousSender,
+        asynchronous: AsynchronousSender,
+    };
+
     pub const VTable = struct {
-        send_snapshot: *const fn (ptr: *anyopaque, req: SnapshotSendRequest) anyerror!void,
-        submit_snapshot: ?*const fn (ptr: *anyopaque, req: SnapshotSendRequest) anyerror!SnapshotSubmitResult = null,
-        drain_completions: ?*const fn (ptr: *anyopaque, out: []SnapshotCompletion) usize = null,
         fetch_snapshot: ?*const fn (ptr: *anyopaque, req: SnapshotFetchRequest, receiver: SnapshotReceiver) anyerror!void = null,
         cancel_snapshot: ?*const fn (ptr: *anyopaque, group_id: core.types.GroupId, snapshot_id: []const u8) anyerror!void = null,
     };
 
     pub fn sendSnapshot(self: SnapshotTransport, req: SnapshotSendRequest) !void {
-        return try self.vtable.send_snapshot(self.ptr, req);
+        return switch (self.sender) {
+            .synchronous => |send_snapshot| try send_snapshot(self.ptr, req),
+            .asynchronous => error.AsynchronousSnapshotTransportRequiresSubmission,
+        };
     }
 
     pub fn submitSnapshot(self: SnapshotTransport, req: SnapshotSendRequest) !SnapshotSubmitResult {
-        if (self.vtable.submit_snapshot) |submit_snapshot|
-            return try submit_snapshot(self.ptr, req);
-        try self.sendSnapshot(req);
-        return .delivered;
+        return switch (self.sender) {
+            .synchronous => |send_snapshot| blk: {
+                try send_snapshot(self.ptr, req);
+                break :blk .delivered;
+            },
+            .asynchronous => |sender| switch (try sender.submit_snapshot(self.ptr, req)) {
+                .accepted => .accepted,
+                .duplicate => .duplicate,
+                .retry_later => |retry| .{ .retry_later = .{
+                    .retry_after_ms = retry.retry_after_ms,
+                } },
+            },
+        };
     }
 
     pub fn drainCompletions(self: SnapshotTransport, out: []SnapshotCompletion) usize {
-        const drain = self.vtable.drain_completions orelse return 0;
-        return drain(self.ptr, out);
+        return switch (self.sender) {
+            .synchronous => 0,
+            .asynchronous => |sender| sender.drain_completions(self.ptr, out),
+        };
     }
 
     pub fn fetchSnapshot(self: SnapshotTransport, req: SnapshotFetchRequest, receiver: SnapshotReceiver) !void {
@@ -182,6 +227,7 @@ test "snapshot transport iface compiles" {
     _ = SnapshotArtifactFormat;
     _ = SnapshotSendRequest;
     _ = SnapshotSubmitResult;
+    _ = AsyncSnapshotSubmitResult;
     _ = SnapshotCompletion;
     _ = SnapshotFetchRequest;
     _ = SnapshotReceiver;
