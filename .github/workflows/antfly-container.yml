@@ -32,9 +32,6 @@ env:
   GAR_REGISTRY: us-central1-docker.pkg.dev
   CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
   ZIG_ARTIFACT_BUCKET: antfly-image-artifacts-zig-build-artifacts
-  ZIG_VERSION: 0.17.0-dev.1933+e19a73c2d
-  ZIG_X86_64_LINUX_SHA256: 122e91695d3dd7a7b640dac7f901a09a900614ef01e936c9f517dae8299b4368
-  ZIG_AARCH64_LINUX_SHA256: af999865a348703ed7496ff3c4a8a83a4c4a2b50097b19f99eb1f9f7e1791e4a
 
 jobs:
   build-artifact:
@@ -65,6 +62,9 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: true
+
+      - name: Load Zig toolchain manifest
+        run: sed '/^#/d; /^$/d' zig/toolchain.env >> "$GITHUB_ENV"
 
       - name: Authenticate to Google Cloud
         id: auth

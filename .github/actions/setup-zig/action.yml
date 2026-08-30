@@ -1,0 +1,19 @@
+name: Set up pinned Zig
+description: Install the Zig version declared in zig/toolchain.env
+
+runs:
+  using: composite
+  steps:
+    - name: Read Zig toolchain manifest
+      id: toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        source "$GITHUB_WORKSPACE/zig/toolchain.env"
+        echo "version=$ZIG_VERSION" >> "$GITHUB_OUTPUT"
+
+    - name: Install Zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ steps.toolchain.outputs.version }}
+        use-cache: false

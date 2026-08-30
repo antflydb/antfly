@@ -13,8 +13,6 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  ZIG_VERSION: 0.17.0-dev.1933+e19a73c2d
-  ZIG_X86_64_LINUX_SHA256: 122e91695d3dd7a7b640dac7f901a09a900614ef01e936c9f517dae8299b4368
   MACOS_SDK_VERSION: "15.5"
   MACOS_SDK_SHA256: c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
 
@@ -34,6 +32,9 @@ jobs:
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           submodules: true
+
+      - name: Load Zig toolchain manifest
+        run: sed '/^#/d; /^$/d' zig/toolchain.env >> "$GITHUB_ENV"
 
       - name: Verify x86_64 host
         run: test "$(uname -m)" = x86_64

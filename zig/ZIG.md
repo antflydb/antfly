@@ -2,7 +2,8 @@
 
 ## 2026-08-29: Zig 0.17 nightly migration
 
-The repository is pinned to Zig `0.17.0-dev.1933+e19a73c2d`. Nightly archives
+The repository's canonical Zig version and archive checksums live in
+[`toolchain.env`](toolchain.env). Nightly archives
 come from `https://ziglang.org/builds/`, rather than the stable-release download
 directory.
 

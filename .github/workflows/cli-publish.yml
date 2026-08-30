@@ -21,8 +21,6 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  ZIG_VERSION: 0.17.0-dev.1933+e19a73c2d
-  ZIG_X86_64_LINUX_SHA256: 122e91695d3dd7a7b640dac7f901a09a900614ef01e936c9f517dae8299b4368
 
 jobs:
   package:
@@ -30,6 +28,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Load Zig toolchain manifest
+        run: sed '/^#/d; /^$/d' zig/toolchain.env >> "$GITHUB_ENV"
 
       - name: Resolve version
         id: version

@@ -195,6 +195,9 @@ jobs:
             echo "release_tooling=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Verify Zig toolchain pins
+        run: make zig-toolchain-check
+
   release-tooling:
     name: release-tooling
     needs: changes
@@ -230,10 +233,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.17.0-dev.1933+e19a73c2d
-          use-cache: false
+        uses: ./.github/actions/setup-zig
 
       - name: Run backup listing against MinIO
         run: scripts/test-backup-s3-integration.sh
@@ -257,12 +257,13 @@ jobs:
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 20
     env:
-      ZIG_VERSION: "0.17.0-dev.1933+e19a73c2d"
-      ZIG_AARCH64_LINUX_SHA256: af999865a348703ed7496ff3c4a8a83a4c4a2b50097b19f99eb1f9f7e1791e4a
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-arm64-codec
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-arm64-codec
     steps:
       - uses: actions/checkout@v6
+
+      - name: Load Zig toolchain manifest
+        run: sed '/^#/d; /^$/d' zig/toolchain.env >> "$GITHUB_ENV"
 
       - name: Verify native Linux ARM64 runner
         run: |
@@ -322,10 +323,7 @@ jobs:
         uses: astral-sh/setup-uv@v8.1.0
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.17.0-dev.1933+e19a73c2d
-          use-cache: false
+        uses: ./.github/actions/setup-zig
 
       - name: Restore ARC Zig cache dirs
         run: |
@@ -595,10 +593,7 @@ jobs:
         uses: astral-sh/setup-uv@v8.1.0
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.17.0-dev.1933+e19a73c2d
-          use-cache: false
+        uses: ./.github/actions/setup-zig
 
       - name: Restore ARC Zig cache dirs
         run: |
@@ -790,10 +785,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.17.0-dev.1933+e19a73c2d
-          use-cache: false
+        uses: ./.github/actions/setup-zig
 
       - name: Restore ARC Zig cache dirs
         run: |
@@ -848,10 +840,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.17.0-dev.1933+e19a73c2d
-          use-cache: false
+        uses: ./.github/actions/setup-zig
 
       - name: Restore ARC cache dirs
         run: |
@@ -956,10 +945,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.17.0-dev.1933+e19a73c2d
-          use-cache: false
+        uses: ./.github/actions/setup-zig
 
       - name: Restore ARC cache dirs
         run: |
