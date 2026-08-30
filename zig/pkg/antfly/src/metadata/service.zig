@@ -68,10 +68,19 @@ const metadata_proposal_passive_wait_ns: u64 = 25 * std.time.ns_per_ms;
 const reallocation_protocol_probe_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_min_backoff_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_max_backoff_ns: u64 = 60 * std.time.ns_per_s;
-const embedding_activity_ttl_ns: u64 = 5 * std.time.ns_per_s;
-const embedding_activity_protocol_version: u16 = 1;
+// The data owner sends clean idle heartbeats every 30 seconds. Keep telemetry
+// through two missed intervals plus scheduling jitter; leadership changes use
+// a new service-local cache and therefore still become unavailable promptly.
+const embedding_activity_ttl_ns: u64 = 90 * std.time.ns_per_s;
+const embedding_activity_protocol_version = metadata_table_manager.embedding_activity_protocol_version;
 
 const EmbeddingActivityCache = struct {
+    const OwnerFence = struct {
+        store_id: u64,
+        reporter_incarnation: u64,
+        status_generation: u64,
+    };
+
     const Entry = struct {
         store_id: u64,
         reporter_incarnation: u64,
@@ -90,11 +99,17 @@ const EmbeddingActivityCache = struct {
     };
 
     mutex: std.Io.Mutex = .init,
+    /// Retained for the lifetime of the current StoreRecord incarnation, even
+    /// after activity expires. Durable status intentionally does not advance
+    /// for activity-only reports, so this is the authority that rejects a
+    /// delayed heartbeat from regressing the ephemeral projection.
+    owner_fences: std.ArrayListUnmanaged(OwnerFence) = .empty,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.entries.items) |entry| entry.deinit(alloc);
         self.entries.deinit(alloc);
+        self.owner_fences.deinit(alloc);
         self.* = .{};
     }
 
@@ -112,6 +127,19 @@ const EmbeddingActivityCache = struct {
         }
     }
 
+    fn ownerFenceIndexAssumeLocked(self: *const @This(), store_id: u64) ?usize {
+        for (self.owner_fences.items, 0..) |fence, index| {
+            if (fence.store_id == store_id) return index;
+        }
+        return null;
+    }
+
+    fn refreshStoreAssumeLocked(self: *@This(), store_id: u64, now_ns: u64) void {
+        for (self.entries.items) |*entry| {
+            if (entry.store_id == store_id) entry.observed_at_ns = now_ns;
+        }
+    }
+
     fn update(
         self: *@This(),
         alloc: std.mem.Allocator,
@@ -123,12 +151,35 @@ const EmbeddingActivityCache = struct {
         defer self.mutex.unlock(std.Options.debug_io);
         for (reports) |report| {
             if (report.embedding_activity_protocol_version != embedding_activity_protocol_version) continue;
+            if (report.reporter_incarnation == 0) continue;
             const store_index = metadata_store_observer.findStoreIndex(projected, report.store_id) orelse continue;
             const store = projected[store_index];
-            if (store.reporter_incarnation != 0 and
-                report.reporter_incarnation != store.reporter_incarnation) continue;
-            if (store.reporter_incarnation != 0 and
+            if (report.reporter_incarnation != store.reporter_incarnation or
                 report.status_generation < store.status_generation) continue;
+
+            if (self.ownerFenceIndexAssumeLocked(report.store_id)) |fence_index| {
+                const fence = &self.owner_fences.items[fence_index];
+                if (fence.reporter_incarnation == report.reporter_incarnation) {
+                    if (report.status_generation < fence.status_generation) continue;
+                    if (report.status_generation == fence.status_generation) {
+                        // Periodic heartbeat of the same immutable owner
+                        // snapshot refreshes liveness without reapplying data.
+                        self.refreshStoreAssumeLocked(report.store_id, now_ns);
+                        continue;
+                    }
+                }
+                fence.* = .{
+                    .store_id = report.store_id,
+                    .reporter_incarnation = report.reporter_incarnation,
+                    .status_generation = report.status_generation,
+                };
+            } else {
+                try self.owner_fences.append(alloc, .{
+                    .store_id = report.store_id,
+                    .reporter_incarnation = report.reporter_incarnation,
+                    .status_generation = report.status_generation,
+                });
+            }
 
             // A report is a full owner snapshot. Replace this store's prior
             // entries atomically so removed indexes and restarted epochs never
@@ -165,6 +216,18 @@ const EmbeddingActivityCache = struct {
     ) void {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
+        var fence_index: usize = self.owner_fences.items.len;
+        while (fence_index > 0) {
+            fence_index -= 1;
+            const fence = self.owner_fences.items[fence_index];
+            const live = for (stores) |store| {
+                if (store.store_id == fence.store_id and
+                    store.reporter_incarnation == fence.reporter_incarnation) break true;
+            } else false;
+            if (live) continue;
+            _ = self.owner_fences.swapRemove(fence_index);
+            self.removeStoreAssumeLocked(cache_alloc, fence.store_id);
+        }
         var i: usize = self.entries.items.len;
         while (i > 0) {
             i -= 1;
@@ -7264,12 +7327,19 @@ test "metadata service transition commands negotiate runtime status payload vers
             return self.ready_version >= required_version;
         }
     };
+    var source_replay = [_]metadata_table_manager.RuntimeIndexSourceReplayStatusReport{.{
+        .artifact_name = "chunks",
+        .published_sequence = 7,
+        .target_sequence = 9,
+        .failed = true,
+    }};
     var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
         .name = "visual_idx",
         .kind = "dense_vector",
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
         .embedding_activity = .{ .epoch = 9, .embeddings_computed = 17 },
+        .source_replay = source_replay[0..],
     }};
     var runtime_statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
         .indexes = indexes[0..],
@@ -7278,6 +7348,7 @@ test "metadata service transition commands negotiate runtime status payload vers
         .store_id = 1,
         .node_id = 2,
         .reporter_incarnation = 77,
+        .artifact_sources_protocol_version = metadata_table_manager.artifact_sources_protocol_version,
         .runtime_statuses = runtime_statuses[0..],
     };
 
@@ -7293,8 +7364,10 @@ test "metadata service transition commands negotiate runtime status payload vers
         &owned_legacy_store,
     );
     try std.testing.expect(!storeHasRuntimeRepairStatus(safe_command.register_store));
+    try std.testing.expect(!storeHasRuntimeArtifactSourceStatus(safe_command.register_store));
     try std.testing.expect(!storeHasRuntimeEmbeddingActivity(safe_command.register_store));
     try std.testing.expectEqual(@as(u64, 0), safe_command.register_store.reporter_incarnation);
+    try std.testing.expectEqual(@as(u16, 0), safe_command.register_store.artifact_sources_protocol_version);
     try std.testing.expectEqual(@as(u16, 0), safe_command.register_store.native_generation_restore_version);
     try std.testing.expect(storeHasRuntimeRepairStatus(store));
 
@@ -7335,6 +7408,7 @@ test "metadata service transition commands negotiate runtime status payload vers
         &owned_repair_store,
     );
     try std.testing.expect(storeHasRuntimeRepairStatus(repair_command.upsert_store));
+    try std.testing.expect(storeHasRuntimeArtifactSourceStatus(repair_command.upsert_store));
     try std.testing.expect(!storeHasRuntimeEmbeddingActivity(repair_command.upsert_store));
     try std.testing.expectEqual(@as(u64, 77), repair_command.upsert_store.reporter_incarnation);
 
@@ -7371,6 +7445,7 @@ test "metadata service transition commands negotiate runtime status payload vers
     );
     try std.testing.expect(unexpectedly_owned != null);
     try std.testing.expect(storeHasRuntimeRepairStatus(current_command.upsert_store));
+    try std.testing.expect(storeHasRuntimeArtifactSourceStatus(current_command.upsert_store));
     try std.testing.expect(!storeHasRuntimeEmbeddingActivity(current_command.upsert_store));
     try std.testing.expectEqual(@as(u64, 77), current_command.upsert_store.reporter_incarnation);
     try std.testing.expectEqual(
@@ -7506,16 +7581,37 @@ test "metadata activity cache is versioned TTL-bound and incarnation scoped" {
     try std.testing.expectEqual(@as(u64, 77), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
     try std.testing.expectEqual(metadata_table_manager.RuntimeEmbeddingActivityStatusReport.Phase.embedding, current[0].runtime_statuses[0].indexes[0].embedding_activity.phase);
 
+    // Activity-only reports do not advance durable StoreRecord state. The
+    // cache's own sequence fence must reject reordered observations.
+    var stale_report = report;
+    stale_report.status_generation = report.status_generation - 1;
+    var stale_indexes = observed_indexes;
+    stale_indexes[0].embedding_activity.embeddings_computed = 999;
+    var stale_runtime = observed_runtime;
+    stale_runtime[0].indexes = stale_indexes[0..];
+    stale_report.runtime_statuses = stale_runtime[0..];
+    try cache.update(alloc, &.{committed}, &.{stale_report}, 102);
+    current[0].runtime_statuses[0].indexes[0].embedding_activity = .{};
+    cache.overlay(alloc, &current, 103);
+    try std.testing.expectEqual(@as(u64, 12), current[0].runtime_statuses[0].indexes[0].embedding_activity.embeddings_computed);
+
     // A recreated generation cannot inherit the prior owner's telemetry.
     current[0].runtime_statuses[0].indexes[0].embedding_activity = .{};
     current[0].runtime_statuses[0].indexes[0].coverage_generation = 8;
-    cache.overlay(alloc, &current, 102);
+    cache.overlay(alloc, &current, 104);
     try std.testing.expectEqual(@as(u64, 0), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
 
-    // Expiry models missed heartbeats and metadata leadership changes: status
-    // becomes unavailable, never synthetic idle or inferred embedding.
+    // An idempotent periodic heartbeat refreshes liveness without permitting
+    // same-generation data to rewrite the snapshot.
     current[0].runtime_statuses[0].indexes[0].coverage_generation = 7;
-    cache.overlay(alloc, &current, 100 + embedding_activity_ttl_ns);
+    try cache.update(alloc, &.{committed}, &.{report}, 100 + embedding_activity_ttl_ns - 1);
+    cache.overlay(alloc, &current, 100 + embedding_activity_ttl_ns + 1);
+    try std.testing.expectEqual(@as(u64, 77), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+
+    // Expiry models missed heartbeats: status becomes unavailable, never
+    // synthetic idle or inferred embedding.
+    current[0].runtime_statuses[0].indexes[0].embedding_activity = .{};
+    cache.overlay(alloc, &current, 100 + 2 * embedding_activity_ttl_ns);
     try std.testing.expectEqual(@as(u64, 0), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
 
     var legacy_report = report;
@@ -8400,6 +8496,10 @@ fn reportStoreStatusesWithProjected(
         if (!metadata_table_manager.reporterFenceValid(
             report.reporter_incarnation,
             report.status_generation,
+        )) return error.InvalidStoreReporterFence;
+        if (!metadata_table_manager.embeddingActivityProtocolValid(
+            report.reporter_incarnation,
+            report.embedding_activity_protocol_version,
         )) return error.InvalidStoreReporterFence;
         const index = metadata_store_observer.findStoreIndex(projected, report.store_id) orelse return error.UnknownStore;
         if (!metadata_store_observer.observationChangesRecordWithRepairStatus(

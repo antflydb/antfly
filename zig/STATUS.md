@@ -193,9 +193,11 @@ and rejects unreleased v13/v14 artifacts.
 Embedding work telemetry is a versioned, readiness-neutral heartbeat. The data
 owner publishes exact phase transitions and coalesced counter progress; the
 metadata leader retains matching store, group, index, generation, and config
-identities in a TTL cache. Activity expires to unavailable across missed
-heartbeats or leader changes. Status must never infer work from coverage debt,
-and activity must never authorize a query or lifecycle transition.
+identities in a TTL cache long enough to span the low-frequency idle heartbeat.
+A separate per-store incarnation/generation fence prevents reordered
+activity-only reports from regressing the cache. Activity expires to unavailable
+across missed heartbeats or leader changes. Status must never infer work from
+coverage debt, and activity must never authorize a query or lifecycle transition.
 
 ### Data Model
 

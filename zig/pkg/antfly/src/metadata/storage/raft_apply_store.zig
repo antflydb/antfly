@@ -4365,9 +4365,20 @@ fn storeHasRuntimeRepairStatus(record: metadata.StoreRecord) bool {
     return false;
 }
 
+fn storeHasRuntimeArtifactSourceStatus(record: metadata.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.source_replay.len != 0) return true;
+        }
+    }
+    return false;
+}
+
 fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
     if (record.native_generation_restore_version != 0 or
+        record.artifact_sources_protocol_version != 0 or
         storeHasRuntimeRepairStatus(record) or
+        storeHasRuntimeArtifactSourceStatus(record) or
         record.reporter_incarnation != 0 or record.status_generation != 0)
         return runtime_status_protocol.current_record_version;
     return null;
@@ -5891,7 +5902,7 @@ fn readRuntimeIndexStatusRecord(
     pos.* += 1;
     const load_error = if (version >= 11) try readOptionalString(alloc, encoded, pos) else null;
     errdefer if (load_error) |value| alloc.free(value);
-    const repair_status: ?metadata.IndexRepairStatus = if (version >= 13) blk: {
+    const repair_status: ?metadata.IndexRepairStatus = if (version >= runtime_status_protocol.repair_status_record_version) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const tag = encoded[pos.*];
         pos.* += 1;
@@ -5904,7 +5915,7 @@ fn readRuntimeIndexStatusRecord(
             else => return error.InvalidMetadataTransitionEncoding,
         };
     } else null;
-    const repair_active_generation_serviceable = if (version >= 13) blk: {
+    const repair_active_generation_serviceable = if (version >= runtime_status_protocol.repair_status_record_version) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const value = encoded[pos.*];
         pos.* += 1;
@@ -11468,18 +11479,16 @@ test "metadata runtime index status decoder accepts version ten records" {
     try std.testing.expect(!decoded.repair_active_generation_serviceable);
 }
 
-test "metadata runtime index status decoder defaults version fifteen source failures safely" {
+test "metadata runtime index status current profile preserves source failures" {
     const alloc = std.testing.allocator;
     try std.testing.expectEqual(@as(u16, 15), runtime_status_protocol.artifact_source_status_record_version);
-    try std.testing.expectEqual(@as(u16, 16), runtime_status_protocol.artifact_source_failure_status_record_version);
+    try std.testing.expectEqual(@as(u16, 15), runtime_status_protocol.artifact_source_failure_status_record_version);
     var encoded = std.ArrayListUnmanaged(u8).empty;
     defer encoded.deinit(alloc);
     const sources = [_]metadata.RuntimeIndexSourceReplayStatusReport{.{
         .artifact_name = "chunk_vectors",
         .published_sequence = 7,
         .target_sequence = 9,
-        // V15 cannot represent this field; the decoder must not consume a byte
-        // from the following record or manufacture a terminal failure.
         .failed = true,
     }};
     try appendRuntimeIndexStatusRecord(alloc, &encoded, .{
@@ -11498,7 +11507,7 @@ test "metadata runtime index status decoder defaults version fifteen source fail
     defer metadata_table_manager.freeRuntimeIndexStatusReport(alloc, decoded);
     try std.testing.expectEqual(encoded.items.len, pos);
     try std.testing.expectEqual(@as(usize, 1), decoded.source_replay.len);
-    try std.testing.expect(!decoded.source_replay[0].failed);
+    try std.testing.expect(decoded.source_replay[0].failed);
 }
 
 test "metadata runtime status writer preserves the version twelve rolling-upgrade contract" {

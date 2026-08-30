@@ -90,6 +90,10 @@ one another.
 - AFB2 `delta` declares a base manifest and carries only absent blobs.
 - Native and portable are manifest values, never inferred from file extension
   or CLI flags during restore.
+- Compression and encryption are declared capabilities, not hints. Current
+  writers emit uncompressed, unencrypted payloads and current restore paths
+  fail closed on any other declaration until the corresponding streaming
+  codec/key-provider implementation is installed.
 
 Remote repositories stay unpacked for deduplication, range access, and
 incremental capture. Exporting one snapshot to a file packs its reachable

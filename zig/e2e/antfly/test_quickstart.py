@@ -18,7 +18,6 @@ import json
 
 import pytest
 import requests
-
 from helpers import (
     assert_created_index,
     assert_single_top_hit,
@@ -26,7 +25,6 @@ from helpers import (
     upsert,
     wait_until,
 )
-
 
 pytestmark = pytest.mark.reuse_antfly_process
 
@@ -992,6 +990,9 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
 
     readiness = partial_status["readiness"]
     coverage = partial_status["coverage"]
+    source_coverage = partial_status["source_coverage"]
+    milestones = partial_status["milestones"]
+    activity = partial_status["activity"]
     assert readiness["queryable"] is True
     assert readiness["complete"] is False
     assert readiness["state"] != "failed"
@@ -1000,6 +1001,24 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     assert readiness["published_revision"] <= readiness["target_revision"]
     assert 0 < coverage["covered"] < coverage["source_total"] == 100
     assert coverage["complete"] is False
+    assert source_coverage["total"] == 100
+    assert source_coverage["covered"] == coverage["covered"]
+    assert source_coverage["complete"] is False
+    assert milestones["queryable"]["reached"] is True
+    assert milestones["queryable"]["blockers"] == []
+    assert milestones["complete"]["reached"] is False
+    assert "source_coverage" in milestones["complete"]["blockers"]
+    assert activity is not None
+    assert activity["epoch"].startswith("a-")
+    assert activity["phase"] in {
+        "idle",
+        "preparing",
+        "embedding",
+        "publishing",
+        "waiting_retry",
+    }
+    assert activity["embeddings_computed"] > 0
+    assert partial_status["searchable_vectors"] == partial_status["total_indexed"]
 
     result = backup_api.query_table(
         table_name,
@@ -1024,6 +1043,11 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     assert complete["readiness"]["queryable"] is True
     assert complete["readiness"]["complete"] is True
     assert complete["coverage"]["covered"] == 100
+    assert complete["source_coverage"]["covered"] == 100
+    assert complete["source_coverage"]["complete"] is True
+    assert complete["milestones"]["complete"]["reached"] is True
+    assert complete["milestones"]["complete"]["blockers"] == []
+    assert complete["searchable_vectors"] == 100
     assert complete["total_indexed"] == 100
 
 

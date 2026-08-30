@@ -347,6 +347,7 @@ pub fn extractNativeFileToStagingDirectory(
     if (manifest_block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
     var parsed_manifest = try bundle.parseManifest(alloc, manifest_block.payload);
     defer parsed_manifest.deinit();
+    try bundle.validateReadablePayloadFeatures(parsed_manifest.value);
     if (parsed_manifest.value.representation != .native or parsed_manifest.value.mode != .full)
         return error.BackupArtifactFormatMismatch;
 

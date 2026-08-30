@@ -173,8 +173,11 @@ stable epoch.
 Activity heartbeat protocol v1 is separate from durable runtime status. Data
 nodes coalesce counter updates to at most once per second while reporting phase
 edges promptly. The metadata leader keeps matching store/index-incarnation
-observations in a five-second TTL cache; leadership changes therefore make
-activity temporarily unavailable without changing readiness. Shared enrichment
+observations for 90 seconds, spanning three 30-second idle-heartbeat intervals.
+An independent incarnation/generation fence rejects reordered activity-only
+reports even though they intentionally do not advance durable Raft state;
+leadership changes still make activity temporarily unavailable without changing
+readiness. Shared enrichment
 producers may fan one completed batch out to every exact consumer index, but
 activity from an unrelated index, table, or stale incarnation must never be
 attributed to the requested index.
@@ -182,9 +185,10 @@ attributed to the requested index.
 The durable runtime-status codec has two negotiated profiles, not a numeric
 feature ladder. It reads the released v0.2.0 range 1–12, writes v12 to old
 peers, and reads/writes current v15. Versions 13 and 14 were unreleased and are
-rejected. Reporter fences, repair state, and native-generation restore identity
-are one mandatory v15 admission-safety profile and wait until every current
-metadata voter supports v15. Activity never enters that codec.
+rejected. Reporter fences, repair state, artifact-source replay/failure facts,
+and native-generation restore identity are one mandatory v15 admission-safety
+profile and wait until every current metadata voter supports v15. Activity never
+enters that codec.
 
 ## Full-Text Routing From Enrichments
 

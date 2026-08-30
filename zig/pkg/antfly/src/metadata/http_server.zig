@@ -2514,6 +2514,10 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.status_generation orelse 0,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.embeddingActivityProtocolValid(
+        parsed.value.reporter_incarnation orelse 0,
+        parsed.value.embedding_activity_protocol_version orelse 0,
+    )) return error.InvalidStoreReporterFence;
     if (!metadata_table_manager.artifactSourcesProtocolValid(
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.artifact_sources_protocol_version orelse 0,
@@ -2730,7 +2734,7 @@ fn cloneParsedRuntimeIndexStatus(
 test "metadata status JSON preserves compact managed repair admission state" {
     const alloc = std.testing.allocator;
     const report = try parseStoreStatusReport(alloc,
-        \\{"store_id":20,"embedding_activity_protocol_version":1,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","embedding_activity":{"epoch":7,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
+        \\{"store_id":20,"reporter_incarnation":77,"embedding_activity_protocol_version":1,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","embedding_activity":{"epoch":7,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
     );
     defer freeStoreStatusReport(alloc, report);
 

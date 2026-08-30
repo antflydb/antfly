@@ -755,6 +755,7 @@ fn writeIndexFailureDiagnostic(
     if (summary.repair_blocks_queryable) |blocks| try writer.print(" blocks_queryable={any}", .{blocks});
     if (summary.repair_blocks_complete) |blocks| try writer.print(" blocks_complete={any}", .{blocks});
     if (summary.repair_reason) |reason| try writer.print(" repair_reason={s}", .{reason});
+    try writePendingReasons(writer, summary.pending_reasons);
     try writeBlockers(writer, blockersForTarget(summary, target));
     try writer.writeAll("; run index list --output json for full diagnostics");
 }
@@ -803,6 +804,7 @@ fn printWaitProgress(index_name: []const u8, target: WaitTarget, summary: IndexS
         if (summary.indexed) |indexed| writer.print(" indexed={d}", .{indexed}) catch return;
         if (summary.visible) |visible| writer.print(" searchable={d}", .{visible}) catch return;
     }
+    writePendingReasons(&writer, summary.pending_reasons) catch return;
     writeBlockers(&writer, blockersForTarget(summary, target)) catch return;
     writer.writeByte('\n') catch return;
     std.debug.print("{s}", .{writer.buffered()});
@@ -884,6 +886,7 @@ fn writeWaitSuccess(
         if (summary.indexed) |indexed| try writer.print(" indexed={d}", .{indexed});
         if (summary.visible) |visible| try writer.print(" searchable={d}", .{visible});
     }
+    try writePendingReasons(writer, summary.pending_reasons);
     try writeBlockers(writer, blockersForTarget(summary, target));
     if (summary.repair_action_required orelse false) {
         try writer.writeAll(" warning=repair_action_required");
@@ -1491,7 +1494,7 @@ test "index wait prefers authoritative readiness contract" {
     var failure_writer = std.Io.Writer.fixed(&failure_buffer);
     try writeIndexFailureDiagnostic(&failure_writer, "dense", .queryable, summary);
     try std.testing.expectEqualStrings(
-        "embeddings index dense failed while waiting until queryable: state=failed source_coverage=- incarnation=g-000000000000002a error=load failed repair_state=failed action_required=true blocks_queryable=true blocks_complete=true repair_reason=activation_manifest_missing blockers=[repair]; run index list --output json for full diagnostics",
+        "embeddings index dense failed while waiting until queryable: state=failed source_coverage=- incarnation=g-000000000000002a error=load failed repair_state=failed action_required=true blocks_queryable=true blocks_complete=true repair_reason=activation_manifest_missing pending_reasons=[repair] blockers=[]; run index list --output json for full diagnostics",
         failure_writer.buffered(),
     );
 

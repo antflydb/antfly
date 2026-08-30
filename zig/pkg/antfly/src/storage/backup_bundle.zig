@@ -131,6 +131,14 @@ pub fn validateManifest(manifest: Manifest) !void {
     }
 }
 
+/// Validates payload capabilities implemented by the current reader. Schema
+/// validation remains separate so tooling can inspect a future bundle and
+/// report its metadata without accidentally claiming it can restore it.
+pub fn validateReadablePayloadFeatures(manifest: Manifest) !void {
+    if (manifest.encryption != null) return error.UnsupportedBackupEncryption;
+    if (manifest.compression != .none) return error.UnsupportedBackupCompression;
+}
+
 pub fn validateSha256(value: []const u8) !void {
     if (value.len != std.crypto.hash.sha2.Sha256.digest_length * 2)
         return error.InvalidBackupDigest;
@@ -336,4 +344,15 @@ test "AFB2 manifest rejects ambiguous delta and traversal paths" {
     }));
     try std.testing.expectError(error.InvalidBackupPath, validateRelativePath("indexes/../store"));
     try std.testing.expectError(error.InvalidBackupPath, validateRelativePath("/absolute"));
+}
+
+test "AFB2 readers fail closed on declared unsupported payload features" {
+    try std.testing.expectError(error.UnsupportedBackupCompression, validateReadablePayloadFeatures(.{
+        .representation = .native,
+        .compression = .zstd,
+    }));
+    try std.testing.expectError(error.UnsupportedBackupEncryption, validateReadablePayloadFeatures(.{
+        .representation = .portable,
+        .encryption = .{ .algorithm = "aes-256-gcm", .key_id = "quickstart" },
+    }));
 }

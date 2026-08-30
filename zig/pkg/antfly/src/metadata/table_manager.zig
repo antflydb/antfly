@@ -15,6 +15,7 @@
 const std = @import("std");
 
 pub const artifact_sources_protocol_version: u16 = 1;
+pub const embedding_activity_protocol_version: u16 = 1;
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
@@ -698,6 +699,11 @@ pub fn reporterFenceValid(reporter_incarnation: u64, status_generation: u64) boo
     return reporter_incarnation != 0 or status_generation == 0;
 }
 
+pub fn embeddingActivityProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
+    return protocol_version <= embedding_activity_protocol_version and
+        (protocol_version == 0 or reporter_incarnation != 0);
+}
+
 pub fn artifactSourcesProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
     return protocol_version <= artifact_sources_protocol_version and
         (protocol_version == 0 or reporter_incarnation != 0);
@@ -727,6 +733,13 @@ test "artifact source protocol support fails closed and includes custom placemen
     try std.testing.expect(storeServesTableData("hot"));
     try std.testing.expect(storeServesTableData("cold"));
     try std.testing.expect(!storeServesTableData("metadata"));
+}
+
+test "embedding activity protocol requires an incarnation fence" {
+    try std.testing.expect(embeddingActivityProtocolValid(0, 0));
+    try std.testing.expect(!embeddingActivityProtocolValid(0, embedding_activity_protocol_version));
+    try std.testing.expect(embeddingActivityProtocolValid(7, embedding_activity_protocol_version));
+    try std.testing.expect(!embeddingActivityProtocolValid(7, embedding_activity_protocol_version + 1));
 }
 
 pub const RuntimeEnrichmentStatusReport = struct {

@@ -126,12 +126,16 @@ pub fn leasePathAlloc(alloc: std.mem.Allocator, lease_id: []const u8) ![]u8 {
 
 pub fn encodeManifestCanonicalAlloc(alloc: std.mem.Allocator, manifest: Manifest) ![]u8 {
     try validateManifest(manifest);
-    return try std.json.Stringify.valueAlloc(alloc, manifest, .{});
+    const encoded = try std.json.Stringify.valueAlloc(alloc, manifest, .{});
+    errdefer alloc.free(encoded);
+    try validateManifestEncodedSize(encoded.len);
+    return encoded;
 }
 
 pub const ParsedManifest = std.json.Parsed(Manifest);
 
 pub fn parseManifestCanonical(alloc: std.mem.Allocator, encoded: []const u8) !ParsedManifest {
+    try validateManifestEncodedSize(encoded.len);
     var parsed = std.json.parseFromSlice(Manifest, alloc, encoded, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
@@ -142,6 +146,11 @@ pub fn parseManifestCanonical(alloc: std.mem.Allocator, encoded: []const u8) !Pa
     defer alloc.free(canonical);
     if (!std.mem.eql(u8, canonical, encoded)) return error.NonCanonicalBackupManifest;
     return parsed;
+}
+
+fn validateManifestEncodedSize(encoded_len: usize) !void {
+    if (encoded_len == 0 or encoded_len > max_manifest_bytes)
+        return error.BackupManifestTooLarge;
 }
 
 pub fn manifestDigestHexAlloc(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
@@ -493,6 +502,15 @@ test "repository manifest is a complete canonical materialized inventory" {
     const digest = try manifestDigestHexAlloc(alloc, encoded);
     defer alloc.free(digest);
     try bundle.validateSha256(digest);
+}
+
+test "repository manifest parsing is bounded before allocation" {
+    try validateManifestEncodedSize(max_manifest_bytes);
+    try std.testing.expectError(
+        error.BackupManifestTooLarge,
+        validateManifestEncodedSize(max_manifest_bytes + 1),
+    );
+    try std.testing.expectError(error.BackupManifestTooLarge, validateManifestEncodedSize(0));
 }
 
 test "repository ref publication is compare and swap" {

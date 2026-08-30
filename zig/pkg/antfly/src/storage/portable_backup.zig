@@ -1055,6 +1055,7 @@ fn PortableArchiveReader(comptime RawReader: type) type {
                 if (manifest_block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
                 var manifest = try backup_bundle.parseManifest(alloc, manifest_block.payload);
                 errdefer manifest.deinit();
+                try backup_bundle.validateReadablePayloadFeatures(manifest.value);
                 if (manifest.value.representation != .portable or manifest.value.mode != .full or
                     manifest.value.objects.len == 0)
                     return error.BackupArtifactFormatMismatch;
