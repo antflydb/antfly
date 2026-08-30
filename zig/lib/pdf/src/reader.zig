@@ -926,6 +926,7 @@ const Type3Font = struct {
     shadings: []PageShading = &.{},
     patterns: []PagePattern = &.{},
     gstates: []PageExtGState = &.{},
+    color_spaces: []PageColorSpace = &.{},
     forms: []PageForm = &.{},
 
     fn deinit(self: *Type3Font, alloc: Allocator) void {
@@ -941,6 +942,8 @@ const Type3Font = struct {
         if (self.patterns.len > 0) alloc.free(self.patterns);
         for (self.gstates) |*gstate| gstate.deinit(alloc);
         if (self.gstates.len > 0) alloc.free(self.gstates);
+        for (self.color_spaces) |*color_space| color_space.deinit(alloc);
+        if (self.color_spaces.len > 0) alloc.free(self.color_spaces);
         for (self.forms) |*form| form.deinit(alloc);
         if (self.forms.len > 0) alloc.free(self.forms);
         self.* = undefined;
@@ -1702,6 +1705,9 @@ const TextRunState = struct {
     group_knockout: bool = false,
     fill_color_space: ColorSpaceKind = .device_gray,
     stroke_color_space: ColorSpaceKind = .device_gray,
+    fill_pattern_base_color_space: ?ColorSpaceKind = null,
+    stroke_pattern_base_color_space: ?ColorSpaceKind = null,
+    color_spaces: []const PageColorSpace = &.{},
     fill_pattern_name: ?[]const u8 = null,
     stroke_pattern_name: ?[]const u8 = null,
     x: f64 = 0,
@@ -1744,6 +1750,9 @@ const TextRunStackEntry = struct {
     group_knockout: bool,
     fill_color_space: ColorSpaceKind,
     stroke_color_space: ColorSpaceKind,
+    fill_pattern_base_color_space: ?ColorSpaceKind,
+    stroke_pattern_base_color_space: ?ColorSpaceKind,
+    color_spaces: []const PageColorSpace,
     fill_pattern_name: ?[]const u8,
     stroke_pattern_name: ?[]const u8,
     clip_box: ?PageBox,
@@ -1776,12 +1785,36 @@ const ColorSpaceKind = enum {
     unsupported,
 };
 
+const ColorSpaceSelection = struct {
+    kind: ColorSpaceKind,
+    pattern_base: ?ColorSpaceKind = null,
+};
+
+const PageColorSpace = struct {
+    name: []u8,
+    selection: ColorSpaceSelection,
+
+    fn deinit(self: *PageColorSpace, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
 fn colorSpaceKindFromName(name: []const u8) ColorSpaceKind {
     if (std.mem.eql(u8, name, "DeviceGray") or std.mem.eql(u8, name, "G")) return .device_gray;
     if (std.mem.eql(u8, name, "DeviceRGB") or std.mem.eql(u8, name, "RGB")) return .device_rgb;
     if (std.mem.eql(u8, name, "DeviceCMYK") or std.mem.eql(u8, name, "CMYK")) return .device_cmyk;
     if (std.mem.eql(u8, name, "Pattern")) return .pattern;
     return .unsupported;
+}
+
+fn colorSpaceSelectionFromName(color_spaces: []const PageColorSpace, name: []const u8) ColorSpaceSelection {
+    const direct = colorSpaceKindFromName(name);
+    if (direct != .unsupported) return .{ .kind = direct };
+    for (color_spaces) |color_space| {
+        if (std.mem.eql(u8, color_space.name, name)) return color_space.selection;
+    }
+    return .{ .kind = .unsupported };
 }
 
 fn initialColorForColorSpace(color_space: ColorSpaceKind) [4]u8 {
@@ -1839,14 +1872,18 @@ fn materializePatternCellColorSpace(color_space: ColorSpaceKind) ColorSpaceKind 
 }
 
 fn selectFillColorSpace(state: anytype, name: []const u8) void {
-    state.fill_color_space = colorSpaceKindFromName(name);
+    const selection = colorSpaceSelectionFromName(state.color_spaces, name);
+    state.fill_color_space = selection.kind;
+    state.fill_pattern_base_color_space = selection.pattern_base;
     state.fill_color = initialColorForColorSpace(state.fill_color_space);
     // Pattern's initial color paints nothing until scn selects a pattern.
     state.fill_pattern_name = null;
 }
 
 fn selectStrokeColorSpace(state: anytype, name: []const u8) void {
-    state.stroke_color_space = colorSpaceKindFromName(name);
+    const selection = colorSpaceSelectionFromName(state.color_spaces, name);
+    state.stroke_color_space = selection.kind;
+    state.stroke_pattern_base_color_space = selection.pattern_base;
     state.stroke_color = initialColorForColorSpace(state.stroke_color_space);
     state.stroke_pattern_name = null;
 }
@@ -1864,6 +1901,9 @@ const GraphicsState = struct {
     group_knockout: bool = false,
     fill_color_space: ColorSpaceKind = .device_gray,
     stroke_color_space: ColorSpaceKind = .device_gray,
+    fill_pattern_base_color_space: ?ColorSpaceKind = null,
+    stroke_pattern_base_color_space: ?ColorSpaceKind = null,
+    color_spaces: []const PageColorSpace = &.{},
     fill_pattern_name: ?[]const u8 = null,
     stroke_pattern_name: ?[]const u8 = null,
     line_cap: @FieldType(ShapeRun, "line_cap") = .butt,
@@ -2013,6 +2053,7 @@ const PagePattern = struct {
     shadings: []PageShading = &.{},
     patterns: []PagePattern = &.{},
     gstates: []PageExtGState = &.{},
+    color_spaces: []PageColorSpace = &.{},
     forms: []PageForm = &.{},
 
     fn deinit(self: *PagePattern, alloc: Allocator) void {
@@ -2029,6 +2070,8 @@ const PagePattern = struct {
         if (self.patterns.len > 0) alloc.free(self.patterns);
         for (self.gstates) |*gstate| gstate.deinit(alloc);
         if (self.gstates.len > 0) alloc.free(self.gstates);
+        for (self.color_spaces) |*color_space| color_space.deinit(alloc);
+        if (self.color_spaces.len > 0) alloc.free(self.color_spaces);
         for (self.forms) |*form| form.deinit(alloc);
         if (self.forms.len > 0) alloc.free(self.forms);
         self.* = undefined;
@@ -2048,6 +2091,7 @@ const PageForm = struct {
     shadings: []PageShading = &.{},
     patterns: []PagePattern = &.{},
     gstates: []PageExtGState = &.{},
+    color_spaces: []PageColorSpace = &.{},
     forms: []PageForm = &.{},
 
     fn deinit(self: *PageForm, alloc: Allocator) void {
@@ -2063,6 +2107,8 @@ const PageForm = struct {
         if (self.patterns.len > 0) alloc.free(self.patterns);
         for (self.gstates) |*gstate| gstate.deinit(alloc);
         if (self.gstates.len > 0) alloc.free(self.gstates);
+        for (self.color_spaces) |*color_space| color_space.deinit(alloc);
+        if (self.color_spaces.len > 0) alloc.free(self.color_spaces);
         for (self.forms) |*form| form.deinit(alloc);
         if (self.forms.len > 0) alloc.free(self.forms);
         self.* = undefined;
@@ -3191,6 +3237,11 @@ pub const Reader = struct {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
 
         const contents = page.get("Contents") orelse return try self.alloc.dupe(u8, "");
         var canonical = std.ArrayList(u8).empty;
@@ -3198,7 +3249,7 @@ pub const Reader = struct {
         var layout_runs = std.ArrayList(LayoutTextRun).empty;
         defer layout_runs.deinit(self.alloc);
         defer for (layout_runs.items) |*run| run.deinit(self.alloc);
-        var layout_parser = try PositionedTextParser.init(self.alloc, .{ .layout = &layout_runs }, .{}, &.{}, .nonzero);
+        var layout_parser = try PositionedTextParser.init(self.alloc, .{ .layout = &layout_runs }, .{ .color_spaces = color_spaces }, &.{}, .nonzero);
         defer layout_parser.deinit();
         layout_parser.cancellation = self.cancellation;
 
@@ -3259,13 +3310,18 @@ pub const Reader = struct {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
 
         const contents = page.get("Contents") orelse return .{
             .text = try self.alloc.dupe(u8, ""),
             .runs = try self.alloc.alloc(TextRun, 0),
             .outline_fallback = pageFontsUsedOutlineFallback(fonts),
         };
-        var analysis = try self.extractContentsTextAnalysisAlloc(contents, fonts, gstates, forms);
+        var analysis = try self.extractContentsTextAnalysisAlloc(contents, fonts, gstates, forms, color_spaces);
         analysis.outline_fallback = pageFontsUsedOutlineFallback(fonts);
         return analysis;
     }
@@ -3291,9 +3347,14 @@ pub const Reader = struct {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
 
         const contents = page.get("Contents") orelse return try self.alloc.alloc(TextRun, 0);
-        return try self.extractContentsTextRunsAlloc(contents, fonts, gstates, forms);
+        return try self.extractContentsTextRunsAlloc(contents, fonts, gstates, forms, color_spaces);
     }
 
     pub fn extractPageImageRunsAlloc(self: *Reader, page_num: usize) ![]ImageRun {
@@ -3317,9 +3378,14 @@ pub const Reader = struct {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
 
         const contents = page.get("Contents") orelse return try self.alloc.alloc(ImageRun, 0);
-        return try self.extractContentsImageRunsAlloc(contents, images, gstates, forms);
+        return try self.extractContentsImageRunsAlloc(contents, images, gstates, forms, color_spaces);
     }
 
     pub fn extractPageShadingRunsAlloc(self: *Reader, page_num: usize) ![]ShadingRun {
@@ -3343,9 +3409,14 @@ pub const Reader = struct {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
 
         const contents = page.get("Contents") orelse return try self.alloc.alloc(ShadingRun, 0);
-        return try self.extractContentsShadingRunsAlloc(contents, shadings, gstates, forms);
+        return try self.extractContentsShadingRunsAlloc(contents, shadings, gstates, forms, color_spaces);
     }
 
     pub fn extractPagePatternRunsAlloc(self: *Reader, page_num: usize) ![]PatternRun {
@@ -3369,9 +3440,14 @@ pub const Reader = struct {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
 
         const contents = page.get("Contents") orelse return try self.alloc.alloc(PatternRun, 0);
-        return try self.extractContentsPatternRunsAlloc(contents, patterns, gstates, forms);
+        return try self.extractContentsPatternRunsAlloc(contents, patterns, gstates, forms, color_spaces);
     }
 
     pub fn extractPageRenderRunsAlloc(self: *Reader, page_num: usize) !PageRenderRuns {
@@ -3424,6 +3500,11 @@ pub const Reader = struct {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
         try self.checkCancellation();
 
         var text_out = std.ArrayList(TextRun).empty;
@@ -3450,12 +3531,12 @@ pub const Reader = struct {
         errdefer if (!pattern_transferred) for (pattern_out.items) |*run| run.deinit(self.alloc);
         errdefer if (!shape_transferred) for (shape_out.items) |*run| run.deinit(self.alloc);
 
-        var text_parser = try PositionedTextParser.init(self.alloc, .{ .render = &text_out }, .{}, &.{}, .nonzero);
+        var text_parser = try PositionedTextParser.init(self.alloc, .{ .render = &text_out }, .{ .color_spaces = color_spaces }, &.{}, .nonzero);
         defer text_parser.deinit();
         text_parser.cancellation = self.cancellation;
 
         if (decoded_content.len > 0) {
-            try self.extractRenderRunsFromContentAppend(&text_parser, &image_out, &shading_out, &pattern_out, &shape_out, decoded_content, fonts, images, shadings, patterns, gstates, forms);
+            try self.extractRenderRunsFromContentAppend(&text_parser, &image_out, &shading_out, &pattern_out, &shape_out, decoded_content, fonts, images, shadings, patterns, gstates, forms, color_spaces);
         }
         try self.checkCancellation();
         var vector_budget = VectorTextWorkBudget.init(self.render_target, page_box);
@@ -3556,8 +3637,13 @@ pub const Reader = struct {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        const color_spaces = try self.collectPageColorSpacesAlloc(&page);
+        defer {
+            for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+            self.alloc.free(color_spaces);
+        }
         const contents = page.get("Contents") orelse return try self.alloc.alloc(ShapeRun, 0);
-        return try self.extractContentsShapeRunsAlloc(contents, gstates, forms);
+        return try self.extractContentsShapeRunsAlloc(contents, gstates, forms, color_spaces);
     }
 
     pub fn extractPageType3TextShapeRunsAlloc(self: *Reader, page_num: usize) ![]ShapeRun {
@@ -4117,11 +4203,11 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsTextRunsAlloc(self: *const Reader, contents: *const syntax.Object, fonts: []const PageFont, gstates: []const PageExtGState, forms: []const PageForm) ![]TextRun {
+    fn extractContentsTextRunsAlloc(self: *const Reader, contents: *const syntax.Object, fonts: []const PageFont, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]TextRun {
         var out = std.ArrayList(TextRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
-        var parser = try PositionedTextParser.init(self.alloc, .{ .render = &out }, .{}, &.{}, .nonzero);
+        var parser = try PositionedTextParser.init(self.alloc, .{ .render = &out }, .{ .color_spaces = color_spaces }, &.{}, .nonzero);
         defer parser.deinit();
         parser.cancellation = self.cancellation;
 
@@ -4139,50 +4225,58 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsImageRunsAlloc(self: *const Reader, contents: *const syntax.Object, images: []const PageImage, gstates: []const PageExtGState, forms: []const PageForm) ![]ImageRun {
+    fn extractContentsImageRunsAlloc(self: *const Reader, contents: *const syntax.Object, images: []const PageImage, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]ImageRun {
         var out = std.ArrayList(ImageRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
 
         const decoded = try self.readCombinedContentStreamsAlloc(contents);
         defer self.alloc.free(decoded);
-        try extractImageRunsFromContentAppendCancelable(self.alloc, &out, decoded, images, gstates, forms, self.cancellation);
+        var paint_order: usize = 0;
+        var next_group_id: u32 = 1;
+        try extractImageRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, images, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsShadingRunsAlloc(self: *const Reader, contents: *const syntax.Object, shadings: []const PageShading, gstates: []const PageExtGState, forms: []const PageForm) ![]ShadingRun {
+    fn extractContentsShadingRunsAlloc(self: *const Reader, contents: *const syntax.Object, shadings: []const PageShading, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]ShadingRun {
         var out = std.ArrayList(ShadingRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
 
         const decoded = try self.readCombinedContentStreamsAlloc(contents);
         defer self.alloc.free(decoded);
-        try extractShadingRunsFromContentAppendCancelable(self.alloc, &out, decoded, shadings, gstates, forms, self.cancellation);
+        var paint_order: usize = 0;
+        var next_group_id: u32 = 1;
+        try extractShadingRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, shadings, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsShapeRunsAlloc(self: *const Reader, contents: *const syntax.Object, gstates: []const PageExtGState, forms: []const PageForm) ![]ShapeRun {
+    fn extractContentsShapeRunsAlloc(self: *const Reader, contents: *const syntax.Object, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]ShapeRun {
         var out = std.ArrayList(ShapeRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
 
         const decoded = try self.readCombinedContentStreamsAlloc(contents);
         defer self.alloc.free(decoded);
-        try extractShapeRunsFromContentAppendCancelable(self.alloc, &out, decoded, gstates, forms, self.cancellation);
+        var paint_order: usize = 0;
+        var next_group_id: u32 = 1;
+        try extractShapeRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn extractContentsPatternRunsAlloc(self: *const Reader, contents: *const syntax.Object, patterns: []const PagePattern, gstates: []const PageExtGState, forms: []const PageForm) ![]PatternRun {
+    fn extractContentsPatternRunsAlloc(self: *const Reader, contents: *const syntax.Object, patterns: []const PagePattern, gstates: []const PageExtGState, forms: []const PageForm, color_spaces: []const PageColorSpace) ![]PatternRun {
         var out = std.ArrayList(PatternRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
 
         const decoded = try self.readCombinedContentStreamsAlloc(contents);
         defer self.alloc.free(decoded);
-        try extractPatternRunsFromContentAppendCancelable(self.alloc, &out, decoded, patterns, gstates, forms, self.cancellation);
+        var paint_order: usize = 0;
+        var next_group_id: u32 = 1;
+        try extractPatternRunsFromContentAppendWithStateCancelable(self.alloc, &out, decoded, patterns, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
@@ -4201,6 +4295,7 @@ pub const Reader = struct {
         patterns: []const PagePattern,
         gstates: []const PageExtGState,
         forms: []const PageForm,
+        color_spaces: []const PageColorSpace,
     ) !void {
         try text_parser.consume(decoded, fonts, gstates, forms);
         const has_do = contentMayContainOperator(decoded, "Do");
@@ -4208,16 +4303,24 @@ pub const Reader = struct {
         const has_shading_paint = contentMayContainOperator(decoded, "sh");
 
         if ((images.len > 0 or forms.len > 0) and has_do) {
-            try extractImageRunsFromContentAppendCancelable(self.alloc, image_out, decoded, images, gstates, forms, self.cancellation);
+            var paint_order: usize = 0;
+            var next_group_id: u32 = 1;
+            try extractImageRunsFromContentAppendWithStateCancelable(self.alloc, image_out, decoded, images, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
         }
         if ((shadings.len > 0 and has_shading_paint) or (forms.len > 0 and has_do)) {
-            try extractShadingRunsFromContentAppendCancelable(self.alloc, shading_out, decoded, shadings, gstates, forms, self.cancellation);
+            var paint_order: usize = 0;
+            var next_group_id: u32 = 1;
+            try extractShadingRunsFromContentAppendWithStateCancelable(self.alloc, shading_out, decoded, shadings, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &paint_order, &next_group_id, self.cancellation);
         }
         if ((patterns.len > 0 and has_shape_paint) or (forms.len > 0 and has_do)) {
-            try extractPatternRunsFromContentAppendCancelable(self.alloc, pattern_out, decoded, patterns, gstates, forms, self.cancellation);
+            var paint_order: usize = 0;
+            var next_group_id: u32 = 1;
+            try extractPatternRunsFromContentAppendWithStateCancelable(self.alloc, pattern_out, decoded, patterns, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
         }
         if (has_shape_paint or (forms.len > 0 and has_do)) {
-            try extractShapeRunsFromContentAppendCancelable(self.alloc, shape_out, decoded, gstates, forms, self.cancellation);
+            var paint_order: usize = 0;
+            var next_group_id: u32 = 1;
+            try extractShapeRunsFromContentAppendWithStateCancelable(self.alloc, shape_out, decoded, gstates, forms, .{ .color_spaces = color_spaces }, &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, self.cancellation);
         }
     }
 
@@ -4499,6 +4602,7 @@ pub const Reader = struct {
         fonts: []const PageFont,
         gstates: []const PageExtGState,
         forms: []const PageForm,
+        color_spaces: []const PageColorSpace,
     ) !PageTextAnalysis {
         var text = std.ArrayList(u8).empty;
         errdefer text.deinit(self.alloc);
@@ -4507,7 +4611,7 @@ pub const Reader = struct {
             for (runs.items) |*run| run.deinit(self.alloc);
             runs.deinit(self.alloc);
         }
-        var run_parser = try PositionedTextParser.init(self.alloc, .{ .render = &runs }, .{}, &.{}, .nonzero);
+        var run_parser = try PositionedTextParser.init(self.alloc, .{ .render = &runs }, .{ .color_spaces = color_spaces }, &.{}, .nonzero);
         defer run_parser.deinit();
         run_parser.cancellation = self.cancellation;
 
@@ -4687,6 +4791,7 @@ pub const Reader = struct {
             .group_parent_id = run.group_parent_id,
             .group_isolated = run.group_isolated,
             .group_knockout = run.group_knockout,
+            .color_spaces = type3.color_spaces,
             .stroke_width = run.stroke_width,
             .clip_box = run.clip_box,
         };
@@ -4768,6 +4873,7 @@ pub const Reader = struct {
                 .group_parent_id = run.group_parent_id,
                 .group_isolated = run.group_isolated,
                 .group_knockout = run.group_knockout,
+                .color_spaces = type3.color_spaces,
                 .matrix = initial_state.matrix,
                 .clip_box = run.clip_box,
             }, initial_clip, run.clip_fill_rule);
@@ -5407,6 +5513,79 @@ pub const Reader = struct {
         return try self.collectFontsFromResourcesAlloc(&resources.?);
     }
 
+    fn classifyColorSpaceResource(
+        self: *const Reader,
+        value: *const syntax.Object,
+        resource_entries: []const syntax.DictEntry,
+        depth: u8,
+    ) anyerror!ColorSpaceSelection {
+        if (depth >= 8) return .{ .kind = .unsupported };
+        var resolved = try self.resolveValue(value);
+        defer resolved.deinit(self.alloc);
+        if (resolved.asName()) |name| {
+            const direct = colorSpaceKindFromName(name);
+            if (direct != .unsupported) return .{ .kind = direct };
+            for (resource_entries) |entry| {
+                if (std.mem.eql(u8, entry.key, name))
+                    return try self.classifyColorSpaceResource(&entry.value, resource_entries, depth + 1);
+            }
+            return .{ .kind = .unsupported };
+        }
+        if (resolved != .array or resolved.array.len == 0) return .{ .kind = .unsupported };
+        const family = resolved.array[0].asName() orelse return .{ .kind = .unsupported };
+        if (std.mem.eql(u8, family, "Pattern")) {
+            if (resolved.array.len == 1) return .{ .kind = .pattern };
+            const base = try self.classifyColorSpaceResource(&resolved.array[1], resource_entries, depth + 1);
+            return .{ .kind = .pattern, .pattern_base = base.kind };
+        }
+        if (std.mem.eql(u8, family, "ICCBased") and resolved.array.len >= 2) {
+            var profile = try self.resolveValue(&resolved.array[1]);
+            defer profile.deinit(self.alloc);
+            if (profile.get("Alternate")) |alternate|
+                return try self.classifyColorSpaceResource(alternate, resource_entries, depth + 1);
+            // PDF defines the corresponding device space as the fallback when
+            // an ICC profile omits Alternate. Honor that fallback without
+            // introducing a platform color-management dependency.
+            const components = if (profile.get("N")) |count| count.asInteger() else null;
+            return .{ .kind = switch (components orelse 0) {
+                1 => .device_gray,
+                3 => .device_rgb,
+                4 => .device_cmyk,
+                else => .unsupported,
+            } };
+        }
+        return .{ .kind = .unsupported };
+    }
+
+    fn collectColorSpacesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object) ![]PageColorSpace {
+        const color_spaces_obj = resources.get("ColorSpace") orelse return try self.alloc.alloc(PageColorSpace, 0);
+        var resolved_color_spaces = try self.resolveValue(color_spaces_obj);
+        defer resolved_color_spaces.deinit(self.alloc);
+        if (resolved_color_spaces != .dict) return try self.alloc.alloc(PageColorSpace, 0);
+
+        var out = std.ArrayList(PageColorSpace).empty;
+        defer out.deinit(self.alloc);
+        errdefer for (out.items) |*color_space| color_space.deinit(self.alloc);
+        for (resolved_color_spaces.dict) |entry| {
+            try self.checkCancellation();
+            var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
+            errdefer if (name) |owned| self.alloc.free(owned);
+            try out.append(self.alloc, .{
+                .name = name.?,
+                .selection = try self.classifyColorSpaceResource(&entry.value, resolved_color_spaces.dict, 0),
+            });
+            name = null;
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn collectPageColorSpacesAlloc(self: *const Reader, page: *const syntax.Object) ![]PageColorSpace {
+        var resources = try self.findInheritedPageValue(page, "Resources");
+        if (resources == null) return try self.alloc.alloc(PageColorSpace, 0);
+        defer if (resources) |*obj| obj.deinit(self.alloc);
+        return try self.collectColorSpacesFromResourcesAlloc(&resources.?);
+    }
+
     fn collectPageImagesAlloc(self: *const Reader, page: *const syntax.Object) ![]PageImage {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PageImage, 0);
@@ -5825,6 +6004,11 @@ pub const Reader = struct {
                 for (gstates) |*gstate| gstate.deinit(self.alloc);
                 if (gstates.len > 0) self.alloc.free(gstates);
             }
+            const color_spaces = if (resolved_pattern_resources) |*pattern_resources| try self.collectColorSpacesFromResourcesAlloc(pattern_resources) else try self.alloc.alloc(PageColorSpace, 0);
+            errdefer {
+                for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+                if (color_spaces.len > 0) self.alloc.free(color_spaces);
+            }
             const forms = if (resolved_pattern_resources) |*pattern_resources| try self.collectFormsFromResourcesAlloc(pattern_resources, fallback_resources orelse pattern_resources, depth + 1, content, exclude_type3_fonts) else try self.alloc.alloc(PageForm, 0);
             errdefer {
                 for (forms) |*form| form.deinit(self.alloc);
@@ -5846,6 +6030,7 @@ pub const Reader = struct {
                 .shadings = shadings,
                 .patterns = patterns,
                 .gstates = gstates,
+                .color_spaces = color_spaces,
                 .forms = forms,
             });
             name = null;
@@ -5910,6 +6095,11 @@ pub const Reader = struct {
                 for (gstates) |*gstate| gstate.deinit(self.alloc);
                 if (gstates.len > 0) self.alloc.free(gstates);
             }
+            const color_spaces = if (resolved_form_resources) |*form_resources| try self.collectColorSpacesFromResourcesAlloc(form_resources) else try self.alloc.alloc(PageColorSpace, 0);
+            errdefer {
+                for (color_spaces) |*color_space| color_space.deinit(self.alloc);
+                if (color_spaces.len > 0) self.alloc.free(color_spaces);
+            }
             const forms = if (resolved_form_resources) |*form_resources| try self.collectFormsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1, content, exclude_type3_fonts) else try self.alloc.alloc(PageForm, 0);
             errdefer {
                 for (forms) |*form| form.deinit(self.alloc);
@@ -5969,6 +6159,7 @@ pub const Reader = struct {
                 .shadings = shadings,
                 .patterns = patterns,
                 .gstates = gstates,
+                .color_spaces = color_spaces,
                 .forms = forms,
             });
             name = null;
@@ -6029,6 +6220,14 @@ pub const Reader = struct {
                 for (owned) |*form| form.deinit(self.alloc);
                 if (owned.len > 0) self.alloc.free(owned);
             };
+            var color_spaces: ?[]PageColorSpace = if (resolved_form_resources) |*form_resources|
+                try self.collectColorSpacesFromResourcesAlloc(form_resources)
+            else
+                try self.alloc.alloc(PageColorSpace, 0);
+            errdefer if (color_spaces) |owned| {
+                for (owned) |*color_space| color_space.deinit(self.alloc);
+                if (owned.len > 0) self.alloc.free(owned);
+            };
             var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
             errdefer if (name) |owned| self.alloc.free(owned);
 
@@ -6048,11 +6247,13 @@ pub const Reader = struct {
                     };
                 },
                 .fonts = fonts.?,
+                .color_spaces = color_spaces.?,
                 .forms = forms.?,
             });
             name = null;
             content = null;
             fonts = null;
+            color_spaces = null;
             forms = null;
         }
         return try out.toOwnedSlice(self.alloc);
@@ -7899,6 +8100,7 @@ pub const Reader = struct {
                 font.images = try self.collectImagesFromResourcesAlloc(&resources, resource_content.items);
                 font.shadings = try self.collectShadingsFromResourcesAlloc(&resources);
                 font.gstates = try self.collectExtGStatesFromResourcesAlloc(&resources);
+                font.color_spaces = try self.collectColorSpacesFromResourcesAlloc(&resources);
                 font.fonts = try self.collectNonType3FontsFromResourcesAlloc(&resources);
                 font.patterns = try self.collectPatternsFromResourcesAlloc(&resources, &resources, 0, resource_content.items, true);
                 font.forms = try self.collectFormsFromResourcesAlloc(&resources, &resources, 0, resource_content.items, true);
@@ -11359,6 +11561,9 @@ fn applyTextRunOperator(
             .group_knockout = state.group_knockout,
             .fill_color_space = state.fill_color_space,
             .stroke_color_space = state.stroke_color_space,
+            .fill_pattern_base_color_space = state.fill_pattern_base_color_space,
+            .stroke_pattern_base_color_space = state.stroke_pattern_base_color_space,
+            .color_spaces = state.color_spaces,
             .fill_pattern_name = state.fill_pattern_name,
             .stroke_pattern_name = state.stroke_pattern_name,
             .clip_box = state.clip_box,
@@ -11396,6 +11601,9 @@ fn applyTextRunOperator(
             state.group_knockout = entry.group_knockout;
             state.fill_color_space = entry.fill_color_space;
             state.stroke_color_space = entry.stroke_color_space;
+            state.fill_pattern_base_color_space = entry.fill_pattern_base_color_space;
+            state.stroke_pattern_base_color_space = entry.stroke_pattern_base_color_space;
+            state.color_spaces = entry.color_spaces;
             state.fill_pattern_name = entry.fill_pattern_name;
             state.stroke_pattern_name = entry.stroke_pattern_name;
             state.clip_box = entry.clip_box;
@@ -11596,6 +11804,7 @@ fn applyTextRunOperator(
     if (std.mem.eql(u8, op, "rg")) {
         if (operands.len >= 3) {
             state.fill_color_space = .device_rgb;
+            state.fill_pattern_base_color_space = null;
             state.fill_pattern_name = null;
             state.fill_color = rgbColor(
                 numericObjectValue(&operands[operands.len - 3]) orelse 0,
@@ -11608,6 +11817,7 @@ fn applyTextRunOperator(
     if (std.mem.eql(u8, op, "RG")) {
         if (operands.len >= 3) {
             state.stroke_color_space = .device_rgb;
+            state.stroke_pattern_base_color_space = null;
             state.stroke_pattern_name = null;
             state.stroke_color = rgbColor(
                 numericObjectValue(&operands[operands.len - 3]) orelse 0,
@@ -11620,6 +11830,7 @@ fn applyTextRunOperator(
     if (std.mem.eql(u8, op, "g")) {
         if (operands.len >= 1) {
             state.fill_color_space = .device_gray;
+            state.fill_pattern_base_color_space = null;
             state.fill_pattern_name = null;
             state.fill_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
         }
@@ -11628,6 +11839,7 @@ fn applyTextRunOperator(
     if (std.mem.eql(u8, op, "G")) {
         if (operands.len >= 1) {
             state.stroke_color_space = .device_gray;
+            state.stroke_pattern_base_color_space = null;
             state.stroke_pattern_name = null;
             state.stroke_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
         }
@@ -11636,6 +11848,7 @@ fn applyTextRunOperator(
     if (std.mem.eql(u8, op, "k")) {
         if (operands.len >= 4) {
             state.fill_color_space = .device_cmyk;
+            state.fill_pattern_base_color_space = null;
             state.fill_pattern_name = null;
             state.fill_color = cmykColor(
                 numericObjectValue(&operands[operands.len - 4]) orelse 0,
@@ -11649,6 +11862,7 @@ fn applyTextRunOperator(
     if (std.mem.eql(u8, op, "K")) {
         if (operands.len >= 4) {
             state.stroke_color_space = .device_cmyk;
+            state.stroke_pattern_base_color_space = null;
             state.stroke_pattern_name = null;
             state.stroke_color = cmykColor(
                 numericObjectValue(&operands[operands.len - 4]) orelse 0,
@@ -11675,7 +11889,7 @@ fn applyTextRunOperator(
         if (state.fill_color_space == .pattern) {
             if (operands.len >= 1 and operands[operands.len - 1] == .name) {
                 state.fill_pattern_name = operands[operands.len - 1].name;
-                if (decodePatternBaseColorOperands(operands[0 .. operands.len - 1])) |color| state.fill_color = color;
+                if (try decodePatternBaseColorOperands(state.fill_pattern_base_color_space, operands[0 .. operands.len - 1])) |color| state.fill_color = color;
             }
         } else if (try decodeShapeColorOperands(state.fill_color_space, operands)) |color| {
             state.fill_pattern_name = null;
@@ -11687,7 +11901,7 @@ fn applyTextRunOperator(
         if (state.stroke_color_space == .pattern) {
             if (operands.len >= 1 and operands[operands.len - 1] == .name) {
                 state.stroke_pattern_name = operands[operands.len - 1].name;
-                if (decodePatternBaseColorOperands(operands[0 .. operands.len - 1])) |color| state.stroke_color = color;
+                if (try decodePatternBaseColorOperands(state.stroke_pattern_base_color_space, operands[0 .. operands.len - 1])) |color| state.stroke_color = color;
             }
         } else if (try decodeShapeColorOperands(state.stroke_color_space, operands)) |color| {
             state.stroke_pattern_name = null;
@@ -11886,6 +12100,7 @@ fn applyImageOperator(
     }
     if (std.mem.eql(u8, op, "rg") and operands.len >= 3) {
         state.fill_color_space = .device_rgb;
+        state.fill_pattern_base_color_space = null;
         state.fill_pattern_name = null;
         state.fill_color = rgbColor(
             numericObjectValue(&operands[operands.len - 3]) orelse 0,
@@ -11896,12 +12111,14 @@ fn applyImageOperator(
     }
     if (std.mem.eql(u8, op, "g") and operands.len >= 1) {
         state.fill_color_space = .device_gray;
+        state.fill_pattern_base_color_space = null;
         state.fill_pattern_name = null;
         state.fill_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
         return;
     }
     if (std.mem.eql(u8, op, "k") and operands.len >= 4) {
         state.fill_color_space = .device_cmyk;
+        state.fill_pattern_base_color_space = null;
         state.fill_pattern_name = null;
         state.fill_color = cmykColor(
             numericObjectValue(&operands[operands.len - 4]) orelse 0,
@@ -11919,7 +12136,7 @@ fn applyImageOperator(
         if (state.fill_color_space == .pattern) {
             if (operands[operands.len - 1] == .name) {
                 state.fill_pattern_name = operands[operands.len - 1].name;
-                if (decodePatternBaseColorOperands(operands[0 .. operands.len - 1])) |color| state.fill_color = color;
+                if (try decodePatternBaseColorOperands(state.fill_pattern_base_color_space, operands[0 .. operands.len - 1])) |color| state.fill_color = color;
             }
         } else if (try decodeShapeColorOperands(state.fill_color_space, operands)) |color| {
             state.fill_pattern_name = null;
@@ -12168,6 +12385,7 @@ fn applyShapeOperator(
     }
     if (std.mem.eql(u8, op, "rg") and operands.len >= 3) {
         state.fill_color_space = .device_rgb;
+        state.fill_pattern_base_color_space = null;
         state.fill_pattern_name = null;
         state.fill_color = rgbColor(
             numericObjectValue(&operands[operands.len - 3]) orelse 0,
@@ -12178,6 +12396,7 @@ fn applyShapeOperator(
     }
     if (std.mem.eql(u8, op, "RG") and operands.len >= 3) {
         state.stroke_color_space = .device_rgb;
+        state.stroke_pattern_base_color_space = null;
         state.stroke_pattern_name = null;
         state.stroke_color = rgbColor(
             numericObjectValue(&operands[operands.len - 3]) orelse 0,
@@ -12188,18 +12407,21 @@ fn applyShapeOperator(
     }
     if (std.mem.eql(u8, op, "g") and operands.len >= 1) {
         state.fill_color_space = .device_gray;
+        state.fill_pattern_base_color_space = null;
         state.fill_pattern_name = null;
         state.fill_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
         return;
     }
     if (std.mem.eql(u8, op, "G") and operands.len >= 1) {
         state.stroke_color_space = .device_gray;
+        state.stroke_pattern_base_color_space = null;
         state.stroke_pattern_name = null;
         state.stroke_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
         return;
     }
     if (std.mem.eql(u8, op, "k") and operands.len >= 4) {
         state.fill_color_space = .device_cmyk;
+        state.fill_pattern_base_color_space = null;
         state.fill_pattern_name = null;
         state.fill_color = cmykColor(
             numericObjectValue(&operands[operands.len - 4]) orelse 0,
@@ -12211,6 +12433,7 @@ fn applyShapeOperator(
     }
     if (std.mem.eql(u8, op, "K") and operands.len >= 4) {
         state.stroke_color_space = .device_cmyk;
+        state.stroke_pattern_base_color_space = null;
         state.stroke_pattern_name = null;
         state.stroke_color = cmykColor(
             numericObjectValue(&operands[operands.len - 4]) orelse 0,
@@ -12232,7 +12455,7 @@ fn applyShapeOperator(
         if (state.fill_color_space == .pattern) {
             if (operands[operands.len - 1] == .name) {
                 state.fill_pattern_name = operands[operands.len - 1].name;
-                if (decodePatternBaseColorOperands(operands[0 .. operands.len - 1])) |color| state.fill_color = color;
+                if (try decodePatternBaseColorOperands(state.fill_pattern_base_color_space, operands[0 .. operands.len - 1])) |color| state.fill_color = color;
             }
         } else if (try decodeShapeColorOperands(state.fill_color_space, operands)) |color| {
             state.fill_pattern_name = null;
@@ -12244,7 +12467,7 @@ fn applyShapeOperator(
         if (state.stroke_color_space == .pattern) {
             if (operands[operands.len - 1] == .name) {
                 state.stroke_pattern_name = operands[operands.len - 1].name;
-                if (decodePatternBaseColorOperands(operands[0 .. operands.len - 1])) |color| state.stroke_color = color;
+                if (try decodePatternBaseColorOperands(state.stroke_pattern_base_color_space, operands[0 .. operands.len - 1])) |color| state.stroke_color = color;
             }
         } else if (try decodeShapeColorOperands(state.stroke_color_space, operands)) |color| {
             state.stroke_pattern_name = null;
@@ -12743,31 +12966,37 @@ fn applyPatternOperator(
     }
     if (std.mem.eql(u8, op, "rg") and operands.len >= 3) {
         state.fill_color_space = .device_rgb;
+        state.fill_pattern_base_color_space = null;
         state.fill_pattern_name = null;
         return;
     }
     if (std.mem.eql(u8, op, "RG") and operands.len >= 3) {
         state.stroke_color_space = .device_rgb;
+        state.stroke_pattern_base_color_space = null;
         state.stroke_pattern_name = null;
         return;
     }
     if (std.mem.eql(u8, op, "g") and operands.len >= 1) {
         state.fill_color_space = .device_gray;
+        state.fill_pattern_base_color_space = null;
         state.fill_pattern_name = null;
         return;
     }
     if (std.mem.eql(u8, op, "G") and operands.len >= 1) {
         state.stroke_color_space = .device_gray;
+        state.stroke_pattern_base_color_space = null;
         state.stroke_pattern_name = null;
         return;
     }
     if (std.mem.eql(u8, op, "k") and operands.len >= 4) {
         state.fill_color_space = .device_cmyk;
+        state.fill_pattern_base_color_space = null;
         state.fill_pattern_name = null;
         return;
     }
     if (std.mem.eql(u8, op, "K") and operands.len >= 4) {
         state.stroke_color_space = .device_cmyk;
+        state.stroke_pattern_base_color_space = null;
         state.stroke_pattern_name = null;
         return;
     }
@@ -12782,7 +13011,7 @@ fn applyPatternOperator(
     if ((std.mem.eql(u8, op, "sc") or std.mem.eql(u8, op, "scn")) and operands.len >= 1) {
         if (state.fill_color_space == .pattern and operands[operands.len - 1] == .name) {
             state.fill_pattern_name = operands[operands.len - 1].name;
-            if (decodePatternBaseColorOperands(operands[0 .. operands.len - 1])) |color| state.fill_color = color;
+            if (try decodePatternBaseColorOperands(state.fill_pattern_base_color_space, operands[0 .. operands.len - 1])) |color| state.fill_color = color;
         } else if (state.fill_color_space != .pattern) {
             state.fill_pattern_name = null;
         }
@@ -12791,7 +13020,7 @@ fn applyPatternOperator(
     if ((std.mem.eql(u8, op, "SC") or std.mem.eql(u8, op, "SCN")) and operands.len >= 1) {
         if (state.stroke_color_space == .pattern and operands[operands.len - 1] == .name) {
             state.stroke_pattern_name = operands[operands.len - 1].name;
-            if (decodePatternBaseColorOperands(operands[0 .. operands.len - 1])) |color| state.stroke_color = color;
+            if (try decodePatternBaseColorOperands(state.stroke_pattern_base_color_space, operands[0 .. operands.len - 1])) |color| state.stroke_color = color;
         } else if (state.stroke_color_space != .pattern) {
             state.stroke_pattern_name = null;
         }
@@ -13045,7 +13274,14 @@ fn emitPatternShadingRun(
     });
 }
 
-fn decodePatternBaseColorOperands(operands: []const syntax.Object) ?[4]u8 {
+fn decodePatternBaseColorOperands(base_color_space: ?ColorSpaceKind, operands: []const syntax.Object) !?[4]u8 {
+    if (base_color_space) |base| return switch (base) {
+        .device_gray, .device_rgb, .device_cmyk => try decodeShapeColorOperands(base, operands),
+        .pattern, .unsupported => error.UnsupportedPdfRendering,
+    };
+    // Be liberal with older producers that put base components directly in
+    // the named Pattern space. Standards-compliant PaintType 2 streams carry
+    // an explicit underlying color space and take the exact path above.
     return switch (operands.len) {
         1 => grayColor(numericObjectValue(&operands[0]) orelse return null),
         3 => rgbColor(
@@ -13844,6 +14080,7 @@ fn findPagePattern(patterns: []const PagePattern, name: []const u8) ?*const Page
 fn buildFormGraphicsState(state: GraphicsState, form: *const PageForm) GraphicsState {
     var next = state;
     next.matrix = multiplyGraphicsMatrix(form.matrix, state.matrix);
+    next.color_spaces = form.color_spaces;
     if (form.bbox) |bbox| {
         const transformed = transformPageBox(bbox, next.matrix);
         next.clip_box = if (next.clip_box) |current| intersectPageBoxes(current, transformed) else transformed;
@@ -13876,6 +14113,9 @@ fn buildFormTextState(state: TextRunState, form: *const PageForm) TextRunState {
         .group_knockout = state.group_knockout,
         .fill_color_space = state.fill_color_space,
         .stroke_color_space = state.stroke_color_space,
+        .fill_pattern_base_color_space = state.fill_pattern_base_color_space,
+        .stroke_pattern_base_color_space = state.stroke_pattern_base_color_space,
+        .color_spaces = form.color_spaces,
         .fill_pattern_name = state.fill_pattern_name,
         .stroke_pattern_name = state.stroke_pattern_name,
         .x = 0,
@@ -13893,7 +14133,7 @@ fn buildFormTextState(state: TextRunState, form: *const PageForm) TextRunState {
     return next;
 }
 
-fn buildPatternTextState(state: GraphicsState) TextRunState {
+fn buildPatternTextState(state: GraphicsState, color_spaces: []const PageColorSpace) TextRunState {
     return .{
         .alpha = state.fill_alpha,
         .stroke_alpha = state.stroke_alpha,
@@ -13907,12 +14147,13 @@ fn buildPatternTextState(state: GraphicsState) TextRunState {
         .group_knockout = state.group_knockout,
         .fill_color_space = materializePatternCellColorSpace(state.fill_color_space),
         .stroke_color_space = materializePatternCellColorSpace(state.stroke_color_space),
+        .color_spaces = color_spaces,
         .fill_pattern_name = null,
         .stroke_pattern_name = null,
     };
 }
 
-fn buildPatternGraphicsState(state: GraphicsState) GraphicsState {
+fn buildPatternGraphicsState(state: GraphicsState, color_spaces: []const PageColorSpace) GraphicsState {
     var next = state;
     next.matrix = .{};
     next.group_isolated = state.group_isolated;
@@ -13920,6 +14161,9 @@ fn buildPatternGraphicsState(state: GraphicsState) GraphicsState {
     next.group_parent_id = state.group_parent_id;
     next.fill_color_space = materializePatternCellColorSpace(state.fill_color_space);
     next.stroke_color_space = materializePatternCellColorSpace(state.stroke_color_space);
+    next.fill_pattern_base_color_space = null;
+    next.stroke_pattern_base_color_space = null;
+    next.color_spaces = color_spaces;
     next.fill_pattern_name = null;
     next.stroke_pattern_name = null;
     next.clip_box = null;
@@ -14056,7 +14300,7 @@ fn buildPatternRunAlloc(
     var tile_text_list = std.ArrayList(TextRun).empty;
     defer tile_text_list.deinit(alloc);
     errdefer for (tile_text_list.items) |*run| run.deinit(alloc);
-    const text_state = buildPatternTextState(state);
+    const text_state = buildPatternTextState(state, pattern.color_spaces);
     var text_parser = try PositionedTextParser.init(alloc, .{ .render = &tile_text_list }, text_state, &.{}, .nonzero);
     defer text_parser.deinit();
     text_parser.paint_order = tile_paint_order;
@@ -14075,7 +14319,7 @@ fn buildPatternRunAlloc(
     var tile_image_list = std.ArrayList(ImageRun).empty;
     defer tile_image_list.deinit(alloc);
     errdefer for (tile_image_list.items) |*run| run.deinit(alloc);
-    const image_state = buildPatternGraphicsState(state);
+    const image_state = buildPatternGraphicsState(state, pattern.color_spaces);
     try extractImageRunsFromContentAppendWithState(alloc, &tile_image_list, pattern.content, pattern.images, pattern.gstates, pattern.forms, image_state, &.{}, .nonzero, &tile_paint_order, &tile_group_id);
 
     tile_paint_order = 0;
@@ -14083,12 +14327,12 @@ fn buildPatternRunAlloc(
     var tile_shading_list = std.ArrayList(ShadingRun).empty;
     defer tile_shading_list.deinit(alloc);
     errdefer for (tile_shading_list.items) |*run| run.deinit(alloc);
-    const shading_state = buildPatternGraphicsState(state);
+    const shading_state = buildPatternGraphicsState(state, pattern.color_spaces);
     try extractShadingRunsFromContentAppendWithState(alloc, &tile_shading_list, pattern.content, pattern.shadings, pattern.gstates, pattern.forms, shading_state, &.{}, .nonzero, &tile_paint_order, &tile_group_id);
 
     tile_paint_order = 0;
     tile_group_id = 1;
-    const pattern_state = buildPatternGraphicsState(state);
+    const pattern_state = buildPatternGraphicsState(state, pattern.color_spaces);
     try extractPatternRunsFromContentAppendWithState(alloc, &tile_pattern_list, pattern.content, pattern.patterns, pattern.gstates, pattern.forms, pattern_state, &.{}, .nonzero, &.{}, 0, &tile_paint_order, &tile_group_id);
 
     tile_paint_order = 0;
@@ -14096,7 +14340,7 @@ fn buildPatternRunAlloc(
     var tile_shape_list = std.ArrayList(ShapeRun).empty;
     defer tile_shape_list.deinit(alloc);
     errdefer for (tile_shape_list.items) |*run| run.deinit(alloc);
-    const shape_state = buildPatternGraphicsState(state);
+    const shape_state = buildPatternGraphicsState(state, pattern.color_spaces);
     try extractShapeRunsFromContentAppendWithState(alloc, &tile_shape_list, pattern.content, pattern.gstates, pattern.forms, shape_state, &.{}, .nonzero, &.{}, 0, &tile_paint_order, &tile_group_id);
 
     const owned_dash = if (kind == .stroke and dash_array.len > 0) try scaleDashArrayAlloc(alloc, dash_array, state.matrix) else null;
@@ -19414,9 +19658,16 @@ test "reader decodes 1-bit image mask xobject" {
 }
 
 test "color space selection uses value state and PDF initial colors" {
+    var rgb_name = [_]u8{ 'R', 'e', 's', 'o', 'u', 'r', 'c', 'e', 'R', 'G', 'B' };
+    var pattern_name = [_]u8{ 'R', 'e', 's', 'o', 'u', 'r', 'c', 'e', 'P', 'a', 't', 't', 'e', 'r', 'n' };
+    const color_spaces = [_]PageColorSpace{
+        .{ .name = &rgb_name, .selection = .{ .kind = .device_rgb } },
+        .{ .name = &pattern_name, .selection = .{ .kind = .pattern, .pattern_base = .device_cmyk } },
+    };
     var state = GraphicsState{
         .fill_color = .{ 255, 0, 0, 255 },
         .stroke_color = .{ 255, 255, 255, 255 },
+        .color_spaces = &color_spaces,
         .fill_pattern_name = "FillPattern",
         .stroke_pattern_name = "StrokePattern",
     };
@@ -19426,10 +19677,14 @@ test "color space selection uses value state and PDF initial colors" {
     try std.testing.expectEqual(cmykColor(0, 0, 0, 1), state.fill_color);
     try std.testing.expectEqual(@as(?[]const u8, null), state.fill_pattern_name);
 
-    selectStrokeColorSpace(&state, "RGB");
+    selectStrokeColorSpace(&state, "ResourceRGB");
     try std.testing.expectEqual(ColorSpaceKind.device_rgb, state.stroke_color_space);
     try std.testing.expectEqual(@as([4]u8, .{ 0, 0, 0, 255 }), state.stroke_color);
     try std.testing.expectEqual(@as(?[]const u8, null), state.stroke_pattern_name);
+
+    selectFillColorSpace(&state, "ResourcePattern");
+    try std.testing.expectEqual(ColorSpaceKind.pattern, state.fill_color_space);
+    try std.testing.expectEqual(@as(?ColorSpaceKind, .device_cmyk), state.fill_pattern_base_color_space);
 
     selectFillColorSpace(&state, "ResourceBacked");
     try std.testing.expectEqual(ColorSpaceKind.unsupported, state.fill_color_space);
@@ -21774,8 +22029,9 @@ test "reader extracts text and shapes through form xobject" {
 test "reader shares one decoded image mask while preserving per-use stencil color" {
     const alloc = std.testing.allocator;
     const image_data = [_]u8{0};
-    const form_content = "q\n1 0 0 1 10 10 cm\n/Im1 Do\nQ\n";
-    const page_content = "q\n1 0 0 rg\n/DeviceGray cs\n/Fm1 Do\n0 0 1 rg\n/Fm2 Do\nQ\n";
+    const red_form_content = "/CSRGB cs\n1 0 0 sc\nq\n1 0 0 1 10 10 cm\n/Im1 Do\nQ\n";
+    const blue_form_content = "0 0 1 rg\nq\n1 0 0 1 10 10 cm\n/Im1 Do\nQ\n";
+    const page_content = "q\n/Fm1 Do\n/Fm2 Do\nQ\n";
     const obj1 = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
     const obj2 = "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n";
     const obj3 = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Fm1 5 0 R /Fm2 7 0 R >> >> /Contents 4 0 R >>\nendobj\n";
@@ -21783,8 +22039,8 @@ test "reader shares one decoded image mask while preserving per-use stencil colo
     defer alloc.free(obj4);
     const obj5 = try std.fmt.allocPrint(
         alloc,
-        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /XObject << /Im1 6 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
-        .{ form_content.len, form_content },
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /ColorSpace << /CSRGB /DeviceRGB >> /XObject << /Im1 6 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ red_form_content.len, red_form_content },
     );
     defer alloc.free(obj5);
     const obj6 = try std.fmt.allocPrint(
@@ -21796,7 +22052,7 @@ test "reader shares one decoded image mask while preserving per-use stencil colo
     const obj7 = try std.fmt.allocPrint(
         alloc,
         "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /XObject << /Im1 6 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
-        .{ form_content.len, form_content },
+        .{ blue_form_content.len, blue_form_content },
     );
     defer alloc.free(obj7);
 
@@ -21843,7 +22099,7 @@ test "reader shares one decoded image mask while preserving per-use stencil colo
     try std.testing.expect(image_runs[0].shared_rgba != null);
     try std.testing.expectEqual(image_runs[0].shared_rgba, image_runs[1].shared_rgba);
     try std.testing.expectEqual(image_runs[0].rgba.ptr, image_runs[1].rgba.ptr);
-    try std.testing.expectEqual(@as(?[4]u8, .{ 0, 0, 0, 255 }), image_runs[0].stencil_color);
+    try std.testing.expectEqual(@as(?[4]u8, .{ 255, 0, 0, 255 }), image_runs[0].stencil_color);
     try std.testing.expectEqual(@as(?[4]u8, .{ 0, 0, 255, 255 }), image_runs[1].stencil_color);
 }
 
@@ -21987,7 +22243,7 @@ test "reader assigns group ids for isolated transparency form runs" {
 
 test "reader extracts colored tiling pattern runs" {
     const alloc = std.testing.allocator;
-    const pattern_content = "1 0 0 rg\n0 0 5 10 re\nf\n";
+    const pattern_content = "/TileRGB cs\n1 0 0 sc\n0 0 5 10 re\nf\n";
     const page_content = "/Pattern cs\n/P1 scn\n0 0 40 20 re\nf\n";
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
@@ -21996,7 +22252,7 @@ test "reader extracts colored tiling pattern runs" {
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
         try std.fmt.allocPrint(
             alloc,
-            "5 0 obj\n<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+            "5 0 obj\n<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << /ColorSpace << /TileRGB /DeviceRGB >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
             .{ pattern_content.len, pattern_content },
         ),
     };
@@ -22031,6 +22287,7 @@ test "reader extracts colored tiling pattern runs" {
     }
     try std.testing.expectEqual(@as(usize, 1), runs.len);
     try std.testing.expectEqual(@as(usize, 1), runs[0].tile_shape_runs.len);
+    try std.testing.expectEqual(@as([4]u8, .{ 0xff, 0x00, 0x00, 0xff }), runs[0].tile_shape_runs[0].color);
     try std.testing.expectApproxEqAbs(@as(f64, 0), runs[0].pattern_bbox.min_x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 0), runs[0].pattern_bbox.min_y, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 10), runs[0].pattern_bbox.max_x, 0.0001);
@@ -22042,11 +22299,11 @@ test "reader extracts colored tiling pattern runs" {
 test "reader extracts uncolored tiling pattern base color" {
     const alloc = std.testing.allocator;
     const pattern_content = "0 0 5 10 re\nf\n";
-    const page_content = "/Pattern cs\n0 1 0 /P1 scn\n0 0 40 20 re\nf\n";
+    const page_content = "/CS1 cs\n0 1 0 /P1 scn\n0 0 40 20 re\nf\n";
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /ColorSpace << /CS1 [/Pattern /DeviceRGB] >> /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
         try std.fmt.allocPrint(
             alloc,
@@ -22099,7 +22356,7 @@ test "pattern cell materializes inherited paint for every content parser" {
         .stroke_pattern_name = "StrokePattern",
     };
 
-    const graphics = buildPatternGraphicsState(outer);
+    const graphics = buildPatternGraphicsState(outer, &.{});
     try std.testing.expectEqual(ColorSpaceKind.device_rgb, graphics.fill_color_space);
     try std.testing.expectEqual(ColorSpaceKind.device_rgb, graphics.stroke_color_space);
     try std.testing.expect(graphics.fill_pattern_name == null);
@@ -22108,7 +22365,7 @@ test "pattern cell materializes inherited paint for every content parser" {
     try std.testing.expectEqual(outer.stroke_color, graphics.stroke_color);
     try std.testing.expect(try solidShapePaintAvailable(graphics.fill_color_space));
 
-    var text = buildPatternTextState(outer);
+    var text = buildPatternTextState(outer, &.{});
     text.render_mode = 2;
     try std.testing.expectEqual(ColorSpaceKind.device_rgb, text.fill_color_space);
     try std.testing.expectEqual(ColorSpaceKind.device_rgb, text.stroke_color_space);
@@ -22117,13 +22374,13 @@ test "pattern cell materializes inherited paint for every content parser" {
 
 test "reader applies uncolored tiling pattern base color to image masks" {
     const alloc = std.testing.allocator;
-    const page_content = "/Pattern cs\n0 1 0 /P1 scn\n0 0 20 20 re\nf\n";
+    const page_content = "/CS1 cs\n0 1 0 /P1 scn\n0 0 20 20 re\nf\n";
     const pattern_content = "q\n5 0 0 5 0 0 cm\n/Im1 Do\nQ\n";
     const image_data = [_]u8{0};
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /ColorSpace << /CS1 [/Pattern /DeviceRGB] >> /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
         try std.fmt.allocPrint(
             alloc,

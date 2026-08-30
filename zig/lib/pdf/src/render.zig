@@ -703,8 +703,10 @@ fn renderPageContentRgbaInBoxAlloc(
     shape_runs: []const reader.ShapeRun,
     cancellation: reader.CancellationProbe,
 ) !RawPageCanvas {
-    return try renderPageContentRgbaInBoxAllocWithBudget(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null);
+    return try renderPageContentRgbaInBoxAllocWithBudget(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null, .opaque_white);
 }
+
+const CanvasBackground = enum { opaque_white, transparent };
 
 fn renderPageContentRgbaInBoxAllocWithBudget(
     alloc: Allocator,
@@ -716,6 +718,7 @@ fn renderPageContentRgbaInBoxAllocWithBudget(
     shape_runs: []const reader.ShapeRun,
     cancellation: reader.CancellationProbe,
     shared_bilevel_sample_budget: ?*BilevelSampleBudget,
+    background: CanvasBackground,
 ) !RawPageCanvas {
     try cancellation.check();
     const page_w = @max(1.0, page_box.max_x - page_box.min_x);
@@ -733,7 +736,7 @@ fn renderPageContentRgbaInBoxAllocWithBudget(
 
     const rgba = try alloc.alloc(u8, rgba_len);
     errdefer alloc.free(rgba);
-    @memset(rgba, 0xff);
+    @memset(rgba, if (background == .opaque_white) 0xff else 0x00);
     var local_bilevel_sample_budget = BilevelSampleBudget.init(pixel_count);
     const bilevel_sample_budget = shared_bilevel_sample_budget orelse &local_bilevel_sample_budget;
     try renderGroupChildrenAlloc(alloc, rgba, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, &plan, 0, false, cancellation, bilevel_sample_budget);
@@ -1681,6 +1684,7 @@ fn renderPatternTileCanvasAlloc(
         run.tile_shape_runs,
         cancellation,
         bilevel_sample_budget,
+        .transparent,
     );
     return .{ .rgba = raw.rgba, .width = raw.width, .height = raw.height };
 }
@@ -2375,6 +2379,9 @@ fn blendPixelMode(canvas: []u8, dst: usize, src: [4]u8, mode: reader.BlendMode) 
         return;
     }
 
+    // Normal source-over is the overwhelmingly common path. Keep its compact
+    // integer formulation so transparency correctness does not add work to
+    // ordinary antialiased text, vectors, and images.
     if (mode == .normal) {
         const da = @as(u32, canvas[dst + 3]);
         const inv_sa = 255 - sa;
@@ -2389,14 +2396,36 @@ fn blendPixelMode(canvas: []u8, dst: usize, src: [4]u8, mode: reader.BlendMode) 
         return;
     }
 
-    const blended_r = blendChannel(mode, src[0], canvas[dst + 0]);
-    const blended_g = blendChannel(mode, src[1], canvas[dst + 1]);
-    const blended_b = blendChannel(mode, src[2], canvas[dst + 2]);
-    const inv_sa = 255 - sa;
-    canvas[dst + 0] = @intCast((@as(u32, blended_r) * sa + @as(u32, canvas[dst + 0]) * inv_sa + 127) / 255);
-    canvas[dst + 1] = @intCast((@as(u32, blended_g) * sa + @as(u32, canvas[dst + 1]) * inv_sa + 127) / 255);
-    canvas[dst + 2] = @intCast((@as(u32, blended_b) * sa + @as(u32, canvas[dst + 2]) * inv_sa + 127) / 255);
-    canvas[dst + 3] = 0xff;
+    const da = @as(u64, canvas[dst + 3]);
+    if (da == 0) {
+        canvas[dst + 0] = src[0];
+        canvas[dst + 1] = src[1];
+        canvas[dst + 2] = src[2];
+        canvas[dst + 3] = src[3];
+        return;
+    }
+    if (da == 255) {
+        const inv_sa = 255 - sa;
+        inline for (0..3) |channel| {
+            const blended = blendChannel(mode, src[channel], canvas[dst + channel]);
+            canvas[dst + channel] = @intCast((@as(u32, blended) * sa + @as(u32, canvas[dst + channel]) * inv_sa + 127) / 255);
+        }
+        canvas[dst + 3] = 0xff;
+        return;
+    }
+    const sa64 = @as(u64, sa);
+    const out_alpha_numerator = sa64 * 255 + da * (255 - sa64);
+    if (out_alpha_numerator == 0) return;
+    inline for (0..3) |channel| {
+        const source = @as(u64, src[channel]);
+        const backdrop = @as(u64, canvas[dst + channel]);
+        const blended = @as(u64, blendChannel(mode, src[channel], canvas[dst + channel]));
+        const color_numerator = source * sa64 * (255 - da) +
+            backdrop * da * (255 - sa64) +
+            blended * sa64 * da;
+        canvas[dst + channel] = @intCast((color_numerator + out_alpha_numerator / 2) / out_alpha_numerator);
+    }
+    canvas[dst + 3] = @intCast((out_alpha_numerator + 127) / 255);
 }
 
 fn compositeGroupCanvas(canvas: []u8, group_canvas: []const u8) void {
@@ -2594,6 +2623,18 @@ test "blend pixel mode screen combines source and backdrop" {
     var canvas = [_]u8{ 0xff, 0x00, 0x00, 0xff };
     blendPixelMode(&canvas, 0, .{ 0x00, 0x00, 0xff, 0xff }, .screen);
     try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 0xff, 0xff }, &canvas);
+}
+
+test "blend modes preserve source color over a transparent backdrop" {
+    var canvas = [_]u8{0} ** 4;
+    blendPixelMode(&canvas, 0, .{ 0x30, 0x60, 0x90, 0x80 }, .multiply);
+    try std.testing.expectEqualSlices(u8, &.{ 0x30, 0x60, 0x90, 0x80 }, &canvas);
+}
+
+test "blend modes compose partially transparent source and backdrop" {
+    var canvas = [_]u8{ 0x80, 0x80, 0x80, 0x80 };
+    blendPixelMode(&canvas, 0, .{ 0x80, 0x80, 0x80, 0x80 }, .multiply);
+    try std.testing.expectEqualSlices(u8, &.{ 0x6b, 0x6b, 0x6b, 0xc0 }, &canvas);
 }
 
 test "blend pixel mode normal opaque replaces backdrop" {
@@ -3972,19 +4013,17 @@ test "draw pattern run tiles colored cell content" {
     };
 
     var canvas: [8 * 4 * 4]u8 = undefined;
-    @memset(&canvas, 0xff);
+    for (0..canvas.len / 4) |pixel| canvas[pixel * 4 ..][0..4].* = .{ 0x00, 0x00, 0xff, 0xff };
     try drawPatternRun(alloc, &canvas, 8, 4, 0, 4, run);
 
     const left_red = ((2 * 8) + 1) * 4;
     const right_red = ((2 * 8) + 5) * 4;
-    const white_gap = ((2 * 8) + 3) * 4;
+    const transparent_gap = ((2 * 8) + 3) * 4;
     try std.testing.expectEqual(@as(u8, 0xff), canvas[left_red + 0]);
     try std.testing.expectEqual(@as(u8, 0x00), canvas[left_red + 1]);
     try std.testing.expectEqual(@as(u8, 0xff), canvas[right_red + 0]);
     try std.testing.expectEqual(@as(u8, 0x00), canvas[right_red + 1]);
-    try std.testing.expectEqual(@as(u8, 0xff), canvas[white_gap + 0]);
-    try std.testing.expectEqual(@as(u8, 0xff), canvas[white_gap + 1]);
-    try std.testing.expectEqual(@as(u8, 0xff), canvas[white_gap + 2]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0xff, 0xff }, canvas[transparent_gap .. transparent_gap + 4]);
 }
 
 test "draw pattern run recolors uncolored cell content" {
@@ -4019,18 +4058,20 @@ test "draw pattern run recolors uncolored cell content" {
     try drawPatternRun(alloc, &canvas, 4, 4, 0, 4, run);
 
     const green_px = ((2 * 4) + 1) * 4;
-    try std.testing.expectEqual(@as(u8, 0x00), canvas[green_px + 0]);
+    const transparent_gap = ((2 * 4) + 3) * 4;
+    try std.testing.expect(canvas[green_px + 0] >= 0x7f and canvas[green_px + 0] <= 0x80);
     try std.testing.expect(canvas[green_px + 1] > 0x80);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff }, canvas[transparent_gap .. transparent_gap + 4]);
 }
 
 test "reader and renderer preserve uncolored tiling pattern cell geometry" {
     const alloc = std.testing.allocator;
     const pattern_content = "0 0 5 10 re\nf\n";
-    const page_content = "/Pattern cs\n0 1 0 /P1 scn\n0 0 20 20 re\nf\n";
+    const page_content = "/CS1 cs\n0 1 0 /P1 scn\n0 0 20 20 re\nf\n";
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /ColorSpace << /CS1 [/Pattern /DeviceRGB] >> /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
         try std.fmt.allocPrint(
             alloc,
@@ -4086,6 +4127,7 @@ test "reader and renderer preserve uncolored tiling pattern cell geometry" {
             green_pixels += 1;
     }
     try std.testing.expect(green_pixels > 0);
+    try std.testing.expect(green_pixels < raw.width * raw.height);
 }
 
 test "nonzero glyph paths preserve counter contours" {
