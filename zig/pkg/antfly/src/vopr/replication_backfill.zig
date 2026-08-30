@@ -175,6 +175,10 @@ pub const Scenario = struct {
         cancellation_checkpoint: u64 = 0,
         cancellation_session: u64 = 0,
         cancellation_recovery_session: u64 = 0,
+        stale_owner_injected: bool = false,
+        stale_owner_rejected_offset: u64 = 0,
+        stale_owner_session: u64 = 0,
+        stale_owner_recovery_session: u64 = 0,
         first_attempt_error_code: u64 = 0,
         applied_mask: u8 = 0,
         apply_calls: u32 = 0,
@@ -367,6 +371,8 @@ pub const Scenario = struct {
                 .stale_owner => if (event.phase == .snapshot_batch_applied) {
                     self.fault_armed = false;
                     self.lease_valid = false;
+                    self.stale_owner_injected = true;
+                    self.stale_owner_session = self.source_sessions_opened;
                 },
                 .topology_change => if (event.phase == .snapshot_batch_applied) {
                     self.fault_armed = false;
@@ -432,6 +438,8 @@ pub const Scenario = struct {
                 self.source_recovery_session = session.generation;
             if (self.cancellation_injected and session.generation > self.cancellation_session)
                 self.cancellation_recovery_session = session.generation;
+            if (self.stale_owner_injected and session.generation > self.stale_owner_session)
+                self.stale_owner_recovery_session = session.generation;
             if (std.mem.eql(u8, params.table, "users_v2"))
                 self.schema_v2_query_seen = true;
             const rows_json = [_][]const u8{
@@ -535,6 +543,8 @@ pub const Scenario = struct {
                 self.first_attempt_failed = true;
                 self.first_attempt_error_code = @intFromError(err);
                 self.stale_rejected = self.mode != .stale_owner or err == error.CdcWorkLeaseLost;
+                if (self.mode == .stale_owner)
+                    self.stale_owner_rejected_offset = (self.latest() orelse return error.MissingReplicationStatus).snapshot_offset;
             }
             if (!snapshot_complete) {
                 self.lease_valid = true;
@@ -620,6 +630,15 @@ pub const Scenario = struct {
             try self.run();
         }
 
+        /// Lose work ownership after the target applied the first batch but
+        /// before its source checkpoint is durable. Resume from the prior
+        /// checkpoint and prove one exact idempotent target replay.
+        pub fn runStaleOwner(self: *@This()) !void {
+            self.mode = .stale_owner;
+            self.fault_armed = true;
+            try self.run();
+        }
+
         pub fn completionSound(self: *const @This()) bool {
             return self.complete and self.applied_mask == 7 and
                 self.max_snapshot_checkpoint <= @popCount(self.applied_mask & 3) and
@@ -655,6 +674,18 @@ pub const Scenario = struct {
                 self.source_sessions_closed == self.source_sessions_opened and
                 self.source_sessions_live == 0 and self.source_sessions_peak == 1 and
                 self.apply_calls == 3 and self.lease_valid and !self.fault_armed;
+        }
+
+        pub fn staleOwnerRecoverySound(self: *const @This()) bool {
+            return self.completionSound() and self.first_attempt_failed and
+                self.stale_owner_injected and self.stale_rejected and
+                self.stale_owner_rejected_offset == 0 and
+                self.first_attempt_error_code == @intFromError(error.CdcWorkLeaseLost) and
+                self.stale_owner_session == 1 and self.stale_owner_recovery_session == 2 and
+                self.source_sessions_opened == 3 and
+                self.source_sessions_closed == self.source_sessions_opened and
+                self.source_sessions_live == 0 and self.source_sessions_peak == 1 and
+                self.apply_calls == 4 and self.lease_valid and !self.fault_armed;
         }
 
         pub fn firstAttemptFailed(self: *const @This()) bool {
@@ -720,6 +751,10 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".cancellation-checkpoint", @intCast(world.state.cancellation_checkpoint));
         try builder.addNamed(allocator, name ++ ".cancellation-session", @intCast(world.state.cancellation_session));
         try builder.addNamed(allocator, name ++ ".cancellation-recovery-session", @intCast(world.state.cancellation_recovery_session));
+        try builder.addNamed(allocator, name ++ ".stale-owner-injected", @intFromBool(world.state.stale_owner_injected));
+        try builder.addNamed(allocator, name ++ ".stale-owner-rejected-offset", @intCast(world.state.stale_owner_rejected_offset));
+        try builder.addNamed(allocator, name ++ ".stale-owner-session", @intCast(world.state.stale_owner_session));
+        try builder.addNamed(allocator, name ++ ".stale-owner-recovery-session", @intCast(world.state.stale_owner_recovery_session));
         try builder.addNamed(allocator, name ++ ".first-attempt-error", @intCast(world.state.first_attempt_error_code));
     }
 
@@ -727,7 +762,7 @@ pub const Scenario = struct {
         const state = world.state;
         try sink.check(allocator, safe_checkpoint_id, state.max_snapshot_checkpoint <= @popCount(state.applied_mask & 3));
         try sink.check(allocator, no_loss_id, !state.complete or state.applied_mask == 7);
-        try sink.check(allocator, stale_rejected_id, state.mode != .stale_owner or state.stale_rejected);
+        try sink.check(allocator, stale_rejected_id, state.mode != .stale_owner or state.staleOwnerRecoverySound());
         try sink.check(
             allocator,
             duplicate_safe_id,
@@ -736,7 +771,8 @@ pub const Scenario = struct {
         try sink.check(allocator, recovery_id, state.complete and
             (state.mode == .clean or state.first_attempt_failed) and
             (state.mode != .source_crash or state.sourceCrashRecoverySound()) and
-            (state.mode != .cancellation or state.cancellationRecoverySound()));
+            (state.mode != .cancellation or state.cancellationRecoverySound()) and
+            (state.mode != .stale_owner or state.staleOwnerRecoverySound()));
     }
 
     pub fn healthSnapshot(world: *World) vopr.health.Snapshot {

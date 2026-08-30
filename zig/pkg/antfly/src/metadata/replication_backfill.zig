@@ -964,6 +964,14 @@ pub const SnapshotBackfillRunner = struct {
                 if (next_snapshot_checkpoint) |checkpoint| checkpoint else "",
             );
 
+            // Applying the target batch and publishing its durable source
+            // checkpoint are separate ownership-sensitive steps. Revalidate
+            // the work lease in that gap so a stale owner can never advance
+            // progress after losing authority. The target operation is
+            // idempotent, so a replacement may safely replay it from the last
+            // durable checkpoint.
+            try self.checkpointWork();
+
             try checkProgressCutoverAuthority(
                 status_sink,
                 table,

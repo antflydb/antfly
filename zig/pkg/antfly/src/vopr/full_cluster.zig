@@ -22,7 +22,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 46;
+    pub const version: u32 = 47;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -51,6 +51,7 @@ pub const Scenario = struct {
     const production_replication_owner_restart_id = vopr.id.stable(name, "production-replication-target-owner-restarts-and-resumes");
     const production_replication_source_crash_id = vopr.id.stable(name, "production-replication-source-session-crashes-and-resumes");
     const production_replication_cancellation_id = vopr.id.stable(name, "production-replication-durable-checkpoint-cancellation-resumes");
+    const production_replication_stale_owner_id = vopr.id.stable(name, "production-replication-stale-owner-cannot-advance-checkpoint");
     const production_graph_hydration_id = vopr.id.stable(name, "production-public-graph-hydrates-documents");
     const production_graph_cancellation_id = vopr.id.stable(name, "production-public-graph-cancellation-drains-fanout");
     const production_graph_cancellation_transport_id = vopr.id.stable(name, "production-public-graph-cancellation-under-transport-fault");
@@ -102,6 +103,7 @@ pub const Scenario = struct {
         .{ .id = production_replication_owner_restart_id, .name = name ++ ".production-replication-target-owner-restarts-and-resumes", .kind = .always },
         .{ .id = production_replication_source_crash_id, .name = name ++ ".production-replication-source-session-crashes-and-resumes", .kind = .always },
         .{ .id = production_replication_cancellation_id, .name = name ++ ".production-replication-durable-checkpoint-cancellation-resumes", .kind = .always },
+        .{ .id = production_replication_stale_owner_id, .name = name ++ ".production-replication-stale-owner-cannot-advance-checkpoint", .kind = .always },
         .{ .id = production_graph_hydration_id, .name = name ++ ".production-public-graph-hydrates-documents", .kind = .always },
         .{ .id = production_graph_cancellation_id, .name = name ++ ".production-public-graph-cancellation-drains-fanout", .kind = .always },
         .{ .id = production_graph_cancellation_transport_id, .name = name ++ ".production-public-graph-cancellation-under-transport-fault", .kind = .always },
@@ -172,13 +174,15 @@ pub const Scenario = struct {
         production_data_plane_replication_owner_restart_service_rate,
         production_data_plane_replication_source_crash_service_rate,
         production_data_plane_replication_cancellation_service_rate,
+        production_data_plane_replication_stale_owner_service_rate,
 
         fn isReplicationBackfill(self: Mode) bool {
             return self == .production_data_plane_replication_backfill_service_rate or
                 self == .production_data_plane_replication_schema_change_service_rate or
                 self == .production_data_plane_replication_owner_restart_service_rate or
                 self == .production_data_plane_replication_source_crash_service_rate or
-                self == .production_data_plane_replication_cancellation_service_rate;
+                self == .production_data_plane_replication_cancellation_service_rate or
+                self == .production_data_plane_replication_stale_owner_service_rate;
         }
 
         fn isProduction(self: Mode) bool {
@@ -217,7 +221,7 @@ pub const Scenario = struct {
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_durable_join_owner_restart, .production_data_plane_durable_join_retry_exhaustion, .production_data_plane_durable_join_cancellation_overlapping_faults, .production_data_plane_durable_join_cancellation_owner_restart, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation, .production_data_plane_global_query_inflight_authorization_revocation, .production_data_plane_global_query_transport_failure, .production_data_plane_global_query_owner_restart, .production_data_plane_query_embedding_cache_service_rate, .production_data_plane_replication_backfill_service_rate, .production_data_plane_replication_schema_change_service_rate, .production_data_plane_replication_owner_restart_service_rate, .production_data_plane_replication_source_crash_service_rate, .production_data_plane_replication_cancellation_service_rate => .clean,
+                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_durable_join_owner_restart, .production_data_plane_durable_join_retry_exhaustion, .production_data_plane_durable_join_cancellation_overlapping_faults, .production_data_plane_durable_join_cancellation_owner_restart, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation, .production_data_plane_global_query_inflight_authorization_revocation, .production_data_plane_global_query_transport_failure, .production_data_plane_global_query_owner_restart, .production_data_plane_query_embedding_cache_service_rate, .production_data_plane_replication_backfill_service_rate, .production_data_plane_replication_schema_change_service_rate, .production_data_plane_replication_owner_restart_service_rate, .production_data_plane_replication_source_crash_service_rate, .production_data_plane_replication_cancellation_service_rate, .production_data_plane_replication_stale_owner_service_rate => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -282,6 +286,7 @@ pub const Scenario = struct {
             vopr.id.stable(name, "production-data-plane-replication-owner-restart-service-rate"),
             vopr.id.stable(name, "production-data-plane-replication-source-crash-service-rate"),
             vopr.id.stable(name, "production-data-plane-replication-cancellation-service-rate"),
+            vopr.id.stable(name, "production-data-plane-replication-stale-owner-service-rate"),
         };
     };
     const mode_names = [_][]const u8{
@@ -329,6 +334,7 @@ pub const Scenario = struct {
         name ++ ".production-data-plane-replication-owner-restart-service-rate",
         name ++ ".production-data-plane-replication-source-crash-service-rate",
         name ++ ".production-data-plane-replication-cancellation-service-rate",
+        name ++ ".production-data-plane-replication-stale-owner-service-rate",
     };
 
     const production_baseline_ordinal: usize = @intFromEnum(Mode.production_data_plane_baseline);
@@ -366,6 +372,7 @@ pub const Scenario = struct {
     const production_replication_owner_restart_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_owner_restart_service_rate);
     const production_replication_source_crash_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_source_crash_service_rate);
     const production_replication_cancellation_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_cancellation_service_rate);
+    const production_replication_stale_owner_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_stale_owner_service_rate);
 
     const metadata_role = vopr.id.stable(name, "role.metadata");
     const public_data_role = vopr.id.stable(name, "role.public-data");
@@ -1089,6 +1096,8 @@ pub const Scenario = struct {
                 self.mode == .production_data_plane_replication_source_crash_service_rate;
             const cancellation_required =
                 self.mode == .production_data_plane_replication_cancellation_service_rate;
+            const stale_owner_required =
+                self.mode == .production_data_plane_replication_stale_owner_service_rate;
             // Owner restart invalidates both the request aimed at the stopped
             // listener and one pooled connection held by the long-lived
             // production client. The runner must absorb exactly those two
@@ -1096,11 +1105,11 @@ pub const Scenario = struct {
             // replacing the client here would hide reconnect behavior.
             const expected_target_attempts: u64 = if (owner_restart_required)
                 5
-            else if (schema_change_required)
+            else if (schema_change_required or stale_owner_required)
                 4
             else
                 3;
-            const expected_target_successes: u64 = if (schema_change_required) 4 else 3;
+            const expected_target_successes: u64 = if (schema_change_required or stale_owner_required) 4 else 3;
             return self.replication_done and self.replication_sound and
                 self.replication_public_visible and self.replication_error_code == 0 and
                 self.replication.completionSound() and
@@ -1110,6 +1119,7 @@ pub const Scenario = struct {
                         cluster.replicationOwnerRestartSound())) and
                 (!source_crash_required or self.replication.sourceCrashRecoverySound()) and
                 (!cancellation_required or self.replication.cancellationRecoverySound()) and
+                (!stale_owner_required or self.replication.staleOwnerRecoverySound()) and
                 cluster.replication_batch_attempts == expected_target_attempts and
                 cluster.replication_batch_successes == expected_target_successes and
                 (cluster.replication_last_status == 201 or cluster.replication_last_status == 202);
@@ -1222,6 +1232,7 @@ pub const Scenario = struct {
                 .production_data_plane_replication_schema_change_service_rate => self.replication.runSchemaChange(),
                 .production_data_plane_replication_source_crash_service_rate => self.replication.runSourceCrash(),
                 .production_data_plane_replication_cancellation_service_rate => self.replication.runCancellation(),
+                .production_data_plane_replication_stale_owner_service_rate => self.replication.runStaleOwner(),
                 else => self.replication.runClean(),
             };
             result catch |err| {
@@ -1927,7 +1938,7 @@ pub const Scenario = struct {
                         .activate = activateJoinCancellationOverlapFaults,
                     });
                 },
-                .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_join_split, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation, .production_data_plane_global_query_inflight_authorization_revocation, .production_data_plane_query_embedding_cache_service_rate, .production_data_plane_replication_backfill_service_rate, .production_data_plane_replication_schema_change_service_rate, .production_data_plane_replication_owner_restart_service_rate, .production_data_plane_replication_source_crash_service_rate, .production_data_plane_replication_cancellation_service_rate => {},
+                .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_join_split, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation, .production_data_plane_global_query_inflight_authorization_revocation, .production_data_plane_query_embedding_cache_service_rate, .production_data_plane_replication_backfill_service_rate, .production_data_plane_replication_schema_change_service_rate, .production_data_plane_replication_owner_restart_service_rate, .production_data_plane_replication_source_crash_service_rate, .production_data_plane_replication_cancellation_service_rate, .production_data_plane_replication_stale_owner_service_rate => {},
             }
         }
 
@@ -2169,6 +2180,10 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".replication-cancellation-checkpoint", @intCast(state.replication.cancellation_checkpoint));
         try builder.addNamed(allocator, name ++ ".replication-cancellation-session", @intCast(state.replication.cancellation_session));
         try builder.addNamed(allocator, name ++ ".replication-cancellation-recovery-session", @intCast(state.replication.cancellation_recovery_session));
+        try builder.addNamed(allocator, name ++ ".replication-stale-owner-injected", @intFromBool(state.replication.stale_owner_injected));
+        try builder.addNamed(allocator, name ++ ".replication-stale-owner-rejected-offset", @intCast(state.replication.stale_owner_rejected_offset));
+        try builder.addNamed(allocator, name ++ ".replication-stale-owner-session", @intCast(state.replication.stale_owner_session));
+        try builder.addNamed(allocator, name ++ ".replication-stale-owner-recovery-session", @intCast(state.replication.stale_owner_recovery_session));
         try builder.addNamed(allocator, name ++ ".replication-first-attempt-error", @intCast(state.replication.first_attempt_error_code));
         try builder.addNamed(allocator, name ++ ".data-hosts", if (cluster) |snapshot| @intCast(snapshot.hosts) else 0);
         try builder.addNamed(allocator, name ++ ".public-requests-ok", @intFromBool(if (cluster) |snapshot| snapshot.requests_ok else false));
@@ -2670,6 +2685,9 @@ pub const Scenario = struct {
         try sink.check(allocator, production_replication_cancellation_id, !state.complete or
             state.mode.? != .production_data_plane_replication_cancellation_service_rate or
             (state.replicationSound() and state.replication.cancellationRecoverySound()));
+        try sink.check(allocator, production_replication_stale_owner_id, !state.complete or
+            state.mode.? != .production_data_plane_replication_stale_owner_service_rate or
+            (state.replicationSound() and state.replication.staleOwnerRecoverySound()));
         try sink.check(allocator, production_graph_hydration_id, !state.complete or
             state.mode.? != .production_data_plane_graph_hydration or
             (cluster != null and cluster.?.graph_hydration_ok and
@@ -2828,11 +2846,13 @@ fn runExactMode(
     const production_replication_owner_restart_mode = mode_id == Scenario.mode_ids[Scenario.production_replication_owner_restart_ordinal];
     const production_replication_source_crash_mode = mode_id == Scenario.mode_ids[Scenario.production_replication_source_crash_ordinal];
     const production_replication_cancellation_mode = mode_id == Scenario.mode_ids[Scenario.production_replication_cancellation_ordinal];
+    const production_replication_stale_owner_mode = mode_id == Scenario.mode_ids[Scenario.production_replication_stale_owner_ordinal];
     const production_replication_mode = production_replication_backfill_mode or
         production_replication_schema_change_mode or
         production_replication_owner_restart_mode or
         production_replication_source_crash_mode or
-        production_replication_cancellation_mode;
+        production_replication_cancellation_mode or
+        production_replication_stale_owner_mode;
     const production_mode = production_baseline_mode or production_graph_mode or
         production_split_mode or production_graph_split_mode or
         production_graph_split_transport_mode or production_graph_split_owner_restart_mode or
@@ -2896,7 +2916,9 @@ fn runExactMode(
         .resource_budget = if (production_mode) 256 else 96,
         .backend_ids = &backend_ids,
         .source_revision = if (production_mode)
-            (if (production_replication_cancellation_mode)
+            (if (production_replication_stale_owner_mode)
+                "full-cluster-vopr-v47-replication-stale-owner-service-rate"
+            else if (production_replication_cancellation_mode)
                 "full-cluster-vopr-v46-replication-durable-cancellation-service-rate"
             else if (production_replication_source_crash_mode)
                 "full-cluster-vopr-v45-replication-source-crash-service-rate"
@@ -3359,6 +3381,19 @@ test "full cluster production replication durable cancellation resumes and exact
         Scenario.mode_ids[ordinal],
         ordinal,
         220_000,
+        .complete,
+    );
+}
+
+test "full cluster production replication stale owner replays undurable batch and exact replays" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.production_replication_stale_owner_ordinal;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        240_000,
         .complete,
     );
 }
