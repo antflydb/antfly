@@ -533,6 +533,10 @@ pub const MemoryReplicaCatalog = struct {
         var next = try cloneReplicaMapFromMap(self.alloc, &self.records);
         errdefer deinitReplicaMap(self.alloc, &next);
         try applyReplicaBatchToMap(self.alloc, &next, upserts, removals);
+        if (replicaMapsEqual(&self.records, &next)) {
+            deinitReplicaMap(self.alloc, &next);
+            return;
+        }
         deinitReplicaMap(self.alloc, &self.records);
         self.records = next;
         self.current_revision = next_revision;
@@ -676,6 +680,10 @@ pub const FileReplicaCatalog = struct {
         var next = try cloneReplicaMapFromMap(self.alloc, &self.records);
         errdefer deinitReplicaMap(self.alloc, &next);
         try applyReplicaBatchToMap(self.alloc, &next, upserts, removals);
+        if (replicaMapsEqual(&self.records, &next)) {
+            deinitReplicaMap(self.alloc, &next);
+            return;
+        }
 
         var previous = self.records;
         self.records = next;
@@ -852,6 +860,19 @@ fn deinitReplicaMap(
     while (it.next()) |record| record.deinit(alloc);
     records.deinit(alloc);
     records.* = .empty;
+}
+
+fn replicaMapsEqual(
+    left: *const std.AutoHashMapUnmanaged(u64, ReplicaRecord),
+    right: *const std.AutoHashMapUnmanaged(u64, ReplicaRecord),
+) bool {
+    if (left.count() != right.count()) return false;
+    var it = left.iterator();
+    while (it.next()) |entry| {
+        const other = right.get(entry.key_ptr.*) orelse return false;
+        if (!eqlReplicaRecord(entry.value_ptr.*, other)) return false;
+    }
+    return true;
 }
 
 fn validateReplicaRecord(record: ReplicaRecord) !void {
@@ -1115,6 +1136,12 @@ test "memory replica catalog batch is revision fenced and publishes atomically" 
         .{ .group_id = 13, .replica_id = 3, .local_node_id = 3 },
     }, &.{11});
     try std.testing.expectEqual(revision + 1, iface.revision());
+    const converged_revision = iface.revision();
+    try iface.applyBatch(converged_revision, &.{
+        .{ .group_id = 12, .replica_id = 2, .local_node_id = 3 },
+        .{ .group_id = 13, .replica_id = 3, .local_node_id = 3 },
+    }, &.{11});
+    try std.testing.expectEqual(converged_revision, iface.revision());
 
     try std.testing.expectError(
         error.ReplicaCatalogRevisionChanged,

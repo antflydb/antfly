@@ -95,6 +95,24 @@ pub fn runRoutedMutation(
     ops: anytype,
     options: RoutedMutationOptions,
 ) !void {
+    return runRoutedMutationWithClock(router, ops, options, SystemClock{});
+}
+
+const SystemClock = struct {
+    fn nowNs(_: SystemClock) u64 {
+        return platform_time.monotonicNs();
+    }
+};
+
+fn runRoutedMutationWithClock(
+    router: anytype,
+    ops: anytype,
+    options: RoutedMutationOptions,
+    clock: anytype,
+) !void {
+    const started_ns = clock.nowNs();
+    const deadline_ns = started_ns +|
+        @as(u64, options.initial_remaining_ms) * std.time.ns_per_ms;
     var attempts: usize = 0;
     var forwarding = Context{
         .remaining_ms = options.initial_remaining_ms,
@@ -102,8 +120,16 @@ pub fn runRoutedMutation(
         .campaign_allowed = true,
     };
     var campaign_allowed = true;
-    var attempt_started_ns = platform_time.monotonicNs();
+    var attempt_started_ns = started_ns;
     while (true) {
+        const now_ns = clock.nowNs();
+        const absolute_remaining_ms = remainingMsUntil(deadline_ns, now_ns) orelse
+            return error.RaftMutationDeadlineExceeded;
+        // A child context may already have reserved response time. Preserve
+        // that tighter bound while also debiting all time spent in a delivered
+        // remote request before route discovery or a local retry.
+        forwarding.remaining_ms = @min(forwarding.remaining_ms, absolute_remaining_ms);
+        attempt_started_ns = now_ns;
         attempts += 1;
         const route = if (comptime @hasDecl(@TypeOf(router.*), "resolveTableMutationRouteWithCampaign"))
             try router.resolveTableMutationRouteWithCampaign(&campaign_allowed, forwarding.remaining_ms)
@@ -114,10 +140,11 @@ pub fn runRoutedMutation(
                 ops.local() catch |err| switch (err) {
                     error.NotLeader => {
                         if (attempts >= options.max_attempts) return error.NotLeader;
-                        const elapsed_ms = elapsedMsSince(attempt_started_ns);
-                        if (elapsed_ms >= forwarding.remaining_ms) return error.NotLeader;
+                        const elapsed_ms = elapsedMsSince(attempt_started_ns, clock.nowNs());
+                        if (elapsed_ms >= forwarding.remaining_ms)
+                            return error.RaftMutationDeadlineExceeded;
                         forwarding.remaining_ms -= elapsed_ms;
-                        attempt_started_ns = platform_time.monotonicNs();
+                        attempt_started_ns = clock.nowNs();
                         continue;
                     },
                     else => return err,
@@ -127,17 +154,21 @@ pub fn runRoutedMutation(
             .forward => |peer| {
                 const parent_attempt_started_ns = attempt_started_ns;
                 const child_forwarding = forwarding.child(
-                    elapsedMsSince(attempt_started_ns),
+                    elapsedMsSince(attempt_started_ns, clock.nowNs()),
                     options.response_reserve_ms,
-                ) catch return error.NotLeader;
-                attempt_started_ns = platform_time.monotonicNs();
+                ) catch |err| return switch (err) {
+                    error.RaftMutationDeadlineExceeded => error.RaftMutationDeadlineExceeded,
+                    error.RaftMutationForwardLimitReached => error.NotLeader,
+                };
+                attempt_started_ns = clock.nowNs();
                 ops.forward(peer, child_forwarding) catch |err| switch (err) {
                     error.RaftMutationRequestNotSent => {
                         if (attempts >= options.max_attempts) return error.NotLeader;
-                        const total_elapsed_ms = elapsedMsSince(parent_attempt_started_ns);
-                        if (total_elapsed_ms >= forwarding.remaining_ms) return error.NotLeader;
+                        const total_elapsed_ms = elapsedMsSince(parent_attempt_started_ns, clock.nowNs());
+                        if (total_elapsed_ms >= forwarding.remaining_ms)
+                            return error.RaftMutationDeadlineExceeded;
                         forwarding.remaining_ms -= total_elapsed_ms;
-                        attempt_started_ns = platform_time.monotonicNs();
+                        attempt_started_ns = clock.nowNs();
                         continue;
                     },
                     error.NotLeader => {
@@ -153,8 +184,16 @@ pub fn runRoutedMutation(
     }
 }
 
-fn elapsedMsSince(started_ns: u64) u32 {
-    const elapsed_ns = platform_time.monotonicNs() -| started_ns;
+fn remainingMsUntil(deadline_ns: u64, now_ns: u64) ?u32 {
+    if (now_ns >= deadline_ns) return null;
+    const remaining_ns = deadline_ns - now_ns;
+    const remaining_ms = remaining_ns / std.time.ns_per_ms;
+    if (remaining_ms == 0) return null;
+    return @intCast(@min(remaining_ms, std.math.maxInt(u32)));
+}
+
+fn elapsedMsSince(started_ns: u64, now_ns: u64) u32 {
+    const elapsed_ns = now_ns -| started_ns;
     return @intCast(@min(elapsed_ns / std.time.ns_per_ms, std.math.maxInt(u32)));
 }
 
@@ -323,4 +362,75 @@ test "absolute mutation driver consumes only delivered hops" {
     const final = driver.nextContext(1_200 * std.time.ns_per_ms, 50 * std.time.ns_per_ms).?;
     try std.testing.expectEqual(@as(u8, 0), final.forwards_remaining);
     try std.testing.expect(!final.campaign_allowed);
+}
+
+test "raft mutation routed driver rejects an exhausted absolute budget before routing" {
+    const Script = struct {
+        route_calls: usize = 0,
+
+        pub fn resolveTableMutationRoute(self: *@This()) !union(enum) { local, forward: void } {
+            self.route_calls += 1;
+            return .local;
+        }
+
+        const Ops = struct {
+            pub fn local(_: @This()) !void {}
+            pub fn forward(_: @This(), _: void, _: Context) !void {}
+        };
+    };
+    var script = Script{};
+    try std.testing.expectError(
+        error.RaftMutationDeadlineExceeded,
+        runRoutedMutation(&script, Script.Ops{}, .{ .initial_remaining_ms = 0 }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), script.route_calls);
+}
+
+test "raft mutation routed driver debits delivered remote time before rediscovery" {
+    const Test = struct {
+        const Clock = struct {
+            now_ns: u64 = std.time.ns_per_ms,
+
+            fn nowNs(self: *@This()) u64 {
+                return self.now_ns;
+            }
+        };
+
+        const Router = struct {
+            route_calls: usize = 0,
+
+            pub fn resolveTableMutationRoute(self: *@This()) !union(enum) { local, forward: void } {
+                self.route_calls += 1;
+                return if (self.route_calls == 1) .{ .forward = {} } else .local;
+            }
+        };
+
+        const Ops = struct {
+            clock: *Clock,
+            local_calls: *usize,
+
+            pub fn local(self: @This()) anyerror!void {
+                self.local_calls.* += 1;
+            }
+
+            pub fn forward(self: @This(), _: void, _: Context) anyerror!void {
+                self.clock.now_ns += 100 * std.time.ns_per_ms;
+                return error.NotLeader;
+            }
+        };
+    };
+    var clock = Test.Clock{};
+    var router = Test.Router{};
+    var local_calls: usize = 0;
+    try std.testing.expectError(
+        error.RaftMutationDeadlineExceeded,
+        runRoutedMutationWithClock(
+            &router,
+            Test.Ops{ .clock = &clock, .local_calls = &local_calls },
+            .{ .initial_remaining_ms = 100 },
+            &clock,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), router.route_calls);
+    try std.testing.expectEqual(@as(usize, 0), local_calls);
 }

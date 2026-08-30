@@ -180,6 +180,14 @@ pub const HostMetrics = struct {
     endpoint_refreshes: usize = 0,
     endpoint_removals: usize = 0,
     replica_admission_conflicts: usize = 0,
+    replica_admission_conflicts_active: usize = 0,
+    membership_converged: usize = 0,
+    membership_waiting_for_replica: usize = 0,
+    membership_waiting_for_leader: usize = 0,
+    membership_waiting_for_local_voter: usize = 0,
+    membership_waiting_for_pending_change: usize = 0,
+    membership_waiting_for_policy: usize = 0,
+    route_retrying_groups: usize = 0,
     inbound_message_enqueues: usize = 0,
     inbound_message_drains: usize = 0,
     quarantined_inbound_message_drops: usize = 0,
@@ -454,22 +462,12 @@ pub const Host = struct {
         // desired state and then rejecting a conflicting live descriptor would
         // leave restart behavior different from the running process.
         descriptor.validateForAdmission() catch |err| return err;
-        if (self.runtime_host.replicaAdmissionConflict(descriptor)) |conflict| {
-            const previous = self.admission_conflicts.get(record.group_id);
-            if (previous == null or !std.meta.eql(previous.?, conflict)) {
-                try self.admission_conflicts.put(self.alloc, record.group_id, conflict);
-                self.metrics.replica_admission_conflicts +|= 1;
-                std.log.warn(
-                    "replica admission blocked group_id={d} local_node_id={d} field={s}",
-                    .{ record.group_id, record.local_node_id, conflict.fieldName() },
-                );
-            }
+        if (try self.observeReplicaAdmissionConflict(record, descriptor)) |conflict| {
             return switch (conflict) {
                 .local_node_id => error.LocalNodeIdMismatch,
                 .runtime_policy => error.ReplicaRuntimePolicyMismatch,
             };
         }
-        _ = self.admission_conflicts.remove(record.group_id);
 
         // Persist admission before publication. A crash between these steps
         // leaves a recoverable catalog entry instead of an untracked live group.
@@ -488,6 +486,60 @@ pub const Host = struct {
         group_id: u64,
     ) ?raft_engine.runtime.group.ReplicaAdmissionConflict {
         return self.admission_conflicts.get(group_id);
+    }
+
+    /// Rechecks a previously blocked restart-scoped policy without touching
+    /// the durable catalog or live runtime. Stable control rounds use this to
+    /// observe configuration rollback and clear stale restart requirements.
+    pub fn revalidateReplicaAdmissionConflict(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+    ) !?raft_engine.runtime.group.ReplicaAdmissionConflict {
+        const factory = self.deps.descriptor_factory orelse return error.MissingReplicaDescriptorFactory;
+        var descriptor = try factory.buildDescriptor(record);
+        defer factory.freeDescriptor(self.alloc, &descriptor);
+        descriptor.group.raft_config.trace_logger = self.cfg.trace_logger orelse
+            if (comptime build_options.with_tla) tracing.stderrRaftTraceLogger() else null;
+        try descriptor.validateForAdmission();
+        return try self.observeReplicaAdmissionConflict(record, descriptor);
+    }
+
+    fn observeReplicaAdmissionConflict(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+        descriptor: raft_engine.runtime.ReplicaDescriptor,
+    ) !?raft_engine.runtime.group.ReplicaAdmissionConflict {
+        if (self.runtime_host.replicaAdmissionConflict(descriptor)) |conflict| {
+            const previous = self.admission_conflicts.get(record.group_id);
+            if (previous == null or !std.meta.eql(previous.?, conflict)) {
+                try self.admission_conflicts.put(self.alloc, record.group_id, conflict);
+                self.metrics.replica_admission_conflicts +|= 1;
+                switch (conflict) {
+                    .local_node_id => std.log.warn(
+                        "replica admission blocked group_id={d} local_node_id={d} field={s}",
+                        .{ record.group_id, record.local_node_id, conflict.fieldName() },
+                    ),
+                    .runtime_policy => |policy_conflict| std.log.warn(
+                        "replica admission requires restart group_id={d} local_node_id={d} field={s} installed_policy={x} desired_policy={x}",
+                        .{
+                            record.group_id,
+                            record.local_node_id,
+                            conflict.fieldName(),
+                            policy_conflict.installed_fingerprint,
+                            policy_conflict.desired_fingerprint,
+                        },
+                    ),
+                }
+            }
+            return conflict;
+        }
+        if (self.admission_conflicts.remove(record.group_id)) {
+            std.log.info(
+                "replica admission conflict cleared group_id={d} local_node_id={d}",
+                .{ record.group_id, record.local_node_id },
+            );
+        }
+        return null;
     }
 
     /// Publishes a fully prepared descriptor into the single-owner runtime.
@@ -743,6 +795,7 @@ pub const Host = struct {
     pub fn metricsSnapshot(self: *const Host) HostMetrics {
         const runtime_metrics = self.runtime_host.metricsSnapshot();
         var snapshot = self.metrics;
+        snapshot.replica_admission_conflicts_active = self.admission_conflicts.count();
         snapshot.hosted_groups = runtime_metrics.group_count;
         snapshot.quarantined_groups = runtime_metrics.quarantined_group_count;
         snapshot.quarantined_inbound_message_drops = runtime_metrics.quarantined_inbound_messages;

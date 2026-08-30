@@ -82,6 +82,14 @@ pub const ReplicaRuntimePolicy = struct {
         }
         return null;
     }
+
+    pub fn fingerprint(self: ReplicaRuntimePolicy) u64 {
+        var hasher = std.hash.Wyhash.init(0x726166745f706f6c);
+        inline for (std.meta.fields(ReplicaRuntimePolicy)) |field| {
+            std.hash.autoHash(&hasher, @field(self, field.name));
+        }
+        return hasher.final();
+    }
 };
 
 pub const ReplicaRuntimePolicyField = std.meta.FieldEnum(ReplicaRuntimePolicy);
@@ -91,12 +99,16 @@ pub const ReplicaAdmissionConflict = union(enum) {
         installed: core.types.NodeId,
         desired: core.types.NodeId,
     },
-    runtime_policy: ReplicaRuntimePolicyField,
+    runtime_policy: struct {
+        field: ReplicaRuntimePolicyField,
+        installed_fingerprint: u64,
+        desired_fingerprint: u64,
+    },
 
     pub fn fieldName(self: ReplicaAdmissionConflict) []const u8 {
         return switch (self) {
             .local_node_id => "local_node_id",
-            .runtime_policy => |field| @tagName(field),
+            .runtime_policy => |conflict| @tagName(conflict.field),
         };
     }
 };
@@ -175,8 +187,14 @@ pub const Group = struct {
             .installed = self.cfg.local_node_id,
             .desired = cfg.local_node_id,
         } };
-        if (self.runtimePolicy().firstConflict(.fromConfig(cfg.raft_config))) |field|
-            return .{ .runtime_policy = field };
+        const installed_policy = self.runtimePolicy();
+        const desired_policy = ReplicaRuntimePolicy.fromConfig(cfg.raft_config);
+        if (installed_policy.firstConflict(desired_policy)) |field|
+            return .{ .runtime_policy = .{
+                .field = field,
+                .installed_fingerprint = installed_policy.fingerprint(),
+                .desired_fingerprint = desired_policy.fingerprint(),
+            } };
         return null;
     }
 

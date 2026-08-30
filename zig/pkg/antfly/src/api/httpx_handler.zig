@@ -4354,6 +4354,11 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(503);
                     return ctx.text("metadata cluster upgrade in progress; retry later");
                 },
+                error.RaftMutationDeadlineExceeded => {
+                    try ctx.setHeader("Retry-After", "1");
+                    _ = ctx.status(503);
+                    return ctx.text("metadata mutation deadline exceeded before admission; retry later");
+                },
                 error.MetadataMutationOutcomeUnknown => {
                     try ctx.setHeader(
                         metadata_http_routes.Routes.raft_mutation_outcome_header,
@@ -4481,6 +4486,11 @@ pub const AntflyApiHandler = struct {
                 try ctx.setHeader("Retry-After", "1");
                 _ = ctx.status(503);
                 return ctx.text("metadata cluster upgrade in progress; retry later");
+            },
+            error.RaftMutationDeadlineExceeded => {
+                try ctx.setHeader("Retry-After", "1");
+                _ = ctx.status(503);
+                return ctx.text("metadata mutation deadline exceeded before admission; retry later");
             },
             error.NotLeader => {
                 return metadataNotLeaderResponse(ctx);

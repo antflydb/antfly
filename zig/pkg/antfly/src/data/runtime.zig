@@ -1780,6 +1780,15 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_executor_control_rejections_total", "counter", "Control executor lease acquisitions rejected during shutdown", lanes.control_rejections_total);
         }
         try health_metrics.appendPromMetric(writer, "antfly_raft_quarantined_groups", "gauge", "Raft groups stopped by a hard Ready safety invariant and awaiting explicit recovery", raft_metrics.quarantined_groups);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_replica_admission_conflicts_active", "gauge", "Replicas whose desired restart-scoped policy differs from the live runtime", raft_metrics.replica_admission_conflicts_active);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_replica_admission_conflicts_total", "counter", "Distinct replica admission conflicts observed", raft_metrics.replica_admission_conflicts);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_membership_converged_groups", "gauge", "Local replica intents whose observed Raft membership is converged", raft_metrics.membership_converged);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_membership_waiting_for_replica_groups", "gauge", "Local replica intents awaiting runtime admission", raft_metrics.membership_waiting_for_replica);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_membership_waiting_for_leader_groups", "gauge", "Local replica intents awaiting a Raft leader for membership convergence", raft_metrics.membership_waiting_for_leader);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_membership_waiting_for_local_voter_groups", "gauge", "Local replica intents whose local node cannot yet propose membership", raft_metrics.membership_waiting_for_local_voter);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_membership_waiting_for_pending_change_groups", "gauge", "Local replica intents awaiting an in-flight configuration change", raft_metrics.membership_waiting_for_pending_change);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_membership_waiting_for_policy_groups", "gauge", "Local replica intents fenced by membership policy", raft_metrics.membership_waiting_for_policy);
+        try health_metrics.appendPromMetric(writer, "antfly_raft_route_retrying_groups", "gauge", "Local Raft groups retrying peer endpoint convergence", raft_metrics.route_retrying_groups);
         try health_metrics.appendPromMetric(writer, "antfly_raft_quarantined_inbound_messages_dropped_total", "counter", "Inbound Raft messages isolated to quarantined groups", raft_metrics.quarantined_inbound_message_drops);
         try health_metrics.appendPromMetric(writer, "antfly_raft_quarantine_resume_attempts_total", "counter", "Fenced operator attempts to resume quarantined Raft groups", raft_metrics.runtime_quarantine_resume_attempts);
         try health_metrics.appendPromMetric(writer, "antfly_raft_quarantine_resume_successes_total", "counter", "Successful fenced resumes of quarantined Raft groups", raft_metrics.runtime_quarantine_resume_successes);
@@ -4817,6 +4826,10 @@ pub const DataServer = struct {
     /// cached because test/bootstrap snapshots can reuse zero for distinct
     /// desired states.
     last_data_raft_reconciled_metadata_epoch: ?u64 = null,
+    /// Epoch-owned local placement plan. Stable control rounds borrow these
+    /// slices directly instead of rebuilding topology indexes and duplicating
+    /// every voter/learner set. Guarded by data_raft_reconcile_mutex.
+    last_data_raft_local_intents: []antfly.raft.PlacementIntent = &.{},
     last_data_raft_storage_ownership_fingerprint: ?u64 = null,
     last_data_raft_status_fingerprint: ?u64 = null,
     /// Last successfully reconciled local ownership scope. The post-drop
@@ -7053,6 +7066,7 @@ pub const DataServer = struct {
         var group_table_name_it = self.last_data_raft_group_table_names.valueIterator();
         while (group_table_name_it.next()) |table_name| self.alloc.free(table_name.*);
         self.last_data_raft_group_table_names.deinit(self.alloc);
+        self.freeCachedDataRaftLocalIntents();
         var protocol_activation_it = self.data_raft_protocol_activations.valueIterator();
         while (protocol_activation_it.next()) |entry| entry.*.release(self.alloc);
         self.data_raft_protocol_activations.deinit(self.alloc);
@@ -11854,6 +11868,27 @@ pub const DataServer = struct {
         self.requestDataRaftMetadataSync();
     }
 
+    fn freeDataRaftLocalIntents(
+        self: *DataServer,
+        intents: []antfly.raft.PlacementIntent,
+    ) void {
+        for (intents) |intent| antfly.raft.reconciler.freeIntentOwned(self.alloc, intent);
+        if (intents.len > 0) self.alloc.free(intents);
+    }
+
+    fn freeCachedDataRaftLocalIntents(self: *DataServer) void {
+        self.freeDataRaftLocalIntents(self.last_data_raft_local_intents);
+        self.last_data_raft_local_intents = &.{};
+    }
+
+    fn replaceCachedDataRaftLocalIntents(
+        self: *DataServer,
+        replacement: []antfly.raft.PlacementIntent,
+    ) void {
+        self.freeCachedDataRaftLocalIntents();
+        self.last_data_raft_local_intents = replacement;
+    }
+
     fn syncDataRaftFromSnapshot(self: *DataServer, snapshot: *const antfly.metadata_api.AdminSnapshot) !void {
         self.observeReallocationRequest(snapshot.reallocation_request);
         const raft = self.data_raft orelse return;
@@ -11865,6 +11900,26 @@ pub const DataServer = struct {
 
         const metadata_epoch = snapshot.status.metadata_epoch;
 
+        if (metadata_epoch != 0 and self.last_data_raft_reconciled_metadata_epoch == metadata_epoch) {
+            // The epoch-owned plan is immutable. Stable rounds borrow it
+            // directly, avoiding topology-index construction and per-group
+            // voter/learner duplication while still advancing Raft state.
+            const local_intents = self.last_data_raft_local_intents;
+            {
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                _ = try raft.host.reconcileMembershipOnly(local_intents);
+            }
+            const status_fingerprint = self.maintainDataRaftLeadership(snapshot, local_intents, registration.node_id);
+            self.observeDataRaftStatusFingerprint(status_fingerprint);
+            if (self.data_raft_protocol_activation_cleanup_needed.load(.acquire)) {
+                const active_group_ids = try self.sortedDataRaftGroupIdsAlloc(local_intents);
+                defer self.alloc.free(active_group_ids);
+                self.retainDataRaftProtocolActivationGroups(active_group_ids);
+            }
+            return;
+        }
+
         var placement_topology = try PlacementTopologyIndex.initForSnapshot(
             self.alloc,
             snapshot.placement_intents,
@@ -11874,10 +11929,8 @@ pub const DataServer = struct {
 
         var local_intents = std.ArrayListUnmanaged(antfly.raft.PlacementIntent).empty;
         defer {
-            for (local_intents.items) |intent| {
-                if (intent.peer_node_ids.len > 0) self.alloc.free(intent.peer_node_ids);
-                if (intent.learner_node_ids.len > 0) self.alloc.free(intent.learner_node_ids);
-            }
+            for (local_intents.items) |intent|
+                antfly.raft.reconciler.freeIntentOwned(self.alloc, intent);
             local_intents.deinit(self.alloc);
         }
         for (snapshot.placement_intents) |intent| {
@@ -11891,33 +11944,20 @@ pub const DataServer = struct {
             const owned_learners = try self.alloc.dupe(u64, learner_node_ids);
             errdefer self.alloc.free(owned_learners);
             var local_intent = intent;
+            local_intent.record = try intent.record.clone(self.alloc);
+            errdefer local_intent.record.deinit(self.alloc);
             local_intent.peer_node_ids = owned_voters;
             local_intent.learner_node_ids = owned_learners;
             try local_intents.append(self.alloc, local_intent);
         }
-        if (metadata_epoch != 0 and self.last_data_raft_reconciled_metadata_epoch == metadata_epoch) {
-            // Raft leadership can change without a metadata epoch. Preserve
-            // leader maintenance and status publication while skipping
-            // restore, descriptor rebuild, peer replacement, and catalog
-            // fsync for identical topology.
-            {
-                lockAtomic(&self.data_raft_mutex);
-                defer self.data_raft_mutex.unlock();
-                _ = try raft.host.reconcileMembershipOnly(local_intents.items);
-            }
-            const status_fingerprint = self.maintainDataRaftLeadership(snapshot, local_intents.items, registration.node_id);
-            self.observeDataRaftStatusFingerprint(status_fingerprint);
-            // The common stable-topology path remains allocation-free. Retry
-            // exact activation cleanup only if its topology-change allocation
-            // previously failed under memory pressure.
-            if (self.data_raft_protocol_activation_cleanup_needed.load(.acquire)) {
-                const active_group_ids = try self.sortedDataRaftGroupIdsAlloc(local_intents.items);
-                defer self.alloc.free(active_group_ids);
-                self.retainDataRaftProtocolActivationGroups(active_group_ids);
-            }
-            return;
-        }
-        var next_group_table_names = try self.buildLocalDataRaftGroupTableNames(snapshot, local_intents.items);
+        // Transfer the one fully-owned plan into the epoch cache. Building a
+        // second deep clone here doubles peak memory on large topology
+        // changes and provides no additional isolation: the remainder of this
+        // round already treats the plan as immutable.
+        var next_cached_local_intents = try local_intents.toOwnedSlice(self.alloc);
+        var cache_transferred = false;
+        defer if (!cache_transferred) self.freeDataRaftLocalIntents(next_cached_local_intents);
+        var next_group_table_names = try self.buildLocalDataRaftGroupTableNames(snapshot, next_cached_local_intents);
         defer {
             var it = next_group_table_names.valueIterator();
             while (it.next()) |name| self.alloc.free(name.*);
@@ -11927,13 +11967,13 @@ pub const DataServer = struct {
         // Persist its table generation before the Raft host can admit messages
         // for that group: state-machine apply is deliberately unable to create
         // storage or consult metadata after an entry has committed.
-        try self.provisionSplitDestinationsBeforeRaftAdmission(snapshot, local_intents.items);
-        const storage_ownership_fingerprint = dataRaftStorageOwnershipFingerprint(local_intents.items);
+        try self.provisionSplitDestinationsBeforeRaftAdmission(snapshot, next_cached_local_intents);
+        const storage_ownership_fingerprint = dataRaftStorageOwnershipFingerprint(next_cached_local_intents);
         const storage_ownership_changed = self.last_data_raft_storage_ownership_fingerprint == null or
             self.last_data_raft_storage_ownership_fingerprint.? != storage_ownership_fingerprint;
         if (storage_ownership_changed) {
             self.last_data_raft_storage_ownership_fingerprint = storage_ownership_fingerprint;
-            try self.invalidateRuntimeStatusForLocalPlacements(snapshot, local_intents.items);
+            try self.invalidateRuntimeStatusForLocalPlacements(snapshot, next_cached_local_intents);
             self.invalidateLocalGroupStatusCache();
             self.markStoreStatusDirtyImmediate();
         }
@@ -11943,7 +11983,7 @@ pub const DataServer = struct {
             for (updates.items) |*update| update.deinit(self.alloc);
             updates.deinit(self.alloc);
         }
-        for (local_intents.items) |intent| {
+        for (next_cached_local_intents) |intent| {
             const transport_peers = placement_topology.peers(intent.record.group_id) orelse
                 return error.MissingPlacementPeerSet;
             for (snapshot.stores) |peer| {
@@ -11970,7 +12010,7 @@ pub const DataServer = struct {
             }
         }
 
-        const active_group_ids = try self.sortedDataRaftGroupIdsAlloc(local_intents.items);
+        const active_group_ids = try self.sortedDataRaftGroupIdsAlloc(next_cached_local_intents);
         defer self.alloc.free(active_group_ids);
 
         // Admit old-or-new before reconciliation because host reconciliation
@@ -11982,8 +12022,8 @@ pub const DataServer = struct {
         var reconcile = reconcile: {
             lockAtomic(&self.data_raft_mutex);
             defer self.data_raft_mutex.unlock();
-            try factory.replacePeerSets(local_intents.items, &placement_topology);
-            try raft.host.replacePlacementIntents(local_intents.items);
+            try factory.replacePeerSets(next_cached_local_intents, &placement_topology);
+            try raft.host.replacePlacementIntents(next_cached_local_intents);
             var prepared = try raft.host.prepareReconcile();
             prepared.beginPreparation();
             break :reconcile prepared;
@@ -12074,8 +12114,11 @@ pub const DataServer = struct {
             };
         }
         self.retainDataRaftProtocolActivationGroups(active_group_ids);
-        const status_fingerprint = self.maintainDataRaftLeadership(snapshot, local_intents.items, registration.node_id);
+        const status_fingerprint = self.maintainDataRaftLeadership(snapshot, next_cached_local_intents, registration.node_id);
         self.observeDataRaftStatusFingerprint(status_fingerprint);
+        self.replaceCachedDataRaftLocalIntents(next_cached_local_intents);
+        cache_transferred = true;
+        next_cached_local_intents = &.{};
         if (metadata_epoch != 0) self.last_data_raft_reconciled_metadata_epoch = metadata_epoch;
         self.replaceLocalDataRaftGroupTableNames(&next_group_table_names);
     }
@@ -20546,6 +20589,8 @@ test "data raft ticker advances consensus independently of control rounds" {
     };
     try server.syncDataRaftFromSnapshot(&snapshot);
     try std.testing.expectEqual(@as(?u64, 17), server.last_data_raft_reconciled_metadata_epoch);
+    try std.testing.expectEqual(@as(usize, 1), server.last_data_raft_local_intents.len);
+    const cached_intents_ptr = server.last_data_raft_local_intents.ptr;
 
     // Simulate leadership loss after durable topology convergence. An
     // unchanged metadata epoch must still run the lightweight campaign phase.
@@ -20558,6 +20603,7 @@ test "data raft ticker advances consensus independently of control rounds" {
     try std.testing.expect(!server.localDataRaftLeaderReady(77));
     try server.syncDataRaftFromSnapshot(&snapshot);
     try std.testing.expect(server.localDataRaftLeaderReady(77));
+    try std.testing.expectEqual(cached_intents_ptr, server.last_data_raft_local_intents.ptr);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();

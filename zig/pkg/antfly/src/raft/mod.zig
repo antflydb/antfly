@@ -127,6 +127,7 @@ pub const Reconciler = reconciler.Reconciler;
 pub const ReconcileResult = reconciler.ReconcileResult;
 pub const DesiredMembership = reconciler.DesiredMembership;
 pub const MembershipConvergence = reconciler.MembershipConvergence;
+pub const RouteConvergence = reconciler.RouteConvergence;
 pub const MetadataUpdate = metadata_view.MetadataUpdate;
 pub const MetadataView = metadata_view.MetadataView;
 pub const PlacementIntent = reconciler.PlacementIntent;
@@ -230,6 +231,7 @@ test "raft integration module compiles" {
     _ = ReconcileResult;
     _ = DesiredMembership;
     _ = MembershipConvergence;
+    _ = RouteConvergence;
     _ = MetadataUpdate;
     _ = MetadataView;
     _ = PlacementIntent;

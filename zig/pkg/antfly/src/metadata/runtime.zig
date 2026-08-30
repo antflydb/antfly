@@ -252,6 +252,15 @@ pub const HealthSource = struct {
 
         try append(writer, "antfly_raft_hosted_groups", "gauge", "Number of raft groups hosted on this node", @intCast(host_metrics.hosted_groups));
         try append(writer, "antfly_raft_quarantined_groups", "gauge", "Number of raft groups stopped by a hard Ready safety invariant and awaiting explicit recovery", @intCast(host_metrics.quarantined_groups));
+        try append(writer, "antfly_raft_replica_admission_conflicts_active", "gauge", "Replicas whose desired restart-scoped policy differs from the live runtime", host_metrics.replica_admission_conflicts_active);
+        try append(writer, "antfly_raft_replica_admission_conflicts_total", "counter", "Distinct replica admission conflicts observed", host_metrics.replica_admission_conflicts);
+        try append(writer, "antfly_raft_membership_converged_groups", "gauge", "Local replica intents whose observed Raft membership is converged", host_metrics.membership_converged);
+        try append(writer, "antfly_raft_membership_waiting_for_replica_groups", "gauge", "Local replica intents awaiting runtime admission", host_metrics.membership_waiting_for_replica);
+        try append(writer, "antfly_raft_membership_waiting_for_leader_groups", "gauge", "Local replica intents awaiting a Raft leader for membership convergence", host_metrics.membership_waiting_for_leader);
+        try append(writer, "antfly_raft_membership_waiting_for_local_voter_groups", "gauge", "Local replica intents whose local node cannot yet propose membership", host_metrics.membership_waiting_for_local_voter);
+        try append(writer, "antfly_raft_membership_waiting_for_pending_change_groups", "gauge", "Local replica intents awaiting an in-flight configuration change", host_metrics.membership_waiting_for_pending_change);
+        try append(writer, "antfly_raft_membership_waiting_for_policy_groups", "gauge", "Local replica intents fenced by membership policy", host_metrics.membership_waiting_for_policy);
+        try append(writer, "antfly_raft_route_retrying_groups", "gauge", "Local Raft groups retrying peer endpoint convergence", host_metrics.route_retrying_groups);
         try append(writer, "antfly_raft_quarantined_inbound_messages_dropped_total", "counter", "Inbound Raft messages isolated to quarantined groups", host_metrics.quarantined_inbound_message_drops);
         try append(writer, "antfly_raft_quarantine_resume_attempts_total", "counter", "Fenced operator attempts to resume quarantined Raft groups", host_metrics.runtime_quarantine_resume_attempts);
         try append(writer, "antfly_raft_quarantine_resume_successes_total", "counter", "Successful fenced resumes of quarantined Raft groups", host_metrics.runtime_quarantine_resume_successes);

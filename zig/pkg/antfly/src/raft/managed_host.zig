@@ -258,6 +258,17 @@ pub const ManagedHost = struct {
         return self.reconciler_loop.membershipStatus(group_id);
     }
 
+    pub fn routeStatus(self: *const ManagedHost, group_id: u64) ?reconciler.RouteConvergence {
+        return self.reconciler_loop.routeStatus(group_id);
+    }
+
+    pub fn replicaAdmissionConflict(
+        self: *ManagedHost,
+        group_id: u64,
+    ) ?raft_engine.runtime.group.ReplicaAdmissionConflict {
+        return self.host.replicaAdmissionConflict(group_id);
+    }
+
     pub fn replacePlacementIntents(self: *ManagedHost, intents: []const reconciler.PlacementIntent) !void {
         try self.view.replaceReplicaIntents(intents);
     }
@@ -550,6 +561,17 @@ pub const ManagedHttpHost = struct {
 
     pub fn membershipStatus(self: *const ManagedHttpHost, group_id: u64) ?reconciler.MembershipConvergence {
         return self.reconciler_loop.membershipStatus(group_id);
+    }
+
+    pub fn routeStatus(self: *const ManagedHttpHost, group_id: u64) ?reconciler.RouteConvergence {
+        return self.reconciler_loop.routeStatus(group_id);
+    }
+
+    pub fn replicaAdmissionConflict(
+        self: *ManagedHttpHost,
+        group_id: u64,
+    ) ?raft_engine.runtime.group.ReplicaAdmissionConflict {
+        return self.http_host.host.replicaAdmissionConflict(group_id);
     }
 
     pub fn replacePlacementIntents(self: *ManagedHttpHost, intents: []const reconciler.PlacementIntent) !void {

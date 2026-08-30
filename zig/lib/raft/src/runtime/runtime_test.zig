@@ -2925,9 +2925,9 @@ test "multi raft validates catalog admission before durability and fences config
     const conflict = host.replicaAdmissionConflict(policy_conflict_descriptor) orelse
         return error.ExpectedReplicaAdmissionConflict;
     switch (conflict) {
-        .runtime_policy => |field| try std.testing.expectEqual(
+        .runtime_policy => |policy_conflict| try std.testing.expectEqual(
             runtime.group.ReplicaRuntimePolicyField.election_tick,
-            field,
+            policy_conflict.field,
         ),
         .local_node_id => return error.UnexpectedReplicaIdentityConflict,
     }
