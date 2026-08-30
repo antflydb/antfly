@@ -37,36 +37,33 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates file gdb strace
 
-      - name: Install Zig
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-26.05
+
+      - name: Install glibc-linked Zig
         run: |
-          curl --fail --location --retry 3 \
-            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
-            -o "$RUNNER_TEMP/zig.tar.xz"
-          mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
-          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+          zig_path="$(nix-build '<nixpkgs>' -A zig_0_16 --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
+          echo "ZIG_EXE=$zig_path/bin/zig" >> "$GITHUB_ENV"
 
       - name: Inspect compiler binary
         run: |
-          file "$RUNNER_TEMP/zig/zig" | tee "$RUNNER_TEMP/zig-file.txt"
-          ldd "$RUNNER_TEMP/zig/zig" 2>&1 | tee "$RUNNER_TEMP/zig-ldd.txt" || true
-          nm -C "$RUNNER_TEMP/zig/zig" 2>/dev/null \
+          file "$ZIG_EXE" | tee "$RUNNER_TEMP/zig-file.txt"
+          ldd "$ZIG_EXE" 2>&1 | tee "$RUNNER_TEMP/zig-ldd.txt" || true
+          nm -C "$ZIG_EXE" 2>/dev/null \
             | grep -E 'llvm::(allocate_buffer|report_bad_alloc_error)' \
             | tee "$RUNNER_TEMP/zig-allocation-symbols.txt" || true
 
-      - name: Raise the per-process VMA ceiling
-        run: |
-          echo "original=$(cat /proc/sys/vm/max_map_count)"
-          sudo sysctl -w vm.max_map_count=4194304
-          test "$(cat /proc/sys/vm/max_map_count)" -ge 4194304
-
-      - name: Run ReleaseFast storage-kernel confirmation probe
+      - name: Run glibc ReleaseFast storage-kernel probe
         env:
           STORAGE_KERNEL_REPORT_ROOT: ${{ runner.temp }}/storage-kernel-reports
         run: |
           mkdir -p "$STORAGE_KERNEL_REPORT_ROOT"
           scripts/ci/diagnose-storage-kernel-codegen.sh \
-            release-fast-raised-map-count ReleaseFast true
+            release-fast-nix-glibc ReleaseFast true
 
       - name: Summarize probe results
         if: ${{ always() }}
