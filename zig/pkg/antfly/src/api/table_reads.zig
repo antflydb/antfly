@@ -25858,13 +25858,20 @@ test "hosted cross-range graph query expands explicit local start keys" {
     const graph_indexes_json =
         \\{"relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}]}}
     ;
+    const graph_config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}";
+    const graph_coverage_generation = internal_keys.derivedCoverageGeneration(graph_config_json);
 
     {
         var left_db = try db_mod.DB.open(alloc, left_path, .{
             .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
         });
         defer left_db.close();
-        try left_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
+        try left_db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json = graph_config_json,
+            .coverage_generation = graph_coverage_generation,
+        });
         try left_db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"left\"}" }},
             .graph_writes = &.{.{
@@ -25882,7 +25889,12 @@ test "hosted cross-range graph query expands explicit local start keys" {
             .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 },
         });
         defer right_db.close();
-        try right_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
+        try right_db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json = graph_config_json,
+            .coverage_generation = graph_coverage_generation,
+        });
         try right_db.batch(.{
             .writes = &.{.{ .key = "zdoc:a", .value = "{\"title\":\"right\"}" }},
             .graph_writes = &.{.{
