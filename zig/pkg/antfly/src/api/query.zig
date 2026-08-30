@@ -25,6 +25,7 @@ const graph_query_mod = @import("../graph/query.zig");
 const graph_node_identity = @import("../graph/node_identity.zig");
 const graph_work_budget = @import("../graph/work_budget.zig");
 const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
+const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
 const public_limits = @import("public_limits.zig");
 const query_contract = @import("query_contract.zig");
 
@@ -140,7 +141,7 @@ fn mergeGenericSearchResultsWithRuntimeSchema(
         }
 
         const graph_results = if (req.graph_queries.len > 0)
-            try mergeGraphSearchResults(alloc, req.graph_queries, results)
+            try mergeGraphSearchResultsWithLimits(alloc, req.graph_queries, results, req.graph_execution_limits)
         else
             @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]);
         errdefer {
@@ -223,7 +224,7 @@ fn mergeGenericSearchResultsWithRuntimeSchema(
     }
 
     const graph_results = if (req.graph_queries.len > 0)
-        try mergeGraphSearchResults(alloc, req.graph_queries, results)
+        try mergeGraphSearchResultsWithLimits(alloc, req.graph_queries, results, req.graph_execution_limits)
     else
         @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]);
     errdefer {
@@ -410,7 +411,7 @@ fn mergeHierarchyUnitSearchResults(
     merged.identity_read_generation = identity_generation;
 
     if (req.graph_queries.len > 0) {
-        const graph_results = try mergeGraphSearchResults(alloc, req.graph_queries, results);
+        const graph_results = try mergeGraphSearchResultsWithLimits(alloc, req.graph_queries, results, req.graph_execution_limits);
         errdefer {
             for (graph_results) |*graph_result| graph_result.deinit(alloc);
             if (graph_results.len > 0) alloc.free(graph_results);
@@ -941,7 +942,7 @@ const GraphAggregateResultBuilder = struct {
             usize,
             self.distinct_values.items.len,
             @sizeOf(graph_node_identity.Ref),
-        ) catch return error.GraphDistinctBudgetExceeded;
+        ) catch return self.distinct_budget.exhaust(.distinct_state_bytes);
         try self.distinct_budget.consumeRetainedBytes(output_bytes);
         const values = try self.distinct_values.toOwnedSlice(alloc);
         self.distinct_seen.deinit(alloc);
@@ -1252,13 +1253,20 @@ fn mergeGraphSearchResults(
     queries: []const db_mod.types.NamedGraphQuery,
     results: []const db_mod.types.SearchResult,
 ) ![]db_mod.types.GraphSearchResult {
-    var merge_work_budget = graph_work_budget.WorkBudget.init(
-        graph_pattern.default_max_explored_nodes,
-        graph_pattern.default_max_explored_edges,
-    );
+    return mergeGraphSearchResultsWithLimits(alloc, queries, results, .{});
+}
+
+fn mergeGraphSearchResultsWithLimits(
+    alloc: std.mem.Allocator,
+    queries: []const db_mod.types.NamedGraphQuery,
+    results: []const db_mod.types.SearchResult,
+    limits: graph_work_budget.Limits,
+) ![]db_mod.types.GraphSearchResult {
+    try limits.validate();
+    var merge_work_budget = graph_work_budget.WorkBudget.initWithLimits(limits);
     var distinct_budget = graph_pattern.DistinctBudget.init(
-        graph_pattern.default_max_distinct_identities,
-        graph_pattern.default_max_distinct_state_bytes,
+        limits.max_distinct_identities,
+        limits.max_distinct_state_bytes,
     );
     var builders = std.ArrayListUnmanaged(GraphSearchResultBuilder).empty;
     defer {
@@ -1377,7 +1385,12 @@ fn mergeGraphSearchResults(
                     if (existing.distinct != distinct) return error.InvalidRemoteResponse;
                     existing.exact = existing.exact and aggregate.exact;
                     if (distinct) {
-                        try existing.appendDistinctValues(alloc, aggregate);
+                        existing.appendDistinctValues(alloc, aggregate) catch |err| {
+                            if (err == error.GraphDistinctBudgetExceeded) {
+                                graph_distinct_budget_diagnostic.recordBudget(graph_result.name, &distinct_budget);
+                            }
+                            return err;
+                        };
                     } else {
                         existing.value = std.math.add(u128, existing.value, aggregate.value) catch return error.Overflow;
                     }
@@ -1410,7 +1423,12 @@ fn mergeGraphSearchResults(
                     };
                     var owned_active = true;
                     errdefer if (owned_active) owned.deinit(alloc);
-                    if (distinct) try owned.appendDistinctValues(alloc, aggregate);
+                    if (distinct) owned.appendDistinctValues(alloc, aggregate) catch |err| {
+                        if (err == error.GraphDistinctBudgetExceeded) {
+                            graph_distinct_budget_diagnostic.recordBudget(graph_result.name, &distinct_budget);
+                        }
+                        return err;
+                    };
                     builder.aggregates.appendAssumeCapacity(owned);
                     owned_active = false;
                 }
@@ -1458,7 +1476,12 @@ fn mergeGraphSearchResults(
     for (builders.items, 0..) |*builder, i| {
         const query = graphQueryByName(queries, builder.name) orelse
             return error.InvalidRemoteResponse;
-        merged[i] = try builder.toOwned(alloc, &merge_work_budget, query);
+        merged[i] = builder.toOwned(alloc, &merge_work_budget, query) catch |err| {
+            if (err == error.GraphDistinctBudgetExceeded) {
+                graph_distinct_budget_diagnostic.recordBudget(builder.name, &distinct_budget);
+            }
+            return err;
+        };
         initialized += 1;
     }
     return merged;
@@ -3838,6 +3861,61 @@ test "graph coordinator distinct merge shares one fail-closed request budget" {
         }),
     );
     try std.testing.expectEqual(@as(usize, 1), builder.distinct_values.items.len);
+}
+
+test "graph coordinator distinct merge honors configured limits and records the exhausted dimension" {
+    const alloc = std.testing.allocator;
+    const values = [_]graph_node_identity.Ref{
+        .{ .table = "people", .key = "one" },
+        .{ .table = "people", .key = "two" },
+    };
+    var aggregates = [_]db_mod.types.GraphAggregateResult{.{
+        .name = @constCast("unique"),
+        .value = values.len,
+        .exact = true,
+        .distinct_values = @constCast(values[0..]),
+    }};
+    var graph_results = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("people"),
+        .aggregates = &aggregates,
+        .hits = &.{},
+    }};
+    const shard_results = [_]db_mod.types.SearchResult{.{
+        .alloc = alloc,
+        .hits = &.{},
+        .graph_results = &graph_results,
+    }};
+    const aggregate_specs = [_]graph_query_mod.NamedCountAggregate{.{
+        .name = "unique",
+        .of = "person",
+        .distinct = true,
+    }};
+    const queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "people",
+        .query = .{
+            .query_type = .pattern,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{} },
+            .aggregates = &aggregate_specs,
+        },
+    }};
+
+    graph_distinct_budget_diagnostic.reset();
+    defer graph_distinct_budget_diagnostic.reset();
+    try std.testing.expectError(
+        error.GraphDistinctBudgetExceeded,
+        mergeGraphSearchResultsWithLimits(alloc, &queries, &shard_results, .{
+            .max_distinct_identities = 1,
+            .max_distinct_state_bytes = 4096,
+        }),
+    );
+    const diagnostic = graph_distinct_budget_diagnostic.take().?;
+    try std.testing.expectEqualStrings("people", diagnostic.operation);
+    try std.testing.expectEqual(
+        graph_pattern.DistinctBudget.Dimension.distinct_identities,
+        diagnostic.dimension,
+    );
+    try std.testing.expectEqual(@as(usize, 1), diagnostic.maximum);
 }
 
 test "graph coordinator admits list capacity and ownership transfer before allocation" {

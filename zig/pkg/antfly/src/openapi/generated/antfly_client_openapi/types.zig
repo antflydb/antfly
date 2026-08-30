@@ -12905,7 +12905,7 @@ pub const GraphAlgebraicPlanningConfig = struct {
 pub const GraphAliasCountAggregate = struct {
     /// Count bindings in which this alias is non-null. An unmatched optional alias does not increment the count.
     count: GraphIdentifier,
-    /// Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
+    /// Count exact table-qualified identities. Exact distinct sets share a request resource budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
     distinct: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
@@ -13325,10 +13325,14 @@ pub const GraphDistinctBudgetExceededError = struct {
     @"error": []const u8,
     message: []const u8,
     retryable: bool,
-    /// Maximum distinct table-qualified identities retained by one request.
-    max_distinct_identities: i64,
-    /// Maximum distinct aggregation working-set bytes admitted for one request, including identity payloads, containers, and output state.
-    max_distinct_state_bytes: i64,
+    /// Named graph operation whose exact distinct aggregation exhausted the request budget.
+    operation: []const u8,
+    /// Distinct aggregation resource exhausted by the operation.
+    dimension: []const u8,
+    /// Configured request ceiling for the exhausted resource.
+    maximum: i64,
+    /// Stable user-facing guidance for reducing exact distinct state.
+    remediation: []const u8,
 };
 
 pub const GraphDocumentBoolFieldBody = struct {
@@ -25361,10 +25365,10 @@ pub const QueryUnprocessableError = union(enum) {
     unsupported_hierarchy_grouping_error: *UnsupportedHierarchyGroupingError,
     graph_work_budget_exceeded_error: *GraphWorkBudgetExceededError,
     exact_sort_error: *ExactSortError,
+    graph_distinct_budget_exceeded_error: *GraphDistinctBudgetExceededError,
     graph_path_weight_domain_error: *GraphPathWeightDomainError,
     query_candidate_budget_exceeded_error: *QueryCandidateBudgetExceededError,
     graph_query_unsupported_error: *GraphQueryUnsupportedError,
-    graph_distinct_budget_exceeded_error: *GraphDistinctBudgetExceededError,
     graph_match_operation_limit_exceeded_error: *GraphMatchOperationLimitExceededError,
     graph_anchor_filter_requires_index_error: *GraphAnchorFilterRequiresIndexError,
     unsupported_query_error: *UnsupportedQueryError,
@@ -25448,6 +25452,20 @@ pub const QueryUnprocessableError = union(enum) {
             "message",
             "retryable",
             "operation",
+            "dimension",
+            "maximum",
+            "remediation",
+        }) and
+            objectStringEquals(source.object, "error", "graph_distinct_budget_exceeded"))
+        {
+            if (try parseStructuralVariant(GraphDistinctBudgetExceededError, allocator, source, options)) |parsed| return .{ .graph_distinct_budget_exceeded_error = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
+            "retryable",
+            "operation",
             "mode",
             "allowed_range",
             "remediation",
@@ -25482,18 +25500,6 @@ pub const QueryUnprocessableError = union(enum) {
             objectStringEquals(source.object, "error", "graph_query_unsupported"))
         {
             if (try parseStructuralVariant(GraphQueryUnsupportedError, allocator, source, options)) |parsed| return .{ .graph_query_unsupported_error = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "status",
-            "error",
-            "message",
-            "retryable",
-            "max_distinct_identities",
-            "max_distinct_state_bytes",
-        }) and
-            objectStringEquals(source.object, "error", "graph_distinct_budget_exceeded"))
-        {
-            if (try parseStructuralVariant(GraphDistinctBudgetExceededError, allocator, source, options)) |parsed| return .{ .graph_distinct_budget_exceeded_error = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "status",
@@ -25544,10 +25550,10 @@ pub const QueryUnprocessableError = union(enum) {
             .unsupported_hierarchy_grouping_error => |v| try jw.write(v.*),
             .graph_work_budget_exceeded_error => |v| try jw.write(v.*),
             .exact_sort_error => |v| try jw.write(v.*),
+            .graph_distinct_budget_exceeded_error => |v| try jw.write(v.*),
             .graph_path_weight_domain_error => |v| try jw.write(v.*),
             .query_candidate_budget_exceeded_error => |v| try jw.write(v.*),
             .graph_query_unsupported_error => |v| try jw.write(v.*),
-            .graph_distinct_budget_exceeded_error => |v| try jw.write(v.*),
             .graph_match_operation_limit_exceeded_error => |v| try jw.write(v.*),
             .graph_anchor_filter_requires_index_error => |v| try jw.write(v.*),
             .unsupported_query_error => |v| try jw.write(v.*),

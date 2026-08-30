@@ -3080,16 +3080,20 @@ export interface components {
             message: string;
             /** @enum {boolean} */
             retryable: false;
+            /** @description Named graph operation whose exact distinct aggregation exhausted the request budget. */
+            operation: string;
+            /**
+             * @description Distinct aggregation resource exhausted by the operation.
+             * @enum {string}
+             */
+            dimension: "distinct_identities" | "distinct_state_bytes";
             /**
              * Format: uint64
-             * @description Maximum distinct table-qualified identities retained by one request.
+             * @description Configured request ceiling for the exhausted resource.
              */
-            max_distinct_identities: number;
-            /**
-             * Format: uint64
-             * @description Maximum distinct aggregation working-set bytes admitted for one request, including identity payloads, containers, and output state.
-             */
-            max_distinct_state_bytes: number;
+            maximum: number;
+            /** @description Stable user-facing guidance for reducing exact distinct state. */
+            remediation: string;
         };
         GraphWorkBudgetExceededError: {
             /**
@@ -12497,7 +12501,7 @@ export interface components {
             /** @description Count bindings in which this alias is non-null. An unmatched optional alias does not increment the count. */
             count: components["schemas"]["GraphIdentifier"];
             /**
-             * @description Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
+             * @description Count exact table-qualified identities. Exact distinct sets share a request resource budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
              * @default false
              */
             distinct?: boolean;

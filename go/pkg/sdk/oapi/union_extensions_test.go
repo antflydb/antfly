@@ -192,3 +192,34 @@ func TestGraphRequestUnionExtensionsSelectStrictArms(t *testing.T) {
 		}
 	})
 }
+
+func TestQueryUnprocessableErrorSelectsStrictGraphArm(t *testing.T) {
+	var union QueryUnprocessableError
+	if err := json.Unmarshal([]byte(`{"status":422,"error":"graph_work_budget_exceeded","message":"budget exhausted","retryable":false,"operation":"friends","mode":"match","dimension":"explored_edges","maximum":2048,"remediation":"narrow the anchor"}`), &union); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := union.DecodeStrictGraphError()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Kind != GraphQueryErrorVariantWorkBudgetExceeded || decoded.WorkBudgetExceeded == nil {
+		t.Fatalf("decoded graph error = %#v", decoded)
+	}
+	if decoded.WorkBudgetExceeded.Operation != "friends" || decoded.WorkBudgetExceeded.Maximum != 2048 {
+		t.Fatalf("work budget error = %#v", decoded.WorkBudgetExceeded)
+	}
+
+	if err := json.Unmarshal([]byte(`{"status":422,"error":"graph_work_budget_exceeded","message":"budget exhausted","retryable":false,"operation":"friends","mode":"match","dimension":"explored_edges","maximum":2048,"remediation":"narrow the anchor","unexpected":true}`), &union); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := union.DecodeStrictGraphError(); err == nil {
+		t.Fatal("expected unknown graph error field to be rejected")
+	}
+
+	if err := json.Unmarshal([]byte(`{"status":422,"error":"query_candidate_budget_exceeded","message":"budget exhausted"}`), &union); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := union.DecodeStrictGraphError(); err == nil {
+		t.Fatal("expected non-graph error discriminator to be rejected")
+	}
+}

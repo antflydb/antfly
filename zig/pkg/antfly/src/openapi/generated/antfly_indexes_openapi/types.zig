@@ -3925,7 +3925,7 @@ pub const GraphAlgebraicPlanningConfig = struct {
 pub const GraphAliasCountAggregate = struct {
     /// Count bindings in which this alias is non-null. An unmatched optional alias does not increment the count.
     count: antfly_graph_identifier_openapi.GraphIdentifier,
-    /// Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
+    /// Count exact table-qualified identities. Exact distinct sets share a request resource budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
     distinct: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.

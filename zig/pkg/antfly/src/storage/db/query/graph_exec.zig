@@ -18,6 +18,7 @@ const types = @import("../types.zig");
 const graph_query_mod = @import("../../../graph/query.zig");
 const graph_pattern_mod = @import("../../../graph/pattern.zig");
 const graph_node_identity = @import("../../../graph/node_identity.zig");
+const graph_distinct_budget_diagnostic = @import("../../../graph/distinct_budget_diagnostic.zig");
 const graph_work_budget_diagnostic = @import("../../../graph/work_budget_diagnostic.zig");
 const graph_path_weight_diagnostic = @import("../../../graph/path_weight_diagnostic.zig");
 const paths_mod = @import("../../../graph/paths.zig");
@@ -468,6 +469,12 @@ pub fn executeGraphQueriesWithSets(
                         exhaustion,
                     );
                 }
+            }
+            if (err == error.GraphDistinctBudgetExceeded) {
+                graph_distinct_budget_diagnostic.recordBudget(
+                    graph_queries[query_index].name,
+                    &request_distinct_budget,
+                );
             }
             return err;
         };

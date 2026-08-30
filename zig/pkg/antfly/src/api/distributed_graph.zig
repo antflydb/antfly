@@ -30,6 +30,7 @@ const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths_mod = @import("../graph/paths.zig");
 const graph_traversal_mod = @import("../graph/traversal.zig");
 const graph_work_budget = @import("../graph/work_budget.zig");
+const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
 const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
 const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
@@ -2045,6 +2046,9 @@ fn executeCrossRangeOnce(
                 if (request_work_budget.exhaustion()) |exhaustion| {
                     graph_work_budget_diagnostic.record(graph_query.name, graph_query.query, exhaustion);
                 }
+            }
+            if (err == error.GraphDistinctBudgetExceeded) {
+                graph_distinct_budget_diagnostic.recordBudget(graph_query.name, &request_distinct_budget);
             }
             if (graph_query_diagnostic.reasonForError(err)) |reason| {
                 graph_query_diagnostic.record(

@@ -18,7 +18,7 @@ class GraphAliasCountAggregate:
             Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The
             value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode
             White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes.
-        distinct (bool | Unset): Count exact table-qualified identities. Exact distinct sets share a request memory
+        distinct (bool | Unset): Count exact table-qualified identities. Exact distinct sets share a request resource
             budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count. Default: False.
     """
 

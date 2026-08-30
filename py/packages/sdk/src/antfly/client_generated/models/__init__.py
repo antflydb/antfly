@@ -341,6 +341,7 @@ from .graph_bindings_return import GraphBindingsReturn
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
 from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
 from .graph_distinct_budget_exceeded_error import GraphDistinctBudgetExceededError
+from .graph_distinct_budget_exceeded_error_dimension import GraphDistinctBudgetExceededErrorDimension
 from .graph_distinct_budget_exceeded_error_error import GraphDistinctBudgetExceededErrorError
 from .graph_distinct_budget_exceeded_error_status import GraphDistinctBudgetExceededErrorStatus
 from .graph_document_bool_field_body import GraphDocumentBoolFieldBody
@@ -1313,6 +1314,7 @@ __all__ = (
     "GraphBoundedTraversalConfig",
     "GraphBoundedTraversalConfigLaw",
     "GraphDistinctBudgetExceededError",
+    "GraphDistinctBudgetExceededErrorDimension",
     "GraphDistinctBudgetExceededErrorError",
     "GraphDistinctBudgetExceededErrorStatus",
     "GraphDocumentBoolFieldBody",

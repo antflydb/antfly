@@ -373,11 +373,26 @@ test "graph identifiers match the versioned wire-policy conformance cases" {
 }
 
 pub const DistinctBudget = struct {
+    pub const Dimension = enum {
+        distinct_identities,
+        distinct_state_bytes,
+    };
+
+    pub const Exhaustion = struct {
+        dimension: Dimension,
+        maximum: usize,
+    };
+
+    max_identities: usize,
+    max_state_bytes: usize,
     remaining_identities: usize,
     remaining_state_bytes: usize,
+    last_exhaustion: ?Exhaustion = null,
 
     pub fn init(max_identities: usize, max_state_bytes: usize) DistinctBudget {
         return .{
+            .max_identities = max_identities,
+            .max_state_bytes = max_state_bytes,
             .remaining_identities = max_identities,
             .remaining_state_bytes = max_state_bytes,
         };
@@ -388,9 +403,11 @@ pub const DistinctBudget = struct {
             usize,
             if (ref.table) |table| table.len else 0,
             ref.key.len,
-        ) catch return error.GraphDistinctBudgetExceeded;
-        if (self.remaining_identities == 0 or identity_bytes > self.remaining_state_bytes)
-            return error.GraphDistinctBudgetExceeded;
+        ) catch return self.exhaust(.distinct_state_bytes);
+        if (self.remaining_identities == 0)
+            return self.exhaust(.distinct_identities);
+        if (identity_bytes > self.remaining_state_bytes)
+            return self.exhaust(.distinct_state_bytes);
         self.remaining_identities -= 1;
         self.remaining_state_bytes -= identity_bytes;
     }
@@ -401,8 +418,23 @@ pub const DistinctBudget = struct {
     /// admission by repeatedly growing and releasing distinct sets.
     pub fn consumeRetainedBytes(self: *DistinctBudget, bytes: usize) !void {
         if (bytes > self.remaining_state_bytes)
-            return error.GraphDistinctBudgetExceeded;
+            return self.exhaust(.distinct_state_bytes);
         self.remaining_state_bytes -= bytes;
+    }
+
+    pub fn exhaust(self: *DistinctBudget, dimension: Dimension) error{GraphDistinctBudgetExceeded} {
+        self.last_exhaustion = .{
+            .dimension = dimension,
+            .maximum = switch (dimension) {
+                .distinct_identities => self.max_identities,
+                .distinct_state_bytes => self.max_state_bytes,
+            },
+        };
+        return error.GraphDistinctBudgetExceeded;
+    }
+
+    pub fn exhaustion(self: DistinctBudget) ?Exhaustion {
+        return self.last_exhaustion;
     }
 };
 
@@ -416,18 +448,18 @@ pub fn ensureBorrowedDistinctMapCapacity(
     const target_capacity = work_budget_mod.hashMapCapacityForCount(
         count,
         std.hash_map.default_max_load_percentage,
-    ) catch return error.GraphDistinctBudgetExceeded;
+    ) catch return budget.exhaust(.distinct_state_bytes);
     if (target_capacity <= map.capacity()) return;
     const current_bytes = work_budget_mod.hashMapRetainedBytes(
         node_identity.Ref,
         Value,
         map.capacity(),
-    ) catch return error.GraphDistinctBudgetExceeded;
+    ) catch return budget.exhaust(.distinct_state_bytes);
     const target_bytes = work_budget_mod.hashMapRetainedBytes(
         node_identity.Ref,
         Value,
         target_capacity,
-    ) catch return error.GraphDistinctBudgetExceeded;
+    ) catch return budget.exhaust(.distinct_state_bytes);
     try budget.consumeRetainedBytes(target_bytes - current_bytes);
     try map.ensureTotalCapacity(alloc, count);
 }
@@ -440,14 +472,14 @@ pub fn ensureDistinctValueCapacity(
 ) !void {
     if (count <= values.capacity) return;
     const doubled = std.math.mul(usize, values.capacity, 2) catch
-        return error.GraphDistinctBudgetExceeded;
+        return budget.exhaust(.distinct_state_bytes);
     const target_capacity = @max(count, @max(@as(usize, 8), doubled));
     const added_capacity = target_capacity - values.capacity;
     const added_bytes = std.math.mul(
         usize,
         added_capacity,
         @sizeOf(node_identity.Ref),
-    ) catch return error.GraphDistinctBudgetExceeded;
+    ) catch return budget.exhaust(.distinct_state_bytes);
     try budget.consumeRetainedBytes(added_bytes);
     try values.ensureTotalCapacityPrecise(alloc, target_capacity);
 }
@@ -2193,7 +2225,7 @@ const StreamingCountAccumulator = struct {
             usize,
             self.distinct_values.items.len,
             @sizeOf(node_identity.Ref),
-        ) catch return error.GraphDistinctBudgetExceeded;
+        ) catch return self.distinct_budget.exhaust(.distinct_state_bytes);
         try self.distinct_budget.consumeRetainedBytes(output_bytes);
         const values = try self.distinct_values.toOwnedSlice(alloc);
         self.distinct_values = .empty;
@@ -4350,6 +4382,9 @@ test "exact distinct aggregates share a fail-closed identity and byte budget" {
             .{ .distinct_budget = &identity_budget },
         ),
     );
+    const identity_exhaustion = identity_budget.exhaustion().?;
+    try std.testing.expectEqual(DistinctBudget.Dimension.distinct_identities, identity_exhaustion.dimension);
+    try std.testing.expectEqual(@as(usize, 1), identity_exhaustion.maximum);
 
     // Repeated identities are retained once per distinct set, but separate
     // aggregate specs share the request budget because each owns a set.
@@ -4383,6 +4418,9 @@ test "exact distinct aggregates share a fail-closed identity and byte budget" {
             .{ .distinct_budget = &byte_budget },
         ),
     );
+    const byte_exhaustion = byte_budget.exhaustion().?;
+    try std.testing.expectEqual(DistinctBudget.Dimension.distinct_state_bytes, byte_exhaustion.dimension);
+    try std.testing.expectEqual(@as(usize, 3), byte_exhaustion.maximum);
 }
 
 test "conjunctive anchor selection prefers filters and ignores declaration order" {

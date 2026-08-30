@@ -21,6 +21,7 @@ const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_query_mod = @import("../graph/query.zig");
+const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
 const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
 const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
@@ -871,13 +872,17 @@ pub fn graphPathWeightDomainErrorBody(alloc: std.mem.Allocator) ![]u8 {
 }
 
 pub fn graphDistinctBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
+    const diagnostic = graph_distinct_budget_diagnostic.take() orelse
+        return error.MissingGraphDistinctBudgetDiagnostic;
     return try std.json.Stringify.valueAlloc(alloc, .{
         .status = @as(u16, 422),
         .@"error" = "graph_distinct_budget_exceeded",
-        .message = "exact graph distinct aggregation exceeded its memory budget; narrow match.anchor or remove distinct",
+        .message = "exact graph distinct aggregation exceeded its request budget",
         .retryable = false,
-        .max_distinct_identities = graph_pattern_mod.default_max_distinct_identities,
-        .max_distinct_state_bytes = graph_pattern_mod.default_max_distinct_state_bytes,
+        .operation = diagnostic.operation,
+        .dimension = graph_distinct_budget_diagnostic.dimensionName(diagnostic.dimension),
+        .maximum = diagnostic.maximum,
+        .remediation = "narrow match.anchor, reduce matching cardinality, split the query, or remove distinct",
     }, .{});
 }
 
@@ -1267,6 +1272,7 @@ pub fn handleTableQueryRequest(
 
     db_mod.resetLastSortRejectionDiagnostic();
     graph_query_diagnostic.reset();
+    graph_distinct_budget_diagnostic.reset();
     graph_work_budget_diagnostic.reset();
     graph_path_weight_diagnostic.reset();
     query_contract.validatePublicQuerySortTupleContract(alloc, body) catch |err| switch (err) {
@@ -3828,7 +3834,13 @@ test "public table query handler maps exact graph execution failures" {
                     graph_path_weight_diagnostic.record("strongest", error.GraphMaxWeightDomainViolation);
                     return error.GraphMaxWeightDomainViolation;
                 },
-                .distinct_budget => error.GraphDistinctBudgetExceeded,
+                .distinct_budget => {
+                    graph_distinct_budget_diagnostic.record("unique_people", .{
+                        .dimension = .distinct_identities,
+                        .maximum = 512,
+                    });
+                    return error.GraphDistinctBudgetExceeded;
+                },
                 .anchor_filter => error.GraphAnchorFilterRequiresIndex,
                 .match_operation_limit => error.GraphMatchOperationLimitExceeded,
                 .graph_query_mode => error.GraphQueryModeUnsupported,
@@ -3924,8 +3936,10 @@ test "public table query handler maps exact graph execution failures" {
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expect(!distinct_error.retryable);
-    try std.testing.expectEqual(@as(i64, @intCast(graph_pattern_mod.default_max_distinct_identities)), distinct_error.max_distinct_identities);
-    try std.testing.expectEqual(@as(i64, @intCast(graph_pattern_mod.default_max_distinct_state_bytes)), distinct_error.max_distinct_state_bytes);
+    try std.testing.expectEqualStrings("unique_people", distinct_error.operation);
+    try std.testing.expectEqualStrings("distinct_identities", distinct_error.dimension);
+    try std.testing.expectEqual(@as(i64, 512), distinct_error.maximum);
+    try std.testing.expect(distinct_error.remediation.len > 0);
 
     kind = .anchor_filter;
     var anchor_resp = try handleTableQueryRequest(

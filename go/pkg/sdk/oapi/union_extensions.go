@@ -62,6 +62,84 @@ func (t GraphWhereExpression) DecodeStrictInto(value any) error {
 	return decodeStrictJSON(t.union, value)
 }
 
+// GraphQueryErrorVariantKind identifies the concrete graph-specific arm of a
+// QueryUnprocessableError. The generated model remains the source of truth for
+// every arm; this extension only performs discriminator-safe selection.
+type GraphQueryErrorVariantKind uint8
+
+const (
+	GraphQueryErrorVariantDistinctBudgetExceeded GraphQueryErrorVariantKind = iota + 1
+	GraphQueryErrorVariantWorkBudgetExceeded
+	GraphQueryErrorVariantPathWeightDomain
+	GraphQueryErrorVariantAnchorFilterRequiresIndex
+	GraphQueryErrorVariantUnsupported
+	GraphQueryErrorVariantMatchOperationLimitExceeded
+)
+
+// DecodedGraphQueryError is one strictly decoded graph-query error arm.
+// Exactly one pointer is non-nil.
+type DecodedGraphQueryError struct {
+	Kind                        GraphQueryErrorVariantKind
+	DistinctBudgetExceeded      *GraphDistinctBudgetExceededError
+	WorkBudgetExceeded          *GraphWorkBudgetExceededError
+	PathWeightDomain            *GraphPathWeightDomainError
+	AnchorFilterRequiresIndex   *GraphAnchorFilterRequiresIndexError
+	Unsupported                 *GraphQueryUnsupportedError
+	MatchOperationLimitExceeded *GraphMatchOperationLimitExceededError
+}
+
+// DecodeStrictGraphError selects a graph-specific QueryUnprocessableError arm
+// by its stable error discriminator and rejects fields outside that generated
+// model. It decodes directly from the union's retained bytes.
+func (t QueryUnprocessableError) DecodeStrictGraphError() (DecodedGraphQueryError, error) {
+	var discriminator struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(t.union, &discriminator); err != nil {
+		return DecodedGraphQueryError{}, err
+	}
+	switch discriminator.Error {
+	case string(GraphDistinctBudgetExceededErrorErrorGraphDistinctBudgetExceeded):
+		value := &GraphDistinctBudgetExceededError{}
+		if err := decodeStrictJSON(t.union, value); err != nil {
+			return DecodedGraphQueryError{}, err
+		}
+		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantDistinctBudgetExceeded, DistinctBudgetExceeded: value}, nil
+	case string(GraphWorkBudgetExceededErrorErrorGraphWorkBudgetExceeded):
+		value := &GraphWorkBudgetExceededError{}
+		if err := decodeStrictJSON(t.union, value); err != nil {
+			return DecodedGraphQueryError{}, err
+		}
+		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantWorkBudgetExceeded, WorkBudgetExceeded: value}, nil
+	case string(GraphPathWeightDomainErrorErrorGraphPathWeightDomainError):
+		value := &GraphPathWeightDomainError{}
+		if err := decodeStrictJSON(t.union, value); err != nil {
+			return DecodedGraphQueryError{}, err
+		}
+		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantPathWeightDomain, PathWeightDomain: value}, nil
+	case string(GraphAnchorFilterRequiresIndexErrorErrorGraphAnchorFilterRequiresIndex):
+		value := &GraphAnchorFilterRequiresIndexError{}
+		if err := decodeStrictJSON(t.union, value); err != nil {
+			return DecodedGraphQueryError{}, err
+		}
+		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantAnchorFilterRequiresIndex, AnchorFilterRequiresIndex: value}, nil
+	case string(GraphQueryUnsupportedErrorErrorGraphQueryUnsupported):
+		value := &GraphQueryUnsupportedError{}
+		if err := decodeStrictJSON(t.union, value); err != nil {
+			return DecodedGraphQueryError{}, err
+		}
+		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantUnsupported, Unsupported: value}, nil
+	case string(GraphMatchOperationLimitExceededErrorErrorGraphMatchOperationLimitExceeded):
+		value := &GraphMatchOperationLimitExceededError{}
+		if err := decodeStrictJSON(t.union, value); err != nil {
+			return DecodedGraphQueryError{}, err
+		}
+		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantMatchOperationLimitExceeded, MatchOperationLimitExceeded: value}, nil
+	default:
+		return DecodedGraphQueryError{}, fmt.Errorf("unsupported graph query error discriminator %q", discriminator.Error)
+	}
+}
+
 func decodeStrictJSON(encoded []byte, value any) error {
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
 	decoder.DisallowUnknownFields()

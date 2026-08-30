@@ -1966,7 +1966,7 @@ components:
     GraphDistinctBudgetExceededError:
       type: object
       additionalProperties: false
-      required: [status, error, message, retryable, max_distinct_identities, max_distinct_state_bytes]
+      required: [status, error, message, retryable, operation, dimension, maximum, remediation]
       properties:
         status:
           type: integer
@@ -1980,14 +1980,20 @@ components:
         retryable:
           type: boolean
           enum: [false]
-        max_distinct_identities:
+        operation:
+          type: string
+          description: Named graph operation whose exact distinct aggregation exhausted the request budget.
+        dimension:
+          type: string
+          enum: [distinct_identities, distinct_state_bytes]
+          description: Distinct aggregation resource exhausted by the operation.
+        maximum:
           type: integer
           format: uint64
-          description: Maximum distinct table-qualified identities retained by one request.
-        max_distinct_state_bytes:
-          type: integer
-          format: uint64
-          description: Maximum distinct aggregation working-set bytes admitted for one request, including identity payloads, containers, and output state.
+          description: Configured request ceiling for the exhausted resource.
+        remediation:
+          type: string
+          description: Stable user-facing guidance for reducing exact distinct state.
     GraphWorkBudgetExceededError:
       type: object
       additionalProperties: false

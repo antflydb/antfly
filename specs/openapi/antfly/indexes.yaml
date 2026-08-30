@@ -3650,7 +3650,7 @@ components:
           default: false
           description: >-
             Count exact table-qualified identities. Exact distinct sets share a
-            request memory budget and fail with
+            request resource budget and fail with
             `graph_distinct_budget_exceeded` instead of returning a partial count.
     GraphCountAggregate:
       oneOf:

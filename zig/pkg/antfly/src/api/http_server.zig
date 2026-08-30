@@ -32,6 +32,9 @@ const batch_api = @import("batch.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
+const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
+const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
+const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
 const graph_wire_envelope = @import("graph_wire_envelope.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const cluster = @import("cluster.zig");
@@ -12005,6 +12008,10 @@ pub const ApiHttpServer = struct {
         defer if (row_filter_json) |value| self.alloc.free(value);
         const source = self.table_reads orelse return error.TableNotFound;
         db_mod.resetLastSortRejectionDiagnostic();
+        graph_query_diagnostic.reset();
+        graph_distinct_budget_diagnostic.reset();
+        graph_path_weight_diagnostic.reset();
+        graph_work_budget_diagnostic.reset();
         var query_response = try self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
@@ -12552,6 +12559,9 @@ pub const ApiHttpServer = struct {
         const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
         db_mod.resetLastSortRejectionDiagnostic();
         graph_query_diagnostic.reset();
+        graph_distinct_budget_diagnostic.reset();
+        graph_path_weight_diagnostic.reset();
+        graph_work_budget_diagnostic.reset();
         const query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
@@ -12626,6 +12636,9 @@ pub const ApiHttpServer = struct {
             const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
             db_mod.resetLastSortRejectionDiagnostic();
             graph_query_diagnostic.reset();
+            graph_distinct_budget_diagnostic.reset();
+            graph_path_weight_diagnostic.reset();
+            graph_work_budget_diagnostic.reset();
             var query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
                 self.alloc,
                 source,

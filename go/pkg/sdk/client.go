@@ -175,8 +175,31 @@ func WithToken(token string) oapi.RequestEditorFn {
 type APIError struct {
 	// StatusCode is the HTTP status code returned by the server.
 	StatusCode int
-	// Message is the error message from the server.
+	// Code is the stable machine-readable error discriminator, when present.
+	Code string
+	// Message is the human-readable error message from the server.
 	Message string
+	// RawBody retains the bounded structured response for forward-compatible
+	// inspection when no more specific convenience error is available.
+	RawBody json.RawMessage
+}
+
+// GraphQueryError preserves one graph-specific 422 response as its selected
+// generated OpenAPI model. Callers can switch on Detail.Kind and inspect the
+// corresponding non-nil generated value without reparsing wire JSON.
+type GraphQueryError struct {
+	StatusCode int
+	Code       string
+	Message    string
+	Retryable  bool
+	Detail     oapi.DecodedGraphQueryError
+}
+
+func (e *GraphQueryError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return e.Code
 }
 
 // IndexMutationTemporarilyUnavailableError reports a retryable index creation
@@ -445,11 +468,31 @@ func readErrorResponse(resp *http.Response) error {
 				RetryAfterSeconds: queryRetryAfterSeconds(resp.Header),
 			}
 		}
+		if resp.StatusCode == http.StatusUnprocessableEntity && errResp.Error != "" {
+			var union oapi.QueryUnprocessableError
+			if err := json.Unmarshal(respBody, &union); err == nil {
+				if detail, err := union.DecodeStrictGraphError(); err == nil {
+					return &GraphQueryError{
+						StatusCode: resp.StatusCode,
+						Code:       errResp.Error,
+						Message:    errResp.Message,
+						Retryable:  errResp.Retryable != nil && *errResp.Retryable,
+						Detail:     detail,
+					}
+				}
+			}
+		}
 	}
 	if parsedStructuredError && errResp.Error != "" {
+		message := errResp.Message
+		if message == "" {
+			message = errResp.Error
+		}
 		return &APIError{
 			StatusCode: resp.StatusCode,
-			Message:    errResp.Error,
+			Code:       errResp.Error,
+			Message:    message,
+			RawBody:    respBody,
 		}
 	}
 

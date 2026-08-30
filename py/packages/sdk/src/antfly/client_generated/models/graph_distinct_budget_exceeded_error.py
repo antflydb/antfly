@@ -5,6 +5,7 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.graph_distinct_budget_exceeded_error_dimension import GraphDistinctBudgetExceededErrorDimension
 from ..models.graph_distinct_budget_exceeded_error_error import GraphDistinctBudgetExceededErrorError
 from ..models.graph_distinct_budget_exceeded_error_status import GraphDistinctBudgetExceededErrorStatus
 
@@ -19,17 +20,20 @@ class GraphDistinctBudgetExceededError:
         error (GraphDistinctBudgetExceededErrorError):
         message (str):
         retryable (bool):
-        max_distinct_identities (int): Maximum distinct table-qualified identities retained by one request.
-        max_distinct_state_bytes (int): Maximum distinct aggregation working-set bytes admitted for one request,
-            including identity payloads, containers, and output state.
+        operation (str): Named graph operation whose exact distinct aggregation exhausted the request budget.
+        dimension (GraphDistinctBudgetExceededErrorDimension): Distinct aggregation resource exhausted by the operation.
+        maximum (int): Configured request ceiling for the exhausted resource.
+        remediation (str): Stable user-facing guidance for reducing exact distinct state.
     """
 
     status: GraphDistinctBudgetExceededErrorStatus
     error: GraphDistinctBudgetExceededErrorError
     message: str
     retryable: bool
-    max_distinct_identities: int
-    max_distinct_state_bytes: int
+    operation: str
+    dimension: GraphDistinctBudgetExceededErrorDimension
+    maximum: int
+    remediation: str
 
     def to_dict(self) -> dict[str, Any]:
         status = self.status.value
@@ -40,9 +44,13 @@ class GraphDistinctBudgetExceededError:
 
         retryable = self.retryable
 
-        max_distinct_identities = self.max_distinct_identities
+        operation = self.operation
 
-        max_distinct_state_bytes = self.max_distinct_state_bytes
+        dimension = self.dimension.value
+
+        maximum = self.maximum
+
+        remediation = self.remediation
 
         field_dict: dict[str, Any] = {}
 
@@ -52,8 +60,10 @@ class GraphDistinctBudgetExceededError:
                 "error": error,
                 "message": message,
                 "retryable": retryable,
-                "max_distinct_identities": max_distinct_identities,
-                "max_distinct_state_bytes": max_distinct_state_bytes,
+                "operation": operation,
+                "dimension": dimension,
+                "maximum": maximum,
+                "remediation": remediation,
             }
         )
 
@@ -70,17 +80,23 @@ class GraphDistinctBudgetExceededError:
 
         retryable = d.pop("retryable")
 
-        max_distinct_identities = d.pop("max_distinct_identities")
+        operation = d.pop("operation")
 
-        max_distinct_state_bytes = d.pop("max_distinct_state_bytes")
+        dimension = GraphDistinctBudgetExceededErrorDimension(d.pop("dimension"))
+
+        maximum = d.pop("maximum")
+
+        remediation = d.pop("remediation")
 
         graph_distinct_budget_exceeded_error = cls(
             status=status,
             error=error,
             message=message,
             retryable=retryable,
-            max_distinct_identities=max_distinct_identities,
-            max_distinct_state_bytes=max_distinct_state_bytes,
+            operation=operation,
+            dimension=dimension,
+            maximum=maximum,
+            remediation=remediation,
         )
 
         return graph_distinct_budget_exceeded_error

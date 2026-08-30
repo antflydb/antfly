@@ -733,6 +733,63 @@ func TestQueryPreservesTopologyRetryGuidance(t *testing.T) {
 	}
 }
 
+func TestQueryPreservesGeneratedGraphErrorDetail(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"status":422,"error":"graph_work_budget_exceeded","message":"exact graph work exceeded the configured request budget","retryable":false,"operation":"friends","mode":"match","dimension":"explored_edges","maximum":2048,"remediation":"narrow the anchor"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.Query(context.Background(), QueryRequest{Table: "files", Limit: 10})
+	if err == nil {
+		t.Fatal("Query error = nil, want GraphQueryError")
+	}
+	var graphErr *GraphQueryError
+	if !errors.As(err, &graphErr) {
+		t.Fatalf("error = %T %[1]v, want GraphQueryError", err)
+	}
+	if graphErr.Code != "graph_work_budget_exceeded" || graphErr.Message != "exact graph work exceeded the configured request budget" || graphErr.Retryable {
+		t.Fatalf("graph error = %#v", graphErr)
+	}
+	if graphErr.Detail.Kind != oapi.GraphQueryErrorVariantWorkBudgetExceeded || graphErr.Detail.WorkBudgetExceeded == nil {
+		t.Fatalf("graph error detail = %#v", graphErr.Detail)
+	}
+	if graphErr.Detail.WorkBudgetExceeded.Operation != "friends" || graphErr.Detail.WorkBudgetExceeded.Maximum != 2048 {
+		t.Fatalf("work budget detail = %#v", graphErr.Detail.WorkBudgetExceeded)
+	}
+}
+
+func TestQueryGenericStructuredErrorPreservesCodeMessageAndBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"status":422,"error":"future_query_error","message":"actionable server message","detail":"preserved"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.Query(context.Background(), QueryRequest{Table: "files", Limit: 10})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %T %[1]v, want APIError", err)
+	}
+	if apiErr.Code != "future_query_error" || apiErr.Message != "actionable server message" || !strings.Contains(string(apiErr.RawBody), `"detail":"preserved"`) {
+		t.Fatalf("API error = %#v", apiErr)
+	}
+}
+
 func TestQueryPreservesTemporaryAvailabilityRetryGuidance(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)

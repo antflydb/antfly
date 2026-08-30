@@ -27,6 +27,7 @@ const query_contract = @import("../../api/query_contract.zig");
 const graph_wire_envelope = @import("../../api/graph_wire_envelope.zig");
 const public_graph_query = @import("../../api/public_graph_query.zig");
 const graph_query_diagnostic = @import("../../api/graph_query_diagnostic.zig");
+const graph_distinct_budget_diagnostic = @import("../../graph/distinct_budget_diagnostic.zig");
 const graph_path_weight_diagnostic = @import("../../graph/path_weight_diagnostic.zig");
 const graph_work_budget_diagnostic = @import("../../graph/work_budget_diagnostic.zig");
 const public_search_request = @import("../../api/public_search_request.zig");
@@ -3237,6 +3238,9 @@ pub const HttpHandler = struct {
                     if (request_work_budget.exhaustion()) |exhaustion| {
                         graph_work_budget_diagnostic.record(named_query.name, named_query.query, exhaustion);
                     }
+                }
+                if (err == error.GraphDistinctBudgetExceeded) {
+                    graph_distinct_budget_diagnostic.recordBudget(named_query.name, &request_distinct_budget);
                 }
                 if (graph_query_diagnostic.reasonForError(err)) |reason| {
                     graph_query_diagnostic.record(
