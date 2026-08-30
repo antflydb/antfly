@@ -402,7 +402,7 @@ pub const Options = struct {
     recovery_scratch_retained_cap_bytes: usize = wal_mod.default_replay_scratch_retained_cap_bytes,
     cursor_scratch_retained_cap_bytes: usize = 1 * 1024 * 1024,
     compaction_scratch_retained_cap_bytes: usize = 4 * 1024 * 1024,
-    io_runtime: storage_io.RuntimeKind = .threaded,
+    io_runtime: storage_io.Runtime = .threaded,
     read_runtime: ?storage_io.ReadRuntime = null,
     native_storage_pool: ?*storage_io.NativeStoragePool = null,
     storage: ?storage_io.Storage = null,
@@ -460,7 +460,7 @@ fn writePressureDuringBulkIngestEnvEnabled() bool {
     return true;
 }
 
-pub const IoRuntime = storage_io.RuntimeKind;
+pub const IoRuntime = storage_io.Runtime;
 pub const Storage = storage_io.Storage;
 pub const HostStorage = storage_io.HostStorage;
 pub const NativeStorageStats = storage_io.NativeStorageStats;

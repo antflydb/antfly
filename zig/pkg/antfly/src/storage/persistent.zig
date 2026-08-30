@@ -267,7 +267,7 @@ const SegmentFileStore = struct {
         root_dir: []const u8,
         storage: ?storage_io.Storage,
         create_if_missing: bool,
-        io_runtime: storage_io.RuntimeKind,
+        io_runtime: storage_io.Runtime,
         native_storage_pool: ?*storage_io.NativeStoragePool,
     ) !SegmentFileStore {
         const owned_root = try allocator.dupe(u8, root_dir);
