@@ -59,6 +59,9 @@ const NativeMatte = struct {
     /// Matte components normalized to the same unit component domain used by
     /// the renderer after the image Decode array has been applied.
     components: [4]f64,
+    /// Native component domains used to map an image Decode array into the
+    /// unit domain where PDF's preblending equation is affine.
+    ranges: [4]ColorComponentRange = .{ .{}, .{}, .{}, .{} },
 };
 
 const JpxAlphaMode = enum {
@@ -1814,16 +1817,13 @@ const max_image_color_space_decode_depth: u8 = 8;
 const ImageSampleDecode = struct {
     decode_obj: ?*const syntax.Object = null,
     default_decode: ?[4]ColorComponentRange = null,
-    samples_are_values: bool = false,
     clamp_count: u8 = 0,
     clamps: [max_image_color_space_decode_depth][4]ColorComponentRange =
         [_][4]ColorComponentRange{.{ .{}, .{}, .{}, .{} }} ** max_image_color_space_decode_depth,
 
-    fn value(self: *const ImageSampleDecode, sample: u8, component_index: usize) f64 {
+    fn encodedValue(self: *const ImageSampleDecode, sample: u8, component_index: usize) f64 {
         const unit = @as(f64, @floatFromInt(sample)) / 255.0;
-        var decoded = if (self.samples_are_values)
-            unit
-        else if (self.default_decode) |ranges|
+        var decoded = if (self.default_decode) |ranges|
             mapUnitToComponentRange(unit, ranges[component_index])
         else if (self.clamp_count > 0)
             applyDecodeUnclamped(unit, self.decode_obj, component_index)
@@ -1832,6 +1832,97 @@ const ImageSampleDecode = struct {
         for (self.clamps[0..self.clamp_count]) |ranges|
             decoded = clampColorComponent(decoded, ranges[component_index]);
         return decoded;
+    }
+
+    fn colorValue(self: *const ImageSampleDecode, value: f64, component_index: usize) f64 {
+        var constrained = value;
+        for (self.clamps[0..self.clamp_count]) |ranges|
+            constrained = clampColorComponent(constrained, ranges[component_index]);
+        return constrained;
+    }
+};
+
+/// Recursive alternate color spaces can consume either encoded image bytes or
+/// real component values produced by a tint transform. Keeping the source
+/// tagged prevents non-unit Lab, Indexed, and ICC values from being clipped or
+/// quantized merely to reuse the encoded-byte conversion path.
+const ImageComponentSamples = struct {
+    source: union(enum) {
+        encoded: []const u8,
+        tint: *TintComponentSamples,
+    },
+    decode: ImageSampleDecode = .{},
+
+    fn encoded(bytes: []const u8, decode_obj: ?*const syntax.Object) ImageComponentSamples {
+        return .{ .source = .{ .encoded = bytes }, .decode = .{ .decode_obj = decode_obj } };
+    }
+
+    fn len(self: *const ImageComponentSamples) usize {
+        return switch (self.source) {
+            .encoded => |bytes| bytes.len,
+            .tint => |tint| blk: {
+                if (tint.input_components == 0) break :blk 0;
+                break :blk std.math.mul(usize, tint.pixel_count, tint.output_components) catch std.math.maxInt(usize);
+            },
+        };
+    }
+
+    fn liveBytes(self: *const ImageComponentSamples) usize {
+        return switch (self.source) {
+            .encoded => |bytes| bytes.len,
+            // Tint outputs are evaluated lazily, so only their input remains
+            // live regardless of the alternate color space's component count.
+            .tint => |tint| tint.input.liveBytes(),
+        };
+    }
+
+    fn isEncoded(self: *const ImageComponentSamples) bool {
+        return self.source == .encoded;
+    }
+
+    fn value(self: *const ImageComponentSamples, sample_index: usize, component_index: usize) f64 {
+        return switch (self.source) {
+            .encoded => |bytes| self.decode.encodedValue(bytes[sample_index], component_index),
+            .tint => |tint| blk: {
+                const pixel = sample_index / tint.output_components;
+                const output_component = sample_index % tint.output_components;
+                const tint_value = tint.value(pixel);
+                const component_value = evalExponentialTintComponent(tint.transform, tint_value, output_component);
+                break :blk self.decode.colorValue(component_value, component_index);
+            },
+        };
+    }
+
+    fn indexedValue(self: *const ImageComponentSamples, sample_index: usize, palette_entries: usize) !u8 {
+        return switch (self.source) {
+            .encoded => |bytes| try applyIndexedSampleDecode(bytes[sample_index], self.decode, palette_entries),
+            .tint => blk: {
+                if (palette_entries == 0) return error.UnsupportedPdfRendering;
+                const max_index = @as(f64, @floatFromInt(palette_entries - 1));
+                const index_value = std.math.clamp(self.value(sample_index, 0), 0.0, max_index);
+                break :blk @intFromFloat(@round(index_value));
+            },
+        };
+    }
+};
+
+/// A one-pixel cache keeps nested spot alternates linear in their recursion
+/// depth while avoiding a full-image intermediate component buffer.
+const TintComponentSamples = struct {
+    input: *const ImageComponentSamples,
+    transform: *const ExponentialTintTransform,
+    pixel_count: usize,
+    input_components: usize,
+    output_components: usize,
+    cached_pixel: ?usize = null,
+    cached_value: f64 = 0,
+
+    fn value(self: *TintComponentSamples, pixel: usize) f64 {
+        if (self.cached_pixel != pixel) {
+            self.cached_value = self.input.value(pixel * self.input_components, 0);
+            self.cached_pixel = pixel;
+        }
+        return self.cached_value;
     }
 };
 
@@ -2350,10 +2441,12 @@ const ExponentialTintTransform = struct {
     n: f64,
     c0: []f64,
     c1: []f64,
+    ranges: ?[]ColorComponentRange = null,
 
     fn deinit(self: *ExponentialTintTransform, alloc: Allocator) void {
         alloc.free(self.c0);
         alloc.free(self.c1);
+        if (self.ranges) |ranges| alloc.free(ranges);
         self.* = undefined;
     }
 };
@@ -7762,9 +7855,8 @@ pub const Reader = struct {
         return try self.decodeResolvedImageColorSpaceToRgbaGuarded(
             rgba,
             pixel_count,
-            samples,
+            ImageComponentSamples.encoded(samples, decode_obj),
             resolved_color_space,
-            .{ .decode_obj = decode_obj },
             0,
         );
     }
@@ -7773,23 +7865,22 @@ pub const Reader = struct {
         self: *const Reader,
         rgba: []u8,
         pixel_count: usize,
-        samples: []const u8,
+        samples: ImageComponentSamples,
         resolved_color_space: *const syntax.Object,
-        sample_decode: ImageSampleDecode,
         depth: u8,
     ) anyerror!void {
         if (depth >= max_image_color_space_decode_depth) return error.UnsupportedPdfRendering;
         if (resolved_color_space.asName()) |color_space| {
-            try decodeDeviceColorSpaceToRgbaWithSampleDecode(rgba, pixel_count, samples, color_space, sample_decode, self.cancellation);
+            try decodeDeviceColorSpaceToRgbaWithSampleDecode(rgba, pixel_count, samples, color_space, self.cancellation);
         } else if (resolved_color_space.* == .array) {
-            if (try self.tryDecodeIccBasedImageToRgbaGuarded(rgba, pixel_count, samples, resolved_color_space.array, sample_decode, depth)) {
+            if (try self.tryDecodeIccBasedImageToRgbaGuarded(rgba, pixel_count, samples, resolved_color_space.array, depth)) {
                 // handled
-            } else if (try self.tryDecodeCalibratedImageToRgbaWithSampleDecode(rgba, pixel_count, samples, resolved_color_space.array, sample_decode)) {
+            } else if (try self.tryDecodeCalibratedImageToRgbaWithSampleDecode(rgba, pixel_count, samples, resolved_color_space.array)) {
                 // handled
-            } else if (try self.tryDecodeSpotColorSpaceToRgbaGuarded(rgba, pixel_count, samples, resolved_color_space.array, sample_decode, depth)) {
+            } else if (try self.tryDecodeSpotColorSpaceToRgbaGuarded(rgba, pixel_count, samples, resolved_color_space.array, depth)) {
                 // handled
             } else {
-                try self.decodeIndexedImageToRgbaGuarded(rgba, pixel_count, samples, resolved_color_space.array, sample_decode, depth);
+                try self.decodeIndexedImageToRgbaGuarded(rgba, pixel_count, samples, resolved_color_space.array, depth);
             }
         } else return error.UnsupportedPdfRendering;
     }
@@ -7864,9 +7955,8 @@ pub const Reader = struct {
         return try self.tryDecodeIccBasedImageToRgbaGuarded(
             rgba,
             pixel_count,
-            decoded,
+            ImageComponentSamples.encoded(decoded, decode_obj),
             color_space,
-            .{ .decode_obj = decode_obj },
             0,
         );
     }
@@ -7875,9 +7965,8 @@ pub const Reader = struct {
         self: *const Reader,
         rgba: []u8,
         pixel_count: usize,
-        decoded: []const u8,
+        samples: ImageComponentSamples,
         color_space: []const syntax.Object,
-        sample_decode: ImageSampleDecode,
         depth: u8,
     ) !bool {
         if (color_space.len < 2) return false;
@@ -7894,8 +7983,8 @@ pub const Reader = struct {
         if (components_i <= 0 or components_i > 4) return error.UnsupportedPdfRendering;
         const component_count: usize = @intCast(components_i);
 
-        var constrained_decode = sample_decode;
-        if (constrained_decode.clamp_count >= max_image_color_space_decode_depth)
+        var constrained_samples = samples;
+        if (constrained_samples.decode.clamp_count >= max_image_color_space_decode_depth)
             return error.UnsupportedPdfRendering;
         var ranges = [4]ColorComponentRange{ .{}, .{}, .{}, .{} };
         if (profile.get("Range")) |range_obj| {
@@ -7917,12 +8006,12 @@ pub const Reader = struct {
         // Once an outer color space has converted encoded samples into color
         // values, nested alternates only constrain those values; they must not
         // decode the same bytes a second time.
-        if (constrained_decode.decode_obj == null and
-            constrained_decode.default_decode == null and
-            !constrained_decode.samples_are_values)
-            constrained_decode.default_decode = ranges;
-        constrained_decode.clamps[constrained_decode.clamp_count] = ranges;
-        constrained_decode.clamp_count += 1;
+        if (constrained_samples.isEncoded() and
+            constrained_samples.decode.decode_obj == null and
+            constrained_samples.decode.default_decode == null)
+            constrained_samples.decode.default_decode = ranges;
+        constrained_samples.decode.clamps[constrained_samples.decode.clamp_count] = ranges;
+        constrained_samples.decode.clamp_count += 1;
 
         if (profile.get("Alternate")) |alternate| {
             var resolved_alternate = try self.resolveImageColorSpaceForDecodeAlloc(alternate);
@@ -7932,9 +8021,8 @@ pub const Reader = struct {
             try self.decodeResolvedImageColorSpaceToRgbaGuarded(
                 rgba,
                 pixel_count,
-                decoded,
+                constrained_samples,
                 &resolved_alternate,
-                constrained_decode,
                 depth + 1,
             );
         } else {
@@ -7944,7 +8032,7 @@ pub const Reader = struct {
                 4 => "DeviceCMYK",
                 else => return error.UnsupportedPdfRendering,
             };
-            try decodeDeviceColorSpaceToRgbaWithSampleDecode(rgba, pixel_count, decoded, device_name, constrained_decode, self.cancellation);
+            try decodeDeviceColorSpaceToRgbaWithSampleDecode(rgba, pixel_count, constrained_samples, device_name, self.cancellation);
         }
         return true;
     }
@@ -7979,9 +8067,8 @@ pub const Reader = struct {
         return try self.tryDecodeCalibratedImageToRgbaWithSampleDecode(
             rgba,
             pixel_count,
-            decoded,
+            ImageComponentSamples.encoded(decoded, decode_obj),
             color_space,
-            .{ .decode_obj = decode_obj },
         );
     }
 
@@ -7989,34 +8076,33 @@ pub const Reader = struct {
         self: *const Reader,
         rgba: []u8,
         pixel_count: usize,
-        decoded: []const u8,
+        samples: ImageComponentSamples,
         color_space: []const syntax.Object,
-        sample_decode: ImageSampleDecode,
     ) !bool {
         if (color_space.len < 2) return false;
         const name = color_space[0].asName() orelse return false;
         if (std.mem.eql(u8, name, "CalGray")) {
-            if (decoded.len < pixel_count) return error.UnsupportedPdfRendering;
+            if (samples.len() < pixel_count) return error.UnsupportedPdfRendering;
             const selection = try self.classifyCalibratedColorSpace(name, &color_space[1]);
             if (selection.kind == .unsupported) return error.UnsupportedPdfRendering;
             for (0..pixel_count) |pixel| {
                 if (pixel & 4095 == 0) try self.checkCancellation();
-                const color = renderColorSpaceComponents(selection.value, .{ sample_decode.value(decoded[pixel], 0), 0, 0, 0 });
+                const color = renderColorSpaceComponents(selection.value, .{ samples.value(pixel, 0), 0, 0, 0 });
                 @memcpy(rgba[pixel * 4 ..][0..4], &color);
             }
             return true;
         }
         if (std.mem.eql(u8, name, "CalRGB")) {
-            if (decoded.len < pixel_count * 3) return error.UnsupportedPdfRendering;
+            if (samples.len() < pixel_count * 3) return error.UnsupportedPdfRendering;
             const selection = try self.classifyCalibratedColorSpace(name, &color_space[1]);
             if (selection.kind == .unsupported) return error.UnsupportedPdfRendering;
             for (0..pixel_count) |pixel| {
                 if (pixel & 4095 == 0) try self.checkCancellation();
                 const src = pixel * 3;
                 const color = renderColorSpaceComponents(selection.value, .{
-                    sample_decode.value(decoded[src], 0),
-                    sample_decode.value(decoded[src + 1], 1),
-                    sample_decode.value(decoded[src + 2], 2),
+                    samples.value(src, 0),
+                    samples.value(src + 1, 1),
+                    samples.value(src + 2, 2),
                     0,
                 });
                 @memcpy(rgba[pixel * 4 ..][0..4], &color);
@@ -8024,19 +8110,40 @@ pub const Reader = struct {
             return true;
         }
         if (std.mem.eql(u8, name, "Lab")) {
-            if (decoded.len < pixel_count * 3) return error.UnsupportedPdfRendering;
+            if (samples.len() < pixel_count * 3) return error.UnsupportedPdfRendering;
             const params = if (color_space[1] == .dict) color_space[1].dict else return error.UnsupportedPdfRendering;
             const range_a = parseLabRange(params, "Range", 0, -100.0, 100.0);
             const range_b = parseLabRange(params, "Range", 2, -100.0, 100.0);
+            if (!std.math.isFinite(range_a[0]) or !std.math.isFinite(range_a[1]) or range_a[0] >= range_a[1] or
+                !std.math.isFinite(range_b[0]) or !std.math.isFinite(range_b[1]) or range_b[0] >= range_b[1])
+                return error.UnsupportedPdfRendering;
             const white = parseLabWhitePoint(params);
+            const lab_ranges = [4]ColorComponentRange{
+                .{ .min = 0, .max = 100 },
+                .{ .min = range_a[0], .max = range_a[1] },
+                .{ .min = range_b[0], .max = range_b[1] },
+                .{},
+            };
+            var lab_samples = samples;
+            if (lab_samples.decode.clamp_count >= max_image_color_space_decode_depth)
+                return error.UnsupportedPdfRendering;
+            // A direct Lab image's default Decode is the Lab component range.
+            // Recursive alternates already contain color values, so they only
+            // need validation/clamping in that same native domain.
+            if (lab_samples.isEncoded() and
+                lab_samples.decode.decode_obj == null and
+                lab_samples.decode.default_decode == null)
+                lab_samples.decode.default_decode = lab_ranges;
+            lab_samples.decode.clamps[lab_samples.decode.clamp_count] = lab_ranges;
+            lab_samples.decode.clamp_count += 1;
             var i: usize = 0;
             while (i < pixel_count) : (i += 1) {
                 if (i & 4095 == 0) try self.checkCancellation();
                 const src = i * 3;
                 const dst = i * 4;
-                const l = sample_decode.value(decoded[src + 0], 0) * 100.0;
-                const a = mapUnitToRange(sample_decode.value(decoded[src + 1], 1), range_a[0], range_a[1]);
-                const b = mapUnitToRange(sample_decode.value(decoded[src + 2], 2), range_b[0], range_b[1]);
+                const l = lab_samples.value(src + 0, 0);
+                const a = lab_samples.value(src + 1, 1);
+                const b = lab_samples.value(src + 2, 2);
                 const color = labColor(l, a, b, white);
                 rgba[dst + 0] = color[0];
                 rgba[dst + 1] = color[1];
@@ -8059,9 +8166,8 @@ pub const Reader = struct {
         return try self.decodeIndexedImageToRgbaGuarded(
             rgba,
             pixel_count,
-            decoded,
+            ImageComponentSamples.encoded(decoded, decode_obj),
             color_space,
-            .{ .decode_obj = decode_obj },
             0,
         );
     }
@@ -8070,9 +8176,8 @@ pub const Reader = struct {
         self: *const Reader,
         rgba: []u8,
         pixel_count: usize,
-        decoded: []const u8,
+        samples: ImageComponentSamples,
         color_space: []const syntax.Object,
-        sample_decode: ImageSampleDecode,
         depth: u8,
     ) !void {
         if (color_space.len < 4) return error.UnsupportedPdfRendering;
@@ -8081,7 +8186,7 @@ pub const Reader = struct {
             return error.UnsupportedPdfRendering;
 
         const hi_val = color_space[2].asInteger() orelse return error.UnsupportedPdfRendering;
-        if (hi_val < 0 or hi_val > std.math.maxInt(u8) or decoded.len < pixel_count)
+        if (hi_val < 0 or hi_val > std.math.maxInt(u8) or samples.len() < pixel_count)
             return error.UnsupportedPdfRendering;
         const comps = try self.colorSpaceInputComponentCount(&color_space[1]);
         if (comps == 0 or comps > 32) return error.UnsupportedPdfRendering;
@@ -8111,22 +8216,21 @@ pub const Reader = struct {
         if (lookup.len < palette_sample_len) return error.UnsupportedPdfRendering;
         const palette_rgba_len = std.math.mul(usize, palette_entries, 4) catch return error.UnsupportedPdfRendering;
         const owned_lookup_len = if (decoded_lookup != null) lookup.len else 0;
-        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ rgba.len, decoded.len, owned_lookup_len, palette_rgba_len });
+        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ rgba.len, samples.liveBytes(), owned_lookup_len, palette_rgba_len });
         const palette_rgba = try self.alloc.alloc(u8, palette_rgba_len);
         defer self.alloc.free(palette_rgba);
         try self.decodeResolvedImageColorSpaceToRgbaGuarded(
             palette_rgba,
             palette_entries,
-            lookup[0..palette_sample_len],
+            .{ .source = .{ .encoded = lookup[0..palette_sample_len] } },
             &color_space[1],
-            .{},
             depth + 1,
         );
 
         var i: usize = 0;
         while (i < pixel_count) : (i += 1) {
             if (i & 4095 == 0) try self.checkCancellation();
-            const idx = try applyIndexedSampleDecode(decoded[i], sample_decode, palette_entries);
+            const idx = try samples.indexedValue(i, palette_entries);
             if (idx >= palette_entries) return error.UnsupportedPdfRendering;
             const src = @as(usize, idx) * 4;
             const dst = i * 4;
@@ -8145,9 +8249,8 @@ pub const Reader = struct {
         return try self.tryDecodeSpotColorSpaceToRgbaGuarded(
             rgba,
             pixel_count,
-            decoded,
+            ImageComponentSamples.encoded(decoded, decode_obj),
             color_space,
-            .{ .decode_obj = decode_obj },
             0,
         );
     }
@@ -8156,9 +8259,8 @@ pub const Reader = struct {
         self: *const Reader,
         rgba: []u8,
         pixel_count: usize,
-        decoded: []const u8,
+        samples: ImageComponentSamples,
         color_space: []const syntax.Object,
-        sample_decode: ImageSampleDecode,
         depth: u8,
     ) !bool {
         if (color_space.len < 4) return false;
@@ -8179,7 +8281,7 @@ pub const Reader = struct {
             return false;
         }
 
-        if (decoded.len < pixel_count * tint_components) return error.UnsupportedPdfRendering;
+        if (samples.len() < pixel_count * tint_components) return error.UnsupportedPdfRendering;
         const alt_components = try self.colorSpaceInputComponentCount(&color_space[alt_index]);
         if (alt_components == 0 or alt_components > 32) return error.UnsupportedPdfRendering;
 
@@ -8187,25 +8289,20 @@ pub const Reader = struct {
         defer transform.deinit(self.alloc);
 
         const alt_len = std.math.mul(usize, pixel_count, alt_components) catch return error.PdfDecodeWorkingSetTooLarge;
-        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ rgba.len, decoded.len, alt_len });
-        const alt_bytes = try self.alloc.alloc(u8, alt_len);
-        defer self.alloc.free(alt_bytes);
-
-        var i: usize = 0;
-        while (i < pixel_count) : (i += 1) {
-            if (i & 4095 == 0) try self.checkCancellation();
-            const tint = sample_decode.value(decoded[i], 0);
-            for (0..alt_components) |component| {
-                alt_bytes[i * alt_components + component] = floatChannel(evalExponentialTintComponent(&transform, tint, component));
-            }
-        }
-
+        var tint_samples = TintComponentSamples{
+            .input = &samples,
+            .transform = &transform,
+            .pixel_count = pixel_count,
+            .input_components = tint_components,
+            .output_components = alt_components,
+        };
+        const transformed_samples = ImageComponentSamples{ .source = .{ .tint = &tint_samples } };
+        std.debug.assert(transformed_samples.len() == alt_len);
         try self.decodeResolvedImageColorSpaceToRgbaGuarded(
             rgba,
             pixel_count,
-            alt_bytes,
+            transformed_samples,
             &color_space[alt_index],
-            .{ .samples_are_values = true },
             depth + 1,
         );
         return true;
@@ -8228,7 +8325,7 @@ pub const Reader = struct {
         const fn_type = dictGetInteger(dict, "FunctionType") orelse return error.UnsupportedPdfRendering;
         if (fn_type != 2) return error.UnsupportedPdfRendering;
         const exponent = dictGetNumber(dict, "N") orelse return error.UnsupportedPdfRendering;
-        if (exponent <= 0) return error.UnsupportedPdfRendering;
+        if (!std.math.isFinite(exponent) or exponent <= 0) return error.UnsupportedPdfRendering;
 
         var c0 = try self.alloc.alloc(f64, alt_components);
         errdefer self.alloc.free(c0);
@@ -8241,17 +8338,38 @@ pub const Reader = struct {
 
         if (dictGetArray(dict, "C0")) |values| {
             if (values.len < alt_components) return error.UnsupportedPdfRendering;
-            for (0..alt_components) |i| c0[i] = numericObjectValue(&values[i]) orelse return error.UnsupportedPdfRendering;
+            for (0..alt_components) |i| {
+                c0[i] = numericObjectValue(&values[i]) orelse return error.UnsupportedPdfRendering;
+                if (!std.math.isFinite(c0[i])) return error.UnsupportedPdfRendering;
+            }
         }
         if (dictGetArray(dict, "C1")) |values| {
             if (values.len < alt_components) return error.UnsupportedPdfRendering;
-            for (0..alt_components) |i| c1[i] = numericObjectValue(&values[i]) orelse return error.UnsupportedPdfRendering;
+            for (0..alt_components) |i| {
+                c1[i] = numericObjectValue(&values[i]) orelse return error.UnsupportedPdfRendering;
+                if (!std.math.isFinite(c1[i])) return error.UnsupportedPdfRendering;
+            }
+        }
+
+        var ranges: ?[]ColorComponentRange = null;
+        if (dictGetArray(dict, "Range")) |values| {
+            if (values.len != alt_components * 2) return error.UnsupportedPdfRendering;
+            ranges = try self.alloc.alloc(ColorComponentRange, alt_components);
+            errdefer self.alloc.free(ranges.?);
+            for (ranges.?, 0..) |*range, component| {
+                const min = numericObjectValue(&values[component * 2]) orelse return error.UnsupportedPdfRendering;
+                const max = numericObjectValue(&values[component * 2 + 1]) orelse return error.UnsupportedPdfRendering;
+                if (!std.math.isFinite(min) or !std.math.isFinite(max) or min > max)
+                    return error.UnsupportedPdfRendering;
+                range.* = .{ .min = min, .max = max };
+            }
         }
 
         return .{
             .n = exponent,
             .c0 = c0,
             .c1 = c1,
+            .ranges = ranges,
         };
     }
 
@@ -8266,9 +8384,8 @@ pub const Reader = struct {
         return try decodeDeviceColorSpaceToRgbaWithSampleDecode(
             rgba,
             pixel_count,
-            decoded,
+            ImageComponentSamples.encoded(decoded, decode_obj),
             color_space,
-            .{ .decode_obj = decode_obj },
             cancellation,
         );
     }
@@ -8276,32 +8393,31 @@ pub const Reader = struct {
     fn decodeDeviceColorSpaceToRgbaWithSampleDecode(
         rgba: []u8,
         pixel_count: usize,
-        decoded: []const u8,
+        samples: ImageComponentSamples,
         color_space: []const u8,
-        sample_decode: ImageSampleDecode,
         cancellation: CancellationProbe,
     ) !void {
         if (std.mem.eql(u8, color_space, "DeviceRGB")) {
-            if (decoded.len < pixel_count * 3) return error.UnsupportedPdfRendering;
+            if (samples.len() < pixel_count * 3) return error.UnsupportedPdfRendering;
             var i: usize = 0;
             while (i < pixel_count) : (i += 1) {
                 if (i & 4095 == 0) try cancellation.check();
                 const src = i * 3;
                 const dst = i * 4;
-                rgba[dst + 0] = floatChannel(sample_decode.value(decoded[src + 0], 0));
-                rgba[dst + 1] = floatChannel(sample_decode.value(decoded[src + 1], 1));
-                rgba[dst + 2] = floatChannel(sample_decode.value(decoded[src + 2], 2));
+                rgba[dst + 0] = floatChannel(samples.value(src + 0, 0));
+                rgba[dst + 1] = floatChannel(samples.value(src + 1, 1));
+                rgba[dst + 2] = floatChannel(samples.value(src + 2, 2));
                 rgba[dst + 3] = 0xff;
             }
             return;
         }
         if (std.mem.eql(u8, color_space, "DeviceGray")) {
-            if (decoded.len < pixel_count) return error.UnsupportedPdfRendering;
+            if (samples.len() < pixel_count) return error.UnsupportedPdfRendering;
             var i: usize = 0;
             while (i < pixel_count) : (i += 1) {
                 if (i & 4095 == 0) try cancellation.check();
                 const dst = i * 4;
-                const gray = floatChannel(sample_decode.value(decoded[i], 0));
+                const gray = floatChannel(samples.value(i, 0));
                 rgba[dst + 0] = gray;
                 rgba[dst + 1] = gray;
                 rgba[dst + 2] = gray;
@@ -8310,17 +8426,17 @@ pub const Reader = struct {
             return;
         }
         if (std.mem.eql(u8, color_space, "DeviceCMYK")) {
-            if (decoded.len < pixel_count * 4) return error.UnsupportedPdfRendering;
+            if (samples.len() < pixel_count * 4) return error.UnsupportedPdfRendering;
             var i: usize = 0;
             while (i < pixel_count) : (i += 1) {
                 if (i & 4095 == 0) try cancellation.check();
                 const src = i * 4;
                 const dst = i * 4;
                 const color = cmykColor(
-                    sample_decode.value(decoded[src + 0], 0),
-                    sample_decode.value(decoded[src + 1], 1),
-                    sample_decode.value(decoded[src + 2], 2),
-                    sample_decode.value(decoded[src + 3], 3),
+                    samples.value(src + 0, 0),
+                    samples.value(src + 1, 1),
+                    samples.value(src + 2, 2),
+                    samples.value(src + 3, 3),
                 );
                 rgba[dst + 0] = color[0];
                 rgba[dst + 1] = color[1];
@@ -8517,33 +8633,42 @@ pub const Reader = struct {
         const component_count = try self.colorSpaceInputComponentCount(&color_space);
         if (component_count == 0 or component_count > 4) return error.UnsupportedPdfRendering;
         if (matte.len != component_count) return error.InvalidPdfImageMask;
+        const ranges = try self.nativeColorSpaceComponentRanges(&color_space, component_count);
 
         var components: [4]f64 = .{ 0, 0, 0, 0 };
         for (matte, 0..) |value, index| {
             const component = numericObjectValue(&value) orelse return error.InvalidPdfImageMask;
             if (!std.math.isFinite(component)) return error.InvalidPdfImageMask;
-            components[index] = try self.normalizeMatteComponent(&color_space, index, component);
+            const range = ranges[index];
+            const span = range.max - range.min;
+            if (!std.math.isFinite(span) or span <= std.math.floatEps(f64) or component < range.min or component > range.max)
+                return error.InvalidPdfImageMask;
+            components[index] = (component - range.min) / span;
         }
-        return .{ .component_count = component_count, .components = components };
+        return .{ .component_count = component_count, .components = components, .ranges = ranges };
     }
 
-    fn normalizeMatteComponent(self: *const Reader, color_space: *const syntax.Object, component_index: usize, value: f64) !f64 {
-        if (color_space.asName() != null) {
-            if (value < 0 or value > 1) return error.InvalidPdfImageMask;
-            return value;
-        }
+    fn nativeColorSpaceComponentRanges(
+        self: *const Reader,
+        color_space: *const syntax.Object,
+        component_count: usize,
+    ) ![4]ColorComponentRange {
+        var ranges = [4]ColorComponentRange{ .{}, .{}, .{}, .{} };
+        if (color_space.asName() != null) return ranges;
         if (color_space.* != .array or color_space.array.len == 0) return error.UnsupportedPdfRendering;
         const family = color_space.array[0].asName() orelse return error.UnsupportedPdfRendering;
         if (std.mem.eql(u8, family, "Lab")) {
-            if (color_space.array.len < 2 or color_space.array[1] != .dict) return error.UnsupportedPdfRendering;
-            if (component_index == 0) {
-                if (value < 0 or value > 100) return error.InvalidPdfImageMask;
-                return value / 100.0;
-            }
-            const range_offset: usize = if (component_index == 1) 0 else 2;
-            const range = parseLabRange(color_space.array[1].dict, "Range", range_offset, -100.0, 100.0);
-            if (value < range[0] or value > range[1] or range[0] == range[1]) return error.InvalidPdfImageMask;
-            return (value - range[0]) / (range[1] - range[0]);
+            if (component_count != 3 or color_space.array.len < 2 or color_space.array[1] != .dict)
+                return error.UnsupportedPdfRendering;
+            const range_a = parseLabRange(color_space.array[1].dict, "Range", 0, -100.0, 100.0);
+            const range_b = parseLabRange(color_space.array[1].dict, "Range", 2, -100.0, 100.0);
+            if (!std.math.isFinite(range_a[0]) or !std.math.isFinite(range_a[1]) or range_a[0] >= range_a[1] or
+                !std.math.isFinite(range_b[0]) or !std.math.isFinite(range_b[1]) or range_b[0] >= range_b[1])
+                return error.InvalidPdfImageMask;
+            ranges[0] = .{ .min = 0, .max = 100 };
+            ranges[1] = .{ .min = range_a[0], .max = range_a[1] };
+            ranges[2] = .{ .min = range_b[0], .max = range_b[1] };
+            return ranges;
         }
         if (std.mem.eql(u8, family, "ICCBased")) {
             if (color_space.array.len < 2) return error.UnsupportedPdfRendering;
@@ -8553,17 +8678,32 @@ pub const Reader = struct {
             if (profile.get("Range")) |range_obj| {
                 var resolved_range = try self.resolveValue(range_obj);
                 defer resolved_range.deinit(self.alloc);
-                if (resolved_range != .array or resolved_range.array.len < (component_index + 1) * 2)
+                if (resolved_range != .array or resolved_range.array.len != component_count * 2)
                     return error.InvalidPdfImageMask;
-                const min_value = numericObjectValue(&resolved_range.array[component_index * 2]) orelse return error.InvalidPdfImageMask;
-                const max_value = numericObjectValue(&resolved_range.array[component_index * 2 + 1]) orelse return error.InvalidPdfImageMask;
-                if (!std.math.isFinite(min_value) or !std.math.isFinite(max_value) or min_value >= max_value or value < min_value or value > max_value)
-                    return error.InvalidPdfImageMask;
-                return (value - min_value) / (max_value - min_value);
+                for (0..component_count) |component| {
+                    const min = (try self.resolvedNumericObjectValue(&resolved_range.array[component * 2])) orelse
+                        return error.InvalidPdfImageMask;
+                    const max = (try self.resolvedNumericObjectValue(&resolved_range.array[component * 2 + 1])) orelse
+                        return error.InvalidPdfImageMask;
+                    if (!std.math.isFinite(min) or !std.math.isFinite(max) or min >= max)
+                        return error.InvalidPdfImageMask;
+                    ranges[component] = .{ .min = min, .max = max };
+                }
             }
+            return ranges;
         }
-        if (value < 0 or value > 1) return error.InvalidPdfImageMask;
-        return value;
+        if (std.mem.eql(u8, family, "Indexed") or std.mem.eql(u8, family, "I")) {
+            if (component_count != 1 or color_space.array.len < 3) return error.UnsupportedPdfRendering;
+            const hi_val = color_space.array[2].asInteger() orelse return error.UnsupportedPdfRendering;
+            if (hi_val < 0 or hi_val > std.math.maxInt(u8)) return error.UnsupportedPdfRendering;
+            ranges[0].max = @floatFromInt(hi_val);
+            return ranges;
+        }
+        if (std.mem.eql(u8, family, "CalGray") or
+            std.mem.eql(u8, family, "CalRGB") or
+            std.mem.eql(u8, family, "Separation") or
+            std.mem.eql(u8, family, "DeviceN")) return ranges;
+        return error.UnsupportedPdfRendering;
     }
 
     fn prepareMatteSoftMaskAlloc(
@@ -15827,11 +15967,11 @@ fn colorFromComponents(color_space_name: []const u8, components: [4]u8, count: u
 
 fn evalExponentialTintComponent(transform: *const ExponentialTintTransform, tint: f64, component: usize) f64 {
     const t = std.math.clamp(tint, 0.0, 1.0);
-    return std.math.clamp(
-        transform.c0[component] + std.math.pow(f64, t, transform.n) * (transform.c1[component] - transform.c0[component]),
-        0.0,
-        1.0,
-    );
+    const value = transform.c0[component] + std.math.pow(f64, t, transform.n) * (transform.c1[component] - transform.c0[component]);
+    return if (transform.ranges) |ranges|
+        clampColorComponent(value, ranges[component])
+    else
+        value;
 }
 
 fn applyDecodeByte(value: u8, decode_obj: ?*const syntax.Object, component_index: usize) u8 {
@@ -15855,11 +15995,10 @@ fn applyIndexedDecode(value: u8, decode_obj: ?*const syntax.Object, palette_entr
 fn applyIndexedSampleDecode(value: u8, sample_decode: ImageSampleDecode, palette_entries: usize) !u8 {
     if (palette_entries == 0) return error.UnsupportedPdfRendering;
     if (sample_decode.default_decode == null and
-        !sample_decode.samples_are_values and
         sample_decode.clamp_count == 0)
         return try applyIndexedDecode(value, sample_decode.decode_obj, palette_entries);
     const max_index = @as(f64, @floatFromInt(palette_entries - 1));
-    const mapped = std.math.clamp(sample_decode.value(value, 0), 0.0, max_index);
+    const mapped = std.math.clamp(sample_decode.encodedValue(value, 0), 0.0, max_index);
     return @intFromFloat(@round(mapped));
 }
 
@@ -16251,9 +16390,24 @@ fn applyResampledMatteToSamples(
                     .u8 => |bytes| @as(f64, @floatFromInt(bytes[sample_index])) / 255.0,
                     .u16 => |words| @as(f64, @floatFromInt(words[sample_index])) / @as(f64, @floatFromInt(max_sample)),
                 };
-                const preblended = applyDecodeNormalized(raw_unit, decode_obj, component);
+                const component_range = matte.ranges[component];
+                const component_span = component_range.max - component_range.min;
+                if (!std.math.isFinite(component_span) or component_span <= std.math.floatEps(f64))
+                    return error.UnsupportedPdfRendering;
+                const explicit_decode = decodeRange(decode_obj, component);
+                const decoded_component = if (explicit_decode) |range|
+                    range.min + std.math.clamp(raw_unit, 0.0, 1.0) * (range.max - range.min)
+                else
+                    mapUnitToComponentRange(raw_unit, component_range);
+                const preblended = (clampColorComponent(decoded_component, component_range) - component_range.min) / component_span;
                 const unblended = unblendNativeComponent(preblended, alpha, matte.components[component]);
-                const encoded_unit = try invertDecodeNormalized(unblended, decode_obj, component);
+                const encoded_unit = if (explicit_decode) |range| blk: {
+                    const decode_span = range.max - range.min;
+                    if (!std.math.isFinite(decode_span) or @abs(decode_span) <= std.math.floatEps(f64))
+                        return error.UnsupportedPdfRendering;
+                    const native_component = mapUnitToComponentRange(unblended, component_range);
+                    break :blk std.math.clamp((native_component - range.min) / decode_span, 0.0, 1.0);
+                } else unblended;
                 switch (samples.data) {
                     .u8 => |bytes| bytes[sample_index] = @intFromFloat(@round(encoded_unit * 255.0)),
                     .u16 => |words| words[sample_index] = @intFromFloat(@round(encoded_unit * @as(f64, @floatFromInt(max_sample)))),
@@ -19373,6 +19527,76 @@ test "indexed Decode preserves the complete palette index range" {
     );
 }
 
+test "spot tint transforms preserve non-unit alternate values" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+
+    var scanner = syntax.Scanner.init(
+        alloc,
+        "[/Separation /Spot [/Indexed /DeviceRGB 2 <ff000000ff000000ff>] << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [2] /N 1 >>]",
+    );
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    var rgba: [4]u8 = undefined;
+    try std.testing.expect(try reader.tryDecodeSpotColorSpaceToRgba(&rgba, 1, &.{255}, color_space.array, null));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, &rgba);
+}
+
+test "ICCBased Lab alternate consumes native component values once" {
+    const alloc = std.testing.allocator;
+    const image_data = &.{ 128, 128, 128 };
+    const content = "q\n1 0 0 1 0 0 cm\n/Im1 Do\nQ\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace [/ICCBased 5 0 R] /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ image_data.len, image_data },
+    );
+    defer alloc.free(image_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /N 3 /Alternate [/Lab << /WhitePoint [0.95047 1 1.08883] /Range [-100 100 -100 100] >>] /Range [0 100 -100 100 -100 100] /Length 0 >>\nstream\nendstream\nendobj\n",
+        image_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageImageRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+
+    const unit = 128.0 / 255.0;
+    const expected = labColor(
+        unit * 100.0,
+        -100.0 + unit * 200.0,
+        -100.0 + unit * 200.0,
+        .{ 0.95047, 1, 1.08883 },
+    );
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqualSlices(u8, &expected, runs[0].rgba[0..4]);
+}
+
 test "reader rejects cyclic ICCBased image alternates" {
     const alloc = std.testing.allocator;
     const image_data = "\x00";
@@ -22224,6 +22448,25 @@ test "native Matte reversal precedes PDF Decode mapping" {
     try std.testing.expect(samples[0] < 2);
     try std.testing.expect(rgba[0] > 253);
     try std.testing.expectEqual(@as(u8, 0xff), rgba[3]);
+}
+
+test "native Matte reversal uses non-unit ICC Decode domain" {
+    var samples = [_]u8{128};
+    const mask = [_]u8{ 128, 128, 128, 255 };
+    const decode_values = [_]syntax.Object{ .{ .integer = 2 }, .{ .integer = 4 } };
+    const decode = syntax.Object{ .array = @constCast(&decode_values) };
+    try applyResampledMatteToSamples(.{
+        .data = .{ .u8 = &samples },
+        .pixel_count = 1,
+        .component_count = 1,
+        .stride = 1,
+        .bits_per_component = 8,
+    }, 1, 1, &mask, 1, 1, false, .{
+        .component_count = 1,
+        .components = .{ 0, 0, 0, 0 },
+        .ranges = .{ .{ .min = 2, .max = 4 }, .{}, .{}, .{} },
+    }, &decode);
+    try std.testing.expect(samples[0] > 253);
 }
 
 test "mask decode context rejects an active reference immediately" {
