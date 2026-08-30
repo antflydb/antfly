@@ -3096,9 +3096,20 @@ fn rc4Crypt(key: []const u8, bytes: []u8) void {
     }
 }
 
-fn decryptAesV2Alloc(alloc: Allocator, encrypted: []const u8, key: [16]u8) ![]u8 {
+fn decryptAesV2AllocWithLimits(
+    alloc: Allocator,
+    encrypted: []const u8,
+    key: [16]u8,
+    max_plaintext_bytes: usize,
+    max_working_bytes: usize,
+) ![]u8 {
     if (encrypted.len < 32 or (encrypted.len - 16) % 16 != 0) return error.InvalidEncryptedPdf;
     const ciphertext = encrypted[16..];
+    if (ciphertext.len > max_working_bytes) return error.PdfDecodeWorkingSetTooLarge;
+    // PKCS#7 padding occupies between one and sixteen bytes. Reject streams
+    // that cannot possibly fit before allocating the block-aligned scratch.
+    const minimum_plaintext_len = ciphertext.len - 16;
+    if (minimum_plaintext_len > max_plaintext_bytes) return error.DecodedStreamTooLarge;
     var plaintext = try alloc.alloc(u8, ciphertext.len);
     errdefer alloc.free(plaintext);
     const aes = std.crypto.core.aes.Aes128.initDec(key);
@@ -3115,9 +3126,19 @@ fn decryptAesV2Alloc(alloc: Allocator, encrypted: []const u8, key: [16]u8) ![]u8
     const padding = plaintext[plaintext.len - 1];
     if (padding == 0 or padding > 16 or padding > plaintext.len) return error.InvalidEncryptedPdf;
     for (plaintext[plaintext.len - padding ..]) |value| if (value != padding) return error.InvalidEncryptedPdf;
-    const result = try alloc.dupe(u8, plaintext[0 .. plaintext.len - padding]);
-    alloc.free(plaintext);
-    return result;
+    const plaintext_len = plaintext.len - padding;
+    if (plaintext_len > max_plaintext_bytes) return error.DecodedStreamTooLarge;
+    return try alloc.realloc(plaintext, plaintext_len);
+}
+
+fn decryptAesV2Alloc(alloc: Allocator, encrypted: []const u8, key: [16]u8) ![]u8 {
+    return try decryptAesV2AllocWithLimits(
+        alloc,
+        encrypted,
+        key,
+        std.math.maxInt(usize),
+        std.math.maxInt(usize),
+    );
 }
 
 fn decryptRc4Alloc(alloc: Allocator, encrypted: []const u8, key: ObjectEncryptionKey) ![]u8 {
@@ -3164,7 +3185,10 @@ pub const Reader = struct {
     font_cache: *std.AutoHashMapUnmanaged(u64, PageFont),
     image_cache: ?*DecodedImageCache = null,
     encryption: ?EncryptionContext = null,
-    decrypted_streams: *std.AutoHashMapUnmanaged(usize, []u8),
+    /// Stream payloads are decrypted lazily so decode limits can be applied
+    /// before allocating. The object reference is all that is retained: it is
+    /// needed to derive the per-object encryption key at raw-read time.
+    encrypted_streams: *std.AutoHashMapUnmanaged(usize, syntax.ObjRef),
     image_decode_target: ?ImageDecodeTarget = null,
     /// Resource dictionary that gives names and Default* substitutions their
     /// dynamic meaning while an image XObject is decoded. Scoped Reader
@@ -3299,13 +3323,13 @@ pub const Reader = struct {
         };
         image_cache.* = .{};
 
-        const decrypted_streams = alloc.create(std.AutoHashMapUnmanaged(usize, []u8)) catch |err| {
+        const encrypted_streams = alloc.create(std.AutoHashMapUnmanaged(usize, syntax.ObjRef)) catch |err| {
             alloc.destroy(image_cache);
             alloc.destroy(font_cache);
             alloc.free(xref_entries);
             return err;
         };
-        decrypted_streams.* = .empty;
+        encrypted_streams.* = .empty;
 
         const owned_trailer = trailer.?;
         trailer = null;
@@ -3322,7 +3346,7 @@ pub const Reader = struct {
             .font_cache = font_cache,
             .image_cache = image_cache,
             .encryption = null,
-            .decrypted_streams = decrypted_streams,
+            .encrypted_streams = encrypted_streams,
             .cancellation = cancellation,
         };
         errdefer reader.deinit();
@@ -3345,10 +3369,8 @@ pub const Reader = struct {
             cache.deinit(self.alloc);
             self.alloc.destroy(cache);
         }
-        var stream_iter = self.decrypted_streams.valueIterator();
-        while (stream_iter.next()) |stream| self.alloc.free(stream.*);
-        self.decrypted_streams.deinit(self.alloc);
-        self.alloc.destroy(self.decrypted_streams);
+        self.encrypted_streams.deinit(self.alloc);
+        self.alloc.destroy(self.encrypted_streams);
         self.alloc.free(self.xref_entries);
         self.trailer.deinit(self.alloc);
         self.* = undefined;
@@ -3477,17 +3499,10 @@ pub const Reader = struct {
             .dict => |entries| for (entries) |*entry| try self.decryptObject(&entry.value, ptr),
             .stream => |stream| {
                 for (stream.header) |*entry| try self.decryptObject(&entry.value, ptr);
-                if (!self.decrypted_streams.contains(stream.data_offset)) {
-                    const data_length = try self.resolvedStreamDataLength(obj);
-                    const end = std.math.add(usize, stream.data_offset, data_length) catch return error.InvalidObjectOffset;
-                    if (end > self.bytes.len) return error.InvalidObjectOffset;
-                    const decrypted = switch (context.method) {
-                        .rc4 => try decryptRc4Alloc(self.alloc, self.bytes[stream.data_offset..end], key),
-                        .aesv2 => try decryptAesV2Alloc(self.alloc, self.bytes[stream.data_offset..end], key.bytes),
-                    };
-                    errdefer self.alloc.free(decrypted);
-                    try self.decrypted_streams.put(self.alloc, stream.data_offset, decrypted);
-                }
+                // Do not decrypt or retain stream payloads during object
+                // resolution. The downstream raw read knows both its terminal
+                // output allowance and its complete working-set allowance.
+                try self.encrypted_streams.put(self.alloc, stream.data_offset, ptr);
             },
             else => {},
         }
@@ -3522,17 +3537,44 @@ pub const Reader = struct {
     }
 
     fn readRawStreamDataWithLimit(self: *const Reader, obj: *const syntax.Object, max_bytes: usize) ![]u8 {
+        return try self.readRawStreamDataWithLimits(obj, max_bytes, max_bytes);
+    }
+
+    fn readRawStreamDataWithLimits(
+        self: *const Reader,
+        obj: *const syntax.Object,
+        max_output_bytes: usize,
+        max_working_bytes: usize,
+    ) ![]u8 {
         if (obj.* != .stream) return error.NotAStream;
         const stream_value = obj.stream;
-        if (self.decrypted_streams.get(stream_value.data_offset)) |decrypted| {
-            if (decrypted.len > max_bytes) return error.PdfDecodeWorkingSetTooLarge;
-            return try self.alloc.dupe(u8, decrypted);
-        }
         const data_length = try self.resolvedStreamDataLength(obj);
-        if (data_length > max_bytes) return error.PdfDecodeWorkingSetTooLarge;
         const end = std.math.add(usize, stream_value.data_offset, data_length) catch return error.InvalidObjectOffset;
         if (end > self.bytes.len) return error.InvalidObjectOffset;
-        return try self.alloc.dupe(u8, self.bytes[stream_value.data_offset..end]);
+        const encoded = self.bytes[stream_value.data_offset..end];
+
+        if (self.encrypted_streams.get(stream_value.data_offset)) |ptr| {
+            const context = self.encryption orelse return error.InvalidEncryptedPdf;
+            const key = objectEncryptionKey(context.file_key, context.file_key_len, ptr, context.method);
+            return switch (context.method) {
+                .rc4 => blk: {
+                    if (encoded.len > max_working_bytes) return error.PdfDecodeWorkingSetTooLarge;
+                    if (encoded.len > max_output_bytes) return error.DecodedStreamTooLarge;
+                    break :blk try decryptRc4Alloc(self.alloc, encoded, key);
+                },
+                .aesv2 => try decryptAesV2AllocWithLimits(
+                    self.alloc,
+                    encoded,
+                    key.bytes,
+                    max_output_bytes,
+                    max_working_bytes,
+                ),
+            };
+        }
+
+        if (data_length > max_working_bytes) return error.PdfDecodeWorkingSetTooLarge;
+        if (data_length > max_output_bytes) return error.DecodedStreamTooLarge;
+        return try self.alloc.dupe(u8, encoded);
     }
 
     fn resolvedStreamDataLength(self: *const Reader, obj: *const syntax.Object) !usize {
@@ -3566,27 +3608,23 @@ pub const Reader = struct {
         try self.checkCancellation();
         if (obj.* != .stream) return error.NotAStream;
         const filter_obj = obj.get("Filter");
+        const has_filters = if (filter_obj) |filter| switch (filter.*) {
+            .array => |items| items.len != 0,
+            else => true,
+        } else false;
         const bounded_final_limit = if (final_output_limit) |limit|
             @min(limit, decode_limits.max_decoded_stream_bytes)
         else
             null;
-        // An unfiltered stream's encoded and decoded representations are the
-        // same. For encrypted objects, however, /Length describes ciphertext
-        // (including AES IV and padding), while the cache contains the actual
-        // decoded plaintext that readRawStreamDataWithLimit will return.
-        if (filter_obj == null) if (bounded_final_limit) |limit| {
-            const stream_data_len = if (self.decrypted_streams.get(obj.stream.data_offset)) |decrypted|
-                decrypted.len
-            else
-                try self.resolvedStreamDataLength(obj);
-            if (stream_data_len > limit)
-                return error.DecodedStreamTooLarge;
-        };
-        const raw_limit = if (filter_obj == null and bounded_final_limit != null)
+        const raw_output_limit = if (!has_filters and bounded_final_limit != null)
             @min(decode_limits.max_working_set_bytes, bounded_final_limit.?)
         else
             decode_limits.max_working_set_bytes;
-        const raw = try self.readRawStreamDataWithLimit(obj, raw_limit);
+        const raw = try self.readRawStreamDataWithLimits(
+            obj,
+            raw_output_limit,
+            decode_limits.max_working_set_bytes,
+        );
         const decoded = try decodeStreamFiltersOwnedAllocWithFinalLimit(
             self.alloc,
             raw,
@@ -4769,6 +4807,55 @@ pub const Reader = struct {
             if (entry.ptr.id == ptr.id and entry.ptr.gen == ptr.gen) return entry;
         }
         return null;
+    }
+
+    fn indirectObjectMayBeString(self: *const Reader, ptr: syntax.ObjRef) bool {
+        const entry = self.findXref(ptr) orelse return true;
+        // Object streams cannot contain stream objects, so an Indexed lookup
+        // stored there can only be the string form. Keep that path bounded.
+        if (entry.compressed_obj_stream_id != null) return true;
+        if (entry.offset >= self.bytes.len) return true;
+
+        var cursor = entry.offset;
+        var token_index: usize = 0;
+        while (token_index < 3) : (token_index += 1) {
+            while (cursor < self.bytes.len) {
+                if (isPdfWhitespace(self.bytes[cursor])) {
+                    cursor += 1;
+                    continue;
+                }
+                if (self.bytes[cursor] == '%') {
+                    while (cursor < self.bytes.len and self.bytes[cursor] != '\r' and self.bytes[cursor] != '\n')
+                        cursor += 1;
+                    continue;
+                }
+                break;
+            }
+            const start = cursor;
+            while (cursor < self.bytes.len and
+                !isPdfWhitespace(self.bytes[cursor]) and
+                self.bytes[cursor] != '%' and
+                std.mem.indexOfScalar(u8, "()<>[]{}/", self.bytes[cursor]) == null)
+                cursor += 1;
+            if (start == cursor) return true;
+            if (token_index == 2 and !std.mem.eql(u8, self.bytes[start..cursor], "obj")) return true;
+        }
+        while (cursor < self.bytes.len) {
+            if (isPdfWhitespace(self.bytes[cursor])) {
+                cursor += 1;
+                continue;
+            }
+            if (self.bytes[cursor] == '%') {
+                while (cursor < self.bytes.len and self.bytes[cursor] != '\r' and self.bytes[cursor] != '\n')
+                    cursor += 1;
+                continue;
+            }
+            break;
+        }
+        if (cursor >= self.bytes.len) return true;
+        if (self.bytes[cursor] == '(') return true;
+        return self.bytes[cursor] == '<' and
+            (cursor + 1 >= self.bytes.len or self.bytes[cursor + 1] != '<');
     }
 
     fn readCompressedObject(self: *const Reader, ptr: syntax.ObjRef, obj_stream_id: u32, obj_index: usize) anyerror!syntax.Object {
@@ -8524,10 +8611,35 @@ pub const Reader = struct {
             parent_live_bytes,
             &.{reserve_bytes},
         );
+        var lookup_owner_live_bytes: usize = 0;
         const lookup_obj: *const syntax.Object = blk: {
             const candidate = &color_space[3];
             if (candidate.* == .obj_ref) {
-                result.lookup_owner = try self.resolveValue(candidate);
+                if (self.indirectObjectMayBeString(candidate.obj_ref)) {
+                    // Indirect strings are attacker-controlled objects, while
+                    // an Indexed lookup can contain at most 256 four-component
+                    // entries. Resolve through the same aggregate allocator so
+                    // parser temporaries and the ownership clone cannot exceed
+                    // the image budget before the object is validated.
+                    var resolve_budget = DecodeBudgetAllocator.init(
+                        self.alloc,
+                        retained_live_bytes,
+                        self.decode_limits.max_working_set_bytes,
+                    );
+                    var bounded_reader = self.*;
+                    bounded_reader.alloc = resolve_budget.allocator();
+                    result.lookup_owner = bounded_reader.resolveValue(candidate) catch |err| {
+                        if (err == error.OutOfMemory and resolve_budget.limit_exceeded)
+                            return error.PdfDecodeWorkingSetTooLarge;
+                        return err;
+                    };
+                    lookup_owner_live_bytes = resolve_budget.live_bytes - retained_live_bytes;
+                } else {
+                    // Stream dictionaries are ordinary object metadata and can
+                    // contain nested DecodeParms. Their payload is bounded
+                    // separately below, after lazy encryption metadata exists.
+                    result.lookup_owner = try self.resolveValue(candidate);
+                }
                 break :blk &result.lookup_owner.?;
             }
             break :blk candidate;
@@ -8535,12 +8647,22 @@ pub const Reader = struct {
         const lookup = switch (lookup_obj.*) {
             .string => lookup_obj.string,
             .stream => blk: {
-                if (retained_live_bytes >= self.decode_limits.max_working_set_bytes)
+                const stream_parent_live_bytes = try decodeWorkingSetTotal(
+                    self.decode_limits.max_working_set_bytes,
+                    retained_live_bytes,
+                    &.{lookup_owner_live_bytes},
+                );
+                if (stream_parent_live_bytes >= self.decode_limits.max_working_set_bytes)
                     return error.PdfDecodeWorkingSetTooLarge;
                 result.decoded_lookup = try self.readDecodedStreamDataWithLimitsAndFinalLimit(lookup_obj, .{
                     .max_decoded_stream_bytes = self.decode_limits.max_decoded_stream_bytes,
-                    .max_working_set_bytes = self.decode_limits.max_working_set_bytes - retained_live_bytes,
+                    .max_working_set_bytes = self.decode_limits.max_working_set_bytes - stream_parent_live_bytes,
                 }, lookup_len);
+                // The decoded lookup is self-contained. Release the indirect
+                // stream dictionary before later color conversion allocations
+                // and keep only the precisely bounded terminal bytes.
+                if (result.lookup_owner) |*owner| owner.deinit(self.alloc);
+                result.lookup_owner = null;
                 break :blk result.decoded_lookup.?;
             },
             else => return error.UnsupportedPdfRendering,
@@ -18031,7 +18153,7 @@ test "recursive page and content collectors are allocation-failure safe" {
     const Runner = struct {
         fn run(alloc: Allocator) !void {
             var font_cache: std.AutoHashMapUnmanaged(u64, PageFont) = .empty;
-            var decrypted_streams: std.AutoHashMapUnmanaged(usize, []u8) = .empty;
+            var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
             var reader = Reader{
                 .alloc = alloc,
                 .bytes = "",
@@ -18041,7 +18163,7 @@ test "recursive page and content collectors are allocation-failure safe" {
                 .xref_entries = &.{},
                 .trailer = .null,
                 .font_cache = &font_cache,
-                .decrypted_streams = &decrypted_streams,
+                .encrypted_streams = &encrypted_streams,
             };
 
             var page_entries = [_]syntax.DictEntry{
@@ -18102,8 +18224,8 @@ test "reader resource collectors release owned elements on allocation failure" {
 
             var font_cache: std.AutoHashMapUnmanaged(u64, PageFont) = .empty;
             defer font_cache.deinit(alloc);
-            var decrypted_streams: std.AutoHashMapUnmanaged(usize, []u8) = .empty;
-            defer decrypted_streams.deinit(alloc);
+            var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
+            defer encrypted_streams.deinit(alloc);
             var reader = Reader{
                 .alloc = alloc,
                 .bytes = "",
@@ -18113,7 +18235,7 @@ test "reader resource collectors release owned elements on allocation failure" {
                 .xref_entries = &.{},
                 .trailer = .null,
                 .font_cache = &font_cache,
-                .decrypted_streams = &decrypted_streams,
+                .encrypted_streams = &encrypted_streams,
             };
 
             const states = try reader.collectExtGStatesFromResourcesAlloc(&resources);
@@ -18534,47 +18656,67 @@ test "AESV2 object data decrypts and removes PKCS7 padding" {
     try std.testing.expectEqualStrings("hello encrypted pdf", decrypted);
 }
 
-test "unfiltered terminal preflight uses cached AES plaintext length" {
+test "unfiltered terminal read decrypts AES lazily within working limits" {
     const alloc = std.testing.allocator;
     var font_cache: std.AutoHashMapUnmanaged(u64, PageFont) = .empty;
     defer font_cache.deinit(alloc);
-    var decrypted_streams: std.AutoHashMapUnmanaged(usize, []u8) = .empty;
-    defer {
-        var values = decrypted_streams.valueIterator();
-        while (values.next()) |value| alloc.free(value.*);
-        decrypted_streams.deinit(alloc);
-    }
-    const data_offset: usize = 17;
-    const cached_plaintext = try alloc.dupe(u8, "abc");
-    decrypted_streams.put(alloc, data_offset, cached_plaintext) catch |err| {
-        alloc.free(cached_plaintext);
-        return err;
+    var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
+    defer encrypted_streams.deinit(alloc);
+    const ptr: syntax.ObjRef = .{ .id = 42, .gen = 3 };
+    const context = EncryptionContext{
+        .file_key = .{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f },
+        .file_key_len = 16,
+        .method = .aesv2,
     };
+    const key = objectEncryptionKey(context.file_key, context.file_key_len, ptr, context.method);
+    var encrypted: [32]u8 = undefined;
+    encrypted[0..16].* = .{ 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f };
+    var padded = [_]u8{13} ** 16;
+    @memcpy(padded[0..3], "abc");
+    for (&padded, encrypted[0..16]) |*value, iv| value.* ^= iv;
+    const aes = std.crypto.core.aes.Aes128.initEnc(key.bytes);
+    var ciphertext: [16]u8 = undefined;
+    aes.encrypt(&ciphertext, &padded);
+    encrypted[16..32].* = ciphertext;
+    try encrypted_streams.put(alloc, 0, ptr);
+
     var reader = Reader{
         .alloc = alloc,
-        .bytes = "",
+        .bytes = &encrypted,
         .decode_limits = .{},
         .version_minor = 7,
         .startxref_offset = 0,
         .xref_entries = &.{},
         .trailer = .null,
         .font_cache = &font_cache,
-        .decrypted_streams = &decrypted_streams,
+        .encryption = context,
+        .encrypted_streams = &encrypted_streams,
     };
     var header = [_]syntax.DictEntry{
         .{ .key = @constCast("Length"), .value = .{ .integer = 32 } },
     };
     var stream: syntax.Object = .{ .stream = .{
         .header = &header,
-        .data_offset = data_offset,
+        .data_offset = 0,
         .data_length = 32,
     } };
 
     // AESV2 /Length includes the 16-byte IV and block padding, but the
-    // terminal palette limit applies to the cached plaintext.
-    const decoded = try reader.readDecodedStreamDataWithLimitsAndFinalLimit(&stream, .{}, 3);
+    // terminal palette limit applies to plaintext. Only one block of scratch
+    // is needed and no decrypted payload is retained on the Reader.
+    const limits = DecodeLimits{ .max_decoded_stream_bytes = 32, .max_working_set_bytes = 16 };
+    const decoded = try reader.readDecodedStreamDataWithLimitsAndFinalLimit(&stream, limits, 3);
     defer alloc.free(decoded);
     try std.testing.expectEqualStrings("abc", decoded);
+    try std.testing.expectEqual(@as(usize, 1), encrypted_streams.count());
+    try std.testing.expectError(
+        error.PdfDecodeWorkingSetTooLarge,
+        reader.readDecodedStreamDataWithLimitsAndFinalLimit(
+            &stream,
+            .{ .max_decoded_stream_bytes = 32, .max_working_set_bytes = 15 },
+            3,
+        ),
+    );
 }
 
 test "RC4 object data decrypts with the unsalted object key" {
@@ -22462,6 +22604,54 @@ test "Indexed palette stream decode reserves retained image working set" {
     );
 }
 
+test "Indexed indirect lookup strings resolve within the aggregate working set" {
+    const alloc = std.testing.allocator;
+    const valid_objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        "3 0 obj\n(abc)\nendobj\n",
+    };
+    const valid_sample = try buildImageDecodeTestPdfAlloc(alloc, &valid_objects);
+    defer alloc.free(valid_sample);
+    var valid_reader = try Reader.initWithDecodeLimits(alloc, valid_sample, .{
+        .max_decoded_stream_bytes = 64,
+        .max_working_set_bytes = 1024,
+    });
+    defer valid_reader.deinit();
+    var scanner = syntax.Scanner.init(alloc, "[/Indexed /DeviceRGB 0 3 0 R]");
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    var palette = try valid_reader.resolveIndexedPaletteAlloc(color_space.array, 0, .palette_rgba);
+    defer palette.deinit(alloc);
+    try std.testing.expectEqualStrings("abc", palette.lookup);
+
+    const oversized_lookup = "a" ** 128;
+    const oversized_object = try std.fmt.allocPrint(
+        alloc,
+        "3 0 obj\n({s})\nendobj\n",
+        .{oversized_lookup},
+    );
+    defer alloc.free(oversized_object);
+    const oversized_objects = [_][]const u8{
+        valid_objects[0],
+        valid_objects[1],
+        oversized_object,
+    };
+    const oversized_sample = try buildImageDecodeTestPdfAlloc(alloc, &oversized_objects);
+    defer alloc.free(oversized_sample);
+    var constrained_reader = try Reader.initWithDecodeLimits(alloc, oversized_sample, .{
+        .max_decoded_stream_bytes = 64,
+        .max_working_set_bytes = 64,
+    });
+    defer constrained_reader.deinit();
+    try std.testing.expectError(
+        error.PdfDecodeWorkingSetTooLarge,
+        constrained_reader.resolveIndexedPaletteAlloc(color_space.array, 0, .palette_rgba),
+    );
+}
+
 test "Indexed palette terminal limit permits larger intermediate filters" {
     const alloc = std.testing.allocator;
     const lookup = [_]u8{ 0x12, 0x34, 0x56 };
@@ -22518,6 +22708,28 @@ test "Indexed unfiltered palette is rejected before copying excess data" {
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
         "3 0 obj\n<< /Length 6 >>\nstream\nabcdef\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var scanner = syntax.Scanner.init(alloc, "[/Indexed /DeviceRGB 0 3 0 R]");
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    try std.testing.expectError(
+        error.DecodedStreamTooLarge,
+        reader.resolveIndexedPaletteAlloc(color_space.array, 0, .palette_rgba),
+    );
+}
+
+test "Indexed empty filter array is preflighted as an unfiltered stream" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        "3 0 obj\n<< /Length 6 /Filter [] >>\nstream\nabcdef\nendstream\nendobj\n",
     };
     const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
     defer alloc.free(sample);
