@@ -994,6 +994,10 @@ pub const StatusSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    /// Routing is carried as one complete capability. Admin-only sources leave
+    /// it null; production constructors never assemble it from independent
+    /// optional callbacks.
+    routing: ?table_catalog.CatalogRoutingSource = null,
 
     pub const VTable = struct {
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
@@ -1077,6 +1081,22 @@ pub const StatusSource = struct {
     pub fn freeRoutingSnapshot(self: StatusSource, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
         const fn_ptr = self.vtable.free_routing_snapshot orelse unreachable;
         fn_ptr(self.ptr, snapshot);
+    }
+
+    /// Return routing only when capture, authoritative confirmation, and
+    /// release are all present. The legacy vtable assembly remains for test
+    /// fixtures during migration, but partial capabilities fail closed.
+    pub fn routingSource(self: StatusSource) ?table_catalog.CatalogRoutingSource {
+        if (self.routing) |routing| return routing;
+        const eventual = self.vtable.routing_snapshot orelse return null;
+        const linearizable = self.vtable.linearizable_routing_snapshot orelse return null;
+        const release = self.vtable.free_routing_snapshot orelse return null;
+        return .{
+            .ptr = self.ptr,
+            .eventual_snapshot = eventual,
+            .linearizable_snapshot = linearizable,
+            .free_snapshot = release,
+        };
     }
 
     pub fn createTable(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
@@ -1404,11 +1424,19 @@ pub const StatusSource = struct {
     }
 
     pub fn fromMetadataHttpService(svc: *metadata_service.MetadataHttpService) StatusSource {
-        return .{ .ptr = svc, .vtable = &comptime makeServiceVTable(metadata_service.MetadataHttpService) };
+        return .{
+            .ptr = svc,
+            .vtable = &comptime makeServiceVTable(metadata_service.MetadataHttpService),
+            .routing = table_catalog.CatalogSource.fromMetadataHttpService(svc).routingSource() catch unreachable,
+        };
     }
 
     pub fn fromMetadataService(svc: *metadata_service.MetadataService) StatusSource {
-        return .{ .ptr = svc, .vtable = &comptime makeServiceVTable(metadata_service.MetadataService) };
+        return .{
+            .ptr = svc,
+            .vtable = &comptime makeServiceVTable(metadata_service.MetadataService),
+            .routing = table_catalog.CatalogSource.fromMetadataService(svc).routingSource() catch unreachable,
+        };
     }
 
     pub fn fromMetadataServer(srv: *metadata_server.MetadataServer) StatusSource {
@@ -4227,7 +4255,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn catalogSource(self: *ApiHttpServer) table_catalog.CatalogSource {
-        if (self.source.vtable.linearizable_routing_snapshot == null) {
+        if (self.source.routingSource() == null) {
             return .{
                 .ptr = self,
                 .vtable = &.{
@@ -4246,6 +4274,7 @@ pub const ApiHttpServer = struct {
                 .routing_snapshot = apiHttpServerCatalogRoutingSnapshot,
                 .linearizable_routing_snapshot = apiHttpServerCatalogLinearizableRoutingSnapshot,
                 .free_routing_snapshot = apiHttpServerCatalogFreeRoutingSnapshot,
+                .wait_for_routing_change = apiHttpServerCatalogWaitForRoutingChange,
             },
         };
     }
@@ -6724,17 +6753,26 @@ pub const ApiHttpServer = struct {
 
     fn apiHttpServerCatalogRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.source.routingSnapshot(deadline_ns);
+        const routing = self.source.routingSource() orelse return error.CatalogRoutingUnavailable;
+        return try routing.eventual_snapshot(routing.ptr, deadline_ns);
     }
 
     fn apiHttpServerCatalogLinearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.source.linearizableRoutingSnapshot(deadline_ns);
+        const routing = self.source.routingSource() orelse return error.CatalogRoutingUnavailable;
+        return try routing.linearizable_snapshot(routing.ptr, deadline_ns);
     }
 
     fn apiHttpServerCatalogFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        self.source.freeRoutingSnapshot(snapshot);
+        const routing = self.source.routingSource() orelse unreachable;
+        routing.free_snapshot(routing.ptr, snapshot);
+    }
+
+    fn apiHttpServerCatalogWaitForRoutingChange(ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, probe_interval_ns: u64) !table_catalog.CatalogChangeWaitResult {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const routing = self.source.routingSource() orelse return error.CatalogRoutingUnavailable;
+        return try routing.waitForChange(observed_token, deadline_ns, probe_interval_ns);
     }
 
     fn waitForTableMetadata(
@@ -33466,6 +33504,42 @@ test "status source reports an absent linearizable read capability without faili
         .vtable = &.{ .status = FakeSource.status },
     };
     try std.testing.expect((try source.linearizableSnapshot(.{})) == null);
+}
+
+test "status source rejects every partial routing capability" {
+    const FakeSource = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn snapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{ .tables = &.{}, .ranges = &.{} };
+        }
+
+        fn release(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+    };
+    var fake: u8 = 0;
+
+    const eventual_only: StatusSource = .{ .ptr = &fake, .vtable = &.{
+        .status = FakeSource.status,
+        .routing_snapshot = FakeSource.snapshot,
+    } };
+    try std.testing.expect(eventual_only.routingSource() == null);
+
+    const missing_release: StatusSource = .{ .ptr = &fake, .vtable = &.{
+        .status = FakeSource.status,
+        .routing_snapshot = FakeSource.snapshot,
+        .linearizable_routing_snapshot = FakeSource.snapshot,
+    } };
+    try std.testing.expect(missing_release.routingSource() == null);
+
+    const complete: StatusSource = .{ .ptr = &fake, .vtable = &.{
+        .status = FakeSource.status,
+        .routing_snapshot = FakeSource.snapshot,
+        .linearizable_routing_snapshot = FakeSource.snapshot,
+        .free_routing_snapshot = FakeSource.release,
+    } };
+    try std.testing.expect(complete.routingSource() != null);
 }
 
 test "status source prefers authoritative schema generation result" {

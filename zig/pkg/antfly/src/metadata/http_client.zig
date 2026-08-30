@@ -252,6 +252,49 @@ pub const MetadataHttpClient = struct {
         return try parseJson(metadata_api.CatalogRoutingSnapshot, self.alloc, resp.body);
     }
 
+    pub fn waitForRoutingChange(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        observed_token: metadata_api.CatalogRoutingChangeToken,
+        budget: RequestBudget,
+    ) !std.json.Parsed(metadata_api.CatalogRoutingChangeResult) {
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_routing_change);
+        defer self.alloc.free(uri);
+
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= budget.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+        const remaining_ns = budget.deadline_ns - now_ns;
+        const remaining_ms = @max(
+            @as(u64, 1),
+            (remaining_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms,
+        );
+        var remaining_buf: [32]u8 = undefined;
+        const remaining = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms});
+        const body = try std.json.Stringify.valueAlloc(self.alloc, metadata_api.CatalogRoutingChangeRequest{
+            .observed_token = observed_token,
+        }, .{});
+        defer self.alloc.free(body);
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = routes.routing_remaining_ms_header, .value = remaining },
+        };
+        var resp = self.executeWithRetryBudget(.{
+            .method = .POST,
+            .uri = uri,
+            .body = body,
+            .content_type = "application/json",
+            .headers = headers[0..],
+            .timeout_ms = default_request_timeout_ms,
+        }, budget) catch |err| switch (err) {
+            error.Timeout, error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        };
+        defer resp.deinit(self.alloc);
+        if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
+        if (resp.status == 504) return error.CatalogRoutingSnapshotTimeout;
+        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        return try parseJson(metadata_api.CatalogRoutingChangeResult, self.alloc, resp.body);
+    }
+
     pub fn validateCatalogPublication(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -1043,6 +1086,39 @@ test "metadata linearizable routing client uses compact internal endpoint" {
     });
     defer result.deinit();
     try std.testing.expectEqual(@as(u64, 9), result.value.catalog_revision);
+}
+
+test "metadata routing change client forwards a replica-scoped long poll" {
+    const Executor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_routing_change));
+            _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
+            const parsed = try std.json.parseFromSlice(metadata_api.CatalogRoutingChangeRequest, alloc, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(u64, 17), parsed.value.observed_token.revision);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, "{\"token\":{\"source_id\":0,\"revision\":18},\"changed\":true}"),
+            };
+        }
+    };
+
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    var result = try client.waitForRoutingChange(
+        "http://127.0.0.1:9000",
+        .{ .source_id = 3, .revision = 17 },
+        .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
+    );
+    defer result.deinit();
+    try std.testing.expect(result.value.changed);
+    try std.testing.expectEqual(@as(u64, 18), result.value.token.revision);
 }
 
 test "metadata http client uses the reallocation route and maps upgrade gating" {

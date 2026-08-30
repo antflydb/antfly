@@ -215,8 +215,27 @@ pub const CatalogRoutingSnapshot = struct {
     metadata_group_id: u64 = 0,
     metadata_incarnation: ?MetadataClusterIncarnation = null,
     catalog_revision: u64 = 0,
+    /// Opaque publication observation used only to wait for a newer routing
+    /// projection. Remote adapters assign `source_id` to the replica that
+    /// produced the snapshot so process-local revisions are never compared
+    /// across replicas.
+    change_token: CatalogRoutingChangeToken = .{},
     tables: []table_manager.TableRecord,
     ranges: []table_manager.RangeRecord,
+};
+
+pub const CatalogRoutingChangeToken = struct {
+    source_id: u64 = 0,
+    revision: u64 = 0,
+};
+
+pub const CatalogRoutingChangeRequest = struct {
+    observed_token: CatalogRoutingChangeToken,
+};
+
+pub const CatalogRoutingChangeResult = struct {
+    token: CatalogRoutingChangeToken,
+    changed: bool,
 };
 
 /// Compact catalog values consumed while staging one data-Raft generation.

@@ -827,6 +827,7 @@ const LocalStandaloneMetadata = struct {
     fn statusSource(self: *LocalStandaloneMetadata) antfly.public_api.http_server.StatusSource {
         return .{
             .ptr = self,
+            .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .status = status,
                 .admin_snapshot = catalogAdminSnapshot,
@@ -991,6 +992,7 @@ const LocalStandaloneMetadata = struct {
         return .{
             .metadata_group_id = group_ids.main_metadata_group_id,
             .catalog_revision = self.epoch,
+            .change_token = .{ .revision = self.epoch },
             .tables = tables,
             .ranges = ranges,
         };

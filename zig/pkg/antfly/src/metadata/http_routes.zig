@@ -24,6 +24,7 @@ pub const Routes = struct {
     pub const internal_linearizable_head = "/internal/v1/catalog/linearizable-head";
     pub const internal_linearizable_snapshot = "/internal/v1/catalog/linearizable-snapshot";
     pub const internal_linearizable_routing_snapshot = "/internal/v1/catalog/linearizable-routing-snapshot";
+    pub const internal_routing_change = "/internal/v1/catalog/routing-change";
     pub const runtime_topology = "/metadata/v1/runtime-topology";
     pub const status = "/metadata/v1/status";
     pub const admin_snapshot = "/metadata/v1/admin/snapshot";

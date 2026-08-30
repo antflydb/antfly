@@ -147,6 +147,7 @@ pub const CatalogProjectionReader = struct {
             .metadata_group_id = metadata_group_id,
             .metadata_incarnation = snapshot.metadata_incarnation,
             .catalog_revision = snapshot.catalog_revision,
+            .change_token = .{ .revision = self.cache.catalog_epoch },
             .tables = tables,
             .ranges = try cloneRanges(alloc, snapshot.ranges, deadline_ns),
         };

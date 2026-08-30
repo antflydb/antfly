@@ -15765,6 +15765,7 @@ const RemoteMetadataSource = struct {
                 .routing_snapshot = remoteRoutingSnapshot,
                 .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
+                .wait_for_routing_change = remoteWaitForRoutingChange,
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = remoteValidateCatalogPublication,
                 .validate_table_publication = remoteValidateCatalogTablePublication,
@@ -15775,6 +15776,7 @@ const RemoteMetadataSource = struct {
     fn statusSource(self: *RemoteMetadataSource) antfly.public_api.http_server.StatusSource {
         return .{
             .ptr = self,
+            .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
@@ -16086,6 +16088,10 @@ const RemoteMetadataSource = struct {
                 .metadata_group_id = parsed.value.metadata_group_id,
                 .metadata_incarnation = parsed.value.metadata_incarnation,
                 .catalog_revision = parsed.value.catalog_revision,
+                .change_token = .{
+                    .source_id = index + 1,
+                    .revision = parsed.value.change_token.revision,
+                },
                 .tables = tables,
                 .ranges = try cloneRangesOwned(self.alloc, parsed.value.ranges),
             };
@@ -16101,6 +16107,43 @@ const RemoteMetadataSource = struct {
         freeTablesOwned(self.alloc, snapshot.tables);
         freeRangesOwned(self.alloc, snapshot.ranges);
         snapshot.* = undefined;
+    }
+
+    fn remoteWaitForRoutingChange(ptr: *anyopaque, observed_token: antfly.metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, probe_interval_ns: u64) !antfly.public_api.table_catalog.CatalogChangeWaitResult {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const budget = antfly.metadata_http_client.RequestBudget{ .deadline_ns = deadline_ns };
+        const index = if (observed_token.source_id > 0 and observed_token.source_id <= self.base_uris.len)
+            observed_token.source_id - 1
+        else
+            self.preferred_read_uri_index;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        var metadata_client = self.metadataClient(arena.allocator());
+        var parsed = metadata_client.waitForRoutingChange(
+            self.base_uris[index],
+            .{ .revision = observed_token.revision },
+            budget,
+        ) catch |err| {
+            if (err != error.UnsupportedOperation and
+                err != error.Timeout and err != error.DeadlineExceeded and
+                err != error.Cancelled and err != error.CatalogRoutingSnapshotTimeout)
+            {
+                // Re-resolve through normal replica failover rather than
+                // comparing this process-local token on another replica.
+                return .changed;
+            }
+            if (err != error.UnsupportedOperation) return .deadline_reached;
+            // Rolling upgrades retain bounded probing until this replica
+            // advertises the long-poll endpoint.
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) return .deadline_reached;
+            const wait_ns = @min(deadline_ns - now_ns, @max(probe_interval_ns, std.time.ns_per_ms));
+            platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
+            return if (platform_time.monotonicNs() >= deadline_ns) .deadline_reached else .changed;
+        };
+        defer parsed.deinit();
+        self.noteMetadataReadSuccess(index);
+        return if (parsed.value.changed) .changed else .deadline_reached;
     }
 
     fn remoteCachedAdminSnapshot(ptr: *anyopaque) !?antfly.metadata_api.AdminSnapshot {

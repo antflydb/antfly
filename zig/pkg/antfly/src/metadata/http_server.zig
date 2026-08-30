@@ -87,6 +87,8 @@ pub const AdminSource = struct {
         routing_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = unsupportedRoutingSnapshot,
         linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
+        routing_change_token: ?*const fn (ptr: *anyopaque) u64 = null,
+        wait_for_routing_change: ?*const fn (ptr: *anyopaque, observed_token: u64, deadline_ns: u64) anyerror!bool = null,
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
         validate_table_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) anyerror!bool = null,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
@@ -172,6 +174,16 @@ pub const AdminSource = struct {
 
     pub fn freeRoutingSnapshot(self: AdminSource, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
         self.vtable.free_routing_snapshot(self.ptr, snapshot);
+    }
+
+    pub fn routingChangeToken(self: AdminSource) !u64 {
+        const token = self.vtable.routing_change_token orelse return error.UnsupportedOperation;
+        return token(self.ptr);
+    }
+
+    pub fn waitForRoutingChange(self: AdminSource, observed_token: u64, deadline_ns: u64) !bool {
+        const wait = self.vtable.wait_for_routing_change orelse return error.UnsupportedOperation;
+        return try wait(self.ptr, observed_token, deadline_ns);
     }
 
     pub fn validatePublication(self: AdminSource, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -355,6 +367,8 @@ pub const AdminSource = struct {
                 .routing_snapshot = metadataServiceRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
+                .routing_change_token = metadataServiceRoutingChangeToken,
+                .wait_for_routing_change = metadataServiceWaitForRoutingChange,
                 .validate_publication = metadataServiceValidatePublication,
                 .validate_table_publication = metadataServiceValidateTablePublication,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
@@ -403,6 +417,8 @@ pub const AdminSource = struct {
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
+                .routing_change_token = metadataHttpServiceRoutingChangeToken,
+                .wait_for_routing_change = metadataHttpServiceWaitForRoutingChange,
                 .validate_publication = metadataHttpServiceValidatePublication,
                 .validate_table_publication = metadataHttpServiceValidateTablePublication,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
@@ -507,6 +523,16 @@ pub const AdminSource = struct {
     fn metadataServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         svc.freeCatalogRoutingSnapshot(snapshot);
+    }
+
+    fn metadataServiceRoutingChangeToken(ptr: *anyopaque) u64 {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        return svc.catalogRoutingChangeToken();
+    }
+
+    fn metadataServiceWaitForRoutingChange(ptr: *anyopaque, observed_token: u64, deadline_ns: u64) !bool {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        return try svc.waitForCatalogRoutingChange(observed_token, deadline_ns);
     }
 
     fn metadataServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -887,6 +913,16 @@ pub const AdminSource = struct {
         svc.freeCatalogRoutingSnapshot(snapshot);
     }
 
+    fn metadataHttpServiceRoutingChangeToken(ptr: *anyopaque) u64 {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return svc.catalogRoutingChangeToken();
+    }
+
+    fn metadataHttpServiceWaitForRoutingChange(ptr: *anyopaque, observed_token: u64, deadline_ns: u64) !bool {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try svc.waitForCatalogRoutingChange(observed_token, deadline_ns);
+    }
+
     fn metadataHttpServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         // Followers use Raft's built-in ReadIndex forwarding and wait until
@@ -1229,6 +1265,7 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_linearizable_head, httpx.Handler.bind(self, metadataLinearizableHead));
         try server.post(routes.Routes.internal_linearizable_snapshot, httpx.Handler.bind(self, metadataLinearizableSnapshot));
         try server.post(routes.Routes.internal_linearizable_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableRoutingSnapshot));
+        try server.post(routes.Routes.internal_routing_change, httpx.Handler.bind(self, metadataRoutingChange));
         try server.get(routes.Routes.runtime_topology, httpx.Handler.bind(self, metadataRuntimeTopology));
         try server.get(routes.Routes.status, httpx.Handler.bind(self, metadataStatus));
         try server.get(routes.Routes.admin_snapshot, httpx.Handler.bind(self, metadataSnapshot));
@@ -1438,6 +1475,21 @@ pub const MetadataHttpServer = struct {
         defer self.source.freeRoutingSnapshot(&result);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return self.trackedJson(ctx, result);
+    }
+
+    fn metadataRoutingChange(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        const body = (try ctx.body()) orelse "";
+        const parsed = std.json.parseFromSlice(metadata_api.CatalogRoutingChangeRequest, ctx.allocator, body, .{}) catch
+            return ctx.status(400).text("invalid routing change request");
+        defer parsed.deinit();
+        const deadline_ns = ctx.application_deadline_ns orelse return ctx.status(400).text("routing deadline required");
+        const changed = self.source.waitForRoutingChange(parsed.value.observed_token.revision, deadline_ns) catch |err|
+            return metadataReadError(ctx, err);
+        return self.trackedJson(ctx, metadata_api.CatalogRoutingChangeResult{
+            .token = .{ .revision = self.source.routingChangeToken() catch |err| return metadataReadError(ctx, err) },
+            .changed = changed,
+        });
     }
 
     fn metadataRuntimeTopology(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -3286,6 +3338,7 @@ test "metadata http server reports reallocation protocol upgrade gating" {
 test "metadata routing server converts relative budget to local deadline" {
     const RoutingSource = struct {
         observed_deadline_ns: ?u64 = null,
+        observed_change_token: ?u64 = null,
 
         fn iface(self: *@This()) AdminSource {
             return .{ .ptr = self, .vtable = &.{
@@ -3295,6 +3348,8 @@ test "metadata routing server converts relative budget to local deadline" {
                 .routing_snapshot = routingSnapshot,
                 .linearizable_routing_snapshot = linearizableRoutingSnapshot,
                 .free_routing_snapshot = freeRoutingSnapshot,
+                .routing_change_token = routingChangeToken,
+                .wait_for_routing_change = waitForRoutingChange,
             } };
         }
 
@@ -3319,6 +3374,17 @@ test "metadata routing server converts relative budget to local deadline" {
         }
 
         fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+
+        fn routingChangeToken(_: *anyopaque) u64 {
+            return 9;
+        }
+
+        fn waitForRoutingChange(ptr: *anyopaque, observed_token: u64, deadline_ns: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observed_change_token = observed_token;
+            self.observed_deadline_ns = deadline_ns;
+            return true;
+        }
     };
 
     var source = RoutingSource{};
@@ -3354,6 +3420,26 @@ test "metadata routing server converts relative budget to local deadline" {
     const linearizable_observed = source.observed_deadline_ns orelse return error.TestExpectedDeadline;
     try std.testing.expect(linearizable_observed >= linearizable_before_ns + 125 * std.time.ns_per_ms);
     try std.testing.expect(linearizable_observed <= platform_time.monotonicNs() + 125 * std.time.ns_per_ms);
+
+    source.observed_deadline_ns = null;
+    var change_request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        routes.Routes.internal_routing_change,
+    );
+    defer change_request.deinit();
+    change_request.body = "{\"observed_token\":{\"source_id\":4,\"revision\":8}}";
+    try change_request.headers.append(routes.routing_remaining_ms_header, "100");
+    var change_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &change_request);
+    defer change_ctx.deinit();
+    var change_response = try server.metadataRoutingChange(&change_ctx);
+    defer change_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), change_response.status.code);
+    try std.testing.expectEqual(@as(?u64, 8), source.observed_change_token);
+    const parsed_change = try std.json.parseFromSlice(metadata_api.CatalogRoutingChangeResult, std.testing.allocator, change_response.body.?, .{});
+    defer parsed_change.deinit();
+    try std.testing.expect(parsed_change.value.changed);
+    try std.testing.expectEqual(@as(u64, 9), parsed_change.value.token.revision);
 }
 
 test "metadata http server serves status and filtered admin routes" {

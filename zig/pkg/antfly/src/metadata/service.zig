@@ -2165,6 +2165,25 @@ pub const MetadataService = struct {
         self.lifecycle_signal.wait(observed, timeout_ns);
     }
 
+    pub fn catalogRoutingChangeToken(self: *const MetadataService) u64 {
+        return self.catalog_epoch.load(.acquire);
+    }
+
+    /// Wait for an actual table/range projection change. Lifecycle wakes for
+    /// unrelated metadata are filtered by the catalog epoch, and the epoch is
+    /// checked on both sides of signal capture to avoid a lost wakeup.
+    pub fn waitForCatalogRoutingChange(self: *MetadataService, observed_epoch: u64, deadline_ns: u64) !bool {
+        try self.ensureLifecycleListenerRegistered();
+        while (self.catalog_epoch.load(.acquire) == observed_epoch) {
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) return false;
+            const signal = self.lifecycle_signal.snapshot(null);
+            if (self.catalog_epoch.load(.acquire) != observed_epoch) return true;
+            self.lifecycle_signal.wait(signal, deadline_ns - now_ns);
+        }
+        return true;
+    }
+
     pub fn setLifecycleReconcileHook(self: *MetadataService, hook: ?LifecycleReconcileHook) void {
         self.lifecycle_reconcile_hook = hook;
         self.lifecycle_reconcile_requested.store(true, .release);
@@ -3960,6 +3979,22 @@ pub const MetadataHttpService = struct {
 
     pub fn waitForLifecycleSignal(self: *MetadataHttpService, observed: LifecycleSignal.Snapshot, timeout_ns: u64) void {
         self.lifecycle_signal.wait(observed, timeout_ns);
+    }
+
+    pub fn catalogRoutingChangeToken(self: *const MetadataHttpService) u64 {
+        return self.catalog_epoch.load(.acquire);
+    }
+
+    pub fn waitForCatalogRoutingChange(self: *MetadataHttpService, observed_epoch: u64, deadline_ns: u64) !bool {
+        try self.ensureLifecycleListenerRegistered();
+        while (self.catalog_epoch.load(.acquire) == observed_epoch) {
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) return false;
+            const signal = self.lifecycle_signal.snapshot(null);
+            if (self.catalog_epoch.load(.acquire) != observed_epoch) return true;
+            self.lifecycle_signal.wait(signal, deadline_ns - now_ns);
+        }
+        return true;
     }
 
     pub fn setLifecycleReconcileHook(self: *MetadataHttpService, hook: ?LifecycleReconcileHook) void {
