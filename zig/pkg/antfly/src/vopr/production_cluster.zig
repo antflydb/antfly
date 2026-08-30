@@ -383,6 +383,24 @@ pub const Fixture = struct {
     global_query_transport_target_configured: bool = false,
     global_query_transport_fault_endpoint: ?std.Io.net.IpAddress = null,
     global_query_route_index: usize = 1,
+    global_query_owner_restart_armed: bool = false,
+    global_query_owner_restart_boundary_observed: bool = false,
+    global_query_owner_restart_target_index: usize = 0,
+    global_query_owner_restart_target_configured: bool = false,
+    global_query_owner_restart_down: bool = false,
+    global_query_owner_restart_rejected_without_partial: bool = false,
+    global_query_owner_restart_rejected_status: u16 = 0,
+    global_query_owner_restart_reconstructed: bool = false,
+    global_query_owner_restart_direct_read: bool = false,
+    global_query_owner_restart_recovered: bool = false,
+    global_query_owner_restart_recovered_status: u16 = 0,
+    global_query_owner_restart_sound: bool = false,
+    global_query_restart_requested: std.Io.Semaphore = .{},
+    global_query_restart_down: std.Io.Semaphore = .{},
+    global_query_restart_recover: std.Io.Semaphore = .{},
+    global_query_restart_recovered: std.Io.Semaphore = .{},
+    global_query_restart_future: ?std.Io.Future(void) = null,
+    global_query_owner_restart_failure: ?anyerror = null,
     join_sound: bool = false,
     split_join_sound: bool = false,
     post_split_join_sound: bool = false,
@@ -574,6 +592,7 @@ pub const Fixture = struct {
     global_query_cancellation_enabled: bool = false,
     global_query_authorization_revocation_enabled: bool = false,
     global_query_transport_failure_enabled: bool = false,
+    global_query_owner_restart_enabled: bool = false,
     join_cancellation_enabled: bool = false,
     join_cancellation_overlap_enabled: bool = false,
     join_cancellation_owner_restart_enabled: bool = false,
@@ -653,6 +672,11 @@ pub const Fixture = struct {
     pub fn setGlobalQueryTransportFailureEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.global_query_transport_failure_enabled = enabled;
+    }
+
+    pub fn setGlobalQueryOwnerRestartEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.global_query_owner_restart_enabled = enabled;
     }
 
     fn liveAuthorizationEnabled(self: *const Fixture) bool {
@@ -749,6 +773,22 @@ pub const Fixture = struct {
         self.global_query_transport_target_index = target_index;
         self.global_query_transport_target_configured = true;
         self.global_query_transport_fault_endpoint = try parseHttpBaseUriAddress(self.data_api_uris[target_index]);
+        self.global_query_route_index = coordinator_index;
+        return coordinator_index;
+    }
+
+    /// Select a public coordinator that cannot serve the tenant group locally
+    /// and freeze the exact production process domain that will disappear at
+    /// the first-result boundary.
+    pub fn configureGlobalQueryOwnerRestartTarget(self: *Fixture, target_index: usize) !usize {
+        if (self.phase != .leaders_ready or !self.global_query_owner_restart_enabled or
+            target_index >= self.data_server_count or !self.data_server_live[target_index])
+            return error.InvalidProductionGlobalQueryOwnerRestartTarget;
+        const coordinator_index = for (0..self.data_api_uri_count) |index| {
+            if (index != target_index and self.data_server_live[index]) break index;
+        } else return error.ProductionGlobalQueryRemoteCoordinatorMissing;
+        self.global_query_owner_restart_target_index = target_index;
+        self.global_query_owner_restart_target_configured = true;
         self.global_query_route_index = coordinator_index;
         return coordinator_index;
     }
@@ -888,6 +928,11 @@ pub const Fixture = struct {
             (!self.global_query_enabled or self.global_query_cancellation_enabled or
                 self.global_query_authorization_revocation_enabled))
             return error.InvalidProductionClusterGlobalQueryTransportMode;
+        if (self.global_query_owner_restart_enabled and
+            (!self.global_query_enabled or self.global_query_cancellation_enabled or
+                self.global_query_authorization_revocation_enabled or
+                self.global_query_transport_failure_enabled))
+            return error.InvalidProductionClusterGlobalQueryOwnerRestartMode;
         if (self.graph_stale_snapshot_retry_exhaustion_enabled and
             (!self.graph_enabled or !self.active_split_enabled))
             return error.InvalidProductionClusterGraphStaleSnapshotMode;
@@ -1287,6 +1332,21 @@ pub const Fixture = struct {
                     "/tables/tenant_b_docs/query",
                 );
                 self.global_query_transport_fault_injected = true;
+            }
+            if (self.global_query_owner_restart_enabled and
+                self.global_query_owner_restart_armed and
+                std.mem.eql(u8, event.table_name, "docs"))
+            {
+                if (!self.global_query_owner_restart_target_configured)
+                    return error.ProductionGlobalQueryOwnerRestartTargetMissing;
+                if (self.currentTenantOwnerIndex() !=
+                    self.global_query_owner_restart_target_index)
+                    return error.ProductionGlobalQueryOwnerRestartTargetLeadershipChanged;
+                self.global_query_owner_restart_armed = false;
+                self.global_query_owner_restart_boundary_observed = true;
+                self.global_query_restart_requested.post(self.sim.io());
+                try self.global_query_restart_down.wait(self.sim.io());
+                if (self.global_query_owner_restart_failure) |err| return err;
             }
         }
     }
@@ -2020,6 +2080,74 @@ pub const Fixture = struct {
         self.graph_restart_recovered.post(self.sim.io());
     }
 
+    fn driveGlobalQueryOwnerRestart(self: *Fixture) void {
+        self.global_query_restart_requested.wait(self.sim.io()) catch return;
+        if (self.driver_stop or self.teardown_started) return;
+        self.stopDataServerForRestart(self.global_query_owner_restart_target_index) catch |err| {
+            self.failGlobalQueryOwnerRestart(err);
+            return;
+        };
+        self.global_query_owner_restart_down = true;
+        self.global_query_restart_down.post(self.sim.io());
+
+        self.global_query_restart_recover.wait(self.sim.io()) catch return;
+        if (self.teardown_started) return;
+        self.restartDataServer(self.global_query_owner_restart_target_index) catch |err| {
+            self.failGlobalQueryOwnerRestart(err);
+            return;
+        };
+        self.global_query_owner_restart_direct_read =
+            self.waitForGlobalQueryOwnerPublicRead() catch |err| {
+                self.failGlobalQueryOwnerRestart(err);
+                return;
+            };
+        if (!self.global_query_owner_restart_direct_read) {
+            self.failGlobalQueryOwnerRestart(
+                error.ProductionGlobalQueryOwnerPublicReadTimeout,
+            );
+            return;
+        }
+        self.global_query_owner_restart_reconstructed = true;
+        self.global_query_restart_recovered.post(self.sim.io());
+    }
+
+    fn failGlobalQueryOwnerRestart(self: *Fixture, err: anyerror) void {
+        self.global_query_owner_restart_failure = err;
+        self.driver_failure = err;
+        self.global_query_restart_down.post(self.sim.io());
+        self.global_query_restart_recovered.post(self.sim.io());
+    }
+
+    /// Reconstruction is not ready merely because the stable Raft identity
+    /// and routing catalog are live again. Require the rebound public listener
+    /// on the exact replacement process to accept and serve a durable read.
+    fn waitForGlobalQueryOwnerPublicRead(self: *Fixture) !bool {
+        var last_transport_error: ?anyerror = null;
+        for (0..1_024) |_| {
+            var response = self.client.fetchLookupResponse(
+                self.data_api_uris[self.global_query_owner_restart_target_index],
+                "tenant_b_docs",
+                "tenant:q",
+                null,
+            ) catch |err| {
+                last_transport_error = err;
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+                continue;
+            };
+            const status = response.status;
+            const sound = status == 200 and
+                std.mem.indexOf(u8, response.body, "production-tenant") != null;
+            response.deinit(self.alloc);
+            if (sound) return true;
+            if (status != 200 and status != 404 and status != 409 and
+                status != 503 and status != 504)
+                return error.UnexpectedHttpStatus;
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        }
+        if (last_transport_error) |err| return err;
+        return false;
+    }
+
     fn driveJoinOwnerRestart(self: *Fixture) void {
         self.join_restart_requested.wait(self.sim.io()) catch return;
         if (self.driver_stop or self.teardown_started) return;
@@ -2266,6 +2394,21 @@ pub const Fixture = struct {
             self.graph_restart_future = null;
         }
         if (self.failure == null) self.failure = self.graph_owner_restart_failure;
+        if (self.global_query_restart_future) |*future| {
+            if (self.global_query_owner_restart_boundary_observed) {
+                if (self.global_query_owner_restart_down and
+                    !self.global_query_owner_restart_reconstructed and
+                    self.global_query_owner_restart_failure == null)
+                {
+                    self.global_query_restart_recover.post(self.sim.io());
+                }
+                future.await(self.sim.io());
+            } else {
+                future.cancel(self.sim.io());
+            }
+            self.global_query_restart_future = null;
+        }
+        if (self.failure == null) self.failure = self.global_query_owner_restart_failure;
         if (self.join_restart_future) |*future| {
             if (self.join_owner_restart_requested) {
                 // If the public operation failed before selecting another
@@ -2444,6 +2587,8 @@ pub const Fixture = struct {
                 try self.runGlobalMultiQueryAuthorizationRevocation()
             else if (self.global_query_transport_failure_enabled)
                 try self.runGlobalMultiQueryTransportFailure()
+            else if (self.global_query_owner_restart_enabled)
+                try self.runGlobalMultiQueryOwnerRestart()
             else
                 try self.runGlobalMultiQuery();
             if (!self.global_query_sound)
@@ -3461,6 +3606,64 @@ pub const Fixture = struct {
             self.global_query_transport_rejected_without_partial and
             self.global_query_transport_recovered;
         return self.global_query_transport_sound;
+    }
+
+    fn runGlobalMultiQueryOwnerRestart(self: *Fixture) !bool {
+        if (!self.global_query_owner_restart_target_configured)
+            return error.ProductionGlobalQueryOwnerRestartTargetMissing;
+        if (self.currentTenantOwnerIndex() !=
+            self.global_query_owner_restart_target_index)
+            return error.ProductionGlobalQueryOwnerRestartTargetLeadershipChanged;
+
+        const results_before = self.global_query_result_assembled_count;
+        self.global_query_restart_future = self.sim.io().async(
+            driveGlobalQueryOwnerRestart,
+            .{self},
+        );
+        self.global_query_owner_restart_armed = true;
+        var rejected = try self.client.fetchGlobalMultiQueryRaw(
+            self.data_api_uris[self.global_query_route_index],
+            global_query_body,
+        );
+        defer rejected.deinit(self.alloc);
+        self.global_query_owner_restart_rejected_status = rejected.status;
+        self.global_query_owner_restart_rejected_without_partial =
+            self.global_query_owner_restart_boundary_observed and
+            self.global_query_owner_restart_down and
+            !self.data_server_live[self.global_query_owner_restart_target_index] and
+            self.global_query_result_assembled_count == results_before + 1 and
+            rejected.status == 503 and
+            std.mem.eql(
+                u8,
+                rejected.body,
+                "{\"code\":\"distributed_query_unavailable\",\"message\":\"distributed query unavailable\",\"retryable\":true}",
+            );
+        if (!self.global_query_owner_restart_rejected_without_partial)
+            return false;
+
+        self.global_query_restart_recover.post(self.sim.io());
+        try self.global_query_restart_recovered.wait(self.sim.io());
+        if (self.global_query_owner_restart_failure) |err| return err;
+        self.global_query_owner_restart_reconstructed =
+            self.global_query_owner_restart_reconstructed and
+            self.data_server_live[self.global_query_owner_restart_target_index] and
+            self.data_api_uri_live[self.global_query_owner_restart_target_index] and
+            self.data_raft_uri_live[self.global_query_owner_restart_target_index];
+        if (!self.global_query_owner_restart_reconstructed or
+            !self.global_query_owner_restart_direct_read) return false;
+
+        const recovered = try self.runGlobalMultiQuery();
+        self.global_query_owner_restart_recovered_status = self.global_query_status;
+        self.global_query_owner_restart_recovered = recovered and
+            self.global_query_result_assembled_count == results_before + 3;
+        self.global_query_owner_restart_sound =
+            self.global_query_owner_restart_boundary_observed and
+            self.global_query_owner_restart_down and
+            self.global_query_owner_restart_rejected_without_partial and
+            self.global_query_owner_restart_reconstructed and
+            self.global_query_owner_restart_direct_read and
+            self.global_query_owner_restart_recovered;
+        return self.global_query_owner_restart_sound;
     }
 
     fn runGraphQuery(
@@ -4727,6 +4930,10 @@ pub const Fixture = struct {
             future.cancel(self.sim.io());
             self.graph_restart_future = null;
         }
+        if (self.global_query_restart_future) |*future| {
+            future.cancel(self.sim.io());
+            self.global_query_restart_future = null;
+        }
         if (self.join_restart_future) |*future| {
             future.cancel(self.sim.io());
             self.join_restart_future = null;
@@ -4814,6 +5021,15 @@ pub const Fixture = struct {
         global_query_transport_rejected_status: u16,
         global_query_transport_recovered_status: u16,
         global_query_transport_ok: bool,
+        global_query_owner_restart_boundary_observed: bool,
+        global_query_owner_restart_down: bool,
+        global_query_owner_restart_rejected_without_partial: bool,
+        global_query_owner_restart_rejected_status: u16,
+        global_query_owner_restart_reconstructed: bool,
+        global_query_owner_restart_direct_read: bool,
+        global_query_owner_restart_recovered: bool,
+        global_query_owner_restart_recovered_status: u16,
+        global_query_owner_restart_ok: bool,
         join_query_ok: bool,
         split_join_query_ok: bool,
         post_split_join_query_ok: bool,
@@ -4991,6 +5207,15 @@ pub const Fixture = struct {
             .global_query_transport_rejected_status = self.global_query_transport_rejected_status,
             .global_query_transport_recovered_status = self.global_query_transport_recovered_status,
             .global_query_transport_ok = self.global_query_transport_sound,
+            .global_query_owner_restart_boundary_observed = self.global_query_owner_restart_boundary_observed,
+            .global_query_owner_restart_down = self.global_query_owner_restart_down,
+            .global_query_owner_restart_rejected_without_partial = self.global_query_owner_restart_rejected_without_partial,
+            .global_query_owner_restart_rejected_status = self.global_query_owner_restart_rejected_status,
+            .global_query_owner_restart_reconstructed = self.global_query_owner_restart_reconstructed,
+            .global_query_owner_restart_direct_read = self.global_query_owner_restart_direct_read,
+            .global_query_owner_restart_recovered = self.global_query_owner_restart_recovered,
+            .global_query_owner_restart_recovered_status = self.global_query_owner_restart_recovered_status,
+            .global_query_owner_restart_ok = self.global_query_owner_restart_sound,
             .join_query_ok = self.join_sound,
             .split_join_query_ok = self.split_join_sound,
             .post_split_join_query_ok = self.post_split_join_sound,
