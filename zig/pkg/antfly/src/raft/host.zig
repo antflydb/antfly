@@ -189,6 +189,10 @@ pub const HostMetrics = struct {
     runtime_ticked_groups: usize = 0,
     runtime_processed_groups: usize = 0,
     runtime_transport_message_sends: usize = 0,
+    runtime_snapshot_submission_deferrals: usize = 0,
+    runtime_snapshot_completions: usize = 0,
+    runtime_snapshot_completion_failures: usize = 0,
+    runtime_snapshot_stale_completions: usize = 0,
     runtime_pending_outbound_messages: usize = 0,
     runtime_pending_outbound_bytes: usize = 0,
     runtime_pending_apply_tasks: usize = 0,
@@ -221,8 +225,15 @@ pub const HostMetrics = struct {
     async_snapshot_send_deduplicated: u64 = 0,
     async_snapshot_send_queue_full: u64 = 0,
     async_snapshot_send_peer_queue_full: u64 = 0,
+    async_snapshot_send_admission_deferred: u64 = 0,
+    async_snapshot_send_reservation_rollbacks: u64 = 0,
+    async_snapshot_send_completions_delivered: u64 = 0,
+    async_snapshot_send_completions_failed: u64 = 0,
     async_snapshot_send_pending: usize = 0,
     async_snapshot_send_pending_bytes: usize = 0,
+    async_snapshot_send_reserved: usize = 0,
+    async_snapshot_send_reserved_bytes: usize = 0,
+    async_snapshot_send_pending_completions: usize = 0,
 };
 
 pub const HttpHostConfig = struct {
@@ -708,6 +719,10 @@ pub const Host = struct {
         snapshot.runtime_ticked_groups = runtime_metrics.ticked_groups;
         snapshot.runtime_processed_groups = runtime_metrics.processed_groups;
         snapshot.runtime_transport_message_sends = runtime_metrics.transport_message_sends;
+        snapshot.runtime_snapshot_submission_deferrals = runtime_metrics.transport_snapshot_submission_deferrals;
+        snapshot.runtime_snapshot_completions = runtime_metrics.transport_snapshot_completions;
+        snapshot.runtime_snapshot_completion_failures = runtime_metrics.transport_snapshot_completion_failures;
+        snapshot.runtime_snapshot_stale_completions = runtime_metrics.transport_snapshot_stale_completions;
         snapshot.runtime_pending_outbound_messages = runtime_metrics.pending_outbound_messages;
         snapshot.runtime_pending_outbound_bytes = runtime_metrics.pending_outbound_bytes;
         snapshot.runtime_pending_apply_tasks = runtime_metrics.pending_apply_tasks;
@@ -1303,8 +1318,15 @@ pub const HttpHost = struct {
         snapshot.async_snapshot_send_deduplicated = async_snapshot_send.deduplicated;
         snapshot.async_snapshot_send_queue_full = async_snapshot_send.queue_full;
         snapshot.async_snapshot_send_peer_queue_full = async_snapshot_send.peer_queue_full;
+        snapshot.async_snapshot_send_admission_deferred = async_snapshot_send.admission_deferred;
+        snapshot.async_snapshot_send_reservation_rollbacks = async_snapshot_send.reservation_rollbacks;
+        snapshot.async_snapshot_send_completions_delivered = async_snapshot_send.completions_delivered;
+        snapshot.async_snapshot_send_completions_failed = async_snapshot_send.completions_failed;
         snapshot.async_snapshot_send_pending = async_snapshot_send.pending;
         snapshot.async_snapshot_send_pending_bytes = async_snapshot_send.pending_bytes;
+        snapshot.async_snapshot_send_reserved = async_snapshot_send.reserved;
+        snapshot.async_snapshot_send_reserved_bytes = async_snapshot_send.reserved_bytes;
+        snapshot.async_snapshot_send_pending_completions = async_snapshot_send.pending_completions;
         return snapshot;
     }
 

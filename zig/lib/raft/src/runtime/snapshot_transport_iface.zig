@@ -33,11 +33,41 @@ pub const SnapshotLocator = struct {
 
 pub const SnapshotSendRequest = struct {
     group_id: core.types.GroupId,
+    /// Runtime generation for this local group. Asynchronous completion
+    /// records use this to fence responses from retired replicas.
+    incarnation: u64 = 0,
     from: core.types.NodeId = 0,
     to: core.types.NodeId,
     term: core.types.Term = 0,
     snapshot: core.types.Snapshot,
     locator: ?SnapshotLocator = null,
+};
+
+/// Submission is an ownership boundary, not a delivery completion boundary.
+/// `accepted` and `duplicate` allow the caller to release its reference;
+/// `retry_later` guarantees that the transport retained nothing.
+pub const SnapshotSubmitResult = union(enum) {
+    accepted,
+    duplicate,
+    retry_later: struct {
+        retry_after_ms: u64 = 1,
+    },
+};
+
+pub const SnapshotCompletionStatus = enum {
+    delivered,
+    failed,
+};
+
+pub const SnapshotCompletion = struct {
+    group_id: core.types.GroupId,
+    incarnation: u64,
+    from: core.types.NodeId,
+    to: core.types.NodeId,
+    term: core.types.Term,
+    snapshot_index: core.types.Index,
+    snapshot_term: core.types.Term,
+    status: SnapshotCompletionStatus,
 };
 
 pub const SnapshotFetchRequest = struct {
@@ -106,12 +136,26 @@ pub const SnapshotTransport = struct {
 
     pub const VTable = struct {
         send_snapshot: *const fn (ptr: *anyopaque, req: SnapshotSendRequest) anyerror!void,
+        submit_snapshot: ?*const fn (ptr: *anyopaque, req: SnapshotSendRequest) anyerror!SnapshotSubmitResult = null,
+        drain_completions: ?*const fn (ptr: *anyopaque, out: []SnapshotCompletion) usize = null,
         fetch_snapshot: ?*const fn (ptr: *anyopaque, req: SnapshotFetchRequest, receiver: SnapshotReceiver) anyerror!void = null,
         cancel_snapshot: ?*const fn (ptr: *anyopaque, group_id: core.types.GroupId, snapshot_id: []const u8) anyerror!void = null,
     };
 
     pub fn sendSnapshot(self: SnapshotTransport, req: SnapshotSendRequest) !void {
         return try self.vtable.send_snapshot(self.ptr, req);
+    }
+
+    pub fn submitSnapshot(self: SnapshotTransport, req: SnapshotSendRequest) !SnapshotSubmitResult {
+        if (self.vtable.submit_snapshot) |submit_snapshot|
+            return try submit_snapshot(self.ptr, req);
+        try self.sendSnapshot(req);
+        return .accepted;
+    }
+
+    pub fn drainCompletions(self: SnapshotTransport, out: []SnapshotCompletion) usize {
+        const drain = self.vtable.drain_completions orelse return 0;
+        return drain(self.ptr, out);
     }
 
     pub fn fetchSnapshot(self: SnapshotTransport, req: SnapshotFetchRequest, receiver: SnapshotReceiver) !void {
@@ -131,6 +175,8 @@ test "snapshot transport iface compiles" {
     _ = SnapshotLocator;
     _ = SnapshotArtifactFormat;
     _ = SnapshotSendRequest;
+    _ = SnapshotSubmitResult;
+    _ = SnapshotCompletion;
     _ = SnapshotFetchRequest;
     _ = SnapshotReceiver;
     _ = SnapshotTransport;

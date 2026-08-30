@@ -650,6 +650,31 @@ test "snapshot failure leaves follower probing from the same index" {
     try std.testing.expectEqual(@as(usize, 0), fixture.raft.messages.items.len);
 }
 
+test "asynchronous snapshot failure is fenced to the active snapshot probe" {
+    var fixture = try initLeaderFromSnapshot();
+    defer fixture.raft.deinit();
+    defer fixture.storage.deinit();
+
+    fixture.raft.progress[1] = .{
+        .match_index = 0,
+        .next_index = 1,
+        .state = .probe,
+        .probe_sent = true,
+        .pending_snapshot_index = 11,
+        .pending_snapshot_term = 11,
+    };
+
+    fixture.raft.reportSnapshotFailure(2, 10, 11);
+    try std.testing.expect(fixture.raft.progress[1].probe_sent);
+    fixture.raft.reportSnapshotFailure(2, 11, 10);
+    try std.testing.expect(fixture.raft.progress[1].probe_sent);
+
+    fixture.raft.reportSnapshotFailure(2, 11, 11);
+    try std.testing.expect(!fixture.raft.progress[1].probe_sent);
+    try std.testing.expectEqual(@as(types.Index, 0), fixture.raft.progress[1].pending_snapshot_index);
+    try std.testing.expectEqual(@as(types.Term, 0), fixture.raft.progress[1].pending_snapshot_term);
+}
+
 test "snapshot success resumes probing from the snapshot index" {
     var fixture = try initLeaderFromSnapshot();
     defer fixture.raft.deinit();

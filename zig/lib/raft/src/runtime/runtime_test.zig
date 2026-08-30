@@ -508,9 +508,12 @@ const TransportRecorder = struct {
 };
 
 const SnapshotTransportRecorder = struct {
+    submit_calls: usize = 0,
+    deferrals_remaining: usize = 0,
     send_calls: usize = 0,
     sent_bytes: usize = 0,
     last_group_id: core.types.GroupId = 0,
+    last_incarnation: u64 = 0,
     last_to: core.types.NodeId = 0,
 
     fn iface(self: *SnapshotTransportRecorder) runtime.snapshot_transport_iface.SnapshotTransport {
@@ -518,8 +521,23 @@ const SnapshotTransportRecorder = struct {
             .ptr = self,
             .vtable = &.{
                 .send_snapshot = sendSnapshot,
+                .submit_snapshot = submitSnapshot,
             },
         };
+    }
+
+    fn submitSnapshot(
+        ptr: *anyopaque,
+        req: runtime.snapshot_transport_iface.SnapshotSendRequest,
+    ) !runtime.snapshot_transport_iface.SnapshotSubmitResult {
+        const self: *SnapshotTransportRecorder = @ptrCast(@alignCast(ptr));
+        self.submit_calls += 1;
+        if (self.deferrals_remaining > 0) {
+            self.deferrals_remaining -= 1;
+            return .{ .retry_later = .{ .retry_after_ms = 1 } };
+        }
+        try sendSnapshot(ptr, req);
+        return .accepted;
     }
 
     fn sendSnapshot(ptr: *anyopaque, req: runtime.snapshot_transport_iface.SnapshotSendRequest) !void {
@@ -527,6 +545,7 @@ const SnapshotTransportRecorder = struct {
         self.send_calls += 1;
         self.sent_bytes += req.snapshot.data.len;
         self.last_group_id = req.group_id;
+        self.last_incarnation = req.incarnation;
         self.last_to = req.to;
     }
 };
@@ -1660,7 +1679,7 @@ test "multi raft routes outbound snapshots through snapshot transport" {
     try storage_recorder.registerStore(94, &store);
 
     var transport_recorder = TransportRecorder{ .alloc = std.testing.allocator };
-    var snapshot_transport = SnapshotTransportRecorder{};
+    var snapshot_transport = SnapshotTransportRecorder{ .deferrals_remaining = 1 };
 
     var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
         .group_storage = storage_recorder.iface(),
@@ -1717,11 +1736,21 @@ test "multi raft routes outbound snapshots through snapshot transport" {
     });
 
     try std.testing.expectEqual(true, try host.processReady(94));
+    try std.testing.expectEqual(@as(usize, 0), snapshot_transport.send_calls);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().pending_outbound_messages);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().transport_snapshot_submission_deferrals);
+
+    // A normal capacity wake-up/next runtime turn retries the retained entry;
+    // Raft does not need to regenerate the snapshot Ready.
+    try std.testing.expectEqual(false, try host.processReady(94));
     try std.testing.expectEqual(@as(usize, 1), snapshot_transport.send_calls);
+    try std.testing.expectEqual(@as(usize, 2), snapshot_transport.submit_calls);
     try std.testing.expectEqual(@as(core.types.GroupId, 94), snapshot_transport.last_group_id);
+    try std.testing.expect(snapshot_transport.last_incarnation != 0);
     try std.testing.expectEqual(@as(core.types.NodeId, 2), snapshot_transport.last_to);
     try std.testing.expectEqual(@as(usize, 0), transport_recorder.sent_messages);
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().transport_snapshot_sends);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_outbound_messages);
 }
 
 test "multi raft fetches snapshot through snapshot transport and steps it into the group" {

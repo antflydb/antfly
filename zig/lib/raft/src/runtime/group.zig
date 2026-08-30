@@ -122,6 +122,15 @@ pub const Group = struct {
         return try self.raw_node.step(msg);
     }
 
+    pub fn reportSnapshotFailure(
+        self: *Group,
+        to: core.types.NodeId,
+        snapshot_index: core.types.Index,
+        snapshot_term: core.types.Term,
+    ) void {
+        self.raw_node.reportSnapshotFailure(to, snapshot_index, snapshot_term);
+    }
+
     pub fn campaign(self: *Group) !void {
         return try self.raw_node.campaign();
     }

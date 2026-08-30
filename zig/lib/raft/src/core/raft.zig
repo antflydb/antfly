@@ -1359,6 +1359,8 @@ pub const Raft = struct {
                 }) catch unreachable;
             } else {
                 self.progress[idx].probe_sent = true;
+                self.progress[idx].pending_snapshot_index = 0;
+                self.progress[idx].pending_snapshot_term = 0;
             }
         }
     }
@@ -1376,18 +1378,43 @@ pub const Raft = struct {
         // delivery retains only a reference instead of copying potentially
         // gigabytes once per queue boundary.
         try snapshot.shareOwnedData(self.alloc, null);
+        const snapshot_index = snapshot.metadata.index;
+        const snapshot_term = snapshot.metadata.term;
 
         try self.send(.{
             .msg_type = .snapshot,
             .from = self.cfg.id,
             .to = to,
             .term = self.hard_state.current_term,
-            .log_index = snapshot.metadata.index,
-            .log_term = snapshot.metadata.term,
+            .log_index = snapshot_index,
+            .log_term = snapshot_term,
             .snapshot = snapshot,
         });
 
         self.progress[idx].probe_sent = true;
+        self.progress[idx].pending_snapshot_index = snapshot_index;
+        self.progress[idx].pending_snapshot_term = snapshot_term;
+    }
+
+    /// Releases a failed asynchronous snapshot probe so the next heartbeat
+    /// response can immediately drive another snapshot attempt. Successful
+    /// publication remains paused until the follower acknowledges progress.
+    pub fn reportSnapshotFailure(
+        self: *Raft,
+        to: types.NodeId,
+        snapshot_index: types.Index,
+        snapshot_term: types.Term,
+    ) void {
+        if (self.soft_state.role != .leader) return;
+        const idx = peerIndex(self.peers, to) orelse return;
+        const progress = &self.progress[idx];
+        if (progress.state != .probe or !progress.probe_sent or
+            progress.pending_snapshot_index != snapshot_index or
+            progress.pending_snapshot_term != snapshot_term)
+            return;
+        progress.probe_sent = false;
+        progress.pending_snapshot_index = 0;
+        progress.pending_snapshot_term = 0;
     }
 
     fn maybeCommit(self: *Raft) bool {

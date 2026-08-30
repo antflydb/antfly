@@ -103,6 +103,15 @@ pub const RawNode = struct {
         return try self.raft.readIndex(rctx);
     }
 
+    pub fn reportSnapshotFailure(
+        self: *RawNode,
+        to: types.NodeId,
+        snapshot_index: types.Index,
+        snapshot_term: types.Term,
+    ) void {
+        self.raft.reportSnapshotFailure(to, snapshot_index, snapshot_term);
+    }
+
     pub fn proposeConfChange(self: *RawNode, conf_change: types.ConfChange) !void {
         self.clearReadyMessages();
         return try self.raft.proposeConfChange(conf_change);

@@ -208,8 +208,15 @@ pub const AsyncSnapshotSendMetricsSnapshot = struct {
     deduplicated: u64 = 0,
     queue_full: u64 = 0,
     peer_queue_full: u64 = 0,
+    admission_deferred: u64 = 0,
+    reservation_rollbacks: u64 = 0,
+    completions_delivered: u64 = 0,
+    completions_failed: u64 = 0,
     pending: usize = 0,
     pending_bytes: usize = 0,
+    reserved: usize = 0,
+    reserved_bytes: usize = 0,
+    pending_completions: usize = 0,
 };
 
 const AsyncSnapshotSendMetrics = struct {
@@ -220,11 +227,16 @@ const AsyncSnapshotSendMetrics = struct {
     deduplicated: std.atomic.Value(u64) = .init(0),
     queue_full: std.atomic.Value(u64) = .init(0),
     peer_queue_full: std.atomic.Value(u64) = .init(0),
+    admission_deferred: std.atomic.Value(u64) = .init(0),
+    reservation_rollbacks: std.atomic.Value(u64) = .init(0),
+    completions_delivered: std.atomic.Value(u64) = .init(0),
+    completions_failed: std.atomic.Value(u64) = .init(0),
 };
 
 pub const HttpSnapshotTransport = struct {
     const QueuedSnapshot = struct {
         group_id: u64,
+        incarnation: u64,
         from: u64,
         to: u64,
         term: u64,
@@ -251,6 +263,7 @@ pub const HttpSnapshotTransport = struct {
             const uri = if (req.locator) |locator| try alloc.dupe(u8, locator.uri) else null;
             return .{
                 .group_id = req.group_id,
+                .incarnation = req.incarnation,
                 .from = req.from,
                 .to = req.to,
                 .term = req.term,
@@ -264,6 +277,7 @@ pub const HttpSnapshotTransport = struct {
         fn request(self: *const QueuedSnapshot) raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest {
             return .{
                 .group_id = self.group_id,
+                .incarnation = self.incarnation,
                 .from = self.from,
                 .to = self.to,
                 .term = self.term,
@@ -280,7 +294,8 @@ pub const HttpSnapshotTransport = struct {
             self: *const QueuedSnapshot,
             req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
         ) bool {
-            if (self.group_id != req.group_id or self.from != req.from or self.to != req.to or
+            if (self.group_id != req.group_id or self.incarnation != req.incarnation or
+                self.from != req.from or self.to != req.to or
                 self.term != req.term or self.snapshot.metadata.index != req.snapshot.metadata.index or
                 self.snapshot.metadata.term != req.snapshot.metadata.term)
                 return false;
@@ -313,8 +328,12 @@ pub const HttpSnapshotTransport = struct {
     send_queue: std.ArrayListUnmanaged(QueuedSnapshot) = .empty,
     send_active_jobs: []?*QueuedSnapshot = &.{},
     send_active_peers: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    send_reserved_peers: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     send_retained_jobs: usize = 0,
     send_retained_bytes: usize = 0,
+    send_reserved_jobs: usize = 0,
+    send_reserved_bytes: usize = 0,
+    send_completions: std.ArrayListUnmanaged(raft_engine.runtime.snapshot_transport_iface.SnapshotCompletion) = .empty,
     send_metrics: AsyncSnapshotSendMetrics = .{},
 
     pub fn init(
@@ -361,6 +380,8 @@ pub const HttpSnapshotTransport = struct {
         for (self.send_queue.items) |*job| job.deinit(self.alloc);
         self.send_queue.deinit(self.alloc);
         self.send_active_peers.deinit(self.alloc);
+        self.send_reserved_peers.deinit(self.alloc);
+        self.send_completions.deinit(self.alloc);
         self.send_mutex.unlock(self.artifact_io);
         // Mapped snapshots may outlive a standalone transport. Their owner
         // retains this control block until the final mapping and reservation
@@ -431,6 +452,8 @@ pub const HttpSnapshotTransport = struct {
             .ptr = self,
             .vtable = &.{
                 .send_snapshot = submitSnapshotCallback,
+                .submit_snapshot = trySubmitSnapshotCallback,
+                .drain_completions = drainCompletionsCallback,
                 .fetch_snapshot = fetchSnapshot,
             },
         };
@@ -444,6 +467,8 @@ pub const HttpSnapshotTransport = struct {
             1;
         try self.send_queue.ensureTotalCapacity(self.alloc, self.cfg.async_send_queue_max);
         try self.send_active_peers.ensureTotalCapacity(self.alloc, worker_count);
+        try self.send_reserved_peers.ensureTotalCapacity(self.alloc, @intCast(self.cfg.async_send_queue_max));
+        try self.send_completions.ensureTotalCapacity(self.alloc, self.cfg.async_send_queue_max);
         self.send_active_jobs = try self.alloc.alloc(?*QueuedSnapshot, worker_count);
         errdefer {
             self.alloc.free(self.send_active_jobs);
@@ -484,6 +509,9 @@ pub const HttpSnapshotTransport = struct {
         self.send_mutex.lockUncancelable(self.artifact_io);
         const pending = self.send_retained_jobs;
         const pending_bytes = self.send_retained_bytes;
+        const reserved = self.send_reserved_jobs;
+        const reserved_bytes = self.send_reserved_bytes;
+        const pending_completions = self.send_completions.items.len;
         self.send_mutex.unlock(self.artifact_io);
         return .{
             .enqueued = self.send_metrics.enqueued.load(.monotonic),
@@ -493,8 +521,15 @@ pub const HttpSnapshotTransport = struct {
             .deduplicated = self.send_metrics.deduplicated.load(.monotonic),
             .queue_full = self.send_metrics.queue_full.load(.monotonic),
             .peer_queue_full = self.send_metrics.peer_queue_full.load(.monotonic),
+            .admission_deferred = self.send_metrics.admission_deferred.load(.monotonic),
+            .reservation_rollbacks = self.send_metrics.reservation_rollbacks.load(.monotonic),
+            .completions_delivered = self.send_metrics.completions_delivered.load(.monotonic),
+            .completions_failed = self.send_metrics.completions_failed.load(.monotonic),
             .pending = pending,
             .pending_bytes = pending_bytes,
+            .reserved = reserved,
+            .reserved_bytes = reserved_bytes,
+            .pending_completions = pending_completions,
         };
     }
 
@@ -515,38 +550,72 @@ pub const HttpSnapshotTransport = struct {
     fn enqueueSnapshot(
         self: *HttpSnapshotTransport,
         req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
-    ) !void {
+    ) !raft_engine.runtime.snapshot_transport_iface.SnapshotSubmitResult {
         if (req.snapshot.data.len > self.cfg.max_snapshot_bytes) return error.SnapshotTooLarge;
+
+        // Reserve every bounded resource before retaining or copying payload
+        // bytes. Queue saturation is normal backpressure and takes no
+        // ownership from the caller.
+        self.send_mutex.lockUncancelable(self.artifact_io);
+        if (self.send_closing) {
+            self.send_mutex.unlock(self.artifact_io);
+            return error.AsyncSnapshotSenderClosed;
+        }
+        if (self.findDuplicateLocked(req)) {
+            _ = self.send_metrics.deduplicated.fetchAdd(1, .monotonic);
+            self.send_mutex.unlock(self.artifact_io);
+            return .duplicate;
+        }
+        if (self.send_retained_jobs +| self.send_reserved_jobs +| self.send_completions.items.len >=
+            self.cfg.async_send_queue_max)
+        {
+            _ = self.send_metrics.queue_full.fetchAdd(1, .monotonic);
+            _ = self.send_metrics.admission_deferred.fetchAdd(1, .monotonic);
+            self.send_mutex.unlock(self.artifact_io);
+            return .{ .retry_later = .{ .retry_after_ms = 1 } };
+        }
+        var peer_jobs: usize = if (self.send_active_peers.contains(req.to)) 1 else 0;
+        for (self.send_queue.items) |queued| {
+            if (queued.to == req.to) peer_jobs += 1;
+        }
+        peer_jobs += self.send_reserved_peers.get(req.to) orelse 0;
+        if (peer_jobs >= self.cfg.async_send_queue_max_per_peer) {
+            _ = self.send_metrics.peer_queue_full.fetchAdd(1, .monotonic);
+            _ = self.send_metrics.admission_deferred.fetchAdd(1, .monotonic);
+            self.send_mutex.unlock(self.artifact_io);
+            return .{ .retry_later = .{ .retry_after_ms = 1 } };
+        }
+        if (req.snapshot.data.len > self.cfg.async_send_max_bytes -|
+            (self.send_retained_bytes +| self.send_reserved_bytes))
+        {
+            _ = self.send_metrics.queue_full.fetchAdd(1, .monotonic);
+            _ = self.send_metrics.admission_deferred.fetchAdd(1, .monotonic);
+            self.send_mutex.unlock(self.artifact_io);
+            return .{ .retry_later = .{ .retry_after_ms = 1 } };
+        }
+        self.send_reserved_jobs += 1;
+        self.send_reserved_bytes += req.snapshot.data.len;
+        const reserved_peer = self.send_reserved_peers.getOrPutAssumeCapacity(req.to);
+        if (!reserved_peer.found_existing) reserved_peer.value_ptr.* = 0;
+        reserved_peer.value_ptr.* += 1;
+        self.send_mutex.unlock(self.artifact_io);
+
+        var reservation_live = true;
+        defer if (reservation_live) self.releaseSubmissionReservation(req.to, req.snapshot.data.len, true);
         var job = try QueuedSnapshot.init(self.alloc, req);
         var owns_job = true;
         defer if (owns_job) job.deinit(self.alloc);
 
         self.send_mutex.lockUncancelable(self.artifact_io);
         defer self.send_mutex.unlock(self.artifact_io);
+        self.releaseSubmissionReservationLocked(req.to, req.snapshot.data.len);
+        reservation_live = false;
         if (self.send_closing) return error.AsyncSnapshotSenderClosed;
-        for (self.send_queue.items) |*queued| if (queued.sameIdentity(req)) {
+        // A concurrent submitter may have published the same identity while
+        // this caller prepared its job. Treat that as successful idempotence.
+        if (self.findDuplicateLocked(req)) {
             _ = self.send_metrics.deduplicated.fetchAdd(1, .monotonic);
-            return;
-        };
-        for (self.send_active_jobs) |active| if (active) |value| if (value.sameIdentity(req)) {
-            _ = self.send_metrics.deduplicated.fetchAdd(1, .monotonic);
-            return;
-        };
-        if (self.send_retained_jobs >= self.cfg.async_send_queue_max) {
-            _ = self.send_metrics.queue_full.fetchAdd(1, .monotonic);
-            return error.AsyncSnapshotSendQueueFull;
-        }
-        var peer_jobs: usize = if (self.send_active_peers.contains(req.to)) 1 else 0;
-        for (self.send_queue.items) |queued| if (queued.to == req.to) {
-            peer_jobs += 1;
-        };
-        if (peer_jobs >= self.cfg.async_send_queue_max_per_peer) {
-            _ = self.send_metrics.peer_queue_full.fetchAdd(1, .monotonic);
-            return error.AsyncSnapshotSendQueueFull;
-        }
-        if (job.snapshot.data.len > self.cfg.async_send_max_bytes -| self.send_retained_bytes) {
-            _ = self.send_metrics.queue_full.fetchAdd(1, .monotonic);
-            return error.AsyncSnapshotSendQueueFull;
+            return .duplicate;
         }
         self.send_queue.appendAssumeCapacity(job);
         owns_job = false;
@@ -555,6 +624,48 @@ pub const HttpSnapshotTransport = struct {
         self.send_retained_bytes += req.snapshot.data.len;
         _ = self.send_metrics.enqueued.fetchAdd(1, .monotonic);
         self.send_ready.signal(self.artifact_io);
+        return .accepted;
+    }
+
+    fn findDuplicateLocked(
+        self: *const HttpSnapshotTransport,
+        req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
+    ) bool {
+        for (self.send_queue.items) |*queued| if (queued.sameIdentity(req)) return true;
+        for (self.send_active_jobs) |active| if (active) |value| if (value.sameIdentity(req)) return true;
+        for (self.send_completions.items) |completion| {
+            if (completion.group_id == req.group_id and
+                completion.incarnation == req.incarnation and
+                completion.from == req.from and
+                completion.to == req.to and
+                completion.term == req.term and
+                completion.snapshot_index == req.snapshot.metadata.index and
+                completion.snapshot_term == req.snapshot.metadata.term)
+                return true;
+        }
+        return false;
+    }
+
+    fn releaseSubmissionReservation(
+        self: *HttpSnapshotTransport,
+        peer_id: u64,
+        bytes: usize,
+        rolled_back: bool,
+    ) void {
+        self.send_mutex.lockUncancelable(self.artifact_io);
+        self.releaseSubmissionReservationLocked(peer_id, bytes);
+        self.send_mutex.unlock(self.artifact_io);
+        if (rolled_back) _ = self.send_metrics.reservation_rollbacks.fetchAdd(1, .monotonic);
+    }
+
+    fn releaseSubmissionReservationLocked(self: *HttpSnapshotTransport, peer_id: u64, bytes: usize) void {
+        std.debug.assert(self.send_reserved_jobs > 0 and self.send_reserved_bytes >= bytes);
+        self.send_reserved_jobs -= 1;
+        self.send_reserved_bytes -= bytes;
+        const peer_count = self.send_reserved_peers.getPtr(peer_id) orelse unreachable;
+        std.debug.assert(peer_count.* > 0);
+        peer_count.* -= 1;
+        if (peer_count.* == 0) std.debug.assert(self.send_reserved_peers.remove(peer_id));
     }
 
     fn asyncSnapshotSenderMain(self: *HttpSnapshotTransport, worker_index: usize) void {
@@ -616,6 +727,10 @@ pub const HttpSnapshotTransport = struct {
         std.debug.assert(self.send_retained_jobs > 0 and self.send_retained_bytes >= job.snapshot.data.len);
         self.send_retained_jobs -= 1;
         self.send_retained_bytes -= job.snapshot.data.len;
+        if (!self.send_closing) {
+            self.queueCompletionLocked(job, .delivered);
+            _ = self.send_metrics.completions_delivered.fetchAdd(1, .monotonic);
+        }
         self.send_ready.broadcast(self.artifact_io);
         self.send_mutex.unlock(self.artifact_io);
     }
@@ -654,6 +769,10 @@ pub const HttpSnapshotTransport = struct {
         self.send_retained_jobs -= 1;
         self.send_retained_bytes -= job.snapshot.data.len;
         _ = self.send_metrics.dropped.fetchAdd(1, .monotonic);
+        if (!self.send_closing) {
+            self.queueCompletionLocked(job, .failed);
+            _ = self.send_metrics.completions_failed.fetchAdd(1, .monotonic);
+        }
         self.send_ready.broadcast(self.artifact_io);
         self.send_mutex.unlock(self.artifact_io);
         if (!self.send_closing) std.log.warn(
@@ -661,6 +780,23 @@ pub const HttpSnapshotTransport = struct {
             .{ job.group_id, job.to, job.attempts, @errorName(err) },
         );
         return false;
+    }
+
+    fn queueCompletionLocked(
+        self: *HttpSnapshotTransport,
+        job: *const QueuedSnapshot,
+        status: raft_engine.runtime.snapshot_transport_iface.SnapshotCompletionStatus,
+    ) void {
+        self.send_completions.appendAssumeCapacity(.{
+            .group_id = job.group_id,
+            .incarnation = job.incarnation,
+            .from = job.from,
+            .to = job.to,
+            .term = job.term,
+            .snapshot_index = job.snapshot.metadata.index,
+            .snapshot_term = job.snapshot.metadata.term,
+            .status = status,
+        });
     }
 
     fn nextSnapshotSendSleepMs(self: *HttpSnapshotTransport) u64 {
@@ -698,6 +834,17 @@ pub const HttpSnapshotTransport = struct {
         self: *HttpSnapshotTransport,
         req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
     ) !void {
+        const result = try self.trySubmitSnapshot(req);
+        switch (result) {
+            .accepted, .duplicate => {},
+            .retry_later => return error.AsyncSnapshotSendQueueFull,
+        }
+    }
+
+    pub fn trySubmitSnapshot(
+        self: *HttpSnapshotTransport,
+        req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
+    ) !raft_engine.runtime.snapshot_transport_iface.SnapshotSubmitResult {
         if (self.send_threads.len == 0) return error.AsyncSnapshotSenderNotStarted;
         return self.enqueueSnapshot(req);
     }
@@ -710,6 +857,35 @@ pub const HttpSnapshotTransport = struct {
     fn submitSnapshotCallback(ptr: *anyopaque, req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest) !void {
         const self: *HttpSnapshotTransport = @ptrCast(@alignCast(ptr));
         return self.submitSnapshot(req);
+    }
+
+    fn trySubmitSnapshotCallback(
+        ptr: *anyopaque,
+        req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
+    ) !raft_engine.runtime.snapshot_transport_iface.SnapshotSubmitResult {
+        const self: *HttpSnapshotTransport = @ptrCast(@alignCast(ptr));
+        return self.trySubmitSnapshot(req);
+    }
+
+    fn drainCompletionsCallback(
+        ptr: *anyopaque,
+        out: []raft_engine.runtime.snapshot_transport_iface.SnapshotCompletion,
+    ) usize {
+        const self: *HttpSnapshotTransport = @ptrCast(@alignCast(ptr));
+        if (out.len == 0) return 0;
+        self.send_mutex.lockUncancelable(self.artifact_io);
+        defer self.send_mutex.unlock(self.artifact_io);
+        const count = @min(out.len, self.send_completions.items.len);
+        @memcpy(out[0..count], self.send_completions.items[0..count]);
+        const remaining = self.send_completions.items.len - count;
+        std.mem.copyForwards(
+            raft_engine.runtime.snapshot_transport_iface.SnapshotCompletion,
+            self.send_completions.items[0..remaining],
+            self.send_completions.items[count..],
+        );
+        self.send_completions.items.len = remaining;
+        if (count > 0) self.send_ready.broadcast(self.artifact_io);
+        return count;
     }
 
     fn sendSnapshotSync(
@@ -1915,17 +2091,35 @@ test "async snapshot send lane deduplicates and applies retained ownership bound
     }, executor.iface(), null);
     defer transport.deinit();
     try transport.send_queue.ensureTotalCapacity(std.testing.allocator, 1);
+    try transport.send_reserved_peers.ensureTotalCapacity(std.testing.allocator, 1);
+    try transport.send_completions.ensureTotalCapacity(std.testing.allocator, 1);
 
     const first: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest = .{
         .group_id = 7,
         .to = 2,
         .snapshot = .{ .metadata = .{ .index = 11, .term = 3 }, .data = @constCast("payload") },
     };
-    try transport.enqueueSnapshot(first);
-    try transport.enqueueSnapshot(first);
+    try std.testing.expectEqual(
+        raft_engine.runtime.snapshot_transport_iface.SnapshotSubmitResult.accepted,
+        try transport.enqueueSnapshot(first),
+    );
+    try std.testing.expectEqual(
+        raft_engine.runtime.snapshot_transport_iface.SnapshotSubmitResult.duplicate,
+        try transport.enqueueSnapshot(first),
+    );
     var second = first;
     second.snapshot.metadata.index += 1;
-    try std.testing.expectError(error.AsyncSnapshotSendQueueFull, transport.enqueueSnapshot(second));
+    // Saturation is decided before QueuedSnapshot.init retains or copies the
+    // payload. A zero-budget allocator therefore cannot turn ordinary
+    // backpressure into an allocation failure.
+    const original_alloc = transport.alloc;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const deferred = blk: {
+        transport.alloc = failing.allocator();
+        defer transport.alloc = original_alloc;
+        break :blk try transport.enqueueSnapshot(second);
+    };
+    try std.testing.expect(std.meta.activeTag(deferred) == .retry_later);
 
     const metrics = transport.asyncSendMetricsSnapshot();
     try std.testing.expectEqual(@as(u64, 1), metrics.enqueued);
@@ -1933,6 +2127,8 @@ test "async snapshot send lane deduplicates and applies retained ownership bound
     try std.testing.expectEqual(@as(u64, 1), metrics.queue_full);
     try std.testing.expectEqual(@as(usize, 1), metrics.pending);
     try std.testing.expectEqual(@as(usize, 7), metrics.pending_bytes);
+    try std.testing.expectEqual(@as(usize, 0), metrics.reserved);
+    try std.testing.expectEqual(@as(usize, 0), metrics.reserved_bytes);
 }
 
 test "active async snapshot job publishes its owned cancellation atomically" {
@@ -1956,11 +2152,14 @@ test "active async snapshot job publishes its owned cancellation atomically" {
     defer transport.deinit();
     try transport.send_queue.ensureTotalCapacity(std.testing.allocator, 1);
     try transport.send_active_peers.ensureTotalCapacity(std.testing.allocator, 1);
+    try transport.send_reserved_peers.ensureTotalCapacity(std.testing.allocator, 1);
+    try transport.send_completions.ensureTotalCapacity(std.testing.allocator, 1);
     var active_jobs = [_]?*HttpSnapshotTransport.QueuedSnapshot{null};
     transport.send_active_jobs = &active_jobs;
 
-    try transport.enqueueSnapshot(.{
+    _ = try transport.enqueueSnapshot(.{
         .group_id = 7,
+        .incarnation = 9,
         .to = 2,
         .snapshot = .{ .metadata = .{ .index = 11, .term = 3 }, .data = @constCast("payload") },
     });
@@ -1977,6 +2176,19 @@ test "active async snapshot job publishes its owned cancellation atomically" {
 
     transport.finishSnapshotJob(0, &job);
     job.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), transport.asyncSendMetricsSnapshot().pending_completions);
+    var completions: [1]raft_engine.runtime.snapshot_transport_iface.SnapshotCompletion = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        transport.submissionTransport().drainCompletions(&completions),
+    );
+    try std.testing.expectEqual(@as(u64, 7), completions[0].group_id);
+    try std.testing.expectEqual(@as(u64, 9), completions[0].incarnation);
+    try std.testing.expectEqual(
+        raft_engine.runtime.snapshot_transport_iface.SnapshotCompletionStatus.delivered,
+        completions[0].status,
+    );
+    try std.testing.expectEqual(@as(usize, 0), transport.asyncSendMetricsSnapshot().pending_completions);
     transport.send_active_jobs = &.{};
 }
 

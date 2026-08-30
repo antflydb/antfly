@@ -167,6 +167,10 @@ pub const HostMetrics = struct {
     transport_message_sends: usize = 0,
     transport_peer_batch_flushes: usize = 0,
     transport_snapshot_sends: usize = 0,
+    transport_snapshot_submission_deferrals: usize = 0,
+    transport_snapshot_completions: usize = 0,
+    transport_snapshot_completion_failures: usize = 0,
+    transport_snapshot_stale_completions: usize = 0,
     restored_replicas: usize = 0,
     pending_outbound_messages: usize = 0,
     pending_outbound_bytes: usize = 0,
@@ -1598,7 +1602,12 @@ pub const MultiRaft = struct {
             try self.enqueueApply(group_id, ready.snapshot, ready.committed_entries, ready.read_states, grp.status().conf_state);
             if (diagnostics) |diag| diag.enqueue_apply_elapsed_ns = clock.elapsedSinceNs(enqueue_apply_start_ns);
             const outbox_append_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-            try outbox.appendMessages(self.alloc, group_id, ready_messages);
+            try outbox.appendMessages(
+                self.alloc,
+                group_id,
+                self.group_incarnations.get(group_id) orelse return error.UnknownGroup,
+                ready_messages,
+            );
             if (diagnostics) |diag| diag.outbox_append_elapsed_ns = clock.elapsedSinceNs(outbox_append_start_ns);
             const advance_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
             grp.advance(ready);
@@ -1656,7 +1665,12 @@ pub const MultiRaft = struct {
             switch (msg.msg_type) {
                 .storage_append => try self.handleLocalStorageAppend(group_id, grp, msg, outbox),
                 .storage_apply => try self.handleLocalStorageApply(group_id, grp, msg, outbox),
-                else => try outbox.appendMessage(self.alloc, group_id, msg),
+                else => try outbox.appendMessage(
+                    self.alloc,
+                    group_id,
+                    self.group_incarnations.get(group_id) orelse return error.UnknownGroup,
+                    msg,
+                ),
             }
         }
         if (diagnostics) |diag| diag.async_message_loop_elapsed_ns = clock.elapsedSinceNs(async_message_loop_start_ns);
@@ -2127,6 +2141,7 @@ pub const MultiRaft = struct {
         self.metrics.transport_message_sends += stats.message_sends;
         self.metrics.transport_peer_batch_flushes += stats.peer_batch_flushes;
         self.metrics.transport_snapshot_sends += stats.snapshot_sends;
+        self.metrics.transport_snapshot_submission_deferrals += stats.snapshot_submission_deferrals;
     }
 
     fn hasOutboundCapacity(self: *const MultiRaft, total_messages: usize, total_bytes: usize) bool {
@@ -2142,6 +2157,7 @@ pub const MultiRaft = struct {
     }
 
     fn flushPendingTransport(self: *MultiRaft) !void {
+        self.drainSnapshotTransportCompletions();
         if (self.pending_outbox.items.items.len == 0) return;
         if (self.hooks.transport == null and self.hooks.snapshot_transport == null) return;
 
@@ -2152,6 +2168,40 @@ pub const MultiRaft = struct {
             self.cfg.max_transport_bytes_per_round,
         );
         self.recordTransportFlush(stats);
+        self.drainSnapshotTransportCompletions();
+    }
+
+    fn drainSnapshotTransportCompletions(self: *MultiRaft) void {
+        const snapshot_transport = self.hooks.snapshot_transport orelse return;
+        var completions: [32]snapshot_transport_iface.SnapshotCompletion = undefined;
+        while (true) {
+            const count = snapshot_transport.drainCompletions(&completions);
+            if (count == 0) return;
+            for (completions[0..count]) |completion| {
+                if (self.group_incarnations.get(completion.group_id) != completion.incarnation) {
+                    self.metrics.transport_snapshot_stale_completions += 1;
+                    continue;
+                }
+                const grp = self.group(completion.group_id) orelse {
+                    self.metrics.transport_snapshot_stale_completions += 1;
+                    continue;
+                };
+                if (completion.from != grp.localNodeId()) {
+                    self.metrics.transport_snapshot_stale_completions += 1;
+                    continue;
+                }
+                self.metrics.transport_snapshot_completions += 1;
+                if (completion.status == .failed) {
+                    self.metrics.transport_snapshot_completion_failures += 1;
+                    grp.reportSnapshotFailure(
+                        completion.to,
+                        completion.snapshot_index,
+                        completion.snapshot_term,
+                    );
+                }
+            }
+            if (count < completions.len) return;
+        }
     }
 
     fn consumePendingApplyPrefix(self: *MultiRaft, count: usize) void {
@@ -2312,7 +2362,12 @@ pub const MultiRaft = struct {
             if (core.message.isLocalStorageThread(response.to) or response.to == grp.localNodeId()) {
                 try grp.step(response);
             } else {
-                try outbox.appendMessage(self.alloc, group_id, response);
+                try outbox.appendMessage(
+                    self.alloc,
+                    group_id,
+                    self.group_incarnations.get(group_id) orelse return error.UnknownGroup,
+                    response,
+                );
             }
         }
     }
@@ -2328,7 +2383,12 @@ pub const MultiRaft = struct {
             if (core.message.isLocalStorageThread(response.to) or response.to == grp.localNodeId()) {
                 try grp.step(response);
             } else {
-                try outbox.appendMessage(self.alloc, group_id, response);
+                try outbox.appendMessage(
+                    self.alloc,
+                    group_id,
+                    self.group_incarnations.get(group_id) orelse return error.UnknownGroup,
+                    response,
+                );
             }
         }
     }
@@ -2336,13 +2396,16 @@ pub const MultiRaft = struct {
 
 const OutboundMessage = struct {
     group_id: core.types.GroupId,
+    incarnation: u64,
     message: core.Message,
+    accepted: bool = false,
 };
 
 const TransportFlushStats = struct {
     message_sends: usize = 0,
     peer_batch_flushes: usize = 0,
     snapshot_sends: usize = 0,
+    snapshot_submission_deferrals: usize = 0,
 };
 
 fn summarizeReady(group_id: core.types.GroupId, ready: core.Ready) backpressure_iface.ReadyPressure {
@@ -2467,11 +2530,13 @@ const TransportOutbox = struct {
         self: *TransportOutbox,
         alloc: std.mem.Allocator,
         group_id: core.types.GroupId,
+        incarnation: u64,
         msg: core.Message,
     ) !void {
         const msg_bytes = approxMessagesSize(&.{msg});
         try self.items.append(alloc, .{
             .group_id = group_id,
+            .incarnation = incarnation,
             .message = try msg.clone(alloc),
         });
         self.approx_bytes += msg_bytes;
@@ -2481,6 +2546,7 @@ const TransportOutbox = struct {
         self: *TransportOutbox,
         alloc: std.mem.Allocator,
         group_id: core.types.GroupId,
+        incarnation: u64,
         messages: []const core.Message,
     ) !void {
         try self.items.ensureUnusedCapacity(alloc, messages.len);
@@ -2488,6 +2554,7 @@ const TransportOutbox = struct {
             const msg_bytes = approxMessagesSize(&.{msg});
             self.items.appendAssumeCapacity(.{
                 .group_id = group_id,
+                .incarnation = incarnation,
                 .message = try msg.clone(alloc),
             });
             self.approx_bytes += msg_bytes;
@@ -2509,31 +2576,42 @@ const TransportOutbox = struct {
 
     fn flush(self: *TransportOutbox, alloc: std.mem.Allocator, hooks: RuntimeHooks) !TransportFlushStats {
         if (self.items.items.len == 0) return .{};
-        defer self.clear(alloc);
+        // Only acknowledged submissions cross the ownership boundary. The
+        // caller restores every unaccepted entry to the pending outbox.
+        defer self.consumeAccepted(alloc);
 
         var stats: TransportFlushStats = .{};
 
         if (hooks.snapshot_transport) |snapshot_transport| {
-            for (self.items.items) |item| {
+            for (self.items.items) |*item| {
                 if (item.message.msg_type != .snapshot) continue;
                 const snapshot = item.message.snapshot orelse return error.MissingSnapshot;
-                try snapshot_transport.sendSnapshot(.{
+                const outcome = try snapshot_transport.submitSnapshot(.{
                     .group_id = item.group_id,
+                    .incarnation = item.incarnation,
                     .from = item.message.from,
                     .to = item.message.to,
                     .term = item.message.term,
                     .snapshot = snapshot,
                 });
-                stats.snapshot_sends += 1;
+                switch (outcome) {
+                    .accepted => {
+                        item.accepted = true;
+                        stats.snapshot_sends += 1;
+                    },
+                    .duplicate => item.accepted = true,
+                    .retry_later => stats.snapshot_submission_deferrals += 1,
+                }
             }
         }
 
         const transport = hooks.transport orelse return stats;
 
         if (!transport.supportsPeerBatches()) {
-            for (self.items.items) |item| {
+            for (self.items.items) |*item| {
                 if (item.message.msg_type == .snapshot) continue;
                 try transport.sendMessages(item.group_id, &.{item.message});
+                item.accepted = true;
                 stats.message_sends += 1;
             }
             return stats;
@@ -2546,6 +2624,7 @@ const TransportOutbox = struct {
         }
 
         for (self.items.items) |item| {
+            if (item.accepted) continue;
             if (item.message.msg_type == .snapshot) continue;
             const peer_idx = blk: {
                 for (peer_builders.items, 0..) |peer, i| {
@@ -2615,6 +2694,9 @@ const TransportOutbox = struct {
                 stats.message_sends += group_batch.messages.len;
             }
         }
+        for (self.items.items) |*item| {
+            if (item.message.msg_type != .snapshot) item.accepted = true;
+        }
         return stats;
     }
 
@@ -2631,7 +2713,10 @@ const TransportOutbox = struct {
         if (take_count == 0) return .{};
 
         var prefix = try self.takePrefix(alloc, take_count);
-        defer prefix.deinit(alloc);
+        defer {
+            self.restorePrefix(&prefix);
+            prefix.deinit(alloc);
+        }
         return try prefix.flush(alloc, hooks);
     }
 
@@ -2667,6 +2752,40 @@ const TransportOutbox = struct {
         self.approx_bytes -= taken_bytes;
 
         return out;
+    }
+
+    fn restorePrefix(self: *TransportOutbox, prefix: *TransportOutbox) void {
+        if (prefix.items.items.len == 0) return;
+        std.debug.assert(self.items.capacity - self.items.items.len >= prefix.items.items.len);
+        const prefix_len = prefix.items.items.len;
+        const old_len = self.items.items.len;
+        self.items.items.len += prefix_len;
+        std.mem.copyBackwards(
+            OutboundMessage,
+            self.items.items[prefix_len .. prefix_len + old_len],
+            self.items.items[0..old_len],
+        );
+        @memcpy(self.items.items[0..prefix_len], prefix.items.items);
+        self.approx_bytes += prefix.approx_bytes;
+        prefix.items.items.len = 0;
+        prefix.approx_bytes = 0;
+    }
+
+    fn consumeAccepted(self: *TransportOutbox, alloc: std.mem.Allocator) void {
+        var retained: usize = 0;
+        var retained_bytes: usize = 0;
+        for (self.items.items, 0..) |*item, index| {
+            if (item.accepted) {
+                item.message.deinit(alloc);
+                continue;
+            }
+            item.accepted = false;
+            retained_bytes += approxMessagesSize(&.{item.message});
+            if (retained != index) self.items.items[retained] = item.*;
+            retained += 1;
+        }
+        self.items.items.len = retained;
+        self.approx_bytes = retained_bytes;
     }
 
     fn clear(self: *TransportOutbox, alloc: std.mem.Allocator) void {

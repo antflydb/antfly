@@ -272,6 +272,8 @@ pub const Progress = struct {
     next_index: Index = 1,
     state: ProgressState = .probe,
     probe_sent: bool = false,
+    pending_snapshot_index: Index = 0,
+    pending_snapshot_term: Term = 0,
     recent_active: bool = false,
 };
 
