@@ -344,6 +344,14 @@ func haRuntimeStartupGate(cluster *antflyv1.AntflyCluster) *antflyv1.HAStartupGa
 	return cluster.Spec.HighAvailability.Runtime.StartupGate
 }
 
+func haManagementDisabled(cluster *antflyv1.AntflyCluster) bool {
+	if cluster == nil || cluster.Spec.HighAvailability == nil {
+		return true
+	}
+	mode := cluster.Spec.HighAvailability.Mode
+	return mode == "" || mode == antflyv1.HAModeDisabled
+}
+
 func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Context, cluster *antflyv1.AntflyCluster, storageSize string) (*corev1.PersistentVolumeClaim, error) {
 	gate := haRuntimeStartupGate(cluster)
 	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed || gate.RequiredReceipt == nil {
@@ -604,6 +612,106 @@ func haStandaloneRuntimeSeedIdentityAnnotations(cluster *antflyv1.AntflyCluster)
 		annotations[haSeedCheckpointLSNAnnotation] = strconv.FormatUint(receipt.CheckpointLSN, 10)
 	}
 	return annotations
+}
+
+type activatedStandaloneStorageBinding struct {
+	claimName   string
+	generation  string
+	annotations map[string]string
+}
+
+// existingActivatedStandaloneStorageBinding recognizes only the complete
+// storage shape emitted after an exact seed activation. It deliberately reads
+// the admitted StatefulSet rather than mutable AntflyCluster annotations: HA
+// disable may remove the startup receipt from the spec/status, but it cannot
+// safely change where the already-running database is mounted.
+func existingActivatedStandaloneStorageBinding(statefulSet *appsv1.StatefulSet, storageVolumeName string) *activatedStandaloneStorageBinding {
+	if statefulSet == nil || strings.TrimSpace(storageVolumeName) == "" {
+		return nil
+	}
+	annotations := statefulSet.Spec.Template.Annotations
+	claimName := strings.TrimSpace(annotations[haSeedTargetPVCNameAnnotation])
+	claimUID := strings.TrimSpace(annotations[haSeedTargetPVCUIDAnnotation])
+	generation := strings.TrimSpace(annotations[haSeedGenerationAnnotation])
+	if claimName == "" || claimUID == "" || generation == "" || generation == "." || generation == ".." || path.Base(generation) != generation ||
+		!isLowerHexDigest(strings.TrimSpace(annotations[haStartupGateReceiptHashAnnotation])) {
+		return nil
+	}
+
+	storageVolumes := 0
+	for i := range statefulSet.Spec.Template.Spec.Volumes {
+		volume := &statefulSet.Spec.Template.Spec.Volumes[i]
+		if volume.Name != storageVolumeName {
+			continue
+		}
+		storageVolumes++
+		if volume.PersistentVolumeClaim == nil || strings.TrimSpace(volume.PersistentVolumeClaim.ClaimName) != claimName {
+			return nil
+		}
+	}
+	if storageVolumes != 1 {
+		return nil
+	}
+	for i := range statefulSet.Spec.VolumeClaimTemplates {
+		if statefulSet.Spec.VolumeClaimTemplates[i].Name == storageVolumeName {
+			return nil
+		}
+	}
+
+	var runtime *corev1.Container
+	for i := range statefulSet.Spec.Template.Spec.Containers {
+		if statefulSet.Spec.Template.Spec.Containers[i].Name == "antfly" {
+			runtime = &statefulSet.Spec.Template.Spec.Containers[i]
+			break
+		}
+	}
+	if runtime == nil {
+		return nil
+	}
+	generationRoot := path.Join(haSeedActivationRelativeRoot, "live-generations", generation)
+	expectedMounts := map[string]string{
+		haSeedLiveDataPath:       path.Join(generationRoot, "data"),
+		haSeedLiveMetadataPath:   path.Join(generationRoot, "metadata"),
+		haSeedLiveExtensionsPath: path.Join(generationRoot, "extensions"),
+	}
+	for mountPath, subPath := range expectedMounts {
+		matches := 0
+		for i := range runtime.VolumeMounts {
+			mount := &runtime.VolumeMounts[i]
+			if mount.MountPath == mountPath {
+				matches++
+				if mount.Name != storageVolumeName || mount.SubPath != subPath {
+					return nil
+				}
+			}
+		}
+		if matches != 1 {
+			return nil
+		}
+	}
+
+	preservedAnnotations := map[string]string{
+		haStartupGateReceiptHashAnnotation: annotations[haStartupGateReceiptHashAnnotation],
+	}
+	for _, key := range haSeedIdentityAnnotationKeys {
+		setHASeedIdentityAnnotation(preservedAnnotations, key, annotations[key])
+	}
+	return &activatedStandaloneStorageBinding{
+		claimName: claimName, generation: generation, annotations: preservedAnnotations,
+	}
+}
+
+func hasExplicitStandaloneStoragePVC(statefulSet *appsv1.StatefulSet, storageVolumeName string) bool {
+	if statefulSet == nil {
+		return false
+	}
+	for i := range statefulSet.Spec.Template.Spec.Volumes {
+		volume := &statefulSet.Spec.Template.Spec.Volumes[i]
+		if volume.Name == storageVolumeName && volume.PersistentVolumeClaim != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec, startupGeneration string) string {
@@ -2904,6 +3012,16 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
+	// HA disable is an authority revocation boundary. Cancel exact-owned Jobs
+	// before validation or workload reconciliation so a malformed/unavailable
+	// workload cannot leave a previously authorized storage mutation running or
+	// keep its PVC pinned by a completed Job Pod.
+	if haManagementDisabled(&antflyCluster) {
+		if err := r.deleteDisabledHAAdminJobs(ctx, &antflyCluster); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Colony's deprovisioner persists an immutable, digest-bound request on the
 	// current primary before Namespace deletion. Reconcile it ahead of ordinary
 	// cluster validation so cleanup cannot deadlock behind unrelated runtime
@@ -4455,6 +4573,17 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	}
 
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, statefulSet, func() error {
+		// Removing HA management must not reinterpret a seeded runtime's disk as a
+		// fresh volumeClaimTemplate. Its database, metadata, and extensions live in
+		// one activated generation on an explicitly bound PVC. Preserve that exact,
+		// already-admitted storage topology while dropping only HA authority.
+		var preservedSeedStorage *activatedStandaloneStorageBinding
+		if !activatedSeedGate && haManagementDisabled(cluster) {
+			preservedSeedStorage = existingActivatedStandaloneStorageBinding(statefulSet, storageVolumeName)
+			if preservedSeedStorage == nil && hasExplicitStandaloneStoragePVC(statefulSet, storageVolumeName) {
+				return fmt.Errorf("existing StatefulSet %s has an explicit standalone storage PVC without a complete activated-seed binding; refusing to reinterpret its on-disk layout", statefulSet.Name)
+			}
+		}
 		if err := validateAndSetStandaloneStorageIdentity(statefulSet, cluster); err != nil {
 			return err
 		}
@@ -4496,6 +4625,8 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 				podAnnotations[haStartupGateReceiptHashAnnotation] = hash
 				maps.Copy(podAnnotations, haStandaloneRuntimeSeedIdentityAnnotations(cluster))
 			}
+		} else if preservedSeedStorage != nil {
+			maps.Copy(podAnnotations, preservedSeedStorage.annotations)
 		}
 		volumeMounts := []corev1.VolumeMount{
 			{Name: storageVolumeName, MountPath: "/antflydb"},
@@ -4509,12 +4640,21 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 				}},
 			},
 		}
-		if activatedSeedGate {
-			required := *startupGate.RequiredReceipt
+		if activatedSeedGate || preservedSeedStorage != nil {
+			claimName := ""
+			generation := ""
+			if activatedSeedGate {
+				required := *startupGate.RequiredReceipt
+				claimName = required.TargetPVCName
+				generation = required.Generation
+			} else {
+				claimName = preservedSeedStorage.claimName
+				generation = preservedSeedStorage.generation
+			}
 			volumes = append(volumes,
-				corev1.Volume{Name: storageVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: required.TargetPVCName}}},
+				corev1.Volume{Name: storageVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claimName}}},
 			)
-			generationRoot := path.Join(haSeedActivationRelativeRoot, "live-generations", required.Generation)
+			generationRoot := path.Join(haSeedActivationRelativeRoot, "live-generations", generation)
 			volumeMounts = append(volumeMounts,
 				corev1.VolumeMount{
 					Name: storageVolumeName, MountPath: haSeedLiveDataPath,
@@ -5948,7 +6088,7 @@ func (r *AntflyClusterReconciler) persistHAActionPlanBarrier(ctx context.Context
 
 func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
 	ha := cluster.Spec.HighAvailability
-	if ha == nil || ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled {
+	if haManagementDisabled(cluster) {
 		return r.deleteDisabledHAAdminJobs(ctx, cluster)
 	}
 	if ha.Admin == nil || !ha.Admin.ExecutePlannedActions || cluster.Status.HAStatus == nil {

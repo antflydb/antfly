@@ -15404,6 +15404,92 @@ func TestReconcileStandaloneStatefulSetSuspendPolicyPreservesExistingStorageTopo
 	}))
 }
 
+func TestReconcileStandaloneStatefulSetHADisablePreservesActivatedSeedStorageTopology(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := startupGatedStandaloneControllerCluster(true)
+	digest := func(value string) string { return strings.Repeat(value, 64) }
+	cluster.Status.HAStatus = &antflyv1.HAStatus{StartupGate: &antflyv1.HAStartupGateStatus{
+		RuntimeEligible: true,
+		ActivationReceipt: &antflyv1.HASeedActivationReceiptStatus{
+			TopologyID: "test-standalone", TopologyGeneration: 3,
+			NodeID: "standby-a", SlotName: "standby-a", Generation: "prod-standby-a-10",
+			ClusterID: 100, TimelineID: 1, Epoch: 1,
+			ManifestID: "manifest-standby-a-10", ManifestSHA256: digest("a"),
+			AggregateSHA256: digest("b"), SeedReceiptSHA256: digest("c"),
+			CaptureReceiptSHA256: digest("d"), MaterializedReceiptSHA256: digest("e"),
+			MaterializedAggregateSHA256: digest("f"),
+			TargetPVCName:               "standby-a-data", TargetPVCUID: "pvc-uid-1",
+			TargetLocalNodeID: 1, TargetReplicaID: 1,
+			GenerationPath:    "live-generations/prod-standby-a-10",
+			RawGenerationPath: "generations/prod-standby-a-10",
+		},
+	}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "standby-a-data", Namespace: "default", UID: types.UID("pvc-uid-1"),
+	}}
+	testClient := newHAControllerTestClient(t, s, cluster, pvc)
+	reconciler := &AntflyClusterReconciler{Client: testClient, Scheme: s}
+
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	cluster.Spec.HighAvailability = nil
+	cluster.Status.HAStatus = nil
+	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+
+	sts := &appsv1.StatefulSet{}
+	g.Expect(testClient.Get(context.Background(), types.NamespacedName{
+		Name: "test-standalone-standalone", Namespace: "default",
+	}, sts)).To(Succeed())
+	g.Expect(sts.Spec.VolumeClaimTemplates).To(BeEmpty())
+	g.Expect(sts.Spec.Template.Spec.Volumes).To(ContainElement(corev1.Volume{
+		Name: "standalone-storage", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: "standby-a-data",
+		}},
+	}))
+	container := sts.Spec.Template.Spec.Containers[0]
+	for mountPath, leaf := range map[string]string{
+		"/antflydb/data": "data", "/antflydb/metadata": "metadata", "/antflydb/extensions": "extensions",
+	} {
+		g.Expect(container.VolumeMounts).To(ContainElement(corev1.VolumeMount{
+			Name: "standalone-storage", MountPath: mountPath,
+			SubPath: ".antfly-ha/active/live-generations/prod-standby-a-10/" + leaf,
+		}))
+	}
+	g.Expect(container.Args[0]).NotTo(ContainSubstring("--ha-"), "disabling HA removes authority without relocating the database")
+	g.Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(haSeedTargetPVCUIDAnnotation, "pvc-uid-1"))
+	g.Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(haSeedGenerationAnnotation, "prod-standby-a-10"))
+}
+
+func TestReconcileStandaloneStatefulSetHADisableRejectsIncompleteExplicitSeedBinding(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := baseStandaloneControllerCluster()
+	existing := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-standalone-standalone", Namespace: "default",
+			Annotations: map[string]string{annotationStorageEngine: "local"},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+				Name: "standalone-storage", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "seed-data"}},
+			}}}},
+		},
+	}
+	testClient := newHAControllerTestClient(t, s, cluster, existing)
+	reconciler := &AntflyClusterReconciler{Client: testClient, Scheme: s}
+
+	err := reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)
+	g.Expect(err).To(MatchError(ContainSubstring("without a complete activated-seed binding")))
+}
+
 func TestReconcileStandaloneStatefulSetStartupGateSuspendsLegacyControllerBeforeClaimHandoff(t *testing.T) {
 	g := NewWithT(t)
 	s := runtime.NewScheme()
