@@ -3134,6 +3134,22 @@ pub const ProvisionedTableWriteCache = struct {
         return false;
     }
 
+    fn hasRetiredOrClosingEntryForGroupTableAssumeLifecycleLocked(
+        self: *const ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+    ) bool {
+        for (self.closing_entries.items) |entry| {
+            if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name))
+                return true;
+        }
+        for (self.retired_entries.items) |entry| {
+            if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name))
+                return true;
+        }
+        return false;
+    }
+
     fn hasForegroundStateForGroupTableLocked(
         self: *const ProvisionedTableWriteCache,
         group_id: u64,
@@ -12063,21 +12079,30 @@ pub const ProvisionedTableWriteSource = struct {
         // LSM single-writer guard correctly rejects every operator retry, but
         // no cache operation remains to perform the close.
         //
-        // Serialize the cold open with both serving and startup caches, then
-        // synchronously drain their exact retirement queues. Keep the open
-        // locks through the snapshot so no cache path can publish a competing
-        // owner or expose a temporary mirror-free DB to background work. The
-        // capture already owns the exclusive HA mutation barrier, so the cold
-        // DB intentionally retains the original null mirror; attaching the
-        // primary mirror would recursively wait on that barrier.
+        // Serialize the cold open with both serving and startup caches. Pending
+        // closes must have been drained by prepareHASeedReplicaSnapshot before
+        // the runtime acquired its exclusive HA mutation barrier: DB.close()
+        // can itself need a shared mutation lease while retiring generated
+        // index state, so draining here would recursively deadlock the capture.
+        // If retirement raced the preflight, fail retryably and let the next
+        // preflight drain it outside the frozen interval.
+        //
+        // Keep the open locks through the snapshot so no cache path can publish
+        // a competing owner or expose a temporary mirror-free DB to background
+        // work. The cold DB intentionally retains the original null mirror;
+        // attaching the primary mirror would recursively wait on the barrier.
         if (self.write_cache != null or self.startup_write_cache != null) {
             var locks = WriteCacheTransitionLocks.init(self, true, true);
             defer locks.deinit();
+            if (locks.first) |cache| {
+                if (cache.hasRetiredOrClosingEntryForGroupTableAssumeLifecycleLocked(group_id, table_name))
+                    return error.HASeedSnapshotRuntimeBusy;
+            }
+            if (locks.second) |cache| {
+                if (cache.hasRetiredOrClosingEntryForGroupTableAssumeLifecycleLocked(group_id, table_name))
+                    return error.HASeedSnapshotRuntimeBusy;
+            }
             locks.releaseStateLocks();
-            if (locks.first) |cache|
-                cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
-            if (locks.second) |cache|
-                cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
 
             var db = openManagedDbForTableGroupWithRuntimeAndHAWriteGate(
                 alloc,
@@ -12126,18 +12151,35 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         deadline_ns: u64,
     ) !void {
-        var probe = self.probeManagedWriterGroupBestEffort(table_name, group_id);
-        defer probe.deinit();
-        switch (probe) {
-            .unknown => return error.HASeedSnapshotRuntimeBusy,
-            .absent => return,
-            .leased => |*cached| cached.db.prepareHASeedSnapshot(deadline_ns) catch |err| switch (err) {
-                error.EnrichmentWaitCanceled,
-                error.EnrichmentWaitTimeout,
-                error.EnrichmentRetryInProgress,
-                => return error.HASeedSnapshotRuntimeBusy,
-                else => return err,
-            },
+        {
+            var probe = self.probeManagedWriterGroupBestEffort(table_name, group_id);
+            defer probe.deinit();
+            switch (probe) {
+                .unknown => return error.HASeedSnapshotRuntimeBusy,
+                .absent => {},
+                .leased => |*cached| cached.db.prepareHASeedSnapshot(deadline_ns) catch |err| switch (err) {
+                    error.EnrichmentWaitCanceled,
+                    error.EnrichmentWaitTimeout,
+                    error.EnrichmentRetryInProgress,
+                    => return error.HASeedSnapshotRuntimeBusy,
+                    else => return err,
+                },
+            }
+        }
+
+        // Promotion can retire a cache owner while an already-admitted request
+        // still holds its last lease. Releasing the probe above may be the
+        // event that queues that owner for close. Drain it now, while shared HA
+        // mutation admission remains available, never after capture freezes the
+        // process-wide barrier.
+        if (self.write_cache != null or self.startup_write_cache != null) {
+            var locks = WriteCacheTransitionLocks.init(self, true, true);
+            defer locks.deinit();
+            locks.releaseStateLocks();
+            if (locks.first) |cache|
+                cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
+            if (locks.second) |cache|
+                cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
         }
     }
 
@@ -47780,7 +47822,7 @@ test "write cache adopts active just-created db across generation bump" {
     try std.testing.expectEqual(misses_before, write_cache.miss_count.load(.monotonic));
 }
 
-test "HA seed capture drains writer released after promotion cache clear" {
+test "HA seed preflight drains writer released after promotion cache clear before capture freeze" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -47930,6 +47972,33 @@ test "HA seed capture drains writer released after promotion cache clear" {
     };
     write_cache.ha_async_mirror = source.ha_async_mirror;
     startup_write_cache.ha_async_mirror = source.ha_async_mirror;
+
+    // A frozen capture must never perform cache-owner destruction. In
+    // production that close can reacquire the barrier through generated-index
+    // retirement, recursively deadlocking this exclusive lease.
+    {
+        var premature_capture = mutation_barrier.acquireExclusive();
+        defer premature_capture.release();
+        try std.testing.expectError(
+            error.HASeedSnapshotRuntimeBusy,
+            source.captureHASeedReplicaSnapshot(
+                alloc,
+                "docs",
+                7001,
+                "premature-promoted-generation",
+                destination_root,
+            ),
+        );
+    }
+
+    try source.prepareHASeedReplicaSnapshot("docs", 7001, std.math.maxInt(u64));
+    try source.prepareHASeedReplicaSnapshot("docs", 7002, std.math.maxInt(u64));
+
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), startup_write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), startup_write_cache.closing_entries.items.len);
+
     var capture_lease = mutation_barrier.acquireExclusive();
     defer capture_lease.release();
 
