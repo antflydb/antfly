@@ -145,6 +145,7 @@ pub const Raft = struct {
     conf_state: types.ConfState,
     pending_snapshot: ?types.Snapshot = null,
     snapshot_in_progress: bool = false,
+    next_snapshot_attempt_generation: u64 = 1,
     uncommitted_size: usize = 0,
     read_sequence: u64 = 0,
     pending_reads: std.ArrayListUnmanaged(PendingRead) = .empty,
@@ -317,6 +318,7 @@ pub const Raft = struct {
                         self.abortLeaderTransfer();
                     }
                 }
+                self.tickSnapshotAcknowledgments();
                 self.heartbeat_elapsed += 1;
                 if (self.heartbeat_elapsed >= self.cfg.heartbeat_tick) {
                     self.heartbeat_elapsed = 0;
@@ -1021,6 +1023,16 @@ pub const Raft = struct {
         if (self.soft_state.role != .leader) return;
         const idx = peerIndex(self.peers, msg.from) orelse return;
 
+        if (self.progress[idx].pending_snapshot_attempt) |pending| {
+            // Append responses emitted before snapshot admission cannot reject
+            // or supersede the active transfer. A success at or beyond the
+            // snapshot boundary is sufficient proof that the transfer is no
+            // longer needed; all other stale responses are ignored.
+            if (msg.reject or msg.log_index < pending.snapshot_index) return;
+            self.progress[idx].pending_snapshot_attempt = null;
+            self.progress[idx].probe_sent = false;
+        }
+
         if (msg.reject) {
             self.progress[idx].state = .probe;
             self.progress[idx].probe_sent = false;
@@ -1075,8 +1087,15 @@ pub const Raft = struct {
     fn handleHeartbeatResponse(self: *Raft, msg: message.Message) !void {
         if (self.soft_state.role != .leader) return;
         if (peerIndex(self.peers, msg.from)) |idx| {
-            self.progress[idx].probe_sent = false;
-            if (self.progress[idx].state == .probe and self.isReplicationTarget(msg.from)) {
+            // A dedicated snapshot attempt remains authoritative until its
+            // transport completion fails or the follower acknowledges it.
+            // Heartbeats must not mint duplicate multi-gigabyte attempts.
+            if (self.progress[idx].pending_snapshot_attempt == null)
+                self.progress[idx].probe_sent = false;
+            if (!self.progress[idx].probe_sent and
+                self.progress[idx].state == .probe and
+                self.isReplicationTarget(msg.from))
+            {
                 try self.sendAppend(msg.from);
             }
         }
@@ -1146,8 +1165,13 @@ pub const Raft = struct {
     fn handleSnapshotResponse(self: *Raft, msg: message.Message) !void {
         if (self.soft_state.role != .leader) return;
         const idx = peerIndex(self.peers, msg.from) orelse return;
+        const pending = self.progress[idx].pending_snapshot_attempt orelse return;
+        // A delayed response for an older snapshot must not release a newer
+        // probe. Retries of the exact same snapshot remain safely idempotent.
+        if (msg.log_index != pending.snapshot_index) return;
 
         self.progress[idx].probe_sent = false;
+        self.progress[idx].pending_snapshot_attempt = null;
         self.clearInflights(idx);
         if (msg.reject) return;
 
@@ -1314,6 +1338,7 @@ pub const Raft = struct {
         const idx = peerIndex(self.peers, to) orelse return;
         const next_index = self.progress[idx].next_index;
         if (next_index < self.log.firstIndex()) {
+            if (self.progress[idx].pending_snapshot_attempt != null) return;
             self.progress[idx].probe_sent = false;
             try self.sendSnapshot(to);
             return;
@@ -1359,8 +1384,7 @@ pub const Raft = struct {
                 }) catch unreachable;
             } else {
                 self.progress[idx].probe_sent = true;
-                self.progress[idx].pending_snapshot_index = 0;
-                self.progress[idx].pending_snapshot_term = 0;
+                self.progress[idx].pending_snapshot_attempt = null;
             }
         }
     }
@@ -1380,6 +1404,7 @@ pub const Raft = struct {
         try snapshot.shareOwnedData(self.alloc, null);
         const snapshot_index = snapshot.metadata.index;
         const snapshot_term = snapshot.metadata.term;
+        const attempt_generation = self.next_snapshot_attempt_generation;
 
         try self.send(.{
             .msg_type = .snapshot,
@@ -1389,11 +1414,19 @@ pub const Raft = struct {
             .log_index = snapshot_index,
             .log_term = snapshot_term,
             .snapshot = snapshot,
+            .snapshot_attempt_generation = attempt_generation,
         });
 
+        self.next_snapshot_attempt_generation +%= 1;
+        if (self.next_snapshot_attempt_generation == 0)
+            self.next_snapshot_attempt_generation = 1;
         self.progress[idx].probe_sent = true;
-        self.progress[idx].pending_snapshot_index = snapshot_index;
-        self.progress[idx].pending_snapshot_term = snapshot_term;
+        self.progress[idx].pending_snapshot_attempt = .{
+            .leader_term = self.hard_state.current_term,
+            .snapshot_index = snapshot_index,
+            .snapshot_term = snapshot_term,
+            .generation = attempt_generation,
+        };
     }
 
     /// Releases a failed asynchronous snapshot probe so the next heartbeat
@@ -1402,19 +1435,66 @@ pub const Raft = struct {
     pub fn reportSnapshotFailure(
         self: *Raft,
         to: types.NodeId,
+        leader_term: types.Term,
         snapshot_index: types.Index,
         snapshot_term: types.Term,
-    ) void {
-        if (self.soft_state.role != .leader) return;
-        const idx = peerIndex(self.peers, to) orelse return;
+        attempt_generation: u64,
+    ) bool {
+        if (self.soft_state.role != .leader) return false;
+        const idx = peerIndex(self.peers, to) orelse return false;
         const progress = &self.progress[idx];
+        const pending = progress.pending_snapshot_attempt orelse return false;
         if (progress.state != .probe or !progress.probe_sent or
-            progress.pending_snapshot_index != snapshot_index or
-            progress.pending_snapshot_term != snapshot_term)
-            return;
+            self.hard_state.current_term != leader_term or
+            pending.leader_term != leader_term or
+            pending.snapshot_index != snapshot_index or
+            pending.snapshot_term != snapshot_term or
+            pending.generation != attempt_generation)
+            return false;
         progress.probe_sent = false;
-        progress.pending_snapshot_index = 0;
-        progress.pending_snapshot_term = 0;
+        progress.pending_snapshot_attempt = null;
+        return true;
+    }
+
+    /// Marks exact-attempt transport delivery without treating it as proof
+    /// that the follower durably applied the snapshot. If the Raft response is
+    /// lost, the acknowledgment watchdog eventually releases the probe.
+    pub fn reportSnapshotDelivered(
+        self: *Raft,
+        to: types.NodeId,
+        leader_term: types.Term,
+        snapshot_index: types.Index,
+        snapshot_term: types.Term,
+        attempt_generation: u64,
+    ) bool {
+        if (self.soft_state.role != .leader) return false;
+        const idx = peerIndex(self.peers, to) orelse return false;
+        const progress = &self.progress[idx];
+        const pending = if (progress.pending_snapshot_attempt) |*attempt| attempt else return false;
+        if (progress.state != .probe or !progress.probe_sent or
+            self.hard_state.current_term != leader_term or
+            pending.leader_term != leader_term or
+            pending.snapshot_index != snapshot_index or
+            pending.snapshot_term != snapshot_term or
+            pending.generation != attempt_generation)
+            return false;
+        pending.delivery_confirmed = true;
+        pending.acknowledgment_elapsed_ticks = 0;
+        return true;
+    }
+
+    fn tickSnapshotAcknowledgments(self: *Raft) void {
+        for (self.progress) |*progress| {
+            const expired = if (progress.pending_snapshot_attempt) |*pending| blk: {
+                if (!pending.delivery_confirmed) break :blk false;
+                pending.acknowledgment_elapsed_ticks +|= 1;
+                break :blk pending.acknowledgment_elapsed_ticks >= self.cfg.election_tick;
+            } else false;
+            if (expired) {
+                progress.pending_snapshot_attempt = null;
+                progress.probe_sent = false;
+            }
+        }
     }
 
     fn maybeCommit(self: *Raft) bool {

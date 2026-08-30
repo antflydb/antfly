@@ -234,12 +234,20 @@ const AsyncSnapshotSendMetrics = struct {
 };
 
 pub const HttpSnapshotTransport = struct {
+    const SenderState = enum {
+        stopped,
+        starting,
+        running,
+        closing,
+    };
+
     const QueuedSnapshot = struct {
         group_id: u64,
         incarnation: u64,
         from: u64,
         to: u64,
         term: u64,
+        attempt_generation: u64,
         snapshot: raft_engine.core.types.Snapshot,
         locator_snapshot_id: ?[]u8 = null,
         locator_uri: ?[]u8 = null,
@@ -267,6 +275,7 @@ pub const HttpSnapshotTransport = struct {
                 .from = req.from,
                 .to = req.to,
                 .term = req.term,
+                .attempt_generation = req.attempt_generation,
                 .snapshot = snapshot,
                 .locator_snapshot_id = snapshot_id,
                 .locator_uri = uri,
@@ -281,6 +290,7 @@ pub const HttpSnapshotTransport = struct {
                 .from = self.from,
                 .to = self.to,
                 .term = self.term,
+                .attempt_generation = self.attempt_generation,
                 .snapshot = self.snapshot,
                 .locator = if (self.locator_snapshot_id) |snapshot_id| .{
                     .snapshot_id = snapshot_id,
@@ -296,7 +306,8 @@ pub const HttpSnapshotTransport = struct {
         ) bool {
             if (self.group_id != req.group_id or self.incarnation != req.incarnation or
                 self.from != req.from or self.to != req.to or
-                self.term != req.term or self.snapshot.metadata.index != req.snapshot.metadata.index or
+                self.term != req.term or self.attempt_generation != req.attempt_generation or
+                self.snapshot.metadata.index != req.snapshot.metadata.index or
                 self.snapshot.metadata.term != req.snapshot.metadata.term)
                 return false;
             if (self.locator_snapshot_id == null) return req.locator == null;
@@ -324,7 +335,7 @@ pub const HttpSnapshotTransport = struct {
     send_threads: []std.Thread = &.{},
     send_mutex: std.Io.Mutex = .init,
     send_ready: std.Io.Condition = .init,
-    send_closing: bool = false,
+    send_state: SenderState = .stopped,
     send_queue: std.ArrayListUnmanaged(QueuedSnapshot) = .empty,
     send_active_jobs: []?*QueuedSnapshot = &.{},
     send_active_peers: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -460,7 +471,27 @@ pub const HttpSnapshotTransport = struct {
     }
 
     pub fn startAsyncSender(self: *HttpSnapshotTransport) !void {
-        if (self.send_threads.len != 0) return;
+        self.send_mutex.lockUncancelable(self.artifact_io);
+        while (self.send_state == .starting)
+            self.send_ready.waitUncancelable(self.artifact_io, &self.send_mutex);
+        if (self.send_state == .running) {
+            self.send_mutex.unlock(self.artifact_io);
+            return;
+        }
+        if (self.send_state != .stopped) {
+            self.send_mutex.unlock(self.artifact_io);
+            return error.AsyncSnapshotSenderClosing;
+        }
+        self.send_state = .starting;
+        self.send_mutex.unlock(self.artifact_io);
+        errdefer {
+            self.send_mutex.lockUncancelable(self.artifact_io);
+            if (self.send_state == .starting) {
+                self.send_state = .stopped;
+                self.send_ready.broadcast(self.artifact_io);
+            }
+            self.send_mutex.unlock(self.artifact_io);
+        }
         const worker_count: u32 = if (self.executor.supportsConcurrentRequests())
             self.cfg.async_send_worker_count
         else
@@ -479,30 +510,61 @@ pub const HttpSnapshotTransport = struct {
         var started: usize = 0;
         errdefer {
             self.send_mutex.lockUncancelable(self.artifact_io);
-            self.send_closing = true;
+            self.send_state = .closing;
             self.send_ready.broadcast(self.artifact_io);
             self.send_mutex.unlock(self.artifact_io);
             for (self.send_threads[0..started]) |thread| thread.join();
+            self.send_mutex.lockUncancelable(self.artifact_io);
+            self.send_state = .stopped;
+            self.send_ready.broadcast(self.artifact_io);
+            self.send_mutex.unlock(self.artifact_io);
             self.alloc.free(self.send_threads);
             self.send_threads = &.{};
         }
         while (started < self.send_threads.len) : (started += 1) {
             self.send_threads[started] = try std.Thread.spawn(.{}, asyncSnapshotSenderMain, .{ self, started });
         }
+        // Publish running only after every worker handle is initialized. This
+        // keeps concurrent stop from ever joining uninitialized storage, while
+        // workers wait below for the single atomic lifecycle transition.
+        self.send_mutex.lockUncancelable(self.artifact_io);
+        self.send_state = .running;
+        self.send_ready.broadcast(self.artifact_io);
+        self.send_mutex.unlock(self.artifact_io);
     }
 
     fn stopAsyncSender(self: *HttpSnapshotTransport) void {
-        if (self.send_threads.len == 0) return;
         self.send_mutex.lockUncancelable(self.artifact_io);
-        self.send_closing = true;
+        while (self.send_state == .starting)
+            self.send_ready.waitUncancelable(self.artifact_io, &self.send_mutex);
+        if (self.send_state == .closing) {
+            while (self.send_state == .closing)
+                self.send_ready.waitUncancelable(self.artifact_io, &self.send_mutex);
+            self.send_mutex.unlock(self.artifact_io);
+            return;
+        }
+        if (self.send_state == .stopped) {
+            self.send_mutex.unlock(self.artifact_io);
+            return;
+        }
+        self.send_state = .closing;
         for (self.send_active_jobs) |job| if (job) |value| value.cancellation.cancel();
         self.send_ready.broadcast(self.artifact_io);
+        // Admission clones run outside the mutex after reserving every
+        // resource. Wait until those submitters have observed closing and
+        // released their reservations before any transport storage is freed.
+        while (self.send_reserved_jobs != 0)
+            self.send_ready.waitUncancelable(self.artifact_io, &self.send_mutex);
         self.send_mutex.unlock(self.artifact_io);
         for (self.send_threads) |thread| thread.join();
-        self.alloc.free(self.send_threads);
+        if (self.send_threads.len > 0) self.alloc.free(self.send_threads);
         self.send_threads = &.{};
-        self.alloc.free(self.send_active_jobs);
+        if (self.send_active_jobs.len > 0) self.alloc.free(self.send_active_jobs);
         self.send_active_jobs = &.{};
+        self.send_mutex.lockUncancelable(self.artifact_io);
+        self.send_state = .stopped;
+        self.send_ready.broadcast(self.artifact_io);
+        self.send_mutex.unlock(self.artifact_io);
     }
 
     pub fn asyncSendMetricsSnapshot(self: *HttpSnapshotTransport) AsyncSnapshotSendMetricsSnapshot {
@@ -557,9 +619,14 @@ pub const HttpSnapshotTransport = struct {
         // bytes. Queue saturation is normal backpressure and takes no
         // ownership from the caller.
         self.send_mutex.lockUncancelable(self.artifact_io);
-        if (self.send_closing) {
+        if (self.send_state != .running) {
+            const lifecycle_err: anyerror = switch (self.send_state) {
+                .stopped, .starting => error.AsyncSnapshotSenderNotStarted,
+                .closing => error.AsyncSnapshotSenderClosed,
+                .running => unreachable,
+            };
             self.send_mutex.unlock(self.artifact_io);
-            return error.AsyncSnapshotSenderClosed;
+            return lifecycle_err;
         }
         if (self.findDuplicateLocked(req)) {
             _ = self.send_metrics.deduplicated.fetchAdd(1, .monotonic);
@@ -610,7 +677,7 @@ pub const HttpSnapshotTransport = struct {
         defer self.send_mutex.unlock(self.artifact_io);
         self.releaseSubmissionReservationLocked(req.to, req.snapshot.data.len);
         reservation_live = false;
-        if (self.send_closing) return error.AsyncSnapshotSenderClosed;
+        if (self.send_state != .running) return error.AsyncSnapshotSenderClosed;
         // A concurrent submitter may have published the same identity while
         // this caller prepared its job. Treat that as successful idempotence.
         if (self.findDuplicateLocked(req)) {
@@ -639,6 +706,7 @@ pub const HttpSnapshotTransport = struct {
                 completion.from == req.from and
                 completion.to == req.to and
                 completion.term == req.term and
+                completion.attempt_generation == req.attempt_generation and
                 completion.snapshot_index == req.snapshot.metadata.index and
                 completion.snapshot_term == req.snapshot.metadata.term)
                 return true;
@@ -666,6 +734,7 @@ pub const HttpSnapshotTransport = struct {
         std.debug.assert(peer_count.* > 0);
         peer_count.* -= 1;
         if (peer_count.* == 0) std.debug.assert(self.send_reserved_peers.remove(peer_id));
+        self.send_ready.broadcast(self.artifact_io);
     }
 
     fn asyncSnapshotSenderMain(self: *HttpSnapshotTransport, worker_index: usize) void {
@@ -689,7 +758,9 @@ pub const HttpSnapshotTransport = struct {
     ) bool {
         while (true) {
             self.send_mutex.lockUncancelable(self.artifact_io);
-            if (self.send_closing) {
+            while (self.send_state == .starting)
+                self.send_ready.waitUncancelable(self.artifact_io, &self.send_mutex);
+            if (self.send_state != .running) {
                 self.send_mutex.unlock(self.artifact_io);
                 return false;
             }
@@ -707,7 +778,7 @@ pub const HttpSnapshotTransport = struct {
             self.send_mutex.unlock(self.artifact_io);
             if (pending == 0) {
                 self.send_mutex.lockUncancelable(self.artifact_io);
-                if (!self.send_closing and self.send_queue.items.len == 0)
+                if (self.send_state == .running and self.send_queue.items.len == 0)
                     self.send_ready.waitUncancelable(self.artifact_io, &self.send_mutex);
                 self.send_mutex.unlock(self.artifact_io);
             } else {
@@ -727,7 +798,7 @@ pub const HttpSnapshotTransport = struct {
         std.debug.assert(self.send_retained_jobs > 0 and self.send_retained_bytes >= job.snapshot.data.len);
         self.send_retained_jobs -= 1;
         self.send_retained_bytes -= job.snapshot.data.len;
-        if (!self.send_closing) {
+        if (self.send_state == .running) {
             self.queueCompletionLocked(job, .delivered);
             _ = self.send_metrics.completions_delivered.fetchAdd(1, .monotonic);
         }
@@ -755,7 +826,7 @@ pub const HttpSnapshotTransport = struct {
         self.send_mutex.lockUncancelable(self.artifact_io);
         self.send_active_jobs[worker_index] = null;
         std.debug.assert(self.send_active_peers.remove(job.to));
-        if (!self.send_closing and !permanent and job.attempts < self.cfg.async_send_max_attempts) {
+        if (self.send_state == .running and !permanent and job.attempts < self.cfg.async_send_max_attempts) {
             job.not_before_ms = snapshotNowMs() +| self.snapshotRetryDelayMs(job.*);
             job.cancellation = .{};
             self.send_queue.appendAssumeCapacity(job.*);
@@ -769,13 +840,14 @@ pub const HttpSnapshotTransport = struct {
         self.send_retained_jobs -= 1;
         self.send_retained_bytes -= job.snapshot.data.len;
         _ = self.send_metrics.dropped.fetchAdd(1, .monotonic);
-        if (!self.send_closing) {
+        const publish_failure = self.send_state == .running;
+        if (publish_failure) {
             self.queueCompletionLocked(job, .failed);
             _ = self.send_metrics.completions_failed.fetchAdd(1, .monotonic);
         }
         self.send_ready.broadcast(self.artifact_io);
         self.send_mutex.unlock(self.artifact_io);
-        if (!self.send_closing) std.log.warn(
+        if (publish_failure) std.log.warn(
             "raft snapshot async send dropped group_id={d} peer_id={d} attempts={d} err={s}",
             .{ job.group_id, job.to, job.attempts, @errorName(err) },
         );
@@ -793,6 +865,7 @@ pub const HttpSnapshotTransport = struct {
             .from = job.from,
             .to = job.to,
             .term = job.term,
+            .attempt_generation = job.attempt_generation,
             .snapshot_index = job.snapshot.metadata.index,
             .snapshot_term = job.snapshot.metadata.term,
             .status = status,
@@ -845,7 +918,6 @@ pub const HttpSnapshotTransport = struct {
         self: *HttpSnapshotTransport,
         req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
     ) !raft_engine.runtime.snapshot_transport_iface.SnapshotSubmitResult {
-        if (self.send_threads.len == 0) return error.AsyncSnapshotSenderNotStarted;
         return self.enqueueSnapshot(req);
     }
 
@@ -2090,6 +2162,7 @@ test "async snapshot send lane deduplicates and applies retained ownership bound
         .async_send_max_bytes = 8,
     }, executor.iface(), null);
     defer transport.deinit();
+    transport.send_state = .running;
     try transport.send_queue.ensureTotalCapacity(std.testing.allocator, 1);
     try transport.send_reserved_peers.ensureTotalCapacity(std.testing.allocator, 1);
     try transport.send_completions.ensureTotalCapacity(std.testing.allocator, 1);
@@ -2150,6 +2223,7 @@ test "active async snapshot job publishes its owned cancellation atomically" {
         .async_send_max_bytes = 8,
     }, executor.iface(), null);
     defer transport.deinit();
+    transport.send_state = .running;
     try transport.send_queue.ensureTotalCapacity(std.testing.allocator, 1);
     try transport.send_active_peers.ensureTotalCapacity(std.testing.allocator, 1);
     try transport.send_reserved_peers.ensureTotalCapacity(std.testing.allocator, 1);
@@ -2190,6 +2264,59 @@ test "active async snapshot job publishes its owned cancellation atomically" {
     );
     try std.testing.expectEqual(@as(usize, 0), transport.asyncSendMetricsSnapshot().pending_completions);
     transport.send_active_jobs = &.{};
+}
+
+test "async snapshot sender shutdown waits for admission reservations" {
+    const Executor = struct {
+        fn iface(_: *@This()) common.RequestExecutor {
+            return .{ .ptr = undefined, .vtable = &.{ .execute = execute } };
+        }
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return error.UnexpectedRequest;
+        }
+    };
+    var executor = Executor{};
+    var transport = try HttpSnapshotTransport.init(std.testing.allocator, .{
+        .root_dir = "/tmp",
+        .max_snapshot_bytes = 8,
+        .max_staging_bytes = 8,
+        .async_send_queue_max = 1,
+        .async_send_queue_max_per_peer = 1,
+        .async_send_max_bytes = 8,
+    }, executor.iface(), null);
+    defer transport.deinit();
+    try transport.send_reserved_peers.ensureTotalCapacity(std.testing.allocator, 1);
+    transport.send_mutex.lockUncancelable(transport.artifact_io);
+    transport.send_state = .running;
+    transport.send_reserved_jobs = 1;
+    transport.send_reserved_bytes = 1;
+    transport.send_reserved_peers.putAssumeCapacity(2, 1);
+    transport.send_mutex.unlock(transport.artifact_io);
+
+    const StopContext = struct {
+        transport: *HttpSnapshotTransport,
+        returned: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.transport.stopAsyncSender();
+            self.returned.store(true, .release);
+        }
+    };
+    var stop_context = StopContext{ .transport = &transport };
+    const stop_thread = try std.Thread.spawn(.{}, StopContext.run, .{&stop_context});
+
+    while (true) {
+        transport.send_mutex.lockUncancelable(transport.artifact_io);
+        const closing = transport.send_state == .closing;
+        transport.send_mutex.unlock(transport.artifact_io);
+        if (closing) break;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(!stop_context.returned.load(.acquire));
+    transport.releaseSubmissionReservation(2, 1, false);
+    stop_thread.join();
+    try std.testing.expect(stop_context.returned.load(.acquire));
+    try std.testing.expectEqual(HttpSnapshotTransport.SenderState.stopped, transport.send_state);
 }
 
 test "transient capability failure does not silently downgrade snapshot publication" {

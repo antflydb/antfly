@@ -36,6 +36,10 @@ pub const RuntimeConfig = struct {
     max_single_outbound_ready_bytes: usize = std.math.maxInt(usize),
     max_transport_messages_per_round: usize = std.math.maxInt(usize),
     max_transport_bytes_per_round: usize = std.math.maxInt(usize),
+    /// Snapshot admission is a separate work class so capacity backoff can
+    /// never consume the latency-sensitive Raft control-message quantum.
+    max_snapshot_submissions_per_round: usize = 2,
+    max_snapshot_submission_scans_per_round: usize = 32,
     max_pending_apply_tasks: usize = std.math.maxInt(usize),
     max_pending_apply_bytes: usize = std.math.maxInt(usize),
     /// Hard ceiling for the one-Ready liveness exception when the apply queue
@@ -168,12 +172,15 @@ pub const HostMetrics = struct {
     transport_peer_batch_flushes: usize = 0,
     transport_snapshot_sends: usize = 0,
     transport_snapshot_submission_deferrals: usize = 0,
+    transport_snapshot_backoff_skips: usize = 0,
     transport_snapshot_completions: usize = 0,
     transport_snapshot_completion_failures: usize = 0,
     transport_snapshot_stale_completions: usize = 0,
     restored_replicas: usize = 0,
     pending_outbound_messages: usize = 0,
     pending_outbound_bytes: usize = 0,
+    pending_control_messages: usize = 0,
+    pending_snapshot_submissions: usize = 0,
     pending_apply_tasks: usize = 0,
     pending_apply_bytes: usize = 0,
     pending_snapshot_bytes: usize = 0,
@@ -1414,7 +1421,7 @@ pub const MultiRaft = struct {
             ready_pressure.committed_entry_bytes +|
             approxReadStatesSize(ready.read_states);
         const outbound_capacity_available = self.hasOutboundCapacity(
-            outbox.items.items.len +| ready_pressure.message_count,
+            outbox.len() +| ready_pressure.message_count,
             outbox.approxBytes() +| ready_pressure.message_bytes,
         );
         const outbound_recovery_permit = ready_pressure.message_bytes >
@@ -1428,8 +1435,8 @@ pub const MultiRaft = struct {
         // Ready so Raft can make progress; subsequent groups remain gated until
         // it drains. Message-count limits stay hard to cap fan-out allocations.
         const outbound_single_ready_progress =
-            self.pending_outbox.items.items.len == 0 and
-            outbox.items.items.len == 0 and
+            self.pending_outbox.isEmpty() and
+            outbox.isEmpty() and
             ready_pressure.message_count <= self.cfg.max_pending_outbound_messages and
             (ready_pressure.message_bytes <= self.cfg.max_single_outbound_ready_bytes or
                 outbound_recovery_permit);
@@ -2121,8 +2128,10 @@ pub const MultiRaft = struct {
     }
 
     fn refreshQueueMetrics(self: *MultiRaft) void {
-        self.metrics.pending_outbound_messages = self.pending_outbox.items.items.len;
+        self.metrics.pending_outbound_messages = self.pending_outbox.len();
         self.metrics.pending_outbound_bytes = self.pending_outbox.approxBytes();
+        self.metrics.pending_control_messages = self.pending_outbox.controlLen();
+        self.metrics.pending_snapshot_submissions = self.pending_outbox.snapshotLen();
 
         var pending_apply_bytes: usize = 0;
         for (self.pending_apply.items) |task| pending_apply_bytes += task.approx_bytes;
@@ -2142,10 +2151,11 @@ pub const MultiRaft = struct {
         self.metrics.transport_peer_batch_flushes += stats.peer_batch_flushes;
         self.metrics.transport_snapshot_sends += stats.snapshot_sends;
         self.metrics.transport_snapshot_submission_deferrals += stats.snapshot_submission_deferrals;
+        self.metrics.transport_snapshot_backoff_skips += stats.snapshot_backoff_skips;
     }
 
     fn hasOutboundCapacity(self: *const MultiRaft, total_messages: usize, total_bytes: usize) bool {
-        return self.pending_outbox.items.items.len +| total_messages <= self.cfg.max_pending_outbound_messages and
+        return self.pending_outbox.len() +| total_messages <= self.cfg.max_pending_outbound_messages and
             self.pending_outbox.approxBytes() +| total_bytes <= self.cfg.max_pending_outbound_bytes;
     }
 
@@ -2158,7 +2168,7 @@ pub const MultiRaft = struct {
 
     fn flushPendingTransport(self: *MultiRaft) !void {
         self.drainSnapshotTransportCompletions();
-        if (self.pending_outbox.items.items.len == 0) return;
+        if (self.pending_outbox.isEmpty()) return;
         if (self.hooks.transport == null and self.hooks.snapshot_transport == null) return;
 
         const stats = try self.pending_outbox.flushBudgeted(
@@ -2166,6 +2176,9 @@ pub const MultiRaft = struct {
             self.hooks,
             self.cfg.max_transport_messages_per_round,
             self.cfg.max_transport_bytes_per_round,
+            self.cfg.max_snapshot_submissions_per_round,
+            self.cfg.max_snapshot_submission_scans_per_round,
+            clock.monotonicNs(),
         );
         self.recordTransportFlush(stats);
         self.drainSnapshotTransportCompletions();
@@ -2190,15 +2203,34 @@ pub const MultiRaft = struct {
                     self.metrics.transport_snapshot_stale_completions += 1;
                     continue;
                 }
-                self.metrics.transport_snapshot_completions += 1;
-                if (completion.status == .failed) {
-                    self.metrics.transport_snapshot_completion_failures += 1;
-                    grp.reportSnapshotFailure(
+                const status = grp.status();
+                if (status.soft.role != .leader or status.hard.current_term != completion.term) {
+                    self.metrics.transport_snapshot_stale_completions += 1;
+                    continue;
+                }
+                const matched = switch (completion.status) {
+                    .failed => grp.reportSnapshotFailure(
                         completion.to,
+                        completion.term,
                         completion.snapshot_index,
                         completion.snapshot_term,
-                    );
+                        completion.attempt_generation,
+                    ),
+                    .delivered => grp.reportSnapshotDelivered(
+                        completion.to,
+                        completion.term,
+                        completion.snapshot_index,
+                        completion.snapshot_term,
+                        completion.attempt_generation,
+                    ),
+                };
+                if (!matched) {
+                    self.metrics.transport_snapshot_stale_completions += 1;
+                    continue;
                 }
+                if (completion.status == .failed)
+                    self.metrics.transport_snapshot_completion_failures += 1;
+                self.metrics.transport_snapshot_completions += 1;
             }
             if (count < completions.len) return;
         }
@@ -2399,6 +2431,7 @@ const OutboundMessage = struct {
     incarnation: u64,
     message: core.Message,
     accepted: bool = false,
+    retry_not_before_ns: u64 = 0,
 };
 
 const TransportFlushStats = struct {
@@ -2406,6 +2439,15 @@ const TransportFlushStats = struct {
     peer_batch_flushes: usize = 0,
     snapshot_sends: usize = 0,
     snapshot_submission_deferrals: usize = 0,
+    snapshot_backoff_skips: usize = 0,
+
+    fn add(self: *TransportFlushStats, other: TransportFlushStats) void {
+        self.message_sends += other.message_sends;
+        self.peer_batch_flushes += other.peer_batch_flushes;
+        self.snapshot_sends += other.snapshot_sends;
+        self.snapshot_submission_deferrals += other.snapshot_submission_deferrals;
+        self.snapshot_backoff_skips += other.snapshot_backoff_skips;
+    }
 };
 
 fn summarizeReady(group_id: core.types.GroupId, ready: core.Ready) backpressure_iface.ReadyPressure {
@@ -2517,12 +2559,18 @@ const PeerBatchBuilder = struct {
 };
 
 const TransportOutbox = struct {
+    /// Latency-sensitive Raft control traffic. Snapshots never enter this FIFO.
     items: std.ArrayListUnmanaged(OutboundMessage) = .empty,
+    /// Backoff-aware snapshot lane with an independent fair scan cursor.
+    snapshot_items: std.ArrayListUnmanaged(OutboundMessage) = .empty,
+    snapshot_cursor: usize = 0,
     approx_bytes: usize = 0,
 
     fn deinit(self: *TransportOutbox, alloc: std.mem.Allocator) void {
         for (self.items.items) |*item| item.message.deinit(alloc);
+        for (self.snapshot_items.items) |*item| item.message.deinit(alloc);
         self.items.deinit(alloc);
+        self.snapshot_items.deinit(alloc);
         self.* = undefined;
     }
 
@@ -2534,7 +2582,8 @@ const TransportOutbox = struct {
         msg: core.Message,
     ) !void {
         const msg_bytes = approxMessagesSize(&.{msg});
-        try self.items.append(alloc, .{
+        const lane = if (msg.msg_type == .snapshot) &self.snapshot_items else &self.items;
+        try lane.append(alloc, .{
             .group_id = group_id,
             .incarnation = incarnation,
             .message = try msg.clone(alloc),
@@ -2549,10 +2598,20 @@ const TransportOutbox = struct {
         incarnation: u64,
         messages: []const core.Message,
     ) !void {
-        try self.items.ensureUnusedCapacity(alloc, messages.len);
+        var control_count: usize = 0;
+        var snapshot_count: usize = 0;
+        for (messages) |msg| {
+            if (msg.msg_type == .snapshot)
+                snapshot_count += 1
+            else
+                control_count += 1;
+        }
+        try self.items.ensureUnusedCapacity(alloc, control_count);
+        try self.snapshot_items.ensureUnusedCapacity(alloc, snapshot_count);
         for (messages) |msg| {
             const msg_bytes = approxMessagesSize(&.{msg});
-            self.items.appendAssumeCapacity(.{
+            const lane = if (msg.msg_type == .snapshot) &self.snapshot_items else &self.items;
+            lane.appendAssumeCapacity(.{
                 .group_id = group_id,
                 .incarnation = incarnation,
                 .message = try msg.clone(alloc),
@@ -2562,12 +2621,32 @@ const TransportOutbox = struct {
     }
 
     fn drainInto(self: *TransportOutbox, alloc: std.mem.Allocator, dst: *TransportOutbox) !void {
-        if (self.items.items.len == 0) return;
+        if (self.isEmpty()) return;
         try dst.items.ensureUnusedCapacity(alloc, self.items.items.len);
+        try dst.snapshot_items.ensureUnusedCapacity(alloc, self.snapshot_items.items.len);
         for (self.items.items) |item| dst.items.appendAssumeCapacity(item);
+        for (self.snapshot_items.items) |item| dst.snapshot_items.appendAssumeCapacity(item);
         dst.approx_bytes += self.approx_bytes;
         self.items.clearRetainingCapacity();
+        self.snapshot_items.clearRetainingCapacity();
+        self.snapshot_cursor = 0;
         self.approx_bytes = 0;
+    }
+
+    fn len(self: *const TransportOutbox) usize {
+        return self.items.items.len + self.snapshot_items.items.len;
+    }
+
+    fn controlLen(self: *const TransportOutbox) usize {
+        return self.items.items.len;
+    }
+
+    fn snapshotLen(self: *const TransportOutbox) usize {
+        return self.snapshot_items.items.len;
+    }
+
+    fn isEmpty(self: *const TransportOutbox) bool {
+        return self.len() == 0;
     }
 
     fn approxBytes(self: *const TransportOutbox) usize {
@@ -2582,34 +2661,10 @@ const TransportOutbox = struct {
 
         var stats: TransportFlushStats = .{};
 
-        if (hooks.snapshot_transport) |snapshot_transport| {
-            for (self.items.items) |*item| {
-                if (item.message.msg_type != .snapshot) continue;
-                const snapshot = item.message.snapshot orelse return error.MissingSnapshot;
-                const outcome = try snapshot_transport.submitSnapshot(.{
-                    .group_id = item.group_id,
-                    .incarnation = item.incarnation,
-                    .from = item.message.from,
-                    .to = item.message.to,
-                    .term = item.message.term,
-                    .snapshot = snapshot,
-                });
-                switch (outcome) {
-                    .accepted => {
-                        item.accepted = true;
-                        stats.snapshot_sends += 1;
-                    },
-                    .duplicate => item.accepted = true,
-                    .retry_later => stats.snapshot_submission_deferrals += 1,
-                }
-            }
-        }
-
         const transport = hooks.transport orelse return stats;
 
         if (!transport.supportsPeerBatches()) {
             for (self.items.items) |*item| {
-                if (item.message.msg_type == .snapshot) continue;
                 try transport.sendMessages(item.group_id, &.{item.message});
                 item.accepted = true;
                 stats.message_sends += 1;
@@ -2625,7 +2680,6 @@ const TransportOutbox = struct {
 
         for (self.items.items) |item| {
             if (item.accepted) continue;
-            if (item.message.msg_type == .snapshot) continue;
             const peer_idx = blk: {
                 for (peer_builders.items, 0..) |peer, i| {
                     if (peer.peer_id == item.message.to) break :blk i;
@@ -2695,7 +2749,76 @@ const TransportOutbox = struct {
             }
         }
         for (self.items.items) |*item| {
-            if (item.message.msg_type != .snapshot) item.accepted = true;
+            item.accepted = true;
+        }
+        return stats;
+    }
+
+    fn flushSnapshotsBudgeted(
+        self: *TransportOutbox,
+        alloc: std.mem.Allocator,
+        hooks: RuntimeHooks,
+        max_submissions: usize,
+        max_scans: usize,
+        now_ns: u64,
+    ) !TransportFlushStats {
+        var stats: TransportFlushStats = .{};
+        if (self.snapshot_items.items.len == 0 or max_submissions == 0 or max_scans == 0)
+            return stats;
+        const transport = hooks.snapshot_transport orelse return stats;
+
+        var submissions: usize = 0;
+        var scans: usize = 0;
+        // Visit each entry at most once per runtime turn. In particular, a
+        // zero retry hint means "retry on the next capacity wake-up", not a
+        // hot loop that can immediately resubmit the same snapshot.
+        const scan_budget = @min(max_scans, self.snapshot_items.items.len);
+        while (self.snapshot_items.items.len > 0 and
+            submissions < max_submissions and scans < scan_budget)
+        {
+            if (self.snapshot_cursor >= self.snapshot_items.items.len)
+                self.snapshot_cursor = 0;
+            const item = &self.snapshot_items.items[self.snapshot_cursor];
+            scans += 1;
+            if (item.retry_not_before_ns > now_ns) {
+                stats.snapshot_backoff_skips += 1;
+                self.snapshot_cursor = (self.snapshot_cursor + 1) % self.snapshot_items.items.len;
+                continue;
+            }
+
+            const snapshot = item.message.snapshot orelse return error.MissingSnapshot;
+            const outcome = try transport.submitSnapshot(.{
+                .group_id = item.group_id,
+                .incarnation = item.incarnation,
+                .from = item.message.from,
+                .to = item.message.to,
+                .term = item.message.term,
+                .attempt_generation = item.message.snapshot_attempt_generation,
+                .snapshot = snapshot,
+            });
+            submissions += 1;
+            switch (outcome) {
+                .accepted, .duplicate => {
+                    const item_bytes = approxMessagesSize(&.{item.message});
+                    // Snapshot attempts are independent across groups. Use a
+                    // swap removal so accepting one item remains O(1) even
+                    // with thousands of lagging groups.
+                    var accepted = self.snapshot_items.swapRemove(self.snapshot_cursor);
+                    accepted.message.deinit(alloc);
+                    self.approx_bytes -= item_bytes;
+                    if (std.meta.activeTag(outcome) == .accepted) stats.snapshot_sends += 1;
+                    if (self.snapshot_items.items.len == 0)
+                        self.snapshot_cursor = 0
+                    else
+                        self.snapshot_cursor %= self.snapshot_items.items.len;
+                },
+                .retry_later => |retry| {
+                    const delay_ns = retry.retry_after_ms *| std.time.ns_per_ms;
+                    item.retry_not_before_ns = now_ns +| delay_ns;
+                    stats.snapshot_submission_deferrals += 1;
+                    self.snapshot_cursor = (self.snapshot_cursor + 1) % self.snapshot_items.items.len;
+                },
+            }
         }
         return stats;
     }
@@ -2706,18 +2829,31 @@ const TransportOutbox = struct {
         hooks: RuntimeHooks,
         max_messages: usize,
         max_bytes: usize,
+        max_snapshot_submissions: usize,
+        max_snapshot_scans: usize,
+        now_ns: u64,
     ) !TransportFlushStats {
-        if (self.items.items.len == 0) return .{};
+        if (self.isEmpty()) return .{};
 
+        var stats: TransportFlushStats = .{};
         const take_count = self.countWithinBudget(max_messages, max_bytes);
-        if (take_count == 0) return .{};
-
-        var prefix = try self.takePrefix(alloc, take_count);
-        defer {
-            self.restorePrefix(&prefix);
-            prefix.deinit(alloc);
+        if (take_count > 0) {
+            var prefix = try self.takePrefix(alloc, take_count);
+            defer {
+                self.restorePrefix(&prefix);
+                prefix.deinit(alloc);
+            }
+            stats.add(try prefix.flush(alloc, hooks));
         }
-        return try prefix.flush(alloc, hooks);
+
+        stats.add(try self.flushSnapshotsBudgeted(
+            alloc,
+            hooks,
+            max_snapshot_submissions,
+            max_snapshot_scans,
+            now_ns,
+        ));
+        return stats;
     }
 
     fn countWithinBudget(self: *const TransportOutbox, max_messages: usize, max_bytes: usize) usize {
@@ -2790,10 +2926,141 @@ const TransportOutbox = struct {
 
     fn clear(self: *TransportOutbox, alloc: std.mem.Allocator) void {
         for (self.items.items) |*item| item.message.deinit(alloc);
+        for (self.snapshot_items.items) |*item| item.message.deinit(alloc);
         self.items.clearRetainingCapacity();
+        self.snapshot_items.clearRetainingCapacity();
+        self.snapshot_cursor = 0;
         self.approx_bytes = 0;
     }
 };
+
+test "snapshot submission backpressure cannot starve control traffic and honors retry deadlines" {
+    const Recorder = struct {
+        control_messages: usize = 0,
+        snapshot_submissions: usize = 0,
+        deferrals_remaining: usize = std.math.maxInt(usize),
+        retry_after_ms: u64 = 1_000,
+
+        fn transport(self: *@This()) transport_iface.Transport {
+            return .{ .ptr = self, .vtable = &.{ .send_messages = sendMessages } };
+        }
+
+        fn snapshotTransport(self: *@This()) snapshot_transport_iface.SnapshotTransport {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .send_snapshot = sendSnapshot,
+                    .submit_snapshot = submitSnapshot,
+                },
+            };
+        }
+
+        fn sendMessages(ptr: *anyopaque, _: core.types.GroupId, messages: []const core.Message) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.control_messages += messages.len;
+        }
+
+        fn sendSnapshot(_: *anyopaque, _: snapshot_transport_iface.SnapshotSendRequest) !void {}
+
+        fn submitSnapshot(
+            ptr: *anyopaque,
+            _: snapshot_transport_iface.SnapshotSendRequest,
+        ) !snapshot_transport_iface.SnapshotSubmitResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.snapshot_submissions += 1;
+            if (self.deferrals_remaining > 0) {
+                self.deferrals_remaining -= 1;
+                return .{ .retry_later = .{ .retry_after_ms = self.retry_after_ms } };
+            }
+            return .accepted;
+        }
+    };
+
+    var recorder: Recorder = .{};
+    var outbox: TransportOutbox = .{};
+    defer outbox.deinit(std.testing.allocator);
+    for (0..70) |index| {
+        try outbox.appendMessage(std.testing.allocator, @intCast(index + 1), 1, .{
+            .msg_type = .snapshot,
+            .from = 1,
+            .to = @intCast(index + 2),
+            .term = 5,
+            .snapshot_attempt_generation = @intCast(index + 1),
+            .snapshot = .{
+                .metadata = .{ .index = @intCast(index + 10), .term = 4 },
+                .data = @constCast("x"),
+            },
+        });
+    }
+    // This message was appended after a backlog larger than the production
+    // control quantum. It must still use the independent control lane now.
+    try outbox.appendMessage(std.testing.allocator, 999, 1, .{
+        .msg_type = .heartbeat,
+        .from = 1,
+        .to = 2,
+        .term = 5,
+    });
+    const first = try outbox.flushBudgeted(
+        std.testing.allocator,
+        .{ .transport = recorder.transport(), .snapshot_transport = recorder.snapshotTransport() },
+        64,
+        512 * 1024,
+        2,
+        32,
+        1_000,
+    );
+    try std.testing.expectEqual(@as(usize, 1), recorder.control_messages);
+    try std.testing.expectEqual(@as(usize, 2), recorder.snapshot_submissions);
+    try std.testing.expectEqual(@as(usize, 1), first.message_sends);
+    try std.testing.expectEqual(@as(usize, 2), first.snapshot_submission_deferrals);
+    try std.testing.expectEqual(@as(usize, 0), outbox.controlLen());
+    try std.testing.expectEqual(@as(usize, 70), outbox.snapshotLen());
+
+    // A one-item lane proves the hint is an eligibility deadline rather than
+    // a spin-loop suggestion.
+    var deadline_recorder: Recorder = .{ .deferrals_remaining = 1 };
+    var deadline_outbox: TransportOutbox = .{};
+    defer deadline_outbox.deinit(std.testing.allocator);
+    try deadline_outbox.appendMessage(std.testing.allocator, 7, 1, .{
+        .msg_type = .snapshot,
+        .from = 1,
+        .to = 2,
+        .term = 5,
+        .snapshot_attempt_generation = 1,
+        .snapshot = .{ .metadata = .{ .index = 10, .term = 4 }, .data = @constCast("x") },
+    });
+    _ = try deadline_outbox.flushBudgeted(
+        std.testing.allocator,
+        .{ .snapshot_transport = deadline_recorder.snapshotTransport() },
+        0,
+        0,
+        1,
+        1,
+        5_000,
+    );
+    const early = try deadline_outbox.flushBudgeted(
+        std.testing.allocator,
+        .{ .snapshot_transport = deadline_recorder.snapshotTransport() },
+        0,
+        0,
+        1,
+        1,
+        5_000 + 999 * std.time.ns_per_ms,
+    );
+    try std.testing.expectEqual(@as(usize, 1), deadline_recorder.snapshot_submissions);
+    try std.testing.expectEqual(@as(usize, 1), early.snapshot_backoff_skips);
+    _ = try deadline_outbox.flushBudgeted(
+        std.testing.allocator,
+        .{ .snapshot_transport = deadline_recorder.snapshotTransport() },
+        0,
+        0,
+        1,
+        1,
+        5_000 + std.time.ns_per_s,
+    );
+    try std.testing.expectEqual(@as(usize, 2), deadline_recorder.snapshot_submissions);
+    try std.testing.expect(deadline_outbox.isEmpty());
+}
 
 test "multi raft owns real groups" {
     var runtime = MultiRaft.init(std.testing.allocator, .{}, .{});

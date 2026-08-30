@@ -106,10 +106,23 @@ pub const RawNode = struct {
     pub fn reportSnapshotFailure(
         self: *RawNode,
         to: types.NodeId,
+        leader_term: types.Term,
         snapshot_index: types.Index,
         snapshot_term: types.Term,
-    ) void {
-        self.raft.reportSnapshotFailure(to, snapshot_index, snapshot_term);
+        attempt_generation: u64,
+    ) bool {
+        return self.raft.reportSnapshotFailure(to, leader_term, snapshot_index, snapshot_term, attempt_generation);
+    }
+
+    pub fn reportSnapshotDelivered(
+        self: *RawNode,
+        to: types.NodeId,
+        leader_term: types.Term,
+        snapshot_index: types.Index,
+        snapshot_term: types.Term,
+        attempt_generation: u64,
+    ) bool {
+        return self.raft.reportSnapshotDelivered(to, leader_term, snapshot_index, snapshot_term, attempt_generation);
     }
 
     pub fn proposeConfChange(self: *RawNode, conf_change: types.ConfChange) !void {

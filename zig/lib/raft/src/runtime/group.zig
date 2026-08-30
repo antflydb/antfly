@@ -125,10 +125,23 @@ pub const Group = struct {
     pub fn reportSnapshotFailure(
         self: *Group,
         to: core.types.NodeId,
+        leader_term: core.types.Term,
         snapshot_index: core.types.Index,
         snapshot_term: core.types.Term,
-    ) void {
-        self.raw_node.reportSnapshotFailure(to, snapshot_index, snapshot_term);
+        attempt_generation: u64,
+    ) bool {
+        return self.raw_node.reportSnapshotFailure(to, leader_term, snapshot_index, snapshot_term, attempt_generation);
+    }
+
+    pub fn reportSnapshotDelivered(
+        self: *Group,
+        to: core.types.NodeId,
+        leader_term: core.types.Term,
+        snapshot_index: core.types.Index,
+        snapshot_term: core.types.Term,
+        attempt_generation: u64,
+    ) bool {
+        return self.raw_node.reportSnapshotDelivered(to, leader_term, snapshot_index, snapshot_term, attempt_generation);
     }
 
     pub fn campaign(self: *Group) !void {

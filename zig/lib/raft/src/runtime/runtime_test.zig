@@ -510,6 +510,7 @@ const TransportRecorder = struct {
 const SnapshotTransportRecorder = struct {
     submit_calls: usize = 0,
     deferrals_remaining: usize = 0,
+    retry_after_ms: u64 = 0,
     send_calls: usize = 0,
     sent_bytes: usize = 0,
     last_group_id: core.types.GroupId = 0,
@@ -534,7 +535,7 @@ const SnapshotTransportRecorder = struct {
         self.submit_calls += 1;
         if (self.deferrals_remaining > 0) {
             self.deferrals_remaining -= 1;
-            return .{ .retry_later = .{ .retry_after_ms = 1 } };
+            return .{ .retry_later = .{ .retry_after_ms = self.retry_after_ms } };
         }
         try sendSnapshot(ptr, req);
         return .accepted;
@@ -1715,6 +1716,9 @@ test "multi raft routes outbound snapshots through snapshot transport" {
     transport_recorder.peer_batch_calls = 0;
     transport_recorder.batched_peer_count = 0;
     transport_recorder.batched_group_count = 0;
+    snapshot_transport.submit_calls = 0;
+    snapshot_transport.send_calls = 0;
+    snapshot_transport.deferrals_remaining = 1;
 
     const grp = host.group(94).?;
     grp.raw_node.raft.progress[1] = .{

@@ -632,6 +632,12 @@ test "snapshot failure leaves follower probing from the same index" {
         .next_index = 1,
         .state = .probe,
         .probe_sent = true,
+        .pending_snapshot_attempt = .{
+            .leader_term = 12,
+            .snapshot_index = 11,
+            .snapshot_term = 11,
+            .generation = 1,
+        },
     };
 
     try fixture.raft.step(.{
@@ -660,19 +666,26 @@ test "asynchronous snapshot failure is fenced to the active snapshot probe" {
         .next_index = 1,
         .state = .probe,
         .probe_sent = true,
-        .pending_snapshot_index = 11,
-        .pending_snapshot_term = 11,
+        .pending_snapshot_attempt = .{
+            .leader_term = 12,
+            .snapshot_index = 11,
+            .snapshot_term = 11,
+            .generation = 7,
+        },
     };
 
-    fixture.raft.reportSnapshotFailure(2, 10, 11);
+    _ = fixture.raft.reportSnapshotFailure(2, 11, 11, 11, 7);
     try std.testing.expect(fixture.raft.progress[1].probe_sent);
-    fixture.raft.reportSnapshotFailure(2, 11, 10);
+    _ = fixture.raft.reportSnapshotFailure(2, 12, 10, 11, 7);
+    try std.testing.expect(fixture.raft.progress[1].probe_sent);
+    _ = fixture.raft.reportSnapshotFailure(2, 12, 11, 10, 7);
+    try std.testing.expect(fixture.raft.progress[1].probe_sent);
+    _ = fixture.raft.reportSnapshotFailure(2, 12, 11, 11, 6);
     try std.testing.expect(fixture.raft.progress[1].probe_sent);
 
-    fixture.raft.reportSnapshotFailure(2, 11, 11);
+    try std.testing.expect(fixture.raft.reportSnapshotFailure(2, 12, 11, 11, 7));
     try std.testing.expect(!fixture.raft.progress[1].probe_sent);
-    try std.testing.expectEqual(@as(types.Index, 0), fixture.raft.progress[1].pending_snapshot_index);
-    try std.testing.expectEqual(@as(types.Term, 0), fixture.raft.progress[1].pending_snapshot_term);
+    try std.testing.expect(fixture.raft.progress[1].pending_snapshot_attempt == null);
 }
 
 test "snapshot success resumes probing from the snapshot index" {
@@ -685,6 +698,12 @@ test "snapshot success resumes probing from the snapshot index" {
         .next_index = 1,
         .state = .probe,
         .probe_sent = true,
+        .pending_snapshot_attempt = .{
+            .leader_term = 12,
+            .snapshot_index = 11,
+            .snapshot_term = 11,
+            .generation = 1,
+        },
     };
 
     try fixture.raft.step(.{
@@ -704,6 +723,32 @@ test "snapshot success resumes probing from the snapshot index" {
     try std.testing.expectEqual(@as(types.Index, 11), fixture.raft.messages.items[0].log_index);
     try std.testing.expectEqual(@as(usize, 1), fixture.raft.messages.items[0].entries.len);
     try std.testing.expectEqual(@as(types.Index, 12), fixture.raft.messages.items[0].entries[0].index);
+}
+
+test "delivered snapshot attempt retries after a bounded acknowledgment wait" {
+    var fixture = try initLeaderFromSnapshot();
+    defer fixture.raft.deinit();
+    defer fixture.storage.deinit();
+
+    fixture.raft.progress[1] = .{
+        .match_index = 0,
+        .next_index = 1,
+        .state = .probe,
+        .probe_sent = true,
+        .pending_snapshot_attempt = .{
+            .leader_term = 12,
+            .snapshot_index = 11,
+            .snapshot_term = 11,
+            .generation = 7,
+        },
+    };
+
+    try std.testing.expect(fixture.raft.reportSnapshotDelivered(2, 12, 11, 11, 7));
+    for (0..fixture.raft.cfg.election_tick - 1) |_| fixture.raft.tick();
+    try std.testing.expect(fixture.raft.progress[1].pending_snapshot_attempt != null);
+    fixture.raft.tick();
+    try std.testing.expect(fixture.raft.progress[1].pending_snapshot_attempt == null);
+    try std.testing.expect(!fixture.raft.progress[1].probe_sent);
 }
 
 test "append response at snapshot index aborts snapshot catch-up and resumes replicate state" {
@@ -763,6 +808,18 @@ test "leader provides snapshot to active follower behind compaction" {
     try std.testing.expectEqual(@as(usize, 1), fixture.raft.messages.items.len);
     try std.testing.expectEqual(message_mod.MessageType.snapshot, fixture.raft.messages.items[0].msg_type);
     try std.testing.expectEqual(@as(types.Index, 11), fixture.raft.messages.items[0].snapshot.?.metadata.index);
+    const attempt = fixture.raft.progress[1].pending_snapshot_attempt.?;
+    try std.testing.expectEqual(attempt.generation, fixture.raft.messages.items[0].snapshot_attempt_generation);
+
+    clearMessages(&fixture.raft);
+    try fixture.raft.step(.{
+        .msg_type = .heartbeat_response,
+        .from = 2,
+        .to = 1,
+        .term = 12,
+    });
+    try std.testing.expectEqual(@as(usize, 0), fixture.raft.messages.items.len);
+    try std.testing.expectEqual(attempt, fixture.raft.progress[1].pending_snapshot_attempt.?);
 }
 
 test "leader incrementally catches up follower within retained snapshot suffix" {

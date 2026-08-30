@@ -39,6 +39,7 @@ pub const SnapshotSendRequest = struct {
     from: core.types.NodeId = 0,
     to: core.types.NodeId,
     term: core.types.Term = 0,
+    attempt_generation: u64 = 0,
     snapshot: core.types.Snapshot,
     locator: ?SnapshotLocator = null,
 };
@@ -65,6 +66,7 @@ pub const SnapshotCompletion = struct {
     from: core.types.NodeId,
     to: core.types.NodeId,
     term: core.types.Term,
+    attempt_generation: u64,
     snapshot_index: core.types.Index,
     snapshot_term: core.types.Term,
     status: SnapshotCompletionStatus,

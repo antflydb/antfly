@@ -267,13 +267,26 @@ pub const ProgressState = enum {
     replicate,
 };
 
+/// Immutable identity of the snapshot transfer currently owning a peer's
+/// probe. The generation is local-only: snapshot bytes travel on the dedicated
+/// transport, so this fence does not alter the replicated Raft wire format.
+pub const SnapshotAttempt = struct {
+    leader_term: Term,
+    snapshot_index: Index,
+    snapshot_term: Term,
+    generation: u64,
+    /// Transport delivery and Raft application acknowledgment are distinct.
+    /// Only a delivered attempt ages toward the bounded acknowledgment retry.
+    delivery_confirmed: bool = false,
+    acknowledgment_elapsed_ticks: u32 = 0,
+};
+
 pub const Progress = struct {
     match_index: Index = 0,
     next_index: Index = 1,
     state: ProgressState = .probe,
     probe_sent: bool = false,
-    pending_snapshot_index: Index = 0,
-    pending_snapshot_term: Term = 0,
+    pending_snapshot_attempt: ?SnapshotAttempt = null,
     recent_active: bool = false,
 };
 

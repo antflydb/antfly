@@ -57,6 +57,8 @@ fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
         .max_single_outbound_ready_bytes = metadata_raft_max_single_ready_bytes,
         .max_transport_messages_per_round = 64,
         .max_transport_bytes_per_round = 512 * 1024,
+        .max_snapshot_submissions_per_round = 2,
+        .max_snapshot_submission_scans_per_round = 32,
         .max_pending_apply_tasks = 1024,
         .max_pending_apply_bytes = 16 * 1024 * 1024,
         .max_single_apply_ready_bytes = metadata_raft_max_single_ready_bytes,
