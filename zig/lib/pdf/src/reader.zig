@@ -3105,30 +3105,41 @@ fn decryptAesV2AllocWithLimits(
 ) ![]u8 {
     if (encrypted.len < 32 or (encrypted.len - 16) % 16 != 0) return error.InvalidEncryptedPdf;
     const ciphertext = encrypted[16..];
-    if (ciphertext.len > max_working_bytes) return error.PdfDecodeWorkingSetTooLarge;
-    // PKCS#7 padding occupies between one and sixteen bytes. Reject streams
-    // that cannot possibly fit before allocating the block-aligned scratch.
-    const minimum_plaintext_len = ciphertext.len - 16;
-    if (minimum_plaintext_len > max_plaintext_bytes) return error.DecodedStreamTooLarge;
-    var plaintext = try alloc.alloc(u8, ciphertext.len);
-    errdefer alloc.free(plaintext);
     const aes = std.crypto.core.aes.Aes128.initDec(key);
+
+    // Determine PKCS#7 padding from the final CBC block before allocating.
+    // This makes the only heap allocation exactly the returned plaintext size;
+    // no allocator-dependent realloc/remap peak can escape the working limit.
+    const last_offset = ciphertext.len - 16;
+    const last_block: [16]u8 = ciphertext[last_offset..][0..16].*;
+    const last_previous: [16]u8 = if (last_offset == 0)
+        encrypted[0..16].*
+    else
+        ciphertext[last_offset - 16 ..][0..16].*;
+    var decoded_last: [16]u8 = undefined;
+    aes.decrypt(&decoded_last, &last_block);
+    for (&decoded_last, last_previous) |*value, prior| value.* ^= prior;
+    const padding = decoded_last[15];
+    if (padding == 0 or padding > 16) return error.InvalidEncryptedPdf;
+    for (decoded_last[16 - padding ..]) |value| if (value != padding) return error.InvalidEncryptedPdf;
+    const plaintext_len = ciphertext.len - padding;
+    if (plaintext_len > max_working_bytes) return error.PdfDecodeWorkingSetTooLarge;
+    if (plaintext_len > max_plaintext_bytes) return error.DecodedStreamTooLarge;
+
+    const plaintext = try alloc.alloc(u8, plaintext_len);
+    errdefer alloc.free(plaintext);
     var previous: [16]u8 = encrypted[0..16].*;
     var offset: usize = 0;
-    while (offset < ciphertext.len) : (offset += 16) {
+    while (offset < plaintext_len) : (offset += 16) {
         const block: [16]u8 = ciphertext[offset..][0..16].*;
         var decoded: [16]u8 = undefined;
         aes.decrypt(&decoded, &block);
         for (&decoded, previous) |*value, prior| value.* ^= prior;
-        plaintext[offset..][0..16].* = decoded;
+        const copy_len = @min(@as(usize, 16), plaintext_len - offset);
+        @memcpy(plaintext[offset..][0..copy_len], decoded[0..copy_len]);
         previous = block;
     }
-    const padding = plaintext[plaintext.len - 1];
-    if (padding == 0 or padding > 16 or padding > plaintext.len) return error.InvalidEncryptedPdf;
-    for (plaintext[plaintext.len - padding ..]) |value| if (value != padding) return error.InvalidEncryptedPdf;
-    const plaintext_len = plaintext.len - padding;
-    if (plaintext_len > max_plaintext_bytes) return error.DecodedStreamTooLarge;
-    return try alloc.realloc(plaintext, plaintext_len);
+    return plaintext;
 }
 
 fn decryptAesV2Alloc(alloc: Allocator, encrypted: []const u8, key: [16]u8) ![]u8 {
@@ -3524,9 +3535,13 @@ pub const Reader = struct {
         if (parsed != .obj_def) return error.ExpectedIndirectObject;
         if (parsed.obj_def.ptr.id != ptr.id or parsed.obj_def.ptr.gen != ptr.gen) return error.ObjectPointerMismatch;
 
-        const value = try parsed.obj_def.value.clone(self.alloc);
-        parsed.deinit(self.alloc);
-        var decrypted = value;
+        // Transfer the parsed value out of the indirect-object wrapper instead
+        // of deep-cloning it. Besides avoiding redundant work for every object,
+        // this keeps bounded metadata parsing from briefly retaining two full
+        // copies of attacker-controlled dictionaries or strings.
+        var decrypted = parsed.obj_def.value.*;
+        self.alloc.destroy(parsed.obj_def.value);
+        parsed = .null;
         errdefer decrypted.deinit(self.alloc);
         if (self.encryption != null) try self.decryptObject(&decrypted, ptr);
         return decrypted;
@@ -4807,55 +4822,6 @@ pub const Reader = struct {
             if (entry.ptr.id == ptr.id and entry.ptr.gen == ptr.gen) return entry;
         }
         return null;
-    }
-
-    fn indirectObjectMayBeString(self: *const Reader, ptr: syntax.ObjRef) bool {
-        const entry = self.findXref(ptr) orelse return true;
-        // Object streams cannot contain stream objects, so an Indexed lookup
-        // stored there can only be the string form. Keep that path bounded.
-        if (entry.compressed_obj_stream_id != null) return true;
-        if (entry.offset >= self.bytes.len) return true;
-
-        var cursor = entry.offset;
-        var token_index: usize = 0;
-        while (token_index < 3) : (token_index += 1) {
-            while (cursor < self.bytes.len) {
-                if (isPdfWhitespace(self.bytes[cursor])) {
-                    cursor += 1;
-                    continue;
-                }
-                if (self.bytes[cursor] == '%') {
-                    while (cursor < self.bytes.len and self.bytes[cursor] != '\r' and self.bytes[cursor] != '\n')
-                        cursor += 1;
-                    continue;
-                }
-                break;
-            }
-            const start = cursor;
-            while (cursor < self.bytes.len and
-                !isPdfWhitespace(self.bytes[cursor]) and
-                self.bytes[cursor] != '%' and
-                std.mem.indexOfScalar(u8, "()<>[]{}/", self.bytes[cursor]) == null)
-                cursor += 1;
-            if (start == cursor) return true;
-            if (token_index == 2 and !std.mem.eql(u8, self.bytes[start..cursor], "obj")) return true;
-        }
-        while (cursor < self.bytes.len) {
-            if (isPdfWhitespace(self.bytes[cursor])) {
-                cursor += 1;
-                continue;
-            }
-            if (self.bytes[cursor] == '%') {
-                while (cursor < self.bytes.len and self.bytes[cursor] != '\r' and self.bytes[cursor] != '\n')
-                    cursor += 1;
-                continue;
-            }
-            break;
-        }
-        if (cursor >= self.bytes.len) return true;
-        if (self.bytes[cursor] == '(') return true;
-        return self.bytes[cursor] == '<' and
-            (cursor + 1 >= self.bytes.len or self.bytes[cursor + 1] != '<');
     }
 
     fn readCompressedObject(self: *const Reader, ptr: syntax.ObjRef, obj_stream_id: u32, obj_index: usize) anyerror!syntax.Object {
@@ -8615,31 +8581,22 @@ pub const Reader = struct {
         const lookup_obj: *const syntax.Object = blk: {
             const candidate = &color_space[3];
             if (candidate.* == .obj_ref) {
-                if (self.indirectObjectMayBeString(candidate.obj_ref)) {
-                    // Indirect strings are attacker-controlled objects, while
-                    // an Indexed lookup can contain at most 256 four-component
-                    // entries. Resolve through the same aggregate allocator so
-                    // parser temporaries and the ownership clone cannot exceed
-                    // the image budget before the object is validated.
-                    var resolve_budget = DecodeBudgetAllocator.init(
-                        self.alloc,
-                        retained_live_bytes,
-                        self.decode_limits.max_working_set_bytes,
-                    );
-                    var bounded_reader = self.*;
-                    bounded_reader.alloc = resolve_budget.allocator();
-                    result.lookup_owner = bounded_reader.resolveValue(candidate) catch |err| {
-                        if (err == error.OutOfMemory and resolve_budget.limit_exceeded)
-                            return error.PdfDecodeWorkingSetTooLarge;
-                        return err;
-                    };
-                    lookup_owner_live_bytes = resolve_budget.live_bytes - retained_live_bytes;
-                } else {
-                    // Stream dictionaries are ordinary object metadata and can
-                    // contain nested DecodeParms. Their payload is bounded
-                    // separately below, after lazy encryption metadata exists.
-                    result.lookup_owner = try self.resolveValue(candidate);
-                }
+                // Both string data and stream dictionaries are attacker-owned.
+                // Charge parser temporaries and retained metadata against the
+                // same aggregate image budget before allocating stream payload.
+                var resolve_budget = DecodeBudgetAllocator.init(
+                    self.alloc,
+                    retained_live_bytes,
+                    self.decode_limits.max_working_set_bytes,
+                );
+                var bounded_reader = self.*;
+                bounded_reader.alloc = resolve_budget.allocator();
+                result.lookup_owner = bounded_reader.resolveValue(candidate) catch |err| {
+                    if (err == error.OutOfMemory and resolve_budget.limit_exceeded)
+                        return error.PdfDecodeWorkingSetTooLarge;
+                    return err;
+                };
+                lookup_owner_live_bytes = resolve_budget.live_bytes - retained_live_bytes;
                 break :blk &result.lookup_owner.?;
             }
             break :blk candidate;
@@ -18709,14 +18666,13 @@ test "unfiltered terminal read decrypts AES lazily within working limits" {
     defer alloc.free(decoded);
     try std.testing.expectEqualStrings("abc", decoded);
     try std.testing.expectEqual(@as(usize, 1), encrypted_streams.count());
-    try std.testing.expectError(
-        error.PdfDecodeWorkingSetTooLarge,
-        reader.readDecodedStreamDataWithLimitsAndFinalLimit(
-            &stream,
-            .{ .max_decoded_stream_bytes = 32, .max_working_set_bytes = 15 },
-            3,
-        ),
+    const exact = try reader.readDecodedStreamDataWithLimitsAndFinalLimit(
+        &stream,
+        .{ .max_decoded_stream_bytes = 32, .max_working_set_bytes = 3 },
+        3,
     );
+    defer alloc.free(exact);
+    try std.testing.expectEqualStrings("abc", exact);
 }
 
 test "RC4 object data decrypts with the unsalted object key" {
@@ -22604,6 +22560,38 @@ test "Indexed palette stream decode reserves retained image working set" {
     );
 }
 
+test "Indexed palette stream metadata is bounded before payload decode" {
+    const alloc = std.testing.allocator;
+    const oversized_header_value = "x" ** 4096;
+    const palette_object = try std.fmt.allocPrint(
+        alloc,
+        "3 0 obj\n<< /Length 3 /Unused ({s}) >>\nstream\nabc\nendstream\nendobj\n",
+        .{oversized_header_value},
+    );
+    defer alloc.free(palette_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+        palette_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.initWithDecodeLimits(alloc, sample, .{
+        .max_decoded_stream_bytes = 64,
+        .max_working_set_bytes = 2048,
+    });
+    defer reader.deinit();
+    var scanner = syntax.Scanner.init(alloc, "[/Indexed /DeviceRGB 0 3 0 R]");
+    defer scanner.deinit();
+    var color_space = try scanner.readObject();
+    defer color_space.deinit(alloc);
+
+    try std.testing.expectError(
+        error.PdfDecodeWorkingSetTooLarge,
+        reader.resolveIndexedPaletteAlloc(color_space.array, 0, .palette_rgba),
+    );
+}
+
 test "Indexed indirect lookup strings resolve within the aggregate working set" {
     const alloc = std.testing.allocator;
     const valid_objects = [_][]const u8{
@@ -22689,7 +22677,7 @@ test "Indexed palette terminal limit permits larger intermediate filters" {
     defer alloc.free(sample);
     var reader = try Reader.initWithDecodeLimits(alloc, sample, .{
         .max_decoded_stream_bytes = 64,
-        .max_working_set_bytes = 1024,
+        .max_working_set_bytes = 4096,
     });
     defer reader.deinit();
     var scanner = syntax.Scanner.init(alloc, "[/Indexed /DeviceRGB 0 3 0 R]");
