@@ -56,6 +56,18 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
     return true;
 }
 
+fn addTrackedScriptCommand(
+    b: *std.Build,
+    command: []const []const u8,
+    script_path: []const u8,
+    args: []const []const u8,
+) *std.Build.Step.Run {
+    const run = b.addSystemCommand(command);
+    run.addFileArg(b.path(script_path));
+    run.addArgs(args);
+    return run;
+}
+
 fn targetRunsOnBuildHost(b: *std.Build, target: std.Build.ResolvedTarget) bool {
     const host = b.graph.host.result;
     return target.result.os.tag == host.os.tag and
@@ -585,17 +597,18 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_runtime_check_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
     }
 
-    const cuda_artifact_source_policy_check = b.addSystemCommand(&.{
-        "bash",
+    const cuda_artifact_source_policy_check = addTrackedScriptCommand(
+        b,
+        &.{"bash"},
         "scripts/regen-cuda-artifacts.sh",
-        "--check-source-policy",
-    });
-    const cuda_artifacts_freshness_check = b.addSystemCommand(&.{
-        "bash",
+        &.{"--check-source-policy"},
+    );
+    const cuda_artifacts_freshness_check = addTrackedScriptCommand(
+        b,
+        &.{"bash"},
         "scripts/regen-cuda-artifacts.sh",
-        "--check",
-        "--all",
-    });
+        &.{ "--check", "--all" },
+    );
     const cuda_artifacts_check_step = b.step("cuda-artifacts-check", "Verify checked-in CUDA artifacts with CUDA 13.2");
     cuda_artifacts_check_step.dependOn(&cuda_artifacts_freshness_check.step);
 
@@ -630,17 +643,21 @@ pub fn build(b: *std.Build) void {
         "Run raw production-vs-generated paged CUDA decode-attention differential checks",
     );
     if (enable_cuda and targetRunsOnBuildHost(b, target)) {
-        const compile_score_prework_hd256 = b.addSystemCommand(&.{
-            "bash",
+        const compile_score_prework_hd256 = addTrackedScriptCommand(
+            b,
+            &.{"bash"},
             "scripts/compile-generated-cuda-candidate.sh",
-        });
+            &.{},
+        );
         compile_score_prework_hd256.addFileArg(b.path("src/ops/cuda/generated/attention_decode_score_prework_hd256.cu"));
         const score_prework_hd256_cubin = compile_score_prework_hd256.addOutputFileArg("attention_decode_score_prework_hd256.sm89.cubin");
 
-        const compile_score_prework_hd512 = b.addSystemCommand(&.{
-            "bash",
+        const compile_score_prework_hd512 = addTrackedScriptCommand(
+            b,
+            &.{"bash"},
             "scripts/compile-generated-cuda-candidate.sh",
-        });
+            &.{},
+        );
         compile_score_prework_hd512.addFileArg(b.path("src/ops/cuda/generated/attention_decode_score_prework_hd512.cu"));
         const score_prework_hd512_cubin = compile_score_prework_hd512.addOutputFileArg("attention_decode_score_prework_hd512.sm89.cubin");
 
@@ -760,11 +777,12 @@ pub fn build(b: *std.Build) void {
         quant_kernel_local_check_step.dependOn(quant_kernel_metal_local_check_step);
     }
 
-    const metal_gemma4_prefill_frame_script_self_test = b.addSystemCommand(&.{
-        "bash",
+    const metal_gemma4_prefill_frame_script_self_test = addTrackedScriptCommand(
+        b,
+        &.{"bash"},
         "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
-        "--self-test",
-    });
+        &.{"--self-test"},
+    );
     const metal_gemma4_prefill_frame_script_self_test_step = b.step(
         "test-metal-gemma4-prefill-frame-script",
         "Run the Metal Gemma4 prefill-frame smoke script self-test",
@@ -774,11 +792,12 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_local_check_step.dependOn(&metal_gemma4_prefill_frame_script_self_test.step);
     }
 
-    const metal_quant_summary_check_self_test = b.addSystemCommand(&.{
-        "python3",
+    const metal_quant_summary_check_self_test = addTrackedScriptCommand(
+        b,
+        &.{"python3"},
         "scripts/check_metal_quant_summary.py",
-        "--self-test",
-    });
+        &.{"--self-test"},
+    );
     const metal_quant_summary_check_self_test_step = b.step(
         "test-metal-quant-summary-check",
         "Run the Metal quant summary checker self-test",
@@ -788,11 +807,12 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_local_check_step.dependOn(&metal_quant_summary_check_self_test.step);
     }
 
-    const metal_gemma4_bench_script_self_test = b.addSystemCommand(&.{
-        "bash",
+    const metal_gemma4_bench_script_self_test = addTrackedScriptCommand(
+        b,
+        &.{"bash"},
         "scripts/gemma4/bench_metal_gemma4_e2b.sh",
-        "--self-test",
-    });
+        &.{"--self-test"},
+    );
     const metal_gemma4_bench_script_self_test_step = b.step(
         "test-metal-gemma4-bench-script",
         "Run the Metal Gemma4 bench script self-test",
@@ -802,11 +822,12 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_local_check_step.dependOn(&metal_gemma4_bench_script_self_test.step);
     }
 
-    const metal_gemma4_prefill_frame_test = b.addSystemCommand(&.{
-        "bash",
+    const metal_gemma4_prefill_frame_test = addTrackedScriptCommand(
+        b,
+        &.{"bash"},
         "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
-        "--antfly-bin",
-    });
+        &.{"--antfly-bin"},
+    );
     metal_gemma4_prefill_frame_test.addFileArg(exe.getEmittedBin());
     const metal_gemma4_prefill_frame_test_step = b.step(
         "test-metal-gemma4-prefill-frame",
@@ -814,11 +835,12 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_prefill_frame_test_step.dependOn(&metal_gemma4_prefill_frame_test.step);
 
-    const metal_gemma4_prefill_frame_generated_q8_test = b.addSystemCommand(&.{
-        "bash",
+    const metal_gemma4_prefill_frame_generated_q8_test = addTrackedScriptCommand(
+        b,
+        &.{"bash"},
         "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
-        "--antfly-bin",
-    });
+        &.{"--antfly-bin"},
+    );
     metal_gemma4_prefill_frame_generated_q8_test.addFileArg(exe.getEmittedBin());
     metal_gemma4_prefill_frame_generated_q8_test.addArg(
         "--generated-q8-smoke",
@@ -829,11 +851,12 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_prefill_frame_generated_q8_test_step.dependOn(&metal_gemma4_prefill_frame_generated_q8_test.step);
 
-    const metal_gemma4_prefill_frame_e4b_test = b.addSystemCommand(&.{
-        "bash",
+    const metal_gemma4_prefill_frame_e4b_test = addTrackedScriptCommand(
+        b,
+        &.{"bash"},
         "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
-        "--antfly-bin",
-    });
+        &.{"--antfly-bin"},
+    );
     metal_gemma4_prefill_frame_e4b_test.addFileArg(exe.getEmittedBin());
     metal_gemma4_prefill_frame_e4b_test.addArg(
         "--e4b-smoke",
@@ -844,13 +867,12 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_prefill_frame_e4b_test_step.dependOn(&metal_gemma4_prefill_frame_e4b_test.step);
 
-    const metal_gemma4_prefill_frame_e4b_generated_q8_test = b.addSystemCommand(&.{
-        "bash",
+    const metal_gemma4_prefill_frame_e4b_generated_q8_test = addTrackedScriptCommand(
+        b,
+        &.{"bash"},
         "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
-        "--e4b-smoke",
-        "--generated-q8-smoke",
-        "--antfly-bin",
-    });
+        &.{ "--e4b-smoke", "--generated-q8-smoke", "--antfly-bin" },
+    );
     metal_gemma4_prefill_frame_e4b_generated_q8_test.addFileArg(exe.getEmittedBin());
     const metal_gemma4_prefill_frame_e4b_generated_q8_test_step = b.step(
         "test-metal-gemma4-prefill-frame-e4b-generated-q8",
@@ -858,14 +880,14 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_prefill_frame_e4b_generated_q8_test_step.dependOn(&metal_gemma4_prefill_frame_e4b_generated_q8_test.step);
 
-    const metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test = b.addSystemCommand(&.{
+    const metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test = addTrackedScriptCommand(b, &.{
         "env",
         "ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_Q4_0_SMALL_BATCH=1",
         "ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_FAMILY_COUNT=2",
         "ANTFLY_INFERENCE_GEMMA4_EXPECTED_GENERATED_TOP_FAMILY=q4_0",
         "ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_TOP_COUNT=1",
         "bash",
-        "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
+    }, "scripts/gemma4/test_metal_gemma4_prefill_frame.sh", &.{
         "--e4b-smoke",
         "--generated-q8-smoke",
         "--antfly-bin",
@@ -893,10 +915,12 @@ pub fn build(b: *std.Build) void {
     quant_kernel_metal_industry_local_check_step.dependOn(quant_kernel_metal_local_check_step);
     quant_kernel_metal_industry_local_check_step.dependOn(quant_kernel_metal_model_local_check_step);
 
-    const metal_gemma4_prefill_block_parity_test = b.addSystemCommand(&.{
-        "bash",
+    const metal_gemma4_prefill_block_parity_test = addTrackedScriptCommand(
+        b,
+        &.{"bash"},
         "scripts/gemma4/test_metal_gemma4_prefill_block_parity.sh",
-    });
+        &.{},
+    );
     metal_gemma4_prefill_block_parity_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_prefill_block_parity_test_step = b.step(
         "test-metal-gemma4-prefill-block-parity",
@@ -904,10 +928,12 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_prefill_block_parity_test_step.dependOn(&metal_gemma4_prefill_block_parity_test.step);
 
-    const metal_gemma4_mtp_long_context_test = b.addSystemCommand(&.{
-        "bash",
+    const metal_gemma4_mtp_long_context_test = addTrackedScriptCommand(
+        b,
+        &.{"bash"},
         "scripts/gemma4/test_metal_gemma4_mtp_long_context.sh",
-    });
+        &.{},
+    );
     metal_gemma4_mtp_long_context_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_mtp_long_context_test_step = b.step(
         "test-metal-gemma4-mtp-long-context",
@@ -918,20 +944,24 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_model_local_check_step.dependOn(&metal_gemma4_mtp_long_context_test.step);
     }
 
-    const metal_gemma4_long_output_benchmark_contract_test = b.addSystemCommand(&.{
-        "python3",
+    const metal_gemma4_long_output_benchmark_contract_test = addTrackedScriptCommand(
+        b,
+        &.{"python3"},
         "scripts/gemma4/test_benchmark_metal_gemma4_long_output.py",
-    });
+        &.{},
+    );
     const metal_gemma4_long_output_benchmark_contract_test_step = b.step(
         "test-metal-gemma4-long-output-benchmark",
         "Test the paired Gemma4 2K-prompt/300-output benchmark contract",
     );
     metal_gemma4_long_output_benchmark_contract_test_step.dependOn(&metal_gemma4_long_output_benchmark_contract_test.step);
 
-    const metal_gemma4_ab_benchmark_contract_test = b.addSystemCommand(&.{
-        "python3",
+    const metal_gemma4_ab_benchmark_contract_test = addTrackedScriptCommand(
+        b,
+        &.{"python3"},
         "scripts/gemma4/test_benchmark_metal_gemma4_ab.py",
-    });
+        &.{},
+    );
     const metal_gemma4_ab_benchmark_contract_test_step = b.step(
         "test-metal-gemma4-ab-benchmark",
         "Test the fail-closed Gemma4 Metal baseline/candidate benchmark contract",
@@ -945,10 +975,12 @@ pub fn build(b: *std.Build) void {
     metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_long_output_benchmark_contract_test_step);
     metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_ab_benchmark_contract_test_step);
 
-    const metal_gemma4_tool_calling_test = b.addSystemCommand(&.{
-        "bash",
+    const metal_gemma4_tool_calling_test = addTrackedScriptCommand(
+        b,
+        &.{"bash"},
         "scripts/gemma4/test_metal_gemma4_tool_calling.sh",
-    });
+        &.{},
+    );
     metal_gemma4_tool_calling_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_tool_calling_test_step = b.step(
         "test-metal-gemma4-tool-calling",
@@ -956,10 +988,12 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_tool_calling_test_step.dependOn(&metal_gemma4_tool_calling_test.step);
 
-    const metal_gemma4_cli_tool_calling_test = b.addSystemCommand(&.{
-        "bash",
+    const metal_gemma4_cli_tool_calling_test = addTrackedScriptCommand(
+        b,
+        &.{"bash"},
         "scripts/gemma4/test_metal_gemma4_cli_tool_calling.sh",
-    });
+        &.{},
+    );
     metal_gemma4_cli_tool_calling_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_cli_tool_calling_test_step = b.step(
         "diagnose-metal-gemma4-cli-tool-calling",
@@ -967,10 +1001,12 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_cli_tool_calling_test_step.dependOn(&metal_gemma4_cli_tool_calling_test.step);
 
-    const metal_gemma4_e2b_bench = b.addSystemCommand(&.{
-        "bash",
+    const metal_gemma4_e2b_bench = addTrackedScriptCommand(
+        b,
+        &.{"bash"},
         "scripts/gemma4/bench_metal_gemma4_e2b.sh",
-    });
+        &.{},
+    );
     metal_gemma4_e2b_bench.step.dependOn(b.getInstallStep());
     const metal_gemma4_e2b_bench_step = b.step(
         "bench-metal-gemma4-e2b",
@@ -978,10 +1014,12 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_e2b_bench_step.dependOn(&metal_gemma4_e2b_bench.step);
 
-    const metal_gemma4_e4b_bench = b.addSystemCommand(&.{
-        "bash",
+    const metal_gemma4_e4b_bench = addTrackedScriptCommand(
+        b,
+        &.{"bash"},
         "scripts/gemma4/bench_metal_gemma4_e4b.sh",
-    });
+        &.{},
+    );
     metal_gemma4_e4b_bench.step.dependOn(b.getInstallStep());
     const metal_gemma4_e4b_bench_step = b.step(
         "bench-metal-gemma4-e4b",
@@ -1685,7 +1723,12 @@ pub fn build(b: *std.Build) void {
     const test_web_projector_step = b.step("test-web-projector", "Run focused web projector/runtime tests");
     test_web_projector_step.dependOn(&run_web_projector_tests.step);
 
-    const run_webgpu_browser_smoke = b.addSystemCommand(&.{ "node", "web/test-webgpu-shader-smoke.mjs" });
+    const run_webgpu_browser_smoke = addTrackedScriptCommand(
+        b,
+        &.{"node"},
+        "web/test-webgpu-shader-smoke.mjs",
+        &.{},
+    );
     const test_webgpu_browser_step = b.step("test-webgpu-browser", "Run Chromium WebGPU shader-family browser smoke");
     test_webgpu_browser_step.dependOn(&run_webgpu_browser_smoke.step);
 

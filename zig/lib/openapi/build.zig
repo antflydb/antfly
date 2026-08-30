@@ -60,7 +60,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
 
     // E2E test for modular code generation
-    const e2e_modular = b.addSystemCommand(&.{ "bash", "test/e2e_modular.sh" });
+    const e2e_modular = b.addSystemCommand(&.{"bash"});
+    e2e_modular.addFileArg(b.path("test/e2e_modular.sh"));
     e2e_modular.step.dependOn(b.getInstallStep());
     const e2e_step = b.step("e2e", "Run end-to-end tests");
     e2e_step.dependOn(&e2e_modular.step);

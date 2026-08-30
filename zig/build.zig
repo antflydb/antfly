@@ -2697,9 +2697,9 @@ pub fn build(b: *std.Build) void {
         "env",
         "PYTHONPYCACHEPREFIX=/tmp/antfly-pycache",
         "python3",
-        "scripts/packaging/test_cabi_packaging.py",
     });
     run_cabi_packaging_tests.setCwd(b.path(".."));
+    run_cabi_packaging_tests.addFileArg(b.path("../scripts/packaging/test_cabi_packaging.py"));
     const capi_package_test_step = b.step("capi-package-test", "Run Antfly C ABI release packaging regression tests");
     capi_package_test_step.dependOn(&run_cabi_packaging_tests.step);
 
