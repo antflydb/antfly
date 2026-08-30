@@ -295,15 +295,86 @@ pub const State = struct {
         self.* = undefined;
     }
 
+    /// The decoder intentionally supports the compact single-stage custom-MCT
+    /// marker layout emitted by this codec. Reject other Annex-J stage graphs
+    /// at the capability gate instead of guessing and returning corrupted
+    /// pixels.
+    pub fn supportedCustomMctPayload(self: *const State) ?[]const u8 {
+        const mco = self.mco orelse return null;
+        const coding_style = self.coding_style orelse return null;
+        if (!coding_style.multiple_component_transform or coding_style.wavelet_transform != 0 or
+            self.header.components.len != 3 or mco.ids.len != 1) return null;
+
+        var referenced_mcc: ?*const McCCollection = null;
+        for (self.mcc_collections) |*mcc| {
+            if (mcc.index == mco.ids[0]) {
+                if (referenced_mcc != null) return null;
+                referenced_mcc = mcc;
+            }
+        }
+        const mcc = referenced_mcc orelse return null;
+        if (mcc.payload.len != 4 or mcc.payload[2] != 0 or mcc.payload[3] != 0) return null;
+        const mct_index = std.mem.readInt(u16, mcc.payload[0..2], .big);
+
+        var referenced_mct: ?*const McTSegment = null;
+        for (self.mct_segments) |*mct| {
+            if (mct.index == mct_index) {
+                if (referenced_mct != null) return null;
+                referenced_mct = mct;
+            }
+        }
+        const mct = referenced_mct orelse return null;
+        if (mct.element_type != 2 or mct.payload.len != 3 * 3 * @sizeOf(f32)) return null;
+        var offset: usize = 0;
+        while (offset < mct.payload.len) : (offset += @sizeOf(f32)) {
+            const raw = std.mem.readInt(u32, mct.payload[offset..][0..4], .big);
+            const value: f32 = @bitCast(raw);
+            if (!std.math.isFinite(value)) return null;
+        }
+        return mct.payload;
+    }
+
+    /// Part-1 RCT/ICT and the compact pixel-wise custom MCT supported here
+    /// operate on corresponding samples from components 0, 1, and 2. Those
+    /// components therefore need identical sampling parameters, precision, and
+    /// signedness, and must use the transform kernel selected by COD. Equal
+    /// subsampling is valid because MCT runs on the shared component grid before
+    /// the result is upsampled to the reference grid. Reject incompatible SIZ or
+    /// COC overrides at the capability boundary instead of allowing
+    /// reconstruction to omit MCT and return plausible but color-corrupted
+    /// pixels.
+    pub fn hasSupportedMctInputs(self: *const State) bool {
+        const default_style = self.coding_style orelse return false;
+        if (!default_style.multiple_component_transform) return true;
+        if (self.header.components.len < 3) return false;
+
+        const first = self.header.components[0];
+        if (first.xrsiz == 0 or first.yrsiz == 0) return false;
+        for (self.header.components[0..3], 0..) |component, component_index| {
+            if (component.xrsiz != first.xrsiz or component.yrsiz != first.yrsiz or
+                component.bits_per_component != first.bits_per_component or
+                component.is_signed != first.is_signed)
+            {
+                return false;
+            }
+            const effective_style = if (component_index < self.component_coding_styles.len)
+                self.component_coding_styles[component_index] orelse default_style
+            else
+                default_style;
+            if (effective_style.wavelet_transform != default_style.wavelet_transform) return false;
+        }
+        return true;
+    }
+
     /// Check support for the full (non-bounded) decode path.
     /// Allows arbitrary decomposition levels, wavelet transform 0 or 1,
     /// quantization styles 0/1/2, MCT, and all code block styles.
     /// Supports single-tile and multi-tile.
-    /// Requires 1-16 bpc, 1/3/4 components, and standard progression orders.
-    /// Component subsampling (XRsiz/YRsiz > 1) is allowed for the u8 decode
-    /// path; subsampled components are upsampled to the image grid post-IDWT.
+    /// Requires 1-16 bpc, 1-5 components, and standard progression orders.
+    /// Component subsampling (XRsiz/YRsiz > 1) is supported by both native
+    /// output paths and is upsampled to the reference grid post-IDWT.
     pub fn fullNativeDecodeSupport(self: *const State) NativeDecodeSupport {
-        if (self.header.components.len != 1 and self.header.components.len != 3 and self.header.components.len != 4) return .unsupported_components;
+        if (self.header.components.len < 1 or self.header.components.len > 5) return .unsupported_components;
         for (self.header.components) |component| {
             if (component.bits_per_component == 0 or component.bits_per_component > 16) return .unsupported_precision;
             if (component.xrsiz == 0 or component.yrsiz == 0) return .unsupported_components;
@@ -312,7 +383,13 @@ pub const State = struct {
         if (coding_style.progression_order > 4) return .unsupported_progression_order;
         // Allow both 5/3 (reversible, transform=1) and 9/7 (irreversible, transform=0)
         if (coding_style.wavelet_transform > 1) return .unsupported_wavelet_transform;
-        // MCT allowed for 3-component images with both wavelet types
+        if (!self.hasSupportedMctInputs())
+            return .unsupported_multi_component_transform;
+        if (self.mco != null and self.supportedCustomMctPayload() == null)
+            return .unsupported_multi_component_transform;
+        // Built-in MCT transforms the first three components and preserves any
+        // additional alpha/spot planes. Custom MCT is gated to the exact
+        // three-component marker layout implemented by the decoder.
         // Quantization styles 0, 1, 2 all supported
         const quantization_style = self.quantization_style orelse return .missing_quantization_style;
         if (quantization_style.style > 2) return .unsupported_quantization_mode;

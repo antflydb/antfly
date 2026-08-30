@@ -224,6 +224,10 @@ fn rewriteLocalTotalAfterObservedDrop(result: *types.SearchResult, source: types
 pub fn dedupeSearchHitsById(alloc: Allocator, result: *types.SearchResult) !void {
     if (allHitsHaveDocOrdinals(result.hits)) return try dedupeSearchHitsByOrdinal(alloc, result);
 
+    return try dedupeSearchHitsByExactId(alloc, result);
+}
+
+fn dedupeSearchHitsByExactId(alloc: Allocator, result: *types.SearchResult) !void {
     const source = result.*;
     const original_hits_len = result.hits.len;
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -248,6 +252,145 @@ pub fn dedupeSearchHitsById(alloc: Allocator, result: *types.SearchResult) !void
     if (result.hits.len > 0) alloc.free(result.hits);
     result.hits = owned_hits;
     rewriteLocalTotalAfterObservedDrop(result, source, original_hits_len, result.hits.len);
+}
+
+const SearchMemberIdentity = struct {
+    source_table: ?[]const u8,
+    id: []const u8,
+    artifact_ref: ?types.ArtifactRef,
+};
+
+const SearchMemberIdentityContext = struct {
+    pub fn hash(_: SearchMemberIdentityContext, identity: SearchMemberIdentity) u64 {
+        var hasher = std.hash.Wyhash.init(0x4152_5449_4641_4354);
+        hashOptionalBytes(&hasher, identity.source_table);
+        if (identity.artifact_ref) |artifact_ref| {
+            hasher.update(&.{1});
+            hashArtifactRef(&hasher, artifact_ref);
+        } else {
+            hasher.update(&.{0});
+            hashLengthPrefixedBytes(&hasher, identity.id);
+        }
+        return hasher.final();
+    }
+
+    pub fn eql(_: SearchMemberIdentityContext, left: SearchMemberIdentity, right: SearchMemberIdentity) bool {
+        if (!optionalBytesEqual(left.source_table, right.source_table)) return false;
+        if (left.artifact_ref) |left_ref| {
+            const right_ref = right.artifact_ref orelse return false;
+            return artifactRefsEqual(left_ref, right_ref);
+        }
+        if (right.artifact_ref != null) return false;
+        return std.mem.eql(u8, left.id, right.id);
+    }
+};
+
+fn dedupeSearchHitsByMemberIdentity(alloc: Allocator, result: *types.SearchResult) !void {
+    const source = result.*;
+    const original_hits_len = result.hits.len;
+    var seen = std.HashMapUnmanaged(
+        SearchMemberIdentity,
+        void,
+        SearchMemberIdentityContext,
+        std.hash_map.default_max_load_percentage,
+    ).empty;
+    defer seen.deinit(alloc);
+
+    var deduped = std.ArrayListUnmanaged(types.SearchHit).empty;
+    errdefer {
+        for (deduped.items) |*hit| hit.deinit(alloc);
+        deduped.deinit(alloc);
+    }
+
+    for (result.hits) |hit| {
+        const identity = SearchMemberIdentity{
+            .source_table = hit.source_table,
+            .id = hit.id,
+            .artifact_ref = hit.artifact_ref,
+        };
+        const gop = try seen.getOrPut(alloc, identity);
+        if (gop.found_existing) continue;
+        try deduped.append(alloc, try hit.clone(alloc));
+    }
+
+    const owned_hits = try alloc.dupe(types.SearchHit, deduped.items);
+    deduped.deinit(alloc);
+
+    for (result.hits) |*hit| hit.deinit(alloc);
+    if (result.hits.len > 0) alloc.free(result.hits);
+    result.hits = owned_hits;
+    rewriteLocalTotalAfterObservedDrop(result, source, original_hits_len, result.hits.len);
+}
+
+fn hashArtifactRef(hasher: *std.hash.Wyhash, artifact_ref: types.ArtifactRef) void {
+    hashLengthPrefixedBytes(hasher, artifact_ref.document_id);
+    hashLengthPrefixedBytes(hasher, artifact_ref.name);
+    hasher.update(&.{@intFromEnum(artifact_ref.kind)});
+    hashOptionalU32(hasher, artifact_ref.chunk_id);
+    hashOptionalBytes(hasher, artifact_ref.unit_id);
+    if (artifact_ref.source) |source| {
+        hasher.update(&.{1});
+        hasher.update(&.{@intFromEnum(source.kind)});
+        hashLengthPrefixedBytes(hasher, source.name);
+        hashOptionalU32(hasher, source.chunk_id);
+        hashOptionalBytes(hasher, source.unit_id);
+    } else {
+        hasher.update(&.{0});
+    }
+}
+
+fn hashLengthPrefixedBytes(hasher: *std.hash.Wyhash, value: []const u8) void {
+    var len_bytes: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &len_bytes, value.len, .little);
+    hasher.update(&len_bytes);
+    hasher.update(value);
+}
+
+fn hashOptionalBytes(hasher: *std.hash.Wyhash, value: ?[]const u8) void {
+    if (value) |bytes| {
+        hasher.update(&.{1});
+        hashLengthPrefixedBytes(hasher, bytes);
+    } else {
+        hasher.update(&.{0});
+    }
+}
+
+fn hashOptionalU32(hasher: *std.hash.Wyhash, value: ?u32) void {
+    if (value) |number| {
+        hasher.update(&.{1});
+        var bytes: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, number, .little);
+        hasher.update(&bytes);
+    } else {
+        hasher.update(&.{0});
+    }
+}
+
+fn artifactRefsEqual(left: types.ArtifactRef, right: types.ArtifactRef) bool {
+    if (left.kind != right.kind or
+        left.chunk_id != right.chunk_id or
+        !std.mem.eql(u8, left.document_id, right.document_id) or
+        !std.mem.eql(u8, left.name, right.name) or
+        !optionalBytesEqual(left.unit_id, right.unit_id))
+    {
+        return false;
+    }
+    if (left.source) |left_source| {
+        const right_source = right.source orelse return false;
+        return left_source.kind == right_source.kind and
+            left_source.chunk_id == right_source.chunk_id and
+            std.mem.eql(u8, left_source.name, right_source.name) and
+            optionalBytesEqual(left_source.unit_id, right_source.unit_id);
+    }
+    return right.source == null;
+}
+
+fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left) |left_bytes| {
+        const right_bytes = right orelse return false;
+        return std.mem.eql(u8, left_bytes, right_bytes);
+    }
+    return right == null;
 }
 
 fn dedupeSearchHitsByOrdinal(alloc: Allocator, result: *types.SearchResult) !void {
@@ -341,7 +484,7 @@ pub fn reshapeChunkBackedResult(
     raw: types.SearchResult,
     shaper: ChunkParentResultShaper,
 ) !types.SearchResult {
-    if (req.return_mode == .chunk) return try hydrateDirectChunkAncestors(alloc, req, raw, shaper);
+    if (req.return_mode == .member or req.return_mode == .chunk) return try hydrateDirectChunkAncestors(alloc, req, raw, shaper);
 
     const group_by_unit = req.return_mode == .unit or req.return_mode == .unit_with_chunks;
     const loaded_unit_chunk_payloads = if (group_by_unit)
@@ -360,8 +503,9 @@ pub fn reshapeChunkBackedResult(
 
     for (raw.hits, 0..) |chunk_hit, chunk_index| {
         var unit_identity = if (group_by_unit)
-            try resolveChunkUnitIdentity(
+            try resolveHitUnitIdentity(
                 alloc,
+                chunk_hit,
                 chunk_hit.stored_data orelse loaded_unit_chunk_payloads.?[chunk_index] orelse return error.StoredDocMissing,
             )
         else
@@ -375,7 +519,12 @@ pub fn reshapeChunkBackedResult(
 
         const gop = try grouped.getOrPut(alloc, parent_id);
         if (!gop.found_existing) {
-            var unit_ref = if (group_by_unit) try artifact_ids.decodeArtifactRefAlloc(alloc, parent_id) else null;
+            var unit_ref = if (group_by_unit)
+                try artifact_ids.decodeArtifactRefAlloc(alloc, parent_id)
+            else if (chunk_hit.artifact_ref) |artifact_ref|
+                try artifact_ref.clone(alloc)
+            else
+                null;
             errdefer if (unit_ref) |*artifact_ref| artifact_ref.deinit(alloc);
             var parent = types.SearchHit{
                 .id = try alloc.dupe(u8, parent_id),
@@ -412,8 +561,16 @@ pub fn reshapeChunkBackedResult(
         if (parent_hit.score == null or (chunk_hit.score != null and chunk_hit.score.? > parent_hit.score.?)) {
             parent_hit.score = chunk_hit.score;
             parent_hit.distance = chunk_hit.distance;
+            if (!group_by_unit) {
+                if (parent_hit.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
+                parent_hit.artifact_ref = if (chunk_hit.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
+            }
         }
         if (req.return_mode == .parent_with_chunks or req.return_mode == .unit_with_chunks) {
+            // Unit grouping has already proved chunk identity by resolving the
+            // chunk's parent-unit metadata. Parent grouping also accepts direct
+            // document members, so it must filter those out explicitly.
+            if (req.return_mode == .parent_with_chunks and !try hitHasChunkIdentity(alloc, chunk_hit)) continue;
             if (req.max_chunks_per_parent > 0 and parent_hit.chunk_hits.len >= req.max_chunks_per_parent) {
                 continue;
             }
@@ -474,25 +631,98 @@ const ChunkUnitIdentity = struct {
     }
 };
 
-fn resolveChunkUnitIdentity(
+fn resolveHitUnitIdentity(
     alloc: Allocator,
+    hit: types.SearchHit,
     stored: []const u8,
 ) !ChunkUnitIdentity {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidChunkArtifact;
-    const unit_key = parsed.value.object.get("_parent_unit_key") orelse return error.InvalidChunkArtifact;
-    if (unit_key != .string or !internal_keys.isDocumentUnitArtifactRecordKey(unit_key.string)) {
-        return error.InvalidChunkArtifact;
-    }
     const fingerprint = parsed.value.object.get(hierarchy_navigation.unit_fingerprint_field);
     if (fingerprint != null and (fingerprint.? != .string or fingerprint.?.string.len == 0)) {
         return error.InvalidChunkArtifact;
     }
+
+    const unit_key = if (parsed.value.object.get("_parent_unit_key")) |value| blk: {
+        if (value != .string or !internal_keys.isDocumentUnitArtifactRecordKey(value.string)) {
+            return error.InvalidChunkArtifact;
+        }
+        break :blk try alloc.dupe(u8, value.string);
+    } else if (hit.artifact_ref) |artifact_ref| blk: {
+        if (artifact_ref.kind == .asset) {
+            const unit_id = artifact_ref.unit_id orelse return error.UnsupportedHierarchyGrouping;
+            break :blk try internal_keys.documentUnitArtifactKeyAlloc(
+                alloc,
+                artifact_ref.document_id,
+                artifact_ref.name,
+                unit_id,
+            );
+        }
+        if (artifact_ref.source) |source| {
+            if (source.kind == .asset) {
+                const unit_id = source.unit_id orelse return error.UnsupportedHierarchyGrouping;
+                break :blk try internal_keys.documentUnitArtifactKeyAlloc(
+                    alloc,
+                    artifact_ref.document_id,
+                    source.name,
+                    unit_id,
+                );
+            }
+        }
+        return error.UnsupportedHierarchyGrouping;
+    } else return error.UnsupportedHierarchyGrouping;
+
+    errdefer alloc.free(unit_key);
     return .{
-        .key = try alloc.dupe(u8, unit_key.string),
+        .key = unit_key,
         .fingerprint = if (fingerprint) |value| try alloc.dupe(u8, value.string) else null,
     };
+}
+
+test "unit identity resolves direct document extraction unit artifacts" {
+    const alloc = std.testing.allocator;
+    const hit = types.SearchHit{
+        .id = @constCast("opaque"),
+        .artifact_ref = .{
+            .document_id = @constCast("doc:a"),
+            .name = @constCast("document_units_v1"),
+            .kind = .asset,
+            .unit_id = @constCast("page:000001"),
+        },
+    };
+    var identity = try resolveHitUnitIdentity(
+        alloc,
+        hit,
+        "{\"_artifact_unit_fingerprint\":\"fingerprint-v1\"}",
+    );
+    defer identity.deinit(alloc);
+
+    const expected = try internal_keys.documentUnitArtifactKeyAlloc(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        "page:000001",
+    );
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, identity.key);
+    try std.testing.expectEqualStrings("fingerprint-v1", identity.fingerprint.?);
+}
+
+test "unit identity fails closed for ordinary chunks" {
+    const hit = types.SearchHit{
+        .id = @constCast("opaque"),
+        .artifact_ref = .{
+            .document_id = @constCast("doc:a"),
+            .name = @constCast("body_chunks_v1"),
+            .kind = .chunk,
+            .chunk_id = 0,
+        },
+    };
+    try std.testing.expectError(
+        error.UnsupportedHierarchyGrouping,
+        resolveHitUnitIdentity(std.testing.allocator, hit, "{\"_parent_doc_key\":\"doc:a\"}"),
+    );
 }
 
 fn groupedUnitRevisionEnvelopeAlloc(alloc: Allocator, fingerprint: []const u8) ![]u8 {
@@ -754,6 +984,33 @@ fn chunkStorageKeyForHitAlloc(alloc: Allocator, hit: types.SearchHit) !?[]u8 {
     var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, hit.id)) orelse return null;
     defer artifact_ref.deinit(alloc);
     return try chunkStorageKeyForArtifactRefAlloc(alloc, artifact_ref);
+}
+
+fn hitHasChunkIdentity(alloc: Allocator, hit: types.SearchHit) !bool {
+    if (hit.artifact_ref) |artifact_ref| {
+        if (artifact_ref.kind == .chunk) return true;
+        return artifact_ref.kind == .embedding and
+            artifact_ref.source != null and
+            artifact_ref.source.?.kind == .chunk;
+    }
+    if (internal_keys.isChunkArtifactRecordKey(hit.id)) return true;
+
+    const maybe_embedding_identity = artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, hit.id) catch |err| switch (err) {
+        error.InvalidInternalUserKey => null,
+        else => return err,
+    };
+    if (maybe_embedding_identity) |identity_value| {
+        var identity = identity_value;
+        defer identity.deinit(alloc);
+        return internal_keys.isChunkArtifactRecordKey(identity.doc_key);
+    }
+
+    var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, hit.id)) orelse return false;
+    defer artifact_ref.deinit(alloc);
+    if (artifact_ref.kind == .chunk) return true;
+    return artifact_ref.kind == .embedding and
+        artifact_ref.source != null and
+        artifact_ref.source.?.kind == .chunk;
 }
 
 fn hydrateDirectChunkAncestors(
@@ -1401,7 +1658,14 @@ pub fn postprocessTextSearchResult(
         .resolve_doc_set_doc_ids = processor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = processor.resolve_doc_ids_to_doc_set,
     });
-    try dedupeSearchHitsById(alloc, &filtered);
+    if (chunk_backed) {
+        // Chunk members intentionally share their parent document ordinal.
+        // Preserve distinct source chunks until hierarchy grouping while still
+        // collapsing duplicate vectors for the same exact artifact member.
+        try dedupeSearchHitsByExactId(alloc, &filtered);
+    } else {
+        try dedupeSearchHitsById(alloc, &filtered);
+    }
     if (chunk_backed) {
         const reshaped = try reshapeChunkBackedResult(alloc, req, filtered, .{
             .ctx = processor.ctx,
@@ -1438,6 +1702,19 @@ pub fn postprocessVectorSearchResult(
         .filter_many = processor.filter_visible_many,
     });
     errdefer filtered.deinit();
+    // Artifact-backed vector indexes retain one independent member for every
+    // (artifact, source key). Raw member modes therefore deduplicate by the
+    // complete artifact identity, not by the resolved document key. Grouped
+    // document-level search still returns each logical document once, with raw
+    // score order making the first occurrence authoritative. Chunk members
+    // remain distinct until hierarchy grouping.
+    if (req.return_mode == .member or req.return_mode == .chunk) {
+        try dedupeSearchHitsByMemberIdentity(alloc, &filtered);
+    } else if (chunk_backed) {
+        try dedupeSearchHitsByExactId(alloc, &filtered);
+    } else {
+        try dedupeSearchHitsById(alloc, &filtered);
+    }
     if (chunk_backed) {
         filtered = try reshapeChunkBackedResult(alloc, req, filtered, .{
             .ctx = processor.ctx,
@@ -1505,8 +1782,10 @@ fn externalizeSearchHitIdentity(alloc: Allocator, hit: *types.SearchHit) !void {
 
     alloc.free(hit.id);
     hit.id = try alloc.dupe(u8, resolved.id);
-    if (hit.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
-    hit.artifact_ref = if (resolved.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
+    if (resolved.artifact_ref) |artifact_ref| {
+        if (hit.artifact_ref) |*existing| existing.deinit(alloc);
+        hit.artifact_ref = try artifact_ref.clone(alloc);
+    }
 
     for (hit.chunk_hits) |*chunk_hit| {
         try externalizeChunkHitIdentity(alloc, chunk_hit);
@@ -1688,6 +1967,107 @@ test "dedupeSearchHitsById uses ordinals when hit page is complete" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 1), result.hits[0].doc_ordinal);
     try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 2), result.hits[1].doc_ordinal);
+}
+
+test "exact-id dedupe preserves distinct chunks sharing a parent ordinal" {
+    const alloc = std.testing.allocator;
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 3),
+        .total_hits = 3,
+    };
+    defer result.deinit();
+    result.hits[0] = .{ .id = try alloc.dupe(u8, "chunk:0"), .doc_ordinal = 1 };
+    result.hits[1] = .{ .id = try alloc.dupe(u8, "chunk:1"), .doc_ordinal = 1 };
+    result.hits[2] = .{ .id = try alloc.dupe(u8, "chunk:0"), .doc_ordinal = 1 };
+
+    try dedupeSearchHitsByExactId(alloc, &result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("chunk:0", result.hits[0].id);
+    try std.testing.expectEqualStrings("chunk:1", result.hits[1].id);
+}
+
+test "vector dedupe preserves the highest-ranked source artifact" {
+    const alloc = std.testing.allocator;
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 2),
+        .total_hits = 2,
+    };
+    defer result.deinit();
+    result.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 0.9,
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "title_dense_v1"),
+            .kind = .embedding,
+        },
+    };
+    result.hits[1] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 0.8,
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "body_dense_v1"),
+            .kind = .embedding,
+        },
+    };
+
+    try dedupeSearchHitsById(alloc, &result);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("title_dense_v1", result.hits[0].artifact_ref.?.name);
+}
+
+test "vector member mode preserves document members from distinct embedding artifacts" {
+    const alloc = std.testing.allocator;
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .doc_ordinal = 1,
+        .score = 0.9,
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "title_dense_v1"),
+            .kind = .embedding,
+        },
+    };
+    hits[1] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .doc_ordinal = 1,
+        .score = 0.8,
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "summary_dense_v1"),
+            .kind = .embedding,
+        },
+    };
+    // Repeated delivery of the same backend member remains idempotent.
+    hits[2] = try hits[1].clone(alloc);
+
+    var loader = TestStoredLoader{};
+    var result = try postprocessVectorSearchResult(alloc, .{
+        .return_mode = .member,
+    }, .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+    }, false, .{
+        .ctx = &loader,
+        .is_visible = TestPostprocessor.isVisible,
+        .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+        .load_parent_stored = TestChunkParentShaper.loadParentStored,
+        .load_stored = TestStoredLoader.loadStored,
+        .load_many_stored = TestStoredLoader.loadManyStored,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqualStrings("title_dense_v1", result.hits[0].artifact_ref.?.name);
+    try std.testing.expectEqualStrings("summary_dense_v1", result.hits[1].artifact_ref.?.name);
 }
 
 test "applyStoredSearchPatternFilters skips stored loads for doc_id-only filters" {

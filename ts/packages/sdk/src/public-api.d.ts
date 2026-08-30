@@ -2703,6 +2703,23 @@ export interface components {
              */
             retry_after_ms?: number;
         };
+        /** @description The requested index depends on a capability unavailable in the current deployment. */
+        UnsupportedIndexCapabilityError: {
+            /** @enum {string} */
+            error: "unsupported_index_capability";
+            /** @enum {string} */
+            message: "artifact-backed index sources are not supported by this deployment";
+            /** @enum {boolean} */
+            retryable: false;
+        };
+        /** @description A retryable index mutation failure, including a distributed artifact-source protocol fence or a temporarily unavailable model probe. */
+        IndexMutationServiceUnavailableError: {
+            /** @enum {string} */
+            error: "index_capability_upgrade_pending" | "index_probe_unavailable";
+            message: string;
+            /** @enum {boolean} */
+            retryable: true;
+        };
         /** @description The metadata service does not yet provide the consistency capability required by backup. */
         MetadataCapabilityUnavailableError: {
             /**
@@ -2877,6 +2894,78 @@ export interface components {
              */
             retryable: false;
         };
+        /** @description A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity. */
+        UnsupportedHierarchyGroupingError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description Stable machine-readable error code.
+             * @enum {string}
+             */
+            error: "unsupported_hierarchy_grouping";
+            /** @description Human-readable remediation using only public query fields. */
+            message: string;
+            /**
+             * @description Stable reason the requested hierarchy level is unavailable.
+             * @enum {string}
+             */
+            reason: "unit_identity_unavailable";
+            /**
+             * @description Public request field that selected the unsupported grouping level.
+             * @enum {string}
+             */
+            field: "hierarchy.group_by.level";
+            /**
+             * @description Select source grouping, omit group_by for direct members, or use an index whose every source is unit-backed.
+             * @enum {string}
+             */
+            action: "use_source_grouping_or_direct_members";
+            /**
+             * @description Retrying the same request cannot succeed without changing its hierarchy grouping.
+             * @enum {boolean}
+             */
+            retryable: false;
+        };
+        /** @description A query requests an unsupported feature without a more specific structured diagnostic. */
+        UnsupportedQueryError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description Stable machine-readable error code.
+             * @enum {string}
+             */
+            error: "unsupported_query_request";
+            /** @description Human-readable error summary. */
+            message: string;
+            /**
+             * @description Retrying the same request cannot succeed without changing it.
+             * @enum {boolean}
+             */
+            retryable: false;
+        };
+        /** @description A public filter or exclusion query contains an invalid or unsupported node. */
+        QueryFilterError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 400 | 422;
+            /** @enum {string} */
+            error: "invalid_query_request" | "unsupported_query_request";
+            message: string;
+            /** @enum {string} */
+            field: "filter_query" | "exclusion_query";
+            /** @description Stable name of the first invalid or unsupported filter node. */
+            offending_node: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
         ExactSortError: {
             /**
              * @description Stable error class.
@@ -2954,6 +3043,17 @@ export interface components {
          * @enum {string}
          */
         ClusterHealth: "unknown" | "healthy" | "unhealthy" | "degraded" | "error";
+        /** @description Deployment-level index capabilities clients can inspect before submitting index mutations. */
+        IndexRuntimeCapabilities: {
+            /** @description Whether full-text, embedding, and graph indexes may currently consume generated artifact streams through either single-source or multi-source request forms. Equivalent to artifact_sources_state=available. */
+            artifact_sources: boolean;
+            artifact_sources_state: components["schemas"]["ArtifactSourcesCapabilityState"];
+        };
+        /**
+         * @description Whether artifact-backed index mutations are accepted now, temporarily fenced during a distributed rolling upgrade, or permanently unsupported by this deployment.
+         * @enum {string}
+         */
+        ArtifactSourcesCapabilityState: "available" | "upgrade_pending" | "unsupported";
         ClusterStatus: {
             health: components["schemas"]["ClusterHealth"];
             /** @description Optional message providing details about the health status */
@@ -2965,6 +3065,7 @@ export interface components {
              * @enum {string}
              */
             deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
+            index_capabilities?: components["schemas"]["IndexRuntimeCapabilities"];
             secret_store?: components["schemas"]["SecretStoreStatus"];
             runtime_config?: components["schemas"]["RuntimeConfigStatus"];
             storage?: components["schemas"]["StorageRuntimeStatus"];
@@ -2982,6 +3083,7 @@ export interface components {
              * @enum {string}
              */
             deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
+            index_capabilities?: components["schemas"]["IndexRuntimeCapabilities"];
             secret_store?: components["schemas"]["SecretStoreStatus"];
             runtime_config?: components["schemas"]["RuntimeConfigStatus"];
             storage?: components["schemas"]["StorageRuntimeStatus"];
@@ -3342,7 +3444,7 @@ export interface components {
          * @description Reason an artifact was added to the repair queue.
          * @enum {string}
          */
-        ArtifactRepairReason: "missing_artifact" | "corrupt_artifact" | "unreadable_artifact" | "enrichment_failed";
+        ArtifactRepairReason: "missing_artifact" | "corrupt_artifact" | "unreadable_artifact" | "enrichment_failed" | "resource_limit_exceeded";
         /**
          * @description Repair subsystem to inspect or run.
          * @enum {string}
@@ -3359,6 +3461,8 @@ export interface components {
             parent_doc_key?: string;
             /** @description Unit identifier for unit-scoped artifacts, when applicable. */
             unit_id?: string;
+            /** @description Canonical artifact stream configured on the affected index. This is the authoritative source-readiness identity and is distinct from the producer input and the derived artifact being repaired. */
+            index_source_artifact_name?: string;
             /** @description Source artifact stream used to produce this artifact, when applicable. */
             source_artifact_name?: string;
             /** @description Derived artifact name that must be reprocessed or made readable. */
@@ -4159,7 +4263,7 @@ export interface components {
              */
             description?: string;
             indexes: {
-                [key: string]: components["schemas"]["IndexConfig"];
+                [key: string]: components["schemas"]["CreatedIndex"];
             };
             shards: {
                 [key: string]: components["schemas"]["ShardConfig"];
@@ -4415,7 +4519,7 @@ export interface components {
             shard_status: {
                 [key: string]: components["schemas"]["IndexStats"];
             };
-            config: components["schemas"]["IndexConfig"];
+            config: components["schemas"]["CreatedIndex"];
             status: components["schemas"]["IndexStats"];
         };
         /** @description Compact LSM backend operational status. Detailed low-level counters are available through metrics. */
@@ -6323,7 +6427,8 @@ export interface components {
          *     size predictable. The presence of this object selects the canonical contract:
          *     without `group_by` or `children`, including when the object is empty, direct index
          *     matches are returned. `ancestors` only controls projected context and never changes result
-         *     cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+         *     cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit
+         *     source-grouped result shape.
          */
         QueryHierarchy: {
             group_by?: components["schemas"]["HierarchyGroupBy"];
@@ -6396,6 +6501,19 @@ export interface components {
              */
             full_text_search?: components["schemas"]["RawQuery"];
             /**
+             * @description Full-text index used by `full_text_search` and by scoring text clauses in `query`.
+             *     Use this to query a named document- or artifact-backed full-text index. The selected
+             *     index must exist and have type `full_text`. Omit this field to use the table's active
+             *     schema full-text index, preserving v0.2 behavior. Structured document filters continue
+             *     to use the active schema index even when retrieval uses a named artifact index. This
+             *     selector is invalid without `full_text_search` or a scoring text clause in `query` and
+             *     receives HTTP 422. This semantic relationship is enforced after the recursive query AST
+             *     is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses
+             *     from filter-only or exclusion-only trees.
+             * @example document_text
+             */
+            full_text_index?: string;
+            /**
              * @description Natural language query for vector similarity search. Results are ranked by semantic similarity
              *     to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF).
              *
@@ -6432,8 +6550,15 @@ export interface components {
              */
             embedding_template?: string;
             /**
-             * @description List of vector index names to use for semantic search. Required when using semantic_search.
-             *     Multiple indexes can be specified, and their results will be merged using RRF.
+             * @description Embedding index names selected for `semantic_search` or explicit `embeddings`.
+             *     Dense and sparse indexes are supported when the corresponding query representation is
+             *     supplied. Provisioned deployments require at least one index for `semantic_search`;
+             *     serverless may infer its single published dense index when this field is omitted. When
+             *     `embeddings` is supplied without this field, the embedding map keys select the indexes.
+             *     Provisioned results from multiple indexes are merged using RRF. Serverless currently
+             *     executes at most one dense and one sparse index per request; it rejects multiple
+             *     same-kind selectors and omitted selectors when more than one corresponding index is
+             *     published rather than choosing an index by catalog order.
              * @example [
              *       "title_body_nomic",
              *       "description_embedding"
@@ -7368,6 +7493,8 @@ export interface components {
             /** @description Unit identifier when the hit is attached to a document unit. */
             parent_unit_id?: string;
             artifact?: components["schemas"]["HierarchyArtifact"];
+            /** @description Artifact member that supplied the score for a source-level grouped hit. */
+            matched_artifact?: components["schemas"]["HierarchyArtifact"];
             ancestors?: components["schemas"]["QueryHitHierarchyAncestors"];
             evidence?: components["schemas"]["HierarchyEvidence"];
             /** @description Matching descendant hits attached by the canonical hierarchy.group_by request. */
@@ -7378,7 +7505,7 @@ export interface components {
             revision?: string;
             /**
              * @deprecated
-             * @description Legacy child chunk hits included for source-level rollups.
+             * @description Deprecated child chunk hits included by the v0.2-compatible implicit source rollup.
              */
             chunks?: components["schemas"]["HierarchyMatchHit"][];
         };
@@ -7410,9 +7537,10 @@ export interface components {
              * @description Stable ancestry envelope for derived document hierarchy hits. Present when
              *     the hit is a derived unit/chunk/embedding artifact or when a source-level
              *     group includes nested matches. Standard fields include `level`,
-             *     `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and
+             *     `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`, and
              *     `ancestors` with response-local or requested DB-backed source/unit context when available.
-             *     Legacy rollup requests continue to use `chunks` instead of `matches`.
+             *     V0.2-compatible implicit rollup requests continue to use the deprecated
+             *     `chunks` field instead of `matches`.
              */
             hierarchy?: components["schemas"]["QueryHitHierarchy"];
             /**
@@ -8227,6 +8355,8 @@ export interface components {
             source_artifact_name?: string;
             /** @description Expected embedding dimension for embedding enrichments. */
             expected_dims?: number;
+            /** @description Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently. */
+            vector_space?: string;
             /** @description Chunk size for chunk enrichments. */
             chunk_size?: number;
             /** @description Chunk overlap for chunk enrichments. */
@@ -8240,41 +8370,27 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Write-only serialized asset producer configuration. It may contain provider credentials and is never returned. */
+            /** @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded. */
             producer_json?: string;
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
         };
-        /** @description Fields shared by every create-index variant. The index name is owned by the request path. */
-        CreateIndexCommon: {
-            /** @description Optional description of the index and its purpose */
-            description?: string;
-            /**
-             * @description Version of the index implementation. Defaults to 0.
-             * @default 0
-             */
-            version?: number;
-            /** @description Inline managed enrichment definitions required by this index. */
-            enrichments?: components["schemas"]["EnrichmentConfig"][];
+        /** @description Textual artifact stream consumed by a full-text index, with an optional source-local projection. */
+        FullTextArtifactIndexSource: {
+            /** @description Stable name of a chunk or textual asset artifact stream. Artifact names must be unique within the index. */
+            artifact: string;
+            /** @description Optional field selected from this artifact's records. When omitted, the index-level field is inherited; when both are omitted, Antfly indexes the default text projection. */
+            field?: string;
         };
         FullTextIndexConfig: {
+            /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            sources?: components["schemas"]["FullTextArtifactIndexSource"][];
             /** @description Whether to use memory-only storage */
             mem_only?: boolean;
-            /** @description Document field indexed as text. Omit for the table's default full-document text index. */
+            /** @description Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection. */
             field?: string;
-            /** @description Generated artifact stream indexed as text. Use with matching inline enrichments. */
+            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             artifact_name?: string;
-        };
-        /** @description Create a full-text index. */
-        CreateFullTextIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["FullTextIndexConfig"] & {
-            /** @enum {string} */
-            type: "full_text";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "full_text";
         };
         /**
          * @description Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
@@ -8288,6 +8404,11 @@ export interface components {
          * @enum {string}
          */
         DerivedCoveragePolicy: "strict" | "partial" | "best_effort";
+        /** @description Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment. */
+        ArtifactIndexSource: {
+            /** @description Stable name of a generated artifact stream. */
+            artifact: string;
+        };
         /**
          * @description Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
          * @default l2_squared
@@ -9239,9 +9360,14 @@ export interface components {
             dimension?: number;
             /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
             field?: string;
-            /** @description Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings. */
+            /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            sources?: components["schemas"]["ArtifactIndexSource"][];
+            /** @description Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             embedding_name?: string;
-            /** @description Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source. */
+            /**
+             * @deprecated
+             * @description Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name is required and this value must exactly match the source_artifact_name on the authoritative embedding enrichment. New clients should declare the relationship only on that enrichment.
+             */
             source_artifact_name?: string;
             /**
              * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
@@ -9276,16 +9402,44 @@ export interface components {
             /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
             execution?: components["schemas"]["IndexExecutionConfig"];
         };
-        /** @description Create a dense or sparse embeddings index. */
-        CreateEmbeddingsIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["EmbeddingsIndexConfig"] & {
-            /** @enum {string} */
-            type: "embeddings";
-        } & {
+        /** @description A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item. */
+        GraphTemplateValue: string | number;
+        /** @description Maps each artifact item to graph node identifiers. */
+        GraphArtifactNodeMappingConfig: {
             /**
-             * @description discriminator enum property added by openapi-typescript
+             * @default document
              * @enum {string}
              */
-            type: "embeddings";
+            model?: "document" | "external";
+            target?: components["schemas"]["GraphTemplateValue"];
+        };
+        /** @description Maps each artifact item to an edge type, weight, and public metadata. */
+        GraphArtifactEdgeMappingConfig: {
+            type?: components["schemas"]["GraphTemplateValue"];
+            weight?: components["schemas"]["GraphTemplateValue"];
+            /** @description JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses. */
+            metadata?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Document fields made available to graph mapping templates through `_doc.value`. */
+        GraphArtifactContextConfig: {
+            doc_fields?: string[];
+        };
+        /** @description Artifact stream materialized into graph edges. Each source artifact is limited to 16 MiB and 1,000,000 relation items so live apply, repair, split, and restore share one bounded admission contract. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are rejected by serverless deployments. */
+        GraphArtifactSourceConfig: {
+            artifact: string;
+            /** @description Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`. */
+            path?: string;
+            /**
+             * @default extraction_relation
+             * @enum {string}
+             */
+            format?: "extraction_relation" | "extraction_graph";
+            mention_edge_type?: string;
+            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
+            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
+            context?: components["schemas"]["GraphArtifactContextConfig"];
         };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
@@ -9325,19 +9479,6 @@ export interface components {
             /** @description Required metadata fields for this edge type */
             required_metadata?: string[];
         };
-        /** @description Artifact stream materialized into graph edges. */
-        GraphArtifactSourceConfig: {
-            /** @enum {string} */
-            kind: "artifact";
-            artifact: string;
-            path?: string;
-            /**
-             * @default extraction_relation
-             * @enum {string}
-             */
-            format?: "extraction_relation" | "extraction_graph";
-            mention_edge_type?: string;
-        };
         /** @description Document input used by an artifact producer. Field sources read one document field; template sources render a Handlebars template. */
         GraphArtifactProducerSourceConfig: {
             /** @enum {string} */
@@ -9356,31 +9497,6 @@ export interface components {
             producer_json?: {
                 [key: string]: unknown;
             };
-        };
-        /** @description A literal numeric value or a Handlebars template evaluated for each materialized graph item. */
-        GraphTemplateValue: string | number;
-        /** @description Maps each artifact item to graph node identifiers. */
-        GraphArtifactNodeMappingConfig: {
-            /**
-             * @default document
-             * @enum {string}
-             */
-            model?: "document" | "external";
-            source?: components["schemas"]["GraphTemplateValue"];
-            target?: components["schemas"]["GraphTemplateValue"];
-        };
-        /** @description Maps each artifact item to an edge type, weight, and public metadata. */
-        GraphArtifactEdgeMappingConfig: {
-            type?: components["schemas"]["GraphTemplateValue"];
-            weight?: components["schemas"]["GraphTemplateValue"];
-            /** @description JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses. */
-            metadata?: {
-                [key: string]: unknown;
-            };
-        };
-        /** @description Document fields made available to graph mapping templates through `_doc.value`. */
-        GraphArtifactContextConfig: {
-            doc_fields?: string[];
         };
         /** @description Algebraic law used to combine bounded graph traversal provenance. */
         GraphBoundedTraversalConfig: {
@@ -9427,6 +9543,8 @@ export interface components {
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
+            /** @description Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            sources?: components["schemas"]["GraphArtifactSourceConfig"][];
             /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
             summarizer?: components["schemas"]["GeneratorConfig"];
             /**
@@ -9439,15 +9557,91 @@ export interface components {
             template?: string;
             /** @description List of edge types with their configurations */
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
-            /** @description Maximum number of edges per document (0 = unlimited) */
+            /** @description Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests. */
             max_edges_per_document?: number;
+            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             source?: components["schemas"]["GraphArtifactSourceConfig"];
+            /** @description Single asset-producer shorthand. It must be paired with exactly one source selecting the same artifact name. */
             artifact?: components["schemas"]["GraphArtifactProducerConfig"];
-            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
-            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
-            context?: components["schemas"]["GraphArtifactContextConfig"];
             algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
             resolvers?: components["schemas"]["GraphResolverConfig"][];
+        };
+        /** @description Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned. */
+        AlgebraicIndexConfig: {
+            /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
+            derive_from_schema?: boolean;
+        };
+        /**
+         * @description The type of the index.
+         * @enum {string}
+         */
+        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
+        /** @description Configuration for an index */
+        IndexConfig: {
+            /** @description Name of the index */
+            name: string;
+            /** @description Optional description of the index and its purpose */
+            description?: string;
+            type: components["schemas"]["IndexType"];
+            /**
+             * @description Version of the index implementation. Defaults to 0.
+             * @default 0
+             */
+            version?: number;
+            /**
+             * @description Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
+             * @example [
+             *       {
+             *         "name": "document_chunks_v1",
+             *         "kind": "chunk",
+             *         "field": "text",
+             *         "source_artifact_name": "document_units_v1",
+             *         "chunk_size": 512
+             *       },
+             *       {
+             *         "name": "document_chunk_dense_v1",
+             *         "kind": "embedding",
+             *         "field": "text",
+             *         "source_artifact_name": "document_chunks_v1",
+             *         "expected_dims": 768
+             *       }
+             *     ]
+             */
+            enrichments?: components["schemas"]["EnrichmentConfig"][];
+        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
+        /** @description Fields shared by every create-index variant. The index name is owned by the request path. */
+        CreateIndexCommon: {
+            /** @description Optional description of the index and its purpose */
+            description?: string;
+            /**
+             * @description Version of the index implementation. Defaults to 0.
+             * @default 0
+             */
+            version?: number;
+            /** @description Inline managed enrichment definitions required by this index. */
+            enrichments?: components["schemas"]["EnrichmentConfig"][];
+        };
+        /** @description Create a full-text index. */
+        CreateFullTextIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["FullTextIndexConfig"] & {
+            /** @enum {string} */
+            type: "full_text";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "full_text";
+        };
+        /** @description Create a dense or sparse embeddings index. */
+        CreateEmbeddingsIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["EmbeddingsIndexConfig"] & {
+            /** @enum {string} */
+            type: "embeddings";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "embeddings";
         };
         /** @description Create a graph index. */
         CreateGraphIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["GraphIndexConfig"] & {
@@ -9459,11 +9653,6 @@ export interface components {
              * @enum {string}
              */
             type: "graph";
-        };
-        /** @description Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned. */
-        AlgebraicIndexConfig: {
-            /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
-            derive_from_schema?: boolean;
         };
         /** @description Create a schema-derived algebraic index. */
         CreateAlgebraicIndexRequest: components["schemas"]["CreateIndexCommon"] & components["schemas"]["AlgebraicIndexConfig"] & {
@@ -9674,49 +9863,218 @@ export interface components {
              */
             dynamic_templates?: components["schemas"]["DynamicTemplate"][];
         };
-        /**
-         * @description The type of the index.
-         * @enum {string}
-         */
-        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
-        /** @description Configuration for an index */
-        IndexConfig: {
-            /** @description Name of the index */
+        /** @description Credential-free normalized enrichment configuration returned after index creation. */
+        CreatedEnrichmentConfig: {
+            name: string;
+            kind: components["schemas"]["EnrichmentKind"];
+            field?: string;
+            template?: string;
+            source_artifact_name?: string;
+            expected_dims?: number;
+            /** @description Optional stable model/token-space identifier asserted for this embedding artifact. */
+            vector_space?: string;
+            chunk_size?: number;
+            chunk_overlap?: number;
+            chunker_json?: string;
+            /** @default false */
+            full_text_index?: boolean;
+            content_type?: string;
+            execution?: components["schemas"]["ExecutionPolicy"];
+        };
+        /** @description Fields returned for every newly created index. Provider credentials are write-only and are never returned. */
+        CreatedIndexCommon: {
+            /** @description Name of the created index */
             name: string;
             /** @description Optional description of the index and its purpose */
             description?: string;
-            type: components["schemas"]["IndexType"];
             /**
              * @description Version of the index implementation. Defaults to 0.
              * @default 0
              */
             version?: number;
+            /** @description Normalized inline managed enrichment definitions required by this index. */
+            enrichments?: components["schemas"]["CreatedEnrichmentConfig"][];
+        };
+        /** @description Canonical full-text configuration returned after creation. Single-source alternative request forms are represented through sources. */
+        CreatedFullTextIndexConfig: {
+            sources?: components["schemas"]["FullTextArtifactIndexSource"][];
+            mem_only?: boolean;
+            field?: string;
+        };
+        /** @description Normalized effective full-text index configuration returned after creation. */
+        CreatedFullTextIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedFullTextIndexConfig"] & {
+            /** @enum {string} */
+            type: "full_text";
+        } & {
             /**
-             * @description Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
-             * @example [
-             *       {
-             *         "name": "document_chunks_v1",
-             *         "kind": "chunk",
-             *         "field": "text",
-             *         "source_artifact_name": "document_units_v1",
-             *         "chunk_size": 512
-             *       },
-             *       {
-             *         "name": "document_chunk_dense_v1",
-             *         "kind": "embedding",
-             *         "field": "text",
-             *         "source_artifact_name": "document_chunks_v1",
-             *         "expected_dims": 768
-             *       }
-             *     ]
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
              */
-            enrichments?: components["schemas"]["EnrichmentConfig"][];
-        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
+            type: "full_text";
+        };
+        /** @description Credential-free provider configuration returned after index creation. Only non-secret provider settings are represented. */
+        CreatedProviderConfig: {
+            /** @description Configured provider discriminator. */
+            provider: string;
+            /** @description Configured provider model when applicable. */
+            model?: string;
+            models?: string[];
+            project_id?: string;
+            location?: string;
+            region?: string;
+            /** Format: uri */
+            url?: string;
+            /** Format: uri */
+            api_url?: string;
+            dimension?: number;
+            dimensions?: number;
+            input_type?: string;
+            truncate?: string;
+            strip_new_lines?: boolean;
+            batch_size?: number;
+            /** Format: float */
+            temperature?: number;
+            max_tokens?: number;
+            /** Format: float */
+            top_p?: number;
+            top_k?: number;
+            /** Format: float */
+            frequency_penalty?: number;
+            /** Format: float */
+            presence_penalty?: number;
+            timeout?: number;
+        };
+        /** @description Credential-free normalized embeddings configuration returned after creation. Single-source v0.2 fields are preserved alongside canonical sources for read compatibility. */
+        CreatedEmbeddingsIndexConfig: {
+            publication_policy?: components["schemas"]["IndexPublicationPolicy"];
+            coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
+            /** @default false */
+            external?: boolean;
+            /** @default false */
+            sparse?: boolean;
+            dimension?: number;
+            field?: string;
+            /** @description Embedding artifact streams indexed together as independent vector members. */
+            sources?: components["schemas"]["ArtifactIndexSource"][];
+            /** @description Released v0.2 single-source read field, preserved when that request form created the index. Canonical source identity is also returned through sources. */
+            readonly embedding_name?: string;
+            /**
+             * @deprecated
+             * @description Deprecated v0.2 descriptive source read field, preserved when supplied with embedding_name. The matching enrichment is authoritative.
+             */
+            readonly source_artifact_name?: string;
+            template?: string;
+            distance_metric?: components["schemas"]["DistanceMetric"];
+            mem_only?: boolean;
+            embedder?: components["schemas"]["CreatedProviderConfig"];
+            summarizer?: components["schemas"]["CreatedProviderConfig"];
+            chunker?: components["schemas"]["ChunkerConfig"];
+            /** @default 10 */
+            top_k?: number;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_weight?: number;
+            /** @default 1024 */
+            chunk_size?: number;
+            execution?: components["schemas"]["IndexExecutionConfig"];
+        };
+        /** @description Normalized effective dense or sparse embeddings index configuration returned after creation. */
+        CreatedEmbeddingsIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedEmbeddingsIndexConfig"] & {
+            /** @enum {string} */
+            type: "embeddings";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "embeddings";
+        };
+        /** @description Canonical artifact stream materialized into graph edges. */
+        CreatedGraphArtifactSourceConfig: {
+            artifact: string;
+            path?: string;
+            /**
+             * @default extraction_relation
+             * @enum {string}
+             */
+            format?: "extraction_relation" | "extraction_graph";
+            mention_edge_type?: string;
+            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
+            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
+            context?: components["schemas"]["GraphArtifactContextConfig"];
+        };
+        /** @description Credential-free graph artifact producer configuration returned after creation. */
+        CreatedGraphArtifactProducerConfig: {
+            name: string;
+            /** @enum {string} */
+            kind: "asset";
+            source: components["schemas"]["GraphArtifactProducerSourceConfig"];
+            content_type?: string;
+            execution?: components["schemas"]["ExecutionPolicy"];
+        };
+        /** @description Credential-free normalized graph configuration returned after creation. */
+        CreatedGraphIndexConfig: {
+            summarizer?: components["schemas"]["CreatedProviderConfig"];
+            template?: string;
+            edge_types?: components["schemas"]["EdgeTypeConfig"][];
+            /** @description Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests. */
+            max_edges_per_document?: number;
+            sources?: components["schemas"]["CreatedGraphArtifactSourceConfig"][];
+            artifact?: components["schemas"]["CreatedGraphArtifactProducerConfig"];
+            algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
+            resolvers?: components["schemas"]["GraphResolverConfig"][];
+        };
+        /** @description Normalized effective graph index configuration returned after creation. */
+        CreatedGraphIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedGraphIndexConfig"] & {
+            /** @enum {string} */
+            type: "graph";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "graph";
+        };
+        /** @description Normalized effective schema-derived algebraic index configuration returned after creation. */
+        CreatedAlgebraicIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["AlgebraicIndexConfig"] & {
+            /** @enum {string} */
+            type: "algebraic";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "algebraic";
+        };
+        /** @description Discriminated normalized configuration returned after an index is created. */
+        CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"];
         /**
-         * @description Authoritative query-readiness and completeness state for the desired index incarnation.
+         * @description Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans.
          * @enum {string}
          */
         IndexReadinessState: "pending" | "queryable_partial" | "ready" | "failed";
+        /**
+         * @description Stable machine-readable reason why an index is pending, partial, or failed.
+         * @enum {string}
+         */
+        IndexReadinessReason: "load_failure" | "enrichment_failure" | "runtime_unavailable" | "shard_observation_incomplete" | "incarnation_pending" | "source_publication" | "repair" | "backfill" | "coverage" | "replay" | "publication";
+        /**
+         * @description Stable machine-readable reason why an artifact source is pending or failed.
+         * @enum {string}
+         */
+        IndexSourceReadinessReason: "index_failed" | "enrichment_failure" | "repair" | "runtime_unavailable" | "shard_observation_incomplete" | "source_observation_incomplete" | "publication";
+        IndexSourceReadinessStatus: {
+            /** @description Configured artifact stream identity. */
+            artifact: string;
+            /** @enum {string} */
+            state: "pending" | "ready" | "failed";
+            /** @description Whether this source is fully observed and published on every expected shard. */
+            complete: boolean;
+            /** @description Stable, machine-readable blockers or failure reasons for this source. Empty when state is ready. */
+            pending_reasons: components["schemas"]["IndexSourceReadinessReason"][];
+        };
         IndexReadinessStatus: {
             state: components["schemas"]["IndexReadinessState"];
             /** @description Whether the published generation can safely answer queries. */
@@ -9735,8 +10093,10 @@ export interface components {
              * @description Highest revision published to the query-visible index represented by this observation.
              */
             published_revision?: number;
-            /** @description Stable, machine-readable blockers. Empty when state is ready. */
-            pending_reasons: string[];
+            /** @description Stable, machine-readable blockers or failure reasons. Empty when state is ready. */
+            pending_reasons: components["schemas"]["IndexReadinessReason"][];
+            /** @description Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order. */
+            sources?: components["schemas"]["IndexSourceReadinessStatus"][];
         };
         /** @description Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics. */
         IndexRepairStatus: {
@@ -9747,6 +10107,12 @@ export interface components {
             state: "rebuilding" | "waiting" | "paused" | "failed";
             /** @description Whether an operator must resume, retry, reconfigure, or drop the affected index. */
             action_required: boolean;
+            /** @description Whether this repair currently prevents the proven serving incarnation from answering queries. */
+            blocks_queryable: boolean;
+            /** @description Whether this repair prevents the desired incarnation from satisfying the complete milestone. */
+            blocks_complete: boolean;
+            /** @description Diagnostic reason automation stopped. Present only when action_required is true. */
+            reason?: string;
         };
         FullTextIndexStats: {
             /**
@@ -11967,166 +12333,6 @@ export interface components {
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
         };
-        /** @description Credential-free normalized enrichment configuration returned after index creation. */
-        CreatedEnrichmentConfig: {
-            name: string;
-            kind: components["schemas"]["EnrichmentKind"];
-            field?: string;
-            template?: string;
-            source_artifact_name?: string;
-            expected_dims?: number;
-            chunk_size?: number;
-            chunk_overlap?: number;
-            chunker_json?: string;
-            /** @default false */
-            full_text_index?: boolean;
-            content_type?: string;
-            execution?: components["schemas"]["ExecutionPolicy"];
-        };
-        /** @description Fields returned for every newly created index. Provider credentials are write-only and are never returned. */
-        CreatedIndexCommon: {
-            /** @description Name of the created index */
-            name: string;
-            /** @description Optional description of the index and its purpose */
-            description?: string;
-            /**
-             * @description Version of the index implementation. Defaults to 0.
-             * @default 0
-             */
-            version?: number;
-            /** @description Normalized inline managed enrichment definitions required by this index. */
-            enrichments?: components["schemas"]["CreatedEnrichmentConfig"][];
-        };
-        /** @description Normalized effective full-text index configuration returned after creation. */
-        CreatedFullTextIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["FullTextIndexConfig"] & {
-            /** @enum {string} */
-            type: "full_text";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "full_text";
-        };
-        /** @description Credential-free provider configuration returned after index creation. Only non-secret provider settings are represented. */
-        CreatedProviderConfig: {
-            /** @description Configured provider discriminator. */
-            provider: string;
-            /** @description Configured provider model when applicable. */
-            model?: string;
-            models?: string[];
-            project_id?: string;
-            location?: string;
-            region?: string;
-            /** Format: uri */
-            url?: string;
-            /** Format: uri */
-            api_url?: string;
-            dimension?: number;
-            dimensions?: number;
-            input_type?: string;
-            truncate?: string;
-            strip_new_lines?: boolean;
-            batch_size?: number;
-            /** Format: float */
-            temperature?: number;
-            max_tokens?: number;
-            /** Format: float */
-            top_p?: number;
-            top_k?: number;
-            /** Format: float */
-            frequency_penalty?: number;
-            /** Format: float */
-            presence_penalty?: number;
-            timeout?: number;
-        };
-        /** @description Credential-free normalized embeddings configuration returned after creation. */
-        CreatedEmbeddingsIndexConfig: {
-            publication_policy?: components["schemas"]["IndexPublicationPolicy"];
-            coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
-            /** @default false */
-            external?: boolean;
-            /** @default false */
-            sparse?: boolean;
-            dimension?: number;
-            field?: string;
-            embedding_name?: string;
-            source_artifact_name?: string;
-            template?: string;
-            distance_metric?: components["schemas"]["DistanceMetric"];
-            mem_only?: boolean;
-            embedder?: components["schemas"]["CreatedProviderConfig"];
-            summarizer?: components["schemas"]["CreatedProviderConfig"];
-            chunker?: components["schemas"]["ChunkerConfig"];
-            /** @default 10 */
-            top_k?: number;
-            /**
-             * Format: float
-             * @default 0
-             */
-            min_weight?: number;
-            /** @default 1024 */
-            chunk_size?: number;
-            execution?: components["schemas"]["IndexExecutionConfig"];
-        };
-        /** @description Normalized effective dense or sparse embeddings index configuration returned after creation. */
-        CreatedEmbeddingsIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedEmbeddingsIndexConfig"] & {
-            /** @enum {string} */
-            type: "embeddings";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "embeddings";
-        };
-        /** @description Credential-free graph artifact producer configuration returned after creation. */
-        CreatedGraphArtifactProducerConfig: {
-            name: string;
-            /** @enum {string} */
-            kind: "asset";
-            source: components["schemas"]["GraphArtifactProducerSourceConfig"];
-            content_type?: string;
-            execution?: components["schemas"]["ExecutionPolicy"];
-        };
-        /** @description Credential-free normalized graph configuration returned after creation. */
-        CreatedGraphIndexConfig: {
-            summarizer?: components["schemas"]["CreatedProviderConfig"];
-            template?: string;
-            edge_types?: components["schemas"]["EdgeTypeConfig"][];
-            max_edges_per_document?: number;
-            source?: components["schemas"]["GraphArtifactSourceConfig"];
-            artifact?: components["schemas"]["CreatedGraphArtifactProducerConfig"];
-            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
-            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
-            context?: components["schemas"]["GraphArtifactContextConfig"];
-            algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
-            resolvers?: components["schemas"]["GraphResolverConfig"][];
-        };
-        /** @description Normalized effective graph index configuration returned after creation. */
-        CreatedGraphIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedGraphIndexConfig"] & {
-            /** @enum {string} */
-            type: "graph";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "graph";
-        };
-        /** @description Normalized effective schema-derived algebraic index configuration returned after creation. */
-        CreatedAlgebraicIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["AlgebraicIndexConfig"] & {
-            /** @enum {string} */
-            type: "algebraic";
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "algebraic";
-        };
-        /** @description Discriminated normalized configuration returned after an index is created. */
-        CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"];
         InferenceError: {
             /** @description Stable machine-readable error code */
             error: string;
@@ -13918,6 +14124,15 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Invalid index configuration or a deployment capability mismatch */
+        IndexMutationBadRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["UnsupportedIndexCapabilityError"] | components["schemas"]["Error"];
+            };
+        };
         /** @description Request body exceeds the configured size limit */
         PayloadTooLarge: {
             headers: {
@@ -13961,6 +14176,17 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Index validation is temporarily unavailable or a distributed rolling upgrade has not yet converged. */
+        IndexMutationServiceUnavailable: {
+            headers: {
+                /** @description Minimum number of seconds clients should wait when the failure is retryable. */
+                "Retry-After"?: number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["IndexMutationServiceUnavailableError"] | components["schemas"]["Error"];
             };
         };
         /** @description Backup could not establish the required metadata authority before starting side effects. */
@@ -14048,6 +14274,15 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["ExactSortError"];
+            };
+        };
+        /** @description The query is valid JSON but requests an unsupported execution or result contract */
+        UnsupportedQuery: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ExactSortError"] | components["schemas"]["QueryFilterError"] | components["schemas"]["UnsupportedHierarchyGroupingError"] | components["schemas"]["UnsupportedQueryError"];
             };
         };
         /** @description The hierarchy changed after the traversal cursor was issued */
@@ -15084,7 +15319,7 @@ export interface operations {
                 };
             };
             409: components["responses"]["HierarchyCursorStale"];
-            422: components["responses"]["UnsupportedExactSort"];
+            422: components["responses"]["UnsupportedQuery"];
             500: components["responses"]["QueryInternalServerError"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
         };
@@ -15307,7 +15542,7 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
-            400: components["responses"]["BadRequest"];
+            400: components["responses"]["IndexMutationBadRequest"];
             /** @description Durable destinations cannot be bound to this credential type */
             422: {
                 headers: {
@@ -15317,6 +15552,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            503: components["responses"]["IndexMutationServiceUnavailable"];
         };
     };
     dropTable: {
@@ -15371,7 +15607,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["HierarchyCursorStale"];
-            422: components["responses"]["UnsupportedExactSort"];
+            422: components["responses"]["UnsupportedQuery"];
             500: components["responses"]["QueryInternalServerError"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
         };
@@ -15550,7 +15786,7 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalServerError"];
-            503: components["responses"]["ServiceUnavailable"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
         };
     };
     reauthorizeTableDestinations: {
@@ -16372,7 +16608,7 @@ export interface operations {
                     "application/json": components["schemas"]["CreatedIndex"];
                 };
             };
-            400: components["responses"]["BadRequest"];
+            400: components["responses"]["IndexMutationBadRequest"];
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             409: components["responses"]["Conflict"];
@@ -16387,7 +16623,7 @@ export interface operations {
             };
             429: components["responses"]["StorageResourceExhausted"];
             500: components["responses"]["InternalServerError"];
-            503: components["responses"]["ServiceUnavailable"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
         };
     };
     dropIndex: {

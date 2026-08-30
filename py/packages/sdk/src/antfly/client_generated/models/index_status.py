@@ -7,13 +7,13 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 if TYPE_CHECKING:
-    from ..models.algebraic_index_config import AlgebraicIndexConfig
     from ..models.algebraic_index_stats import AlgebraicIndexStats
-    from ..models.embeddings_index_config import EmbeddingsIndexConfig
+    from ..models.created_algebraic_index import CreatedAlgebraicIndex
+    from ..models.created_embeddings_index import CreatedEmbeddingsIndex
+    from ..models.created_full_text_index import CreatedFullTextIndex
+    from ..models.created_graph_index import CreatedGraphIndex
     from ..models.embeddings_index_stats import EmbeddingsIndexStats
-    from ..models.full_text_index_config import FullTextIndexConfig
     from ..models.full_text_index_stats import FullTextIndexStats
-    from ..models.graph_index_config import GraphIndexConfig
     from ..models.graph_index_stats import GraphIndexStats
     from ..models.index_status_shard_status import IndexStatusShardStatus
 
@@ -26,33 +26,33 @@ class IndexStatus:
     """
     Attributes:
         shard_status (IndexStatusShardStatus):
-        config (AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig | GraphIndexConfig): Configuration
-            for an index
+        config (CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex):
+            Discriminated normalized configuration returned after an index is created.
         status (AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats): Statistics for an
             index
     """
 
     shard_status: IndexStatusShardStatus
-    config: AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig | GraphIndexConfig
+    config: CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex
     status: AlgebraicIndexStats | EmbeddingsIndexStats | FullTextIndexStats | GraphIndexStats
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.embeddings_index_config import EmbeddingsIndexConfig
+        from ..models.created_embeddings_index import CreatedEmbeddingsIndex
+        from ..models.created_full_text_index import CreatedFullTextIndex
+        from ..models.created_graph_index import CreatedGraphIndex
         from ..models.embeddings_index_stats import EmbeddingsIndexStats
-        from ..models.full_text_index_config import FullTextIndexConfig
         from ..models.full_text_index_stats import FullTextIndexStats
-        from ..models.graph_index_config import GraphIndexConfig
         from ..models.graph_index_stats import GraphIndexStats
 
         shard_status = self.shard_status.to_dict()
 
         config: dict[str, Any]
-        if isinstance(self.config, FullTextIndexConfig):
+        if isinstance(self.config, CreatedFullTextIndex):
             config = self.config.to_dict()
-        elif isinstance(self.config, EmbeddingsIndexConfig):
+        elif isinstance(self.config, CreatedEmbeddingsIndex):
             config = self.config.to_dict()
-        elif isinstance(self.config, GraphIndexConfig):
+        elif isinstance(self.config, CreatedGraphIndex):
             config = self.config.to_dict()
         else:
             config = self.config.to_dict()
@@ -81,13 +81,13 @@ class IndexStatus:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.algebraic_index_config import AlgebraicIndexConfig
         from ..models.algebraic_index_stats import AlgebraicIndexStats
-        from ..models.embeddings_index_config import EmbeddingsIndexConfig
+        from ..models.created_algebraic_index import CreatedAlgebraicIndex
+        from ..models.created_embeddings_index import CreatedEmbeddingsIndex
+        from ..models.created_full_text_index import CreatedFullTextIndex
+        from ..models.created_graph_index import CreatedGraphIndex
         from ..models.embeddings_index_stats import EmbeddingsIndexStats
-        from ..models.full_text_index_config import FullTextIndexConfig
         from ..models.full_text_index_stats import FullTextIndexStats
-        from ..models.graph_index_config import GraphIndexConfig
         from ..models.graph_index_stats import GraphIndexStats
         from ..models.index_status_shard_status import IndexStatusShardStatus
 
@@ -96,36 +96,36 @@ class IndexStatus:
 
         def _parse_config(
             data: object,
-        ) -> AlgebraicIndexConfig | EmbeddingsIndexConfig | FullTextIndexConfig | GraphIndexConfig:
+        ) -> CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_index_config_type_0 = FullTextIndexConfig.from_dict(data)
+                componentsschemas_created_index_type_0 = CreatedFullTextIndex.from_dict(data)
 
-                return componentsschemas_index_config_type_0
+                return componentsschemas_created_index_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_index_config_type_1 = EmbeddingsIndexConfig.from_dict(data)
+                componentsschemas_created_index_type_1 = CreatedEmbeddingsIndex.from_dict(data)
 
-                return componentsschemas_index_config_type_1
+                return componentsschemas_created_index_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_index_config_type_2 = GraphIndexConfig.from_dict(data)
+                componentsschemas_created_index_type_2 = CreatedGraphIndex.from_dict(data)
 
-                return componentsschemas_index_config_type_2
+                return componentsschemas_created_index_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_index_config_type_3 = AlgebraicIndexConfig.from_dict(data)
+            componentsschemas_created_index_type_3 = CreatedAlgebraicIndex.from_dict(data)
 
-            return componentsschemas_index_config_type_3
+            return componentsschemas_created_index_type_3
 
         config = _parse_config(d.pop("config"))
 

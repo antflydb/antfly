@@ -205,6 +205,14 @@ pub const AdminSnapshot = struct {
     merged_group_statuses: []metadata_reconciler.MergedGroupStatus = &.{},
 };
 
+/// Atomic projected catalog view used only for table-to-group routing. Keep
+/// identity and operational status out of this type so it cannot accidentally
+/// be used as a publication fence or an admin snapshot.
+pub const CatalogRoutingSnapshot = struct {
+    tables: []table_manager.TableRecord,
+    ranges: []table_manager.RangeRecord,
+};
+
 /// Compact catalog values consumed while staging one data-Raft generation.
 /// Metadata replicas compare this after a linearizable read so the network and
 /// allocation cost is independent of the cluster-wide catalog size.
@@ -469,6 +477,8 @@ fn catalogRangeTopologyDigest(range: table_manager.RangeRecord) [std.crypto.hash
     hashCatalogTopologyBytes(&hasher, range.restore_connection);
     hasher.update(std.mem.asBytes(&range.restore_artifact_size_bytes));
     hashCatalogTopologyBytes(&hasher, range.restore_artifact_sha256);
+    hasher.update(std.mem.asBytes(&range.restore_native_manifest_size_bytes));
+    hashCatalogTopologyBytes(&hasher, range.restore_native_manifest_sha256);
     hasher.update(&range.completed_restore_fingerprint);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);

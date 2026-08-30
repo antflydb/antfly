@@ -29,6 +29,7 @@ pub const RoutedStateMachine = struct {
                 .prepare_snapshot = prepareSnapshot,
                 .build_snapshot = buildSnapshot,
                 .apply_ready = applyReady,
+                .retire_group = retireGroup,
             },
         };
     }
@@ -73,5 +74,14 @@ pub const RoutedStateMachine = struct {
                 try observer.onReadStates(group_id, read_states);
             }
         }
+    }
+
+    fn retireGroup(ptr: *anyopaque, group_id: raft_engine.core.types.GroupId) void {
+        const self: *RoutedStateMachine = @ptrCast(@alignCast(ptr));
+        const target = if (self.metadata_group_id != null and group_id == self.metadata_group_id.?)
+            self.metadata_state_machine
+        else
+            self.data_state_machine;
+        target.retireGroup(group_id);
     }
 };

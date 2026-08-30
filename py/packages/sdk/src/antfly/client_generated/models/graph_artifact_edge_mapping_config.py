@@ -19,10 +19,10 @@ class GraphArtifactEdgeMappingConfig:
     """Maps each artifact item to an edge type, weight, and public metadata.
 
     Attributes:
-        type_ (float | str | Unset): A literal numeric value or a Handlebars template evaluated for each materialized
-            graph item.
-        weight (float | str | Unset): A literal numeric value or a Handlebars template evaluated for each materialized
-            graph item.
+        type_ (float | str | Unset): A literal string or finite numeric value, or a Handlebars template evaluated for
+            each materialized graph item.
+        weight (float | str | Unset): A literal string or finite numeric value, or a Handlebars template evaluated for
+            each materialized graph item.
         metadata (GraphArtifactEdgeMappingConfigMetadata | Unset): JSON metadata template copied onto each materialized
             edge. Sensitive keys are omitted from create responses.
     """
