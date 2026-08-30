@@ -162,6 +162,13 @@ Activity explains why counters are moving; it never proves readiness or
 failure, and losing volatile activity state on restart must not make an index
 less queryable.
 
+`index wait` mirrors those names. It prints `source_coverage`,
+`searchable_vectors`, and optional activity/chunk counters; it does not emit a
+generic `progress` percentage that could read as complete while publication is
+still pending. Blockers are labeled for the milestone they gate
+(`queryable_blockers` or `complete_blockers`). Reaching `--until queryable`
+while later work remains therefore reports `complete_blockers` explicitly.
+
 The work owner, rather than coverage debt, controls the activity phase:
 claim/preparation sets `preparing`, a provider batch sets `embedding`, durable
 artifact publication sets `publishing`, a supervised retry sets

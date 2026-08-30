@@ -157,6 +157,8 @@ pub fn validateManifest(manifest: Manifest) !void {
     var previous_digest: ?[]const u8 = null;
     for (manifest.blobs) |blob| {
         try validateSha256(blob.sha256);
+        if (blob.compression != manifest.compression)
+            return error.InvalidBackupManifest;
         if (blob.compression == .none and blob.logical_size_bytes != blob.stored_size_bytes)
             return error.InvalidBackupManifest;
         if (manifest.mode == .full and !blob.included)
@@ -215,6 +217,9 @@ pub fn blobIndex(blobs: []const BlobDescriptor, digest: []const u8) ?usize {
 pub fn validateReadablePayloadFeatures(manifest: Manifest) !void {
     if (manifest.encryption != null) return error.UnsupportedBackupEncryption;
     if (manifest.compression != .none) return error.UnsupportedBackupCompression;
+    for (manifest.blobs) |blob| {
+        if (blob.compression != .none) return error.UnsupportedBackupCompression;
+    }
 }
 
 pub fn validateSha256(value: []const u8) !void {

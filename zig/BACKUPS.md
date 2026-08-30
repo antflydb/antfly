@@ -63,7 +63,8 @@ content-addressed blobs:
 ```text
 refs/<backup-id>          -> root manifest SHA-256
 manifests/<sha256>        -> immutable canonical snapshot manifest
-blobs/sha256/<sha256>     -> immutable artifact bytes
+seals/<manifest-sha256>    -> immutable receipt-complete proof
+blobs/sha256/<storage-sha256> -> immutable artifact bytes
 ```
 
 Every manifest declares table/catalog identity, an explicit `portable` or
@@ -73,7 +74,8 @@ inventories:
 
 - `objects`, sorted by logical path, map each restorable path and semantic role
   to a blob digest. Shards list object paths, not bare digests.
-- `blobs`, sorted by digest, describe each unique stored byte sequence once.
+- `blobs`, sorted by content digest, carry separate content and stored-byte
+  digests and describe each unique stored representation once.
   Several objects may reference one blob without losing either path.
 
 That split is required for native restore: a digest-only inventory can prove
@@ -92,36 +94,44 @@ then permits the owner to publish the generation.
 
 Refs are published with compare-and-swap semantics through a fenced publication
 session. The session first installs the immutable candidate manifest and a
-durable lease naming that exact digest. Each newly required blob upload returns
+durable, renewable lease naming that exact digest and any exact incremental
+base. Each newly required blob upload returns
 a backend-issued receipt bound to the session fence and to the verified object
-generation. Finalization accepts the complete receipt set, consumes the lease,
-and conditionally publishes the ref while holding the repository coordinator.
+generation. Finalization accepts the complete receipt set, writes an immutable
+completion seal, consumes the manifest-bound lease, and conditionally publishes
+the ref while holding the repository coordinator.
 It does not issue one remote existence request per blob.
 
-Garbage collection marks manifests and blobs reachable from refs and active
+Garbage collection marks manifests, seals, and blobs reachable from refs and active
 leases at one repository epoch, then applies a grace period before deletion.
 Every lease/ref transition advances that epoch and every deletion rechecks it
 under the same coordinator. A publication that races an old mark therefore
 forces that sweep to restart instead of deleting its candidate artifacts.
 Failed writers cannot expose partial snapshots, stale writers are fenced, and
-concurrent writers cannot silently replace one another.
+concurrent writers cannot silently replace one another. Parent links are
+informational lineage, not retention edges: complete child inventories directly
+retain every stored blob they need, avoiding unbounded ancestor retention.
+Remote coordinator owners refresh through an ETag compare-and-swap immediately
+before control mutations, and epoch updates are themselves conditional writes,
+so a process resumed after lease takeover cannot mutate repository state.
 
 Publication order is part of the durability contract:
 
-1. validate a full capture or a typed exact base whose digest is recomputed
-   from its canonical manifest;
+1. validate a full capture or a typed committed base whose digest is recomputed
+   from its canonical manifest and whose immutable completion seal matches;
 2. write the candidate manifest immutably and activate its fenced lease;
-3. stream only newly required `blobs/sha256/<digest>` objects with
+3. stream only newly required `blobs/sha256/<storage-sha256>` objects with
    create-if-absent semantics, keeping the source file generation pinned and
    post-verifying the stored object generation;
-4. validate the backend receipts, consume the lease, and conditionally update
-   `refs/<backup-id>` with the expected prior digest and generation.
+4. validate the backend receipts, write the completion seal, consume the lease,
+   and conditionally update `refs/<backup-id>` with the expected prior digest
+   and generation.
 
 A crash before step 4 leaves unreachable immutable content but no visible
 partial backup. Competing writers cannot silently replace one another. GC marks
-from live refs and unexpired restore/export leases, follows parent links for
-retention, and deletes only unmarked objects older than a grace cutoff from the
-same stable repository epoch.
+from live refs and unexpired restore/export leases, retains an active delta's
+exact base proof while publication is in flight, and deletes only unmarked
+objects older than a grace cutoff from the same stable repository epoch.
 
 `.afb` is the transport layer over that model:
 

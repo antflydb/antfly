@@ -268,9 +268,9 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         )
         assert "Index title_body (embeddings) reached queryable:" in text_wait.stdout
         assert "source_coverage=" in text_wait.stdout
-        assert "indexed_entries=" in text_wait.stdout
-        assert "visible_entries=" in text_wait.stdout
+        assert "searchable_vectors=" in text_wait.stdout
         assert "pending_reasons=" in text_wait.stdout
+        assert "complete_blockers=" in text_wait.stdout
 
         text_query = cli(
             "query",

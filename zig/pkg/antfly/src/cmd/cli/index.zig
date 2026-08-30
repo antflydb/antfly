@@ -749,8 +749,8 @@ fn blockersForTarget(summary: IndexSummary, target: WaitTarget) []const []const 
     };
 }
 
-fn writeBlockers(writer: anytype, blockers: []const []const u8) !void {
-    try writer.writeAll(" blockers=[");
+fn writeBlockers(writer: anytype, milestone: WaitTarget, blockers: []const []const u8) !void {
+    try writer.print(" {s}_blockers=[", .{@tagName(milestone)});
     for (blockers, 0..) |blocker, index| {
         if (index > 0) try writer.writeAll(",");
         try writer.writeAll(blocker);
@@ -781,7 +781,7 @@ fn writeIndexFailureDiagnostic(
     if (summary.repair_blocks_complete) |blocks| try writer.print(" blocks_complete={any}", .{blocks});
     if (summary.repair_reason) |reason| try writer.print(" repair_reason={s}", .{reason});
     try writePendingReasons(writer, summary.pending_reasons);
-    try writeBlockers(writer, blockersForTarget(summary, target));
+    try writeBlockers(writer, target, blockersForTarget(summary, target));
     try writer.writeAll("; run index list --output json for full diagnostics");
 }
 
@@ -811,9 +811,6 @@ fn printWaitProgress(index_name: []const u8, target: WaitTarget, summary: IndexS
         @tagName(target),
         summary.state,
     }) catch return;
-    if (summary.progress) |progress| {
-        writer.print(" {d:.1}%", .{@max(0.0, @min(1.0, progress)) * 100.0}) catch return;
-    }
     writeSourceCoverage(&writer, summary) catch return;
     if (std.mem.eql(u8, summary.index_type, "embeddings")) {
         if (summary.visible) |visible| writer.print(" searchable_vectors={d}", .{visible}) catch return;
@@ -830,7 +827,7 @@ fn printWaitProgress(index_name: []const u8, target: WaitTarget, summary: IndexS
         if (summary.visible) |visible| writer.print(" searchable={d}", .{visible}) catch return;
     }
     writePendingReasons(&writer, summary.pending_reasons) catch return;
-    writeBlockers(&writer, blockersForTarget(summary, target)) catch return;
+    writeBlockers(&writer, target, blockersForTarget(summary, target)) catch return;
     writer.writeByte('\n') catch return;
     std.debug.print("{s}", .{writer.buffered()});
 }
@@ -886,17 +883,12 @@ fn writeWaitSuccess(
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const writer = &out.writer;
-    try writer.print("Index {s} ({s}) reached {s}: state={s} progress=", .{
+    try writer.print("Index {s} ({s}) reached {s}: state={s}", .{
         index_readiness.createdIndexName(index.config),
         summary.index_type,
         @tagName(target),
         summary.state,
     });
-    if (summary.progress) |progress| {
-        try writer.print("{d:.1}%", .{@max(0.0, @min(1.0, progress)) * 100.0});
-    } else {
-        try writer.writeAll("-");
-    }
     try writeSourceCoverage(writer, summary);
     if (std.mem.eql(u8, summary.index_type, "embeddings")) {
         if (summary.visible) |visible| try writer.print(" searchable_vectors={d}", .{visible});
@@ -912,7 +904,13 @@ fn writeWaitSuccess(
         if (summary.visible) |visible| try writer.print(" searchable={d}", .{visible});
     }
     try writePendingReasons(writer, summary.pending_reasons);
-    try writeBlockers(writer, blockersForTarget(summary, target));
+    // Once queryability is reached, the only useful remaining blockers are
+    // those for full completion. Keep that label stable even when completion
+    // happened before the successful sample.
+    if (target == .queryable)
+        try writeBlockers(writer, .complete, summary.complete_blockers)
+    else
+        try writeBlockers(writer, target, blockersForTarget(summary, target));
     if (summary.repair_action_required orelse false) {
         try writer.writeAll(" warning=repair_action_required");
         if (summary.repair_state) |state| try writer.print(" repair_state={s}", .{state});
@@ -1519,7 +1517,7 @@ test "index wait prefers authoritative readiness contract" {
     var failure_writer = std.Io.Writer.fixed(&failure_buffer);
     try writeIndexFailureDiagnostic(&failure_writer, "dense", .queryable, summary);
     try std.testing.expectEqualStrings(
-        "embeddings index dense failed while waiting until queryable: state=failed source_coverage=- incarnation=g-000000000000002a error=load failed repair_state=failed action_required=true blocks_queryable=true blocks_complete=true repair_reason=activation_manifest_missing pending_reasons=[repair] blockers=[]; run index list --output json for full diagnostics",
+        "embeddings index dense failed while waiting until queryable: state=failed source_coverage=- incarnation=g-000000000000002a error=load failed repair_state=failed action_required=true blocks_queryable=true blocks_complete=true repair_reason=activation_manifest_missing pending_reasons=[repair] queryable_blockers=[]; run index list --output json for full diagnostics",
         failure_writer.buffered(),
     );
 

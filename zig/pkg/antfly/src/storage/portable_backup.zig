@@ -2630,7 +2630,7 @@ test "import preflights full portable envelope before mutating destination" {
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
 
-    try std.testing.expectError(error.EndOfStream, importPortable(alloc, &dst, truncated));
+    try std.testing.expectError(error.InvalidBundleFooter, importPortable(alloc, &dst, truncated));
     try std.testing.expectError(error.NotFound, dst.get(alloc, store_key));
 }
 

@@ -523,7 +523,40 @@ const RemoteRepositoryCoordinator = struct {
     alloc: std.mem.Allocator,
     store: *RemoteBackupStore,
     owner: [32]u8,
+    etag: []u8,
     released: bool = false,
+
+    fn deinit(self: *@This()) void {
+        self.alloc.free(self.etag);
+        self.* = undefined;
+    }
+
+    /// Refreshing with an ETag CAS is the fencing check. An owner paused past
+    /// expiry cannot resume a control-plane mutation after a successor has
+    /// replaced the coordinator object.
+    fn refresh(self: *@This()) !void {
+        const now_unix_ns: u64 = @intCast(platform_time.realtimeNs());
+        const encoded = try encodeClusterBackupReservationLease(
+            self.alloc,
+            &self.owner,
+            now_unix_ns +| repository_coordinator_duration_ns,
+        );
+        defer self.alloc.free(encoded);
+        const key = try self.store.keyAlloc(self.alloc, repository_coordinator_path);
+        defer self.alloc.free(key);
+        var result = self.store.client.putObject(self.store.bucket, key, encoded, .{
+            .content_type = "text/plain",
+            .if_match_etag = self.etag,
+        }) catch |err| switch (err) {
+            error.FileNotFound, error.PreconditionFailed => return error.BackupPublicationFenced,
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+        const next_etag = result.etag orelse return error.BackupReservationIdentityUnavailable;
+        const owned = try self.alloc.dupe(u8, next_etag);
+        self.alloc.free(self.etag);
+        self.etag = owned;
+    }
 
     fn release(self: *@This()) !void {
         if (self.released) return;
@@ -580,8 +613,12 @@ fn acquireRemoteRepositoryCoordinator(
         },
         else => return err,
     };
-    result.deinit(alloc);
-    return .{ .alloc = alloc, .store = store, .owner = owner };
+    defer result.deinit(alloc);
+    const etag = try alloc.dupe(
+        u8,
+        result.etag orelse return error.BackupReservationIdentityUnavailable,
+    );
+    return .{ .alloc = alloc, .store = store, .owner = owner, .etag = etag };
 }
 
 pub const RepositoryLocationBackend = struct {
@@ -597,6 +634,7 @@ pub const RepositoryLocationBackend = struct {
             .contains = contains,
             .read_epoch = readRepositoryEpoch,
             .activate_lease = activateRepositoryLease,
+            .renew_lease = renewRepositoryLease,
             .finalize_publication = finalizeRepositoryPublication,
             .release_lease = releaseRepositoryLease,
             .delete_if_older_than = deleteIfOlderThan,
@@ -817,15 +855,38 @@ pub const RepositoryLocationBackend = struct {
     fn writeRemoteRepositoryEpochUnderLock(
         self: *@This(),
         store: *RemoteBackupStore,
+        coordinator: *RemoteRepositoryCoordinator,
         epoch: u64,
     ) !void {
+        try coordinator.refresh();
         var encoded: [32]u8 = undefined;
-        try store.writeBytes(
-            self.alloc,
-            repository_epoch_path,
-            encodeRepositoryEpoch(&encoded, epoch),
-            "text/plain",
-        );
+        const key = try store.keyAlloc(self.alloc, repository_epoch_path);
+        defer self.alloc.free(key);
+        var current = store.client.getObject(store.bucket, key, .{
+            .range = .{ .offset = 0, .length = repository_epoch_max_bytes },
+            .skip_metadata_probe = true,
+            .max_response_bytes = repository_epoch_max_bytes,
+        }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        defer if (current) |*value| value.deinit(self.alloc);
+        if (current) |*value| {
+            const observed = try parseRepositoryEpoch(value.body);
+            if (epoch != observed +| 1) return error.BackupRepositoryEpochChanged;
+        } else if (epoch != 1) return error.BackupRepositoryEpochChanged;
+        var result = store.client.putObject(store.bucket, key, encodeRepositoryEpoch(&encoded, epoch), .{
+            .content_type = "text/plain",
+            .if_none_match = current == null,
+            .if_match_etag = if (current) |value|
+                value.metadata.etag orelse return error.BackupReservationIdentityUnavailable
+            else
+                null,
+        }) catch |err| switch (err) {
+            error.FileNotFound, error.PreconditionFailed => return error.BackupRepositoryEpochChanged,
+            else => return err,
+        };
+        result.deinit(self.alloc);
     }
 
     fn readLocalRepositoryEpochAssumeRoot(self: *@This(), root: std.Io.Dir) !u64 {
@@ -926,7 +987,9 @@ pub const RepositoryLocationBackend = struct {
             },
             .remote => |*store| blk: {
                 var coordinator = try acquireRemoteRepositoryCoordinator(self.alloc, store);
+                defer coordinator.deinit();
                 defer coordinator.release() catch {};
+                try coordinator.refresh();
                 const existing = store.readBytesAllocLimited(self.alloc, path, 64 * 1024) catch |err| switch (err) {
                     error.FileNotFound => null,
                     else => return err,
@@ -938,10 +1001,11 @@ pub const RepositoryLocationBackend = struct {
                     if (parsed.value.fencing_token != fencing_token or
                         !std.mem.eql(u8, value, encoded)) return error.BackupRepositoryBusy;
                 } else {
+                    try coordinator.refresh();
                     try store.writeBytesIfAbsent(self.alloc, path, encoded, "application/json");
                 }
                 const next = (try readRemoteRepositoryEpochAssumeStore(self, store)) +| 1;
-                try self.writeRemoteRepositoryEpochUnderLock(store, next);
+                try self.writeRemoteRepositoryEpochUnderLock(store, &coordinator, next);
                 break :blk next;
             },
         };
@@ -951,6 +1015,7 @@ pub const RepositoryLocationBackend = struct {
         context: *anyopaque,
         lease_path: []const u8,
         fencing_token: u64,
+        manifest_sha256: []const u8,
         now_unix_ns: i128,
         ref_path: []const u8,
         encoded_ref: []const u8,
@@ -958,6 +1023,10 @@ pub const RepositoryLocationBackend = struct {
         expected_generation: ?u64,
     ) !u64 {
         const self = fromContext(context);
+        var next_ref = try backup_repository.parseRefCanonical(self.alloc, encoded_ref);
+        defer next_ref.deinit();
+        if (!std.mem.eql(u8, next_ref.value.manifest_sha256, manifest_sha256))
+            return error.BackupPublicationFenced;
         return switch (self.location.*) {
             .file => |backup_root| blk: {
                 var root = try openOrCreateBackupRootNoFollow(self.io, backup_root);
@@ -977,7 +1046,9 @@ pub const RepositoryLocationBackend = struct {
                 defer self.alloc.free(lease_bytes);
                 var lease = try backup_repository.parseLeaseCanonical(self.alloc, lease_bytes, now_unix_ns);
                 defer lease.deinit();
-                if (lease.value.fencing_token != fencing_token) return error.BackupPublicationFenced;
+                if (lease.value.fencing_token != fencing_token or
+                    !std.mem.eql(u8, lease.value.manifest_sha256, manifest_sha256))
+                    return error.BackupPublicationFenced;
                 const next = (try readLocalRepositoryEpochAssumeRoot(self, root)) +| 1;
                 try self.writeLocalRepositoryEpochUnderLock(root, next);
                 try publishRef(context, ref_path, encoded_ref, expected_manifest_sha256, expected_generation);
@@ -988,16 +1059,109 @@ pub const RepositoryLocationBackend = struct {
             },
             .remote => |*store| blk: {
                 var coordinator = try acquireRemoteRepositoryCoordinator(self.alloc, store);
+                defer coordinator.deinit();
                 defer coordinator.release() catch {};
+                try coordinator.refresh();
                 const lease_bytes = try store.readBytesAllocLimited(self.alloc, lease_path, 64 * 1024);
                 defer self.alloc.free(lease_bytes);
                 var lease = try backup_repository.parseLeaseCanonical(self.alloc, lease_bytes, now_unix_ns);
                 defer lease.deinit();
-                if (lease.value.fencing_token != fencing_token) return error.BackupPublicationFenced;
+                if (lease.value.fencing_token != fencing_token or
+                    !std.mem.eql(u8, lease.value.manifest_sha256, manifest_sha256))
+                    return error.BackupPublicationFenced;
                 const next = (try readRemoteRepositoryEpochAssumeStore(self, store)) +| 1;
-                try self.writeRemoteRepositoryEpochUnderLock(store, next);
+                try self.writeRemoteRepositoryEpochUnderLock(store, &coordinator, next);
+                try coordinator.refresh();
                 try publishRef(context, ref_path, encoded_ref, expected_manifest_sha256, expected_generation);
                 deleteRemoteRepositoryLease(self, store, lease_path, fencing_token) catch {};
+                break :blk next;
+            },
+        };
+    }
+
+    fn renewRepositoryLease(
+        context: *anyopaque,
+        lease_path: []const u8,
+        fencing_token: u64,
+        manifest_sha256: []const u8,
+        now_unix_ns: i128,
+        expires_at_unix_ns: i128,
+    ) !u64 {
+        const self = fromContext(context);
+        if (expires_at_unix_ns <= now_unix_ns) return error.InvalidBackupLease;
+        return switch (self.location.*) {
+            .file => |backup_root| blk: {
+                var root = try openOrCreateBackupRootNoFollow(self.io, backup_root);
+                defer root.close(self.io);
+                try ensureBackupRelativeParentNoFollow(self.io, root, repository_coordinator_path);
+                var lock = try openOrCreateBackupLockFile(self.io, root, repository_coordinator_path);
+                defer lock.close(self.io);
+                try lock.lock(self.io, .exclusive);
+                defer lock.unlock(self.io);
+                const encoded = try readFileFromBackupRootAlloc(self.alloc, self.io, root, lease_path, 64 * 1024);
+                defer self.alloc.free(encoded);
+                var parsed = try backup_repository.parseLeaseCanonical(self.alloc, encoded, now_unix_ns);
+                defer parsed.deinit();
+                if (parsed.value.fencing_token != fencing_token or
+                    !std.mem.eql(u8, parsed.value.manifest_sha256, manifest_sha256))
+                    return error.BackupPublicationFenced;
+                if (expires_at_unix_ns <= parsed.value.expires_at_unix_ns)
+                    return error.InvalidBackupLease;
+                const renewed: backup_repository.Lease = .{
+                    .lease_id = parsed.value.lease_id,
+                    .manifest_sha256 = parsed.value.manifest_sha256,
+                    .base_manifest_sha256 = parsed.value.base_manifest_sha256,
+                    .fencing_token = fencing_token,
+                    .expires_at_unix_ns = expires_at_unix_ns,
+                };
+                const renewed_encoded = try backup_repository.encodeLeaseCanonicalAlloc(self.alloc, renewed, now_unix_ns);
+                defer self.alloc.free(renewed_encoded);
+                try replaceFileInBackupRootUnderHeldLock(self.alloc, self.io, root, lease_path, renewed_encoded);
+                const next = (try readLocalRepositoryEpochAssumeRoot(self, root)) +| 1;
+                try self.writeLocalRepositoryEpochUnderLock(root, next);
+                break :blk next;
+            },
+            .remote => |*store| blk: {
+                var coordinator = try acquireRemoteRepositoryCoordinator(self.alloc, store);
+                defer coordinator.deinit();
+                defer coordinator.release() catch {};
+                try coordinator.refresh();
+                const key = try store.keyAlloc(self.alloc, lease_path);
+                defer self.alloc.free(key);
+                var current = try store.client.getObject(store.bucket, key, .{
+                    .range = .{ .offset = 0, .length = 64 * 1024 },
+                    .skip_metadata_probe = true,
+                    .max_response_bytes = 64 * 1024,
+                });
+                defer current.deinit(self.alloc);
+                var parsed = try backup_repository.parseLeaseCanonical(self.alloc, current.body, now_unix_ns);
+                defer parsed.deinit();
+                if (parsed.value.fencing_token != fencing_token or
+                    !std.mem.eql(u8, parsed.value.manifest_sha256, manifest_sha256))
+                    return error.BackupPublicationFenced;
+                if (expires_at_unix_ns <= parsed.value.expires_at_unix_ns)
+                    return error.InvalidBackupLease;
+                const renewed: backup_repository.Lease = .{
+                    .lease_id = parsed.value.lease_id,
+                    .manifest_sha256 = parsed.value.manifest_sha256,
+                    .base_manifest_sha256 = parsed.value.base_manifest_sha256,
+                    .fencing_token = fencing_token,
+                    .expires_at_unix_ns = expires_at_unix_ns,
+                };
+                const renewed_encoded = try backup_repository.encodeLeaseCanonicalAlloc(self.alloc, renewed, now_unix_ns);
+                defer self.alloc.free(renewed_encoded);
+                const etag = current.metadata.etag orelse return error.BackupReservationIdentityUnavailable;
+                try coordinator.refresh();
+                var result = store.client.putObject(store.bucket, key, renewed_encoded, .{
+                    .content_type = "application/json",
+                    .if_match_etag = etag,
+                }) catch |err| switch (err) {
+                    error.FileNotFound, error.PreconditionFailed => return error.BackupPublicationFenced,
+                    else => return err,
+                };
+                result.deinit(self.alloc);
+                const next = (try readRemoteRepositoryEpochAssumeStore(self, store)) +| 1;
+                try self.writeRemoteRepositoryEpochUnderLock(store, &coordinator, next);
                 break :blk next;
             },
         };
@@ -1030,10 +1194,12 @@ pub const RepositoryLocationBackend = struct {
             },
             .remote => |*store| blk: {
                 var coordinator = try acquireRemoteRepositoryCoordinator(self.alloc, store);
+                defer coordinator.deinit();
                 defer coordinator.release() catch {};
+                try coordinator.refresh();
                 try deleteRemoteRepositoryLease(self, store, lease_path, fencing_token);
                 const next = (try readRemoteRepositoryEpochAssumeStore(self, store)) +| 1;
-                try self.writeRemoteRepositoryEpochUnderLock(store, next);
+                try self.writeRemoteRepositoryEpochUnderLock(store, &coordinator, next);
                 break :blk next;
             },
         };
@@ -1083,7 +1249,9 @@ pub const RepositoryLocationBackend = struct {
             },
             .remote => |*store| blk: {
                 var coordinator = try acquireRemoteRepositoryCoordinator(self.alloc, store);
+                defer coordinator.deinit();
                 defer coordinator.release() catch {};
+                try coordinator.refresh();
                 if (try readRemoteRepositoryEpochAssumeStore(self, store) != expected_epoch)
                     return error.BackupRepositoryEpochChanged;
                 const key = try store.keyAlloc(self.alloc, path);
@@ -1096,6 +1264,7 @@ pub const RepositoryLocationBackend = struct {
                 const modified_ms = metadata.last_modified_unix_ms orelse break :blk false;
                 if (@as(i128, modified_ms) * std.time.ns_per_ms >= cutoff_unix_ns) break :blk false;
                 const etag = metadata.etag orelse break :blk false;
+                try coordinator.refresh();
                 store.client.deleteObject(store.bucket, key, .{ .if_match_etag = etag }) catch |err| switch (err) {
                     error.FileNotFound, error.PreconditionFailed => break :blk false,
                     else => return err,
@@ -1213,7 +1382,8 @@ pub const RepositoryLocationBackend = struct {
         if (!localArtifactStatsEqual(initial_source_stat, try current_source.stat(io)))
             return error.SourceFileChanged;
         return .{
-            .sha256 = sha256,
+            .content_sha256 = sha256,
+            .storage_sha256 = sha256,
             .logical_size_bytes = logical_size_bytes,
             .publication_fence = publication_fence,
             .storage_identity = storage_identity,
@@ -1350,11 +1520,12 @@ test "canonical repository file adapter streams blobs and compare-and-swaps refs
         .objects = &.{.{
             .logical_path = "source.bin",
             .role = "catalog",
-            .blob_sha256 = integrity.sha256,
+            .content_sha256 = integrity.sha256,
             .logical_size_bytes = integrity.size_bytes,
         }},
         .blobs = &.{.{
-            .sha256 = integrity.sha256,
+            .content_sha256 = integrity.sha256,
+            .storage_sha256 = integrity.sha256,
             .logical_size_bytes = integrity.size_bytes,
             .stored_size_bytes = integrity.size_bytes,
         }},
@@ -1388,6 +1559,47 @@ test "canonical repository file adapter streams blobs and compare-and-swaps refs
     var snapshot = try backup_repository.resolveSnapshot(alloc, backend, "session");
     defer snapshot.deinit();
     try std.testing.expectEqualStrings(session.manifest_sha256, snapshot.ref.value.manifest_sha256);
+}
+
+test "remote repository coordinator fences a resumed stale owner" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var location: BackupLocation = .{
+        .remote = try RemoteBackupStore.initWithClient(alloc, memory.client(), "bucket", "backups"),
+    };
+    defer location.deinit(alloc);
+    const store = &location.remote;
+
+    var stale = try acquireRemoteRepositoryCoordinator(alloc, store);
+    defer stale.deinit();
+    var adapter: RepositoryLocationBackend = .{
+        .alloc = alloc,
+        .io = store.io,
+        .location = &location,
+    };
+    try adapter.writeRemoteRepositoryEpochUnderLock(store, &stale, 1);
+    try std.testing.expectError(
+        error.BackupRepositoryEpochChanged,
+        adapter.writeRemoteRepositoryEpochUnderLock(store, &stale, 1),
+    );
+    const successor_owner = "successor-owner";
+    const encoded = try encodeClusterBackupReservationLease(
+        alloc,
+        successor_owner,
+        @as(u64, @intCast(platform_time.realtimeNs())) +| repository_coordinator_duration_ns,
+    );
+    defer alloc.free(encoded);
+    const key = try store.keyAlloc(alloc, repository_coordinator_path);
+    defer alloc.free(key);
+    var replacement = try store.client.putObject(store.bucket, key, encoded, .{
+        .content_type = "text/plain",
+        .if_match_etag = stale.etag,
+    });
+    replacement.deinit(alloc);
+
+    try std.testing.expectError(error.BackupPublicationFenced, stale.refresh());
+    try std.testing.expectError(error.BackupPublicationFenced, stale.release());
 }
 
 test "repository remote verification accepts only full-object SHA-256 proofs" {

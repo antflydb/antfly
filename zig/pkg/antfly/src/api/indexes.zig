@@ -2316,13 +2316,21 @@ fn aggregateIndexStatusIndexed(
         aggregate.runtime_present = true;
         const matches_desired_incarnation = coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
         const shard_repair_lifecycle = publicIndexRepairLifecycle(item);
-        const shard_load_failure_blocks = matches_desired_incarnation and item.load_error != null and
+        // A runnable repair owns the quarantined candidate and its load error.
+        // That error is recovery input, not a second terminal serving failure:
+        // the repair lifecycle already carries the correct query/complete
+        // fences. Preserve fail-closed aggregation for an ordinary failed
+        // sibling and for a repair that has stopped and needs operator action.
+        const shard_load_error_is_terminal = item.load_error != null and
+            (publicIndexRepairState(item) == null or shard_repair_lifecycle.action_required);
+        const shard_load_failure_blocks = matches_desired_incarnation and shard_load_error_is_terminal and
             !shard_repair_lifecycle.active_generation_serviceable;
         const shard_enrichment_failure_blocks = matches_desired_incarnation and item.enrichment_failed and
             !shard_repair_lifecycle.active_generation_serviceable;
-        if (shard_load_failure_blocks or shard_enrichment_failure_blocks or
-            (matches_desired_incarnation and shard_repair_lifecycle.blocks_queryable))
-        {
+        // This counter is the cross-shard terminal-failure reduction. Repair
+        // admission is reduced independently below, retaining its recoverable
+        // lifecycle instead of relabelling a blocked rebuild as a failure.
+        if (shard_load_failure_blocks or shard_enrichment_failure_blocks) {
             aggregate.query_blocking_group_count +|= 1;
         }
         // Integrity failures are current index-scoped facts even when the
@@ -3211,6 +3219,62 @@ test "index status exposes compact repair state without internal diagnostics" {
     var waiting = item;
     waiting.index_repair_wait_reason = "backoff";
     try std.testing.expectEqualStrings("waiting", publicIndexRepairState(waiting).?);
+}
+
+test "runnable repair owns its load error without becoming a terminal aggregate failure" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .load_error = "TransientCandidateOpenFailure",
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .index_repair_status = .rebuilding,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .index_count = 1, .indexes = indexes[0..] },
+    }};
+    const aggregate = aggregateIndexStatusIndexed(
+        &runtimes,
+        "thumbnail",
+        &.{7},
+        42,
+        99,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), aggregate.query_blocking_group_count);
+    try std.testing.expectEqualStrings("rebuilding", aggregate.repair_state.?);
+    try std.testing.expect(!aggregate.repair_action_required);
+    try std.testing.expect(!aggregate.load_error_blocks_queryable);
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        aggregate,
+        aggregate.table_doc_count,
+        .external,
+        false,
+        42,
+        99,
+        aggregate.async_indexing,
+        aggregate.enrichment,
+        aggregate.resolution,
+        aggregate.promotion,
+        aggregate.resolver_replay,
+        null,
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"milestones\":{\"queryable\":{\"reached\":false,\"blockers\":[\"repair\",\"publication\"]},\"complete\":{\"reached\":false,\"blockers\":[\"repair\",\"publication\"]}},\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"pending_reasons\":[\"repair\",\"backfill\"]}}",
+        encoded.items,
+    );
 }
 
 test "index status aggregation preserves actionable repair diagnostics for the requested incarnation" {
