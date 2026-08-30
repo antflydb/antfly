@@ -3571,9 +3571,15 @@ pub const Reader = struct {
         else
             null;
         // An unfiltered stream's encoded and decoded representations are the
-        // same. Reject an oversized terminal value before duplicating it.
+        // same. For encrypted objects, however, /Length describes ciphertext
+        // (including AES IV and padding), while the cache contains the actual
+        // decoded plaintext that readRawStreamDataWithLimit will return.
         if (filter_obj == null) if (bounded_final_limit) |limit| {
-            if (try self.resolvedStreamDataLength(obj) > limit)
+            const stream_data_len = if (self.decrypted_streams.get(obj.stream.data_offset)) |decrypted|
+                decrypted.len
+            else
+                try self.resolvedStreamDataLength(obj);
+            if (stream_data_len > limit)
                 return error.DecodedStreamTooLarge;
         };
         const raw_limit = if (filter_obj == null and bounded_final_limit != null)
@@ -11915,7 +11921,7 @@ fn applyPredictorAlloc(
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
-    try out.ensureTotalCapacity(alloc, output_len);
+    try out.ensureTotalCapacityPrecise(alloc, output_len);
     const prev = try alloc.alloc(u8, row_len);
     defer alloc.free(prev);
     @memset(prev, 0);
@@ -17957,6 +17963,27 @@ test "predictor dimensions reject overflow and oversized rows before allocation"
     );
 }
 
+test "predictor exact output fits an exact working-set reservation" {
+    const alloc = std.testing.allocator;
+    const predicted = [_]u8{ 0, 0x12, 0x34, 0x56 };
+    var entries = [_]syntax.DictEntry{
+        .{ .key = @constCast("Predictor"), .value = .{ .integer = 12 } },
+        .{ .key = @constCast("Columns"), .value = .{ .integer = 1 } },
+        .{ .key = @constCast("Colors"), .value = .{ .integer = 3 } },
+        .{ .key = @constCast("BitsPerComponent"), .value = .{ .integer = 8 } },
+    };
+    var params: syntax.Object = .{ .dict = &entries };
+
+    // Account the retained predictor input plus the exact output, previous
+    // row, and current-row buffers without capacity-growth slack.
+    var budget = DecodeBudgetAllocator.init(alloc, predicted.len, predicted.len + 9);
+    const decode_alloc = budget.allocator();
+    const decoded = try applyPredictorAlloc(decode_alloc, &predicted, &params, 3, .{});
+    defer decode_alloc.free(decoded);
+    try std.testing.expectEqualSlices(u8, &.{ 0x12, 0x34, 0x56 }, decoded);
+    try std.testing.expectEqual(@as(usize, predicted.len + decoded.len), budget.live_bytes);
+}
+
 test "reader can extract plain text from simple page content" {
     const alloc = std.testing.allocator;
     const content = "BT\n(Hello World) Tj\nET\n";
@@ -18505,6 +18532,49 @@ test "AESV2 object data decrypts and removes PKCS7 padding" {
     const decrypted = try decryptAesV2Alloc(alloc, &encrypted, key);
     defer alloc.free(decrypted);
     try std.testing.expectEqualStrings("hello encrypted pdf", decrypted);
+}
+
+test "unfiltered terminal preflight uses cached AES plaintext length" {
+    const alloc = std.testing.allocator;
+    var font_cache: std.AutoHashMapUnmanaged(u64, PageFont) = .empty;
+    defer font_cache.deinit(alloc);
+    var decrypted_streams: std.AutoHashMapUnmanaged(usize, []u8) = .empty;
+    defer {
+        var values = decrypted_streams.valueIterator();
+        while (values.next()) |value| alloc.free(value.*);
+        decrypted_streams.deinit(alloc);
+    }
+    const data_offset: usize = 17;
+    const cached_plaintext = try alloc.dupe(u8, "abc");
+    decrypted_streams.put(alloc, data_offset, cached_plaintext) catch |err| {
+        alloc.free(cached_plaintext);
+        return err;
+    };
+    var reader = Reader{
+        .alloc = alloc,
+        .bytes = "",
+        .decode_limits = .{},
+        .version_minor = 7,
+        .startxref_offset = 0,
+        .xref_entries = &.{},
+        .trailer = .null,
+        .font_cache = &font_cache,
+        .decrypted_streams = &decrypted_streams,
+    };
+    var header = [_]syntax.DictEntry{
+        .{ .key = @constCast("Length"), .value = .{ .integer = 32 } },
+    };
+    var stream: syntax.Object = .{ .stream = .{
+        .header = &header,
+        .data_offset = data_offset,
+        .data_length = 32,
+    } };
+
+    // AESV2 /Length includes the 16-byte IV and block padding, but the
+    // terminal palette limit applies to the cached plaintext.
+    const decoded = try reader.readDecodedStreamDataWithLimitsAndFinalLimit(&stream, .{}, 3);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings("abc", decoded);
 }
 
 test "RC4 object data decrypts with the unsalted object key" {
