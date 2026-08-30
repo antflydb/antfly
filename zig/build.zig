@@ -1412,6 +1412,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Omit debug information from release artifacts") orelse false;
+    const storage_kernel_sections = b.option(
+        bool,
+        "storage-kernel-sections",
+        "Emit per-function and per-data sections for the shared storage kernel",
+    ) orelse true;
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -10521,7 +10526,7 @@ pub fn build(b: *std.Build) void {
         );
         runtime_unit_step.dependOn(&role_artifact.step);
         runtime_library_artifacts[@intFromEnum(unit)] = role_artifact;
-        if (unit == .distributed) {
+        if (unit == .distributed and storage_kernel_sections) {
             // The executable and C ABI libraries share this one optimized
             // PIC object. Give the final links enough section granularity
             // to retain only the C ABI roots in the shared libraries while
