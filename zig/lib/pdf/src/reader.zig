@@ -1813,12 +1813,22 @@ const max_image_color_space_decode_depth: u8 = 8;
 /// preserving the specified order for nested profiles with disjoint ranges.
 const ImageSampleDecode = struct {
     decode_obj: ?*const syntax.Object = null,
+    default_decode: ?[4]ColorComponentRange = null,
+    samples_are_values: bool = false,
     clamp_count: u8 = 0,
     clamps: [max_image_color_space_decode_depth][4]ColorComponentRange =
         [_][4]ColorComponentRange{.{ .{}, .{}, .{}, .{} }} ** max_image_color_space_decode_depth,
 
-    fn value(self: ImageSampleDecode, sample: u8, component_index: usize) f64 {
-        var decoded = applyDecodeUnit(sample, self.decode_obj, component_index);
+    fn value(self: *const ImageSampleDecode, sample: u8, component_index: usize) f64 {
+        const unit = @as(f64, @floatFromInt(sample)) / 255.0;
+        var decoded = if (self.samples_are_values)
+            unit
+        else if (self.default_decode) |ranges|
+            mapUnitToComponentRange(unit, ranges[component_index])
+        else if (self.clamp_count > 0)
+            applyDecodeUnclamped(unit, self.decode_obj, component_index)
+        else
+            applyDecodeNormalized(unit, self.decode_obj, component_index);
         for (self.clamps[0..self.clamp_count]) |ranges|
             decoded = clampColorComponent(decoded, ranges[component_index]);
         return decoded;
@@ -1981,6 +1991,10 @@ fn selectStrokeDeviceColorSpace(state: anytype, kind: ColorSpaceKind, components
 
 fn clampColorComponent(value: f64, range: ColorComponentRange) f64 {
     return @min(range.max, @max(range.min, value));
+}
+
+fn mapUnitToComponentRange(unit: f64, range: ColorComponentRange) f64 {
+    return range.min + std.math.clamp(unit, 0.0, 1.0) * (range.max - range.min);
 }
 
 fn renderColorSpaceComponents(color_space: ColorSpaceValue, components: [4]f64) [4]u8 {
@@ -7899,6 +7913,14 @@ pub const Reader = struct {
                 ranges[component] = .{ .min = min, .max = max };
             }
         }
+        // ICCBased uses the profile Range as its default image Decode array.
+        // Once an outer color space has converted encoded samples into color
+        // values, nested alternates only constrain those values; they must not
+        // decode the same bytes a second time.
+        if (constrained_decode.decode_obj == null and
+            constrained_decode.default_decode == null and
+            !constrained_decode.samples_are_values)
+            constrained_decode.default_decode = ranges;
         constrained_decode.clamps[constrained_decode.clamp_count] = ranges;
         constrained_decode.clamp_count += 1;
 
@@ -8178,7 +8200,14 @@ pub const Reader = struct {
             }
         }
 
-        try self.decodeResolvedImageColorSpaceToRgbaGuarded(rgba, pixel_count, alt_bytes, &color_space[alt_index], .{}, depth + 1);
+        try self.decodeResolvedImageColorSpaceToRgbaGuarded(
+            rgba,
+            pixel_count,
+            alt_bytes,
+            &color_space[alt_index],
+            .{ .samples_are_values = true },
+            depth + 1,
+        );
         return true;
     }
 
@@ -15815,12 +15844,20 @@ fn applyDecodeUnit(value: u8, decode_obj: ?*const syntax.Object, component_index
 }
 
 fn applyIndexedDecode(value: u8, decode_obj: ?*const syntax.Object, palette_entries: usize) !u8 {
-    return try applyIndexedSampleDecode(value, .{ .decode_obj = decode_obj }, palette_entries);
+    if (palette_entries == 0) return error.UnsupportedPdfRendering;
+    const max_index = @as(f64, @floatFromInt(palette_entries - 1));
+    const unit = @as(f64, @floatFromInt(value)) / 255.0;
+    const range = decodeRange(decode_obj, 0) orelse return value;
+    const mapped = std.math.clamp(range.min + unit * (range.max - range.min), 0.0, max_index);
+    return @intFromFloat(@round(mapped));
 }
 
 fn applyIndexedSampleDecode(value: u8, sample_decode: ImageSampleDecode, palette_entries: usize) !u8 {
     if (palette_entries == 0) return error.UnsupportedPdfRendering;
-    if (sample_decode.decode_obj == null and sample_decode.clamp_count == 0) return value;
+    if (sample_decode.default_decode == null and
+        !sample_decode.samples_are_values and
+        sample_decode.clamp_count == 0)
+        return try applyIndexedDecode(value, sample_decode.decode_obj, palette_entries);
     const max_index = @as(f64, @floatFromInt(palette_entries - 1));
     const mapped = std.math.clamp(sample_decode.value(value, 0), 0.0, max_index);
     return @intFromFloat(@round(mapped));
@@ -16133,6 +16170,11 @@ fn normalizeU16SamplesToU8Alloc(alloc: Allocator, samples: []const u16, bits_per
 fn applyDecodeNormalized(unit: f64, decode_obj: ?*const syntax.Object, component_index: usize) f64 {
     const range = decodeRange(decode_obj, component_index) orelse return std.math.clamp(unit, 0.0, 1.0);
     return std.math.clamp(range.min + unit * (range.max - range.min), 0.0, 1.0);
+}
+
+fn applyDecodeUnclamped(unit: f64, decode_obj: ?*const syntax.Object, component_index: usize) f64 {
+    const range = decodeRange(decode_obj, component_index) orelse return std.math.clamp(unit, 0.0, 1.0);
+    return range.min + std.math.clamp(unit, 0.0, 1.0) * (range.max - range.min);
 }
 
 fn invertDecodeNormalized(value: f64, decode_obj: ?*const syntax.Object, component_index: usize) !f64 {
@@ -19275,6 +19317,60 @@ test "reader clips decoded ICCBased image samples to profile range" {
     try std.testing.expectEqual(@as(usize, 1), runs.len);
     try std.testing.expectEqual(@as(u8, 64), runs[0].rgba[0]);
     try std.testing.expectEqual(@as(u8, 191), runs[0].rgba[4]);
+}
+
+test "reader uses ICC profile range as the default image Decode" {
+    const alloc = std.testing.allocator;
+    const image_data = "\x00\x40\xff";
+    const content = "q\n3 0 0 1 0 0 cm\n/Im1 Do\nQ\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, content },
+    );
+    defer alloc.free(content_object);
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 3 /Height 1 /ColorSpace [/ICCBased 5 0 R] /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ image_data.len, image_data },
+    );
+    defer alloc.free(image_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im1 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        content_object,
+        "5 0 obj\n<< /N 1 /Alternate /DeviceGray /Range [0.25 0.75] /Length 0 >>\nstream\nendstream\nendobj\n",
+        image_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const runs = try reader.extractPageImageRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(u8, 64), runs[0].rgba[0]);
+    try std.testing.expectEqual(@as(u8, 96), runs[0].rgba[4]);
+    try std.testing.expectEqual(@as(u8, 191), runs[0].rgba[8]);
+}
+
+test "indexed Decode preserves the complete palette index range" {
+    var decode_values = [_]syntax.Object{ .{ .integer = 0 }, .{ .integer = 2 } };
+    const decode = syntax.Object{ .array = &decode_values };
+
+    try std.testing.expectEqual(@as(u8, 0), try applyIndexedDecode(0, &decode, 3));
+    try std.testing.expectEqual(@as(u8, 1), try applyIndexedDecode(128, &decode, 3));
+    try std.testing.expectEqual(@as(u8, 2), try applyIndexedDecode(255, &decode, 3));
+    try std.testing.expectEqual(
+        @as(u8, 2),
+        try applyIndexedSampleDecode(255, .{ .decode_obj = &decode }, 3),
+    );
 }
 
 test "reader rejects cyclic ICCBased image alternates" {
