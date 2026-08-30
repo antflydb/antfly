@@ -83,6 +83,46 @@ pub const SnapshotCompletion = struct {
     snapshot_index: core.types.Index,
     snapshot_term: core.types.Term,
     status: SnapshotCompletionStatus,
+
+    pub fn key(self: SnapshotCompletion) SnapshotAttemptKey {
+        return .{
+            .group_id = self.group_id,
+            .incarnation = self.incarnation,
+            .from = self.from,
+            .to = self.to,
+            .term = self.term,
+            .attempt_generation = self.attempt_generation,
+            .snapshot_index = self.snapshot_index,
+            .snapshot_term = self.snapshot_term,
+        };
+    }
+};
+
+/// Exact local identity of one transport-owned snapshot publication. It is
+/// deliberately independent of payload storage so runtimes can retain bounded
+/// liveness state after the transport takes ownership of large snapshot bytes.
+pub const SnapshotAttemptKey = struct {
+    group_id: core.types.GroupId,
+    incarnation: u64,
+    from: core.types.NodeId,
+    to: core.types.NodeId,
+    term: core.types.Term,
+    attempt_generation: u64,
+    snapshot_index: core.types.Index,
+    snapshot_term: core.types.Term,
+
+    pub fn fromRequest(req: SnapshotSendRequest) SnapshotAttemptKey {
+        return .{
+            .group_id = req.group_id,
+            .incarnation = req.incarnation,
+            .from = req.from,
+            .to = req.to,
+            .term = req.term,
+            .attempt_generation = req.attempt_generation,
+            .snapshot_index = req.snapshot.metadata.index,
+            .snapshot_term = req.snapshot.metadata.term,
+        };
+    }
 };
 
 pub const SnapshotFetchRequest = struct {
@@ -164,6 +204,12 @@ pub const SnapshotTransport = struct {
             ptr: *anyopaque,
             out: []SnapshotCompletion,
         ) usize,
+        /// Idempotently relinquishes transport ownership of an exact attempt.
+        /// A racing terminal completion may win; runtimes fence it by key.
+        cancel_submission: *const fn (
+            ptr: *anyopaque,
+            key: SnapshotAttemptKey,
+        ) void,
     };
 
     /// The tagged sender makes the asynchronous ownership contract total:
@@ -209,6 +255,13 @@ pub const SnapshotTransport = struct {
         };
     }
 
+    pub fn cancelSubmission(self: SnapshotTransport, key: SnapshotAttemptKey) void {
+        switch (self.sender) {
+            .synchronous => {},
+            .asynchronous => |sender| sender.cancel_submission(self.ptr, key),
+        }
+    }
+
     pub fn fetchSnapshot(self: SnapshotTransport, req: SnapshotFetchRequest, receiver: SnapshotReceiver) !void {
         if (self.vtable.fetch_snapshot) |fetch_snapshot| {
             return try fetch_snapshot(self.ptr, req, receiver);
@@ -229,6 +282,7 @@ test "snapshot transport iface compiles" {
     _ = SnapshotSubmitResult;
     _ = AsyncSnapshotSubmitResult;
     _ = SnapshotCompletion;
+    _ = SnapshotAttemptKey;
     _ = SnapshotFetchRequest;
     _ = SnapshotReceiver;
     _ = SnapshotTransport;

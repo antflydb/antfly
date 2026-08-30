@@ -4123,6 +4123,7 @@ pub fn build(b: *std.Build) void {
             "multi raft drainReady reserves continuations for productive groups",
             "multi raft empty drain remains allocation free after group admission",
             "multi raft backpressure rejects async ready before cloning messages",
+            "multi raft routes outbound snapshots through snapshot transport",
         },
     });
     const run_raft_ready_continuation_tests = addFilteredTestRunArtifact(b, raft_ready_continuation_tests);
@@ -4132,6 +4133,26 @@ pub fn build(b: *std.Build) void {
         .filters = &.{ "raft integration module compiles", "raft.transport." },
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
+
+    // Snapshot artifact storage has its own root because Zig does not collect
+    // tests from the implementation behind the transport compatibility alias.
+    // Keep the target component-wide rather than naming an individual policy
+    // regression so new storage contracts are discovered automatically.
+    const raft_storage_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/raft_storage_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, raft_storage_test_mod, true, true);
+    const raft_storage_tests = b.addTest(.{
+        .root_module = raft_storage_test_mod,
+        .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_raft_storage_tests = addFilteredTestRunArtifact(b, raft_storage_tests);
 
     // Keep this as the stable behavioral suffix of the declaration rather
     // than duplicating its descriptive worker-model prefix. The exact-filter
@@ -7302,6 +7323,7 @@ pub fn build(b: *std.Build) void {
     raft_test_step.dependOn(&run_raft_restore_tests.step);
     raft_test_step.dependOn(&run_raft_library_tests.step);
     raft_test_step.dependOn(&run_raft_ready_continuation_tests.step);
+    raft_test_step.dependOn(&run_raft_storage_tests.step);
 
     const raft_runtime_test_step = b.step("raft-runtime-test", "Run focused managed Raft runtime tests");
     raft_runtime_test_step.dependOn(&run_raft_runtime_tests.step);
@@ -7312,6 +7334,9 @@ pub fn build(b: *std.Build) void {
 
     const raft_transport_test_step = b.step("raft-transport-test", "Run raft transport unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
+
+    const raft_storage_test_step = b.step("raft-storage-test", "Run Raft snapshot artifact storage tests");
+    raft_storage_test_step.dependOn(&run_raft_storage_tests.step);
 
     unit_test_step.dependOn(&run_lib_regex_tests.step);
     unit_test_step.dependOn(&run_raft_library_tests.step);

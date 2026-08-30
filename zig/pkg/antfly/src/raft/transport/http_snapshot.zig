@@ -212,6 +212,7 @@ pub const AsyncSnapshotSendMetricsSnapshot = struct {
     reservation_rollbacks: u64 = 0,
     completions_delivered: u64 = 0,
     completions_failed: u64 = 0,
+    cancelled: u64 = 0,
     pending: usize = 0,
     pending_bytes: usize = 0,
     reserved: usize = 0,
@@ -231,6 +232,7 @@ const AsyncSnapshotSendMetrics = struct {
     reservation_rollbacks: std.atomic.Value(u64) = .init(0),
     completions_delivered: std.atomic.Value(u64) = .init(0),
     completions_failed: std.atomic.Value(u64) = .init(0),
+    cancelled: std.atomic.Value(u64) = .init(0),
 };
 
 pub const HttpSnapshotTransport = struct {
@@ -259,6 +261,9 @@ pub const HttpSnapshotTransport = struct {
         /// worker activation; there is no stack-local pointer to install after
         /// a worker has become visible.
         cancellation: common.RequestCancellation = .{},
+        /// Set under send_mutex when the runtime relinquishes this exact
+        /// attempt. Workers must release ownership without retry/completion.
+        runtime_cancelled: bool = false,
 
         fn init(
             alloc: std.mem.Allocator,
@@ -315,6 +320,20 @@ pub const HttpSnapshotTransport = struct {
             return self.locator_format == locator.format and
                 std.mem.eql(u8, self.locator_snapshot_id.?, locator.snapshot_id) and
                 std.mem.eql(u8, self.locator_uri.?, locator.uri);
+        }
+
+        fn sameAttemptKey(
+            self: *const QueuedSnapshot,
+            key: raft_engine.runtime.snapshot_transport_iface.SnapshotAttemptKey,
+        ) bool {
+            return self.group_id == key.group_id and
+                self.incarnation == key.incarnation and
+                self.from == key.from and
+                self.to == key.to and
+                self.term == key.term and
+                self.attempt_generation == key.attempt_generation and
+                self.snapshot.metadata.index == key.snapshot_index and
+                self.snapshot.metadata.term == key.snapshot_term;
         }
 
         fn deinit(self: *QueuedSnapshot, alloc: std.mem.Allocator) void {
@@ -464,6 +483,7 @@ pub const HttpSnapshotTransport = struct {
             .sender = .{ .asynchronous = .{
                 .submit_snapshot = trySubmitSnapshotCallback,
                 .drain_completions = drainCompletionsCallback,
+                .cancel_submission = cancelSubmissionCallback,
             } },
             .vtable = &.{
                 .fetch_snapshot = fetchSnapshot,
@@ -588,6 +608,7 @@ pub const HttpSnapshotTransport = struct {
             .reservation_rollbacks = self.send_metrics.reservation_rollbacks.load(.monotonic),
             .completions_delivered = self.send_metrics.completions_delivered.load(.monotonic),
             .completions_failed = self.send_metrics.completions_failed.load(.monotonic),
+            .cancelled = self.send_metrics.cancelled.load(.monotonic),
             .pending = pending,
             .pending_bytes = pending_bytes,
             .reserved = reserved,
@@ -799,7 +820,7 @@ pub const HttpSnapshotTransport = struct {
         std.debug.assert(self.send_retained_jobs > 0 and self.send_retained_bytes >= job.snapshot.data.len);
         self.send_retained_jobs -= 1;
         self.send_retained_bytes -= job.snapshot.data.len;
-        if (self.send_state == .running) {
+        if (self.send_state == .running and !job.runtime_cancelled) {
             self.queueCompletionLocked(job, .delivered);
             _ = self.send_metrics.completions_delivered.fetchAdd(1, .monotonic);
         }
@@ -821,13 +842,14 @@ pub const HttpSnapshotTransport = struct {
             error.InvalidSnapshotTransferLimits,
             error.SnapshotTransferProtocolUpgradeRequired,
             error.SnapshotArtifactGenerationConflict,
+            error.SnapshotArtifactTooLarge,
             => true,
             else => false,
         };
         self.send_mutex.lockUncancelable(self.artifact_io);
         self.send_active_jobs[worker_index] = null;
         std.debug.assert(self.send_active_peers.remove(job.to));
-        if (self.send_state == .running and !permanent and job.attempts < self.cfg.async_send_max_attempts) {
+        if (self.send_state == .running and !job.runtime_cancelled and !permanent and job.attempts < self.cfg.async_send_max_attempts) {
             job.not_before_ms = snapshotNowMs() +| self.snapshotRetryDelayMs(job.*);
             job.cancellation = .{};
             self.send_queue.appendAssumeCapacity(job.*);
@@ -841,7 +863,7 @@ pub const HttpSnapshotTransport = struct {
         self.send_retained_jobs -= 1;
         self.send_retained_bytes -= job.snapshot.data.len;
         _ = self.send_metrics.dropped.fetchAdd(1, .monotonic);
-        const publish_failure = self.send_state == .running;
+        const publish_failure = self.send_state == .running and !job.runtime_cancelled;
         if (publish_failure) {
             self.queueCompletionLocked(job, .failed);
             _ = self.send_metrics.completions_failed.fetchAdd(1, .monotonic);
@@ -933,6 +955,50 @@ pub const HttpSnapshotTransport = struct {
     ) !raft_engine.runtime.snapshot_transport_iface.AsyncSnapshotSubmitResult {
         const self: *HttpSnapshotTransport = @ptrCast(@alignCast(ptr));
         return self.trySubmitSnapshot(req);
+    }
+
+    fn cancelSubmissionCallback(
+        ptr: *anyopaque,
+        key: raft_engine.runtime.snapshot_transport_iface.SnapshotAttemptKey,
+    ) void {
+        const self: *HttpSnapshotTransport = @ptrCast(@alignCast(ptr));
+        self.cancelSubmission(key);
+    }
+
+    fn cancelSubmission(
+        self: *HttpSnapshotTransport,
+        key: raft_engine.runtime.snapshot_transport_iface.SnapshotAttemptKey,
+    ) void {
+        var removed: ?QueuedSnapshot = null;
+        var cancelled = false;
+        self.send_mutex.lockUncancelable(self.artifact_io);
+        for (self.send_queue.items, 0..) |*job, index| {
+            if (!job.sameAttemptKey(key)) continue;
+            removed = self.send_queue.orderedRemove(index);
+            std.debug.assert(self.send_retained_jobs > 0 and
+                self.send_retained_bytes >= removed.?.snapshot.data.len);
+            self.send_retained_jobs -= 1;
+            self.send_retained_bytes -= removed.?.snapshot.data.len;
+            cancelled = true;
+            break;
+        }
+        if (removed == null) {
+            for (self.send_active_jobs) |active| {
+                const job = active orelse continue;
+                if (!job.sameAttemptKey(key)) continue;
+                if (job.runtime_cancelled) break;
+                job.runtime_cancelled = true;
+                job.cancellation.cancel();
+                cancelled = true;
+                break;
+            }
+        }
+        if (cancelled) {
+            _ = self.send_metrics.cancelled.fetchAdd(1, .monotonic);
+            self.send_ready.broadcast(self.artifact_io);
+        }
+        self.send_mutex.unlock(self.artifact_io);
+        if (removed) |*job| job.deinit(self.alloc);
     }
 
     fn drainCompletionsCallback(
@@ -1188,7 +1254,7 @@ pub const HttpSnapshotTransport = struct {
             .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        return mapSnapshotUploadStatus(resp.status);
     }
 
     fn sendChunkedSnapshot(
@@ -1381,8 +1447,17 @@ pub const HttpSnapshotTransport = struct {
     ) !void {
         var resp = try self.executor.execute(alloc, req);
         defer resp.deinit(alloc);
-        if (resp.status == 409) return error.SnapshotArtifactGenerationConflict;
-        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        return mapSnapshotUploadStatus(resp.status);
+    }
+
+    fn mapSnapshotUploadStatus(status: u16) !void {
+        return switch (status) {
+            200...299 => {},
+            409 => error.SnapshotArtifactGenerationConflict,
+            413 => error.SnapshotArtifactTooLarge,
+            429 => error.SnapshotArtifactPressure,
+            else => error.UnexpectedHttpStatus,
+        };
     }
 
     fn fetchSnapshot(
@@ -2139,6 +2214,18 @@ test "snapshot staging budget rejects aggregate overcommit and is reusable" {
     try std.testing.expectEqual(@as(usize, 0), budget.reserved.load(.acquire));
 }
 
+test "snapshot upload status preserves permanent and retryable admission semantics" {
+    try HttpSnapshotTransport.mapSnapshotUploadStatus(204);
+    try std.testing.expectError(
+        error.SnapshotArtifactTooLarge,
+        HttpSnapshotTransport.mapSnapshotUploadStatus(413),
+    );
+    try std.testing.expectError(
+        error.SnapshotArtifactPressure,
+        HttpSnapshotTransport.mapSnapshotUploadStatus(429),
+    );
+}
+
 test "async snapshot send lane deduplicates and applies retained ownership bounds" {
     const Executor = struct {
         fn iface(_: *@This()) common.RequestExecutor {
@@ -2198,9 +2285,15 @@ test "async snapshot send lane deduplicates and applies retained ownership bound
     try std.testing.expectEqual(@as(usize, 7), metrics.pending_bytes);
     try std.testing.expectEqual(@as(usize, 0), metrics.reserved);
     try std.testing.expectEqual(@as(usize, 0), metrics.reserved_bytes);
+
+    transport.submissionTransport().cancelSubmission(.fromRequest(first));
+    const cancelled = transport.asyncSendMetricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), cancelled.cancelled);
+    try std.testing.expectEqual(@as(usize, 0), cancelled.pending);
+    try std.testing.expectEqual(@as(usize, 0), cancelled.pending_bytes);
 }
 
-test "active async snapshot job publishes its owned cancellation atomically" {
+test "active async snapshot job honors exact runtime cancellation without a late completion" {
     const Executor = struct {
         fn iface(_: *@This()) common.RequestExecutor {
             return .{ .ptr = undefined, .vtable = &.{ .execute = execute } };
@@ -2227,38 +2320,30 @@ test "active async snapshot job publishes its owned cancellation atomically" {
     var active_jobs = [_]?*HttpSnapshotTransport.QueuedSnapshot{null};
     transport.send_active_jobs = &active_jobs;
 
-    _ = try transport.enqueueSnapshot(.{
+    const req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest = .{
         .group_id = 7,
         .incarnation = 9,
         .to = 2,
         .snapshot = .{ .metadata = .{ .index = 11, .term = 3 }, .data = @constCast("payload") },
-    });
+    };
+    _ = try transport.enqueueSnapshot(req);
     var job: HttpSnapshotTransport.QueuedSnapshot = undefined;
     try std.testing.expect(transport.awaitSnapshotJob(0, &job));
     try std.testing.expect(active_jobs[0].? == &job);
 
-    // This is exactly the observation performed by shutdown while holding the
-    // sender mutex. The token exists as soon as the active job does.
-    transport.send_mutex.lockUncancelable(transport.artifact_io);
-    active_jobs[0].?.cancellation.cancel();
-    transport.send_mutex.unlock(transport.artifact_io);
+    transport.submissionTransport().cancelSubmission(.fromRequest(req));
     try std.testing.expect(job.cancellation.isCancelled());
+    try std.testing.expect(job.runtime_cancelled);
 
     transport.finishSnapshotJob(0, &job);
     job.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), transport.asyncSendMetricsSnapshot().pending_completions);
+    try std.testing.expectEqual(@as(usize, 0), transport.asyncSendMetricsSnapshot().pending_completions);
     var completions: [1]raft_engine.runtime.snapshot_transport_iface.SnapshotCompletion = undefined;
     try std.testing.expectEqual(
-        @as(usize, 1),
+        @as(usize, 0),
         transport.submissionTransport().drainCompletions(&completions),
     );
-    try std.testing.expectEqual(@as(u64, 7), completions[0].group_id);
-    try std.testing.expectEqual(@as(u64, 9), completions[0].incarnation);
-    try std.testing.expectEqual(
-        raft_engine.runtime.snapshot_transport_iface.SnapshotCompletionStatus.delivered,
-        completions[0].status,
-    );
-    try std.testing.expectEqual(@as(usize, 0), transport.asyncSendMetricsSnapshot().pending_completions);
+    try std.testing.expectEqual(@as(u64, 1), transport.asyncSendMetricsSnapshot().cancelled);
     transport.send_active_jobs = &.{};
 }
 

@@ -58,6 +58,11 @@ pub const SnapshotArtifactUsageSnapshot = struct {
     reserved_bytes: u64,
     reserved_count: usize,
     reconciliations: u64,
+    maintenance_requests: u64,
+    maintenance_runs: u64,
+    maintenance_failures: u64,
+    permanent_admission_rejections: u64,
+    pressure_admission_rejections: u64,
 };
 
 pub const FileSnapshotStore = struct {
@@ -83,6 +88,16 @@ pub const FileSnapshotStore = struct {
     artifact_reserved: ArtifactUsage = .{},
     artifact_usage_reconciliations: std.atomic.Value(u64) = .init(0),
     next_artifact_maintenance_ns: std.atomic.Value(u64) = .init(0),
+    artifact_maintenance_mutex: std.atomic.Mutex = .unlocked,
+    artifact_maintenance_thread: ?std.Thread = null,
+    artifact_maintenance_event: std.Io.Event = .unset,
+    artifact_maintenance_stop: std.atomic.Value(bool) = .init(false),
+    artifact_maintenance_requested: std.atomic.Value(bool) = .init(false),
+    artifact_maintenance_requests: std.atomic.Value(u64) = .init(0),
+    artifact_maintenance_runs: std.atomic.Value(u64) = .init(0),
+    artifact_maintenance_failures: std.atomic.Value(u64) = .init(0),
+    artifact_permanent_rejections: std.atomic.Value(u64) = .init(0),
+    artifact_pressure_rejections: std.atomic.Value(u64) = .init(0),
     fetch_lease_mutex: std.atomic.Mutex = .unlocked,
     fetch_leases: std.StringHashMapUnmanaged(FetchLease) = .empty,
 
@@ -115,6 +130,12 @@ pub const FileSnapshotStore = struct {
     }
 
     pub fn deinit(self: *FileSnapshotStore) void {
+        platform_sync.lockYielding(&self.artifact_maintenance_mutex);
+        self.artifact_maintenance_stop.store(true, .release);
+        const maintenance_thread = self.artifact_maintenance_thread;
+        if (maintenance_thread != null) self.artifact_maintenance_event.set(io(self));
+        self.artifact_maintenance_mutex.unlock();
+        if (maintenance_thread) |thread| thread.join();
         var lease_keys = self.fetch_leases.keyIterator();
         while (lease_keys.next()) |key| self.alloc.free(key.*);
         self.fetch_leases.deinit(self.alloc);
@@ -155,6 +176,11 @@ pub const FileSnapshotStore = struct {
             .reserved_bytes = self.artifact_reserved.bytes,
             .reserved_count = self.artifact_reserved.count,
             .reconciliations = self.artifact_usage_reconciliations.load(.monotonic),
+            .maintenance_requests = self.artifact_maintenance_requests.load(.monotonic),
+            .maintenance_runs = self.artifact_maintenance_runs.load(.monotonic),
+            .maintenance_failures = self.artifact_maintenance_failures.load(.monotonic),
+            .permanent_admission_rejections = self.artifact_permanent_rejections.load(.monotonic),
+            .pressure_admission_rejections = self.artifact_pressure_rejections.load(.monotonic),
         };
     }
 
@@ -170,13 +196,9 @@ pub const FileSnapshotStore = struct {
         if (body.len > self.cfg.max_snapshot_bytes) return error.SnapshotTooLarge;
         self.maybeRunArtifactMaintenance();
         return self.putSnapshotLocked(snapshot_id, body) catch |err| switch (err) {
-            error.SnapshotArtifactQuotaExceeded => {
-                // Reclamation must never run while this identity's stripe is
-                // held: an unrelated expired identity may hash to the same
-                // stripe. Retry the entire immutable-generation check after
-                // cleanup because another writer could publish meanwhile.
-                try self.cleanupExpiredArtifacts();
-                return try self.putSnapshotLocked(snapshot_id, body);
+            error.SnapshotArtifactPressure => {
+                self.requestArtifactMaintenance();
+                return err;
             },
             else => return err,
         };
@@ -302,11 +324,9 @@ pub const FileSnapshotStore = struct {
             return error.SnapshotTooLarge;
         self.maybeRunArtifactMaintenance();
         return self.beginChunkedSnapshotLocked(snapshot_id, encoded, total_len) catch |err| switch (err) {
-            error.SnapshotArtifactQuotaExceeded => {
-                // Drop the identity stripe before sweeping, then restart all
-                // generation checks under the reacquired stripe.
-                try self.cleanupExpiredArtifacts();
-                return try self.beginChunkedSnapshotLocked(snapshot_id, encoded, total_len);
+            error.SnapshotArtifactPressure => {
+                self.requestArtifactMaintenance();
+                return err;
             },
             else => return err,
         };
@@ -697,6 +717,10 @@ pub const FileSnapshotStore = struct {
             error.FileNotFound => null,
             else => return err,
         };
+        if (requested_bytes > self.cfg.artifact_policy.max_bytes) {
+            _ = self.artifact_permanent_rejections.fetchAdd(1, .monotonic);
+            return error.SnapshotArtifactTooLarge;
+        }
         platform_sync.lockYielding(&self.artifact_ledger_mutex);
         defer self.artifact_ledger_mutex.unlock();
         const durable_bytes = self.artifact_usage.bytes -| if (existing) |stat| stat.size else 0;
@@ -707,7 +731,8 @@ pub const FileSnapshotStore = struct {
             occupied_bytes > self.cfg.artifact_policy.max_bytes or
             requested_bytes > self.cfg.artifact_policy.max_bytes - occupied_bytes)
         {
-            return error.SnapshotArtifactQuotaExceeded;
+            _ = self.artifact_pressure_rejections.fetchAdd(1, .monotonic);
+            return error.SnapshotArtifactPressure;
         }
         self.artifact_usage = .{ .bytes = durable_bytes, .count = durable_count };
         self.artifact_reserved.bytes += requested_bytes;
@@ -874,10 +899,8 @@ pub const FileSnapshotStore = struct {
         self.next_artifact_maintenance_ns.store(now_ns +| artifact_maintenance_interval_ns, .release);
     }
 
-    /// Rate-limited opportunistic sweeping avoids a store-owned maintenance
-    /// thread while guaranteeing the first transfer after an idle interval
-    /// reclaims expired artifacts. Only one request performs the directory
-    /// scan; chunk traffic remains on its O(1) striped-lock path.
+    /// Foreground requests only publish an O(1) wake-up. Directory iteration
+    /// and durability syncs stay on the store's maintenance lane.
     fn maybeRunArtifactMaintenance(self: *FileSnapshotStore) void {
         const now_ns = platform_time.monotonicNs();
         const previous = self.next_artifact_maintenance_ns.load(.acquire);
@@ -888,12 +911,66 @@ pub const FileSnapshotStore = struct {
             .acq_rel,
             .acquire,
         ) != null) return;
-        self.cleanupExpiredArtifacts() catch |err| {
-            std.log.warn("raft snapshot artifact maintenance deferred root={s} err={s}", .{
-                self.root_dir,
-                @errorName(err),
-            });
-        };
+        self.requestArtifactMaintenance();
+    }
+
+    fn requestArtifactMaintenance(self: *FileSnapshotStore) void {
+        _ = self.artifact_maintenance_requests.fetchAdd(1, .monotonic);
+        self.artifact_maintenance_requested.store(true, .release);
+        if (comptime builtin.single_threaded) return;
+
+        platform_sync.lockYielding(&self.artifact_maintenance_mutex);
+        if (self.artifact_maintenance_stop.load(.acquire)) {
+            self.artifact_maintenance_mutex.unlock();
+            return;
+        }
+        if (self.artifact_maintenance_thread == null) {
+            self.artifact_maintenance_thread = std.Thread.spawn(
+                .{},
+                artifactMaintenanceMain,
+                .{self},
+            ) catch |err| {
+                _ = self.artifact_maintenance_failures.fetchAdd(1, .monotonic);
+                std.log.warn("raft snapshot artifact maintenance start failed root={s} err={s}", .{
+                    self.root_dir,
+                    @errorName(err),
+                });
+                self.artifact_maintenance_mutex.unlock();
+                return;
+            };
+        }
+        self.artifact_maintenance_event.set(io(self));
+        self.artifact_maintenance_mutex.unlock();
+    }
+
+    fn artifactMaintenanceMain(self: *FileSnapshotStore) void {
+        while (true) {
+            self.artifact_maintenance_event.reset();
+            if (self.artifact_maintenance_stop.load(.acquire)) return;
+            if (self.artifact_maintenance_requested.swap(false, .acq_rel)) {
+                self.cleanupExpiredArtifacts() catch |err| {
+                    _ = self.artifact_maintenance_failures.fetchAdd(1, .monotonic);
+                    std.log.warn("raft snapshot artifact maintenance deferred root={s} err={s}", .{
+                        self.root_dir,
+                        @errorName(err),
+                    });
+                };
+                _ = self.artifact_maintenance_runs.fetchAdd(1, .monotonic);
+                self.deferArtifactMaintenance();
+            }
+            if (self.artifact_maintenance_stop.load(.acquire)) return;
+            self.artifact_maintenance_event.waitTimeout(io(self), .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromNanoseconds(artifact_maintenance_interval_ns),
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => {
+                    self.artifact_maintenance_requested.store(true, .release);
+                },
+                error.Canceled => if (self.artifact_maintenance_stop.load(.acquire)) return,
+            };
+        }
     }
 
     const ManagedArtifact = struct { snapshot_id: []const u8, staging: bool };
@@ -1062,6 +1139,14 @@ fn testCollidingSnapshotId(
     return error.SnapshotLockCollisionNotFound;
 }
 
+fn waitForArtifactMaintenance(store: *FileSnapshotStore, completed_before: u64) !void {
+    for (0..2_000) |_| {
+        if (store.artifactUsageSnapshot().maintenance_runs > completed_before) return;
+        try store.io().sleep(.fromMilliseconds(1), .awake);
+    }
+    return error.ArtifactMaintenanceTimeout;
+}
+
 test "file snapshot store persists snapshot bodies" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1163,12 +1248,15 @@ test "legacy snapshot artifacts share quota and expiry lifecycle" {
     defer store.deinit();
     const iface = store.store();
     try std.testing.expectError(
-        error.SnapshotArtifactQuotaExceeded,
+        error.SnapshotArtifactTooLarge,
         iface.putSnapshot(std.testing.allocator, "over-quota", "12345"),
     );
+    try std.testing.expectEqual(@as(u64, 1), store.artifactUsageSnapshot().permanent_admission_rejections);
     try iface.putSnapshot(std.testing.allocator, "expires", "1234");
     try store.io().sleep(.fromMilliseconds(2), .awake);
-    store.next_artifact_maintenance_ns.store(0, .release);
+    const maintenance_runs = store.artifactUsageSnapshot().maintenance_runs;
+    store.requestArtifactMaintenance();
+    try waitForArtifactMaintenance(&store, maintenance_runs);
     try std.testing.expectError(
         error.FileNotFound,
         iface.getSnapshot(std.testing.allocator, "expires"),
@@ -1176,7 +1264,7 @@ test "legacy snapshot artifacts share quota and expiry lifecycle" {
     try std.testing.expectEqual(@as(usize, 0), (try store.artifactUsage()).count);
 }
 
-test "snapshot quota pressure reclaims expired artifacts before rejecting admission" {
+test "snapshot quota returns retryable pressure while background maintenance reclaims expiry" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1202,9 +1290,14 @@ test "snapshot quota pressure reclaims expired artifacts before rejecting admiss
     const replacement_id = try testCollidingSnapshotId(&store, expired_id, &replacement_buffer);
     try iface.putSnapshot(std.testing.allocator, expired_id, "1234");
     try store.io().sleep(.fromMilliseconds(2), .awake);
-    // Periodic maintenance remains deferred. The failed O(1) reservation
-    // triggers one sweep outside the colliding identity stripe and one full
-    // validation retry, giving callers progress instead of a stale quota error.
+    // The failed O(1) reservation returns retryable pressure immediately and
+    // wakes cleanup outside the colliding identity stripe.
+    const maintenance_runs = store.artifactUsageSnapshot().maintenance_runs;
+    try std.testing.expectError(
+        error.SnapshotArtifactPressure,
+        iface.putSnapshot(std.testing.allocator, replacement_id, "5678"),
+    );
+    try waitForArtifactMaintenance(&store, maintenance_runs);
     try iface.putSnapshot(std.testing.allocator, replacement_id, "5678");
     const usage = store.artifactUsageSnapshot();
     try std.testing.expectEqual(@as(u64, 4), usage.durable_bytes);
@@ -1216,7 +1309,7 @@ test "snapshot quota pressure reclaims expired artifacts before rejecting admiss
     );
 }
 
-test "chunked quota pressure reclaims expired artifact sharing its lock stripe" {
+test "chunked quota pressure reclaims a colliding expired artifact off the request path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1251,6 +1344,12 @@ test "chunked quota pressure reclaims expired artifact sharing its lock stripe" 
         .data_len = body.len,
         .digest = snapshot_transfer.digest(body),
     };
+    const maintenance_runs = store.artifactUsageSnapshot().maintenance_runs;
+    try std.testing.expectError(
+        error.SnapshotArtifactPressure,
+        iface.vtable.begin_chunked_snapshot.?(iface.ptr, manifest, replacement_id),
+    );
+    try waitForArtifactMaintenance(&store, maintenance_runs);
     try iface.vtable.begin_chunked_snapshot.?(iface.ptr, manifest, replacement_id);
 
     const usage = store.artifactUsageSnapshot();
@@ -1595,7 +1694,9 @@ test "active chunked fetch lease fences committed artifact expiry" {
     );
     fetched_manifest.deinit(std.testing.allocator);
     try store.io().sleep(.fromMilliseconds(2), .awake);
-    store.next_artifact_maintenance_ns.store(0, .release);
+    var maintenance_runs = store.artifactUsageSnapshot().maintenance_runs;
+    store.requestArtifactMaintenance();
+    try waitForArtifactMaintenance(&store, maintenance_runs);
     const chunk = try iface.vtable.get_snapshot_chunk.?(
         iface.ptr,
         std.testing.allocator,
@@ -1609,7 +1710,9 @@ test "active chunked fetch lease fences committed artifact expiry" {
 
     // An abandoned fetch eventually becomes reclaimable again.
     try store.io().sleep(.fromMilliseconds(25), .awake);
-    store.next_artifact_maintenance_ns.store(0, .release);
+    maintenance_runs = store.artifactUsageSnapshot().maintenance_runs;
+    store.requestArtifactMaintenance();
+    try waitForArtifactMaintenance(&store, maintenance_runs);
     try std.testing.expectError(
         error.FileNotFound,
         iface.vtable.get_snapshot_manifest.?(iface.ptr, std.testing.allocator, "leased"),
@@ -1639,7 +1742,7 @@ test "file snapshot store enforces logical artifact quota before sparse allocati
     };
     const iface = store.store();
     try std.testing.expectError(
-        error.SnapshotArtifactQuotaExceeded,
+        error.SnapshotArtifactTooLarge,
         iface.vtable.begin_chunked_snapshot.?(iface.ptr, manifest, "over-quota"),
     );
     try std.testing.expectEqual(@as(usize, 0), (try store.artifactUsage()).count);

@@ -516,6 +516,8 @@ const SnapshotTransportRecorder = struct {
     last_group_id: core.types.GroupId = 0,
     last_incarnation: u64 = 0,
     last_to: core.types.NodeId = 0,
+    cancellations: usize = 0,
+    last_cancelled: ?runtime.snapshot_transport_iface.SnapshotAttemptKey = null,
 
     fn iface(self: *SnapshotTransportRecorder) runtime.snapshot_transport_iface.SnapshotTransport {
         return .{
@@ -523,6 +525,7 @@ const SnapshotTransportRecorder = struct {
             .sender = .{ .asynchronous = .{
                 .submit_snapshot = submitSnapshot,
                 .drain_completions = drainCompletions,
+                .cancel_submission = cancelSubmission,
             } },
             .vtable = &.{},
         };
@@ -544,6 +547,15 @@ const SnapshotTransportRecorder = struct {
 
     fn drainCompletions(_: *anyopaque, _: []runtime.snapshot_transport_iface.SnapshotCompletion) usize {
         return 0;
+    }
+
+    fn cancelSubmission(
+        ptr: *anyopaque,
+        key: runtime.snapshot_transport_iface.SnapshotAttemptKey,
+    ) void {
+        const self: *SnapshotTransportRecorder = @ptrCast(@alignCast(ptr));
+        self.cancellations += 1;
+        self.last_cancelled = key;
     }
 
     fn sendSnapshot(ptr: *anyopaque, req: runtime.snapshot_transport_iface.SnapshotSendRequest) !void {
@@ -1687,7 +1699,9 @@ test "multi raft routes outbound snapshots through snapshot transport" {
     var transport_recorder = TransportRecorder{ .alloc = std.testing.allocator };
     var snapshot_transport = SnapshotTransportRecorder{ .deferrals_remaining = 1 };
 
-    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .snapshot_transport_completion_timeout_ms = 0,
+    }, .{
         .group_storage = storage_recorder.iface(),
         .transport = transport_recorder.iface(),
         .snapshot_transport = snapshot_transport.iface(),
@@ -1760,6 +1774,22 @@ test "multi raft routes outbound snapshots through snapshot transport" {
     try std.testing.expectEqual(@as(usize, 0), transport_recorder.sent_messages);
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().transport_snapshot_sends);
     try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_outbound_messages);
+
+    // An accepted asynchronous attempt is a bounded lease. A transport that
+    // never completes it is cancelled by exact identity and Raft is released
+    // to generate a fresh attempt instead of hanging in snapshot state.
+    snapshot_transport.deferrals_remaining = std.math.maxInt(usize);
+    _ = try host.processReady(94);
+    try std.testing.expectEqual(@as(usize, 1), snapshot_transport.cancellations);
+    const cancelled = snapshot_transport.last_cancelled.?;
+    try std.testing.expectEqual(@as(core.types.GroupId, 94), cancelled.group_id);
+    try std.testing.expectEqual(snapshot_transport.last_incarnation, cancelled.incarnation);
+    try std.testing.expectEqual(@as(core.types.NodeId, 2), cancelled.to);
+    try std.testing.expectEqual(@as(core.types.Index, 11), cancelled.snapshot_index);
+    const metrics = host.metricsSnapshot();
+    try std.testing.expectEqual(@as(usize, 1), metrics.transport_snapshot_completion_timeouts);
+    try std.testing.expectEqual(@as(usize, 1), metrics.transport_snapshot_cancellations);
+    try std.testing.expectEqual(@as(usize, 0), metrics.transport_snapshot_owned_attempts);
 }
 
 test "multi raft fetches snapshot through snapshot transport and steps it into the group" {
