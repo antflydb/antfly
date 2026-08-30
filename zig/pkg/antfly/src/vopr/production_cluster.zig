@@ -346,6 +346,19 @@ pub const Fixture = struct {
     replication_batch_attempts: u64 = 0,
     replication_batch_successes: u64 = 0,
     replication_last_status: u16 = 0,
+    replication_owner_restart_enabled: bool = false,
+    replication_owner_restart_injected: bool = false,
+    replication_owner_restart_target_index: usize = 0,
+    replication_owner_restart_down: bool = false,
+    replication_owner_restart_rejected: bool = false,
+    replication_owner_restart_error_code: u64 = 0,
+    replication_owner_restart_reconstructed: bool = false,
+    replication_owner_restart_durable_row_recovered: bool = false,
+    replication_owner_restart_direct_read: bool = false,
+    replication_owner_restart_direct_read_attempts: u64 = 0,
+    replication_owner_restart_direct_read_status: u16 = 0,
+    replication_owner_restart_direct_read_error_code: u64 = 0,
+    replication_owner_restart_failure: ?anyerror = null,
     completion_fence: ?CompletionFence = null,
     write_statuses: [3]u16 = .{ 0, 0, 0 },
     write_body_digests: [3]u64 = .{ 0, 0, 0 },
@@ -774,6 +787,15 @@ pub const Fixture = struct {
         self.completion_fence = fence;
     }
 
+    pub fn setReplicationOwnerRestartEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.replication_owner_restart_enabled = enabled;
+    }
+
+    pub fn replicationOwnerRestartFailureCode(self: *const Fixture) u64 {
+        return if (self.replication_owner_restart_failure) |err| @intFromError(err) else 0;
+    }
+
     /// Production target for composed replication-backfill histories. The
     /// runner supplies typed BatchRequest values; this adapter preserves them
     /// as public batch JSON and deliberately crosses the ordinary HTTP router,
@@ -800,6 +822,14 @@ pub const Fixture = struct {
         const body_slice = try api_batch.encodeBatchRequest(allocator, req);
         defer allocator.free(body_slice);
 
+        if (self.replication_owner_restart_enabled and
+            self.replication_batch_successes == 1 and
+            !self.replication_owner_restart_injected)
+        {
+            try self.injectReplicationOwnerRestart(allocator, table_name, body_slice);
+            unreachable;
+        }
+
         const route_index: usize = @intCast(self.replication_batch_attempts % self.data_api_uri_count);
         self.replication_batch_attempts +|= 1;
         var response = try self.client.fetchBatch(
@@ -811,6 +841,170 @@ pub const Fixture = struct {
         self.replication_last_status = response.status;
         self.replication_batch_successes +|= 1;
         return {};
+    }
+
+    fn injectReplicationOwnerRestart(
+        self: *Fixture,
+        allocator: std.mem.Allocator,
+        table_name: []const u8,
+        body: []const u8,
+    ) !void {
+        // The replication completion fence keeps every production owner live
+        // after the ordinary public workload reaches its terminal graph
+        // boundary. Crash the target there: no unrelated request is borrowing
+        // the DataServer, while Raft drivers and all recovery owners remain
+        // active for the replication retry.
+        for (0..100_000) |_| {
+            if (self.phase == .graph_query_complete) break;
+            if (self.failure) |err| return err;
+            if (self.teardown_started) return error.Canceled;
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        } else return error.ProductionReplicationOwnerRestartBoundaryTimeout;
+
+        const target_index = self.currentDataLeaderIndex(
+            metadata_sim.VoprPublicClusterFixture.data_group_id,
+        ) orelse return error.ProductionReplicationOwnerUnavailable;
+        const stopped_uri = try allocator.dupe(u8, self.data_api_uris[target_index]);
+        defer allocator.free(stopped_uri);
+
+        self.replication_owner_restart_injected = true;
+        self.replication_owner_restart_target_index = target_index;
+        self.stopDataServerForRestart(target_index) catch |err| {
+            self.replication_owner_restart_failure = err;
+            return err;
+        };
+        self.replication_owner_restart_down = true;
+        self.replication_batch_attempts +|= 1;
+
+        var unexpected_response = self.client.fetchBatch(
+            stopped_uri,
+            table_name,
+            body,
+        ) catch |request_err| {
+            self.replication_owner_restart_rejected = true;
+            self.replication_owner_restart_error_code = @intFromError(request_err);
+            self.reconstructReplicationOwner(target_index) catch |restart_err| {
+                self.replication_owner_restart_failure = restart_err;
+                return restart_err;
+            };
+            return request_err;
+        };
+        defer unexpected_response.deinit(self.alloc);
+        self.replication_batch_successes +|= 1;
+        self.replication_last_status = unexpected_response.status;
+        self.reconstructReplicationOwner(target_index) catch |restart_err| {
+            self.replication_owner_restart_failure = restart_err;
+            return restart_err;
+        };
+        return error.ProductionReplicationStoppedOwnerAcceptedBatch;
+    }
+
+    fn reconstructReplicationOwner(self: *Fixture, target_index: usize) !void {
+        try self.restartDataServer(target_index);
+        self.replication_owner_restart_reconstructed = true;
+        if (!try self.waitForReplicationOwnerRecovery(target_index))
+            return error.ProductionReplicationOwnerPublicReadTimeout;
+    }
+
+    fn waitForReplicationOwnerRecovery(self: *Fixture, target_index: usize) !bool {
+        // The first replication row is durably committed before the crash, but
+        // its derived public index is advanced by the next successful batch.
+        // Do not deadlock that batch behind an impossible queryability fence.
+        // Instead prove both halves independently before retrying: the exact
+        // reconstructed process recovered doc:d from its local group, and its
+        // rebound public listener can serve an already-indexed durable row.
+        // replicationBackfillVisible later requires doc:d/doc:e/doc:f through
+        // every public coordinator after the durable runner has resumed.
+        // A process restart invalidates pooled connections by definition. Use
+        // a fresh external client with bounded transport deadlines for the
+        // readiness proof; the long-lived workload client still performs the
+        // failed target attempt, durable retry, and final all-coordinator
+        // visibility checks.
+        var probe_executor = io_http_executor.IoHttpExecutor.init(self.alloc, self.sim.io(), .{
+            .keep_alive = false,
+            .connect_timeout_ms = 100,
+            .read_timeout_ms = 100,
+            .write_timeout_ms = 100,
+            .pool_max_connections = 1,
+            .pool_max_per_host = 1,
+        });
+        defer probe_executor.deinit();
+        var probe_authorization = PublicAuthorizationExecutor{
+            .inner = probe_executor.executor(),
+            .authorization = graph_authorization_header,
+        };
+        var probe_client = api_http_client.ApiHttpClient.init(
+            self.alloc,
+            if (self.liveAuthorizationEnabled())
+                probe_authorization.iface()
+            else
+                probe_executor.executor(),
+        );
+
+        for (0..32) |_| {
+            if (!self.replication_owner_restart_durable_row_recovered) {
+                const recovered = self.data_servers[target_index].read_source.source().lookupGroupLocal(
+                    self.alloc,
+                    metadata_sim.VoprPublicClusterFixture.data_group_id,
+                    "docs",
+                    "doc:d",
+                    .{},
+                    .stale,
+                ) catch null;
+                if (recovered) |recovered_value| {
+                    var lookup = recovered_value;
+                    defer lookup.deinit(self.alloc);
+                    self.replication_owner_restart_durable_row_recovered =
+                        std.mem.indexOf(u8, lookup.json, "alpha") != null;
+                }
+            }
+
+            if (!self.replication_owner_restart_direct_read) {
+                self.replication_owner_restart_direct_read_attempts +|= 1;
+                var response = probe_client.fetchLookupResponse(
+                    self.data_api_uris[target_index],
+                    "docs",
+                    "doc:c",
+                    null,
+                ) catch |err| {
+                    self.replication_owner_restart_direct_read_error_code = @intFromError(err);
+                    switch (err) {
+                        error.ConnectionRefused,
+                        error.ConnectionResetByPeer,
+                        error.EndOfStream,
+                        error.SendFailed,
+                        => {
+                            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+                            continue;
+                        },
+                        else => return err,
+                    }
+                };
+                defer response.deinit(self.alloc);
+                self.replication_owner_restart_direct_read_status = response.status;
+                self.replication_owner_restart_direct_read_error_code = 0;
+                self.replication_owner_restart_direct_read = response.status == 200 and
+                    std.mem.indexOf(u8, response.body, "production-left") != null;
+            }
+
+            if (self.replication_owner_restart_durable_row_recovered and
+                self.replication_owner_restart_direct_read)
+                return true;
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        }
+        return false;
+    }
+
+    pub fn replicationOwnerRestartSound(self: *const Fixture) bool {
+        return self.replication_owner_restart_enabled and
+            self.replication_owner_restart_injected and
+            self.replication_owner_restart_down and
+            self.replication_owner_restart_rejected and
+            self.replication_owner_restart_error_code == @intFromError(error.SendFailed) and
+            self.replication_owner_restart_reconstructed and
+            self.replication_owner_restart_durable_row_recovered and
+            self.replication_owner_restart_direct_read and
+            self.replication_owner_restart_failure == null;
     }
 
     pub fn replicationBackfillVisible(self: *Fixture) !bool {
@@ -5478,7 +5672,12 @@ pub const Fixture = struct {
         if (self.cleanup_started) return .{};
         var progress: RaftProgress = .{};
         for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
-            if (!self.data_server_live[index]) continue;
+            // A stable-identity restart keeps the array slot occupied while
+            // the old runtime is destroyed and the replacement is brought to
+            // readiness. `live` alone is intentionally published during
+            // construction; `paused` is the process-level exclusion boundary
+            // for observers and control/Raft drivers across the whole restart.
+            if (self.data_server_paused[index] or !self.data_server_live[index]) continue;
             const raft = server.data_raft orelse continue;
             const status = raft.host.http_host.host.raftStatus(initial_groups[0]) orelse continue;
             progress.commit_index = @max(progress.commit_index, status.hard.commit_index);
