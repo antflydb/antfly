@@ -1791,6 +1791,40 @@ fn initialColorForColorSpace(color_space: ColorSpaceKind) [4]u8 {
     };
 }
 
+fn solidShapePaintAvailable(color_space: ColorSpaceKind) !bool {
+    return switch (color_space) {
+        .device_gray, .device_rgb, .device_cmyk => true,
+        // Pattern paint is emitted by the resource-aware pattern pass.
+        .pattern => false,
+        .unsupported => error.UnsupportedPdfRendering,
+    };
+}
+
+fn textPaintChannelAvailable(color_space: ColorSpaceKind, pattern_name: ?[]const u8) !bool {
+    return switch (color_space) {
+        .device_gray, .device_rgb, .device_cmyk => true,
+        .pattern => pattern_name != null,
+        .unsupported => error.UnsupportedPdfRendering,
+    };
+}
+
+fn effectiveTextRenderMode(state: TextRunState) !i64 {
+    const mode = @mod(state.render_mode, 8);
+    const uses_fill = mode == 0 or mode == 2 or mode == 4 or mode == 6;
+    const uses_stroke = mode == 1 or mode == 2 or mode == 5 or mode == 6;
+    const fill = uses_fill and try textPaintChannelAvailable(state.fill_color_space, state.fill_pattern_name);
+    const stroke = uses_stroke and try textPaintChannelAvailable(state.stroke_color_space, state.stroke_pattern_name);
+    const paint_mode: i64 = if (fill and stroke)
+        2
+    else if (fill)
+        0
+    else if (stroke)
+        1
+    else
+        3;
+    return paint_mode + if (mode >= 4) @as(i64, 4) else 0;
+}
+
 fn selectFillColorSpace(state: anytype, name: []const u8) void {
     state.fill_color_space = colorSpaceKindFromName(name);
     state.fill_color = initialColorForColorSpace(state.fill_color_space);
@@ -12358,20 +12392,22 @@ fn applyShapeOperator(
     if (std.mem.eql(u8, op, "f") or std.mem.eql(u8, op, "F") or std.mem.eql(u8, op, "f*")) {
         if (current_path.items.len >= 3) {
             const order = paint_order.*;
-            try emitPolygonShapeRun(
-                alloc,
-                out,
-                order,
-                state.*,
-                current_path.items,
-                .fill,
-                true,
-                if (std.mem.eql(u8, op, "f*")) .even_odd else .nonzero,
-                current_dash.items,
-                dash_phase.*,
-                current_clip_points.items,
-                current_clip_fill_rule.*,
-            );
+            if (try solidShapePaintAvailable(state.fill_color_space)) {
+                try emitPolygonShapeRun(
+                    alloc,
+                    out,
+                    order,
+                    state.*,
+                    current_path.items,
+                    .fill,
+                    true,
+                    if (std.mem.eql(u8, op, "f*")) .even_odd else .nonzero,
+                    current_dash.items,
+                    dash_phase.*,
+                    current_clip_points.items,
+                    current_clip_fill_rule.*,
+                );
+            }
             paint_order.* += 1;
         }
         current_path.clearRetainingCapacity();
@@ -12382,7 +12418,8 @@ fn applyShapeOperator(
         if (std.mem.eql(u8, op, "s")) current_path_closed.* = true;
         if (current_path.items.len >= 2) {
             const order = paint_order.*;
-            try emitPolygonShapeRun(alloc, out, order, state.*, current_path.items, .stroke, current_path_closed.*, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*);
+            if (try solidShapePaintAvailable(state.stroke_color_space))
+                try emitPolygonShapeRun(alloc, out, order, state.*, current_path.items, .stroke, current_path_closed.*, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*);
             paint_order.* += 1;
         }
         current_path.clearRetainingCapacity();
@@ -12393,21 +12430,24 @@ fn applyShapeOperator(
         const closed = current_path_closed.* or std.mem.eql(u8, op, "b") or std.mem.eql(u8, op, "b*");
         if (current_path.items.len >= 3) {
             const order = paint_order.*;
-            try emitPolygonShapeRun(
-                alloc,
-                out,
-                order,
-                state.*,
-                current_path.items,
-                .fill,
-                true,
-                if (std.mem.eql(u8, op, "B*") or std.mem.eql(u8, op, "b*")) .even_odd else .nonzero,
-                current_dash.items,
-                dash_phase.*,
-                current_clip_points.items,
-                current_clip_fill_rule.*,
-            );
-            try emitPolygonShapeRun(alloc, out, order, state.*, current_path.items, .stroke, closed, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*);
+            if (try solidShapePaintAvailable(state.fill_color_space)) {
+                try emitPolygonShapeRun(
+                    alloc,
+                    out,
+                    order,
+                    state.*,
+                    current_path.items,
+                    .fill,
+                    true,
+                    if (std.mem.eql(u8, op, "B*") or std.mem.eql(u8, op, "b*")) .even_odd else .nonzero,
+                    current_dash.items,
+                    dash_phase.*,
+                    current_clip_points.items,
+                    current_clip_fill_rule.*,
+                );
+            }
+            if (try solidShapePaintAvailable(state.stroke_color_space))
+                try emitPolygonShapeRun(alloc, out, order, state.*, current_path.items, .stroke, closed, .nonzero, current_dash.items, dash_phase.*, current_clip_points.items, current_clip_fill_rule.*);
             paint_order.* += 1;
         }
         current_path.clearRetainingCapacity();
@@ -13083,7 +13123,11 @@ fn appendTextRunDecodedString(
     else
         estimateDecodedAdvance(decoded, state.*);
     const vertical = if (state.current_font_index) |font_idx| fonts[font_idx].isVertical() else false;
-    if (state.render_mode != 3) switch (out) {
+    const render_mode = switch (out) {
+        .layout => state.render_mode,
+        .render => try effectiveTextRenderMode(state.*),
+    };
+    if (render_mode != 3) switch (out) {
         .layout => |layout_out| {
             const text = try alloc.dupe(u8, decoded);
             errdefer alloc.free(text);
@@ -13135,7 +13179,7 @@ fn appendTextRunDecodedString(
                 .d = basis_y[1],
                 .alpha = state.alpha,
                 .stroke_alpha = state.stroke_alpha,
-                .render_mode = state.render_mode,
+                .render_mode = render_mode,
                 .fill_color = state.fill_color,
                 .stroke_color = state.stroke_color,
                 .stroke_width = state.stroke_width,
@@ -19374,6 +19418,67 @@ test "color space selection uses value state and PDF initial colors" {
 
     selectFillColorSpace(&state, "ResourceBacked");
     try std.testing.expectEqual(ColorSpaceKind.unsupported, state.fill_color_space);
+}
+
+test "pattern color space without scn emits no solid shape" {
+    const alloc = std.testing.allocator;
+    var runs = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+
+    try extractShapeRunsFromContentAppend(alloc, &runs, "/Pattern cs\n0 0 10 10 re\nf\n", &.{}, &.{});
+    try std.testing.expectEqual(@as(usize, 0), runs.items.len);
+}
+
+test "unsupported shape color space fails closed when painted" {
+    const alloc = std.testing.allocator;
+    var runs = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+
+    try std.testing.expectError(
+        error.UnsupportedPdfRendering,
+        extractShapeRunsFromContentAppend(alloc, &runs, "/CS1 cs\n0 0 10 10 re\nf\n", &.{}, &.{}),
+    );
+}
+
+test "pattern color space without scn suppresses only its text paint channel" {
+    const alloc = std.testing.allocator;
+    var runs = std.ArrayList(TextRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+
+    try extractTextRunsFromContentAppend(
+        alloc,
+        &runs,
+        "/Pattern cs\nBT\n(No fill) Tj\n/DeviceGray CS\n2 Tr\n(Stroke) Tj\nET\n",
+        &.{},
+        &.{},
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+    try std.testing.expectEqualStrings("Stroke", runs.items[0].text);
+    try std.testing.expectEqual(@as(i64, 1), runs.items[0].render_mode);
+}
+
+test "unsupported text color space fails closed when painted" {
+    const alloc = std.testing.allocator;
+    var runs = std.ArrayList(TextRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+
+    try std.testing.expectError(
+        error.UnsupportedPdfRendering,
+        extractTextRunsFromContentAppend(alloc, &runs, "/CS1 cs\nBT\n(Unsupported) Tj\nET\n", &.{}, &.{}, &.{}),
+    );
 }
 
 test "reader applies soft mask image alpha" {
