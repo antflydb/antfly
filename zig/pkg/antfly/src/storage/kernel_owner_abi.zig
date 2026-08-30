@@ -1158,6 +1158,8 @@ pub const RestorePrepareRequest = extern struct {
     snapshot_path: BorrowedBytes = .{},
     expected_artifact_size_bytes: u64 = 0,
     expected_artifact_sha256: BorrowedBytes = .{},
+    expected_native_manifest_size_bytes: u64 = 0,
+    expected_native_manifest_sha256: BorrowedBytes = .{},
     manifest_json: BorrowedBytes = .{},
 };
 
@@ -1176,6 +1178,8 @@ pub const RestoreBootstrapRequest = extern struct {
     connection: BorrowedBytes = .{},
     artifact_size_bytes: u64 = 0,
     artifact_sha256: BorrowedBytes = .{},
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: BorrowedBytes = .{},
     required_capability: BorrowedBytes = .{},
     secret_store: ?*anyopaque = null,
     node_config: ?*const anyopaque = null,

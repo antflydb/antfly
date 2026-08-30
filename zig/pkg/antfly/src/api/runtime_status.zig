@@ -1934,8 +1934,8 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .doc_identity = stats.doc_identity,
         .doc_set_planning = stats.doc_set_planning,
         .enrichment = stats.enrichment,
-        .resolution = stats.resolution,
-        .promotion = stats.promotion,
+        .resolution = cloneReplayStageStats(stats.resolution),
+        .promotion = cloneReplayStageStats(stats.promotion),
         .resolver_replay = resolver_replay,
         .ttl_cleanup = stats.ttl_cleanup,
         .transaction_recovery = stats.transaction_recovery,
@@ -1944,6 +1944,41 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .term_doc_freq_cache_misses = stats.term_doc_freq_cache_misses,
         .async_indexing = stats.async_indexing,
     };
+}
+
+fn cloneReplayStageStats(stats: db_mod.types.ReplayStageStats) db_mod.types.ReplayStageStats {
+    var cloned = stats;
+    // Replay reasons are a bounded status vocabulary produced as static
+    // literals by the storage runtime. JSON parsing temporarily points these
+    // slices into the response buffer, so re-intern them before that buffer is
+    // released. Unknown values remain safe and explicit across rolling
+    // versions without inventing ownership inside the base DBStats contract.
+    cloned.blocked_reason = if (stats.blocked_reason.len == 0)
+        ""
+    else if (std.mem.eql(u8, stats.blocked_reason, "not_source_group_leader"))
+        "not_source_group_leader"
+    else if (std.mem.eql(u8, stats.blocked_reason, "missing_entity_sink"))
+        "missing_entity_sink"
+    else
+        "unrecognized_replay_block";
+    return cloned;
+}
+
+test "cloned runtime status stabilizes replay blocked reasons" {
+    const alloc = std.testing.allocator;
+    const resolution_reason = try alloc.dupe(u8, "not_source_group_leader");
+    defer alloc.free(resolution_reason);
+    const promotion_reason = try alloc.dupe(u8, "missing_entity_sink");
+    defer alloc.free(promotion_reason);
+    const cloned = try cloneDBStats(alloc, .{
+        .resolution = .{ .blocked = true, .blocked_reason = resolution_reason },
+        .promotion = .{ .blocked = true, .blocked_reason = promotion_reason },
+    });
+    @memset(resolution_reason, 0xaa);
+    @memset(promotion_reason, 0xaa);
+    defer db_mod.types.freeDBStats(alloc, cloned);
+    try std.testing.expectEqualStrings("not_source_group_leader", cloned.resolution.blocked_reason);
+    try std.testing.expectEqualStrings("missing_entity_sink", cloned.promotion.blocked_reason);
 }
 
 fn publishGroupForTest(

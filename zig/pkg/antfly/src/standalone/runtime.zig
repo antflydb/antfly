@@ -1790,6 +1790,7 @@ pub fn runFromIterator(
 
     const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
     var storage_kernel_context = kernel_owner_client.Context{};
+    defer if (control_only_storage_sources) storage_kernel_context.deinit();
     if (comptime control_only_storage_sources) {
         try storage_kernel_context.ensureWith(.{
             .storage_kind = if (lite_path != null) .lite else .directory,
@@ -1797,8 +1798,10 @@ pub fn runFromIterator(
             .storage_path = .fromSlice(lite_path orelse ""),
             .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
         });
+        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
+        defer alloc.free(security_json);
+        try storage_kernel_context.configureRemoteContentSecurity(security_json);
     }
-    defer if (control_only_storage_sources) storage_kernel_context.deinit();
 
     var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer node_backend_runtime.deinit();

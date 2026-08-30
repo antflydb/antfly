@@ -3249,7 +3249,7 @@ test "data server repair owner cancels and drains through backend runtime" {
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(1),
         .backend_runtime = runtime.ptr(),
         .listener_cfg = undefined,
@@ -3300,7 +3300,7 @@ test "data server rejects replicated transition admission after owner shutdown" 
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(1),
         .backend_runtime = runtime.ptr(),
         .listener_cfg = undefined,
@@ -4288,7 +4288,7 @@ test "runtime status disk usage cache is scoped to one root generation and group
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(1),
         .backend_runtime = runtime.ptr(),
         .listener_cfg = undefined,
@@ -4358,7 +4358,7 @@ test "runtime status disk scan retries across a reallocation fence and group inv
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(1),
         .backend_runtime = runtime.ptr(),
         .listener_cfg = undefined,
@@ -15777,6 +15777,12 @@ pub const DataServer = struct {
                 var context = kernel_owner_client.Context{};
                 try context.ensure();
                 storage_kernel_context = context;
+                const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(
+                    alloc,
+                    cfg.api_server_cfg.remote_content,
+                );
+                defer alloc.free(security_json);
+                try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
             }
         }
 
@@ -19461,14 +19467,17 @@ pub fn runFromIterator(
     defer active_audio_runtime.deinit();
 
     var process_storage_kernel_context: ?StorageKernelContext = null;
+    defer if (process_storage_kernel_context) |*context| context.deinit();
     if (comptime storage_kernel_experiment) {
         var context = kernel_owner_client.Context{};
         try context.ensureWith(.{
             .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
         });
         process_storage_kernel_context = context;
+        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
+        defer alloc.free(security_json);
+        try process_storage_kernel_context.?.configureRemoteContentSecurity(security_json);
     }
-    defer if (process_storage_kernel_context) |*context| context.deinit();
 
     var auth_backend: ?LegacyAuthBackend = null;
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
@@ -21640,7 +21649,7 @@ test "data runtime local group status provider collects and caches group statuse
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -21742,7 +21751,7 @@ test "data runtime raft status changes force immediate store status publication"
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -21785,7 +21794,7 @@ test "data runtime reallocation request refreshes group status once per request"
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -22036,7 +22045,7 @@ test "data runtime local split fallback preserves source identity namespace" {
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -22236,7 +22245,7 @@ test "data runtime split apply store seeding reuses cached source writer" {
             ),
             .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
             .status_source = undefined,
-            .api_server_cfg = undefined,
+            .api_server_cfg = .{},
             .query_async_limit = .limited(8),
             .listener_cfg = undefined,
             .storage_kernel_context = storage_context,
@@ -22282,7 +22291,7 @@ test "data runtime split apply store seeding reuses cached source writer" {
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -22509,7 +22518,7 @@ test "data runtime local merge fallback uses its durable table contract" {
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -22682,7 +22691,7 @@ test "data runtime store status reuses stale cache while refreshing local group 
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -22785,7 +22794,7 @@ test "data runtime store status keeps stale cache and skips local group refresh 
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -22898,7 +22907,7 @@ test "data runtime live local group status skips the active startup group on a c
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -22977,7 +22986,7 @@ test "data runtime local group status does not open roots owned by transitions" 
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -23097,7 +23106,7 @@ test "data runtime store status cold miss schedules a nonblocking refresh" {
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -23176,7 +23185,7 @@ test "data runtime metadata local group status provider does not cold-open inlin
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -23250,7 +23259,7 @@ test "data runtime local group refresh prefers runtime status snapshot over DB o
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -23441,7 +23450,7 @@ test "data runtime background refresh publishes a cold placeholder without DB op
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -23586,7 +23595,7 @@ test "data runtime provisioned cache warmup populates runtime status without pin
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -23792,7 +23801,7 @@ test "data runtime provisioned cache warmup defers while startup catch-up is act
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -23933,7 +23942,7 @@ test "data runtime status refresh preserves only the active catch-up group while
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -24128,7 +24137,7 @@ test "data runtime status refresh publishes and retries an active startup group 
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -24250,7 +24259,7 @@ test "data runtime status refresh publishes synthetic missing status for absent 
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -24370,7 +24379,7 @@ test "data runtime status refresh budget preserves fresh cached group status for
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -24514,7 +24523,7 @@ test "data runtime status refresh reuses managed writer snapshot instead of reop
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -24655,7 +24664,7 @@ test "data runtime status refresh falls back to live managed writer status when 
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -24789,7 +24798,7 @@ test "data runtime status refresh publishes placeholder when live managed writer
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -24855,7 +24864,7 @@ test "data local group status refresh skips active group when cache entry is mis
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -25012,7 +25021,7 @@ test "data runtime status refresh publishes sibling placeholder when only one gr
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -25300,7 +25309,7 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
             fake_catalog.iface(),
         ),
         .status_source = fake_status.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -25469,7 +25478,7 @@ test "data runtime startup catch-up clears dirty bit for terminal degraded index
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -25618,7 +25627,7 @@ test "data runtime startup catch-up clears no-debt busy writer groups" {
                 FakeCatalog.iface(),
             ),
             .status_source = FakeStatus.iface(),
-            .api_server_cfg = undefined,
+            .api_server_cfg = .{},
             .query_async_limit = .limited(8),
             .listener_cfg = undefined,
         };
@@ -25857,7 +25866,7 @@ test "data runtime startup catch-up retries unresolved leadership and observes l
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -25985,7 +25994,7 @@ test "data runtime startup catch-up stays dirty when metadata snapshot is unavai
             EmptyCatalog.iface(),
         ),
         .status_source = NoSnapshotStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -26034,7 +26043,7 @@ test "runtime status observation cannot erase a startup catch-up retry" {
         .read_source = undefined,
         .write_source = undefined,
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -26074,7 +26083,7 @@ test "data runtime defers replica-root reconcile only while startup catch-up own
         .read_source = undefined,
         .write_source = undefined,
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -26102,7 +26111,7 @@ test "data runtime data changes mark provisioned startup catch-up dirty" {
         .read_source = undefined,
         .write_source = undefined,
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -26123,7 +26132,7 @@ test "data runtime reconciled changes invalidate status without scheduling root 
         .read_source = undefined,
         .write_source = undefined,
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -26150,7 +26159,7 @@ test "data runtime repair debt hook targets the affected group queue" {
         .read_source = undefined,
         .write_source = undefined,
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .backend_runtime = runtime.ptr(),
         .listener_cfg = undefined,
@@ -26223,7 +26232,7 @@ test "data runtime repair failures preserve durable backoff and increase retry d
         .read_source = undefined,
         .write_source = undefined,
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -26254,7 +26263,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
         .read_source = undefined,
         .write_source = undefined,
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -26381,7 +26390,7 @@ test "data runtime repair queue links and removes debt in constant time" {
         .read_source = undefined,
         .write_source = undefined,
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -26422,7 +26431,7 @@ test "data runtime structural changes preserve writer-published runtime status a
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -26465,7 +26474,7 @@ test "data runtime structural changes preserve physical root generations" {
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -26569,7 +26578,7 @@ test "data runtime startup catch-up prefers cached admin snapshot" {
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = snapshot_source.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -26617,7 +26626,7 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .backend_runtime = backend_runtime.ptr(),
         .listener_cfg = undefined,
@@ -26677,7 +26686,7 @@ test "data runtime runRound backs off retryable provision metadata failures" {
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .backend_runtime = backend_runtime.ptr(),
         .listener_cfg = undefined,
@@ -26748,7 +26757,7 @@ test "data runtime provisioned root refresh worker backs off retryable metadata 
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .backend_runtime = backend_runtime.ptr(),
         .listener_cfg = undefined,
@@ -26806,7 +26815,7 @@ test "data runtime provisioned root refresh spawn failure preserves retry bookke
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -26930,7 +26939,7 @@ test "data runtime startup catch-up stays dirty when local groups are not visibl
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -27079,7 +27088,7 @@ test "data runtime startup catch-up stays dirty when local leadership is unresol
             FakeCatalog.iface(),
         ),
         .status_source = FakeStatus.iface(),
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -27118,7 +27127,7 @@ test "data runtime startup catch-up spawn failure preserves retry bookkeeping" {
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -31781,7 +31790,7 @@ test "data runtime lsm maintenance scheduler defers under resource pressure" {
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-antfly-data-runtime-maintenance", FakeCatalog.iface()),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };
@@ -31832,7 +31841,7 @@ test "data runtime background maintenance is due for dense posting cadence witho
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-antfly-data-runtime-dense-posting-maintenance", FakeCatalog.iface()),
         .status_source = undefined,
-        .api_server_cfg = undefined,
+        .api_server_cfg = .{},
         .query_async_limit = .limited(8),
         .listener_cfg = undefined,
     };

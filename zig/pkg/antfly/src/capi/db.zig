@@ -70,9 +70,9 @@ const backups_api = antfly.public_api.backups;
 const backup_restore = antfly.raft.storage.backup_restore;
 const common_config = antfly.common_config;
 const common_secrets = antfly.common_secrets;
-const scraping = @import("antfly_scraping");
-const inference_provider_client = @import("../storage/inference_provider_client.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
+const scraping = antfly.scraping;
+const inference_provider_client = antfly.inference_provider_client;
+const managed_embedder = antfly.managed_embedder;
 const raft_catalog = antfly.raft_catalog;
 const Allocator = std.mem.Allocator;
 
@@ -4441,6 +4441,8 @@ const RestoreRequestScope = struct {
             .authority = .staged_local,
             .expected_artifact_size_bytes = request.expected_artifact_size_bytes,
             .expected_artifact_sha256 = request.expected_artifact_sha256.slice(),
+            .expected_native_manifest_size_bytes = request.expected_native_manifest_size_bytes,
+            .expected_native_manifest_sha256 = request.expected_native_manifest_sha256.slice(),
             .manifest = &self.manifest.value,
         };
     }
@@ -4629,6 +4631,8 @@ pub fn storageRestoreApplyBootstrap(
         .connection = request.connection.slice(),
         .artifact_size_bytes = request.artifact_size_bytes,
         .artifact_sha256 = request.artifact_sha256.slice(),
+        .native_manifest_size_bytes = request.native_manifest_size_bytes,
+        .native_manifest_sha256 = request.native_manifest_sha256.slice(),
     };
     backup_restore.applyBackupRestoreFromRecordWithOptions(
         std.heap.c_allocator,
@@ -5500,8 +5504,12 @@ pub fn storageOwnerRuntimeStatusJson(
             handle.alloc,
             handle.storage_owner_group_id,
         ) catch null) orelse 0,
-        .stats = handle.db.runtimeStatusStatsConsistent(handle.alloc) catch |err|
-            return storageOwnerStatusFromError(err),
+        // Runtime status is a periodic observation, not a foreground
+        // consistency barrier. Never retain the shared owner lease while
+        // waiting for an apply writer: structural reconciliation may need its
+        // exclusive lease to advance the exact work holding that writer.
+        .stats = (handle.db.runtimeStatusStatsConsistentIfAvailable(handle.alloc) catch |err|
+            return storageOwnerStatusFromError(err)) orelse return .busy,
         .lsm_storage_stats = .{
             .maintenance = handle.db.snapshotLsmMaintenanceStats(),
             .write = handle.db.snapshotLsmWriteStats(),
@@ -5518,6 +5526,35 @@ pub fn storageOwnerRuntimeStatusJson(
         .len = @intCast(response.len),
     };
     return .ok;
+}
+
+test "storage owner runtime status does not wait behind apply writer" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "storage-owner-runtime-status-busy");
+    defer alloc.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+
+    var handle = Handle{
+        .alloc = alloc,
+        .db = try db_mod.DB.open(alloc, path, .{}),
+        .storage_owner_table_name = @constCast("docs"),
+        .storage_owner_group_id = 7,
+    };
+    defer handle.db.close();
+
+    handle.db.core.lockApplyExclusive();
+    defer handle.db.core.unlockApplyExclusive();
+    var response: kernel_owner_abi.OwnedBytes = .{};
+    try std.testing.expectEqual(
+        kernel_owner_abi.Status.busy,
+        storageOwnerRuntimeStatusJson(
+            &handle,
+            &.{ .table_name = .fromSlice("docs") },
+            &response,
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 0), response.len);
 }
 
 const StorageOwnerObservationCancellation = struct {

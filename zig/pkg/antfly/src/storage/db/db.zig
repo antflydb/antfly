@@ -3770,7 +3770,10 @@ pub const DB = struct {
     // quarantined indexes recover or the DB closes.
     quarantine_retry_thread: ?std.Thread = null,
     quarantine_retry_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    quarantine_retry_start_address_for_test: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    // DB pointers are borrowed by independently compiled runtime units. Keep
+    // the physical layout identical in test and production artifacts even
+    // though only tests observe this diagnostic value.
+    quarantine_retry_start_address_for_test: usize = 0,
     artifact_repair_metadata_future: ?Io.Future(void) = null,
     artifact_repair_metadata_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shadow: ?ShadowState,
@@ -3813,7 +3816,7 @@ pub const DB = struct {
     active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
     shadow_index_repair_hook: ?@This().ShadowIndexRepairHook = null,
     graph_restore_parse_cache: ?GraphRestoreParseCache = null,
-    graph_restore_parse_count_for_test: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    graph_restore_parse_count_for_test: usize = 0,
 
     const IndexRepairDiscoveryObservationTestHook = struct {
         ptr: *anyopaque,

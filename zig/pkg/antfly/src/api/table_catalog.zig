@@ -591,6 +591,112 @@ fn listTableRanges(
     return ranges;
 }
 
+pub const TableGroupDescriptorProjection = struct {
+    table_id: u64,
+    doc_identity_shard_id: u64,
+    doc_identity_range_id: u64,
+    schema_json: []u8,
+    indexes_json: []u8,
+
+    pub fn deinit(self: *TableGroupDescriptorProjection, alloc: std.mem.Allocator) void {
+        alloc.free(self.schema_json);
+        alloc.free(self.indexes_json);
+        self.* = undefined;
+    }
+};
+
+/// Resolve the catalog-owned physical contract for one table group from the
+/// atomically paired table/range projection. Storage owner lifecycle must not
+/// depend on the much larger administrative status snapshot, whose unrelated
+/// runtime projections may legitimately be busy during foreground writes.
+pub fn tableGroupDescriptorProjection(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    deadline_ns: ?u64,
+) !?TableGroupDescriptorProjection {
+    {
+        var snapshot = try catalog.routingSnapshot(deadline_ns);
+        defer catalog.freeRoutingSnapshot(&snapshot);
+        if (findTableByName(snapshot.tables(), table_name)) |table| {
+            for (snapshot.ranges()) |range| {
+                if (range.table_id != table.table_id or range.group_id != group_id) continue;
+                return try descriptorProjectionFromValues(
+                    alloc,
+                    table.table_id,
+                    metadata_table_manager.rangeDocIdentityShardId(range),
+                    metadata_table_manager.rangeDocIdentityRangeId(range),
+                    table.schema_json,
+                    table.indexes_json,
+                );
+            }
+        }
+    }
+
+    // A split destination does not become an active routing range until
+    // cutover, but its immutable descriptor is already captured in the
+    // replicated transition contract. Consult the full lifecycle projection
+    // only on this compact-routing miss; ordinary owner opens stay independent
+    // of the much larger administrative/runtime status snapshot.
+    var admin = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&admin);
+    for (admin.split_transitions) |transition| {
+        if ((transition.source_group_id != group_id and transition.destination_group_id != group_id) or
+            !std.mem.eql(u8, transition.table_contract.table_name, table_name)) continue;
+        try transition.table_contract.validateForSplit();
+        const identity = if (transition.destination_group_id == group_id)
+            transition.table_contract.target_identity
+        else
+            transition.table_contract.source_identity;
+        return try descriptorProjectionFromValues(
+            alloc,
+            transition.table_contract.table_id,
+            identity.shard_id,
+            identity.range_id,
+            transition.table_contract.schema_json,
+            transition.table_contract.indexes_json,
+        );
+    }
+    for (admin.merge_transitions) |transition| {
+        if ((transition.donor_group_id != group_id and transition.receiver_group_id != group_id) or
+            !std.mem.eql(u8, transition.table_contract.table_name, table_name)) continue;
+        try transition.table_contract.validateForMerge(transition.allow_doc_identity_reassignment);
+        const identity = if (transition.receiver_group_id == group_id)
+            transition.table_contract.target_identity
+        else
+            transition.table_contract.source_identity;
+        return try descriptorProjectionFromValues(
+            alloc,
+            transition.table_contract.table_id,
+            identity.shard_id,
+            identity.range_id,
+            transition.table_contract.schema_json,
+            transition.table_contract.indexes_json,
+        );
+    }
+    return null;
+}
+
+fn descriptorProjectionFromValues(
+    alloc: std.mem.Allocator,
+    table_id: u64,
+    doc_identity_shard_id: u64,
+    doc_identity_range_id: u64,
+    schema_json: []const u8,
+    indexes_json: []const u8,
+) !TableGroupDescriptorProjection {
+    const owned_schema_json = try alloc.dupe(u8, schema_json);
+    errdefer alloc.free(owned_schema_json);
+    return .{
+        .table_id = table_id,
+        .doc_identity_shard_id = doc_identity_shard_id,
+        .doc_identity_range_id = doc_identity_range_id,
+        .schema_json = owned_schema_json,
+        .indexes_json = try alloc.dupe(u8, indexes_json),
+    };
+}
+
 pub fn resolveGroupsForSpan(
     alloc: std.mem.Allocator,
     catalog: CatalogSource,
@@ -1013,6 +1119,80 @@ test "span routing uses compact catalog snapshot when available" {
     defer std.testing.allocator.free(groups);
     try std.testing.expectEqualSlices(u64, &.{7001}, groups);
     try std.testing.expect(state.freed);
+}
+
+test "descriptor projection resolves a staged split destination from its transition contract" {
+    const FakeCatalog = struct {
+        const tables = [_]metadata_table_manager.TableRecord{
+            .{ .table_id = 7, .name = "docs", .schema_json = "{\"type\":\"object\"}", .indexes_json = "{}", .placement_role = "data" },
+        };
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+        };
+        const split_transitions = [_]metadata_transition_state.SplitTransitionRecord{.{
+            .transition_id = 99,
+            .attempt_epoch = 1,
+            .source_group_id = 7001,
+            .destination_group_id = 7002,
+            .table_contract = .{
+                .table_id = 7,
+                .table_name = "docs",
+                .schema_json = "{\"type\":\"object\"}",
+                .indexes_json = "{}",
+                .source_identity = .{ .shard_id = 71, .range_id = 72 },
+                .target_identity = .{ .shard_id = 71, .range_id = 72 },
+            },
+        }};
+
+        fn iface() CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = routingSnapshot,
+                    .free_routing_snapshot = freeRoutingSnapshot,
+                },
+            };
+        }
+
+        fn routingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast(split_transitions[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var projection = (try tableGroupDescriptorProjection(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        "docs",
+        7002,
+        null,
+    )).?;
+    defer projection.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 7), projection.table_id);
+    try std.testing.expectEqual(@as(u64, 71), projection.doc_identity_shard_id);
+    try std.testing.expectEqual(@as(u64, 72), projection.doc_identity_range_id);
+    try std.testing.expectEqualStrings("{\"type\":\"object\"}", projection.schema_json);
+    try std.testing.expectEqualStrings("{}", projection.indexes_json);
 }
 
 test "eventual span routing treats snapshot deadline as an empty projection" {

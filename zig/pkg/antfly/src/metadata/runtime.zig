@@ -1039,14 +1039,17 @@ pub fn runFromIterator(
     defer active_audio_runtime.deinit();
 
     var storage_kernel_context: ?StorageKernelContext = null;
+    defer if (storage_kernel_context) |*context| context.deinit();
     if (comptime storage_kernel_experiment) {
         var context = kernel_owner_client.Context{};
         try context.ensureWith(.{
             .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
         });
         storage_kernel_context = context;
+        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
+        defer alloc.free(security_json);
+        try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
     }
-    defer if (storage_kernel_context) |*context| context.deinit();
 
     var auth_backend: ?LegacyAuthBackend = null;
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;

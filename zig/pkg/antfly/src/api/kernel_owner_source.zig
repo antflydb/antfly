@@ -31,7 +31,6 @@ const text_memory = @import("../storage/db/text_memory_stats.zig");
 const ha_replication_record = @import("../storage/ha/replication_record.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const metadata_api = @import("../metadata/api.zig");
-const metadata_table_manager = @import("../metadata/table_manager.zig");
 const backup_contract = @import("backup_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const query_response = @import("query_response.zig");
@@ -107,6 +106,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         indexes_json: []u8,
         owner: client.Owner,
         active_users: usize = 0,
+        /// Writer preference for structural reconciliation. Once an exclusive
+        /// caller observes live readers, new observational/foreground readers
+        /// must stop entering so the existing leases can drain.
+        exclusive_pending: bool = false,
         exclusive_active: bool = false,
         retired: bool = false,
         bulk_ingest_active: std.atomic.Value(bool) = .init(false),
@@ -207,6 +210,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         std.debug.assert(self.context.handle == null);
         self.context.handle = handle;
         self.owns_context = false;
+        // A borrowed process context must be fully configured before any
+        // system store or table owner acquires it. Reconfiguring it lazily
+        // here would race those existing owners and correctly return busy.
+        self.remote_content_configured = true;
         return self;
     }
 
@@ -597,6 +604,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .snapshot_path = .fromSlice(request.shard.snapshot_path),
                 .expected_artifact_size_bytes = request.shard.artifact_size_bytes,
                 .expected_artifact_sha256 = .fromSlice(request.shard.artifact_sha256),
+                .expected_native_manifest_size_bytes = request.shard.native_manifest_size_bytes,
+                .expected_native_manifest_sha256 = .fromSlice(request.shard.native_manifest_sha256),
                 .manifest_json = .fromSlice(manifest_json),
             },
         };
@@ -784,6 +793,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         snapshot_path: []const u8,
         artifact_size_bytes: u64 = 0,
         artifact_sha256: []const u8 = "",
+        native_manifest_size_bytes: u64 = 0,
+        native_manifest_sha256: []const u8 = "",
     };
 
     fn backupTableGroupLocal(
@@ -833,6 +844,11 @@ pub const ProvisionedKernelOwnerSource = struct {
             else
                 "";
             errdefer if (artifact_sha256.len > 0) alloc.free(@constCast(artifact_sha256));
+            const native_manifest_sha256 = if (shard.native_manifest_sha256.len > 0)
+                try alloc.dupe(u8, shard.native_manifest_sha256)
+            else
+                "";
+            errdefer if (native_manifest_sha256.len > 0) alloc.free(@constCast(native_manifest_sha256));
             shards[i] = .{
                 .group_id = shard.group_id,
                 .start_key = start_key,
@@ -840,6 +856,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .snapshot_path = snapshot_path,
                 .artifact_size_bytes = shard.artifact_size_bytes,
                 .artifact_sha256 = artifact_sha256,
+                .native_manifest_size_bytes = shard.native_manifest_size_bytes,
+                .native_manifest_sha256 = native_manifest_sha256,
             };
             initialized += 1;
         }
@@ -1075,13 +1093,13 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         var count: usize = 0;
         for (self.entries.items) |entry| {
-            if (entry.retired or entry.exclusive_active or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
+            if (entry.retired or entry.exclusive_pending or entry.exclusive_active or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
             count += 1;
         }
         const leases = try self.alloc.alloc(Lease, count);
         var initialized: usize = 0;
         for (self.entries.items) |entry| {
-            if (entry.retired or entry.exclusive_active or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
+            if (entry.retired or entry.exclusive_pending or entry.exclusive_active or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
             entry.active_users += 1;
             leases[initialized] = .{ .source = self, .entry = entry, .created = false };
             initialized += 1;
@@ -1195,35 +1213,26 @@ pub const ProvisionedKernelOwnerSource = struct {
         group_id: u64,
         table_name: []const u8,
     ) !LoadedDescriptor {
-        var snapshot = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&snapshot);
-
-        var table_record: ?metadata_table_manager.TableRecord = null;
-        for (snapshot.tables) |table| {
-            if (!std.mem.eql(u8, table.name, table_name)) continue;
-            table_record = table;
-            break;
-        }
-        const table = table_record orelse return error.TableNotFound;
-        for (snapshot.ranges) |range| {
-            if (range.table_id != table.table_id or range.group_id != group_id) continue;
-            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
-            errdefer alloc.free(path);
-            const schema_json = try alloc.dupe(u8, table.schema_json);
-            errdefer alloc.free(schema_json);
-            return .{
-                .path = path,
-                .schema_json = schema_json,
-                .indexes_json = try alloc.dupe(u8, table.indexes_json),
-                .generation = self.visibleRootGeneration(group_id),
-                .identity = .{
-                    .table_id = table.table_id,
-                    .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
-                    .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
-                },
-            };
-        }
-        return error.TableNotFound;
+        var projection = (try table_catalog.tableGroupDescriptorProjection(
+            alloc,
+            self.catalog,
+            table_name,
+            group_id,
+            null,
+        )) orelse return error.TableNotFound;
+        errdefer projection.deinit(alloc);
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        return .{
+            .path = path,
+            .schema_json = projection.schema_json,
+            .indexes_json = projection.indexes_json,
+            .generation = self.visibleRootGeneration(group_id),
+            .identity = .{
+                .table_id = projection.table_id,
+                .shard_id = projection.doc_identity_shard_id,
+                .range_id = projection.doc_identity_range_id,
+            },
+        };
     }
 
     fn acquire(
@@ -1373,6 +1382,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         descriptor: descriptor_contract.Descriptor,
         exclusive: bool,
     ) !Lease {
+        errdefer if (exclusive) self.clearExclusivePending(group_id, table_name);
         var wait_io_impl = std.Io.Threaded.init(self.alloc, .{});
         defer wait_io_impl.deinit();
         const wait_io = wait_io_impl.io();
@@ -1387,6 +1397,33 @@ pub const ProvisionedKernelOwnerSource = struct {
                 else => return err,
             };
         }
+    }
+
+    fn clearExclusivePending(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!entry.exclusive_active) entry.exclusive_pending = false;
+        }
+    }
+
+    fn tryReserveEntryLeaseLocked(entry: *Entry, exclusive: bool) bool {
+        if (entry.exclusive_active or (!exclusive and entry.exclusive_pending)) return false;
+        if (exclusive and entry.active_users != 0) {
+            entry.exclusive_pending = true;
+            return false;
+        }
+        entry.active_users += 1;
+        if (exclusive) {
+            entry.exclusive_pending = false;
+            entry.exclusive_active = true;
+        }
+        return true;
     }
 
     fn acquireDescriptorOnce(
@@ -1425,11 +1462,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 stale_index = index;
                 break;
             }
-            if (entry.exclusive_active or (exclusive and entry.active_users != 0)) {
-                return error.StorageKernelOwnerTransitionRequired;
-            }
-            entry.active_users += 1;
-            if (exclusive) entry.exclusive_active = true;
+            if (!tryReserveEntryLeaseLocked(entry, exclusive)) return error.StorageKernelOwnerTransitionRequired;
             _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
             return .{ .source = self, .entry = entry, .created = false, .exclusive = exclusive };
         }
@@ -1469,6 +1502,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .indexes_json = owned_indexes_json,
             .owner = owner,
             .active_users = 1,
+            .exclusive_pending = false,
             .exclusive_active = exclusive,
         };
         self.entries.appendAssumeCapacity(entry);
@@ -2636,3 +2670,27 @@ pub const ProvisionedKernelOwnerSource = struct {
         return result;
     }
 };
+
+test "pending exclusive storage owner lease blocks new readers until drain" {
+    var entry: ProvisionedKernelOwnerSource.Entry = undefined;
+    entry.active_users = 1;
+    entry.exclusive_pending = false;
+    entry.exclusive_active = false;
+
+    try std.testing.expect(!ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, true));
+    try std.testing.expect(entry.exclusive_pending);
+    try std.testing.expectEqual(@as(usize, 1), entry.active_users);
+
+    // Observational status reads arriving after the writer must not starve it.
+    try std.testing.expect(!ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, false));
+    try std.testing.expectEqual(@as(usize, 1), entry.active_users);
+
+    // Once the original reader drains, the waiting exclusive lease wins and
+    // clears the pending gate while its active gate remains authoritative.
+    entry.active_users = 0;
+    try std.testing.expect(ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, true));
+    try std.testing.expect(!entry.exclusive_pending);
+    try std.testing.expect(entry.exclusive_active);
+    try std.testing.expectEqual(@as(usize, 1), entry.active_users);
+    try std.testing.expect(!ProvisionedKernelOwnerSource.tryReserveEntryLeaseLocked(&entry, false));
+}
