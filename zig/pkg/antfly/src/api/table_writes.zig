@@ -25519,7 +25519,6 @@ fn catchUpManagedDb(
             else
                 db.runUntilIdle();
             idle_result catch |err| {
-                std.log.warn("managed startup catch-up replay idle drain failed table={s} err={}", .{ table_name, err });
                 if (owner == .live_writer and err == error.EnrichmentRetryInProgress) {
                     // The resident asynchronous worker owns provider retry.
                     // Yield this bounded repair pass so partial generations
@@ -25532,6 +25531,7 @@ fn catchUpManagedDb(
                         .index_repair_pending = advance_index_repairs,
                     };
                 }
+                std.log.warn("managed startup catch-up replay idle drain failed table={s} err={}", .{ table_name, err });
                 if (err == error.ArtifactRepairRequired and initial_index_repair_debt) {
                     if (mode == .broad_debt_only) return err;
                     break;
@@ -25579,7 +25579,6 @@ fn catchUpManagedDb(
             else
                 db.runUntilIdle();
             idle_result catch |err| {
-                std.log.warn("managed startup catch-up dense rebuild idle drain failed table={s} err={}", .{ table_name, err });
                 if (owner == .live_writer and err == error.EnrichmentRetryInProgress) {
                     return .{
                         .had_debt = true,
@@ -25589,6 +25588,7 @@ fn catchUpManagedDb(
                         .index_repair_pending = advance_index_repairs,
                     };
                 }
+                std.log.warn("managed startup catch-up dense rebuild idle drain failed table={s} err={}", .{ table_name, err });
                 return err;
             };
             try db.core.index_manager.syncAll(true);
