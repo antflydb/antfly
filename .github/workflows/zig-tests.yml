@@ -196,7 +196,7 @@ jobs:
           fi
 
       - name: Verify Zig toolchain pins
-        run: make zig-toolchain-check
+        run: python3 scripts/ci/verify_zig_toolchain.py
 
   release-tooling:
     name: release-tooling
