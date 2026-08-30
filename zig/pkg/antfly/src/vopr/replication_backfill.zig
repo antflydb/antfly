@@ -162,6 +162,15 @@ pub const Scenario = struct {
         target_rebalanced: bool = false,
         schema_changed: bool = false,
         schema_v2_query_seen: bool = false,
+        source_crash_pending: bool = false,
+        source_crash_injected: bool = false,
+        source_crash_error_code: u64 = 0,
+        source_sessions_opened: u64 = 0,
+        source_sessions_closed: u64 = 0,
+        source_sessions_live: u64 = 0,
+        source_sessions_peak: u64 = 0,
+        source_crash_session: u64 = 0,
+        source_recovery_session: u64 = 0,
         applied_mask: u8 = 0,
         apply_calls: u32 = 0,
         lifecycle_calls: u32 = 0,
@@ -173,6 +182,11 @@ pub const Scenario = struct {
 
         const config_v1 = "[{\"type\":\"postgres\",\"dsn\":\"postgres://vopr\",\"postgres_table\":\"users_v1\",\"key_template\":\"id\"}]";
         const config_v2 = "[{\"type\":\"postgres\",\"dsn\":\"postgres://vopr\",\"postgres_table\":\"users_v2\",\"key_template\":\"id\"}]";
+
+        const SourceSession = struct {
+            fixture: *Fixture,
+            generation: u64,
+        };
 
         fn init(allocator: std.mem.Allocator) !*Fixture {
             const self = try allocator.create(Fixture);
@@ -323,7 +337,11 @@ pub const Scenario = struct {
             switch (self.mode) {
                 .source_crash => if (event.phase == .provider_prepared) {
                     self.fault_armed = false;
-                    return error.ConnectionResetByPeer;
+                    // Arm the actual provider query boundary. Throwing from
+                    // this lifecycle hook would only prove runner recovery
+                    // from a harness callback, not replacement of a failed
+                    // source session.
+                    self.source_crash_pending = true;
                 },
                 .cancellation => if (event.phase == .provider_prepared) {
                     self.fault_armed = false;
@@ -352,8 +370,17 @@ pub const Scenario = struct {
         }
 
         fn sourceFactory(ptr: *anyopaque, allocator: std.mem.Allocator, config: foreign.Config) !foreign.Source {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             allocator.free(config.dsn);
-            return .{ .ptr = ptr, .vtable = &.{
+            const session = try allocator.create(SourceSession);
+            self.source_sessions_opened +|= 1;
+            self.source_sessions_live +|= 1;
+            self.source_sessions_peak = @max(self.source_sessions_peak, self.source_sessions_live);
+            session.* = .{
+                .fixture = self,
+                .generation = self.source_sessions_opened,
+            };
+            return .{ .ptr = session, .vtable = &.{
                 .deinit = sourceDeinit,
                 .query = sourceQuery,
                 .statistics = sourceStatistics,
@@ -362,14 +389,30 @@ pub const Scenario = struct {
             } };
         }
 
-        fn sourceDeinit(_: *anyopaque, _: std.mem.Allocator) void {}
+        fn sourceDeinit(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+            const session: *SourceSession = @ptrCast(@alignCast(ptr));
+            std.debug.assert(session.fixture.source_sessions_live > 0);
+            session.fixture.source_sessions_live -= 1;
+            session.fixture.source_sessions_closed +|= 1;
+            allocator.destroy(session);
+        }
 
         fn sourceStatistics(_: *anyopaque, _: []const u8) !foreign.TableStatistics {
             return .{ .row_count = 2, .size_bytes = 64 };
         }
 
         fn sourceQuery(ptr: *anyopaque, allocator: std.mem.Allocator, params: foreign.QueryParams) !foreign.QueryResult {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const session: *SourceSession = @ptrCast(@alignCast(ptr));
+            const self = session.fixture;
+            if (self.source_crash_pending) {
+                self.source_crash_pending = false;
+                self.source_crash_injected = true;
+                self.source_crash_error_code = @intFromError(error.ConnectionResetByPeer);
+                self.source_crash_session = session.generation;
+                return error.ConnectionResetByPeer;
+            }
+            if (self.source_crash_injected and session.generation > self.source_crash_session)
+                self.source_recovery_session = session.generation;
             if (std.mem.eql(u8, params.table, "users_v2"))
                 self.schema_v2_query_seen = true;
             const rows_json = [_][]const u8{
@@ -539,6 +582,15 @@ pub const Scenario = struct {
             try self.run();
         }
 
+        /// Fail the first provider query after durable preparation, close that
+        /// owned source session, and resume through a newly created session.
+        /// This entry point is shared by focused and deployment histories.
+        pub fn runSourceCrash(self: *@This()) !void {
+            self.mode = .source_crash;
+            self.fault_armed = true;
+            try self.run();
+        }
+
         pub fn completionSound(self: *const @This()) bool {
             return self.complete and self.applied_mask == 7 and
                 self.max_snapshot_checkpoint <= @popCount(self.applied_mask & 3) and
@@ -548,6 +600,18 @@ pub const Scenario = struct {
         pub fn schemaChangeRecoverySound(self: *const @This()) bool {
             return self.completionSound() and self.first_attempt_failed and
                 self.schema_changed and self.schema_v2_query_seen and
+                !self.fault_armed;
+        }
+
+        pub fn sourceCrashRecoverySound(self: *const @This()) bool {
+            return self.completionSound() and self.first_attempt_failed and
+                self.source_crash_injected and !self.source_crash_pending and
+                self.source_crash_error_code == @intFromError(error.ConnectionResetByPeer) and
+                self.source_crash_session == 1 and
+                self.source_recovery_session == 2 and
+                self.source_sessions_opened == 3 and
+                self.source_sessions_closed == self.source_sessions_opened and
+                self.source_sessions_live == 0 and self.source_sessions_peak == 1 and
                 !self.fault_armed;
         }
 
@@ -602,6 +666,14 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".apply-calls", @intCast(world.state.apply_calls));
         try builder.addNamed(allocator, name ++ ".lifecycle-calls", @intCast(world.state.lifecycle_calls));
         try builder.addNamed(allocator, name ++ ".checkpoint", @intCast(world.state.max_snapshot_checkpoint));
+        try builder.addNamed(allocator, name ++ ".source-crash-injected", @intFromBool(world.state.source_crash_injected));
+        try builder.addNamed(allocator, name ++ ".source-crash-error", @intCast(world.state.source_crash_error_code));
+        try builder.addNamed(allocator, name ++ ".source-sessions-opened", @intCast(world.state.source_sessions_opened));
+        try builder.addNamed(allocator, name ++ ".source-sessions-closed", @intCast(world.state.source_sessions_closed));
+        try builder.addNamed(allocator, name ++ ".source-sessions-live", @intCast(world.state.source_sessions_live));
+        try builder.addNamed(allocator, name ++ ".source-sessions-peak", @intCast(world.state.source_sessions_peak));
+        try builder.addNamed(allocator, name ++ ".source-crash-session", @intCast(world.state.source_crash_session));
+        try builder.addNamed(allocator, name ++ ".source-recovery-session", @intCast(world.state.source_recovery_session));
     }
 
     pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: std.mem.Allocator) !void {
@@ -614,7 +686,9 @@ pub const Scenario = struct {
             duplicate_safe_id,
             !state.complete or state.applied_mask == 7,
         );
-        try sink.check(allocator, recovery_id, state.complete and (state.mode == .clean or state.first_attempt_failed));
+        try sink.check(allocator, recovery_id, state.complete and
+            (state.mode == .clean or state.first_attempt_failed) and
+            (state.mode != .source_crash or state.sourceCrashRecoverySound()));
     }
 
     pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
