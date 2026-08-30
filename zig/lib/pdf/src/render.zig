@@ -1478,20 +1478,9 @@ fn drawPatternRun(
     return try drawPatternRunCancelable(alloc, canvas, canvas_w, canvas_h, min_x, max_y, run, .{}, null);
 }
 
-fn drawPatternRunCancelable(
-    alloc: Allocator,
-    canvas: []u8,
-    canvas_w: usize,
-    canvas_h: usize,
-    min_x: f64,
-    max_y: f64,
-    run: reader.PatternRun,
-    cancellation: reader.CancellationProbe,
-    bilevel_sample_budget: ?*BilevelSampleBudget,
-) anyerror!void {
-    const ShapeKind = @FieldType(reader.ShapeRun, "kind");
-    const bounds = shapeRunBounds(.{
-        .kind = if (run.kind == .fill) ShapeKind.fill else ShapeKind.stroke,
+fn patternTargetShape(run: reader.PatternRun) reader.ShapeRun {
+    return .{
+        .kind = if (run.kind == .fill) .fill else .stroke,
         .paint_order = run.paint_order,
         .blend_mode = run.blend_mode,
         .group_id = run.group_id,
@@ -1512,7 +1501,71 @@ fn drawPatternRunCancelable(
         .clip_fill_rule = run.clip_fill_rule,
         .points = run.points,
         .subpath_starts = run.subpath_starts,
-    });
+    };
+}
+
+const ImageAlphaSampler = struct {
+    run: reader.ImageRun,
+    inv_a: f64,
+    inv_b: f64,
+    inv_c: f64,
+    inv_d: f64,
+
+    fn init(run: reader.ImageRun) ?ImageAlphaSampler {
+        const det = run.a * run.d - run.b * run.c;
+        if (@abs(det) < 0.000001) return null;
+        return .{
+            .run = run,
+            .inv_a = run.d / det,
+            .inv_b = -run.b / det,
+            .inv_c = -run.c / det,
+            .inv_d = run.a / det,
+        };
+    }
+
+    fn alphaAt(self: ImageAlphaSampler, world_x: f64, world_y: f64) u8 {
+        const dx = world_x - self.run.e;
+        const dy = world_y - self.run.f;
+        const u = self.inv_a * dx + self.inv_c * dy;
+        const v = self.inv_b * dx + self.inv_d * dy;
+        if (!finite(u) or !finite(v) or u < 0 or u > 1 or v < 0 or v > 1) return 0;
+        if (self.run.interpolate) return bilinearImageSample(self.run, u, 1.0 - v)[3];
+        const sx = @min(self.run.width - 1, @as(u32, @intFromFloat(@floor(u * @as(f64, @floatFromInt(self.run.width))))));
+        const sy = @min(self.run.height - 1, @as(u32, @intFromFloat(@floor((1.0 - v) * @as(f64, @floatFromInt(self.run.height))))));
+        return self.run.rgba[(@as(usize, sy) * @as(usize, self.run.width) + @as(usize, sx)) * 4 + 3];
+    }
+};
+
+fn patternTargetAlpha(run: reader.PatternRun, mask_sampler: ?ImageAlphaSampler, world_x: f64, world_y: f64) u8 {
+    if (mask_sampler) |sampler| return sampler.alphaAt(world_x, world_y);
+    const shape = patternTargetShape(run);
+    const hit = if (run.kind == .fill)
+        pointInShape(world_x, world_y, shape)
+    else
+        pointInStrokeShape(world_x, world_y, shape);
+    return if (hit) 0xff else 0;
+}
+
+fn drawPatternRunCancelable(
+    alloc: Allocator,
+    canvas: []u8,
+    canvas_w: usize,
+    canvas_h: usize,
+    min_x: f64,
+    max_y: f64,
+    run: reader.PatternRun,
+    cancellation: reader.CancellationProbe,
+    bilevel_sample_budget: ?*BilevelSampleBudget,
+) anyerror!void {
+    const mask_sampler = if (run.stencil_mask) |mask| ImageAlphaSampler.init(mask) else null;
+    if (run.stencil_mask != null and mask_sampler == null) return;
+    const bounds: reader.PageBox = if (run.stencil_mask) |mask| blk: {
+        const value = imageRunBounds(mask);
+        break :blk .{ .min_x = value.min_x, .min_y = value.min_y, .max_x = value.max_x, .max_y = value.max_y };
+    } else blk: {
+        const value = shapeRunBounds(patternTargetShape(run));
+        break :blk .{ .min_x = value.min_x, .min_y = value.min_y, .max_x = value.max_x, .max_y = value.max_y };
+    };
     const x0 = floorToCanvas(bounds.min_x - min_x, canvas_w);
     const x1 = ceilToCanvas(bounds.max_x - min_x, canvas_w);
     const y0 = floorToCanvas(max_y - bounds.max_y, canvas_h);
@@ -1529,49 +1582,15 @@ fn drawPatternRunCancelable(
                 const world_x = min_x + (@as(f64, @floatFromInt(px)) + 0.5);
                 const world_y = max_y - (@as(f64, @floatFromInt(py)) + 0.5);
                 if (has_clip and !pointPassesClip(world_x, world_y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
-                const target_hit = if (run.kind == .fill)
-                    pointInShape(world_x, world_y, .{
-                        .kind = .fill,
-                        .color = .{ 0, 0, 0, 0 },
-                        .stroke_width = 0,
-                        .closed = true,
-                        .fill_rule = run.fill_rule,
-                        .points = run.points,
-                        .subpath_starts = run.subpath_starts,
-                    })
-                else blk: {
-                    const tmp: reader.ShapeRun = .{
-                        .kind = .stroke,
-                        .paint_order = run.paint_order,
-                        .blend_mode = run.blend_mode,
-                        .group_id = run.group_id,
-                        .group_parent_id = run.group_parent_id,
-                        .group_isolated = run.group_isolated,
-                        .group_knockout = run.group_knockout,
-                        .fill_rule = run.fill_rule,
-                        .line_cap = run.line_cap,
-                        .line_join = run.line_join,
-                        .miter_limit = run.miter_limit,
-                        .dash_array = run.dash_array,
-                        .dash_phase = run.dash_phase,
-                        .color = .{ 0, 0, 0, 0 },
-                        .stroke_width = run.stroke_width,
-                        .closed = run.closed,
-                        .clip_box = run.clip_box,
-                        .clip_points = run.clip_points,
-                        .clip_fill_rule = run.clip_fill_rule,
-                        .points = run.points,
-                        .subpath_starts = run.subpath_starts,
-                    };
-                    break :blk pointInStrokeShape(world_x, world_y, tmp);
-                };
-                if (!target_hit) continue;
+                const target_alpha = patternTargetAlpha(run, mask_sampler, world_x, world_y);
+                if (target_alpha == 0) continue;
                 const t_opt = switch (shading.kind) {
                     .axial => axialShadingT(world_x, world_y, shading),
                     .radial => radialShadingT(world_x, world_y, shading),
                 };
                 const t = t_opt orelse continue;
-                const color = lerpColor(shading.c0, shading.c1, t);
+                var color = lerpColor(shading.c0, shading.c1, t);
+                color[3] = @intCast((@as(u16, color[3]) * @as(u16, target_alpha) + 127) / 255);
                 blendPixelMode(canvas, (py * canvas_w + px) * 4, color, run.blend_mode);
             }
         }
@@ -1595,43 +1614,8 @@ fn drawPatternRunCancelable(
             const world_x = min_x + (@as(f64, @floatFromInt(px)) + 0.5);
             const world_y = max_y - (@as(f64, @floatFromInt(py)) + 0.5);
             if (has_clip and !pointPassesClip(world_x, world_y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
-            const target_hit = if (run.kind == .fill)
-                pointInShape(world_x, world_y, .{
-                    .kind = .fill,
-                    .color = .{ 0, 0, 0, 0 },
-                    .stroke_width = 0,
-                    .closed = true,
-                    .fill_rule = run.fill_rule,
-                    .points = run.points,
-                    .subpath_starts = run.subpath_starts,
-                })
-            else blk: {
-                const tmp: reader.ShapeRun = .{
-                    .kind = .stroke,
-                    .paint_order = run.paint_order,
-                    .blend_mode = run.blend_mode,
-                    .group_id = run.group_id,
-                    .group_parent_id = run.group_parent_id,
-                    .group_isolated = run.group_isolated,
-                    .group_knockout = run.group_knockout,
-                    .fill_rule = run.fill_rule,
-                    .line_cap = run.line_cap,
-                    .line_join = run.line_join,
-                    .miter_limit = run.miter_limit,
-                    .dash_array = run.dash_array,
-                    .dash_phase = run.dash_phase,
-                    .color = .{ 0, 0, 0, 0 },
-                    .stroke_width = run.stroke_width,
-                    .closed = run.closed,
-                    .clip_box = run.clip_box,
-                    .clip_points = run.clip_points,
-                    .clip_fill_rule = run.clip_fill_rule,
-                    .points = run.points,
-                    .subpath_starts = run.subpath_starts,
-                };
-                break :blk pointInStrokeShape(world_x, world_y, tmp);
-            };
-            if (!target_hit) continue;
+            const target_alpha = patternTargetAlpha(run, mask_sampler, world_x, world_y);
+            if (target_alpha == 0) continue;
 
             const dx = world_x - run.pattern_matrix.e;
             const dy = world_y - run.pattern_matrix.f;
@@ -1657,6 +1641,7 @@ fn drawPatternRunCancelable(
                     @intCast((@as(u16, base_color[3]) * @as(u16, color[3]) + 127) / 255),
                 };
             }
+            color[3] = @intCast((@as(u16, color[3]) * @as(u16, target_alpha) + 127) / 255);
             blendPixelMode(canvas, (py * canvas_w + px) * 4, color, run.blend_mode);
         }
     }
@@ -4024,6 +4009,52 @@ test "draw pattern run tiles colored cell content" {
     try std.testing.expectEqual(@as(u8, 0xff), canvas[right_red + 0]);
     try std.testing.expectEqual(@as(u8, 0x00), canvas[right_red + 1]);
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0xff, 0xff }, canvas[transparent_gap .. transparent_gap + 4]);
+}
+
+test "draw pattern run clips paint through image stencil coverage" {
+    const alloc = std.testing.allocator;
+    var tile_points = [_][2]f64{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
+    var tile_shapes = [_]reader.ShapeRun{.{
+        .kind = .fill,
+        .color = .{ 0xff, 0x00, 0x00, 0xff },
+        .stroke_width = 1,
+        .closed = true,
+        .points = &tile_points,
+    }};
+    var mask_rgba = [_]u8{
+        0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0x00,
+    };
+    const run: reader.PatternRun = .{
+        .kind = .fill,
+        .points = &.{},
+        .stencil_mask = .{
+            .rgba = &mask_rgba,
+            .width = 2,
+            .height = 1,
+            .a = 4,
+            .b = 0,
+            .c = 0,
+            .d = 2,
+            .e = 0,
+            .f = 0,
+            .x = 0,
+            .y = 0,
+            .draw_width = 4,
+            .draw_height = 2,
+        },
+        .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
+        .pattern_x_step = 1,
+        .pattern_y_step = 1,
+        .tile_shape_runs = &tile_shapes,
+    };
+
+    var canvas: [4 * 2 * 4]u8 = undefined;
+    for (0..canvas.len / 4) |pixel| canvas[pixel * 4 ..][0..4].* = .{ 0x00, 0x00, 0xff, 0xff };
+    try drawPatternRun(alloc, &canvas, 4, 2, 0, 2, run);
+
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 0x00, 0xff }, canvas[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0xff, 0xff }, canvas[12..16]);
 }
 
 test "draw pattern run recolors uncolored cell content" {
