@@ -1237,7 +1237,7 @@ test "serverless http client round-trips the table public API routes" {
     try std.testing.expectEqual(serverless.DefaultQueryView.latest, table_policy.policy.default_query_view);
 
     const mutations = [_]serverless.DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-a", .body = "alpha" },
+        .{ .kind = .upsert, .doc_id = "doc-a", .body = "{\"body\":\"alpha\"}" },
     };
     var ingest = try tables_api.ingest("", .{
         .table_name = "docs",
@@ -1272,7 +1272,7 @@ test "serverless http client round-trips the table public API routes" {
     try std.testing.expectEqual(@as(usize, 1), search.value.hits.len);
 
     const next_mutations = [_]serverless.DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-b", .body = "beta" },
+        .{ .kind = .upsert, .doc_id = "doc-b", .body = "{\"body\":\"beta\"}" },
     };
     var next_ingest = try tables_api.ingest("", .{
         .table_name = "docs",

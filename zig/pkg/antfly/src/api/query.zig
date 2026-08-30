@@ -4230,10 +4230,12 @@ test "graph coordinator distinct merge honors configured limits and records the 
         .name = @constCast("people"),
         .aggregates = &aggregates,
         .hits = &.{},
+        .total_hits = 0,
     }};
     const shard_results = [_]db_mod.types.SearchResult{.{
         .alloc = alloc,
         .hits = &.{},
+        .total_hits = 0,
         .graph_results = &graph_results,
     }};
     const aggregate_specs = [_]graph_query_mod.NamedCountAggregate{.{

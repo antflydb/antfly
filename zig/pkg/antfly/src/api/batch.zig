@@ -110,7 +110,7 @@ fn parseBatchRequestWithOptions(
     const writes: []db_mod.types.BatchWrite = writes: {
         if (root.get("inserts")) |inserts| {
             if (inserts == .null) break :writes &.{};
-            const parsed_writes = try parseInserts(alloc, inserts);
+            const parsed_writes = try parseInserts(alloc, inserts, !allow_internal);
             errdefer freeWrites(alloc, parsed_writes);
             break :writes parsed_writes;
         }
@@ -603,7 +603,11 @@ fn parseInternalU64(value: std.json.Value) !u64 {
     };
 }
 
-fn parseInserts(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.BatchWrite {
+fn parseInserts(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    require_document_objects: bool,
+) ![]db_mod.types.BatchWrite {
     if (value != .object) return error.InvalidBatchRequest;
     const inserts = value.object;
     const writes = try alloc.alloc(db_mod.types.BatchWrite, inserts.count());
@@ -618,6 +622,12 @@ fn parseInserts(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types
 
     var it = inserts.iterator();
     while (it.next()) |entry| {
+        // Public BatchRequest.inserts is map[string]object in OpenAPI. Enforce
+        // that contract before storage so every admitted document can be
+        // returned through QueryHit._source. Internal decoding stays opaque to
+        // preserve replay and movement of durable data written by older nodes.
+        if (require_document_objects and entry.value_ptr.* != .object)
+            return error.InvalidBatchRequest;
         writes[initialized] = .{
             .key = try alloc.dupe(u8, entry.key_ptr.*),
             .value = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.*, .{}),
@@ -778,6 +788,29 @@ test "batch parser accepts inserts and deletes" {
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), owned.writes.len);
     try std.testing.expectEqual(@as(usize, 1), owned.deletes.len);
+}
+
+test "public batch parser rejects non-object documents while internal replay remains opaque" {
+    const alloc = std.testing.allocator;
+    inline for (.{
+        \\{"inserts":{"doc:a":"text"}}
+        ,
+        \\{"inserts":{"doc:a":42}}
+        ,
+        \\{"inserts":{"doc:a":[1,2]}}
+        ,
+        \\{"inserts":{"doc:a":null}}
+        ,
+    }) |body| {
+        try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, body));
+    }
+
+    var replay = try parseInternalBatchRequest(alloc,
+        \\{"inserts":{"doc:a":"legacy durable value"}}
+    );
+    defer replay.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), replay.writes.len);
+    try std.testing.expectEqualStrings("\"legacy durable value\"", replay.writes[0].value);
 }
 
 test "batch parser preserves oversized value errors" {
