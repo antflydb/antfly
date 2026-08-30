@@ -73,6 +73,10 @@ pub const Receipt = struct {
 pub const Options = struct {
     max_keys: u32 = 1000,
     max_quiescence_rounds: usize = 8,
+    /// Production seed storage is S3 and must prove that both live objects and
+    /// every historical version/delete marker are gone. Tests using an
+    /// explicitly non-versioned backend may disable this requirement.
+    require_version_purge: bool = true,
     /// Deterministic clock seam for unit tests. Production callers leave null.
     completed_at_override: ?[]const u8 = null,
 };
@@ -142,37 +146,55 @@ pub fn deleteAll(alloc: Allocator, store: Store, request: Request, options: Opti
         .lease => {},
     }
 
-    var deleted_keys = std.StringHashMapUnmanaged(void).empty;
-    defer deinitOwnedSet(alloc, &deleted_keys);
+    var deleted_objects = std.StringHashMapUnmanaged(void).empty;
+    defer deinitOwnedSet(alloc, &deleted_objects);
     var deleted_generations = std.StringHashMapUnmanaged(void).empty;
     defer deinitOwnedSet(alloc, &deleted_generations);
 
     var empty = false;
     var round: usize = 0;
     while (round < options.max_quiescence_rounds) : (round += 1) {
-        const keys = try listAllKeysAlloc(alloc, store, options.max_keys);
-        defer freeKeys(alloc, keys);
-        if (keys.len == 0) {
-            empty = true;
-            break;
-        }
-        for (keys) |key| {
-            // A backend violating the list prefix contract must never be given
-            // a delete call outside the authorized boundary.
-            if (!std.mem.startsWith(u8, key, store.prefix))
-                return error.SeedPrefixCleanupListEscapedPrefix;
-            if (!deleted_keys.contains(key)) try rememberOwned(alloc, &deleted_keys, key);
-            if (generationFromKey(store.prefix, key)) |generation| {
-                if (!deleted_generations.contains(generation))
-                    try rememberOwned(alloc, &deleted_generations, generation);
+        if (options.require_version_purge) {
+            const versions = try listAllObjectVersionsAlloc(alloc, store, options.max_keys);
+            defer freeObjectVersions(alloc, versions);
+            if (versions.len == 0) {
+                empty = true;
+                break;
             }
-            try deleteObjectIfPresent(store, key);
+            for (versions) |version| {
+                try validateListedKey(store.prefix, version.key);
+                const identity = try versionIdentityAlloc(alloc, version.key, version.version_id);
+                defer alloc.free(identity);
+                if (!deleted_objects.contains(identity)) try rememberOwned(alloc, &deleted_objects, identity);
+                try rememberGeneration(alloc, &deleted_generations, store.prefix, version.key);
+                try deleteObjectVersionIfPresent(store, version.key, version.version_id);
+            }
+        } else {
+            const keys = try listAllKeysAlloc(alloc, store, options.max_keys);
+            defer freeKeys(alloc, keys);
+            if (keys.len == 0) {
+                empty = true;
+                break;
+            }
+            for (keys) |key| {
+                try validateListedKey(store.prefix, key);
+                if (!deleted_objects.contains(key)) try rememberOwned(alloc, &deleted_objects, key);
+                try rememberGeneration(alloc, &deleted_generations, store.prefix, key);
+                try deleteObjectIfPresent(store, key);
+            }
         }
     }
     if (!empty) {
-        var remaining = try listFirstPage(alloc, store, options.max_keys);
-        defer remaining.deinit(alloc);
-        if (remaining.entries.len != 0) return error.SeedPrefixCleanupNotQuiescent;
+        if (options.require_version_purge) {
+            var remaining = try listFirstVersionPage(alloc, store, options.max_keys);
+            defer remaining.deinit(alloc);
+            if (remaining.entries.len != 0 or remaining.is_truncated)
+                return error.SeedPrefixCleanupNotQuiescent;
+        } else {
+            var remaining = try listFirstPage(alloc, store, options.max_keys);
+            defer remaining.deinit(alloc);
+            if (remaining.entries.len != 0) return error.SeedPrefixCleanupNotQuiescent;
+        }
         empty = true;
     }
 
@@ -194,7 +216,7 @@ pub fn deleteAll(alloc: Allocator, store: Store, request: Request, options: Opti
         .prefix_sha256 = request.prefix_sha256,
         .request_sha256 = request.request_sha256,
         .deleted_generations = deleted_generations.count(),
-        .deleted_objects = deleted_keys.count(),
+        .deleted_objects = deleted_objects.count(),
         .retained_objects = 0,
         .prefix_empty = empty,
         .complete = empty,
@@ -336,6 +358,61 @@ fn listAllKeysAlloc(alloc: Allocator, store: Store, max_keys: u32) ![][]u8 {
     return try keys.toOwnedSlice(alloc);
 }
 
+fn listAllObjectVersionsAlloc(alloc: Allocator, store: Store, max_keys: u32) ![]object_storage.ObjectVersionEntry {
+    var entries = std.ArrayListUnmanaged(object_storage.ObjectVersionEntry).empty;
+    errdefer freeObjectVersionList(alloc, &entries);
+    var key_marker: ?[]u8 = null;
+    defer if (key_marker) |value| alloc.free(value);
+    var version_id_marker: ?[]u8 = null;
+    defer if (version_id_marker) |value| alloc.free(value);
+    while (true) {
+        var result = try store.client.listObjectVersions(store.bucket, .{
+            .prefix = store.prefix,
+            .key_marker = key_marker,
+            .version_id_marker = version_id_marker,
+            .max_keys = max_keys,
+        });
+        defer result.deinit(alloc);
+        for (result.entries) |entry| {
+            var owned = object_storage.ObjectVersionEntry{
+                .key = try alloc.dupe(u8, entry.key),
+                .version_id = undefined,
+                .is_delete_marker = entry.is_delete_marker,
+            };
+            errdefer alloc.free(owned.key);
+            owned.version_id = try alloc.dupe(u8, entry.version_id);
+            entries.append(alloc, owned) catch |err| {
+                owned.deinit(alloc);
+                return err;
+            };
+        }
+        if (!result.is_truncated) break;
+        const next_key = result.next_key_marker orelse return error.InvalidListVersionsResponse;
+        if (key_marker != null and
+            std.mem.eql(u8, key_marker.?, next_key) and
+            optionalEql(version_id_marker, result.next_version_id_marker))
+        {
+            return error.SeedPrefixCleanupPaginationStalled;
+        }
+        const owned_next_key = try alloc.dupe(u8, next_key);
+        errdefer alloc.free(owned_next_key);
+        const owned_next_version = if (result.next_version_id_marker) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
+        if (key_marker) |value| alloc.free(value);
+        if (version_id_marker) |value| alloc.free(value);
+        key_marker = owned_next_key;
+        version_id_marker = owned_next_version;
+    }
+    return try entries.toOwnedSlice(alloc);
+}
+
+fn optionalEql(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    return std.mem.eql(u8, lhs.?, rhs.?);
+}
+
 fn listFirstPage(alloc: Allocator, store: Store, max_keys: u32) !object_storage.ListResult {
     var client = store.client.*;
     client.allocator = alloc;
@@ -346,11 +423,48 @@ fn listFirstPage(alloc: Allocator, store: Store, max_keys: u32) !object_storage.
     });
 }
 
+fn listFirstVersionPage(alloc: Allocator, store: Store, max_keys: u32) !object_storage.ListObjectVersionsResult {
+    var client = store.client.*;
+    client.allocator = alloc;
+    return try client.listObjectVersions(store.bucket, .{
+        .prefix = store.prefix,
+        .max_keys = max_keys,
+    });
+}
+
 fn deleteObjectIfPresent(store: Store, key: []const u8) !void {
     store.client.deleteObject(store.bucket, key, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NoSuchKey, error.ObjectNotFound => return,
         else => return err,
     };
+}
+
+fn deleteObjectVersionIfPresent(store: Store, key: []const u8, version_id: []const u8) !void {
+    store.client.deleteObject(store.bucket, key, .{ .version_id = version_id }) catch |err| switch (err) {
+        error.FileNotFound, error.NoSuchKey, error.ObjectNotFound => return,
+        else => return err,
+    };
+}
+
+fn validateListedKey(prefix: []const u8, key: []const u8) !void {
+    // A backend violating the list prefix contract must never be given a
+    // delete call outside the authorized boundary.
+    if (!std.mem.startsWith(u8, key, prefix))
+        return error.SeedPrefixCleanupListEscapedPrefix;
+}
+
+fn rememberGeneration(alloc: Allocator, generations: *std.StringHashMapUnmanaged(void), prefix: []const u8, key: []const u8) !void {
+    if (generationFromKey(prefix, key)) |generation| {
+        if (!generations.contains(generation)) try rememberOwned(alloc, generations, generation);
+    }
+}
+
+fn versionIdentityAlloc(alloc: Allocator, key: []const u8, version_id: []const u8) ![]u8 {
+    const identity = try alloc.alloc(u8, key.len + 1 + version_id.len);
+    @memcpy(identity[0..key.len], key);
+    identity[key.len] = 0;
+    @memcpy(identity[key.len + 1 ..], version_id);
+    return identity;
 }
 
 fn generationFromKey(prefix: []const u8, key: []const u8) ?[]const u8 {
@@ -386,6 +500,16 @@ fn freeKeys(alloc: Allocator, keys: [][]u8) void {
 fn freeKeyList(alloc: Allocator, keys: *std.ArrayListUnmanaged([]u8)) void {
     for (keys.items) |key| alloc.free(key);
     keys.deinit(alloc);
+}
+
+fn freeObjectVersions(alloc: Allocator, entries: []object_storage.ObjectVersionEntry) void {
+    for (entries) |*entry| entry.deinit(alloc);
+    alloc.free(entries);
+}
+
+fn freeObjectVersionList(alloc: Allocator, entries: *std.ArrayListUnmanaged(object_storage.ObjectVersionEntry)) void {
+    for (entries.items) |*entry| entry.deinit(alloc);
+    entries.deinit(alloc);
 }
 
 fn isLowerSha256(value: []const u8) bool {

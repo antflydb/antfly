@@ -170,6 +170,13 @@ unbounded retention.
 Configure `standbys[*].seedArtifact` when the source backup and the standby do
 not share a filesystem. The same path is used for initial bootstrap and reseed:
 
+The object-store credentials must permit `ListBucketVersions` and
+`DeleteObjectVersion` in addition to ordinary list/get/put/delete operations.
+When HA is disabled or an instance is deleted, Antfly inventories and deletes
+every version and delete marker below the exact instance seed prefix before it
+publishes a successful cleanup receipt. This remains required for unversioned
+buckets because S3-compatible providers expose the same version-list contract.
+
 1. capture the base backup in the primary runtime and freeze its manifest boundary;
 2. publish every file and bounded chunk to an immutable object-store generation, then publish `COMPLETE.json` last;
 3. reverify the complete remote v3 generation before garbage-collecting old local source captures;
