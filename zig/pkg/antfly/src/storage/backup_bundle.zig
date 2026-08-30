@@ -79,6 +79,34 @@ pub const Manifest = struct {
     blobs: []const BlobDescriptor = &.{},
 };
 
+/// A delta base is one canonical manifest identity, never a caller-assembled
+/// digest plus an unrelated blob list. Writers validate the digest against the
+/// complete manifest before omitting any payload bytes.
+pub const ExactBase = struct {
+    manifest_sha256: []const u8,
+    manifest: Manifest,
+
+    pub fn validate(self: @This(), alloc: std.mem.Allocator) !void {
+        try validateSha256(self.manifest_sha256);
+        const encoded = try encodeManifestAlloc(alloc, self.manifest);
+        defer alloc.free(encoded);
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+        const actual = std.fmt.bytesToHex(digest, .lower);
+        if (!std.mem.eql(u8, &actual, self.manifest_sha256))
+            return error.BackupBaseMismatch;
+    }
+
+    pub fn containsBlob(self: @This(), digest: []const u8) bool {
+        return findBlob(self.manifest.blobs, digest) != null;
+    }
+};
+
+pub const CaptureMode = union(enum) {
+    full,
+    delta: ExactBase,
+};
+
 pub fn encodeManifestAlloc(alloc: std.mem.Allocator, manifest: Manifest) ![]u8 {
     try validateManifest(manifest);
     const encoded = try std.json.Stringify.valueAlloc(alloc, manifest, .{});
@@ -435,6 +463,25 @@ test "AFB2 manifest rejects ambiguous delta and traversal paths" {
     }));
     try std.testing.expectError(error.InvalidBackupPath, validateRelativePath("indexes/../store"));
     try std.testing.expectError(error.InvalidBackupPath, validateRelativePath("/absolute"));
+}
+
+test "AFB2 delta base binds inventory and identity to one canonical manifest" {
+    const alloc = std.testing.allocator;
+    const manifest: Manifest = .{ .representation = .native };
+    const encoded = try encodeManifestAlloc(alloc, manifest);
+    defer alloc.free(encoded);
+    var digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded, &digest_bytes, .{});
+    const digest = std.fmt.bytesToHex(digest_bytes, .lower);
+
+    try (ExactBase{ .manifest_sha256 = &digest, .manifest = manifest }).validate(alloc);
+    try std.testing.expectError(
+        error.BackupBaseMismatch,
+        (ExactBase{
+            .manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+            .manifest = manifest,
+        }).validate(alloc),
+    );
 }
 
 test "AFB2 readers fail closed on declared unsupported payload features" {

@@ -3008,6 +3008,7 @@ pub fn build(b: *std.Build) void {
             "document batch round-trip",
             "AFB2 manifest separates representation from snapshot mode",
             "AFB2 manifest rejects ambiguous delta and traversal paths",
+            "AFB2 delta base binds inventory and identity to one canonical manifest",
             "AFB2 readers fail closed on declared unsupported payload features",
             "AFB2 trailer locates the footer without scanning payloads",
             "AFB2 native directory round trips through staged extraction",
@@ -3019,6 +3020,7 @@ pub fn build(b: *std.Build) void {
             "incremental plan uploads only blobs absent from complete parent",
             "repository incremental upload streams only blobs absent from exact parent",
             "repository publishes resolves and materializes one complete deduplicated snapshot",
+            "repository epoch fences GC and active publication leases retain candidates",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -6619,6 +6621,7 @@ pub fn build(b: *std.Build) void {
             "api http server rejects an empty cluster backup without publishing a manifest",
             "backup manifest validation rejects ambiguous or unbound artifacts",
             "canonical repository file adapter streams blobs and compare-and-swaps refs",
+            "repository remote verification accepts only full-object SHA-256 proofs",
             "cluster backup manifest rejects incomplete coverage",
             "restore source identities are bounded and canonical",
             "portable backup integrity rejects changed staged bytes",

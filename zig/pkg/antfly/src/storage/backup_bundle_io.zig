@@ -66,11 +66,7 @@ pub const PackOptions = struct {
     table_name: []const u8 = "",
     created_at_unix_ns: i64 = 0,
     storage_engine: []const u8 = "antfly-native",
-    mode: bundle.SnapshotMode = .full,
-    parent_manifest_sha256: ?[]const u8 = null,
-    /// Digest-sorted complete base inventory. In delta mode, matching blobs
-    /// remain in the new complete manifest but their bytes are omitted.
-    base_blob_sha256: []const []const u8 = &.{},
+    capture: bundle.CaptureMode = .full,
 };
 
 pub fn readManifestFromFile(
@@ -121,20 +117,21 @@ pub fn packNativePathsToWriter(
     sink: *std.Io.Writer,
     options: PackOptions,
 ) !void {
-    switch (options.mode) {
-        .full => if (options.parent_manifest_sha256 != null or options.base_blob_sha256.len != 0)
-            return error.InvalidBackupManifest,
-        .delta => {
-            try bundle.validateSha256(options.parent_manifest_sha256 orelse return error.InvalidBackupManifest);
-            var previous: ?[]const u8 = null;
-            for (options.base_blob_sha256) |digest| {
-                try bundle.validateSha256(digest);
-                if (previous) |value| if (std.mem.order(u8, value, digest) != .lt)
-                    return error.NonCanonicalBackupManifest;
-                previous = digest;
-            }
+    const snapshot_mode: bundle.SnapshotMode = switch (options.capture) {
+        .full => .full,
+        .delta => |base| blk: {
+            try base.validate(alloc);
+            if (base.manifest.representation != .native or
+                !std.mem.eql(u8, options.backup_id, base.manifest.backup_id) or
+                !std.mem.eql(u8, options.table_name, base.manifest.table_name))
+                return error.BackupBaseMismatch;
+            break :blk .delta;
         },
-    }
+    };
+    const parent_manifest_sha256: ?[]const u8 = switch (options.capture) {
+        .full => null,
+        .delta => |base| base.manifest_sha256,
+    };
     for (selected_roots, 0..) |path, index| {
         try bundle.validateRelativePath(path);
         for (selected_roots[0..index]) |previous| {
@@ -169,7 +166,10 @@ pub fn packNativePathsToWriter(
             .sha256 = file.sha256,
             .size_bytes = file.size_bytes,
             .source_index = source_index,
-            .included = !digestInSortedSet(options.base_blob_sha256, &digest_strings[source_index]),
+            .included = switch (options.capture) {
+                .full => true,
+                .delta => |base| !base.containsBlob(&digest_strings[source_index]),
+            },
         });
     }
     std.mem.sort(SourceBlob, source_blobs.items, {}, struct {
@@ -204,8 +204,8 @@ pub fn packNativePathsToWriter(
         .backup_id = options.backup_id,
         .table_name = options.table_name,
         .representation = .native,
-        .mode = options.mode,
-        .parent_manifest_sha256 = options.parent_manifest_sha256,
+        .mode = snapshot_mode,
+        .parent_manifest_sha256 = parent_manifest_sha256,
         .created_at_unix_ns = options.created_at_unix_ns,
         .compatibility = .{ .storage_engine = options.storage_engine },
         .objects = objects,
@@ -285,20 +285,6 @@ pub fn packNativePathsToWriter(
         .footer_payload_size = footer.len,
     });
     try sink.writeAll(&trailer);
-}
-
-fn digestInSortedSet(sorted: []const []const u8, digest: []const u8) bool {
-    var low: usize = 0;
-    var high: usize = sorted.len;
-    while (low < high) {
-        const mid = low + (high - low) / 2;
-        switch (std.mem.order(u8, sorted[mid], digest)) {
-            .lt => low = mid + 1,
-            .gt => high = mid,
-            .eq => return true,
-        }
-    }
-    return false;
 }
 
 fn collectSourceFiles(
@@ -767,16 +753,14 @@ test "AFB2 native delta requires and resolves the exact parent manifest" {
     Sha256.hash(base_manifest_bytes, &parent_digest_bytes, .{});
     const parent_digest = std.fmt.bytesToHex(parent_digest_bytes, .lower);
 
-    const base_digests = try alloc.alloc([]const u8, base_manifest.value.blobs.len);
-    defer alloc.free(base_digests);
-    for (base_manifest.value.blobs, 0..) |blob, index| base_digests[index] = blob.sha256;
     var delta_archive: std.ArrayList(u8) = .empty;
     defer delta_archive.deinit(alloc);
     var delta_writer = std.Io.Writer.Allocating.fromArrayList(alloc, &delta_archive);
     try packNativeDirectoryToWriter(alloc, io, child_root, &delta_writer.writer, .{
-        .mode = .delta,
-        .parent_manifest_sha256 = &parent_digest,
-        .base_blob_sha256 = base_digests,
+        .capture = .{ .delta = .{
+            .manifest_sha256 = &parent_digest,
+            .manifest = base_manifest.value,
+        } },
     });
     delta_archive = delta_writer.toArrayList();
     const delta_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/delta.afb", .{tmp.sub_path});

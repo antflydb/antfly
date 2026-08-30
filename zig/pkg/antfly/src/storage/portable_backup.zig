@@ -191,10 +191,7 @@ pub const ExportOptions = struct {
     backup_id: []const u8 = "",
     table_name: []const u8 = "",
     created_at_unix_ns: i64 = 0,
-    mode: backup_bundle.SnapshotMode = .full,
-    parent_manifest_sha256: ?[]const u8 = null,
-    /// Digest-sorted complete base inventory.
-    base_blob_sha256: []const []const u8 = &.{},
+    capture: backup_bundle.CaptureMode = .full,
 };
 
 pub fn exportPortableToWriterWithOptions(
@@ -203,21 +200,21 @@ pub fn exportPortableToWriterWithOptions(
     sink_writer: *std.Io.Writer,
     options: ExportOptions,
 ) !void {
-    switch (options.mode) {
-        .full => if (options.parent_manifest_sha256 != null or options.base_blob_sha256.len != 0)
-            return error.InvalidBackupManifest,
-        .delta => {
-            try backup_bundle.validateSha256(options.parent_manifest_sha256 orelse
-                return error.InvalidBackupManifest);
-            var previous: ?[]const u8 = null;
-            for (options.base_blob_sha256) |digest| {
-                try backup_bundle.validateSha256(digest);
-                if (previous) |value| if (std.mem.order(u8, value, digest) != .lt)
-                    return error.NonCanonicalBackupManifest;
-                previous = digest;
-            }
+    const snapshot_mode: backup_bundle.SnapshotMode = switch (options.capture) {
+        .full => .full,
+        .delta => |base| blk: {
+            try base.validate(alloc);
+            if (base.manifest.representation != .portable or
+                !std.mem.eql(u8, options.backup_id, base.manifest.backup_id) or
+                !std.mem.eql(u8, options.table_name, base.manifest.table_name))
+                return error.BackupBaseMismatch;
+            break :blk .delta;
         },
-    }
+    };
+    const parent_manifest_sha256: ?[]const u8 = switch (options.capture) {
+        .full => null,
+        .delta => |base| base.manifest_sha256,
+    };
     var scan = try store.beginReadTxn();
     defer scan.abort();
 
@@ -272,15 +269,18 @@ pub fn exportPortableToWriterWithOptions(
             .sha256 = &blob_digest_strings[index],
             .logical_size_bytes = blob.size_bytes,
             .stored_size_bytes = blob.size_bytes,
-            .included = !digestInSortedStringSet(options.base_blob_sha256, &blob_digest_strings[index]),
+            .included = switch (options.capture) {
+                .full => true,
+                .delta => |base| !base.containsBlob(&blob_digest_strings[index]),
+            },
         };
     }
     const manifest = try backup_bundle.encodeManifestAlloc(alloc, .{
         .backup_id = options.backup_id,
         .table_name = options.table_name,
         .representation = .portable,
-        .mode = options.mode,
-        .parent_manifest_sha256 = options.parent_manifest_sha256,
+        .mode = snapshot_mode,
+        .parent_manifest_sha256 = parent_manifest_sha256,
         .created_at_unix_ns = options.created_at_unix_ns,
         .compatibility = .{ .storage_engine = "logical" },
         .objects = descriptors,
@@ -331,20 +331,6 @@ pub fn exportPortableToWriterWithOptions(
         .footer_payload_size = footer_payload.len,
     });
     try sink_writer.writeAll(&trailer);
-}
-
-fn digestInSortedStringSet(sorted: []const []const u8, digest: []const u8) bool {
-    var low: usize = 0;
-    var high: usize = sorted.len;
-    while (low < high) {
-        const mid = low + (high - low) / 2;
-        switch (std.mem.order(u8, sorted[mid], digest)) {
-            .lt => low = mid + 1,
-            .gt => high = mid,
-            .eq => return true,
-        }
-    }
-    return false;
 }
 
 fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutput) !void {
@@ -2443,10 +2429,6 @@ test "portable AFB2 delta resolves exact base and deduplicates physical blobs" {
     var parent_digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(manifest_block.payload, &parent_digest_bytes, .{});
     const parent_digest = std.fmt.bytesToHex(parent_digest_bytes, .lower);
-    const base_digests = try alloc.alloc([]const u8, base_manifest.value.blobs.len);
-    defer alloc.free(base_digests);
-    for (base_manifest.value.blobs, 0..) |blob, index| base_digests[index] = blob.sha256;
-
     const second_key = try internal_keys.documentKeyAlloc(alloc, "doc2");
     defer alloc.free(second_key);
     try src.putBatch(&.{.{ .key = second_key, .value = "{\"id\":\"doc2\"}" }}, &.{});
@@ -2454,9 +2436,10 @@ test "portable AFB2 delta resolves exact base and deduplicates physical blobs" {
     defer delta_archive.deinit(alloc);
     var delta_writer = std.Io.Writer.Allocating.fromArrayList(alloc, &delta_archive);
     try exportPortableToWriterWithOptions(alloc, &src, &delta_writer.writer, .{
-        .mode = .delta,
-        .parent_manifest_sha256 = &parent_digest,
-        .base_blob_sha256 = base_digests,
+        .capture = .{ .delta = .{
+            .manifest_sha256 = &parent_digest,
+            .manifest = base_manifest.value,
+        } },
     });
     delta_archive = delta_writer.toArrayList();
     try std.testing.expectError(error.BackupBaseRequired, validatePortable(alloc, delta_archive.items));

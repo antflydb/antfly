@@ -90,24 +90,38 @@ pins that immutable manifest digest, downloads each unique blob once into a
 private staging cache, rehashes it, materializes all logical objects, and only
 then permits the owner to publish the generation.
 
-Refs are published with compare-and-swap semantics after all immutable objects
-are durable. Garbage collection marks manifests and blobs reachable from refs
-and active leases, then applies a grace period before deletion. Failed writers
-cannot expose partial snapshots, and concurrent writers cannot silently replace
-one another.
+Refs are published with compare-and-swap semantics through a fenced publication
+session. The session first installs the immutable candidate manifest and a
+durable lease naming that exact digest. Each newly required blob upload returns
+a backend-issued receipt bound to the session fence and to the verified object
+generation. Finalization accepts the complete receipt set, consumes the lease,
+and conditionally publishes the ref while holding the repository coordinator.
+It does not issue one remote existence request per blob.
+
+Garbage collection marks manifests and blobs reachable from refs and active
+leases at one repository epoch, then applies a grace period before deletion.
+Every lease/ref transition advances that epoch and every deletion rechecks it
+under the same coordinator. A publication that races an old mark therefore
+forces that sweep to restart instead of deleting its candidate artifacts.
+Failed writers cannot expose partial snapshots, stale writers are fenced, and
+concurrent writers cannot silently replace one another.
 
 Publication order is part of the durability contract:
 
-1. stream and verify all missing `blobs/sha256/<digest>` objects with
-   create-if-absent semantics;
-2. write canonical manifest JSON to `manifests/<digest>` immutably;
-3. conditionally update `refs/<backup-id>` with the expected prior digest and
-   generation.
+1. validate a full capture or a typed exact base whose digest is recomputed
+   from its canonical manifest;
+2. write the candidate manifest immutably and activate its fenced lease;
+3. stream only newly required `blobs/sha256/<digest>` objects with
+   create-if-absent semantics, keeping the source file generation pinned and
+   post-verifying the stored object generation;
+4. validate the backend receipts, consume the lease, and conditionally update
+   `refs/<backup-id>` with the expected prior digest and generation.
 
-A crash before step 3 leaves unreachable immutable content but no visible
+A crash before step 4 leaves unreachable immutable content but no visible
 partial backup. Competing writers cannot silently replace one another. GC marks
 from live refs and unexpired restore/export leases, follows parent links for
-retention, and deletes only unmarked objects older than a grace cutoff.
+retention, and deletes only unmarked objects older than a grace cutoff from the
+same stable repository epoch.
 
 `.afb` is the transport layer over that model:
 
@@ -119,11 +133,13 @@ retention, and deletes only unmarked objects older than a grace cutoff.
   fixed-size checksummed trailer locates that footer without scanning payloads.
 - AFB2 `full` is self-contained and is the normal offline/superquickstart
   artifact.
-- AFB2 `delta` declares an immutable base-manifest digest and carries only
-  absent blobs. Both native and portable readers require an exact matching base
-  provider, rehash every supplied base blob, and reject missing or mismatched
-  bases. Delta manifests remain complete inventories; only their physical
-  payload is partial.
+- AFB2 `delta` accepts one typed exact base containing the immutable canonical
+  base manifest and its digest; callers cannot independently assemble a parent
+  digest and a blob inventory. Writers recompute that identity before omitting
+  bytes. Both native and portable readers require the same exact matching base,
+  rehash every supplied base blob, and reject missing or mismatched bases.
+  Delta manifests remain complete inventories; only their physical payload is
+  partial.
 - Native and portable are manifest values, never inferred from file extension
   or CLI flags during restore.
 - Compression and encryption are declared capabilities, not hints. Current

@@ -34,13 +34,20 @@ without losing native filenames. Parent links make incremental capture,
 accounting, and reachability GC efficient; repository restore pins one immutable
 manifest and does not replay a parent chain.
 
+Repository publication is a fenced session: an immutable candidate manifest
+is leased before upload, verified blob generations produce fence-bound
+receipts, and finalization consumes those receipts without an O(total blobs)
+remote existence scan. Lease/ref changes advance a repository epoch, so a GC
+sweep can delete only from the stable epoch it marked.
+
 `.afb` is the Antfly Backup Bundle transport envelope. AFB1 remains readable as
 the v0.2.0 portable stream. AFB2 identifies native versus portable and full
 versus delta in its manifest, stores digest-addressed blobs, and ends with a
 digest-to-offset index plus a fixed-size checksummed locator trailer. Full
 bundles carry every unique digest once. Delta
-bundles carry only digests absent from an exact declared base; native and
-portable import both fail closed without that base and rehash resolved content.
+bundles carry only digests absent from one typed exact base whose canonical
+manifest hashes to the declared identity; native and portable import both fail
+closed without that base and rehash resolved content.
 A self-contained native AFB2 is therefore a transport for an already validated
 native generation, not a new storage engine.
 
