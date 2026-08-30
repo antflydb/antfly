@@ -99,6 +99,10 @@ pub const GeneratedEnrichmentRequest = struct {
     chunk_overlap: u32 = 0,
     chunker_json: []const u8 = "",
     full_text_index: bool = false,
+    /// Persist generated chunk records even when no text index consumes them.
+    /// Graph indexes read their source payloads from the artifact store, while
+    /// embedding-only consumers can usually reuse the in-flight chunk cache.
+    persist_artifact: bool = false,
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
     execution_json: []const u8 = "",
@@ -168,6 +172,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .chunk_overlap = request.chunk_overlap,
         .chunker_json = chunker_json,
         .full_text_index = request.full_text_index,
+        .persist_artifact = request.persist_artifact,
         .content_type = content_type,
         .producer_json = producer_json,
         .execution_json = execution_json,
@@ -303,6 +308,7 @@ test "generated enrichment request clone round trip" {
             .chunk_size = 512,
             .chunk_overlap = 64,
             .chunker_json = "{\"provider\":\"antfly\",\"text\":{\"target_tokens\":512,\"overlap_tokens\":64}}",
+            .persist_artifact = true,
         },
     });
     defer deinitGeneratedRequests(alloc, cloned);
@@ -318,6 +324,7 @@ test "generated enrichment request clone round trip" {
     try std.testing.expectEqual(@as(u32, 512), cloned[0].chunk_size);
     try std.testing.expectEqual(@as(u32, 64), cloned[0].chunk_overlap);
     try std.testing.expectEqualStrings("{\"provider\":\"antfly\",\"text\":{\"target_tokens\":512,\"overlap_tokens\":64}}", cloned[0].chunker_json);
+    try std.testing.expect(cloned[0].persist_artifact);
 }
 
 test "generated enrichment request clone without source_template" {

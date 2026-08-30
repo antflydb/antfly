@@ -32,6 +32,9 @@ class TableRepairIssue:
             last_seen_ns (int): Monotonic timestamp when this issue was last observed or attempted.
             parent_doc_key (str | Unset): Parent source document key for chunk-derived artifacts.
             unit_id (str | Unset): Unit identifier for unit-scoped artifacts, when applicable.
+            index_source_artifact_name (str | Unset): Canonical artifact stream configured on the affected index. This is
+                the authoritative source-readiness identity and is distinct from the producer input and the derived artifact
+                being repaired.
             source_artifact_name (str | Unset): Source artifact stream used to produce this artifact, when applicable.
             artifact_key (str | Unset): Hex-encoded internal artifact storage key, when known.
             chunk_id (int | None | Unset): Chunk ordinal for chunk-derived artifacts.
@@ -53,6 +56,7 @@ class TableRepairIssue:
     last_seen_ns: int
     parent_doc_key: str | Unset = UNSET
     unit_id: str | Unset = UNSET
+    index_source_artifact_name: str | Unset = UNSET
     source_artifact_name: str | Unset = UNSET
     artifact_key: str | Unset = UNSET
     chunk_id: int | None | Unset = UNSET
@@ -87,6 +91,8 @@ class TableRepairIssue:
         parent_doc_key = self.parent_doc_key
 
         unit_id = self.unit_id
+
+        index_source_artifact_name = self.index_source_artifact_name
 
         source_artifact_name = self.source_artifact_name
 
@@ -125,6 +131,8 @@ class TableRepairIssue:
             field_dict["parent_doc_key"] = parent_doc_key
         if unit_id is not UNSET:
             field_dict["unit_id"] = unit_id
+        if index_source_artifact_name is not UNSET:
+            field_dict["index_source_artifact_name"] = index_source_artifact_name
         if source_artifact_name is not UNSET:
             field_dict["source_artifact_name"] = source_artifact_name
         if artifact_key is not UNSET:
@@ -169,6 +177,8 @@ class TableRepairIssue:
 
         unit_id = d.pop("unit_id", UNSET)
 
+        index_source_artifact_name = d.pop("index_source_artifact_name", UNSET)
+
         source_artifact_name = d.pop("source_artifact_name", UNSET)
 
         artifact_key = d.pop("artifact_key", UNSET)
@@ -202,6 +212,7 @@ class TableRepairIssue:
             last_seen_ns=last_seen_ns,
             parent_doc_key=parent_doc_key,
             unit_id=unit_id,
+            index_source_artifact_name=index_source_artifact_name,
             source_artifact_name=source_artifact_name,
             artifact_key=artifact_key,
             chunk_id=chunk_id,

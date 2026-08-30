@@ -37,6 +37,11 @@ import {
   MultiSelectContent,
   MultiSelectItem,
   MultiSelectTrigger,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
   Sheet,
   SheetContent,
   SheetHeader,
@@ -60,13 +65,14 @@ import { ReloadIcon } from "@radix-ui/react-icons";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, type TableSchema } from "../api";
+import type { TableSchema } from "../api";
 import AggregationResults from "../components/AggregationResults";
 import AIQueryAssistant from "../components/AIQueryAssistant";
-import CreateIndexDialog from "../components/CreateIndexDialog";
+import CreateIndexDialog, {
+  type ArtifactSourcesCapabilityState,
+} from "../components/CreateIndexDialog";
 import DocumentBuilder from "../components/DocumentBuilder";
 import { GraphIndexExplorer } from "../components/GraphIndexExplorer";
-
 import BulkInsert from "../components/Insert";
 import JsonViewer from "../components/JsonViewer";
 import FieldSelector from "../components/querybuilder/FieldSelector";
@@ -76,6 +82,7 @@ import SearchBoxBuilder from "../components/SearchBoxBuilder";
 import DocumentSchemasForm from "../components/schema-builder/DocumentSchemasForm";
 import { DocumentArtifactsPanel } from "../components/table/DocumentArtifactsPanel";
 import { TableReprocessPanel } from "../components/table/TableReprocessPanel";
+import { useApi } from "../hooks/use-api-config";
 import {
   type BasicField,
   generateBasicFields,
@@ -242,11 +249,13 @@ interface TableDetailsPageProps {
 
 const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "overview" }) => {
   const theme = localStorage.getItem("theme") || "light";
+  const client = useApi();
   const { tableName } = useParams<{ tableName: string }>();
   const activeTableName = useRef(tableName);
   activeTableName.current = tableName;
   const indexesRequestSequence = useRef(0);
   const tableMetadataRequestSequence = useRef(0);
+  const artifactSourcesCapabilityRequestSequence = useRef(0);
   const queryAbortController = useRef<AbortController | null>(null);
   const navigate = useNavigate();
   const [indexes, setIndexes] = useState<IndexStatus[]>([]);
@@ -260,15 +269,55 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [migration, setMigration] = useState<AntflyTable["migration"]>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [openCreateDialog, setOpenCreateDialog] = useState(false);
+  const [artifactSourcesSupported, setArtifactSourcesSupported] = useState<boolean | undefined>(
+    undefined
+  );
+  const [artifactSourcesState, setArtifactSourcesState] =
+    useState<ArtifactSourcesCapabilityState>();
+  const [artifactSourcesCapabilityError, setArtifactSourcesCapabilityError] = useState(false);
   const [openDropDialog, setOpenDropDialog] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState<IndexStatus | null>(null);
   const [query, setQuery] = useState("");
   const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
   const [queryIndexes, setQueryIndexes] = useState<string[]>([]);
+  const [fullTextIndex, setFullTextIndex] = useState("");
   const [filterQuery, setFilterQuery] = useState(JSON.stringify({}, null, 2));
   const [semanticQuery, setSemanticQuery] = useState(JSON.stringify({}, null, 2));
   const [selectedFields, setSelectedFields] = useState<string[]>([]);
   const [includeProfile, setIncludeProfile] = useState(false);
+
+  const refreshArtifactSourcesCapability = useCallback(() => {
+    const requestSequence = ++artifactSourcesCapabilityRequestSequence.current;
+    setArtifactSourcesSupported(undefined);
+    setArtifactSourcesState(undefined);
+    setArtifactSourcesCapabilityError(false);
+    void client
+      .getStatus()
+      .then((status) => {
+        if (requestSequence === artifactSourcesCapabilityRequestSequence.current) {
+          const capabilities = status.index_capabilities;
+          const supported = capabilities?.artifact_sources === true;
+          setArtifactSourcesSupported(supported);
+          setArtifactSourcesState(
+            capabilities?.artifact_sources_state ?? (supported ? "available" : "unsupported")
+          );
+          setArtifactSourcesCapabilityError(false);
+        }
+      })
+      .catch(() => {
+        if (requestSequence === artifactSourcesCapabilityRequestSequence.current) {
+          setArtifactSourcesSupported(undefined);
+          setArtifactSourcesCapabilityError(true);
+        }
+      });
+  }, [client]);
+
+  useEffect(() => {
+    refreshArtifactSourcesCapability();
+    return () => {
+      artifactSourcesCapabilityRequestSequence.current++;
+    };
+  }, [refreshArtifactSourcesCapability]);
 
   // Derive search modes from input content instead of toggles
   const hasSemanticQuery = query.trim().length > 0 && queryIndexes.length > 0;
@@ -287,8 +336,9 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [queryMode, setQueryMode] = useState<"builder" | "json">("builder");
 
   const artifactRetrieval = useMemo(
-    () => builderArtifactRetrievalDefaults(indexes, query, queryIndexes, tableStatus),
-    [indexes, query, queryIndexes, tableStatus]
+    () =>
+      builderArtifactRetrievalDefaults(indexes, query, queryIndexes, tableStatus, fullTextIndex),
+    [indexes, query, queryIndexes, tableStatus, fullTextIndex]
   );
   const artifactSelectionError = hasSemanticQuery ? artifactRetrieval?.selectionError : undefined;
   const queryMetadataBlocker = tableQueryMetadataBlocker(indexesMetadataState, tableMetadataState);
@@ -301,6 +351,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     return buildTableQueryRequest({
       query,
       queryIndexes,
+      fullTextIndex,
       selectedFields,
       semanticQuery,
       filterQuery,
@@ -313,6 +364,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   }, [
     query,
     queryIndexes,
+    fullTextIndex,
     filterQuery,
     semanticQuery,
     selectedFields,
@@ -348,6 +400,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         const nextQueryIndexes = Array.isArray(queryRequest.indexes)
           ? queryRequest.indexes.filter((index): index is string => typeof index === "string")
           : [];
+        const nextFullTextIndex =
+          typeof queryRequest.full_text_index === "string" ? queryRequest.full_text_index : "";
         const nextSelectedFields = Array.isArray(queryRequest.fields)
           ? queryRequest.fields.filter((field): field is string => typeof field === "string")
           : [];
@@ -372,6 +426,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         const rebuilt = buildTableQueryRequest({
           query: nextQuery,
           queryIndexes: nextQueryIndexes,
+          fullTextIndex: nextFullTextIndex,
           selectedFields: nextSelectedFields,
           semanticQuery: nextSemanticQuery,
           filterQuery: nextFilterQuery,
@@ -388,6 +443,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         }
 
         setQueryIndexes(nextQueryIndexes);
+        setFullTextIndex(nextFullTextIndex);
         setSelectedFields(nextSelectedFields);
         setIncludeProfile(queryRequest.profile === true);
         setFieldInput("");
@@ -409,7 +465,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     const requestSequence = ++indexesRequestSequence.current;
     setIndexesMetadataState("loading");
     try {
-      const response = await api.indexes.list(tableName);
+      const response = await client.indexes.list(tableName);
       if (
         activeTableName.current !== tableName ||
         requestSequence !== indexesRequestSequence.current
@@ -422,8 +478,14 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
           .filter((index) => index.config.type === "embeddings")
           .map((index) => index.config.name)
       );
+      const liveFullTextIndexes = new Set(
+        nextIndexes
+          .filter((index) => index.config.type === "full_text")
+          .map((index) => index.config.name)
+      );
       setIndexes(nextIndexes);
       setQueryIndexes((current) => current.filter((name) => liveVectorIndexes.has(name)));
+      setFullTextIndex((current) => (current && liveFullTextIndexes.has(current) ? current : ""));
       setIndexesMetadataState("ready");
     } catch (e) {
       if (
@@ -435,7 +497,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       setError(`Failed to fetch indexes for table ${tableName}.`);
       console.error(e);
     }
-  }, [tableName]);
+  }, [client, tableName]);
 
   const fetchTableSchema = useCallback(async () => {
     if (!tableName) return;
@@ -443,7 +505,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     const requestSequence = ++tableMetadataRequestSequence.current;
     setTableMetadataState("loading");
     try {
-      const response = await api.tables.get(tableName);
+      const response = await client.tables.get(tableName);
       if (
         activeTableName.current !== tableName ||
         requestSequence !== tableMetadataRequestSequence.current
@@ -471,7 +533,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       setError(tableQueryErrorMessage(e, `Failed to fetch table metadata for ${tableName}.`));
       console.error(e);
     }
-  }, [tableName]);
+  }, [client, tableName]);
 
   const fetchDocumentCount = useCallback(async () => {
     if (!tableName) return;
@@ -480,7 +542,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       return;
     }
     try {
-      const response = await api.tables.query(tableName, {
+      const response = await client.tables.query(tableName, {
         filter_query: { match_all: {} },
         count: true,
         limit: 0,
@@ -491,7 +553,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       if (activeTableName.current !== tableName) return;
       setDocumentCount(null);
     }
-  }, [storageStatus?.empty, tableName]);
+  }, [client, storageStatus?.empty, tableName]);
 
   useEffect(() => {
     fetchIndexes();
@@ -520,6 +582,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     setQuery("");
     setQueryResult(null);
     setQueryIndexes([]);
+    setFullTextIndex("");
     setFilterQuery(JSON.stringify({}, null, 2));
     setSemanticQuery(JSON.stringify({}, null, 2));
     setSelectedFields([]);
@@ -554,8 +617,9 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     if (!tableName || !selectedIndex) return;
     try {
       const droppedIndexName = selectedIndex.config.name;
-      await api.indexes.drop(tableName, droppedIndexName);
+      await client.indexes.drop(tableName, droppedIndexName);
       setQueryIndexes((current) => current.filter((name) => name !== droppedIndexName));
+      setFullTextIndex((current) => (current === droppedIndexName ? "" : current));
       await refreshQueryMetadata();
       handleCloseDropDialog();
     } catch (e) {
@@ -570,6 +634,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
 
   const handleQueryIndexChange = (value: string[]) => {
     setQueryIndexes(value);
+  };
+
+  const handleFullTextIndexChange = (value: string) => {
+    setFullTextIndex(value === "__active_schema__" ? "" : value);
   };
 
   const handleRunQuery = useCallback(async () => {
@@ -596,7 +664,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         setError("The query editor must contain one JSON object.");
         return;
       }
-      const response = await api.tables.query(tableName, queryRequest, {
+      const response = await client.tables.query(tableName, queryRequest, {
         signal: controller.signal,
       });
       if (
@@ -621,6 +689,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       }
     }
   }, [
+    client,
     tableName,
     queryMode,
     parsedJsonQuery,
@@ -711,7 +780,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         version: 0, // Default version to 0 if not specified
         ...schema,
       };
-      await api.tables.updateSchema(tableName, schemaWithVersion);
+      await client.tables.updateSchema(tableName, schemaWithVersion);
       fetchTableSchema();
       setIsEditingSchema(false);
     } catch (error) {
@@ -1243,6 +1312,39 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                               </p>
                             )}
                           </div>
+                          {indexes.some((idx) => idx.config.type === "full_text") && (
+                            <div>
+                              <Label className="text-xs mb-1 block">Full-text Index</Label>
+                              <Select
+                                value={fullTextIndex || "__active_schema__"}
+                                onValueChange={handleFullTextIndexChange}
+                                disabled={queryIndexes.length > 0}
+                              >
+                                <SelectTrigger>
+                                  <SelectValue placeholder="Use active schema index" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="__active_schema__">
+                                    Active schema index (automatic)
+                                  </SelectItem>
+                                  {indexes
+                                    .filter((idx) => idx.config.type === "full_text")
+                                    .map((index) => (
+                                      <SelectItem key={index.config.name} value={index.config.name}>
+                                        {index.config.name}
+                                      </SelectItem>
+                                    ))}
+                                </SelectContent>
+                              </Select>
+                              <p className="mt-1 text-xs text-muted-foreground">
+                                {queryIndexes.length > 0
+                                  ? "Clear vector indexes to run full-text search."
+                                  : fullTextIndex
+                                    ? "Queries the selected named full-text index."
+                                    : "Uses the full-text index for the table's active read schema."}
+                              </p>
+                            </div>
+                          )}
                           {queryIndexes.length > 1 && (
                             <Alert className="py-1.5 px-3">
                               <AlertDescription className="text-xs">
@@ -1532,6 +1634,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         tableName={tableName || ""}
         onIndexCreated={handleIndexCreated}
         schema={tableSchema}
+        artifactSourcesSupported={artifactSourcesSupported}
+        artifactSourcesState={artifactSourcesState}
+        artifactSourcesCapabilityError={artifactSourcesCapabilityError}
+        onRetryArtifactSourcesCapability={refreshArtifactSourcesCapability}
       />
       <Dialog open={openDropDialog} onOpenChange={setOpenDropDialog}>
         <DialogContent className="max-w-[450px]">

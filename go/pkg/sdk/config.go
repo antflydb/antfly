@@ -19,6 +19,8 @@ package sdk
 import (
 	"encoding/json"
 	"fmt"
+	"math"
+	"strings"
 
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
@@ -178,13 +180,22 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 	}
 	switch typed := config.(type) {
 	case IndexConfig:
+		if err := validateIndexRequestRelationships(data, typed.Type); err != nil {
+			return nil, err
+		}
 		return newCreateIndexRequestFromIndexConfig(data, typed.Type)
 	case *IndexConfig:
 		if typed == nil {
 			return nil, fmt.Errorf("index config must not be nil")
 		}
+		if err := validateIndexRequestRelationships(data, typed.Type); err != nil {
+			return nil, err
+		}
 		return newCreateIndexRequestFromIndexConfig(data, typed.Type)
 	case EmbeddingsIndexConfig, CreateEmbeddingsIndexRequest:
+		if err := validateIndexRequestRelationships(data, IndexTypeEmbeddings); err != nil {
+			return nil, err
+		}
 		var variant oapi.CreateEmbeddingsIndexRequest
 		if err := json.Unmarshal(data, &variant); err != nil {
 			return nil, fmt.Errorf("build embeddings create index request: %w", err)
@@ -197,12 +208,18 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 		if typed == nil {
 			return nil, fmt.Errorf("embeddings create index request must not be nil")
 		}
+		if err := validateIndexRequestRelationships(data, IndexTypeEmbeddings); err != nil {
+			return nil, err
+		}
 		variant := *typed
 		variant.Type = oapi.CreateEmbeddingsIndexRequestTypeEmbeddings
 		if err := request.FromCreateEmbeddingsIndexRequest(variant); err != nil {
 			return nil, fmt.Errorf("set embeddings create index request: %w", err)
 		}
 	case FullTextIndexConfig, CreateFullTextIndexRequest:
+		if err := validateIndexRequestRelationships(data, IndexTypeFullText); err != nil {
+			return nil, err
+		}
 		var variant oapi.CreateFullTextIndexRequest
 		if err := json.Unmarshal(data, &variant); err != nil {
 			return nil, fmt.Errorf("build full-text create index request: %w", err)
@@ -215,12 +232,18 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 		if typed == nil {
 			return nil, fmt.Errorf("full-text create index request must not be nil")
 		}
+		if err := validateIndexRequestRelationships(data, IndexTypeFullText); err != nil {
+			return nil, err
+		}
 		variant := *typed
 		variant.Type = oapi.CreateFullTextIndexRequestTypeFullText
 		if err := request.FromCreateFullTextIndexRequest(variant); err != nil {
 			return nil, fmt.Errorf("set full-text create index request: %w", err)
 		}
 	case GraphIndexConfig, CreateGraphIndexRequest:
+		if err := validateIndexRequestRelationships(data, IndexTypeGraph); err != nil {
+			return nil, err
+		}
 		var variant oapi.CreateGraphIndexRequest
 		if err := json.Unmarshal(data, &variant); err != nil {
 			return nil, fmt.Errorf("build graph create index request: %w", err)
@@ -232,6 +255,9 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 	case *CreateGraphIndexRequest:
 		if typed == nil {
 			return nil, fmt.Errorf("graph create index request must not be nil")
+		}
+		if err := validateIndexRequestRelationships(data, IndexTypeGraph); err != nil {
+			return nil, err
 		}
 		variant := *typed
 		variant.Type = oapi.CreateGraphIndexRequestTypeGraph
@@ -262,6 +288,65 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 	return request, nil
 }
 
+func relationshipFieldActive(fields map[string]json.RawMessage, name string) bool {
+	raw, ok := fields[name]
+	if !ok {
+		return false
+	}
+	value := strings.TrimSpace(string(raw))
+	return value != "" && value != "null" && value != "false"
+}
+
+func validateIndexRequestRelationships(data []byte, indexType IndexType) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return fmt.Errorf("decode %s index config: %w", indexType, err)
+	}
+	hasSources := relationshipFieldActive(fields, "sources")
+	switch indexType {
+	case IndexTypeFullText:
+		if hasSources && relationshipFieldActive(fields, "artifact_name") {
+			return fmt.Errorf("sources cannot be combined with artifact_name")
+		}
+	case IndexTypeGraph:
+		if hasSources && relationshipFieldActive(fields, "source") {
+			return fmt.Errorf("sources cannot be combined with source")
+		}
+	case IndexTypeEmbeddings:
+		if hasSources {
+			for _, field := range []string{"external", "field", "template", "chunker", "embedding_name", "source_artifact_name"} {
+				if relationshipFieldActive(fields, field) {
+					return fmt.Errorf("sources cannot be combined with %s", field)
+				}
+			}
+		}
+		if relationshipFieldActive(fields, "source_artifact_name") && !relationshipFieldActive(fields, "embedding_name") {
+			return fmt.Errorf("source_artifact_name requires a non-empty embedding_name")
+		}
+		var embeddingFields struct {
+			EmbeddingName      string `json:"embedding_name"`
+			SourceArtifactName string `json:"source_artifact_name"`
+			Enrichments        []struct {
+				Name               string `json:"name"`
+				Kind               string `json:"kind"`
+				SourceArtifactName string `json:"source_artifact_name"`
+			} `json:"enrichments"`
+		}
+		if err := json.Unmarshal(data, &embeddingFields); err != nil {
+			return fmt.Errorf("decode embeddings index relationships: %w", err)
+		}
+		if embeddingFields.EmbeddingName != "" && embeddingFields.SourceArtifactName != "" {
+			for _, enrichment := range embeddingFields.Enrichments {
+				if enrichment.Kind == "embedding" && enrichment.Name == embeddingFields.EmbeddingName &&
+					enrichment.SourceArtifactName != embeddingFields.SourceArtifactName {
+					return fmt.Errorf("source_artifact_name must match the authoritative embedding enrichment")
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func newCreateIndexRequestFromIndexConfig(data []byte, indexType IndexType) (*CreateIndexRequest, error) {
 	switch indexType {
 	case IndexTypeEmbeddings, IndexTypeFullText, IndexTypeGraph, IndexTypeAlgebraic:
@@ -286,24 +371,233 @@ func newCreateIndexRequestFromIndexConfig(data []byte, indexType IndexType) (*Cr
 	return request, nil
 }
 
-// ArtifactEmbeddingIndexConfig describes a managed vector index whose vectors
-// are generated from an existing generated artifact stream.
-type ArtifactEmbeddingIndexConfig struct {
-	// SourceArtifactName is the artifact stream to embed, for example
-	// "document_chunks_v1".
+const maxArtifactSources = 64
+
+// NewArtifactIndexSources builds the shared artifact-only source shape used by
+// full-text and embeddings indexes.
+func NewArtifactIndexSources(artifacts ...string) ([]ArtifactIndexSource, error) {
+	if len(artifacts) == 0 {
+		return nil, fmt.Errorf("at least one artifact source is required")
+	}
+	if len(artifacts) > maxArtifactSources {
+		return nil, fmt.Errorf("at most %d artifact sources are allowed", maxArtifactSources)
+	}
+	sources := make([]ArtifactIndexSource, 0, len(artifacts))
+	seen := make(map[string]struct{}, len(artifacts))
+	for i, artifact := range artifacts {
+		if artifact == "" {
+			return nil, fmt.Errorf("artifacts[%d] is required", i)
+		}
+		if _, ok := seen[artifact]; ok {
+			return nil, fmt.Errorf("duplicate artifact source %q", artifact)
+		}
+		seen[artifact] = struct{}{}
+		sources = append(sources, ArtifactIndexSource{Artifact: artifact})
+	}
+	return sources, nil
+}
+
+// ArtifactFullTextIndexOptions controls optional projection behavior for an
+// artifact-backed full-text index.
+type ArtifactFullTextIndexOptions struct {
+	Field   string
+	MemOnly bool
+	// Sources enables source-local field projections and is mutually exclusive
+	// with the positional artifact names.
+	Sources []FullTextArtifactIndexSource
+}
+
+// NewArtifactFullTextIndexConfig builds a full-text index over one or more
+// generated chunk or textual asset streams using whole-artifact projection.
+func NewArtifactFullTextIndexConfig(name string, artifacts ...string) (*IndexConfig, error) {
+	return NewArtifactFullTextIndexConfigWithOptions(name, ArtifactFullTextIndexOptions{}, artifacts...)
+}
+
+// NewArtifactFullTextIndexConfigForSources builds a full-text union over
+// artifact streams whose records may expose searchable text under different
+// fields.
+func NewArtifactFullTextIndexConfigForSources(name string, sources ...FullTextArtifactIndexSource) (*IndexConfig, error) {
+	return NewArtifactFullTextIndexConfigWithOptions(name, ArtifactFullTextIndexOptions{Sources: sources})
+}
+
+// NewArtifactFullTextIndexConfigWithOptions builds an artifact-backed
+// full-text index with an optional content field shared by every source.
+func NewArtifactFullTextIndexConfigWithOptions(name string, options ArtifactFullTextIndexOptions, artifacts ...string) (*IndexConfig, error) {
+	if name == "" {
+		return nil, fmt.Errorf("index name is required")
+	}
+	if len(artifacts) > 0 && options.Sources != nil {
+		return nil, fmt.Errorf("artifacts and sources are mutually exclusive")
+	}
+	var sources []FullTextArtifactIndexSource
+	if options.Sources != nil {
+		if len(options.Sources) == 0 {
+			return nil, fmt.Errorf("at least one artifact source is required")
+		}
+		if len(options.Sources) > maxArtifactSources {
+			return nil, fmt.Errorf("at most %d artifact sources are allowed", maxArtifactSources)
+		}
+		sources = make([]FullTextArtifactIndexSource, len(options.Sources))
+		seen := make(map[string]struct{}, len(options.Sources))
+		for i, source := range options.Sources {
+			if source.Artifact == "" {
+				return nil, fmt.Errorf("sources[%d].artifact is required", i)
+			}
+			if _, ok := seen[source.Artifact]; ok {
+				return nil, fmt.Errorf("duplicate artifact source %q", source.Artifact)
+			}
+			seen[source.Artifact] = struct{}{}
+			sourceField := strings.TrimSpace(source.Field)
+			if source.Field != "" && sourceField == "" {
+				return nil, fmt.Errorf("sources[%d].field must not be empty", i)
+			}
+			sources[i] = FullTextArtifactIndexSource{Artifact: source.Artifact, Field: sourceField}
+		}
+	} else {
+		artifactSources, err := NewArtifactIndexSources(artifacts...)
+		if err != nil {
+			return nil, err
+		}
+		sources = make([]FullTextArtifactIndexSource, len(artifactSources))
+		for i, source := range artifactSources {
+			sources[i] = FullTextArtifactIndexSource{Artifact: source.Artifact}
+		}
+	}
+	field := strings.TrimSpace(options.Field)
+	if options.Field != "" && field == "" {
+		return nil, fmt.Errorf("field must not be empty")
+	}
+	return NewIndexConfig(name, FullTextIndexConfig{
+		Sources: sources,
+		Field:   field,
+		MemOnly: options.MemOnly,
+	})
+}
+
+// NewGraphTemplateValue creates a string literal or Handlebars template value.
+func NewGraphTemplateValue(value string) (GraphTemplateValue, error) {
+	var result GraphTemplateValue
+	if err := result.FromGraphTemplateValue0(value); err != nil {
+		return GraphTemplateValue{}, fmt.Errorf("encode graph template value: %w", err)
+	}
+	return result, nil
+}
+
+// NewGraphNumericValue creates a finite numeric graph mapping value.
+func NewGraphNumericValue(value float64) (GraphTemplateValue, error) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return GraphTemplateValue{}, fmt.Errorf("graph numeric value must be finite")
+	}
+	var result GraphTemplateValue
+	if err := result.FromGraphTemplateValue1(value); err != nil {
+		return GraphTemplateValue{}, fmt.Errorf("encode graph numeric value: %w", err)
+	}
+	return result, nil
+}
+
+// NewGraphIndexSources validates and defensively copies graph artifact sources.
+func NewGraphIndexSources(sources ...GraphArtifactSourceConfig) ([]GraphArtifactSourceConfig, error) {
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("at least one graph artifact source is required")
+	}
+	if len(sources) > maxArtifactSources {
+		return nil, fmt.Errorf("at most %d graph artifact sources are allowed", maxArtifactSources)
+	}
+	result := make([]GraphArtifactSourceConfig, len(sources))
+	seen := make(map[string]struct{}, len(sources))
+	for i, source := range sources {
+		if source.Artifact == "" {
+			return nil, fmt.Errorf("sources[%d].artifact is required", i)
+		}
+		if !validGraphArtifactPath(source.Path) {
+			return nil, fmt.Errorf("sources[%d].path must be $, a dot-separated field path, or end in [*]", i)
+		}
+		if _, exists := seen[source.Artifact]; exists {
+			return nil, fmt.Errorf("duplicate graph artifact source %q", source.Artifact)
+		}
+		if source.Format != "" && source.Format != GraphArtifactSourceConfigFormatExtractionRelation && source.Format != GraphArtifactSourceConfigFormatExtractionGraph {
+			return nil, fmt.Errorf("sources[%d].format is invalid", i)
+		}
+		if source.Nodes.Model != "" && source.Nodes.Model != GraphArtifactNodeMappingConfigModelDocument && source.Nodes.Model != GraphArtifactNodeMappingConfigModelExternal {
+			return nil, fmt.Errorf("sources[%d].nodes.model is invalid", i)
+		}
+		fields := append([]string(nil), source.Context.DocFields...)
+		fieldSet := make(map[string]struct{}, len(fields))
+		for j, field := range fields {
+			if field == "" {
+				return nil, fmt.Errorf("sources[%d].context.doc_fields[%d] is required", i, j)
+			}
+			if _, exists := fieldSet[field]; exists {
+				return nil, fmt.Errorf("sources[%d].context.doc_fields contains duplicate %q", i, field)
+			}
+			fieldSet[field] = struct{}{}
+		}
+		result[i] = source
+		result[i].Context.DocFields = fields
+		if source.Edge.Metadata != nil {
+			encoded, err := json.Marshal(source.Edge.Metadata)
+			if err != nil {
+				return nil, fmt.Errorf("sources[%d].edge.metadata must contain JSON values: %w", i, err)
+			}
+			result[i].Edge.Metadata = nil
+			if err := json.Unmarshal(encoded, &result[i].Edge.Metadata); err != nil {
+				return nil, fmt.Errorf("copy sources[%d].edge.metadata: %w", i, err)
+			}
+		}
+		seen[source.Artifact] = struct{}{}
+	}
+	return result, nil
+}
+
+func validGraphArtifactPath(path string) bool {
+	if path == "" || path == "$" {
+		return true
+	}
+	if !strings.HasPrefix(path, "$.") {
+		return false
+	}
+	trimmed := strings.TrimPrefix(path, "$.")
+	trimmed = strings.TrimSuffix(trimmed, "[*]")
+	if trimmed == "" {
+		return false
+	}
+	for _, part := range strings.Split(trimmed, ".") {
+		if part == "" {
+			return false
+		}
+		for _, ch := range []byte(part) {
+			if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ArtifactEmbeddingSource describes one generated embedding artifact stream
+// and the enrichment that produces it.
+type ArtifactEmbeddingSource struct {
+	// ArtifactName is the stable generated embedding artifact name.
+	ArtifactName string
+	// SourceArtifactName is an upstream artifact stream such as
+	// "document_chunks_v1". Leave it empty to read a document field directly.
 	SourceArtifactName string
-	// EmbeddingName is the generated embedding artifact name consumed by the
-	// vector index. It defaults to the index name.
-	EmbeddingName string
-	// SourceField is the text field inside each source artifact payload. It
-	// defaults to "text".
+	// SourceField defaults to "text" when SourceTemplate is empty.
 	SourceField string
-	// VectorField is the vector field exposed to the vector index. It defaults
-	// to "embedding".
-	VectorField string
+	// SourceTemplate optionally renders the embedding input.
+	SourceTemplate string
+}
+
+// ArtifactEmbeddingIndexConfig describes a managed vector index whose vectors
+// are generated from one or more document- or artifact-backed streams.
+type ArtifactEmbeddingIndexConfig struct {
+	// Sources contribute independent vector members to the index.
+	Sources []ArtifactEmbeddingSource
 	// ExpectedDims is optional when the embedder can be probed by the server.
 	ExpectedDims int
-	Embedder     EmbedderConfig
+	// Sparse creates a sparse token-space index. ExpectedDims must be zero.
+	Sparse   bool
+	Embedder EmbedderConfig
 	// DistanceMetric defaults on the server when left empty.
 	DistanceMetric DistanceMetric
 }
@@ -312,45 +606,64 @@ func NewArtifactEmbeddingIndexConfig(name string, config ArtifactEmbeddingIndexC
 	if name == "" {
 		return nil, fmt.Errorf("index name is required")
 	}
-	if config.SourceArtifactName == "" {
-		return nil, fmt.Errorf("source artifact name is required")
-	}
 	if config.Embedder.Provider == "" {
 		return nil, fmt.Errorf("embedder provider is required")
 	}
+	if len(config.Sources) == 0 {
+		return nil, fmt.Errorf("at least one artifact embedding source is required")
+	}
+	if len(config.Sources) > maxArtifactSources {
+		return nil, fmt.Errorf("at most %d artifact embedding sources are allowed", maxArtifactSources)
+	}
+	if config.ExpectedDims < 0 {
+		return nil, fmt.Errorf("expected dimensions cannot be negative")
+	}
+	if config.Sparse && config.ExpectedDims != 0 {
+		return nil, fmt.Errorf("expected dimensions must be zero for sparse embedding indexes")
+	}
+	if config.Sparse && config.DistanceMetric != "" {
+		return nil, fmt.Errorf("distance metric must be empty for sparse embedding indexes")
+	}
+	if config.DistanceMetric != "" && config.DistanceMetric != DistanceMetricL2Squared && config.DistanceMetric != DistanceMetricInnerProduct && config.DistanceMetric != DistanceMetricCosine {
+		return nil, fmt.Errorf("distance metric is invalid")
+	}
 
-	embeddingName := config.EmbeddingName
-	if embeddingName == "" {
-		embeddingName = name
+	artifactNames := make([]string, 0, len(config.Sources))
+	enrichments := make([]EnrichmentConfig, 0, len(config.Sources))
+	for i, source := range config.Sources {
+		if source.ArtifactName == "" {
+			return nil, fmt.Errorf("sources[%d].artifact name is required", i)
+		}
+		sourceField := source.SourceField
+		if source.SourceTemplate != "" {
+			sourceField = ""
+		} else if sourceField == "" {
+			sourceField = "text"
+		}
+		artifactNames = append(artifactNames, source.ArtifactName)
+		enrichments = append(enrichments, EnrichmentConfig{
+			Name:               source.ArtifactName,
+			Kind:               EnrichmentKindEmbedding,
+			Field:              sourceField,
+			Template:           source.SourceTemplate,
+			SourceArtifactName: source.SourceArtifactName,
+			ExpectedDims:       config.ExpectedDims,
+		})
 	}
-	sourceField := config.SourceField
-	if sourceField == "" {
-		sourceField = "text"
+	sources, err := NewArtifactIndexSources(artifactNames...)
+	if err != nil {
+		return nil, err
 	}
-	vectorField := config.VectorField
-	if vectorField == "" {
-		vectorField = "embedding"
-	}
-
 	idx, err := NewIndexConfig(name, EmbeddingsIndexConfig{
-		Field:              vectorField,
-		EmbeddingName:      embeddingName,
-		SourceArtifactName: config.SourceArtifactName,
-		Dimension:          config.ExpectedDims,
-		Embedder:           config.Embedder,
-		DistanceMetric:     config.DistanceMetric,
+		Sources:        sources,
+		Dimension:      config.ExpectedDims,
+		Sparse:         config.Sparse,
+		Embedder:       config.Embedder,
+		DistanceMetric: config.DistanceMetric,
 	})
 	if err != nil {
 		return nil, err
 	}
-	idx.Enrichments = []EnrichmentConfig{
-		{
-			Name:               embeddingName,
-			Kind:               EnrichmentKindEmbedding,
-			Field:              sourceField,
-			SourceArtifactName: config.SourceArtifactName,
-			ExpectedDims:       config.ExpectedDims,
-		},
-	}
+	idx.Enrichments = enrichments
 	return idx, nil
 }

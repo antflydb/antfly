@@ -791,6 +791,15 @@ fn storeHasRuntimeRepairStatus(record: metadata_table_manager.StoreRecord) bool 
     return false;
 }
 
+fn storeHasRuntimeArtifactSourceStatus(record: metadata_table_manager.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.source_replay.len != 0) return true;
+        }
+    }
+    return false;
+}
+
 fn reportsHaveRuntimeRepairStatus(reports: []const metadata_table_manager.StoreStatusReport) bool {
     for (reports) |report| {
         for (report.runtime_statuses) |runtime_status| {
@@ -832,9 +841,23 @@ fn stripRuntimeRepairStatus(record: *metadata_table_manager.StoreRecord) void {
     }
 }
 
+fn stripRuntimeArtifactSourceStatus(
+    alloc: std.mem.Allocator,
+    record: *metadata_table_manager.StoreRecord,
+) void {
+    for (record.runtime_statuses) |*runtime_status| {
+        for (runtime_status.indexes) |*index_status| {
+            for (index_status.source_replay) |source| alloc.free(source.artifact_name);
+            if (index_status.source_replay.len > 0) alloc.free(index_status.source_replay);
+            index_status.source_replay = &.{};
+        }
+    }
+}
+
 fn stripRuntimeReporterFence(record: *metadata_table_manager.StoreRecord) void {
     record.reporter_incarnation = 0;
     record.status_generation = 0;
+    record.artifact_sources_protocol_version = 0;
     record.native_generation_restore_version = 0;
 }
 
@@ -855,7 +878,9 @@ fn runtimeStatusProtocolSafeCommand(
                 record.status_generation,
             )) return error.InvalidStoreReporterFence;
             const needs_current_protocol = storeHasRuntimeRepairStatus(record) or
+                storeHasRuntimeArtifactSourceStatus(record) or
                 record.reporter_incarnation != 0 or record.status_generation != 0 or
+                record.artifact_sources_protocol_version != 0 or
                 record.native_generation_restore_version != 0;
             if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
             // Unlike registration, an upsert carrying an incarnation may be a
@@ -868,6 +893,7 @@ fn runtimeStatusProtocolSafeCommand(
             }
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
             stripRuntimeRepairStatus(&legacy_record);
+            stripRuntimeArtifactSourceStatus(service.alloc, &legacy_record);
             stripRuntimeReporterFence(&legacy_record);
             owned_legacy_store.* = legacy_record;
             return .{ .upsert_store = legacy_record };
@@ -878,11 +904,14 @@ fn runtimeStatusProtocolSafeCommand(
                 record.status_generation,
             )) return error.InvalidStoreReporterFence;
             const needs_current_protocol = storeHasRuntimeRepairStatus(record) or
+                storeHasRuntimeArtifactSourceStatus(record) or
                 record.reporter_incarnation != 0 or record.status_generation != 0 or
+                record.artifact_sources_protocol_version != 0 or
                 record.native_generation_restore_version != 0;
             if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
             stripRuntimeRepairStatus(&legacy_record);
+            stripRuntimeArtifactSourceStatus(service.alloc, &legacy_record);
             stripRuntimeReporterFence(&legacy_record);
             owned_legacy_store.* = legacy_record;
             return .{ .register_store = legacy_record };
@@ -1290,6 +1319,18 @@ const CatalogValidationSnapshotCache = struct {
     }
 };
 
+fn lockMutexUntil(mutex: *std.Io.Mutex, deadline_ns: ?u64) bool {
+    const deadline = deadline_ns orelse {
+        mutex.lockUncancelable(std.Options.debug_io);
+        return true;
+    };
+    while (!mutex.tryLock()) {
+        if (platform_time.monotonicNs() >= deadline) return false;
+        platform_clock.Clock.real().sleepMs(1);
+    }
+    return true;
+}
+
 const ProjectedCoreSnapshotCache = struct {
     core_epoch: u64 = 0,
     placement_epoch: u64 = 0,
@@ -1502,6 +1543,32 @@ fn cloneProjectedRangesOwned(
         cloned = i + 1;
     }
     return out;
+}
+
+fn cloneCatalogRoutingSnapshot(
+    service: anytype,
+    deadline_ns: ?u64,
+) !metadata_api.CatalogRoutingSnapshot {
+    if (!lockMutexUntil(&service.catalog_validation_mutex, deadline_ns))
+        return error.CatalogRoutingSnapshotTimeout;
+    defer service.catalog_validation_mutex.unlock(std.Options.debug_io);
+
+    const catalog = try service.catalogValidationSnapshotLockedUntil(deadline_ns);
+    const tables = try cloneProjectedTablesOwned(service.alloc, catalog.tables);
+    errdefer service.freeProjectedTables(service.alloc, tables);
+    return .{
+        .tables = tables,
+        .ranges = try cloneProjectedRangesOwned(service.alloc, catalog.ranges),
+    };
+}
+
+fn freeCatalogRoutingSnapshotOwned(
+    service: anytype,
+    snapshot: *metadata_api.CatalogRoutingSnapshot,
+) void {
+    service.freeProjectedTables(service.alloc, snapshot.tables);
+    service.freeProjectedRanges(service.alloc, snapshot.ranges);
+    snapshot.* = undefined;
 }
 
 fn cloneProjectedStoresOwned(
@@ -2939,6 +3006,16 @@ pub const MetadataService = struct {
         return try metadata_api.captureSnapshot(self.alloc, self);
     }
 
+    /// Capture only the atomically paired table/range projection used for
+    /// routing, without computing the full administrative status projection.
+    pub fn catalogRoutingSnapshot(self: *MetadataService, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        return try cloneCatalogRoutingSnapshot(self, deadline_ns);
+    }
+
+    pub fn freeCatalogRoutingSnapshot(self: *MetadataService, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        freeCatalogRoutingSnapshotOwned(self, snapshot);
+    }
+
     pub fn adminSnapshotFence(self: *MetadataService) !AdminSnapshotFence {
         const raft = serviceGroupRaftObservation(self, self.metadata_group_id);
         return .{
@@ -2973,17 +3050,28 @@ pub const MetadataService = struct {
         return snapshot.index.matchesTablePublication(contract, self.metadata_group_id, incarnation, snapshot.tables);
     }
 
-    fn captureCatalogValidationSnapshot(self: *MetadataService) !CatalogValidationSnapshot {
+    fn captureCatalogValidationSnapshot(
+        self: *MetadataService,
+        deadline_ns: ?u64,
+    ) !CatalogValidationSnapshot {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         var snapshot: CatalogValidationSnapshot = .{};
         errdefer snapshot.deinit(self.alloc);
-        snapshot.tables = try store.listTables(self.alloc, self.metadata_group_id);
-        snapshot.ranges = try store.listRanges(self.alloc, self.metadata_group_id);
+        const projected = try store.captureCatalogProjection(self.alloc, self.metadata_group_id, deadline_ns);
+        snapshot.tables = projected.tables;
+        snapshot.ranges = projected.ranges;
         snapshot.index = try metadata_api.CatalogProjectionIndex.init(self.alloc, snapshot.tables, snapshot.ranges);
         return snapshot;
     }
 
     fn catalogValidationSnapshotLocked(self: *MetadataService) !*const CatalogValidationSnapshot {
+        return try self.catalogValidationSnapshotLockedUntil(null);
+    }
+
+    fn catalogValidationSnapshotLockedUntil(
+        self: *MetadataService,
+        deadline_ns: ?u64,
+    ) !*const CatalogValidationSnapshot {
         try self.ensureLifecycleListenerRegistered();
         const current_epoch = self.catalog_epoch.load(.acquire);
         if (self.catalog_validation_cache.snapshot != null and
@@ -2992,15 +3080,21 @@ pub const MetadataService = struct {
             return &(self.catalog_validation_cache.snapshot orelse unreachable);
         }
 
-        // MetadataService does not own the HTTP runtime lock. Stabilize the
-        // two projected lists against the listener epoch instead, so a table
-        // and its ranges can never come from different applied revisions.
+        // The apply store captures both projected lists from one point-in-time
+        // storage transaction. The listener epoch stabilizes cache publication
+        // and invalidation without either apply or outer Raft runtime locks.
         var attempts: usize = 0;
         while (attempts < 4) : (attempts += 1) {
+            if (deadline_ns) |deadline| {
+                if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+            }
             const before = self.catalog_epoch.load(.acquire);
-            var fresh = try self.captureCatalogValidationSnapshot();
+            var fresh = try self.captureCatalogValidationSnapshot(deadline_ns);
             errdefer fresh.deinit(self.alloc);
             const after = self.catalog_epoch.load(.acquire);
+            if (deadline_ns) |deadline| {
+                if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+            }
             if (before != after) {
                 fresh.deinit(self.alloc);
                 continue;
@@ -5703,6 +5797,17 @@ pub const MetadataHttpService = struct {
         return try self.buildAdminSnapshot(true);
     }
 
+    /// Capture only the atomically paired table/range projection used for
+    /// routing. In particular, this avoids computing detailed operator status
+    /// and reconciliation planning on the public request path.
+    pub fn catalogRoutingSnapshot(self: *MetadataHttpService, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        return try cloneCatalogRoutingSnapshot(self, deadline_ns);
+    }
+
+    pub fn freeCatalogRoutingSnapshot(self: *MetadataHttpService, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        freeCatalogRoutingSnapshotOwned(self, snapshot);
+    }
+
     pub fn adminSnapshotFence(self: *MetadataHttpService) !AdminSnapshotFence {
         const raft = serviceGroupRaftObservation(self, self.metadata_group_id);
         return .{
@@ -5865,28 +5970,61 @@ pub const MetadataHttpService = struct {
         return snapshot.index.matchesTablePublication(contract, self.metadata_group_id, incarnation, snapshot.tables);
     }
 
-    /// Called with both the catalog-validation mutex and the Raft runtime lock
-    /// held. Only catalog records are cloned, and non-catalog projection
-    /// traffic cannot invalidate this cache.
+    fn captureCatalogValidationSnapshot(
+        self: *MetadataHttpService,
+        deadline_ns: ?u64,
+    ) !CatalogValidationSnapshot {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        var snapshot: CatalogValidationSnapshot = .{};
+        errdefer snapshot.deinit(self.alloc);
+        const projected = try store.captureCatalogProjection(self.alloc, self.metadata_group_id, deadline_ns);
+        snapshot.tables = projected.tables;
+        snapshot.ranges = projected.ranges;
+        snapshot.index = try metadata_api.CatalogProjectionIndex.init(self.alloc, snapshot.tables, snapshot.ranges);
+        return snapshot;
+    }
+
+    /// The apply store captures one committed table/range pair from a
+    /// point-in-time storage transaction, and this catalog mutex publishes that
+    /// immutable pair. The listener epoch stabilizes cache publication and
+    /// invalidation without either apply or outer Raft runtime locks.
     fn catalogValidationSnapshotLocked(self: *MetadataHttpService) !*const CatalogValidationSnapshot {
+        return try self.catalogValidationSnapshotLockedUntil(null);
+    }
+
+    fn catalogValidationSnapshotLockedUntil(
+        self: *MetadataHttpService,
+        deadline_ns: ?u64,
+    ) !*const CatalogValidationSnapshot {
         try self.ensureLifecycleListenerRegistered();
         const current_epoch = self.catalog_epoch.load(.acquire);
-        if (self.catalog_validation_cache.snapshot == null or
-            self.catalog_validation_cache.catalog_epoch != current_epoch)
+        if (self.catalog_validation_cache.snapshot != null and
+            self.catalog_validation_cache.catalog_epoch == current_epoch)
         {
-            const store = self.projectedStore() orelse return error.MissingMetadataStore;
-            var fresh: CatalogValidationSnapshot = .{};
-            errdefer fresh.deinit(self.alloc);
-            fresh.tables = try store.listTables(self.alloc, self.metadata_group_id);
-            fresh.ranges = try store.listRanges(self.alloc, self.metadata_group_id);
-            fresh.index = try metadata_api.CatalogProjectionIndex.init(self.alloc, fresh.tables, fresh.ranges);
-            if (self.catalog_validation_cache.snapshot) |*snapshot| snapshot.deinit(self.alloc);
-            self.catalog_validation_cache = .{
-                .catalog_epoch = current_epoch,
-                .snapshot = fresh,
-            };
+            return &(self.catalog_validation_cache.snapshot orelse unreachable);
         }
-        return &(self.catalog_validation_cache.snapshot orelse unreachable);
+
+        var attempts: usize = 0;
+        while (attempts < 4) : (attempts += 1) {
+            if (deadline_ns) |deadline| {
+                if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+            }
+            const before = self.catalog_epoch.load(.acquire);
+            var fresh = try self.captureCatalogValidationSnapshot(deadline_ns);
+            errdefer fresh.deinit(self.alloc);
+            const after = self.catalog_epoch.load(.acquire);
+            if (deadline_ns) |deadline| {
+                if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+            }
+            if (before != after) {
+                fresh.deinit(self.alloc);
+                continue;
+            }
+            if (self.catalog_validation_cache.snapshot) |*snapshot| snapshot.deinit(self.alloc);
+            self.catalog_validation_cache = .{ .catalog_epoch = after, .snapshot = fresh };
+            return &(self.catalog_validation_cache.snapshot orelse unreachable);
+        }
+        return error.CatalogProjectionUnstable;
     }
 
     pub fn freeAdminSnapshot(self: *MetadataHttpService, snapshot: *metadata_api.AdminSnapshot) void {
@@ -6032,8 +6170,6 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn listProjectedTables(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
-        self.lockRuntime();
-        defer self.unlockRuntime();
         self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
         defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
         const snapshot = try self.catalogValidationSnapshotLocked();
@@ -6152,8 +6288,6 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn listProjectedRanges(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
-        self.lockRuntime();
-        defer self.unlockRuntime();
         self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
         defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
         const snapshot = try self.catalogValidationSnapshotLocked();
@@ -13579,6 +13713,20 @@ test "metadata service admin snapshot captures projected topology and status" {
     try std.testing.expectEqualStrings("lsn:0/16B6A50", snapshot.replication_source_statuses[0].prepared_checkpoint);
     try std.testing.expectEqualStrings("lsn:0/16B6B10", snapshot.replication_source_statuses[0].stream_checkpoint);
     try std.testing.expectEqual(@as(usize, 1), snapshot.status.repair_placement_groups);
+
+    var routing = try svc.catalogRoutingSnapshot(null);
+    defer svc.freeCatalogRoutingSnapshot(&routing);
+    try std.testing.expectEqual(@as(usize, 1), routing.tables.len);
+    try std.testing.expectEqual(@as(usize, 1), routing.ranges.len);
+    try std.testing.expectEqual(@as(u64, 89), routing.tables[0].table_id);
+    try std.testing.expectEqual(@as(u64, 8901), routing.ranges[0].group_id);
+
+    svc.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+    defer svc.catalog_validation_mutex.unlock(std.Options.debug_io);
+    try std.testing.expectError(
+        error.CatalogRoutingSnapshotTimeout,
+        svc.catalogRoutingSnapshot(platform_time.monotonicNs() + std.time.ns_per_ms),
+    );
 }
 
 test "metadata service committed metadata changes request lifecycle reconcile hook" {
@@ -13987,6 +14135,29 @@ test "metadata http service catalog cache is independent from volatile projectio
     defer svc.freeProjectedTables(std.testing.allocator, before);
     try std.testing.expectEqual(@as(usize, 0), before.len);
     try std.testing.expectEqual(true, svc.lifecycle_listener_registered);
+
+    // Routing reads the independently published catalog projection and must
+    // not depend on the Raft runtime lock being available.
+    {
+        svc.lockRuntime();
+        defer svc.unlockRuntime();
+        var routing = try svc.catalogRoutingSnapshot(null);
+        defer svc.freeCatalogRoutingSnapshot(&routing);
+        try std.testing.expectEqual(@as(usize, 0), routing.tables.len);
+        try std.testing.expectEqual(@as(usize, 0), routing.ranges.len);
+    }
+
+    // A contended publication mutex observes the caller's routing deadline
+    // instead of extending the outer eventual-resolution timeout forever.
+    {
+        svc.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+        defer svc.catalog_validation_mutex.unlock(std.Options.debug_io);
+        try std.testing.expectError(
+            error.CatalogRoutingSnapshotTimeout,
+            svc.catalogRoutingSnapshot(platform_time.monotonicNs() + std.time.ns_per_ms),
+        );
+    }
+
     const leader_status = svc.raft.host.http_host.host.raftStatus(2900) orelse return error.MissingRaftStatus;
     try std.testing.expect(leader_status.hard.current_term > 0);
     const receipt = try svc.proposeTransitionCommandWithReceiptInTerm(.{
