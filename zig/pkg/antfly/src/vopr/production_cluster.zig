@@ -529,6 +529,7 @@ pub const Fixture = struct {
     join_enabled: bool = false,
     join_cancellation_enabled: bool = false,
     join_cancellation_overlap_enabled: bool = false,
+    join_cancellation_owner_restart_enabled: bool = false,
     join_worker_retry_enabled: bool = false,
     join_owner_restart_enabled: bool = false,
     join_retry_exhaustion_enabled: bool = false,
@@ -595,6 +596,11 @@ pub const Fixture = struct {
     pub fn setJoinCancellationOverlapEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.join_cancellation_overlap_enabled = enabled;
+    }
+
+    pub fn setJoinCancellationOwnerRestartEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.join_cancellation_owner_restart_enabled = enabled;
     }
 
     pub fn setJoinWorkerRetryEnabled(self: *Fixture, enabled: bool) void {
@@ -670,7 +676,9 @@ pub const Fixture = struct {
         if (self.phase != .reads_complete or !self.join_owner_restart_enabled)
             return error.InvalidProductionJoinOwnerRestartTarget;
         const group_id = metadata_sim.VoprPublicClusterFixture.data_group_id;
-        const coordinator_index = for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+        const coordinator_index = if (self.join_cancellation_owner_restart_enabled)
+            1
+        else for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
             const raft = server.data_raft orelse continue;
             if (raft.host.http_host.host.raftStatus(group_id) == null) break index;
         } else return error.ProductionDataJoinRemoteCoordinatorMissing;
@@ -788,12 +796,16 @@ pub const Fixture = struct {
             return error.InvalidProductionClusterJoinCancellationMode;
         if (self.join_cancellation_overlap_enabled and !self.join_cancellation_enabled)
             return error.InvalidProductionClusterJoinCancellationOverlapMode;
+        if (self.join_cancellation_owner_restart_enabled and
+            (!self.join_cancellation_enabled or !self.join_owner_restart_enabled))
+            return error.InvalidProductionClusterJoinCancellationOwnerRestartMode;
         if (self.join_worker_retry_enabled and
             (!self.join_enabled or self.join_cancellation_enabled or
                 self.active_split_enabled or self.fault_mode != .clean))
             return error.InvalidProductionClusterJoinWorkerRetryMode;
         if (self.join_owner_restart_enabled and
-            (!self.join_enabled or self.join_cancellation_enabled or
+            (!self.join_enabled or
+                (self.join_cancellation_enabled and !self.join_cancellation_owner_restart_enabled) or
                 self.join_worker_retry_enabled or self.active_split_enabled or
                 self.fault_mode != .clean))
             return error.InvalidProductionClusterJoinOwnerRestartMode;
@@ -1407,12 +1419,16 @@ pub const Fixture = struct {
                         self.join_owner_restart_job_id = event.job_id;
                         self.join_owner_restart_partition_index = event.partition_index;
                         self.join_owner_restart_requested = true;
-                        self.join_restart_requested.post(self.sim.io());
-                        // Return immediately so the serving handler can unwind
-                        // while the restart owner tears down this exact process.
-                        return error.GroupLeaderUnavailable;
+                        if (!self.join_cancellation_owner_restart_enabled) {
+                            self.join_restart_requested.post(self.sim.io());
+                            // Return immediately so the serving handler can
+                            // unwind while the restart owner tears down this
+                            // exact process.
+                            return error.GroupLeaderUnavailable;
+                        }
                     }
-                    if (self.join_owner_restart_recovered_group_id == 0 and
+                    if (!self.join_cancellation_owner_restart_enabled and
+                        self.join_owner_restart_recovered_group_id == 0 and
                         event.partition_index == self.join_owner_restart_partition_index and
                         event.owner_group_id != self.join_owner_restart_failed_group_id)
                     {
@@ -2549,6 +2565,8 @@ pub const Fixture = struct {
     }
 
     fn runJoinCancellationQuery(self: *Fixture) !bool {
+        if (self.join_cancellation_owner_restart_enabled)
+            try self.prepareJoinOwnerRestartCampaign();
         if (self.join_cancellation_overlap_enabled) {
             try self.prepareJoinCancellationOverlapCampaign();
             const fault_observer = self.join_cancellation_overlap_fault_observer orelse
@@ -2588,6 +2606,8 @@ pub const Fixture = struct {
         const completed_before = self.join_partition_worker_completed_count;
         const coordinator_index = if (self.join_cancellation_overlap_enabled)
             self.join_cancellation_overlap_coordinator_index
+        else if (self.join_cancellation_owner_restart_enabled)
+            self.join_owner_restart_coordinator_index
         else
             1;
         var in_flight = self.sim.io().async(fetchJoinQuery, .{
@@ -2622,7 +2642,15 @@ pub const Fixture = struct {
                     self.join_cancellation_overlap_first_group_id ==
                         self.join_cancellation_overlap_worker_group_id or
                     self.join_cancellation_overlap_coordinator_index ==
-                        self.join_cancellation_overlap_network_target_index)))
+                        self.join_cancellation_overlap_network_target_index)) or
+            (self.join_cancellation_owner_restart_enabled and
+                (!self.join_owner_restart_requested or
+                    !self.join_owner_restart_target_configured or
+                    self.join_owner_restart_job_id != self.join_cancellation_job_id or
+                    self.join_owner_restart_failed_group_id !=
+                        self.join_cancellation_owner_group_id or
+                    self.join_owner_restart_target_index ==
+                        self.join_owner_restart_coordinator_index)))
             return false;
 
         self.join_cancellation_requested = true;
@@ -2632,11 +2660,21 @@ pub const Fixture = struct {
                 else => break :blk false,
             };
             defer response.deinit(self.alloc);
-            break :blk false;
+            break :blk self.join_cancellation_owner_restart_enabled and
+                response.status == 500 and
+                std.mem.indexOf(u8, response.body, "\"code\":\"internal_failure\"") != null and
+                std.mem.indexOf(u8, response.body, "\"hits\"") == null;
         };
-        self.join_cancellation_observed = cancelled_request and
+        // V35 deliberately does not add a product error mapping for this
+        // composed history: the partition stream and finalizer may surface
+        // different terminal shapes. Its semantic oracle is the established
+        // worker boundary, the public Future cancellation above, and zero
+        // completion from that worker.
+        self.join_cancellation_observed =
+            (cancelled_request or self.join_cancellation_owner_restart_enabled) and
             self.join_partition_worker_completed_count == completed_before;
-        if (!self.join_cancellation_observed) return false;
+        if (!self.join_cancellation_observed and
+            !self.join_cancellation_owner_restart_enabled) return false;
 
         if (self.join_cancellation_overlap_enabled) {
             self.sim.setOutboundEndpointOutage(null);
@@ -2647,13 +2685,58 @@ pub const Fixture = struct {
             if (!self.join_cancellation_overlap_resource_healed) return false;
         }
 
+        if (!self.join_cancellation_observed) return false;
+
+        if (self.join_cancellation_owner_restart_enabled) {
+            // The deployment fault was registered at the worker boundary.
+            // Create and release the production restart owner only after the
+            // canceled request has reached its terminal with no worker
+            // completion. Until this point the runnable-task topology is the
+            // proven V30 cancellation topology, and teardown cannot cause the
+            // cancellation evidence.
+            self.join_restart_future = self.sim.io().async(driveJoinOwnerRestart, .{self});
+            self.join_restart_requested.post(self.sim.io());
+            while (!self.join_owner_restart_down and self.join_owner_restart_failure == null)
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+            if (!self.join_owner_restart_down or self.join_owner_restart_failure != null)
+                return false;
+            self.join_restart_recover.post(self.sim.io());
+            while (!self.join_owner_restart_recovered and self.join_owner_restart_failure == null)
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+            if (!self.join_owner_restart_recovered or self.join_owner_restart_failure != null)
+                return false;
+            self.join_owner_restart_recovery_query_active = true;
+        }
+        defer self.join_owner_restart_recovery_query_active = false;
+
         self.join_sound = try self.runJoinQuery();
+        if (self.join_cancellation_owner_restart_enabled) {
+            self.join_owner_restart_recovery_join = self.join_sound;
+            if (!self.join_owner_restart_recovery_join) return false;
+            var rebuilt_read = self.client.fetchLookupResponse(
+                self.data_api_uris[self.join_owner_restart_target_index],
+                "tenant_b_docs",
+                "tenant:q",
+                null,
+            ) catch return false;
+            defer rebuilt_read.deinit(self.alloc);
+            self.join_owner_restart_post_reconstruction_read = rebuilt_read.status == 200 and
+                std.mem.indexOf(u8, rebuilt_read.body, "production-tenant") != null;
+            self.join_owner_restart_sound =
+                self.join_owner_restart_post_reconstruction_read;
+        }
         self.join_cancellation_recovered = self.join_sound and
             self.join_partition_worker_started_count > started_before + 1 and
             self.join_partition_worker_completed_count > completed_before and
             (!self.join_cancellation_overlap_enabled or
                 (self.join_cancellation_overlap_network_healed and
-                    self.join_cancellation_overlap_resource_healed));
+                    self.join_cancellation_overlap_resource_healed)) and
+            (!self.join_cancellation_owner_restart_enabled or
+                (self.join_owner_restart_down and
+                    self.join_owner_restart_recovered and
+                    self.join_owner_restart_recovery_join and
+                    self.join_owner_restart_post_reconstruction_read and
+                    self.join_owner_restart_sound));
         return self.join_cancellation_recovered;
     }
 
@@ -4322,6 +4405,7 @@ pub const Fixture = struct {
         join_owner_restart_recovered_group_id: u64,
         join_owner_restart_target_index: usize,
         join_owner_restart_recovery_index: usize,
+        join_owner_restart_coordinator_index: usize,
         join_owner_restart_requested: bool,
         join_owner_restart_down: bool,
         join_owner_restart_recovered: bool,
@@ -4469,6 +4553,7 @@ pub const Fixture = struct {
             .join_owner_restart_recovered_group_id = self.join_owner_restart_recovered_group_id,
             .join_owner_restart_target_index = self.join_owner_restart_target_index,
             .join_owner_restart_recovery_index = self.join_owner_restart_recovery_index,
+            .join_owner_restart_coordinator_index = self.join_owner_restart_coordinator_index,
             .join_owner_restart_requested = self.join_owner_restart_requested,
             .join_owner_restart_down = self.join_owner_restart_down,
             .join_owner_restart_recovered = self.join_owner_restart_recovered,

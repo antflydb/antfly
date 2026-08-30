@@ -18,7 +18,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 34;
+    pub const version: u32 = 35;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -37,6 +37,7 @@ pub const Scenario = struct {
     const production_join_owner_restart_id = vopr.id.stable(name, "public-durable-shuffle-partition-owner-reconstruction");
     const production_join_retry_exhaustion_id = vopr.id.stable(name, "public-durable-shuffle-overlapping-fault-retry-exhaustion");
     const production_join_cancellation_overlap_id = vopr.id.stable(name, "public-durable-shuffle-cancellation-under-overlapping-faults");
+    const production_join_cancellation_owner_restart_id = vopr.id.stable(name, "public-durable-shuffle-cancellation-owner-reconstruction");
     const production_overlapping_faults_id = vopr.id.stable(name, "production-graph-overlapping-link-resource-faults-recover");
     const production_socket_pressure_id = vopr.id.stable(name, "production-listener-socket-pressure-recovers-during-split");
     const production_service_rate_id = vopr.id.stable(name, "production-service-rates-compose-and-heal");
@@ -76,6 +77,7 @@ pub const Scenario = struct {
         .{ .id = production_join_owner_restart_id, .name = name ++ ".public-durable-shuffle-partition-owner-reconstruction", .kind = .always },
         .{ .id = production_join_retry_exhaustion_id, .name = name ++ ".public-durable-shuffle-overlapping-fault-retry-exhaustion", .kind = .always },
         .{ .id = production_join_cancellation_overlap_id, .name = name ++ ".public-durable-shuffle-cancellation-under-overlapping-faults", .kind = .always },
+        .{ .id = production_join_cancellation_owner_restart_id, .name = name ++ ".public-durable-shuffle-cancellation-owner-reconstruction", .kind = .always },
         .{ .id = production_overlapping_faults_id, .name = name ++ ".production-graph-overlapping-link-resource-faults-recover", .kind = .always },
         .{ .id = production_socket_pressure_id, .name = name ++ ".production-listener-socket-pressure-recovers-during-split", .kind = .always },
         .{ .id = production_service_rate_id, .name = name ++ ".production-service-rates-compose-and-heal", .kind = .always },
@@ -124,6 +126,7 @@ pub const Scenario = struct {
         production_data_plane_durable_join_owner_restart,
         production_data_plane_durable_join_retry_exhaustion,
         production_data_plane_durable_join_cancellation_overlapping_faults,
+        production_data_plane_durable_join_cancellation_owner_restart,
         production_data_plane_graph_split_overlapping_faults,
         production_data_plane_graph_split_socket_pressure,
         production_data_plane_service_rate,
@@ -149,6 +152,7 @@ pub const Scenario = struct {
                 self == .production_data_plane_durable_join_owner_restart or
                 self == .production_data_plane_durable_join_retry_exhaustion or
                 self == .production_data_plane_durable_join_cancellation_overlapping_faults or
+                self == .production_data_plane_durable_join_cancellation_owner_restart or
                 self == .production_data_plane_graph_split_overlapping_faults or
                 self == .production_data_plane_graph_split_socket_pressure or
                 self == .production_data_plane_service_rate or
@@ -161,7 +165,7 @@ pub const Scenario = struct {
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_durable_join_owner_restart, .production_data_plane_durable_join_retry_exhaustion, .production_data_plane_durable_join_cancellation_overlapping_faults, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion => .clean,
+                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_durable_join_owner_restart, .production_data_plane_durable_join_retry_exhaustion, .production_data_plane_durable_join_cancellation_overlapping_faults, .production_data_plane_durable_join_cancellation_owner_restart, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -206,6 +210,7 @@ pub const Scenario = struct {
             vopr.id.stable(name, "production-data-plane-durable-join-owner-restart"),
             vopr.id.stable(name, "production-data-plane-durable-join-retry-exhaustion"),
             vopr.id.stable(name, "production-data-plane-durable-join-cancellation-overlapping-faults"),
+            vopr.id.stable(name, "production-data-plane-durable-join-cancellation-owner-restart"),
             vopr.id.stable(name, "production-data-plane-graph-split-overlapping-faults"),
             vopr.id.stable(name, "production-data-plane-graph-split-socket-pressure"),
             vopr.id.stable(name, "production-data-plane-service-rate"),
@@ -241,6 +246,7 @@ pub const Scenario = struct {
         name ++ ".production-data-plane-durable-join-owner-restart",
         name ++ ".production-data-plane-durable-join-retry-exhaustion",
         name ++ ".production-data-plane-durable-join-cancellation-overlapping-faults",
+        name ++ ".production-data-plane-durable-join-cancellation-owner-restart",
         name ++ ".production-data-plane-graph-split-overlapping-faults",
         name ++ ".production-data-plane-graph-split-socket-pressure",
         name ++ ".production-data-plane-service-rate",
@@ -266,6 +272,7 @@ pub const Scenario = struct {
     const production_durable_join_owner_restart_ordinal: usize = @intFromEnum(Mode.production_data_plane_durable_join_owner_restart);
     const production_durable_join_retry_exhaustion_ordinal: usize = @intFromEnum(Mode.production_data_plane_durable_join_retry_exhaustion);
     const production_durable_join_cancellation_overlap_ordinal: usize = @intFromEnum(Mode.production_data_plane_durable_join_cancellation_overlapping_faults);
+    const production_durable_join_cancellation_owner_restart_ordinal: usize = @intFromEnum(Mode.production_data_plane_durable_join_cancellation_owner_restart);
     const production_graph_split_overlapping_faults_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_overlapping_faults);
     const production_graph_split_socket_pressure_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_socket_pressure);
     const production_service_rate_ordinal: usize = @intFromEnum(Mode.production_data_plane_service_rate);
@@ -377,6 +384,7 @@ pub const Scenario = struct {
         join_owner_restart_recovered_group_id: u64 = 0,
         join_owner_restart_target_index: usize = 0,
         join_owner_restart_recovery_index: usize = 0,
+        join_owner_restart_coordinator_index: usize = 0,
         join_owner_restart_requested: bool = false,
         join_owner_restart_down: bool = false,
         join_owner_restart_recovered: bool = false,
@@ -800,6 +808,7 @@ pub const Scenario = struct {
                     .join_owner_restart_recovered_group_id = snapshot.join_owner_restart_recovered_group_id,
                     .join_owner_restart_target_index = snapshot.join_owner_restart_target_index,
                     .join_owner_restart_recovery_index = snapshot.join_owner_restart_recovery_index,
+                    .join_owner_restart_coordinator_index = snapshot.join_owner_restart_coordinator_index,
                     .join_owner_restart_requested = snapshot.join_owner_restart_requested,
                     .join_owner_restart_down = snapshot.join_owner_restart_down,
                     .join_owner_restart_recovered = snapshot.join_owner_restart_recovered,
@@ -1014,20 +1023,26 @@ pub const Scenario = struct {
                         mode == .production_data_plane_durable_join_worker_retry or
                         mode == .production_data_plane_durable_join_owner_restart or
                         mode == .production_data_plane_durable_join_retry_exhaustion or
-                        mode == .production_data_plane_durable_join_cancellation_overlapping_faults,
+                        mode == .production_data_plane_durable_join_cancellation_overlapping_faults or
+                        mode == .production_data_plane_durable_join_cancellation_owner_restart,
                 );
                 self.production_cluster.?.setJoinCancellationEnabled(
                     mode == .production_data_plane_durable_join_cancellation or
-                        mode == .production_data_plane_durable_join_cancellation_overlapping_faults,
+                        mode == .production_data_plane_durable_join_cancellation_overlapping_faults or
+                        mode == .production_data_plane_durable_join_cancellation_owner_restart,
                 );
                 self.production_cluster.?.setJoinCancellationOverlapEnabled(
                     mode == .production_data_plane_durable_join_cancellation_overlapping_faults,
+                );
+                self.production_cluster.?.setJoinCancellationOwnerRestartEnabled(
+                    mode == .production_data_plane_durable_join_cancellation_owner_restart,
                 );
                 self.production_cluster.?.setJoinWorkerRetryEnabled(
                     mode == .production_data_plane_durable_join_worker_retry,
                 );
                 self.production_cluster.?.setJoinOwnerRestartEnabled(
-                    mode == .production_data_plane_durable_join_owner_restart,
+                    mode == .production_data_plane_durable_join_owner_restart or
+                        mode == .production_data_plane_durable_join_cancellation_owner_restart,
                 );
                 self.production_cluster.?.setJoinRetryExhaustionEnabled(
                     mode == .production_data_plane_durable_join_retry_exhaustion,
@@ -1301,7 +1316,9 @@ pub const Scenario = struct {
                     .custom,
                     domain_id,
                 ),
-                .production_data_plane_durable_join_owner_restart => {
+                .production_data_plane_durable_join_owner_restart,
+                .production_data_plane_durable_join_cancellation_owner_restart,
+                => {
                     const production = self.production_cluster orelse
                         return error.MissingProductionCluster;
                     production.setJoinOwnerRestartFaultObserver(.{
@@ -1800,6 +1817,30 @@ pub const Scenario = struct {
                 cluster.?.join_partition_worker_completed_count > 0 and
                 cluster.?.join_partition_worker_started_count ==
                     cluster.?.join_partition_worker_completed_count + 1));
+        try sink.check(allocator, production_join_cancellation_owner_restart_id, !state.complete or
+            state.mode.? != .production_data_plane_durable_join_cancellation_owner_restart or
+            (cluster != null and cluster.?.join_query_ok and
+                cluster.?.join_cancellation_ok and
+                cluster.?.join_cancellation_boundary_observed and
+                cluster.?.join_cancellation_job_id != 0 and
+                cluster.?.join_cancellation_owner_group_id != 0 and
+                cluster.?.join_cancellation_requested and
+                cluster.?.join_cancellation_observed and
+                cluster.?.join_cancellation_recovered and
+                cluster.?.join_owner_restart_requested and
+                cluster.?.join_owner_restart_job_id == cluster.?.join_cancellation_job_id and
+                cluster.?.join_owner_restart_failed_group_id ==
+                    cluster.?.join_cancellation_owner_group_id and
+                cluster.?.join_owner_restart_target_index !=
+                    cluster.?.join_owner_restart_coordinator_index and
+                cluster.?.join_owner_restart_down and
+                cluster.?.join_owner_restart_recovered and
+                cluster.?.join_owner_restart_recovery_join and
+                cluster.?.join_owner_restart_post_reconstruction_read and
+                cluster.?.join_owner_restart_ok and
+                cluster.?.join_partition_worker_completed_count > 0 and
+                cluster.?.join_partition_worker_started_count ==
+                    cluster.?.join_partition_worker_completed_count + 1));
         try sink.check(allocator, production_join_worker_retry_id, !state.complete or
             state.mode.? != .production_data_plane_durable_join_worker_retry or
             (cluster != null and cluster.?.join_query_ok and
@@ -2016,6 +2057,7 @@ fn runExactMode(
     const production_durable_join_owner_restart_mode = mode_id == Scenario.mode_ids[Scenario.production_durable_join_owner_restart_ordinal];
     const production_durable_join_retry_exhaustion_mode = mode_id == Scenario.mode_ids[Scenario.production_durable_join_retry_exhaustion_ordinal];
     const production_durable_join_cancellation_overlap_mode = mode_id == Scenario.mode_ids[Scenario.production_durable_join_cancellation_overlap_ordinal];
+    const production_durable_join_cancellation_owner_restart_mode = mode_id == Scenario.mode_ids[Scenario.production_durable_join_cancellation_owner_restart_ordinal];
     const production_graph_split_overlapping_faults_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_overlapping_faults_ordinal];
     const production_graph_split_socket_pressure_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_socket_pressure_ordinal];
     const production_service_rate_mode = mode_id == Scenario.mode_ids[Scenario.production_service_rate_ordinal];
@@ -2032,6 +2074,7 @@ fn runExactMode(
         production_durable_join_cancellation_mode or production_durable_join_worker_retry_mode or
         production_durable_join_owner_restart_mode or
         production_durable_join_retry_exhaustion_mode or production_durable_join_cancellation_overlap_mode or
+        production_durable_join_cancellation_owner_restart_mode or
         production_graph_split_overlapping_faults_mode or production_graph_split_socket_pressure_mode or
         production_service_rate_mode or production_graph_hydration_mode or
         production_graph_cancellation_mode or production_graph_cancellation_transport_mode or
@@ -2046,7 +2089,8 @@ fn runExactMode(
         Scenario.production_split_ordinal
     else if (production_durable_join_takeover_mode or production_durable_join_cancellation_mode or
         production_durable_join_worker_retry_mode or production_durable_join_owner_restart_mode or
-        production_durable_join_retry_exhaustion_mode or production_durable_join_cancellation_overlap_mode)
+        production_durable_join_retry_exhaustion_mode or production_durable_join_cancellation_overlap_mode or
+        production_durable_join_cancellation_owner_restart_mode)
         Scenario.production_graph_ordinal
     else if (production_graph_split_owner_restart_mode or
         production_graph_split_partial_write_mode or production_graph_split_resource_pressure_mode)
@@ -2077,7 +2121,9 @@ fn runExactMode(
         .resource_budget = if (production_mode) 256 else 96,
         .backend_ids = &backend_ids,
         .source_revision = if (production_mode)
-            (if (production_durable_join_cancellation_overlap_mode)
+            (if (production_durable_join_cancellation_owner_restart_mode)
+                "full-cluster-vopr-v35-durable-join-cancellation-owner-restart"
+            else if (production_durable_join_cancellation_overlap_mode)
                 "full-cluster-vopr-v34-durable-join-cancellation-overlapping-faults"
             else if (production_durable_join_retry_exhaustion_mode)
                 "full-cluster-vopr-v33-durable-join-retry-exhaustion"
@@ -2377,6 +2423,19 @@ test "full cluster production durable shuffle cancellation under overlapping fau
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
     const ordinal = Scenario.production_durable_join_cancellation_overlap_ordinal;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        420_000,
+        .complete,
+    );
+}
+
+test "full cluster production durable shuffle cancellation with owner reconstruction exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.production_durable_join_cancellation_owner_restart_ordinal;
     try runExactMode(
         history_allocator.allocator(),
         Scenario.mode_ids[ordinal],
