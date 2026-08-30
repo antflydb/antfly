@@ -7962,6 +7962,8 @@ pub const Reader = struct {
         const palette_sample_len = std.math.mul(usize, palette_entries, comps) catch return error.UnsupportedPdfRendering;
         if (lookup.len < palette_sample_len) return error.UnsupportedPdfRendering;
         const palette_rgba_len = std.math.mul(usize, palette_entries, 4) catch return error.UnsupportedPdfRendering;
+        const owned_lookup_len = if (decoded_lookup != null) lookup.len else 0;
+        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ rgba.len, decoded.len, owned_lookup_len, palette_rgba_len });
         const palette_rgba = try self.alloc.alloc(u8, palette_rgba_len);
         defer self.alloc.free(palette_rgba);
         try self.decodeResolvedImageColorSpaceToRgba(
@@ -8017,6 +8019,7 @@ pub const Reader = struct {
         defer transform.deinit(self.alloc);
 
         const alt_len = std.math.mul(usize, pixel_count, alt_components) catch return error.PdfDecodeWorkingSetTooLarge;
+        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ rgba.len, decoded.len, alt_len });
         const alt_bytes = try self.alloc.alloc(u8, alt_len);
         defer self.alloc.free(alt_bytes);
 
