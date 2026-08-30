@@ -328,6 +328,7 @@ pub const Fixture = struct {
     control_completions: std.Io.Semaphore = .{},
     control_round_active: bool = false,
     public_request_ingress_count: u64 = 0,
+    public_response_ready_count: u64 = 0,
     write_statuses: [3]u16 = .{ 0, 0, 0 },
     write_body_digests: [3]u64 = .{ 0, 0, 0 },
     write_attempts: [3]u64 = .{ 0, 0, 0 },
@@ -347,6 +348,16 @@ pub const Fixture = struct {
     global_query_sound: bool = false,
     global_query_status: u16 = 0,
     global_query_response_count: usize = 0,
+    global_query_result_assembled_count: u64 = 0,
+    global_query_cancellation_boundary: std.Io.Semaphore = .{},
+    global_query_cancellation_release: std.Io.Semaphore = .{},
+    global_query_cancellation_armed: bool = false,
+    global_query_cancellation_boundary_observed: bool = false,
+    global_query_cancellation_requested: bool = false,
+    global_query_cancellation_observed: bool = false,
+    global_query_cancellation_no_partial: bool = false,
+    global_query_cancellation_recovered: bool = false,
+    global_query_cancellation_sound: bool = false,
     join_sound: bool = false,
     split_join_sound: bool = false,
     post_split_join_sound: bool = false,
@@ -535,6 +546,7 @@ pub const Fixture = struct {
     graph_stale_snapshot_retry_exhaustion_enabled: bool = false,
     join_enabled: bool = false,
     global_query_enabled: bool = false,
+    global_query_cancellation_enabled: bool = false,
     join_cancellation_enabled: bool = false,
     join_cancellation_overlap_enabled: bool = false,
     join_cancellation_owner_restart_enabled: bool = false,
@@ -599,6 +611,11 @@ pub const Fixture = struct {
     pub fn setGlobalQueryEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.global_query_enabled = enabled;
+    }
+
+    pub fn setGlobalQueryCancellationEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.global_query_cancellation_enabled = enabled;
     }
 
     pub fn setJoinCancellationEnabled(self: *Fixture, enabled: bool) void {
@@ -1159,6 +1176,20 @@ pub const Fixture = struct {
         self.last_request_lifecycle_group = event.group_id;
         self.last_request_lifecycle_index = event.log_index;
         self.last_request_lifecycle_phase = event.phase;
+        if (event.phase == .query_result_assembled and
+            std.mem.eql(u8, event.operation_id, "public.global.multi_query"))
+        {
+            self.global_query_result_assembled_count +|= 1;
+            if (self.global_query_cancellation_enabled and
+                self.global_query_cancellation_armed and
+                std.mem.eql(u8, event.table_name, "docs"))
+            {
+                self.global_query_cancellation_armed = false;
+                self.global_query_cancellation_boundary_observed = true;
+                self.global_query_cancellation_boundary.post(self.sim.io());
+                try self.global_query_cancellation_release.wait(self.sim.io());
+            }
+        }
     }
 
     fn observePublicRequestLifecycle(
@@ -1167,6 +1198,7 @@ pub const Fixture = struct {
     ) !void {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
         if (event.phase == .ingress) self.public_request_ingress_count +|= 1;
+        if (event.phase == .response_ready) self.public_response_ready_count +|= 1;
     }
 
     fn observeDistributedGraphLifecycle(
@@ -2307,7 +2339,10 @@ pub const Fixture = struct {
             if (!try self.waitForDocIdentityReady("docs", 64) or
                 !try self.waitForDocIdentityReady("tenant_b_docs", 64))
                 return error.ProductionDataGlobalQueryIdentityPublicationTimeout;
-            self.global_query_sound = try self.runGlobalMultiQuery();
+            self.global_query_sound = if (self.global_query_cancellation_enabled)
+                try self.runGlobalMultiQueryCancellation()
+            else
+                try self.runGlobalMultiQuery();
             if (!self.global_query_sound)
                 return error.ProductionDataGlobalQueryFailed;
         }
@@ -3153,6 +3188,76 @@ pub const Fixture = struct {
         // also prove that no result crossed the docs/tenant boundary.
         return queryResponseHasExactHitIds(responses[0], &.{ "doc:c", "doc:k", "doc:x" }) and
             queryResponseHasExactHitIds(responses[1], &.{ "tenant:q", "tenant:r" });
+    }
+
+    fn fetchGlobalMultiQuery(
+        self: *Fixture,
+        uri: []const u8,
+        body: []const u8,
+    ) !common_http.HttpResponse {
+        return self.client.fetchGlobalMultiQueryRaw(uri, body);
+    }
+
+    fn runGlobalMultiQueryCancellation(self: *Fixture) !bool {
+        const results_before = self.global_query_result_assembled_count;
+        const responses_ready_before = self.public_response_ready_count;
+        self.global_query_cancellation_armed = true;
+
+        var in_flight = self.sim.io().async(fetchGlobalMultiQuery, .{
+            self,
+            self.data_api_uris[1],
+            global_query_body,
+        });
+        defer if (in_flight.any_future != null) {
+            const canceled_response: ?common_http.HttpResponse = in_flight.cancel(self.sim.io()) catch null;
+            if (canceled_response) |response_value| {
+                var response = response_value;
+                response.deinit(self.alloc);
+            }
+        };
+
+        try self.global_query_cancellation_boundary.wait(self.sim.io());
+        if (!self.global_query_cancellation_boundary_observed or
+            self.global_query_result_assembled_count != results_before + 1)
+            return false;
+
+        self.global_query_cancellation_requested = true;
+        // Wake the server-owned lifecycle hook before cancel joins the client
+        // task. `Future.cancel` abandons the socket first; when the handler
+        // resumes, the next NDJSON line observes that request cancellation.
+        self.global_query_cancellation_release.post(self.sim.io());
+        const cancelled_request = blk: {
+            var response = in_flight.cancel(self.sim.io()) catch |err| switch (err) {
+                error.Canceled, error.Cancelled => break :blk true,
+                else => break :blk false,
+            };
+            defer response.deinit(self.alloc);
+            break :blk false;
+        };
+        self.global_query_cancellation_observed = cancelled_request;
+        if (!self.global_query_cancellation_observed) return false;
+
+        // Client unwinding and server request completion are distinct owners.
+        // Do not inspect the no-partial oracle until the production handler
+        // has crossed its response-ready boundary and released admission.
+        for (0..1_000) |_| {
+            if (self.public_response_ready_count > responses_ready_before) break;
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        } else return false;
+        self.global_query_cancellation_no_partial =
+            self.global_query_result_assembled_count == results_before + 1;
+        if (!self.global_query_cancellation_no_partial) return false;
+
+        const recovered = try self.runGlobalMultiQuery();
+        self.global_query_cancellation_recovered = recovered and
+            self.global_query_result_assembled_count == results_before + 3;
+        self.global_query_cancellation_sound =
+            self.global_query_cancellation_boundary_observed and
+            self.global_query_cancellation_requested and
+            self.global_query_cancellation_observed and
+            self.global_query_cancellation_no_partial and
+            self.global_query_cancellation_recovered;
+        return self.global_query_cancellation_sound;
     }
 
     fn runGraphQuery(
@@ -4477,6 +4582,13 @@ pub const Fixture = struct {
         global_query_ok: bool,
         global_query_status: u16,
         global_query_response_count: usize,
+        global_query_result_assembled_count: u64,
+        global_query_cancellation_boundary_observed: bool,
+        global_query_cancellation_requested: bool,
+        global_query_cancellation_observed: bool,
+        global_query_cancellation_no_partial: bool,
+        global_query_cancellation_recovered: bool,
+        global_query_cancellation_ok: bool,
         join_query_ok: bool,
         split_join_query_ok: bool,
         post_split_join_query_ok: bool,
@@ -4629,6 +4741,13 @@ pub const Fixture = struct {
             .global_query_ok = self.global_query_sound,
             .global_query_status = self.global_query_status,
             .global_query_response_count = self.global_query_response_count,
+            .global_query_result_assembled_count = self.global_query_result_assembled_count,
+            .global_query_cancellation_boundary_observed = self.global_query_cancellation_boundary_observed,
+            .global_query_cancellation_requested = self.global_query_cancellation_requested,
+            .global_query_cancellation_observed = self.global_query_cancellation_observed,
+            .global_query_cancellation_no_partial = self.global_query_cancellation_no_partial,
+            .global_query_cancellation_recovered = self.global_query_cancellation_recovered,
+            .global_query_cancellation_ok = self.global_query_cancellation_sound,
             .join_query_ok = self.join_sound,
             .split_join_query_ok = self.split_join_sound,
             .post_split_join_query_ok = self.post_split_join_sound,

@@ -18,7 +18,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 36;
+    pub const version: u32 = 37;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -47,6 +47,7 @@ pub const Scenario = struct {
     const production_graph_authorization_id = vopr.id.stable(name, "production-public-graph-inflight-authorization-revocation");
     const production_graph_stale_snapshot_id = vopr.id.stable(name, "production-public-graph-stale-snapshot-retry-exhaustion");
     const production_global_query_id = vopr.id.stable(name, "production-public-global-query-isolates-table-results");
+    const production_global_query_cancellation_id = vopr.id.stable(name, "production-public-global-query-cancellation-fails-closed");
     const graph_restart_id = vopr.id.stable(name, "public-graph-inflight-restart-sound");
     const graph_topology_id = vopr.id.stable(name, "public-graph-topology-churn-fails-closed");
     const graph_partial_id = vopr.id.stable(name, "public-graph-partial-result-rejected");
@@ -88,6 +89,7 @@ pub const Scenario = struct {
         .{ .id = production_graph_authorization_id, .name = name ++ ".production-public-graph-inflight-authorization-revocation", .kind = .always },
         .{ .id = production_graph_stale_snapshot_id, .name = name ++ ".production-public-graph-stale-snapshot-retry-exhaustion", .kind = .always },
         .{ .id = production_global_query_id, .name = name ++ ".production-public-global-query-isolates-table-results", .kind = .always },
+        .{ .id = production_global_query_cancellation_id, .name = name ++ ".production-public-global-query-cancellation-fails-closed", .kind = .always },
         .{ .id = graph_restart_id, .name = name ++ ".public-graph-inflight-restart-sound", .kind = .always },
         .{ .id = graph_topology_id, .name = name ++ ".public-graph-topology-churn-fails-closed", .kind = .always },
         .{ .id = graph_partial_id, .name = name ++ ".public-graph-partial-result-rejected", .kind = .always },
@@ -138,6 +140,7 @@ pub const Scenario = struct {
         production_data_plane_graph_inflight_authorization_revocation,
         production_data_plane_graph_stale_snapshot_retry_exhaustion,
         production_data_plane_global_query,
+        production_data_plane_global_query_cancellation,
 
         fn isProduction(self: Mode) bool {
             return self == .production_data_plane_baseline or
@@ -164,12 +167,13 @@ pub const Scenario = struct {
                 self == .production_data_plane_graph_cancellation_transport_failure or
                 self == .production_data_plane_graph_inflight_authorization_revocation or
                 self == .production_data_plane_graph_stale_snapshot_retry_exhaustion or
-                self == .production_data_plane_global_query;
+                self == .production_data_plane_global_query or
+                self == .production_data_plane_global_query_cancellation;
         }
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_durable_join_owner_restart, .production_data_plane_durable_join_retry_exhaustion, .production_data_plane_durable_join_cancellation_overlapping_faults, .production_data_plane_durable_join_cancellation_owner_restart, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query => .clean,
+                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_durable_join_owner_restart, .production_data_plane_durable_join_retry_exhaustion, .production_data_plane_durable_join_cancellation_overlapping_faults, .production_data_plane_durable_join_cancellation_owner_restart, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -224,6 +228,7 @@ pub const Scenario = struct {
             vopr.id.stable(name, "production-data-plane-graph-inflight-authorization-revocation"),
             vopr.id.stable(name, "production-data-plane-graph-stale-snapshot-retry-exhaustion"),
             vopr.id.stable(name, "production-data-plane-global-query"),
+            vopr.id.stable(name, "production-data-plane-global-query-cancellation"),
         };
     };
     const mode_names = [_][]const u8{
@@ -261,6 +266,7 @@ pub const Scenario = struct {
         name ++ ".production-data-plane-graph-inflight-authorization-revocation",
         name ++ ".production-data-plane-graph-stale-snapshot-retry-exhaustion",
         name ++ ".production-data-plane-global-query",
+        name ++ ".production-data-plane-global-query-cancellation",
     };
 
     const production_baseline_ordinal: usize = @intFromEnum(Mode.production_data_plane_baseline);
@@ -288,6 +294,7 @@ pub const Scenario = struct {
     const production_graph_authorization_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_inflight_authorization_revocation);
     const production_graph_stale_snapshot_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_stale_snapshot_retry_exhaustion);
     const production_global_query_ordinal: usize = @intFromEnum(Mode.production_data_plane_global_query);
+    const production_global_query_cancellation_ordinal: usize = @intFromEnum(Mode.production_data_plane_global_query_cancellation);
 
     const metadata_role = vopr.id.stable(name, "role.metadata");
     const public_data_role = vopr.id.stable(name, "role.public-data");
@@ -358,6 +365,13 @@ pub const Scenario = struct {
         global_query_ok: bool = false,
         global_query_status: u16 = 0,
         global_query_response_count: usize = 0,
+        global_query_result_assembled_count: u64 = 0,
+        global_query_cancellation_boundary_observed: bool = false,
+        global_query_cancellation_requested: bool = false,
+        global_query_cancellation_observed: bool = false,
+        global_query_cancellation_no_partial: bool = false,
+        global_query_cancellation_recovered: bool = false,
+        global_query_cancellation_ok: bool = false,
         cleanup_ok: bool = false,
         raft_wire_requests: u64 = 0,
         node_resource_managers: usize = 0,
@@ -801,6 +815,13 @@ pub const Scenario = struct {
                     .global_query_ok = snapshot.global_query_ok,
                     .global_query_status = snapshot.global_query_status,
                     .global_query_response_count = snapshot.global_query_response_count,
+                    .global_query_result_assembled_count = snapshot.global_query_result_assembled_count,
+                    .global_query_cancellation_boundary_observed = snapshot.global_query_cancellation_boundary_observed,
+                    .global_query_cancellation_requested = snapshot.global_query_cancellation_requested,
+                    .global_query_cancellation_observed = snapshot.global_query_cancellation_observed,
+                    .global_query_cancellation_no_partial = snapshot.global_query_cancellation_no_partial,
+                    .global_query_cancellation_recovered = snapshot.global_query_cancellation_recovered,
+                    .global_query_cancellation_ok = snapshot.global_query_cancellation_ok,
                     .join_query_ok = snapshot.join_query_ok,
                     .split_join_query_ok = snapshot.split_join_query_ok,
                     .post_split_join_query_ok = snapshot.post_split_join_query_ok,
@@ -1040,7 +1061,11 @@ pub const Scenario = struct {
                         mode == .production_data_plane_durable_join_cancellation_owner_restart,
                 );
                 self.production_cluster.?.setGlobalQueryEnabled(
-                    mode == .production_data_plane_global_query,
+                    mode == .production_data_plane_global_query or
+                        mode == .production_data_plane_global_query_cancellation,
+                );
+                self.production_cluster.?.setGlobalQueryCancellationEnabled(
+                    mode == .production_data_plane_global_query_cancellation,
                 );
                 self.production_cluster.?.setJoinCancellationEnabled(
                     mode == .production_data_plane_durable_join_cancellation or
@@ -1358,7 +1383,7 @@ pub const Scenario = struct {
                         .activate = activateJoinCancellationOverlapFaults,
                     });
                 },
-                .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_join_split, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query => {},
+                .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_join_split, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation => {},
             }
         }
 
@@ -1628,6 +1653,12 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".public-global-query-ok", @intFromBool(if (cluster) |snapshot| snapshot.global_query_ok else false));
         try builder.addNamed(allocator, name ++ ".public-global-query-status", if (cluster) |snapshot| snapshot.global_query_status else 0);
         try builder.addNamed(allocator, name ++ ".public-global-query-responses", if (cluster) |snapshot| @intCast(snapshot.global_query_response_count) else 0);
+        try builder.addNamed(allocator, name ++ ".public-global-query-results-assembled", if (cluster) |snapshot| @intCast(snapshot.global_query_result_assembled_count) else 0);
+        try builder.addNamed(allocator, name ++ ".public-global-query-cancellation-boundary", @intFromBool(if (cluster) |snapshot| snapshot.global_query_cancellation_boundary_observed else false));
+        try builder.addNamed(allocator, name ++ ".public-global-query-cancellation-requested", @intFromBool(if (cluster) |snapshot| snapshot.global_query_cancellation_requested else false));
+        try builder.addNamed(allocator, name ++ ".public-global-query-cancellation-observed", @intFromBool(if (cluster) |snapshot| snapshot.global_query_cancellation_observed else false));
+        try builder.addNamed(allocator, name ++ ".public-global-query-cancellation-no-partial", @intFromBool(if (cluster) |snapshot| snapshot.global_query_cancellation_no_partial else false));
+        try builder.addNamed(allocator, name ++ ".public-global-query-cancellation-recovered", @intFromBool(if (cluster) |snapshot| snapshot.global_query_cancellation_recovered else false));
         try builder.addNamed(allocator, name ++ ".public-graph-hydration-ok", @intFromBool(if (cluster) |snapshot| snapshot.graph_hydration_ok else false));
         try builder.addNamed(allocator, name ++ ".public-graph-hydration-started", if (cluster) |snapshot| @intCast(snapshot.graph_hydration_started_count) else 0);
         try builder.addNamed(allocator, name ++ ".public-graph-hydration-fanout-started", if (cluster) |snapshot| @intCast(snapshot.graph_hydration_fanout_started_count) else 0);
@@ -1745,10 +1776,20 @@ pub const Scenario = struct {
         try sink.check(allocator, isolation_id, !state.complete or
             (if (production) |value| value.tenant_sound else fixture != null and fixture.?.table_isolation_sound));
         try sink.check(allocator, production_global_query_id, !state.complete or
-            state.mode.? != .production_data_plane_global_query or
+            (state.mode.? != .production_data_plane_global_query and
+                state.mode.? != .production_data_plane_global_query_cancellation) or
             (cluster != null and cluster.?.global_query_ok and
                 cluster.?.global_query_status == 200 and
                 cluster.?.global_query_response_count == 2));
+        try sink.check(allocator, production_global_query_cancellation_id, !state.complete or
+            state.mode.? != .production_data_plane_global_query_cancellation or
+            (cluster != null and cluster.?.global_query_cancellation_ok and
+                cluster.?.global_query_cancellation_boundary_observed and
+                cluster.?.global_query_cancellation_requested and
+                cluster.?.global_query_cancellation_observed and
+                cluster.?.global_query_cancellation_no_partial and
+                cluster.?.global_query_cancellation_recovered and
+                cluster.?.global_query_result_assembled_count == 3));
         try sink.check(allocator, graph_query_id, !state.complete or
             (if (production_mode)
                 !production_graph_mode or (cluster != null and cluster.?.graph_query_ok)
@@ -2091,6 +2132,7 @@ fn runExactMode(
     const production_graph_inflight_authorization_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_authorization_ordinal];
     const production_graph_stale_snapshot_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_stale_snapshot_ordinal];
     const production_global_query_mode = mode_id == Scenario.mode_ids[Scenario.production_global_query_ordinal];
+    const production_global_query_cancellation_mode = mode_id == Scenario.mode_ids[Scenario.production_global_query_cancellation_ordinal];
     const production_mode = production_baseline_mode or production_graph_mode or
         production_split_mode or production_graph_split_mode or
         production_graph_split_transport_mode or production_graph_split_owner_restart_mode or
@@ -2104,7 +2146,8 @@ fn runExactMode(
         production_service_rate_mode or production_graph_hydration_mode or
         production_graph_cancellation_mode or production_graph_cancellation_transport_mode or
         production_graph_inflight_authorization_mode or
-        production_graph_stale_snapshot_mode or production_global_query_mode;
+        production_graph_stale_snapshot_mode or production_global_query_mode or
+        production_global_query_cancellation_mode;
     // Fault extensions of the promoted graph/split history keep its
     // cooperative scheduling seed. The prefixed mode remains distinct replay
     // truth, while comparable scheduling ensures the experiment changes the
@@ -2132,7 +2175,7 @@ fn runExactMode(
         Scenario.production_graph_ordinal
     else if (production_graph_stale_snapshot_mode)
         Scenario.production_graph_split_ordinal
-    else if (production_global_query_mode)
+    else if (production_global_query_mode or production_global_query_cancellation_mode)
         Scenario.production_graph_ordinal
     else
         mode_ordinal;
@@ -2148,7 +2191,9 @@ fn runExactMode(
         .resource_budget = if (production_mode) 256 else 96,
         .backend_ids = &backend_ids,
         .source_revision = if (production_mode)
-            (if (production_global_query_mode)
+            (if (production_global_query_cancellation_mode)
+                "full-cluster-vopr-v37-public-global-query-cancellation"
+            else if (production_global_query_mode)
                 "full-cluster-vopr-v36-public-global-query"
             else if (production_durable_join_cancellation_owner_restart_mode)
                 "full-cluster-vopr-v35-durable-join-cancellation-owner-restart"
@@ -2587,6 +2632,19 @@ test "full cluster production public global query exact replay" {
         Scenario.mode_ids[ordinal],
         ordinal,
         90_000,
+        .complete,
+    );
+}
+
+test "full cluster production public global query cancellation exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.production_global_query_cancellation_ordinal;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        110_000,
         .complete,
     );
 }
