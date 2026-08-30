@@ -1296,10 +1296,9 @@ pub const HttpHandler = struct {
         defer query_api.freeAggregationRequests(self.alloc, aggregation_requests);
 
         const raw_filter_query_json = if (request.filter_query) |query|
-            try stringifyJsonValueAlloc(self.alloc, query)
+            query.bytes
         else
             null;
-        defer if (raw_filter_query_json) |query| self.alloc.free(query);
         const filter_query_json = try foreign_sources_api.buildEffectiveFilterQueryJsonAlloc(
             self.alloc,
             foreign_source,
@@ -12099,6 +12098,10 @@ test "serverless public graph query rejects exact sort controls" {
         .query = undefined,
         .runtime_status = undefined,
     };
+
+    var diagnostic_storage: graph_query_diagnostic.Storage = .{};
+    const diagnostic_binding = graph_query_diagnostic.bind(&diagnostic_storage);
+    defer diagnostic_binding.deinit();
 
     graph_query_diagnostic.reset();
     defer graph_query_diagnostic.reset();

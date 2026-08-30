@@ -504,9 +504,21 @@ fn metadataValidateBleveQuery(
 fn metadataValidateBleveFieldsAgainstContext(
     alloc: std.mem.Allocator,
     context: *const QueryBuilderTableContext,
-    value: std.json.Value,
+    input: anytype,
     label: []const u8,
 ) !?[]const u8 {
+    const Input = @TypeOf(input);
+    if (comptime Input != std.json.Value) {
+        if (comptime @hasField(Input, "bytes")) {
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, input.bytes, .{}) catch
+                return try std.fmt.allocPrint(alloc, "{s} is not valid JSON", .{label});
+            defer parsed.deinit();
+            return metadataValidateBleveFieldsAgainstContext(alloc, context, parsed.value, label);
+        }
+        @compileError("Bleve query must be std.json.Value or raw JSON");
+    }
+
+    const value: std.json.Value = input;
     switch (value) {
         .object => |object| {
             if (object.get("field")) |field_value| {
@@ -566,9 +578,21 @@ fn metadataValidateBleveTextOperatorFields(
 fn metadataValidateFilterFieldsAgainstContext(
     alloc: std.mem.Allocator,
     context: *const QueryBuilderTableContext,
-    value: std.json.Value,
+    input: anytype,
     label: []const u8,
 ) !?[]const u8 {
+    const Input = @TypeOf(input);
+    if (comptime Input != std.json.Value) {
+        if (comptime @hasField(Input, "bytes")) {
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, input.bytes, .{}) catch
+                return try std.fmt.allocPrint(alloc, "{s} is not valid JSON", .{label});
+            defer parsed.deinit();
+            return metadataValidateFilterFieldsAgainstContext(alloc, context, parsed.value, label);
+        }
+        @compileError("filter query must be std.json.Value or raw JSON");
+    }
+
+    const value: std.json.Value = input;
     switch (value) {
         .object => |object| {
             const object_mode = metadataFilterModeForObject(object);
@@ -2704,11 +2728,13 @@ fn buildGeneratedSemanticQueryBuilderAttemptFromMessages(
     try validateGeneratedSemanticQueryBuilderResponse(request, mode, fields, semantic_indexes, parsed.value);
     const full_text_search = queryBuilderNonNullJsonValue(parsed.value.full_text_search);
     if (plan_validator) |validator| {
+        const raw_full_text_search = if (full_text_search) |query| try rawQueryFromJsonValueAlloc(alloc, query) else null;
+        defer if (raw_full_text_search) |query| alloc.free(@constCast(query.bytes));
         const query_request = metadata_openapi.QueryRequest{
             .table = queryBuilderEffectiveTable(request),
             .semantic_search = parsed.value.semantic_search,
             .indexes = parsed.value.indexes,
-            .full_text_search = full_text_search,
+            .full_text_search = raw_full_text_search,
         };
         if (try validator.validateQueryRequest(alloc, request, query_request, null, if (std.ascii.eqlIgnoreCase(mode, "hybrid")) "hybrid" else "semantic")) |feedback| {
             return .{ .feedback = feedback };
@@ -2723,6 +2749,10 @@ fn buildGeneratedSemanticQueryBuilderAttemptFromMessages(
         .confidence = parsed.value.confidence,
         .warnings = if (parsed.value.warnings) |warning_values| try cloneStringSlice(alloc, warning_values) else null,
     } };
+}
+
+fn rawQueryFromJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) !metadata_openapi.RawQuery {
+    return .{ .bytes = try std.json.Stringify.valueAlloc(alloc, value, .{}) };
 }
 
 fn validateGeneratedSemanticQueryBuilderResponse(
@@ -2973,10 +3003,11 @@ fn buildQueryBuilderGraphSeedQueryRequest(
     switch (built.query_kind) {
         .status_only => {},
         .conjunction => {
-            out.full_text_search = try buildQueryBuilderMatchQueryValue(alloc, built.text_value.?, built.text_field.?);
+            const value = try buildQueryBuilderMatchQueryValue(alloc, built.text_value.?, built.text_field.?);
+            out.full_text_search = try rawQueryFromJsonValueAlloc(alloc, value);
         },
         .field_match, .generic, .llm_full_text => {
-            out.full_text_search = built.query;
+            out.full_text_search = try rawQueryFromJsonValueAlloc(alloc, built.query);
         },
         .semantic => {
             out.semantic_search = built.text_value;
@@ -2986,18 +3017,19 @@ fn buildQueryBuilderGraphSeedQueryRequest(
             out.semantic_search = built.text_value;
             out.indexes = built.indexes;
             if (built.text_field != null and built.text_value != null) {
-                out.full_text_search = try buildQueryBuilderMatchQueryValue(alloc, built.text_value.?, built.text_field.?);
+                const value = try buildQueryBuilderMatchQueryValue(alloc, built.text_value.?, built.text_field.?);
+                out.full_text_search = try rawQueryFromJsonValueAlloc(alloc, value);
             } else if (built.status_field == null or built.status_value == null) {
-                out.full_text_search = built.query;
+                out.full_text_search = try rawQueryFromJsonValueAlloc(alloc, built.query);
             }
         },
     }
-    out.filter_query = try buildQueryBuilderFilterQueryValue(alloc, built);
-    out.filter_query = try combineQueryBuilderFilterQueries(
+    const filter_query = try combineQueryBuilderFilterQueries(
         alloc,
-        out.filter_query,
+        try buildQueryBuilderFilterQueryValue(alloc, built),
         try buildQueryBuilderConstraintFilterQueryValue(alloc, request.constraints, fields),
     );
+    out.filter_query = if (filter_query) |value| try rawQueryFromJsonValueAlloc(alloc, value) else null;
     return out;
 }
 
@@ -4293,7 +4325,8 @@ fn buildQueryBuilderQueryRequest(
         try buildQueryBuilderConstraintFilterQueryValue(alloc, request.constraints, fields),
     );
     out.filter_prefix = queryBuilderConstraintString(request.constraints, "filter_prefix");
-    out.exclusion_query = try buildQueryBuilderConstraintExclusionQueryValue(alloc, request.constraints, fields);
+    const exclusion_query = try buildQueryBuilderConstraintExclusionQueryValue(alloc, request.constraints, fields);
+    out.exclusion_query = if (exclusion_query) |value| try rawQueryFromJsonValueAlloc(alloc, value) else null;
     out.graph_queries = try queryBuilderGraphSearches(alloc, request, built, graph_indexes);
     const expand_strategy = queryBuilderConstraintString(request.constraints, "expand_strategy");
     if (expand_strategy != null) {
@@ -4302,29 +4335,31 @@ fn buildQueryBuilderQueryRequest(
 
     switch (built.query_kind) {
         .status_only => {
-            out.filter_query = filter_query orelse built.query;
+            out.filter_query = try rawQueryFromJsonValueAlloc(alloc, filter_query orelse built.query);
         },
         .conjunction => {
-            out.full_text_search = try buildQueryBuilderMatchQueryValue(alloc, built.text_value.?, built.text_field.?);
-            out.filter_query = filter_query;
+            const value = try buildQueryBuilderMatchQueryValue(alloc, built.text_value.?, built.text_field.?);
+            out.full_text_search = try rawQueryFromJsonValueAlloc(alloc, value);
+            out.filter_query = if (filter_query) |filter| try rawQueryFromJsonValueAlloc(alloc, filter) else null;
         },
         .field_match, .generic, .llm_full_text => {
-            out.full_text_search = built.query;
-            out.filter_query = filter_query;
+            out.full_text_search = try rawQueryFromJsonValueAlloc(alloc, built.query);
+            out.filter_query = if (filter_query) |filter| try rawQueryFromJsonValueAlloc(alloc, filter) else null;
         },
         .semantic => {
             out.semantic_search = built.text_value;
             out.indexes = built.indexes;
-            out.filter_query = filter_query;
+            out.filter_query = if (filter_query) |filter| try rawQueryFromJsonValueAlloc(alloc, filter) else null;
         },
         .hybrid => {
             out.semantic_search = built.text_value;
             out.indexes = built.indexes;
-            out.filter_query = filter_query;
+            out.filter_query = if (filter_query) |filter| try rawQueryFromJsonValueAlloc(alloc, filter) else null;
             if (built.text_field != null and built.text_value != null) {
-                out.full_text_search = try buildQueryBuilderMatchQueryValue(alloc, built.text_value.?, built.text_field.?);
+                const value = try buildQueryBuilderMatchQueryValue(alloc, built.text_value.?, built.text_field.?);
+                out.full_text_search = try rawQueryFromJsonValueAlloc(alloc, value);
             } else if (built.status_field == null or built.status_value == null) {
-                out.full_text_search = built.query;
+                out.full_text_search = try rawQueryFromJsonValueAlloc(alloc, built.query);
             }
         },
     }
@@ -6899,16 +6934,13 @@ test "query builder metadata validator accepts the canonical ranked result ref" 
 }
 
 test "query builder preflight reports metadata diagnostics" {
-    var parsed_query = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"match\":\"published\",\"field\":\"body\"}", .{});
-    defer parsed_query.deinit();
-
     var collected = collectQueryBuilderContext(.{
         .schema_fields = &.{"body"},
     });
     var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
         .intent = "find published docs",
     }, .{
-        .full_text_search = parsed_query.value,
+        .full_text_search = .{ .bytes = "{\"match\":\"published\",\"field\":\"body\"}" },
     }, null, "full_text", .{});
     defer preflight.deinit(std.testing.allocator);
 
@@ -6954,11 +6986,6 @@ test "query builder preflight accepts queryable mapped sort field outside full t
 }
 
 test "query builder preflight validates filters against query modes not full text coverage" {
-    var parsed_filter = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"term\":\"published\",\"field\":\"status\"}", .{});
-    defer parsed_filter.deinit();
-    var parsed_range = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"range\":{\"published_at\":{\"gte\":\"2026-01-01\"}}}", .{});
-    defer parsed_range.deinit();
-
     const capabilities = [_]QueryBuilderFieldCapability{
         .{
             .field = "body",
@@ -6985,7 +7012,7 @@ test "query builder preflight validates filters against query modes not full tex
     var exact_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
         .intent = "published docs",
     }, .{
-        .filter_query = parsed_filter.value,
+        .filter_query = .{ .bytes = "{\"term\":\"published\",\"field\":\"status\"}" },
     }, null, "query_builder", .{});
     defer exact_preflight.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), exact_preflight.diagnostics.len);
@@ -6993,16 +7020,13 @@ test "query builder preflight validates filters against query modes not full tex
     var range_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
         .intent = "recent docs",
     }, .{
-        .filter_query = parsed_range.value,
+        .filter_query = .{ .bytes = "{\"range\":{\"published_at\":{\"gte\":\"2026-01-01\"}}}" },
     }, null, "query_builder", .{});
     defer range_preflight.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), range_preflight.diagnostics.len);
 }
 
 test "query builder preflight rejects filter operators without required query mode" {
-    var parsed_filter = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"term\":\"published\",\"field\":\"body\"}", .{});
-    defer parsed_filter.deinit();
-
     const capabilities = [_]QueryBuilderFieldCapability{
         .{
             .field = "body",
@@ -7019,7 +7043,7 @@ test "query builder preflight rejects filter operators without required query mo
     var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
         .intent = "published docs",
     }, .{
-        .filter_query = parsed_filter.value,
+        .filter_query = .{ .bytes = "{\"term\":\"published\",\"field\":\"body\"}" },
     }, null, "query_builder", .{});
     defer preflight.deinit(std.testing.allocator);
 
@@ -7295,11 +7319,6 @@ test "query builder preflight accepts observed dynamic sortable field" {
 }
 
 test "query builder preflight validates score sort source" {
-    var parsed_query = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"match\":\"raft\",\"field\":\"body\"}", .{});
-    defer parsed_query.deinit();
-    var parsed_match_all = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"match_all\":{}}", .{});
-    defer parsed_match_all.deinit();
-
     var collected = collectQueryBuilderContext(.{
         .schema_fields = &.{"body"},
         .full_text_index_metadata = &.{.{ .name = "search_idx", .fields = &.{"body"} }},
@@ -7309,7 +7328,7 @@ test "query builder preflight validates score sort source" {
     var valid_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
         .intent = "highest scoring docs",
     }, .{
-        .full_text_search = parsed_query.value,
+        .full_text_search = .{ .bytes = "{\"match\":\"raft\",\"field\":\"body\"}" },
         .order_by = &score_order,
     }, null, "query_builder", .{});
     defer valid_preflight.deinit(std.testing.allocator);
@@ -7335,7 +7354,7 @@ test "query builder preflight validates score sort source" {
     var filter_shaped_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
         .intent = "highest scoring docs",
     }, .{
-        .full_text_search = parsed_match_all.value,
+        .full_text_search = .{ .bytes = "{\"match_all\":{}}" },
         .order_by = &score_order,
     }, null, "query_builder", .{});
     defer filter_shaped_preflight.deinit(std.testing.allocator);
@@ -7599,9 +7618,6 @@ test "query builder preflight includes runtime validator diagnostics" {
         }
     };
 
-    var parsed_query = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"match\":\"published\",\"field\":\"body\"}", .{});
-    defer parsed_query.deinit();
-
     var collected = collectQueryBuilderContext(.{
         .schema_fields = &.{"body"},
         .full_text_index_metadata = &.{.{ .name = "search_idx", .fields = &.{"body"} }},
@@ -7610,7 +7626,7 @@ test "query builder preflight includes runtime validator diagnostics" {
     var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
         .intent = "find published docs",
     }, .{
-        .full_text_search = parsed_query.value,
+        .full_text_search = .{ .bytes = "{\"match\":\"published\",\"field\":\"body\"}" },
     }, null, "full_text", .{});
     defer preflight.deinit(std.testing.allocator);
 
@@ -7703,9 +7719,6 @@ test "query builder preflight estimate mode includes runtime summary" {
         }
     };
 
-    var parsed_query = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"match\":\"published\",\"field\":\"body\"}", .{});
-    defer parsed_query.deinit();
-
     var collected = collectQueryBuilderContext(.{
         .schema_fields = &.{"body"},
         .full_text_index_metadata = &.{.{ .name = "search_idx", .fields = &.{"body"} }},
@@ -7714,7 +7727,7 @@ test "query builder preflight estimate mode includes runtime summary" {
     var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
         .intent = "find published docs",
     }, .{
-        .full_text_search = parsed_query.value,
+        .full_text_search = .{ .bytes = "{\"match\":\"published\",\"field\":\"body\"}" },
     }, null, "full_text", .{ .mode = .estimate });
     defer preflight.deinit(std.testing.allocator);
 
@@ -7849,18 +7862,13 @@ test "query builder preflight estimate mode reports vector worker fallback risk"
         }
     };
 
-    var parsed_query = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"match":"raft","field":"body"}
-    , .{});
-    defer parsed_query.deinit();
-
     var collected = collectQueryBuilderContext(.{
         .runtime_query_request_validator = RuntimeValidator.iface(),
     });
     var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
         .intent = "find docs with unsupported vector filter",
     }, .{
-        .full_text_search = parsed_query.value,
+        .full_text_search = .{ .bytes = "{\"match\":\"raft\",\"field\":\"body\"}" },
     }, null, "full_text", .{ .mode = .estimate });
     defer preflight.deinit(std.testing.allocator);
 
@@ -7935,9 +7943,6 @@ test "query builder preflight estimate mode derives text bounds and postings lat
         }
     };
 
-    var parsed_query = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"match\":\"draft published\",\"field\":\"body\"}", .{});
-    defer parsed_query.deinit();
-
     var collected = collectQueryBuilderContext(.{
         .schema_fields = &.{"body"},
         .full_text_index_metadata = &.{.{ .name = "search_idx", .fields = &.{"body"} }},
@@ -7946,7 +7951,7 @@ test "query builder preflight estimate mode derives text bounds and postings lat
     var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
         .intent = "find draft or published docs",
     }, .{
-        .full_text_search = parsed_query.value,
+        .full_text_search = .{ .bytes = "{\"match\":\"draft published\",\"field\":\"body\"}" },
     }, null, "full_text", .{ .mode = .estimate });
     defer preflight.deinit(std.testing.allocator);
 
@@ -8028,12 +8033,10 @@ test "query builder preflight estimate mode reports structured count budget limi
         .full_text_index_metadata = &.{.{ .name = "search_idx", .fields = &.{"score"} }},
         .runtime_query_request_validator = RuntimeValidator.iface(),
     });
-    var parsed_filter = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"numeric_range\":{\"field\":\"score\",\"min\":10}}", .{});
-    defer parsed_filter.deinit();
     var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
         .intent = "find high scores",
     }, .{
-        .filter_query = parsed_filter.value,
+        .filter_query = .{ .bytes = "{\"numeric_range\":{\"field\":\"score\",\"min\":10}}" },
     }, null, "filter", .{ .mode = .estimate, .max_work = 1000 });
     defer preflight.deinit(std.testing.allocator);
 

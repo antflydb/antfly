@@ -5235,7 +5235,7 @@ fn parseSingleAggregationRequestAlloc(
         else
             "",
         .background_query = if (aggregation.background_filter) |value|
-            try parseAggregationBackgroundQueryAlloc(alloc, value)
+            try parseAggregationBackgroundQueryJsonAlloc(alloc, value.bytes)
         else
             null,
         .ranges = ranges,
@@ -5320,6 +5320,15 @@ fn parseAggregationBackgroundQueryAlloc(
         }
     }
     return error.UnsupportedQueryRequest;
+}
+
+fn parseAggregationBackgroundQueryJsonAlloc(
+    alloc: std.mem.Allocator,
+    raw: []const u8,
+) !aggregations_mod.BackgroundQuery {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    return try parseAggregationBackgroundQueryAlloc(alloc, parsed.value);
 }
 
 fn buildAggregationResults(
@@ -7409,7 +7418,18 @@ fn buildRerankerQueryText(alloc: std.mem.Allocator, request: anytype) ![]const u
     return error.UnsupportedQueryRequest;
 }
 
-fn buildRerankerQueryTextFromValue(alloc: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+fn buildRerankerQueryTextFromValue(alloc: std.mem.Allocator, input: anytype) ![]const u8 {
+    const Input = @TypeOf(input);
+    if (comptime Input != std.json.Value) {
+        if (comptime @hasField(Input, "bytes")) {
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, input.bytes, .{});
+            defer parsed.deinit();
+            return buildRerankerQueryTextFromValue(alloc, parsed.value);
+        }
+        @compileError("reranker query input must be std.json.Value or raw JSON");
+    }
+
+    const value: std.json.Value = input;
     if (value == .string) return try alloc.dupe(u8, value.string);
     if (value != .object) return try jsonStringifyAlloc(alloc, value);
 
@@ -7540,22 +7560,26 @@ fn normalizePublicQueryBucketsAlloc(
         );
     }
     if (request.full_text_search) |full_text_search| {
-        try validatePublicQueryTraversalBudgetAlloc(alloc, full_text_search);
+        var parsed_full_text_search = try std.json.parseFromSlice(std.json.Value, alloc, full_text_search.bytes, .{});
+        defer parsed_full_text_search.deinit();
+        try validatePublicQueryTraversalBudgetAlloc(alloc, parsed_full_text_search.value);
         try appendFullTextSearchClausesAlloc(
             alloc,
             &scoring_must,
             &filter_clauses,
             &filter_text_queries,
-            full_text_search,
+            parsed_full_text_search.value,
             limit,
         );
     }
     if (request.filter_query) |filter_query| {
+        var parsed_filter_query = try std.json.parseFromSlice(std.json.Value, alloc, filter_query.bytes, .{});
+        defer parsed_filter_query.deinit();
         appendPublicFilterOrTextClausesAlloc(
             alloc,
             &filter_clauses,
             &filter_text_queries,
-            filter_query,
+            parsed_filter_query.value,
             limit,
         ) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidFilterQueryRequest,
@@ -7564,11 +7588,13 @@ fn normalizePublicQueryBucketsAlloc(
         };
     }
     if (request.exclusion_query) |exclusion_query| {
+        var parsed_exclusion_query = try std.json.parseFromSlice(std.json.Value, alloc, exclusion_query.bytes, .{});
+        defer parsed_exclusion_query.deinit();
         appendPublicFilterOrTextClausesAlloc(
             alloc,
             &exclusion_clauses,
             &exclusion_text_queries,
-            exclusion_query,
+            parsed_exclusion_query.value,
             limit,
         ) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -8978,8 +9004,22 @@ pub fn encodeSupportedPatternFilterQueryAlloc(
 /// stored-document semantics.
 pub fn normalizePublicStoredFilterQueryAlloc(
     alloc: std.mem.Allocator,
-    query: std.json.Value,
+    input: anytype,
 ) ![]u8 {
+    const Input = @TypeOf(input);
+    if (comptime Input != std.json.Value) {
+        if (comptime @hasField(Input, "bytes")) {
+            const parsed = std.json.parseFromSlice(std.json.Value, alloc, input.bytes, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidQueryRequest,
+            };
+            defer parsed.deinit();
+            return normalizePublicStoredFilterQueryAlloc(alloc, parsed.value);
+        }
+        @compileError("stored filter query must be std.json.Value or raw JSON");
+    }
+
+    const query: std.json.Value = input;
     var clauses = std.ArrayListUnmanaged([]u8).empty;
     errdefer deinitOwnedStringArrayList(alloc, &clauses);
     try appendPublicFilterClausesAlloc(alloc, &clauses, query, 10);

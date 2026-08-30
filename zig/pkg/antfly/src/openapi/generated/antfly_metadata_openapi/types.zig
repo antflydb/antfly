@@ -4019,11 +4019,108 @@ pub const GraphPathWeightDomainError = struct {
     retryable: bool,
     /// Named shortest-path operation that encountered the incompatible edge weight.
     operation: []const u8,
+    /// Exact path algorithm whose numeric domain was violated.
     mode: []const u8,
+    /// Stable machine-readable reason the weight was rejected.
+    violation: []const u8,
     /// Required edge-weight interval for exact execution in the selected mode.
     allowed_range: []const u8,
     /// Stable user-facing guidance for correcting the graph or query.
     remediation: []const u8,
+};
+
+pub const GraphQueryUnprocessableError = union(enum) {
+    graph_distinct_budget_exceeded_error: GraphDistinctBudgetExceededError,
+    graph_work_budget_exceeded_error: GraphWorkBudgetExceededError,
+    graph_path_weight_domain_error: GraphPathWeightDomainError,
+    graph_anchor_filter_requires_index_error: GraphAnchorFilterRequiresIndexError,
+    graph_query_unsupported_error: GraphQueryUnsupportedError,
+    graph_match_operation_limit_exceeded_error: GraphMatchOperationLimitExceededError,
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { @"error": DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.@"error") {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "graph_distinct_budget_exceeded")) {
+            return .{ .graph_distinct_budget_exceeded_error = try std.json.parseFromSliceLeaky(GraphDistinctBudgetExceededError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_work_budget_exceeded")) {
+            return .{ .graph_work_budget_exceeded_error = try std.json.parseFromSliceLeaky(GraphWorkBudgetExceededError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_path_weight_domain_error")) {
+            return .{ .graph_path_weight_domain_error = try std.json.parseFromSliceLeaky(GraphPathWeightDomainError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
+            return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromSliceLeaky(GraphAnchorFilterRequiresIndexError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_query_unsupported")) {
+            return .{ .graph_query_unsupported_error = try std.json.parseFromSliceLeaky(GraphQueryUnsupportedError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_match_operation_limit_exceeded")) {
+            return .{ .graph_match_operation_limit_exceeded_error = try std.json.parseFromSliceLeaky(GraphMatchOperationLimitExceededError, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("error") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "graph_distinct_budget_exceeded")) {
+            return .{ .graph_distinct_budget_exceeded_error = try std.json.parseFromValueLeaky(GraphDistinctBudgetExceededError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_work_budget_exceeded")) {
+            return .{ .graph_work_budget_exceeded_error = try std.json.parseFromValueLeaky(GraphWorkBudgetExceededError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_path_weight_domain_error")) {
+            return .{ .graph_path_weight_domain_error = try std.json.parseFromValueLeaky(GraphPathWeightDomainError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
+            return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromValueLeaky(GraphAnchorFilterRequiresIndexError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_query_unsupported")) {
+            return .{ .graph_query_unsupported_error = try std.json.parseFromValueLeaky(GraphQueryUnsupportedError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_match_operation_limit_exceeded")) {
+            return .{ .graph_match_operation_limit_exceeded_error = try std.json.parseFromValueLeaky(GraphMatchOperationLimitExceededError, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .graph_distinct_budget_exceeded_error => |v| try jw.write(v),
+            .graph_work_budget_exceeded_error => |v| try jw.write(v),
+            .graph_path_weight_domain_error => |v| try jw.write(v),
+            .graph_anchor_filter_requires_index_error => |v| try jw.write(v),
+            .graph_query_unsupported_error => |v| try jw.write(v),
+            .graph_match_operation_limit_exceeded_error => |v| try jw.write(v),
+        }
+    }
 };
 
 pub const GraphQueryUnsupportedError = struct {
@@ -7160,10 +7257,10 @@ pub const QueryTemporarilyUnavailableError = struct {
 
 pub const QueryUnprocessableError = union(enum) {
     unsupported_hierarchy_grouping_error: *UnsupportedHierarchyGroupingError,
+    graph_path_weight_domain_error: *GraphPathWeightDomainError,
     graph_work_budget_exceeded_error: *GraphWorkBudgetExceededError,
     exact_sort_error: *ExactSortError,
     graph_distinct_budget_exceeded_error: *GraphDistinctBudgetExceededError,
-    graph_path_weight_domain_error: *GraphPathWeightDomainError,
     query_candidate_budget_exceeded_error: *QueryCandidateBudgetExceededError,
     graph_query_unsupported_error: *GraphQueryUnsupportedError,
     graph_match_operation_limit_exceeded_error: *GraphMatchOperationLimitExceededError,
@@ -7221,6 +7318,21 @@ pub const QueryUnprocessableError = union(enum) {
             "retryable",
             "operation",
             "mode",
+            "violation",
+            "allowed_range",
+            "remediation",
+        }) and
+            objectStringEquals(source.object, "error", "graph_path_weight_domain_error"))
+        {
+            if (try parseStructuralVariant(GraphPathWeightDomainError, allocator, source, options)) |parsed| return .{ .graph_path_weight_domain_error = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
+            "retryable",
+            "operation",
+            "mode",
             "dimension",
             "maximum",
             "remediation",
@@ -7256,20 +7368,6 @@ pub const QueryUnprocessableError = union(enum) {
             objectStringEquals(source.object, "error", "graph_distinct_budget_exceeded"))
         {
             if (try parseStructuralVariant(GraphDistinctBudgetExceededError, allocator, source, options)) |parsed| return .{ .graph_distinct_budget_exceeded_error = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "status",
-            "error",
-            "message",
-            "retryable",
-            "operation",
-            "mode",
-            "allowed_range",
-            "remediation",
-        }) and
-            objectStringEquals(source.object, "error", "graph_path_weight_domain_error"))
-        {
-            if (try parseStructuralVariant(GraphPathWeightDomainError, allocator, source, options)) |parsed| return .{ .graph_path_weight_domain_error = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "error",
@@ -7345,10 +7443,10 @@ pub const QueryUnprocessableError = union(enum) {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
             .unsupported_hierarchy_grouping_error => |v| try jw.write(v.*),
+            .graph_path_weight_domain_error => |v| try jw.write(v.*),
             .graph_work_budget_exceeded_error => |v| try jw.write(v.*),
             .exact_sort_error => |v| try jw.write(v.*),
             .graph_distinct_budget_exceeded_error => |v| try jw.write(v.*),
-            .graph_path_weight_domain_error => |v| try jw.write(v.*),
             .query_candidate_budget_exceeded_error => |v| try jw.write(v.*),
             .graph_query_unsupported_error => |v| try jw.write(v.*),
             .graph_match_operation_limit_exceeded_error => |v| try jw.write(v.*),
@@ -7359,8 +7457,8 @@ pub const QueryUnprocessableError = union(enum) {
     }
 };
 
-/// A validated Antfly query retained as raw JSON by Go and Zig servers and clients.
-pub const RawQuery = std.json.Value;
+/// An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
+pub const RawQuery = OpenApiRawJson;
 
 /// Bounded request to list table repair issues.
 pub const RepairIssueListRequest = struct {
@@ -12146,6 +12244,97 @@ pub fn OpenApiOptionalNullable(comptime T: type) type {
         }
     };
 }
+
+/// Syntactically validated JSON retained as compact owned bytes.
+pub const OpenApiRawJson = struct {
+    bytes: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        var stringify: std.json.Stringify = .{ .writer = &output.writer };
+        copyValue(allocator, source, options, &stringify) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => |parse_err| return parse_err,
+        };
+        return .{ .bytes = try output.toOwnedSlice() };
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
+        return .{ .bytes = try std.json.Stringify.valueAlloc(allocator, source, .{}) };
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginWriteRaw();
+        try jw.writer.writeAll(self.bytes);
+        jw.endWriteRaw();
+    }
+
+    fn copyValue(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions, jw: *std.json.Stringify) !void {
+        switch (try source.peekNextTokenType()) {
+            .object_begin => {
+                _ = try source.next();
+                try jw.beginObject();
+                while (try source.peekNextTokenType() != .object_end) {
+                    const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+                    switch (token) {
+                        .string => |name| try jw.objectField(name),
+                        .allocated_string => |name| {
+                            defer allocator.free(name);
+                            try jw.objectField(name);
+                        },
+                        else => return error.UnexpectedToken,
+                    }
+                    try copyValue(allocator, source, options, jw);
+                }
+                _ = try source.next();
+                try jw.endObject();
+            },
+            .array_begin => {
+                _ = try source.next();
+                try jw.beginArray();
+                while (try source.peekNextTokenType() != .array_end) try copyValue(allocator, source, options, jw);
+                _ = try source.next();
+                try jw.endArray();
+            },
+            .string => switch (try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?)) {
+                .string => |value| try jw.write(value),
+                .allocated_string => |value| {
+                    defer allocator.free(value);
+                    try jw.write(value);
+                },
+                else => unreachable,
+            },
+            .number => switch (try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?)) {
+                .number => |value| try writeNumber(jw, value),
+                .allocated_number => |value| {
+                    defer allocator.free(value);
+                    try writeNumber(jw, value);
+                },
+                else => unreachable,
+            },
+            .true => {
+                _ = try source.next();
+                try jw.write(true);
+            },
+            .false => {
+                _ = try source.next();
+                try jw.write(false);
+            },
+            .null => {
+                _ = try source.next();
+                try jw.write(null);
+            },
+            .object_end, .array_end, .end_of_document => return error.UnexpectedToken,
+        }
+    }
+
+    fn writeNumber(jw: *std.json.Stringify, value: []const u8) !void {
+        try jw.beginWriteRaw();
+        try jw.writer.writeAll(value);
+        jw.endWriteRaw();
+    }
+};
 
 /// Parse an OpenAPI object without materializing a second JSON tree while
 /// rejecting explicit null for optional properties whose schemas are non-nullable.

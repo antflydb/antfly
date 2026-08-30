@@ -18,27 +18,47 @@ pub const Diagnostic = struct {
     maximum: usize,
 };
 
-threadlocal var last_diagnostic: ?Diagnostic = null;
-threadlocal var operation_buf: [graph_query.max_identifier_bytes]u8 = undefined;
+pub const Storage = struct {
+    diagnostic: ?Diagnostic = null,
+    operation_buf: [graph_query.max_identifier_bytes]u8 = undefined,
+};
+
+threadlocal var active_storage: ?*Storage = null;
+
+pub const Binding = struct {
+    previous: ?*Storage,
+
+    pub fn deinit(self: Binding) void {
+        active_storage = self.previous;
+    }
+};
+
+pub fn bind(storage: *Storage) Binding {
+    const previous = active_storage;
+    active_storage = storage;
+    return .{ .previous = previous };
+}
 
 pub fn reset() void {
-    last_diagnostic = null;
+    if (active_storage) |storage| storage.diagnostic = null;
 }
 
 pub fn take() ?Diagnostic {
-    const diagnostic = last_diagnostic;
-    last_diagnostic = null;
+    const storage = active_storage orelse return null;
+    const diagnostic = storage.diagnostic;
+    storage.diagnostic = null;
     return diagnostic;
 }
 
 pub fn record(operation: []const u8, query: graph_query.GraphQuery, exhaustion: Exhaustion) void {
-    if (operation.len == 0 or operation.len > operation_buf.len) {
-        last_diagnostic = null;
+    const storage = active_storage orelse return;
+    if (operation.len == 0 or operation.len > storage.operation_buf.len) {
+        storage.diagnostic = null;
         return;
     }
-    @memcpy(operation_buf[0..operation.len], operation);
-    last_diagnostic = .{
-        .operation = operation_buf[0..operation.len],
+    @memcpy(storage.operation_buf[0..operation.len], operation);
+    storage.diagnostic = .{
+        .operation = storage.operation_buf[0..operation.len],
         .mode = mode(query),
         .dimension = exhaustion.dimension,
         .maximum = exhaustion.maximum,
@@ -67,6 +87,9 @@ fn mode(query: graph_query.GraphQuery) []const u8 {
 }
 
 test "work budget diagnostic owns the operation name" {
+    var storage: Storage = .{};
+    const binding = bind(&storage);
+    defer binding.deinit();
     var operation = [_]u8{ 'm', 'a', 't', 'c', 'h' };
     record(&operation, .{ .query_type = .pattern, .index_name = "graph", .start_nodes = .{ .keys = &.{} }, .match_pattern = .{ .nodes = &.{}, .edges = &.{} } }, .{
         .dimension = .explored_edges,

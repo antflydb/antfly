@@ -212,8 +212,22 @@ func TestQueryUnprocessableErrorSelectsStrictGraphArm(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"status":422,"error":"graph_work_budget_exceeded","message":"budget exhausted","retryable":false,"operation":"friends","mode":"match","dimension":"explored_edges","maximum":2048,"remediation":"narrow the anchor","unexpected":true}`), &union); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := union.DecodeStrictGraphError(); err == nil {
-		t.Fatal("expected unknown graph error field to be rejected")
+	if _, err := union.DecodeStrictGraphError(); err != nil {
+		t.Fatalf("additive response field should be tolerated: %v", err)
+	}
+
+	if err := json.Unmarshal([]byte(`{"error":"graph_work_budget_exceeded"}`), &union); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := union.DecodeStrictGraphError(); err == nil || !strings.Contains(err.Error(), "missing required field") {
+		t.Fatalf("expected missing generated required field to be rejected, got %v", err)
+	}
+
+	if err := json.Unmarshal([]byte(`{"status":422,"error":"graph_path_weight_domain_error","message":"bad weight","retryable":false,"operation":"route","mode":"weight_sum","violation":"path_sum_overflow","allowed_range":"finite f64","remediation":"normalize weights"}`), &union); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := union.DecodeStrictGraphError(); err == nil || !strings.Contains(err.Error(), "invalid enum") {
+		t.Fatalf("expected invalid generated enum value to be rejected, got %v", err)
 	}
 
 	if err := json.Unmarshal([]byte(`{"status":422,"error":"query_candidate_budget_exceeded","message":"budget exhausted"}`), &union); err != nil {

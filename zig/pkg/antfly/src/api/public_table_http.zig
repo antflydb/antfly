@@ -25,6 +25,7 @@ const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagn
 const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
 const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
+const graph_request_diagnostics = @import("graph_request_diagnostics.zig");
 const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -856,7 +857,8 @@ pub fn graphWorkBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
 pub fn graphPathWeightDomainErrorBody(alloc: std.mem.Allocator) ![]u8 {
     const diagnostic = graph_path_weight_diagnostic.take() orelse graph_path_weight_diagnostic.Diagnostic{
         .operation = "$request",
-        .mode = "weighted_path",
+        .mode = .weighted_path,
+        .violation = .path_sum_overflow,
         .allowed_range = "mode-dependent",
     };
     return try std.json.Stringify.valueAlloc(alloc, .{
@@ -865,7 +867,8 @@ pub fn graphPathWeightDomainErrorBody(alloc: std.mem.Allocator) ![]u8 {
         .message = "an edge weight or accumulated path score is outside the path algorithm's exact numeric domain",
         .retryable = false,
         .operation = diagnostic.operation,
-        .mode = diagnostic.mode,
+        .mode = @tagName(diagnostic.mode),
+        .violation = @tagName(diagnostic.violation),
         .allowed_range = diagnostic.allowed_range,
         .remediation = "normalize edge weights or select a compatible path weight mode",
     }, .{});
@@ -1265,6 +1268,10 @@ pub fn handleTableQueryRequest(
     row_filter_json: ?[]const u8,
     api: TableApi,
 ) !OwnedResponse {
+    var diagnostic_context: graph_request_diagnostics.Context = .{};
+    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    defer diagnostic_scope.deinit();
+
     if (try bodyHasInternalShardQueryFields(alloc, body)) {
         std.log.warn("public table query rejected internal fields table={s}", .{table_name});
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid query request") };
@@ -4175,6 +4182,9 @@ test "unsupported graph diagnostics identify the rejected operation feature" {
 }
 
 test "runtime graph capability diagnostics preserve the failing named operation" {
+    var diagnostic_context: graph_request_diagnostics.Context = .{};
+    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    defer diagnostic_scope.deinit();
     graph_query_diagnostic.reset();
     graph_query_diagnostic.record(
         "later_match",
@@ -4200,6 +4210,9 @@ test "runtime graph capability diagnostics preserve the failing named operation"
 }
 
 test "recorded graph diagnostics explain serverless legacy rejection" {
+    var diagnostic_context: graph_request_diagnostics.Context = .{};
+    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    defer diagnostic_scope.deinit();
     graph_query_diagnostic.reset();
     defer graph_query_diagnostic.reset();
     graph_query_diagnostic.record(
@@ -4234,6 +4247,9 @@ test "recorded graph diagnostics explain serverless legacy rejection" {
 }
 
 test "recorded graph diagnostics identify unsupported request controls" {
+    var diagnostic_context: graph_request_diagnostics.Context = .{};
+    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    defer diagnostic_scope.deinit();
     graph_query_diagnostic.reset();
     defer graph_query_diagnostic.reset();
     graph_query_diagnostic.record(

@@ -298,6 +298,7 @@ pub const GraphQueryParams = types.GraphQueryParams;
 pub const GraphQueryResults = types.GraphQueryResults;
 pub const GraphQueryStats = types.GraphQueryStats;
 pub const GraphQueryType = types.GraphQueryType;
+pub const GraphQueryUnprocessableError = types.GraphQueryUnprocessableError;
 pub const GraphQueryUnsupportedError = types.GraphQueryUnsupportedError;
 pub const GraphResolverConfig = types.GraphResolverConfig;
 pub const GraphResult = types.GraphResult;

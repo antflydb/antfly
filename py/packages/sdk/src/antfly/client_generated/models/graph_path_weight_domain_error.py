@@ -8,6 +8,7 @@ from attrs import define as _attrs_define
 from ..models.graph_path_weight_domain_error_error import GraphPathWeightDomainErrorError
 from ..models.graph_path_weight_domain_error_mode import GraphPathWeightDomainErrorMode
 from ..models.graph_path_weight_domain_error_status import GraphPathWeightDomainErrorStatus
+from ..models.graph_path_weight_domain_error_violation import GraphPathWeightDomainErrorViolation
 
 T = TypeVar("T", bound="GraphPathWeightDomainError")
 
@@ -21,7 +22,8 @@ class GraphPathWeightDomainError:
         message (str):
         retryable (bool):
         operation (str): Named shortest-path operation that encountered the incompatible edge weight.
-        mode (GraphPathWeightDomainErrorMode):
+        mode (GraphPathWeightDomainErrorMode): Exact path algorithm whose numeric domain was violated.
+        violation (GraphPathWeightDomainErrorViolation): Stable machine-readable reason the weight was rejected.
         allowed_range (str): Required edge-weight interval for exact execution in the selected mode.
         remediation (str): Stable user-facing guidance for correcting the graph or query.
     """
@@ -32,6 +34,7 @@ class GraphPathWeightDomainError:
     retryable: bool
     operation: str
     mode: GraphPathWeightDomainErrorMode
+    violation: GraphPathWeightDomainErrorViolation
     allowed_range: str
     remediation: str
 
@@ -48,6 +51,8 @@ class GraphPathWeightDomainError:
 
         mode = self.mode.value
 
+        violation = self.violation.value
+
         allowed_range = self.allowed_range
 
         remediation = self.remediation
@@ -62,6 +67,7 @@ class GraphPathWeightDomainError:
                 "retryable": retryable,
                 "operation": operation,
                 "mode": mode,
+                "violation": violation,
                 "allowed_range": allowed_range,
                 "remediation": remediation,
             }
@@ -84,6 +90,8 @@ class GraphPathWeightDomainError:
 
         mode = GraphPathWeightDomainErrorMode(d.pop("mode"))
 
+        violation = GraphPathWeightDomainErrorViolation(d.pop("violation"))
+
         allowed_range = d.pop("allowed_range")
 
         remediation = d.pop("remediation")
@@ -95,6 +103,7 @@ class GraphPathWeightDomainError:
             retryable=retryable,
             operation=operation,
             mode=mode,
+            violation=violation,
             allowed_range=allowed_range,
             remediation=remediation,
         )

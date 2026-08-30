@@ -149,15 +149,61 @@ def _parse_response(
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_unprocessable_error_type_2 = GraphDistinctBudgetExceededError.from_dict(data)
+                componentsschemas_graph_query_unprocessable_error_type_0 = GraphDistinctBudgetExceededError.from_dict(
+                    data
+                )
 
-                return componentsschemas_query_unprocessable_error_type_2
+                return componentsschemas_graph_query_unprocessable_error_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_unprocessable_error_type_3 = GraphWorkBudgetExceededError.from_dict(data)
+                componentsschemas_graph_query_unprocessable_error_type_1 = GraphWorkBudgetExceededError.from_dict(data)
+
+                return componentsschemas_graph_query_unprocessable_error_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_graph_query_unprocessable_error_type_2 = GraphPathWeightDomainError.from_dict(data)
+
+                return componentsschemas_graph_query_unprocessable_error_type_2
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_graph_query_unprocessable_error_type_3 = (
+                    GraphAnchorFilterRequiresIndexError.from_dict(data)
+                )
+
+                return componentsschemas_graph_query_unprocessable_error_type_3
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_graph_query_unprocessable_error_type_4 = GraphQueryUnsupportedError.from_dict(data)
+
+                return componentsschemas_graph_query_unprocessable_error_type_4
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_graph_query_unprocessable_error_type_5 = (
+                    GraphMatchOperationLimitExceededError.from_dict(data)
+                )
+
+                return componentsschemas_graph_query_unprocessable_error_type_5
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_unprocessable_error_type_3 = QueryFilterError.from_dict(data)
 
                 return componentsschemas_query_unprocessable_error_type_3
             except (TypeError, ValueError, AttributeError, KeyError):
@@ -165,58 +211,16 @@ def _parse_response(
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_query_unprocessable_error_type_4 = GraphPathWeightDomainError.from_dict(data)
+                componentsschemas_query_unprocessable_error_type_4 = UnsupportedHierarchyGroupingError.from_dict(data)
 
                 return componentsschemas_query_unprocessable_error_type_4
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_unprocessable_error_type_5 = GraphAnchorFilterRequiresIndexError.from_dict(data)
-
-                return componentsschemas_query_unprocessable_error_type_5
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_unprocessable_error_type_6 = GraphQueryUnsupportedError.from_dict(data)
-
-                return componentsschemas_query_unprocessable_error_type_6
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_unprocessable_error_type_7 = GraphMatchOperationLimitExceededError.from_dict(
-                    data
-                )
-
-                return componentsschemas_query_unprocessable_error_type_7
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_unprocessable_error_type_8 = QueryFilterError.from_dict(data)
-
-                return componentsschemas_query_unprocessable_error_type_8
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_query_unprocessable_error_type_9 = UnsupportedHierarchyGroupingError.from_dict(data)
-
-                return componentsschemas_query_unprocessable_error_type_9
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_query_unprocessable_error_type_10 = UnsupportedQueryError.from_dict(data)
+            componentsschemas_query_unprocessable_error_type_5 = UnsupportedQueryError.from_dict(data)
 
-            return componentsschemas_query_unprocessable_error_type_10
+            return componentsschemas_query_unprocessable_error_type_5
 
         response_422 = _parse_response_422(response.json())
 

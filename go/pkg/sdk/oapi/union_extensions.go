@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
+	"strings"
 )
 
 // DecodeInto decodes the retained GraphResult JSON directly into value.
@@ -89,55 +91,118 @@ type DecodedGraphQueryError struct {
 }
 
 // DecodeStrictGraphError selects a graph-specific QueryUnprocessableError arm
-// by its stable error discriminator and rejects fields outside that generated
-// model. It decodes directly from the union's retained bytes.
+// through the generated discriminated union and validates the selected
+// generated model's required fields, enum values, and constants. Unknown
+// response fields remain tolerated so clients are resilient to additive server
+// changes.
 func (t QueryUnprocessableError) DecodeStrictGraphError() (DecodedGraphQueryError, error) {
-	var discriminator struct {
-		Error string `json:"error"`
-	}
-	if err := json.Unmarshal(t.union, &discriminator); err != nil {
+	var union GraphQueryUnprocessableError
+	if err := json.Unmarshal(t.union, &union); err != nil {
 		return DecodedGraphQueryError{}, err
 	}
-	switch discriminator.Error {
-	case string(GraphDistinctBudgetExceededErrorErrorGraphDistinctBudgetExceeded):
-		value := &GraphDistinctBudgetExceededError{}
-		if err := decodeStrictJSON(t.union, value); err != nil {
-			return DecodedGraphQueryError{}, err
-		}
-		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantDistinctBudgetExceeded, DistinctBudgetExceeded: value}, nil
-	case string(GraphWorkBudgetExceededErrorErrorGraphWorkBudgetExceeded):
-		value := &GraphWorkBudgetExceededError{}
-		if err := decodeStrictJSON(t.union, value); err != nil {
-			return DecodedGraphQueryError{}, err
-		}
-		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantWorkBudgetExceeded, WorkBudgetExceeded: value}, nil
-	case string(GraphPathWeightDomainErrorErrorGraphPathWeightDomainError):
-		value := &GraphPathWeightDomainError{}
-		if err := decodeStrictJSON(t.union, value); err != nil {
-			return DecodedGraphQueryError{}, err
-		}
-		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantPathWeightDomain, PathWeightDomain: value}, nil
-	case string(GraphAnchorFilterRequiresIndexErrorErrorGraphAnchorFilterRequiresIndex):
-		value := &GraphAnchorFilterRequiresIndexError{}
-		if err := decodeStrictJSON(t.union, value); err != nil {
-			return DecodedGraphQueryError{}, err
-		}
-		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantAnchorFilterRequiresIndex, AnchorFilterRequiresIndex: value}, nil
-	case string(GraphQueryUnsupportedErrorErrorGraphQueryUnsupported):
-		value := &GraphQueryUnsupportedError{}
-		if err := decodeStrictJSON(t.union, value); err != nil {
-			return DecodedGraphQueryError{}, err
-		}
-		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantUnsupported, Unsupported: value}, nil
-	case string(GraphMatchOperationLimitExceededErrorErrorGraphMatchOperationLimitExceeded):
-		value := &GraphMatchOperationLimitExceededError{}
-		if err := decodeStrictJSON(t.union, value); err != nil {
-			return DecodedGraphQueryError{}, err
-		}
-		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantMatchOperationLimitExceeded, MatchOperationLimitExceeded: value}, nil
-	default:
-		return DecodedGraphQueryError{}, fmt.Errorf("unsupported graph query error discriminator %q", discriminator.Error)
+	selected, err := union.ValueByDiscriminator()
+	if err != nil {
+		return DecodedGraphQueryError{}, err
 	}
+	if err := validateGeneratedResponseJSON(t.union, selected); err != nil {
+		return DecodedGraphQueryError{}, err
+	}
+
+	switch value := selected.(type) {
+	case GraphDistinctBudgetExceededError:
+		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantDistinctBudgetExceeded, DistinctBudgetExceeded: &value}, nil
+	case GraphWorkBudgetExceededError:
+		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantWorkBudgetExceeded, WorkBudgetExceeded: &value}, nil
+	case GraphPathWeightDomainError:
+		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantPathWeightDomain, PathWeightDomain: &value}, nil
+	case GraphAnchorFilterRequiresIndexError:
+		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantAnchorFilterRequiresIndex, AnchorFilterRequiresIndex: &value}, nil
+	case GraphQueryUnsupportedError:
+		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantUnsupported, Unsupported: &value}, nil
+	case GraphMatchOperationLimitExceededError:
+		return DecodedGraphQueryError{Kind: GraphQueryErrorVariantMatchOperationLimitExceeded, MatchOperationLimitExceeded: &value}, nil
+	default:
+		return DecodedGraphQueryError{}, fmt.Errorf("unsupported generated graph query error model %T", selected)
+	}
+}
+
+// validateGeneratedResponseJSON validates the constraints that encoding/json
+// alone cannot enforce. Requiredness comes from generated json tags and enum or
+// single-value constraints come from generated Valid methods, keeping the
+// OpenAPI-generated model as the source of truth without a second field list.
+func validateGeneratedResponseJSON(encoded []byte, value any) error {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &members); err != nil {
+		return err
+	}
+	valueType := reflect.TypeOf(value)
+	if valueType.Kind() != reflect.Struct {
+		return fmt.Errorf("generated response must be a struct, got %T", value)
+	}
+	for i := 0; i < valueType.NumField(); i++ {
+		field := valueType.Field(i)
+		name, options, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if name == "" {
+			name = field.Name
+		}
+		if name == "-" || strings.Contains(options, "omitempty") || strings.Contains(options, "omitzero") {
+			continue
+		}
+		raw, present := members[name]
+		if !present {
+			return fmt.Errorf("missing required field %q", name)
+		}
+		if string(raw) == "null" && field.Type.Kind() != reflect.Pointer {
+			return fmt.Errorf("required field %q cannot be null", name)
+		}
+	}
+	return validateGeneratedEnums(reflect.ValueOf(value), "")
+}
+
+func validateGeneratedEnums(value reflect.Value, path string) error {
+	if value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface {
+		if value.IsNil() {
+			return nil
+		}
+		return validateGeneratedEnums(value.Elem(), path)
+	}
+	if value.CanInterface() {
+		if validator, ok := value.Interface().(interface{ Valid() bool }); ok && !validator.Valid() {
+			return fmt.Errorf("field %q has an invalid enum or constant value", path)
+		}
+	}
+	switch value.Kind() {
+	case reflect.Struct:
+		typeOfValue := value.Type()
+		for i := 0; i < value.NumField(); i++ {
+			fieldType := typeOfValue.Field(i)
+			name, _, _ := strings.Cut(fieldType.Tag.Get("json"), ",")
+			if name == "" {
+				name = fieldType.Name
+			}
+			fieldPath := name
+			if path != "" {
+				fieldPath = path + "." + name
+			}
+			if err := validateGeneratedEnums(value.Field(i), fieldPath); err != nil {
+				return err
+			}
+		}
+	case reflect.Array, reflect.Slice:
+		for i := 0; i < value.Len(); i++ {
+			if err := validateGeneratedEnums(value.Index(i), fmt.Sprintf("%s[%d]", path, i)); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		iterator := value.MapRange()
+		for iterator.Next() {
+			if err := validateGeneratedEnums(iterator.Value(), fmt.Sprintf("%s[%v]", path, iterator.Key().Interface())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func decodeStrictJSON(encoded []byte, value any) error {

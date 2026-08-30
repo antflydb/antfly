@@ -23,19 +23,37 @@ pub const Diagnostic = struct {
     reason: Reason,
 };
 
-// Public graph operation names are admitted at no more than 512 UTF-8 bytes.
-// Copy the name so the diagnostic remains valid while request-owned query
-// storage unwinds through the error path.
-threadlocal var last_diagnostic: ?Diagnostic = null;
-threadlocal var operation_buf: [graph_query.max_identifier_bytes]u8 = undefined;
+/// Request-owned storage. The active thread only retains a scoped pointer to
+/// this value while synchronous query execution is in progress.
+pub const Storage = struct {
+    diagnostic: ?Diagnostic = null,
+    operation_buf: [graph_query.max_identifier_bytes]u8 = undefined,
+};
+
+threadlocal var active_storage: ?*Storage = null;
+
+pub const Binding = struct {
+    previous: ?*Storage,
+
+    pub fn deinit(self: Binding) void {
+        active_storage = self.previous;
+    }
+};
+
+pub fn bind(storage: *Storage) Binding {
+    const previous = active_storage;
+    active_storage = storage;
+    return .{ .previous = previous };
+}
 
 pub fn reset() void {
-    last_diagnostic = null;
+    if (active_storage) |storage| storage.diagnostic = null;
 }
 
 pub fn take() ?Diagnostic {
-    const diagnostic = last_diagnostic;
-    last_diagnostic = null;
+    const storage = active_storage orelse return null;
+    const diagnostic = storage.diagnostic;
+    storage.diagnostic = null;
     return diagnostic;
 }
 
@@ -62,19 +80,23 @@ pub fn record(operation: []const u8, query_feature: []const u8, reason: Reason) 
     // Admission guarantees this bound for public requests. Fail closed for an
     // internal caller that bypasses admission instead of emitting a truncated,
     // misleading operation name.
-    if (operation.len == 0 or operation.len > operation_buf.len) {
-        last_diagnostic = null;
+    const storage = active_storage orelse return;
+    if (operation.len == 0 or operation.len > storage.operation_buf.len) {
+        storage.diagnostic = null;
         return;
     }
-    @memcpy(operation_buf[0..operation.len], operation);
-    last_diagnostic = .{
-        .operation = operation_buf[0..operation.len],
+    @memcpy(storage.operation_buf[0..operation.len], operation);
+    storage.diagnostic = .{
+        .operation = storage.operation_buf[0..operation.len],
         .feature = query_feature,
         .reason = reason,
     };
 }
 
 test "graph capability diagnostic owns operation name and clears on take" {
+    var storage: Storage = .{};
+    const binding = bind(&storage);
+    defer binding.deinit();
     var operation = [_]u8{ 'l', 'a', 't', 'e', 'r' };
     record(&operation, "match", .external_alias_source_not_supported);
     @memset(&operation, 'x');

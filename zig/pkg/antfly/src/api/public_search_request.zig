@@ -90,18 +90,25 @@ pub fn parseTextClausesAlloc(
 ) !ParsedTextClauses {
     return .{
         .full_text = if (request.full_text_search) |value|
-            try public_text_query_mod.parseTextSpecAlloc(alloc, value)
+            try parseRawTextSpecAlloc(alloc, value)
         else
             null,
         .filter_text = if (request.filter_query) |value|
-            try public_text_query_mod.parseTextSpecAlloc(alloc, value)
+            try parseRawTextSpecAlloc(alloc, value)
         else
             null,
         .exclusion_text = if (request.exclusion_query) |value|
-            try public_text_query_mod.parseTextSpecAlloc(alloc, value)
+            try parseRawTextSpecAlloc(alloc, value)
         else
             null,
     };
+}
+
+fn parseRawTextSpecAlloc(alloc: std.mem.Allocator, raw: anytype) !public_text_query_mod.PublicTextSpec {
+    if (@TypeOf(raw) == std.json.Value) return try public_text_query_mod.parseTextSpecAlloc(alloc, raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw.bytes, .{});
+    defer parsed.deinit();
+    return try public_text_query_mod.parseTextSpecAlloc(alloc, parsed.value);
 }
 
 pub fn parseEmbeddingsAlloc(

@@ -2031,7 +2031,7 @@ components:
     GraphPathWeightDomainError:
       type: object
       additionalProperties: false
-      required: [status, error, message, retryable, operation, mode, allowed_range, remediation]
+      required: [status, error, message, retryable, operation, mode, violation, allowed_range, remediation]
       properties:
         status:
           type: integer
@@ -2051,6 +2051,11 @@ components:
         mode:
           type: string
           enum: [min_weight, max_weight, weighted_path]
+          description: Exact path algorithm whose numeric domain was violated.
+        violation:
+          type: string
+          enum: [negative_edge_weight, edge_weight_above_one, path_sum_overflow]
+          description: Stable machine-readable reason the weight was rejected.
         allowed_range:
           type: string
           description: Required edge-weight interval for exact execution in the selected mode.
@@ -2144,16 +2149,28 @@ components:
           type: integer
           format: uint64
           description: Named MATCH operations supplied by the request.
-    QueryUnprocessableError:
+    GraphQueryUnprocessableError:
       oneOf:
-        - $ref: '#/components/schemas/ExactSortError'
-        - $ref: '#/components/schemas/QueryCandidateBudgetExceededError'
         - $ref: '#/components/schemas/GraphDistinctBudgetExceededError'
         - $ref: '#/components/schemas/GraphWorkBudgetExceededError'
         - $ref: '#/components/schemas/GraphPathWeightDomainError'
         - $ref: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
         - $ref: '#/components/schemas/GraphQueryUnsupportedError'
         - $ref: '#/components/schemas/GraphMatchOperationLimitExceededError'
+      discriminator:
+        propertyName: error
+        mapping:
+          graph_distinct_budget_exceeded: '#/components/schemas/GraphDistinctBudgetExceededError'
+          graph_work_budget_exceeded: '#/components/schemas/GraphWorkBudgetExceededError'
+          graph_path_weight_domain_error: '#/components/schemas/GraphPathWeightDomainError'
+          graph_anchor_filter_requires_index: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
+          graph_query_unsupported: '#/components/schemas/GraphQueryUnsupportedError'
+          graph_match_operation_limit_exceeded: '#/components/schemas/GraphMatchOperationLimitExceededError'
+    QueryUnprocessableError:
+      oneOf:
+        - $ref: '#/components/schemas/ExactSortError'
+        - $ref: '#/components/schemas/QueryCandidateBudgetExceededError'
+        - $ref: '#/components/schemas/GraphQueryUnprocessableError'
         - $ref: '#/components/schemas/QueryFilterError'
         - $ref: '#/components/schemas/UnsupportedHierarchyGroupingError'
         - $ref: '#/components/schemas/UnsupportedQueryError'
@@ -6889,8 +6906,8 @@ components:
       oneOf:
         - $ref: "query.yaml#/components/schemas/Query"
       x-go-type: json.RawMessage
-      x-zig-type: std.json.Value
-      description: A validated Antfly query retained as raw JSON by Go and Zig servers and clients.
+      x-zig-type: raw_json
+      description: An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
 
     HierarchyProjection:
       type: object

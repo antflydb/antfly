@@ -407,6 +407,7 @@ from .graph_path_weight_domain_error import GraphPathWeightDomainError
 from .graph_path_weight_domain_error_error import GraphPathWeightDomainErrorError
 from .graph_path_weight_domain_error_mode import GraphPathWeightDomainErrorMode
 from .graph_path_weight_domain_error_status import GraphPathWeightDomainErrorStatus
+from .graph_path_weight_domain_error_violation import GraphPathWeightDomainErrorViolation
 from .graph_paths_result import GraphPathsResult
 from .graph_paths_result_kind import GraphPathsResultKind
 from .graph_queries import GraphQueries
@@ -1382,6 +1383,7 @@ __all__ = (
     "GraphPathWeightDomainErrorError",
     "GraphPathWeightDomainErrorMode",
     "GraphPathWeightDomainErrorStatus",
+    "GraphPathWeightDomainErrorViolation",
     "GraphQueries",
     "GraphQueryParams",
     "GraphQueryParamsAlgorithmParams",

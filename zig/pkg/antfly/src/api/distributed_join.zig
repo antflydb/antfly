@@ -338,12 +338,24 @@ pub const SupportedJoinFilters = struct {
 
 pub fn combineFilterQueryWithRowFilterJson(
     alloc: std.mem.Allocator,
-    existing_filter_query: ?std.json.Value,
+    existing_filter_query: anytype,
     row_filter_json: []const u8,
 ) !std.json.Value {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_filter_json, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
-    return try combineFilterQueryValues(alloc, existing_filter_query, parsed.value);
+    const Optional = @TypeOf(existing_filter_query);
+    const Child = @typeInfo(Optional).optional.child;
+    if (comptime Child == std.json.Value) {
+        return try combineFilterQueryValues(alloc, existing_filter_query, parsed.value);
+    }
+    if (existing_filter_query) |raw| {
+        if (comptime @hasField(Child, "bytes")) {
+            const existing = std.json.parseFromSlice(std.json.Value, alloc, raw.bytes, .{}) catch return error.InvalidQueryRequest;
+            defer existing.deinit();
+            return try combineFilterQueryValues(alloc, existing.value, parsed.value);
+        }
+    }
+    return try combineFilterQueryValues(alloc, null, parsed.value);
 }
 
 pub fn applyRightTableRowFilterJson(
@@ -4272,7 +4284,10 @@ fn supportedJoinFiltersFromOpenApi(
 ) !?SupportedJoinFilters {
     const value = filters orelse return null;
     return .{
-        .filter_query = if (value.filter_query) |query| try cloneJsonValue(alloc, query) else null,
+        .filter_query = if (value.filter_query) |query|
+            try std.json.parseFromSliceLeaky(std.json.Value, alloc, query.bytes, .{})
+        else
+            null,
         .filter_prefix = if (value.filter_prefix) |prefix| try alloc.dupe(u8, prefix) else null,
         .limit = if (value.limit) |limit|
             if (limit < 0)

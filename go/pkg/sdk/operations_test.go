@@ -790,6 +790,30 @@ func TestQueryGenericStructuredErrorPreservesCodeMessageAndBody(t *testing.T) {
 	}
 }
 
+func TestQueryGenericStructuredCodeErrorPreservesCodeMessageAndBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"status":422,"code":"future_storage_error","message":"actionable server message","detail":"preserved"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.Query(context.Background(), QueryRequest{Table: "files", Limit: 10})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %T %[1]v, want APIError", err)
+	}
+	if apiErr.Code != "future_storage_error" || apiErr.Message != "actionable server message" || !strings.Contains(string(apiErr.RawBody), `"detail":"preserved"`) {
+		t.Fatalf("API error = %#v", apiErr)
+	}
+}
+
 func TestQueryPreservesTemporaryAvailabilityRetryGuidance(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)

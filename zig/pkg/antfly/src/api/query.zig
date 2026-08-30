@@ -3864,6 +3864,9 @@ test "graph coordinator distinct merge shares one fail-closed request budget" {
 }
 
 test "graph coordinator distinct merge honors configured limits and records the exhausted dimension" {
+    var diagnostic_storage: graph_distinct_budget_diagnostic.Storage = .{};
+    const diagnostic_binding = graph_distinct_budget_diagnostic.bind(&diagnostic_storage);
+    defer diagnostic_binding.deinit();
     const alloc = std.testing.allocator;
     const values = [_]graph_node_identity.Ref{
         .{ .table = "people", .key = "one" },
@@ -3919,6 +3922,9 @@ test "graph coordinator distinct merge honors configured limits and records the 
 }
 
 test "graph coordinator admits list capacity and ownership transfer before allocation" {
+    var diagnostic_storage: graph_work_budget_diagnostic.Storage = .{};
+    const diagnostic_binding = graph_work_budget_diagnostic.bind(&diagnostic_storage);
+    defer diagnostic_binding.deinit();
     const alloc = std.testing.allocator;
     const query: graph_query_mod.GraphQuery = .{
         .query_type = .traverse,

@@ -322,11 +322,8 @@ pub fn encodeMatchQueryRequestWithFlags(
     });
     defer alloc.free(full_text_json);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, full_text_json, .{});
-    defer parsed.deinit();
-
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .full_text_search = parsed.value,
+        .full_text_search = .{ .bytes = full_text_json },
         .fields = fields,
         .limit = limit,
         .count = count,
@@ -350,29 +347,23 @@ pub fn encodeFilteredQueryRequest(
         .field = match_field,
     });
     defer alloc.free(full_text_json);
-    var full_text = try std.json.parseFromSlice(std.json.Value, alloc, full_text_json, .{});
-    defer full_text.deinit();
 
     const filter_json = try stringifyJsonAlloc(alloc, query_openapi.TermQuery{
         .term = filter_term,
         .field = filter_field,
     });
     defer alloc.free(filter_json);
-    var filter = try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{});
-    defer filter.deinit();
 
     const exclusion_json = try stringifyJsonAlloc(alloc, query_openapi.TermQuery{
         .term = exclusion_term,
         .field = exclusion_field,
     });
     defer alloc.free(exclusion_json);
-    var exclusion = try std.json.parseFromSlice(std.json.Value, alloc, exclusion_json, .{});
-    defer exclusion.deinit();
 
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .full_text_search = full_text.value,
-        .filter_query = filter.value,
-        .exclusion_query = exclusion.value,
+        .full_text_search = .{ .bytes = full_text_json },
+        .filter_query = .{ .bytes = filter_json },
+        .exclusion_query = .{ .bytes = exclusion_json },
         .fields = fields,
         .limit = limit,
     });
@@ -386,11 +377,9 @@ pub fn encodeQueryRequest(
 ) ![]u8 {
     const full_text_json = try stringifyJsonAlloc(alloc, query_value);
     defer alloc.free(full_text_json);
-    var full_text = try std.json.parseFromSlice(std.json.Value, alloc, full_text_json, .{});
-    defer full_text.deinit();
 
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .full_text_search = full_text.value,
+        .full_text_search = .{ .bytes = full_text_json },
         .fields = fields,
         .limit = limit,
     });
@@ -691,8 +680,6 @@ pub fn encodeMatchGraphTraverseFromResultRefQueryRequest(
         .field = field,
     });
     defer alloc.free(full_text_json);
-    var full_text = try std.json.parseFromSlice(std.json.Value, alloc, full_text_json, .{});
-    defer full_text.deinit();
 
     var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
     defer graph_queries.deinit(alloc);
@@ -708,7 +695,7 @@ pub fn encodeMatchGraphTraverseFromResultRefQueryRequest(
     try graph_queries.map.put(alloc, graph_name, .{ .graph_traverse_query = &query });
 
     return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
-        .full_text_search = full_text.value,
+        .full_text_search = .{ .bytes = full_text_json },
         .graph_queries = graph_queries,
         .limit = limit,
     });

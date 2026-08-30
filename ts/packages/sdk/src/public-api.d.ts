@@ -3075,7 +3075,10 @@ export interface components {
              * @enum {integer}
              */
             status: 422;
-            /** @enum {string} */
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
             error: "graph_distinct_budget_exceeded";
             message: string;
             /** @enum {boolean} */
@@ -3101,7 +3104,10 @@ export interface components {
              * @enum {integer}
              */
             status: 422;
-            /** @enum {string} */
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
             error: "graph_work_budget_exceeded";
             message: string;
             /** @enum {boolean} */
@@ -3129,15 +3135,26 @@ export interface components {
              * @enum {integer}
              */
             status: 422;
-            /** @enum {string} */
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
             error: "graph_path_weight_domain_error";
             message: string;
             /** @enum {boolean} */
             retryable: false;
             /** @description Named shortest-path operation that encountered the incompatible edge weight. */
             operation: string;
-            /** @enum {string} */
+            /**
+             * @description Exact path algorithm whose numeric domain was violated.
+             * @enum {string}
+             */
             mode: "min_weight" | "max_weight" | "weighted_path";
+            /**
+             * @description Stable machine-readable reason the weight was rejected.
+             * @enum {string}
+             */
+            violation: "negative_edge_weight" | "edge_weight_above_one" | "path_sum_overflow";
             /** @description Required edge-weight interval for exact execution in the selected mode. */
             allowed_range: string;
             /** @description Stable user-facing guidance for correcting the graph or query. */
@@ -3149,7 +3166,10 @@ export interface components {
              * @enum {integer}
              */
             status: 422;
-            /** @enum {string} */
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
             error: "graph_anchor_filter_requires_index";
             message: string;
             /** @enum {boolean} */
@@ -3161,7 +3181,10 @@ export interface components {
              * @enum {integer}
              */
             status: 422;
-            /** @enum {string} */
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
             error: "graph_query_unsupported";
             message: string;
             /** @enum {boolean} */
@@ -3182,7 +3205,10 @@ export interface components {
              * @enum {integer}
              */
             status: 422;
-            /** @enum {string} */
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
             error: "graph_match_operation_limit_exceeded";
             message: string;
             /** @enum {boolean} */
@@ -3198,7 +3224,8 @@ export interface components {
              */
             actual: number;
         };
-        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphWorkBudgetExceededError"] | components["schemas"]["GraphPathWeightDomainError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphQueryUnsupportedError"] | components["schemas"]["GraphMatchOperationLimitExceededError"] | components["schemas"]["QueryFilterError"] | components["schemas"]["UnsupportedHierarchyGroupingError"] | components["schemas"]["UnsupportedQueryError"];
+        GraphQueryUnprocessableError: components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphWorkBudgetExceededError"] | components["schemas"]["GraphPathWeightDomainError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphQueryUnsupportedError"] | components["schemas"]["GraphMatchOperationLimitExceededError"];
+        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphQueryUnprocessableError"] | components["schemas"]["QueryFilterError"] | components["schemas"]["UnsupportedHierarchyGroupingError"] | components["schemas"]["UnsupportedQueryError"];
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -6510,7 +6537,7 @@ export interface components {
              */
             packed_values: string;
         };
-        /** @description A validated Antfly query retained as raw JSON by Go and Zig servers and clients. */
+        /** @description An Antfly query expression retained as syntactically validated JSON and compiled by the query engine. */
         RawQuery: components["schemas"]["Query"];
         HierarchyProjection: {
             /**

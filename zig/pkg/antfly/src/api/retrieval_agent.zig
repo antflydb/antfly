@@ -817,7 +817,7 @@ fn executeInternal(
         const strategy = detectStrategy(retrieval_query);
         try strategies.append(arena, strategy);
         var refinement_queries = std.ArrayListUnmanaged([]const u8).empty;
-        if (currentRetrievalQueryText(retrieval_query)) |current_query| {
+        if (currentRetrievalQueryText(arena, retrieval_query)) |current_query| {
             try refinement_queries.append(arena, current_query);
         }
 
@@ -957,7 +957,7 @@ fn executeInternal(
                 previous_attempt_summary,
                 candidate_scores,
                 attempted_query_indices,
-                can_attempt_refinement and nextEvaluationRefinedQueryText(classification_result, retrieval_query, retrieval_query_index, refinement_queries.items) != null,
+                can_attempt_refinement and nextEvaluationRefinedQueryText(arena, classification_result, retrieval_query, retrieval_query_index, refinement_queries.items) != null,
                 strategy == .tree and pending_tree_expansion_plan != null,
                 planner_can_clarify,
             );
@@ -1051,7 +1051,7 @@ fn executeInternal(
                 continue;
             }
             if (planner_decision != .refine_query) break;
-            if (nextEvaluationRefinedQueryText(classification_result, retrieval_query, retrieval_query_index, refinement_queries.items)) |refined_query| {
+            if (nextEvaluationRefinedQueryText(arena, classification_result, retrieval_query, retrieval_query_index, refinement_queries.items)) |refined_query| {
                 try refinement_queries.append(arena, refined_query);
                 try appendStep(arena, &steps_list, &live, .{
                     .kind = .planning,
@@ -1840,10 +1840,8 @@ fn buildEvaluationRefineQueryStepDetails(
     if (retrieval_query.semantic_search) |original_query| {
         try obj.put(alloc, "original_query", .{ .string = original_query });
     } else if (retrieval_query.full_text_search) |full_text| {
-        if (full_text == .object) {
-            if (full_text.object.get("query")) |query_value| {
-                if (query_value == .string) try obj.put(alloc, "original_query", .{ .string = query_value.string });
-            }
+        if (extractRawQueryStringAlloc(alloc, full_text)) |query| {
+            try obj.put(alloc, "original_query", .{ .string = query });
         }
     }
     if (retrieval_query.table) |table_name| {
@@ -4095,15 +4093,16 @@ fn maybeProbeAgenticSelection(
             try extractTreeFallbackRootKey(arena, query_json)
         else
             null;
+        const probe_query_text = queryTextForProbe(arena, classification_result, retrieval_query);
         const query_hits = if (retrieval_query.tree_search != null)
-            try extractTreeHits(arena, parsed_query.value, queryTextForProbe(classification_result, retrieval_query), fallback_tree_root)
+            try extractTreeHits(arena, parsed_query.value, probe_query_text, fallback_tree_root)
         else
             extractHits(parsed_query.value);
 
         scores[candidate_pos].probe_hits = @intCast(query_hits.len);
         if (query_hits.len > 0) {
             const probe_context = buildContextText(arena, query_hits[0..@min(query_hits.len, 3)]) catch "";
-            scores[candidate_pos].probe_relevance = queryCoverageScore(queryTextForProbe(classification_result, retrieval_query), probe_context);
+            scores[candidate_pos].probe_relevance = queryCoverageScore(probe_query_text, probe_context);
         }
         scores[candidate_pos].probe_top_score = if (query_hits.len > 0) query_hits[0]._score else 0.0;
     }
@@ -4252,15 +4251,16 @@ fn probeAgenticFallbackCandidates(
             try extractTreeFallbackRootKey(arena, query_json)
         else
             null;
+        const probe_query_text = queryTextForProbe(arena, classification_result, retrieval_query);
         const query_hits = if (retrieval_query.tree_search != null)
-            try extractTreeHits(arena, parsed_query.value, queryTextForProbe(classification_result, retrieval_query), fallback_tree_root)
+            try extractTreeHits(arena, parsed_query.value, probe_query_text, fallback_tree_root)
         else
             extractHits(parsed_query.value);
 
         scores[candidate_pos].probe_hits = @intCast(query_hits.len);
         if (query_hits.len > 0) {
             const probe_context = buildContextText(arena, query_hits[0..@min(query_hits.len, 3)]) catch "";
-            scores[candidate_pos].probe_relevance = queryCoverageScore(queryTextForProbe(classification_result, retrieval_query), probe_context);
+            scores[candidate_pos].probe_relevance = queryCoverageScore(probe_query_text, probe_context);
         }
         scores[candidate_pos].probe_top_score = if (query_hits.len > 0) query_hits[0]._score else 0.0;
     }
@@ -4779,6 +4779,7 @@ fn compareProbeCandidate(lhs: AgenticCandidateScore, rhs: AgenticCandidateScore)
 }
 
 fn queryTextForProbe(
+    alloc: std.mem.Allocator,
     classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query: RetrievalQueryRequest,
 ) []const u8 {
@@ -4788,10 +4789,10 @@ fn queryTextForProbe(
     }
     if (retrieval_query.semantic_search) |semantic_search| return semantic_search;
     if (retrieval_query.full_text_search) |full_text| {
-        if (extractQueryString(full_text)) |query| return query;
+        if (extractRawQueryStringAlloc(alloc, full_text)) |query| return query;
     }
     if (retrieval_query.filter_query) |filter_query| {
-        if (extractQueryString(filter_query)) |query| return query;
+        if (extractRawQueryStringAlloc(alloc, filter_query)) |query| return query;
     }
     if (retrieval_query.tree_search) |tree_search| {
         if (tree_search.start_nodes) |start_nodes| return start_nodes;
@@ -4808,6 +4809,11 @@ fn extractQueryString(value: std.json.Value) ?[]const u8 {
         },
         else => null,
     };
+}
+
+fn extractRawQueryStringAlloc(alloc: std.mem.Allocator, raw: metadata_openapi.RawQuery) ?[]const u8 {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{}) catch return null;
+    return extractQueryString(value);
 }
 
 fn preferredAgenticQueryStrategy(request: RetrievalAgentRequest) generating_api_openapi.QueryStrategy {
@@ -5446,12 +5452,18 @@ fn encodeQueryValueForRetrievalQuery(
     // would incorrectly present retrieval-only `tree_search` to the canonical
     // QueryRequest parser and would add a full stringify/parse cycle per step.
     var query_request = canonicalQueryRequestFromRetrieval(retrieval_query);
-    applyClassificationRefinement(&query_request, classification_result, retrieval_query_index, refinement_pass);
+    try applyClassificationRefinement(arena, &query_request, classification_result, retrieval_query_index, refinement_pass);
     // The raw query predicates are already folded into this query's mandatory
     // set. Install that canonical set instead of conjoining the source query a
     // second time on every refinement pass.
-    query_request.filter_query = mandatory_predicates.filter_query;
-    query_request.exclusion_query = mandatory_predicates.exclusion_query;
+    query_request.filter_query = if (mandatory_predicates.filter_query) |predicate|
+        try rawQueryFromValueAlloc(arena, predicate)
+    else
+        null;
+    query_request.exclusion_query = if (mandatory_predicates.exclusion_query) |predicate|
+        try rawQueryFromValueAlloc(arena, predicate)
+    else
+        null;
     if (retrieval_query.tree_search) |tree_search| {
         if (query_request.graph_queries != null)
             return error.UnsupportedRetrievalAgentRequest;
@@ -5516,16 +5528,24 @@ fn buildMandatoryPredicates(
     for (queries, out) |query, *predicates| {
         if (query.table == null) return error.InvalidRetrievalAgentRequest;
         predicates.* = global;
+        const filter_query = if (query.filter_query) |raw|
+            try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
+        else
+            null;
+        const exclusion_query = if (query.exclusion_query) |raw|
+            try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
+        else
+            null;
         predicates.filter_query = try combineMandatoryPredicate(
             alloc,
             predicates.filter_query,
-            query.filter_query,
+            filter_query,
             "conjuncts",
         );
         predicates.exclusion_query = try combineMandatoryPredicate(
             alloc,
             predicates.exclusion_query,
-            query.exclusion_query,
+            exclusion_query,
             "disjuncts",
         );
     }
@@ -5640,18 +5660,32 @@ fn applyMandatoryPredicates(
     query_request: *QueryRequest,
     mandatory: MandatoryPredicates,
 ) !void {
-    query_request.filter_query = try combineMandatoryPredicate(
+    const existing_filter = if (query_request.filter_query) |raw|
+        try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
+    else
+        null;
+    const existing_exclusion = if (query_request.exclusion_query) |raw|
+        try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
+    else
+        null;
+    const combined_filter = try combineMandatoryPredicate(
         alloc,
-        query_request.filter_query,
+        existing_filter,
         mandatory.filter_query,
         "conjuncts",
     );
-    query_request.exclusion_query = try combineMandatoryPredicate(
+    const combined_exclusion = try combineMandatoryPredicate(
         alloc,
-        query_request.exclusion_query,
+        existing_exclusion,
         mandatory.exclusion_query,
         "disjuncts",
     );
+    query_request.filter_query = if (combined_filter) |value| try rawQueryFromValueAlloc(alloc, value) else null;
+    query_request.exclusion_query = if (combined_exclusion) |value| try rawQueryFromValueAlloc(alloc, value) else null;
+}
+
+fn rawQueryFromValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) !metadata_openapi.RawQuery {
+    return .{ .bytes = try std.json.Stringify.valueAlloc(alloc, value, .{}) };
 }
 
 fn combineMandatoryPredicate(
@@ -5673,11 +5707,12 @@ fn combineMandatoryPredicate(
 }
 
 fn applyClassificationRefinement(
+    alloc: std.mem.Allocator,
     query_request: *QueryRequest,
     classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query_index: usize,
     refinement_pass: QueryRefinementPass,
-) void {
+) !void {
     const classification = classification_result orelse return;
     const refined_text = selectRefinedQueryText(classification, retrieval_query_index, refinement_pass) orelse return;
 
@@ -5686,9 +5721,11 @@ fn applyClassificationRefinement(
     }
     if (refinement_pass == .evaluation) {
         if (query_request.full_text_search) |*full_text| {
-            if (full_text.* == .object) {
-                if (full_text.object.getPtr("query")) |query_value| {
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, full_text.bytes, .{});
+            if (parsed == .object) {
+                if (parsed.object.getPtr("query")) |query_value| {
                     query_value.* = .{ .string = refined_text };
+                    full_text.* = try rawQueryFromValueAlloc(alloc, parsed);
                 }
             }
         }
@@ -5753,14 +5790,15 @@ fn initialRefinedQueryText(
 }
 
 fn currentRetrievalQueryText(
+    alloc: std.mem.Allocator,
     retrieval_query: RetrievalQueryRequest,
 ) ?[]const u8 {
     if (retrieval_query.semantic_search) |semantic_search| return semantic_search;
     if (retrieval_query.full_text_search) |full_text| {
-        if (extractQueryString(full_text)) |query| return query;
+        if (extractRawQueryStringAlloc(alloc, full_text)) |query| return query;
     }
     if (retrieval_query.filter_query) |filter_query| {
-        if (extractQueryString(filter_query)) |query| return query;
+        if (extractRawQueryStringAlloc(alloc, filter_query)) |query| return query;
     }
     return null;
 }
@@ -5776,6 +5814,7 @@ fn containsUsedQueryText(
 }
 
 fn nextEvaluationRefinedQueryText(
+    alloc: std.mem.Allocator,
     classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
@@ -5800,7 +5839,7 @@ fn nextEvaluationRefinedQueryText(
     if (!containsUsedQueryText(used_queries, semantic_query)) return semantic_query;
     if (!containsUsedQueryText(used_queries, classification.improved_query)) return classification.improved_query;
 
-    if (currentRetrievalQueryText(retrieval_query)) |current_query| {
+    if (currentRetrievalQueryText(alloc, retrieval_query)) |current_query| {
         if (!containsUsedQueryText(used_queries, current_query)) return current_query;
     }
     return null;
@@ -5964,22 +6003,14 @@ fn discoverTreeRootKeys(
     runner: QueryRunner,
     table_name: []const u8,
     index_name: []const u8,
-    filter_query: ?std.json.Value,
-    exclusion_query: ?std.json.Value,
+    filter_query: ?metadata_openapi.RawQuery,
+    exclusion_query: ?metadata_openapi.RawQuery,
 ) ![]const []const u8 {
     const scan_page_size: u32 = 256;
     const max_root_keys: usize = 4096;
 
-    const filter_query_json = if (filter_query) |value|
-        try std.json.Stringify.valueAlloc(alloc, value, .{})
-    else
-        null;
-    defer if (filter_query_json) |value| alloc.free(value);
-    const exclusion_query_json = if (exclusion_query) |value|
-        try std.json.Stringify.valueAlloc(alloc, value, .{})
-    else
-        null;
-    defer if (exclusion_query_json) |value| alloc.free(value);
+    const filter_query_json = if (filter_query) |value| value.bytes else null;
+    const exclusion_query_json = if (exclusion_query) |value| value.bytes else null;
 
     var roots = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
@@ -7395,20 +7426,20 @@ test "retrieval agent can select multiple evaluation refinement phrases" {
         .limit = 5,
     };
 
-    const first = nextEvaluationRefinedQueryText(classification, retrieval_query, 0, &[_][]const u8{
+    const first = nextEvaluationRefinedQueryText(std.testing.allocator, classification, retrieval_query, 0, &[_][]const u8{
         "architecture",
         "semantic architecture query",
     }).?;
     try std.testing.expectEqualStrings("architecture overview", first);
 
-    const second = nextEvaluationRefinedQueryText(classification, retrieval_query, 0, &[_][]const u8{
+    const second = nextEvaluationRefinedQueryText(std.testing.allocator, classification, retrieval_query, 0, &[_][]const u8{
         "architecture",
         "semantic architecture query",
         "architecture overview",
     }).?;
     try std.testing.expectEqualStrings("architecture planning", second);
 
-    const third = nextEvaluationRefinedQueryText(classification, retrieval_query, 0, &[_][]const u8{
+    const third = nextEvaluationRefinedQueryText(std.testing.allocator, classification, retrieval_query, 0, &[_][]const u8{
         "architecture",
         "semantic architecture query",
         "architecture overview",

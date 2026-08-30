@@ -483,14 +483,21 @@ func readErrorResponse(resp *http.Response) error {
 			}
 		}
 	}
-	if parsedStructuredError && errResp.Error != "" {
+	stableCode := errResp.Error
+	if stableCode == "" {
+		// Stateful Antfly historically used code for some error families. Keep
+		// that transport compatibility at the SDK boundary while exposing one
+		// canonical APIError.Code to callers.
+		stableCode = errResp.Code
+	}
+	if parsedStructuredError && stableCode != "" {
 		message := errResp.Message
 		if message == "" {
-			message = errResp.Error
+			message = stableCode
 		}
 		return &APIError{
 			StatusCode: resp.StatusCode,
-			Code:       errResp.Error,
+			Code:       stableCode,
 			Message:    message,
 			RawBody:    respBody,
 		}

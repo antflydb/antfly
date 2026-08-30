@@ -38,7 +38,9 @@ pub const TypeGenerator = struct {
     /// Stable semantic helper key -> allocated public Zig type identifier.
     auxiliary_type_names: std.StringHashMapUnmanaged([]const u8) = .empty,
     optional_nullable_type_name: ?[]const u8 = null,
+    raw_json_type_name: ?[]const u8 = null,
     uses_optional_nullable: bool = false,
+    uses_raw_json: bool = false,
     uses_presence_aware_object: bool = false,
     type_names_initialized: bool = false,
 
@@ -57,6 +59,11 @@ pub const TypeGenerator = struct {
             "OpenApiOptionalNullable",
         );
         self.optional_nullable_type_name = optional_nullable_type_name;
+        const raw_json_type_name = try self.allocateAuxiliaryTypeName(
+            "openapi-raw-json",
+            "OpenApiRawJson",
+        );
+        self.raw_json_type_name = raw_json_type_name;
 
         // Zig named declarations can reference later declarations, so schema
         // emission does not need dependency ordering. Keeping this lexical makes
@@ -83,10 +90,120 @@ pub const TypeGenerator = struct {
             try self.emitOptionalNullableType(optional_nullable_type_name);
             try self.w.blank();
         }
+        if (self.uses_raw_json) {
+            try self.emitRawJsonType(raw_json_type_name);
+            try self.w.blank();
+        }
         if (self.uses_presence_aware_object) {
             try self.emitPresenceAwareObjectHelpers();
             try self.w.blank();
         }
+    }
+
+    /// A syntactically validated JSON subtree retained as compact owned bytes.
+    /// Parsing copies tokens directly into the final buffer instead of building
+    /// a std.json.Value DOM that callers must stringify before semantic parsing.
+    fn emitRawJsonType(self: *TypeGenerator, type_name: []const u8) !void {
+        try self.w.line("/// Syntactically validated JSON retained as compact owned bytes.", .{});
+        try self.w.line("pub const {s} = struct {{", .{type_name});
+        self.w.indent();
+        try self.w.line("bytes: []const u8,", .{});
+        try self.w.blank();
+        try self.w.line("pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {{", .{});
+        self.w.indent();
+        try self.w.line("var output: std.Io.Writer.Allocating = .init(allocator);", .{});
+        try self.w.line("errdefer output.deinit();", .{});
+        try self.w.line("var stringify: std.json.Stringify = .{{ .writer = &output.writer }};", .{});
+        try self.w.line("copyValue(allocator, source, options, &stringify) catch |err| switch (err) {{", .{});
+        self.w.indent();
+        try self.w.line("error.WriteFailed => return error.OutOfMemory,", .{});
+        try self.w.line("else => |parse_err| return parse_err,", .{});
+        self.w.dedent();
+        try self.w.line("}};", .{});
+        try self.w.line("return .{{ .bytes = try output.toOwnedSlice() }};", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.blank();
+        try self.w.line("pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {{", .{});
+        self.w.indent();
+        try self.w.line("return .{{ .bytes = try std.json.Stringify.valueAlloc(allocator, source, .{{}}) }};", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.blank();
+        try self.w.line("pub fn jsonStringify(self: @This(), jw: anytype) !void {{", .{});
+        self.w.indent();
+        try self.w.line("try jw.beginWriteRaw();", .{});
+        try self.w.line("try jw.writer.writeAll(self.bytes);", .{});
+        try self.w.line("jw.endWriteRaw();", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.blank();
+        try self.w.line("fn copyValue(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions, jw: *std.json.Stringify) !void {{", .{});
+        self.w.indent();
+        try self.w.line("switch (try source.peekNextTokenType()) {{", .{});
+        self.w.indent();
+        try self.w.line(".object_begin => {{", .{});
+        self.w.indent();
+        try self.w.line("_ = try source.next();", .{});
+        try self.w.line("try jw.beginObject();", .{});
+        try self.w.line("while (try source.peekNextTokenType() != .object_end) {{", .{});
+        self.w.indent();
+        try self.w.line("const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);", .{});
+        try self.w.line("switch (token) {{", .{});
+        self.w.indent();
+        try self.w.line(".string => |name| try jw.objectField(name),", .{});
+        try self.w.line(".allocated_string => |name| {{ defer allocator.free(name); try jw.objectField(name); }},", .{});
+        try self.w.line("else => return error.UnexpectedToken,", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.line("try copyValue(allocator, source, options, jw);", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.line("_ = try source.next();", .{});
+        try self.w.line("try jw.endObject();", .{});
+        self.w.dedent();
+        try self.w.line("}},", .{});
+        try self.w.line(".array_begin => {{", .{});
+        self.w.indent();
+        try self.w.line("_ = try source.next();", .{});
+        try self.w.line("try jw.beginArray();", .{});
+        try self.w.line("while (try source.peekNextTokenType() != .array_end) try copyValue(allocator, source, options, jw);", .{});
+        try self.w.line("_ = try source.next();", .{});
+        try self.w.line("try jw.endArray();", .{});
+        self.w.dedent();
+        try self.w.line("}},", .{});
+        try self.w.line(".string => switch (try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?)) {{", .{});
+        self.w.indent();
+        try self.w.line(".string => |value| try jw.write(value),", .{});
+        try self.w.line(".allocated_string => |value| {{ defer allocator.free(value); try jw.write(value); }},", .{});
+        try self.w.line("else => unreachable,", .{});
+        self.w.dedent();
+        try self.w.line("}},", .{});
+        try self.w.line(".number => switch (try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?)) {{", .{});
+        self.w.indent();
+        try self.w.line(".number => |value| try writeNumber(jw, value),", .{});
+        try self.w.line(".allocated_number => |value| {{ defer allocator.free(value); try writeNumber(jw, value); }},", .{});
+        try self.w.line("else => unreachable,", .{});
+        self.w.dedent();
+        try self.w.line("}},", .{});
+        try self.w.line(".true => {{ _ = try source.next(); try jw.write(true); }},", .{});
+        try self.w.line(".false => {{ _ = try source.next(); try jw.write(false); }},", .{});
+        try self.w.line(".null => {{ _ = try source.next(); try jw.write(null); }},", .{});
+        try self.w.line(".object_end, .array_end, .end_of_document => return error.UnexpectedToken,", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.blank();
+        try self.w.line("fn writeNumber(jw: *std.json.Stringify, value: []const u8) !void {{", .{});
+        self.w.indent();
+        try self.w.line("try jw.beginWriteRaw();", .{});
+        try self.w.line("try jw.writer.writeAll(value);", .{});
+        try self.w.line("jw.endWriteRaw();", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        self.w.dedent();
+        try self.w.line("}};", .{});
     }
 
     fn emitOptionalNullableType(self: *TypeGenerator, type_name: []const u8) !void {
@@ -325,7 +442,7 @@ pub const TypeGenerator = struct {
         // intent before composition handling so a transparent oneOf wrapper
         // cannot accidentally turn a forward-compatible raw surface into a
         // best-effort structural union.
-        if (try zigTypeOverride(schema)) |override| {
+        if (try self.zigTypeOverride(schema)) |override| {
             if (schema.description) |desc| try self.w.docComment(desc);
             try self.w.line("pub const {s} = {s};", .{ type_name, override });
             return;
@@ -500,10 +617,14 @@ pub const TypeGenerator = struct {
         };
     }
 
-    fn zigTypeOverride(schema: types.Schema) error{InvalidOpenApiSchema}!?[]const u8 {
+    fn zigTypeOverride(self: *TypeGenerator, schema: types.Schema) error{InvalidOpenApiSchema}!?[]const u8 {
         const override = schema.extensions.get("x-zig-type") orelse return null;
-        if (!std.mem.eql(u8, override, "std.json.Value")) return error.InvalidOpenApiSchema;
-        return override;
+        if (std.mem.eql(u8, override, "std.json.Value")) return override;
+        if (std.mem.eql(u8, override, "raw_json")) {
+            self.uses_raw_json = true;
+            return self.raw_json_type_name orelse return error.InvalidOpenApiSchema;
+        }
+        return error.InvalidOpenApiSchema;
     }
 
     fn initializeTypeNames(self: *TypeGenerator, schema_names: []const []const u8) !void {
@@ -1812,7 +1933,7 @@ pub const TypeGenerator = struct {
 
     /// Get the Zig type string for an inline schema.
     fn zigTypeForSchema(self: *TypeGenerator, schema: types.Schema) GenError![]const u8 {
-        if (try zigTypeOverride(schema)) |override| return override;
+        if (try self.zigTypeOverride(schema)) |override| return override;
 
         // OpenAPI 3.0 wraps a nullable $ref in a single-member allOf because
         // nullable is otherwise ignored next to $ref. Preserve the referenced
@@ -2050,6 +2171,38 @@ test "explicit Zig raw JSON override wins over nested structural unions" {
 
     try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), "pub const RawQuery = std.json.Value;") != null);
     try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), "pub const RawQuery = union(enum) {") == null);
+}
+
+test "raw_json override emits an owned streaming JSON type" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var override_extensions = std.StringArrayHashMapUnmanaged([]const u8){};
+    try override_extensions.put(arena, "x-zig-type", "raw_json");
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "RawQuery", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .extensions = override_extensions,
+    } });
+
+    const doc = types.OpenApiDoc{
+        .openapi = "3.1.0",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+    const output = w.toSlice();
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const RawQuery = OpenApiRawJson;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "bytes: []const u8,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "copyValue(allocator, source, options, &stringify)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.beginWriteRaw();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.writer.writeAll(self.bytes);") != null);
 }
 
 test "nullable raw JSON override distinguishes required null from optional absence" {

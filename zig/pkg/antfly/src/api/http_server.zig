@@ -32,6 +32,7 @@ const batch_api = @import("batch.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
+const graph_request_diagnostics = @import("graph_request_diagnostics.zig");
 const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
 const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
 const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
@@ -9108,8 +9109,8 @@ pub const ApiHttpServer = struct {
         try ensureRequestDeadline(request_deadline_ns);
         const request = &parsed_request.value;
         var injected_filter_owned = false;
-        defer if (injected_filter_owned) if (request.filter_query) |*value|
-            json_helpers.deinitJsonValue(alloc, value);
+        defer if (injected_filter_owned) if (request.filter_query) |value|
+            alloc.free(@constCast(value.bytes));
         if (row_filter_json) |value| {
             try injectRowFilterIntoOpenApiQueryRequest(alloc, request, value);
             injected_filter_owned = true;
@@ -9177,10 +9178,9 @@ pub const ApiHttpServer = struct {
         try ensureRequestDeadline(request_deadline_ns);
 
         const raw_filter_query_json = if (request.filter_query) |query|
-            try stringifyJsonValueAlloc(alloc, query)
+            query.bytes
         else
             null;
-        defer if (raw_filter_query_json) |query| alloc.free(query);
         const filter_query_json = try foreign_sources_api.buildEffectiveFilterQueryJsonAlloc(
             alloc,
             foreign_source,
@@ -9302,8 +9302,8 @@ pub const ApiHttpServer = struct {
         var primary_request = try parsePublicTableQueryBody(alloc, primary_body);
         defer primary_request.deinit();
         var injected_filter_owned = false;
-        defer if (injected_filter_owned) if (primary_request.value.filter_query) |*value|
-            json_helpers.deinitJsonValue(alloc, value);
+        defer if (injected_filter_owned) if (primary_request.value.filter_query) |value|
+            alloc.free(@constCast(value.bytes));
         if (row_filter_json) |value| {
             try injectRowFilterIntoOpenApiQueryRequest(alloc, &primary_request.value, value);
             injected_filter_owned = true;
@@ -12001,6 +12001,10 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) ![]u8 {
+        var diagnostic_context: graph_request_diagnostics.Context = .{};
+        const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+        defer diagnostic_scope.deinit();
+
         comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.query) == .query);
         if (!self.tryAcquireQuery()) return error.RequestAdmissionExhausted;
         defer self.releaseQuery();
@@ -12548,6 +12552,10 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
+        var diagnostic_context: graph_request_diagnostics.Context = .{};
+        const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+        defer diagnostic_scope.deinit();
+
         // `/query` selects its table from the body, so path middleware cannot
         // establish this authorization boundary. Keep the check in the query
         // service so every transport and direct caller is covered.
@@ -12590,6 +12598,10 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
+        var diagnostic_context: graph_request_diagnostics.Context = .{};
+        const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+        defer diagnostic_scope.deinit();
+
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
@@ -19178,9 +19190,9 @@ fn injectRowFilterIntoOpenApiQueryRequest(
     row_filter_json: []const u8,
 ) !void {
     var combined = try distributed_join.combineFilterQueryWithRowFilterJson(alloc, req.filter_query, row_filter_json);
-    errdefer json_helpers.deinitJsonValue(alloc, &combined);
-    if (req.filter_query) |*existing| json_helpers.deinitJsonValue(alloc, existing);
-    req.filter_query = combined;
+    defer json_helpers.deinitJsonValue(alloc, &combined);
+    const encoded = try std.json.Stringify.valueAlloc(alloc, combined, .{});
+    req.filter_query = .{ .bytes = encoded };
 }
 
 pub fn injectRowFilterIntoScanRequest(
@@ -27982,7 +27994,14 @@ test "api http server query builder replays clarification decisions" {
     var field_answer = try std.json.parseFromSlice(metadata_openapi.QueryBuilderResult, alloc, field_answer_resp.body, .{});
     defer field_answer.deinit();
     try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, field_answer.value.status.?);
-    try std.testing.expectEqualStrings("title", field_answer.value.query_request.?.full_text_search.?.object.get("field").?.string);
+    var full_text_search = try ant_json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        field_answer.value.query_request.?.full_text_search.?.bytes,
+        .{},
+    );
+    defer full_text_search.deinit();
+    try std.testing.expectEqualStrings("title", full_text_search.value.object.get("field").?.string);
 
     var semantic_question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,

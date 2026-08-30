@@ -89,6 +89,7 @@ pub const GraphAnchorFilterRequiresIndexError = types.GraphAnchorFilterRequiresI
 pub const GraphDistinctBudgetExceededError = types.GraphDistinctBudgetExceededError;
 pub const GraphMatchOperationLimitExceededError = types.GraphMatchOperationLimitExceededError;
 pub const GraphPathWeightDomainError = types.GraphPathWeightDomainError;
+pub const GraphQueryUnprocessableError = types.GraphQueryUnprocessableError;
 pub const GraphQueryUnsupportedError = types.GraphQueryUnsupportedError;
 pub const GraphWorkBudgetExceededError = types.GraphWorkBudgetExceededError;
 pub const HierarchyAncestor = types.HierarchyAncestor;
