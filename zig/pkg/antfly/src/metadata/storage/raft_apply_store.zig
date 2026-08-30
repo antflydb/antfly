@@ -5455,7 +5455,7 @@ fn appendRuntimeGroupStatusRecord(
 }
 
 fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u16 {
-    var version = runtime_status_protocol.legacy_record_version;
+    var version = runtime_status_protocol.v0_2_0_record_version;
     for (record.indexes) |index| {
         for (index.source_replay) |source| if (source.failed)
             return runtime_status_protocol.artifact_source_failure_status_record_version;
@@ -5525,7 +5525,6 @@ fn readRuntimeEnrichmentStatusRecord(
     alloc: std.mem.Allocator,
     encoded: []const u8,
     pos: *usize,
-    version: u16,
 ) !metadata.RuntimeEnrichmentStatusReport {
     if (pos.* + 3 > encoded.len) return error.InvalidMetadataTransitionEncoding;
     const enabled = encoded[pos.*] != 0;
@@ -5550,8 +5549,8 @@ fn readRuntimeEnrichmentStatusRecord(
     const error_count = try readInt(encoded, pos, u64);
     const retryable_error_count = try readInt(encoded, pos, u64);
     const fatal_error_count = try readInt(encoded, pos, u64);
-    const consecutive_retry_count = if (version >= 12) try readInt(encoded, pos, u32) else 0;
-    const next_retry_at_ms = if (version >= 12) try readInt(encoded, pos, u64) else 0;
+    const consecutive_retry_count = try readInt(encoded, pos, u32);
+    const next_retry_at_ms = try readInt(encoded, pos, u64);
     if (pos.* + 4 > encoded.len) return error.InvalidMetadataTransitionEncoding;
     const retrying = encoded[pos.*] != 0;
     pos.* += 1;
@@ -5600,7 +5599,7 @@ fn readRuntimeEnrichmentStatusRecord(
         .last_embed_batch_items = try readInt(encoded, pos, u64),
         .last_embed_batch_bytes = try readInt(encoded, pos, u64),
         .last_embed_batch_max_bytes = try readInt(encoded, pos, u64),
-        .last_embed_batch_completed_ms = if (version >= 10) try readInt(encoded, pos, u64) else 0,
+        .last_embed_batch_completed_ms = try readInt(encoded, pos, u64),
         .last_embed_batch_ns = try readInt(encoded, pos, u64),
         .total_embed_ns = try readInt(encoded, pos, u64),
         .dense_artifact_bytes_written = try readInt(encoded, pos, u64),
@@ -5647,50 +5646,13 @@ fn readRuntimeGroupStatusRecordWithMaxVersion(
     const lsm_root_generation = try readInt(encoded, pos, u64);
     const status_generation = try readInt(encoded, pos, u64);
     const doc_count = try readInt(encoded, pos, u64);
-    const disk_bytes = if (version >= 2) try readInt(encoded, pos, u64) else 0;
-    const disk_bytes_known = if (version >= 8) blk: {
-        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
-        const value = encoded[pos.*] != 0;
-        pos.* += 1;
-        break :blk value;
-    } else false;
-    const created_at_millis = if (version >= 2) try readInt(encoded, pos, u64) else 0;
+    const disk_bytes = try readInt(encoded, pos, u64);
+    if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+    const disk_bytes_known = encoded[pos.*] != 0;
+    pos.* += 1;
+    const created_at_millis = try readInt(encoded, pos, u64);
     const index_count = try readInt(encoded, pos, u32);
-    const enrichment = if (version >= 9)
-        try readRuntimeEnrichmentStatusRecord(alloc, encoded, pos, version)
-    else blk: {
-        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
-        const enabled = encoded[pos.*] != 0;
-        pos.* += 1;
-        const target_sequence = try readInt(encoded, pos, u64);
-        const applied_sequence = try readInt(encoded, pos, u64);
-        const lifecycle_field_count: usize = if (version >= 8) 4 else 2;
-        if (pos.* + lifecycle_field_count > encoded.len) return error.InvalidMetadataTransitionEncoding;
-        const retrying = encoded[pos.*] != 0;
-        pos.* += 1;
-        const worker_failed = encoded[pos.*] != 0;
-        pos.* += 1;
-        const worker_started = if (version >= 8) started: {
-            const value = encoded[pos.*] != 0;
-            pos.* += 1;
-            break :started value;
-        } else false;
-        const stalled = if (version >= 8) stalled_value: {
-            const value = encoded[pos.*] != 0;
-            pos.* += 1;
-            break :stalled_value value;
-        } else false;
-        break :blk metadata.RuntimeEnrichmentStatusReport{
-            .enabled = enabled,
-            .target_sequence = target_sequence,
-            .applied_sequence = applied_sequence,
-            .projection_checkpoint_status = try alloc.dupe(u8, if (enabled) "rebuilding" else "clean"),
-            .retrying = retrying,
-            .worker_failed = worker_failed,
-            .worker_started = worker_started,
-            .stalled = stalled,
-        };
-    };
+    const enrichment = try readRuntimeEnrichmentStatusRecord(alloc, encoded, pos);
     errdefer alloc.free(enrichment.projection_checkpoint_status);
     if (pos.* + 4 > encoded.len) return error.InvalidMetadataTransitionEncoding;
     const async_indexing_active = encoded[pos.*] != 0;
@@ -5701,8 +5663,8 @@ fn readRuntimeGroupStatusRecordWithMaxVersion(
     pos.* += 1;
     const async_bulk_coalescing_active = encoded[pos.*] != 0;
     pos.* += 1;
-    const doc_identity = if (version >= 3) try readRuntimeDocIdentityStatusRecord(encoded, pos) else metadata.RuntimeDocIdentityStatusReport{};
-    const doc_set_planning = if (version >= 3) try readRuntimeDocSetPlanningStatusRecord(encoded, pos, version) else metadata.RuntimeDocSetPlanningStatusReport{};
+    const doc_identity = try readRuntimeDocIdentityStatusRecord(encoded, pos);
+    const doc_set_planning = try readRuntimeDocSetPlanningStatusRecord(encoded, pos);
     const runtime_index_count = try readInt(encoded, pos, u32);
     const indexes = try alloc.alloc(metadata.RuntimeIndexStatusReport, runtime_index_count);
     var initialized: usize = 0;
@@ -5844,7 +5806,6 @@ fn appendRuntimeDocSetPlanningStatusRecord(
 fn readRuntimeDocSetPlanningStatusRecord(
     encoded: []const u8,
     pos: *usize,
-    version: u16,
 ) !metadata.RuntimeDocSetPlanningStatusReport {
     return .{
         .resolved_set_count = try readInt(encoded, pos, u64),
@@ -5859,7 +5820,7 @@ fn readRuntimeDocSetPlanningStatusRecord(
         .missing_ordinal_coverage_count = try readInt(encoded, pos, u64),
         .bitmap_promotion_count = try readInt(encoded, pos, u64),
         .unsupported_filter_shape_count = try readInt(encoded, pos, u64),
-        .stale_identity_generation_rejection_count = if (version >= 4) try readInt(encoded, pos, u64) else 0,
+        .stale_identity_generation_rejection_count = try readInt(encoded, pos, u64),
     };
 }
 
@@ -5869,8 +5830,7 @@ fn appendRuntimeIndexStatusRecord(
     record: metadata.RuntimeIndexStatusReport,
     version: u16,
 ) !void {
-    // Production writers emit only released, negotiable profiles. Historical
-    // versions remain decoder-only compatibility surfaces.
+    // Production writers emit only released, negotiable profiles.
     if (!runtime_status_protocol.isNegotiable(version))
         return error.InvalidMetadataTransitionEncoding;
     try appendRequiredString(alloc, out, record.name);
@@ -5917,6 +5877,8 @@ fn readRuntimeIndexStatusRecord(
     pos: *usize,
     version: u16,
 ) !metadata.RuntimeIndexStatusReport {
+    if (!runtime_status_protocol.isSupported(version))
+        return error.InvalidMetadataTransitionEncoding;
     const name = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(name);
     const kind = try readRequiredString(alloc, encoded, pos);
@@ -5926,23 +5888,16 @@ fn readRuntimeIndexStatusRecord(
     const edge_count = try readInt(encoded, pos, u64);
     const node_count = try readInt(encoded, pos, u64);
     const root_node = try readInt(encoded, pos, u64);
-    const coverage_produced_count = if (version >= 5) try readInt(encoded, pos, u64) else 0;
-    const coverage_skipped_count = if (version >= 5) try readInt(encoded, pos, u64) else 0;
-    const coverage_terminal_failed_count = if (version >= 5) try readInt(encoded, pos, u64) else 0;
-    const coverage_generation = if (version >= 7) try readInt(encoded, pos, u64) else 0;
-    const coverage_config_hash = if (version >= 6) try readInt(encoded, pos, u64) else 0;
-    const coverage_identity_ready = if (version >= 7) blk: {
-        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
-        const ready = encoded[pos.*] != 0;
-        pos.* += 1;
-        break :blk ready;
-    } else false;
-    const coverage_summary_ready = if (version >= 6) blk: {
-        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
-        const ready = encoded[pos.*] != 0;
-        pos.* += 1;
-        break :blk ready;
-    } else false;
+    const coverage_produced_count = try readInt(encoded, pos, u64);
+    const coverage_skipped_count = try readInt(encoded, pos, u64);
+    const coverage_terminal_failed_count = try readInt(encoded, pos, u64);
+    const coverage_generation = try readInt(encoded, pos, u64);
+    const coverage_config_hash = try readInt(encoded, pos, u64);
+    if (pos.* + 2 > encoded.len) return error.InvalidMetadataTransitionEncoding;
+    const coverage_identity_ready = encoded[pos.*] != 0;
+    pos.* += 1;
+    const coverage_summary_ready = encoded[pos.*] != 0;
+    pos.* += 1;
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
     const backfill_active = encoded[pos.*] != 0;
     pos.* += 1;
@@ -5952,9 +5907,9 @@ fn readRuntimeIndexStatusRecord(
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
     const replay_catch_up_required = encoded[pos.*] != 0;
     pos.* += 1;
-    const load_error = if (version >= 11) try readOptionalString(alloc, encoded, pos) else null;
+    const load_error = try readOptionalString(alloc, encoded, pos);
     errdefer if (load_error) |value| alloc.free(value);
-    const repair_status: ?metadata.IndexRepairStatus = if (version >= runtime_status_protocol.repair_status_record_version) blk: {
+    const repair_status: ?metadata.IndexRepairStatus = if (version == runtime_status_protocol.current_record_version) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const tag = encoded[pos.*];
         pos.* += 1;
@@ -5967,14 +5922,14 @@ fn readRuntimeIndexStatusRecord(
             else => return error.InvalidMetadataTransitionEncoding,
         };
     } else null;
-    const repair_active_generation_serviceable = if (version >= runtime_status_protocol.repair_status_record_version) blk: {
+    const repair_active_generation_serviceable = if (version == runtime_status_protocol.current_record_version) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const value = encoded[pos.*];
         pos.* += 1;
         if (value > 1 or (value == 1 and repair_status == null)) return error.InvalidMetadataTransitionEncoding;
         break :blk value == 1;
     } else false;
-    const source_replay_count = if (version >= runtime_status_protocol.artifact_source_status_record_version)
+    const source_replay_count = if (version == runtime_status_protocol.current_record_version)
         try readInt(encoded, pos, u16)
     else
         0;
@@ -5989,7 +5944,7 @@ fn readRuntimeIndexStatusRecord(
         errdefer alloc.free(artifact_name);
         const published_sequence = try readInt(encoded, pos, u64);
         const target_sequence = try readInt(encoded, pos, u64);
-        const failed = if (version >= runtime_status_protocol.artifact_source_failure_status_record_version) blk: {
+        const failed = if (version == runtime_status_protocol.current_record_version) blk: {
             if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
             const value = encoded[pos.*];
             pos.* += 1;
@@ -11595,7 +11550,7 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expect(status.indexes[0].repair_active_generation_serviceable);
 }
 
-test "metadata runtime index status decoder accepts version ten records" {
+test "metadata runtime index status codec rejects unreleased profiles" {
     const alloc = std.testing.allocator;
     var encoded = std.ArrayListUnmanaged(u8).empty;
     defer encoded.deinit(alloc);
@@ -11609,34 +11564,11 @@ test "metadata runtime index status decoder accepts version ten records" {
     );
     try std.testing.expectEqual(@as(usize, 0), encoded.items.len);
 
-    try appendRuntimeIndexStatusRecord(alloc, &encoded, .{
-        .name = "legacy_idx",
-        .kind = "dense_vector",
-        .doc_count = 17,
-        .replay_applied_sequence = 9,
-        .replay_target_sequence = 11,
-        .replay_catch_up_required = true,
-    }, runtime_status_protocol.legacy_record_version);
-
-    // V10 and the released V12 profile share the same index layout except for
-    // the V11 optional load-error tag. Keep the production writer restricted
-    // to V12/V15 and derive this decoder-only fixture from immutable V12.
-    try std.testing.expectEqual(@as(u8, 0), encoded.items[encoded.items.len - 1]);
-    encoded.items.len -= 1;
-
     var pos: usize = 0;
-    const decoded = try readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, 10);
-    defer metadata_table_manager.freeRuntimeIndexStatusReport(alloc, decoded);
-
-    try std.testing.expectEqual(encoded.items.len, pos);
-    try std.testing.expectEqualStrings("legacy_idx", decoded.name);
-    try std.testing.expectEqual(@as(u64, 17), decoded.doc_count);
-    try std.testing.expectEqual(@as(u64, 9), decoded.replay_applied_sequence);
-    try std.testing.expectEqual(@as(u64, 11), decoded.replay_target_sequence);
-    try std.testing.expect(decoded.replay_catch_up_required);
-    try std.testing.expectEqual(@as(?[]const u8, null), decoded.load_error);
-    try std.testing.expect(decoded.repair_status == null);
-    try std.testing.expect(!decoded.repair_active_generation_serviceable);
+    try std.testing.expectError(
+        error.InvalidMetadataTransitionEncoding,
+        readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, 10),
+    );
 }
 
 test "metadata runtime index status current profile preserves source failures" {
@@ -11693,7 +11625,7 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
     try appendRuntimeGroupStatusRecord(alloc, &encoded, status);
     var version_pos: usize = 0;
     try std.testing.expectEqual(
-        runtime_status_protocol.legacy_record_version,
+        runtime_status_protocol.v0_2_0_record_version,
         try readInt(encoded.items, &version_pos, u16),
     );
     var runtime_statuses = [_]metadata.RuntimeGroupStatusReport{status};
@@ -11708,15 +11640,15 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
         runtime_status_protocol.repair_status_record_version,
         storeRuntimeStatusRecordVersion(store).?,
     );
-    var legacy_pos: usize = 0;
-    const legacy_decoded = try readRuntimeGroupStatusRecordWithMaxVersion(
+    var v0_2_0_pos: usize = 0;
+    const v0_2_0_decoded = try readRuntimeGroupStatusRecordWithMaxVersion(
         alloc,
         encoded.items,
-        &legacy_pos,
-        runtime_status_protocol.legacy_record_version,
+        &v0_2_0_pos,
+        runtime_status_protocol.v0_2_0_record_version,
     );
-    defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, legacy_decoded);
-    try std.testing.expectEqual(encoded.items.len, legacy_pos);
+    defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, v0_2_0_decoded);
+    try std.testing.expectEqual(encoded.items.len, v0_2_0_pos);
 
     encoded.clearRetainingCapacity();
     indexes[0].repair_status = .rebuilding;
@@ -11727,14 +11659,14 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
         runtime_status_protocol.repair_status_record_version,
         try readInt(encoded.items, &version_pos, u16),
     );
-    legacy_pos = 0;
+    v0_2_0_pos = 0;
     try std.testing.expectError(
         error.InvalidMetadataTransitionEncoding,
         readRuntimeGroupStatusRecordWithMaxVersion(
             alloc,
             encoded.items,
-            &legacy_pos,
-            runtime_status_protocol.legacy_record_version,
+            &v0_2_0_pos,
+            runtime_status_protocol.v0_2_0_record_version,
         ),
     );
 
@@ -11779,7 +11711,7 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
     try appendRuntimeGroupStatusRecord(alloc, &encoded, status);
     version_pos = 0;
     try std.testing.expectEqual(
-        runtime_status_protocol.legacy_record_version,
+        runtime_status_protocol.v0_2_0_record_version,
         try readInt(encoded.items, &version_pos, u16),
     );
     var current_pos: usize = 0;

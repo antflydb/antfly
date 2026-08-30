@@ -903,7 +903,7 @@ fn runtimeStatusProtocolCompatible(
     return peer_status.metadata_group_id == metadata_group_id and
         peer_status.metadata_raft_local_node_id == node_id and
         std.mem.eql(u8, &peer_incarnation, &incarnation) and
-        (required_version == metadata_runtime_status_protocol.legacy_record_version or
+        (required_version == metadata_runtime_status_protocol.v0_2_0_record_version or
             peer_status.runtime_status_record_version == metadata_runtime_status_protocol.current_record_version);
 }
 
@@ -1104,7 +1104,7 @@ fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord
         storeHasRuntimeArtifactSourceStatus(record) or
         record.reporter_incarnation != 0 or record.status_generation != 0)
         return metadata_runtime_status_protocol.current_record_version;
-    return metadata_runtime_status_protocol.legacy_record_version;
+    return metadata_runtime_status_protocol.v0_2_0_record_version;
 }
 
 /// Every durable fact beyond v12 participates in admission or restore safety
@@ -1126,12 +1126,12 @@ fn stripRuntimeStatusAboveVersion(
 }
 
 fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16) u16 {
-    if (required_version == metadata_runtime_status_protocol.legacy_record_version)
+    if (required_version == metadata_runtime_status_protocol.v0_2_0_record_version)
         return required_version;
     if (required_version == metadata_runtime_status_protocol.current_record_version and
         service.runtimeStatusProtocolReady(metadata_runtime_status_protocol.current_record_version))
         return metadata_runtime_status_protocol.current_record_version;
-    return metadata_runtime_status_protocol.legacy_record_version;
+    return metadata_runtime_status_protocol.v0_2_0_record_version;
 }
 
 fn runtimeStatusProtocolSafeCommand(
@@ -4956,7 +4956,7 @@ pub const MetadataHttpService = struct {
                 self.metadata_group_id,
                 node_id,
                 incarnation,
-                metadata_runtime_status_protocol.legacy_record_version,
+                metadata_runtime_status_protocol.v0_2_0_record_version,
             )) {
                 std.log.warn(
                     "runtime-status protocol activation blocked: metadata member {d} reports node={d} group={d} version={d}",
@@ -7324,7 +7324,7 @@ test "metadata runtime status protocol negotiates only released v12 and current 
         metadata_runtime_status_protocol.repair_status_record_version,
     ));
 
-    status.runtime_status_record_version = metadata_runtime_status_protocol.legacy_record_version;
+    status.runtime_status_record_version = metadata_runtime_status_protocol.v0_2_0_record_version;
     try std.testing.expect(runtimeStatusProtocolCompatible(status, 42, 7, incarnation, 12));
     try std.testing.expect(!runtimeStatusProtocolCompatible(status, 42, 7, incarnation, 15));
     status.runtime_status_record_version = 13;
@@ -7459,7 +7459,7 @@ test "metadata service transition commands negotiate runtime status payload vers
 
     var legacy_service = FakeService{
         .alloc = std.testing.allocator,
-        .ready_version = metadata_runtime_status_protocol.legacy_record_version,
+        .ready_version = metadata_runtime_status_protocol.v0_2_0_record_version,
     };
     var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
     defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(std.testing.allocator, record);
@@ -8591,7 +8591,7 @@ fn reportStoreStatusesWithProjected(
         reporter_fence_transition_possible)
         metadata_runtime_status_protocol.current_record_version
     else
-        metadata_runtime_status_protocol.legacy_record_version;
+        metadata_runtime_status_protocol.v0_2_0_record_version;
     const supported_version = highestSupportedRuntimeStatusVersion(service, required_version);
     const include_repair_status = !repair_status_transition_possible or
         supported_version == metadata_runtime_status_protocol.current_record_version;
