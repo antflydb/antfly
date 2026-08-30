@@ -1158,6 +1158,12 @@ pub const Client = struct {
             if (interrupt.isCancellationRequested()) return error.Cancelled;
             var res = self.executeRequestOnce(req, timeout_override_ms, deadline_ms, interrupt) catch |err| {
                 if (interrupt.isCancellationRequested()) return error.Cancelled;
+                // Socket and Io.Reader adapters may need to translate a
+                // cancellation into their narrower transport error set. They
+                // re-publish the task cancellation before doing so; consume
+                // that signal here so a caller never observes RecvFailed,
+                // SendFailed, or InvalidResponse for its own Future cancel.
+                self.io.checkCancel() catch return error.Canceled;
                 ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
                 const safe_unsent = isSafeUnsentRetryError(err);
                 const replayable_transport = policy.retry_on_connection_error and
@@ -1168,7 +1174,7 @@ pub const Client = struct {
                     attempt += 1;
                     const delay_ms = policy.calculateDelay(attempt);
                     if (delay_ms > 0) {
-                        self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+                        try self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake);
                     }
                     continue;
                 }
@@ -1180,7 +1186,7 @@ pub const Client = struct {
                 attempt += 1;
                 const delay_ms = policy.calculateDelay(attempt);
                 if (delay_ms > 0) {
-                    self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+                    try self.io.sleep(Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake);
                 }
                 continue;
             }
@@ -1378,6 +1384,7 @@ pub const Client = struct {
             interrupt,
         ) catch |err| {
             if (interrupt.isCancellationRequested()) return error.Cancelled;
+            self.io.checkCancel() catch return error.Canceled;
             ensureRequestDeadline(self.io, deadline_ms) catch return error.Timeout;
             return err;
         };

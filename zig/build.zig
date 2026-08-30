@@ -7744,7 +7744,7 @@ pub fn build(b: *std.Build) void {
     const run_generation_reranking_vopr_tests = b.addRunArtifact(generation_reranking_vopr_tests);
     const generation_reranking_vopr_test_step = b.step(
         "generation-reranking-vopr-test",
-        "Run generation fallback/retry and reranking validation/error histories on VoprIo",
+        "Run local/remote generation and reranking fallback, replacement, validation, timeout, and cancellation histories on VoprIo",
     );
     generation_reranking_vopr_test_step.dependOn(&run_generation_reranking_vopr_tests.step);
 
