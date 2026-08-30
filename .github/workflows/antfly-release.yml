@@ -11,6 +11,9 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   ZIG_VERSION: 0.16.0
+  # Keep the glibc-linked host compiler reproducible. The release targets are
+  # still the musl and Darwin targets selected by the matrix below.
+  NIXPKGS_REV: c5c4a43b0e8056328ec4529f735cabdb8f1942bb
   MACOS_SDK_VERSION: "15.5"
   MACOS_SDK_SHA256: c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd
 
@@ -75,17 +78,23 @@ jobs:
         if: ${{ matrix.os == 'linux' }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates
+          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates file
 
-      - name: Install Zig (Linux)
+      - name: Install Nix
+        if: ${{ matrix.os == 'linux' }}
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ env.NIXPKGS_REV }}.tar.gz
+
+      - name: Install glibc-linked Zig (Linux)
         if: ${{ matrix.os == 'linux' }}
         run: |
-          curl --fail --location --retry 3 \
-            "https://ziglang.org/download/${ZIG_VERSION}/zig-${{ matrix.zig_arch }}-linux-${ZIG_VERSION}.tar.xz" \
-            -o "$RUNNER_TEMP/zig.tar.xz"
-          mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
-          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+          zig_path="$(nix-build '<nixpkgs>' -A zig_0_16 --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
 
       - name: Install pinned macOS cross-compilation SDK
         if: ${{ matrix.macos_sdk == 'true' }}
