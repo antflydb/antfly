@@ -80,15 +80,32 @@ func TestCreateHierarchyIndexesIncludesSelectivePDFOCRInSingleConfig(t *testing.
 		t.Fatalf("createHierarchyIndexes: %v", err)
 	}
 	documentUnits := indexes["document_units"].(map[string]any)
+	if documentUnits["type"] != "graph" {
+		t.Fatalf("document_units type = %#v, want graph", documentUnits["type"])
+	}
+	source := documentUnits["source"].(map[string]any)
+	if _, exists := source["kind"]; exists {
+		t.Fatalf("graph source must not contain a kind discriminator: %#v", source)
+	}
+	if source["artifact"] != docsaf.DefaultDocumentUnitsArtifact || source["path"] != "$.edges[*]" {
+		t.Fatalf("unexpected graph source: %#v", source)
+	}
 	artifact := documentUnits["artifact"].(map[string]any)
+	if _, exists := artifact["field"]; exists {
+		t.Fatalf("graph artifact producer must use typed source: %#v", artifact)
+	}
+	artifactSource := artifact["source"].(map[string]any)
+	if artifactSource["type"] != "field" || artifactSource["value"] != "url" {
+		t.Fatalf("unexpected graph artifact producer source: %#v", artifactSource)
+	}
 	producer := artifact["producer_json"].(map[string]any)
 	config := producer["config"].(map[string]any)
 	ocr := config["ocr"].(map[string]any)
-	if ocr["render_dpi"] != 200 {
+	if ocr["render_dpi"] != float64(200) {
 		t.Fatalf("render_dpi = %#v, want 200", ocr["render_dpi"])
 	}
 	quality := ocr["quality"].(map[string]any)
-	if quality["min_content_chars"] != 75 {
+	if quality["min_content_chars"] != float64(75) {
 		t.Fatalf("min_content_chars = %#v, want 75", quality["min_content_chars"])
 	}
 	reader := ocr["config"].(map[string]any)

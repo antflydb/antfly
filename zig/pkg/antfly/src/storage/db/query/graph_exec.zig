@@ -529,7 +529,19 @@ pub fn executeGraphQueriesWithSets(
         });
     }
 
+    // The request budget is stack-owned by this coordinator. Returned paths
+    // must keep their allocation ownership, but cannot retain a release hook
+    // into that expired stack frame. Keep their charges consumptive until all
+    // named operations have run, then detach only at the ownership boundary.
+    for (results[0..initialized]) |*result| consumeGraphSearchResultState(result);
     return results;
+}
+
+fn consumeGraphSearchResultState(result: *types.GraphSearchResult) void {
+    for (result.paths) |*path| {
+        path.retained_budget = null;
+        path.retained_state_bytes = 0;
+    }
 }
 
 fn graphResultHasQualifiedIdentity(result: types.GraphSearchResult) bool {
@@ -1557,7 +1569,7 @@ pub fn executeSingleNonPatternQueryWithSets(
         graph_pattern_mod.default_max_distinct_identities,
         graph_pattern_mod.default_max_distinct_state_bytes,
     );
-    return try executeSingleNonPatternQueryWithSetsWithBudgets(
+    var result = try executeSingleNonPatternQueryWithSetsWithBudgets(
         alloc,
         req,
         named,
@@ -1565,6 +1577,8 @@ pub fn executeSingleNonPatternQueryWithSets(
         executor,
         .{ .work = &work_budget, .distinct = &distinct_budget },
     );
+    consumeGraphSearchResultState(&result);
+    return result;
 }
 
 pub fn executeSingleNonPatternQueryWithSetsWithBudgets(

@@ -1577,8 +1577,16 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     var parsed_indexes_after_schema = try std.json.parseFromSlice([]metadata_openapi.IndexStatus, std.heap.page_allocator, indexes_after_schema.body, .{});
     defer parsed_indexes_after_schema.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed_indexes_after_schema.value.len);
-    try std.testing.expectEqualStrings("full_text_index_v0", parsed_indexes_after_schema.value[0].config.name);
-    try std.testing.expectEqualStrings("full_text_index_v1", parsed_indexes_after_schema.value[1].config.name);
+    const full_text_v0 = switch (parsed_indexes_after_schema.value[0].config) {
+        .created_full_text_index => |config| config,
+        else => return error.TestExpectedEqual,
+    };
+    const full_text_v1 = switch (parsed_indexes_after_schema.value[1].config) {
+        .created_full_text_index => |config| config,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expectEqualStrings("full_text_index_v0", full_text_v0.name);
+    try std.testing.expectEqualStrings("full_text_index_v1", full_text_v1.name);
 
     const index_body = try test_contract_helpers.encodeCreateIndexRequest(std.heap.page_allocator, "embed_idx");
     defer std.heap.page_allocator.free(index_body);
@@ -1642,8 +1650,16 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     var parsed_indexes_after_drop = try std.json.parseFromSlice([]metadata_openapi.IndexStatus, std.heap.page_allocator, indexes_after_drop.body, .{});
     defer parsed_indexes_after_drop.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed_indexes_after_drop.value.len);
-    try std.testing.expectEqualStrings("full_text_index_v0", parsed_indexes_after_drop.value[0].config.name);
-    try std.testing.expectEqualStrings("full_text_index_v1", parsed_indexes_after_drop.value[1].config.name);
+    const remaining_full_text_v0 = switch (parsed_indexes_after_drop.value[0].config) {
+        .created_full_text_index => |config| config,
+        else => return error.TestExpectedEqual,
+    };
+    const remaining_full_text_v1 = switch (parsed_indexes_after_drop.value[1].config) {
+        .created_full_text_index => |config| config,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expectEqualStrings("full_text_index_v0", remaining_full_text_v0.name);
+    try std.testing.expectEqualStrings("full_text_index_v1", remaining_full_text_v1.name);
 
     var stable_table_detail = try client.fetchTable(client_base, "docs");
     defer stable_table_detail.deinit(std.heap.page_allocator);

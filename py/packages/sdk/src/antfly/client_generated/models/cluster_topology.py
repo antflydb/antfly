@@ -12,6 +12,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.cluster_data_status import ClusterDataStatus
+    from ..models.index_runtime_capabilities import IndexRuntimeCapabilities
     from ..models.runtime_config_status import RuntimeConfigStatus
     from ..models.secret_store_status import SecretStoreStatus
     from ..models.storage_runtime_status import StorageRuntimeStatus
@@ -29,6 +30,8 @@ class ClusterTopology:
         message (str | Unset): Optional message providing details about the health status
         auth_enabled (bool | Unset): Indicates whether authentication is enabled for the cluster
         deployment_mode (ClusterTopologyDeploymentMode | Unset): Runtime deployment topology
+        index_capabilities (IndexRuntimeCapabilities | Unset): Deployment-level index capabilities clients can inspect
+            before submitting index mutations.
         secret_store (SecretStoreStatus | Unset): Non-secret status for the local secrets file store, when one is
             available.
         runtime_config (RuntimeConfigStatus | Unset): Non-secret status for the applied config.json snapshot. Hot
@@ -41,6 +44,7 @@ class ClusterTopology:
     message: str | Unset = UNSET
     auth_enabled: bool | Unset = UNSET
     deployment_mode: ClusterTopologyDeploymentMode | Unset = UNSET
+    index_capabilities: IndexRuntimeCapabilities | Unset = UNSET
     secret_store: SecretStoreStatus | Unset = UNSET
     runtime_config: RuntimeConfigStatus | Unset = UNSET
     storage: StorageRuntimeStatus | Unset = UNSET
@@ -58,6 +62,10 @@ class ClusterTopology:
         deployment_mode: str | Unset = UNSET
         if not isinstance(self.deployment_mode, Unset):
             deployment_mode = self.deployment_mode.value
+
+        index_capabilities: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.index_capabilities, Unset):
+            index_capabilities = self.index_capabilities.to_dict()
 
         secret_store: dict[str, Any] | Unset = UNSET
         if not isinstance(self.secret_store, Unset):
@@ -85,6 +93,8 @@ class ClusterTopology:
             field_dict["auth_enabled"] = auth_enabled
         if deployment_mode is not UNSET:
             field_dict["deployment_mode"] = deployment_mode
+        if index_capabilities is not UNSET:
+            field_dict["index_capabilities"] = index_capabilities
         if secret_store is not UNSET:
             field_dict["secret_store"] = secret_store
         if runtime_config is not UNSET:
@@ -97,6 +107,7 @@ class ClusterTopology:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.cluster_data_status import ClusterDataStatus
+        from ..models.index_runtime_capabilities import IndexRuntimeCapabilities
         from ..models.runtime_config_status import RuntimeConfigStatus
         from ..models.secret_store_status import SecretStoreStatus
         from ..models.storage_runtime_status import StorageRuntimeStatus
@@ -116,6 +127,13 @@ class ClusterTopology:
             deployment_mode = UNSET
         else:
             deployment_mode = ClusterTopologyDeploymentMode(_deployment_mode)
+
+        _index_capabilities = d.pop("index_capabilities", UNSET)
+        index_capabilities: IndexRuntimeCapabilities | Unset
+        if isinstance(_index_capabilities, Unset):
+            index_capabilities = UNSET
+        else:
+            index_capabilities = IndexRuntimeCapabilities.from_dict(_index_capabilities)
 
         _secret_store = d.pop("secret_store", UNSET)
         secret_store: SecretStoreStatus | Unset
@@ -144,6 +162,7 @@ class ClusterTopology:
             message=message,
             auth_enabled=auth_enabled,
             deployment_mode=deployment_mode,
+            index_capabilities=index_capabilities,
             secret_store=secret_store,
             runtime_config=runtime_config,
             storage=storage,

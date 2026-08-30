@@ -14,6 +14,7 @@
 
 const decode = @import("decode.zig");
 const encode = @import("encode.zig");
+const decode_control = @import("decode_control.zig");
 
 pub const box = @import("box.zig");
 pub const markers = @import("markers.zig");
@@ -41,13 +42,18 @@ pub const DecodedImage = decode.DecodedImage;
 pub const DecodedImageU16 = decode.DecodedImageU16;
 pub const DecodeBackend = decode.DecodeBackend;
 pub const NativeDecodeSupport = decode.NativeDecodeSupport;
+pub const CancellationProbe = decode_control.CancellationProbe;
 
 pub const decodeHeader = decode.decodeHeader;
 pub const decodeHeaderBytes = decode.decodeHeaderBytes;
+pub const decodeHeaderBytesWithCancellation = decode.decodeHeaderBytesWithCancellation;
 pub const decodeU8 = decode.decodeU8;
 pub const decodeU8Bytes = decode.decodeU8Bytes;
+pub const decodeU8BytesWithCancellation = decode.decodeU8BytesWithCancellation;
 pub const decodeU8BytesAtResolution = decode.decodeU8BytesAtResolution;
+pub const decodeU8BytesAtResolutionWithCancellation = decode.decodeU8BytesAtResolutionWithCancellation;
 pub const decodeU16Bytes = decode.decodeU16Bytes;
+pub const decodeU16BytesWithCancellation = decode.decodeU16BytesWithCancellation;
 pub const nativeDecodeSupport = decode.nativeDecodeSupport;
 pub const nativeDecodeSupportBytes = decode.nativeDecodeSupportBytes;
 

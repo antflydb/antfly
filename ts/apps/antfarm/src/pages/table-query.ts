@@ -3,6 +3,7 @@ import type { IndexStatus, TableQueryRequest, TableStatus } from "@antfly/sdk";
 export interface TableQueryBuilderState {
   query: string;
   queryIndexes: string[];
+  fullTextIndex?: string;
   selectedFields: string[];
   semanticQuery: string;
   filterQuery: string;
@@ -69,6 +70,7 @@ type ArtifactAwareIndexConfig = IndexStatus["config"] & {
   embedding_name?: string;
   field?: string;
   source_artifact_name?: string;
+  sources?: Array<{ artifact: string }>;
 };
 
 type ArtifactEnrichment = NonNullable<TableStatus["artifact_enrichments"]>[number];
@@ -93,7 +95,13 @@ export function tableRequiresSafeProjection(
 
   return indexes.some((index) => {
     const config = index.config as ArtifactAwareIndexConfig;
-    if (config.artifact_name || config.source_artifact_name) return true;
+    if (
+      artifactSourceNames(config).length > 0 ||
+      config.artifact_name ||
+      config.source_artifact_name
+    ) {
+      return true;
+    }
     const enrichments = structuredEnrichments(
       tableStatus?.indexes?.[config.name]?.enrichments ?? config.enrichments
     );
@@ -113,10 +121,16 @@ export function builderArtifactRetrievalDefaults(
   indexes: IndexStatus[],
   query: string,
   selectedVectorIndexes: string[],
-  tableStatus?: TableStatus | null
+  tableStatus?: TableStatus | null,
+  selectedFullTextIndex?: string
 ): ArtifactRetrievalDefaults | null {
   if (!query.trim()) return null;
-  return artifactRetrievalDefaults(indexes, selectedVectorIndexes, tableStatus);
+  return artifactRetrievalDefaults(
+    indexes,
+    selectedVectorIndexes,
+    tableStatus,
+    selectedFullTextIndex
+  );
 }
 
 export function requestArtifactRetrievalDefaults(
@@ -144,7 +158,11 @@ export function requestArtifactRetrievalDefaults(
   }
 
   if (request.full_text_search !== undefined || request.hierarchy !== undefined) {
-    const defaults = artifactRetrievalDefaults(indexes, [], tableStatus);
+    const fullTextIndex =
+      typeof request.full_text_index === "string" && request.full_text_index.trim()
+        ? request.full_text_index
+        : undefined;
+    const defaults = artifactRetrievalDefaults(indexes, [], tableStatus, fullTextIndex);
     if (defaults) activeDefaults.push(defaults);
   }
 
@@ -162,15 +180,37 @@ export function requestArtifactRetrievalDefaults(
 export function artifactRetrievalDefaults(
   indexes: IndexStatus[],
   selectedVectorIndexes: string[],
-  tableStatus?: TableStatus | null
+  tableStatus?: TableStatus | null,
+  selectedFullTextIndex?: string
 ): ArtifactRetrievalDefaults | null {
   // The list endpoint owns membership. Table status supplies richer enrichment
   // metadata, but may briefly lag a create/drop operation.
   const configs = new Map(indexes.map((index) => [index.config.name, index.config]));
-  const candidateNames =
-    selectedVectorIndexes.length > 0
-      ? selectedVectorIndexes.filter((name) => configs.get(name)?.type === "embeddings")
-      : [...configs].filter(([, config]) => config.type === "full_text").map(([name]) => name);
+  const fullTextNames = [...configs]
+    .filter(([, config]) => config.type === "full_text")
+    .map(([name]) => name);
+  const schemaVersion = (tableStatus?.migration?.read_schema ?? tableStatus?.schema)?.version;
+  const activeSchemaIndex =
+    typeof schemaVersion === "number" ? `full_text_index_v${schemaVersion}` : undefined;
+  const schemaFullTextNames = fullTextNames.filter((name) => /^full_text_index_v\d+$/.test(name));
+  const automaticFullTextNames = activeSchemaIndex
+    ? fullTextNames.includes(activeSchemaIndex)
+      ? [activeSchemaIndex]
+      : []
+    : schemaFullTextNames.length === 1
+      ? schemaFullTextNames
+      : [];
+  const candidateNames = selectedVectorIndexes.length
+    ? selectedVectorIndexes.filter((name) => configs.get(name)?.type === "embeddings")
+    : selectedFullTextIndex
+      ? configs.get(selectedFullTextIndex)?.type === "full_text"
+        ? [selectedFullTextIndex]
+        : []
+      : automaticFullTextNames.length > 0
+        ? automaticFullTextNames
+        : fullTextNames.length === 1
+          ? fullTextNames
+          : [];
 
   const tableEnrichments = tableStatus?.artifact_enrichments ?? [];
   const artifactSearchFields = new Set<string>();
@@ -187,6 +227,22 @@ export function artifactRetrievalDefaults(
       tableStatus?.indexes?.[name]?.enrichments ?? config.enrichments
     );
     if (config.type === "embeddings") {
+      const sourceNames = artifactSourceNames(config);
+      if (sourceNames.length > 0) {
+        const sourceEnrichments = findSourceEnrichments(
+          sourceNames,
+          enrichments,
+          tableEnrichments,
+          "embedding"
+        );
+        for (const enrichment of sourceEnrichments) {
+          const field = enrichment.field?.trim() || "text";
+          artifactSearchFields.add(field);
+          artifactProjectionFields.add(field);
+        }
+        artifactIndexCount++;
+        continue;
+      }
       if (!config.source_artifact_name) {
         ordinaryIndexCount++;
         continue;
@@ -203,13 +259,17 @@ export function artifactRetrievalDefaults(
     // candidates, but must never turn an unrelated vector index into an
     // artifact-backed index.
     const allEnrichments = [...enrichments, ...tableEnrichments];
-    const artifactEnrichments = allEnrichments.filter(
-      (enrichment) =>
-        (enrichment.kind === "chunk" || enrichment.kind === "asset") &&
-        (config.artifact_name
-          ? enrichment.name === config.artifact_name
-          : enrichment.full_text_index === true)
-    );
+    const sourceNames = artifactSourceNames(config);
+    const artifactEnrichments =
+      sourceNames.length > 0
+        ? findSourceEnrichments(sourceNames, enrichments, tableEnrichments, "chunk", "asset")
+        : allEnrichments.filter(
+            (enrichment) =>
+              (enrichment.kind === "chunk" || enrichment.kind === "asset") &&
+              (config.artifact_name
+                ? enrichment.name === config.artifact_name
+                : enrichment.full_text_index === true)
+          );
 
     if (artifactEnrichments.length > 0) {
       for (const enrichment of artifactEnrichments) {
@@ -226,7 +286,7 @@ export function artifactRetrievalDefaults(
         artifactProjectionFields.add(field);
       }
       artifactIndexCount++;
-    } else if (config.artifact_name) {
+    } else if (sourceNames.length > 0 || config.artifact_name) {
       const field = config.field?.trim() || "text";
       artifactSearchFields.add(field);
       artifactProjectionFields.add(field);
@@ -256,6 +316,32 @@ function structuredEnrichments(enrichments: unknown): ArtifactEnrichment[] {
     (enrichment): enrichment is ArtifactEnrichment =>
       typeof enrichment === "object" && enrichment !== null
   );
+}
+
+function artifactSourceNames(config: ArtifactAwareIndexConfig): string[] {
+  if (!Array.isArray(config.sources)) return [];
+  return config.sources
+    .map((source) => source?.artifact)
+    .filter((artifact): artifact is string => typeof artifact === "string" && artifact.length > 0);
+}
+
+function findSourceEnrichments(
+  sourceNames: string[],
+  indexEnrichments: ArtifactEnrichment[],
+  tableEnrichments: ArtifactEnrichment[],
+  ...kinds: ArtifactEnrichment["kind"][]
+): ArtifactEnrichment[] {
+  const names = new Set(sourceNames);
+  const allowedKinds = new Set(kinds);
+  const found = new Map<string, ArtifactEnrichment>();
+  for (const enrichment of [...indexEnrichments, ...tableEnrichments]) {
+    if (!names.has(enrichment.name) || !allowedKinds.has(enrichment.kind)) continue;
+    if (!found.has(enrichment.name)) found.set(enrichment.name, enrichment);
+  }
+  return sourceNames.flatMap((name) => {
+    const enrichment = found.get(name);
+    return enrichment ? [enrichment] : [];
+  });
 }
 
 function findEmbeddingSourceEnrichment(
@@ -423,6 +509,7 @@ function normalizedProjectionFields(projectionFields?: string[]): string[] {
 export function buildTableQueryRequest({
   query,
   queryIndexes,
+  fullTextIndex,
   selectedFields,
   semanticQuery,
   filterQuery,
@@ -444,6 +531,7 @@ export function buildTableQueryRequest({
     request.indexes = queryIndexes;
     request.semantic_search = trimmedQuery;
   } else if (trimmedQuery.length > 0) {
+    if (fullTextIndex?.trim()) request.full_text_index = fullTextIndex.trim();
     if (normalizedSearchFields.length > 0) {
       request.full_text_search = artifactFullTextQuery(normalizedSearchFields, trimmedQuery);
     } else {

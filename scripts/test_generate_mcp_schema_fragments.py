@@ -217,6 +217,15 @@ class McpSchemaFragmentTests(unittest.TestCase):
         }
         self.assertEqual([], list(validator.iter_errors(shorthand_with_null_raw)))
 
+        named_full_text = {
+            "tableName": "docs",
+            "fullTextSearch": "hello",
+            "fullTextIndex": "document_text",
+        }
+        self.assertEqual([], list(validator.iter_errors(named_full_text)))
+        del named_full_text["fullTextSearch"]
+        self.assertNotEqual([], list(validator.iter_errors(named_full_text)))
+
 
 if __name__ == "__main__":
     unittest.main()

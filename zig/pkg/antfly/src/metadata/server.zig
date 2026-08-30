@@ -230,6 +230,7 @@ pub const MetadataServer = struct {
             );
             try public_http_server.attachReplicatedRestoreJobStore(metadataRestoreJobPersistence(svc));
             owned_public_http_server = public_http_server;
+            public_http_server.bindIncomingGraphRoutes(public_read_source.source());
 
             const mux = try alloc.create(MetadataAdminMux);
             mux.* = .{

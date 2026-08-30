@@ -138,20 +138,20 @@ describe("GraphIndexExplorer", () => {
           paths: [
             {
               path: {
-              nodes: [{ key: "shared" }, { key: "shared", table: "entities" }],
-              edges: [
-                {
-                  from: { key: "shared" },
-                  to: { key: "shared", table: "entities" },
-                  direction: "out",
-                  type: "mentions",
-                  weight: 1,
-                },
-              ],
-              length: 1,
-              objective: "min_hops",
-              weight_sum: 1,
-              objective_value: 1,
+                nodes: [{ key: "shared" }, { key: "shared", table: "entities" }],
+                edges: [
+                  {
+                    from: { key: "shared" },
+                    to: { key: "shared", table: "entities" },
+                    direction: "out",
+                    type: "mentions",
+                    weight: 1,
+                  },
+                ],
+                length: 1,
+                objective: "min_hops",
+                weight_sum: 1,
+                objective_value: 1,
               },
             },
           ],

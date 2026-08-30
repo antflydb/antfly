@@ -152,6 +152,12 @@ pub fn encodeEdgeValueAlloc(
     return buf;
 }
 
+/// Validate the single durable weight domain shared by public writes,
+/// enrichment artifacts, and direct graph-index callers.
+pub fn validateEdgeWeight(weight: f64) !void {
+    return edge_weight.validateStored(weight);
+}
+
 /// Decode edge value from binary format.
 pub fn decodeEdgeValue(data: []const u8) !DecodedEdgeValue {
     if (data.len < edge_value_header_len) return error.InvalidGraphEdgeValue;
@@ -1010,7 +1016,6 @@ pub const GraphIndex = struct {
             try edge_weight.validateStored(write.weight);
         }
         for (deletes) |delete| try edge_type_mod.validateStored(delete.edge_type);
-
         try self.validateTreeBatchWrites(writes, deletes);
 
         var main_batch = try self.beginWriteOutgoingBatch();
@@ -1765,6 +1770,8 @@ pub const GraphIndex = struct {
         const owned_pairs = try self.mainStoreScanRange(alloc, range_lower, range_upper);
         defer backend_scan.freeResults(alloc, owned_pairs);
 
+        var outgoing_batch = try self.beginWriteOutgoingBatch();
+        errdefer outgoing_batch.abort();
         var reverse_txn = try self.beginWriteReverseTxn();
         errdefer reverse_txn.abort();
 
@@ -1775,6 +1782,10 @@ pub const GraphIndex = struct {
 
             const rev_key = try reverseEdgeKeyAlloc(alloc, parsed.target, self.index_name, parsed.edge_type, parsed.source);
             defer alloc.free(rev_key);
+            outgoing_batch.delete(pair.key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
             reverse_txn.delete(rev_key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
@@ -1782,40 +1793,15 @@ pub const GraphIndex = struct {
             removed += 1;
         }
 
-        var keys_to_delete = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (keys_to_delete.items) |key| alloc.free(key);
-            keys_to_delete.deinit(alloc);
-        }
-
-        {
-            var cur = try reverse_txn.openCursor();
-            defer cur.close();
-
-            if (try cur.seekAtOrAfter(range_lower)) |initial_entry| {
-                var entry = initial_entry;
-                while (true) {
-                    if (range_upper.len > 0 and std.mem.order(u8, entry.key, range_upper) != .lt) break;
-                    if (try parseReverseEdgeKeyAlloc(alloc, entry.key)) |parsed_owned| {
-                        var parsed = parsed_owned;
-                        defer parsed.deinit(alloc);
-                        if (std.mem.eql(u8, parsed.index_name, self.index_name)) {
-                            try keys_to_delete.append(alloc, try alloc.dupe(u8, entry.key));
-                        }
-                    }
-                    entry = (try cur.next()) orelse break;
-                }
-            }
-        }
-
-        for (keys_to_delete.items) |key| {
-            reverse_txn.delete(key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
-            removed += 1;
-        }
-
+        // Reverse rows are projections of source-owned outgoing edges, not
+        // target-owned records. Keep projections whose target moved to another
+        // range; distributed incoming reads fan out across source owners. The
+        // loop above already removes the exact reverse projection for every
+        // outgoing edge whose source is leaving this range.
+        //
+        // Match normal graph batch publication order: make forward ownership
+        // authoritative first, then retire the corresponding projections.
+        try outgoing_batch.commit();
         try reverse_txn.commit();
         try self.rebuildCounterMetadata();
         return removed;
@@ -2353,6 +2339,16 @@ test "graph edge encoding round-trip" {
     try std.testing.expectError(error.InvalidGraphEdgeValue, decodeEdgeValue(invalid));
 }
 
+test "graph storage rejects non-finite edge weights" {
+    const alloc = std.testing.allocator;
+    for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |weight| {
+        try std.testing.expectError(
+            error.InvalidGraphEdges,
+            encodeEdgeValueAlloc(alloc, weight, 0, 0, "{}"),
+        );
+    }
+}
+
 test "graph edge values support large metadata and reject truncated records" {
     const alloc = std.testing.allocator;
     const metadata = try alloc.alloc(u8, 16 * 1024);
@@ -2526,7 +2522,7 @@ test "graph rebuildReverseFromOwnedOutgoingEdges respects split ownership bounds
     try std.testing.expectEqual(@as(usize, 0), incoming_y.len);
 }
 
-test "graph pruneOwnedRange removes reverse edges for removed split range" {
+test "graph pruneOwnedRange preserves reverse edges for retained cross-range sources" {
     const alloc = std.testing.allocator;
     var store_buf: [256]u8 = undefined;
     const store_path = tmpPath(&store_buf, "store");
@@ -2548,7 +2544,8 @@ test "graph pruneOwnedRange removes reverse edges for removed split range" {
 
     const incoming_z = try graph.getEdges(alloc, "doc:z", "ref", .in);
     defer GraphIndex.freeEdges(alloc, incoming_z);
-    try std.testing.expectEqual(@as(usize, 0), incoming_z.len);
+    try std.testing.expectEqual(@as(usize, 1), incoming_z.len);
+    try std.testing.expectEqualStrings("doc:a", incoming_z[0].source);
 
     const incoming_y = try graph.getEdges(alloc, "doc:y", "ref", .in);
     defer GraphIndex.freeEdges(alloc, incoming_y);
@@ -2557,6 +2554,16 @@ test "graph pruneOwnedRange removes reverse edges for removed split range" {
     const incoming_q = try graph.getEdges(alloc, "doc:q", "ref", .in);
     defer GraphIndex.freeEdges(alloc, incoming_q);
     try std.testing.expectEqual(@as(usize, 0), incoming_q.len);
+
+    const outgoing_a = try graph.getEdges(alloc, "doc:a", "ref", .out);
+    defer GraphIndex.freeEdges(alloc, outgoing_a);
+    try std.testing.expectEqual(@as(usize, 1), outgoing_a.len);
+    const outgoing_z = try graph.getEdges(alloc, "doc:z", "ref", .out);
+    defer GraphIndex.freeEdges(alloc, outgoing_z);
+    try std.testing.expectEqual(@as(usize, 0), outgoing_z.len);
+    const outgoing_m = try graph.getEdges(alloc, "doc:m", "ref", .out);
+    defer GraphIndex.freeEdges(alloc, outgoing_m);
+    try std.testing.expectEqual(@as(usize, 0), outgoing_m.len);
 }
 
 test "tree topology rejects second outgoing edge" {

@@ -39,6 +39,9 @@ export {
   DEFAULT_WRITE_MAX_REQUEST_BYTES,
   DEFAULT_WRITE_MAX_RESPONSE_BYTES,
   HierarchyCursorStaleError,
+  INDEX_MUTATION_TEMPORARILY_UNAVAILABLE_CODES,
+  type IndexMutationTemporarilyUnavailableCode,
+  IndexMutationTemporarilyUnavailableError,
   type IndexOperations,
   QUERY_TEMPORARILY_UNAVAILABLE_CODES,
   type QueryExecutionOptions,
@@ -66,6 +69,18 @@ export {
   graphTermRangeFilter,
   validateGraphQueryIdentifiers,
 } from "./graph-identifiers.js";
+export {
+  type ArtifactEmbeddingIndexOptions,
+  type ArtifactEmbeddingSourceConfig,
+  type ArtifactFullTextIndexOptions,
+  artifactEmbeddingIndexConfig,
+  artifactFullTextIndexConfig,
+  artifactIndexSources,
+  type FullTextArtifactSourceConfig,
+  fullTextArtifactIndexSources,
+  graphIndexSources,
+  validateCreateIndexRequestRelationships,
+} from "./index-config.js";
 export {
   InferenceAPIError,
   InferenceCapacityError,
@@ -286,6 +301,7 @@ export type {
   GraphTraverseQuery,
   GraphWhereExpression,
   IndexConfig,
+  IndexRuntimeCapabilities,
   IndexStatus,
   IndexType,
   InferenceConnection,

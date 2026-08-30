@@ -35,6 +35,7 @@ from .exceptions import (
     AntflyAuthError,
     AntflyConnectionError,
     AntflyException,
+    IndexMutationTemporarilyUnavailableError,
     InferenceAPIError,
     InferenceCapacityError,
     StorageResourceExhaustedError,
@@ -51,6 +52,19 @@ from .graph_queries import (
     graph_date_range_filter,
     graph_numeric_range_filter,
     graph_term_range_filter,
+)
+from .index_config import (
+    ArtifactEmbeddingSource,
+    FullTextArtifactSource,
+    GraphArtifactSource,
+    GraphContextMapping,
+    GraphEdgeMapping,
+    GraphNodeMapping,
+    artifact_embedding_index_config,
+    artifact_full_text_index_config,
+    artifact_index_sources,
+    graph_index_sources,
+    validate_create_index_request_relationships,
 )
 
 __version__ = "0.1.0"
@@ -80,6 +94,7 @@ __all__ = [
     "EmbedderProvider",
     "antfly_embedder",
     "AntflyException",
+    "IndexMutationTemporarilyUnavailableError",
     "AntflyConnectionError",
     "AntflyAuthError",
     "InferenceAPIError",
@@ -96,5 +111,16 @@ __all__ = [
     "graph_term_range_filter",
     "SparseEmbedding",
     "PackedSparseEmbedding",
+    "ArtifactEmbeddingSource",
+    "FullTextArtifactSource",
+    "GraphArtifactSource",
+    "GraphContextMapping",
+    "GraphEdgeMapping",
+    "GraphNodeMapping",
+    "artifact_embedding_index_config",
+    "artifact_full_text_index_config",
+    "artifact_index_sources",
+    "graph_index_sources",
+    "validate_create_index_request_relationships",
     "__version__",
 ]

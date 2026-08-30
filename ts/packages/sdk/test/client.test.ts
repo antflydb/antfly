@@ -3,6 +3,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
+  ClusterStatus,
   CreateTableRequest,
   QueryRequest,
   TableQueryRequest,
@@ -35,6 +36,7 @@ vi.mock("openapi-fetch", () => ({
 const {
   AntflyClient,
   HierarchyCursorStaleError,
+  IndexMutationTemporarilyUnavailableError,
   QueryTemporarilyUnavailableError,
   StorageResourceExhaustedError,
   StorageReadTemporarilyUnavailableError,
@@ -120,6 +122,26 @@ describe("AntflyClient", () => {
     });
   });
 
+  describe("status", () => {
+    it("returns the typed deployment capability contract", async () => {
+      const status: ClusterStatus = {
+        health: "healthy",
+        deployment_mode: "standalone",
+        index_capabilities: { artifact_sources: true, artifact_sources_state: "available" },
+      };
+      mockGet.mockResolvedValueOnce({ data: status, error: undefined });
+
+      await expect(client.getStatus()).resolves.toEqual(status);
+      expect(mockGet).toHaveBeenCalledWith("/db/v1/status");
+    });
+
+    it("rejects an empty successful status response", async () => {
+      mockGet.mockResolvedValueOnce({ data: undefined, error: undefined });
+
+      await expect(client.getStatus()).rejects.toThrow("response body was empty");
+    });
+  });
+
   describe("query", () => {
     it("should execute global query", async () => {
       const mockResponse = {
@@ -192,6 +214,7 @@ describe("AntflyClient", () => {
 
       const request: TableQueryRequest = {
         table: "products",
+        full_text_index: "product_text",
         full_text_search: {
           match: "laptop",
           field: "name",
@@ -276,6 +299,22 @@ describe("AntflyClient", () => {
         params: { path: { tableName: "new_table" } },
         body: config,
       });
+    });
+
+    it("rejects invalid inline indexes before creating a table", async () => {
+      const config = {
+        indexes: {
+          semantic: {
+            type: "embeddings",
+            source_artifact_name: "document_chunks_v1",
+          },
+        },
+      } as CreateTableRequest;
+
+      await expect(client.tables.create("new_table", config)).rejects.toThrow(
+        'Invalid index "semantic": Embedding source_artifact_name requires a non-empty embedding_name.'
+      );
+      expect(mockPost).not.toHaveBeenCalled();
     });
 
     it("should query a specific table", async () => {
@@ -875,6 +914,16 @@ describe("AntflyClient", () => {
       ).rejects.toThrow("unexpected empty response");
     });
 
+    it("rejects invalid index field relationships before transport", async () => {
+      await expect(
+        client.indexes.create("wikipedia", "thumbnail", {
+          type: "embeddings",
+          source_artifact_name: "thumbnail_chunks_v1",
+        })
+      ).rejects.toThrow("requires a non-empty embedding_name");
+      expect(mockPost).not.toHaveBeenCalled();
+    });
+
     it("preserves storage admission retry metadata", async () => {
       mockPost.mockResolvedValueOnce({
         data: undefined,
@@ -929,6 +978,37 @@ describe("AntflyClient", () => {
           dimension: 512,
         })
       ).rejects.toMatchObject({ retryAfterMs: 3000, retryAfterSeconds: 3 });
+    });
+
+    it("preserves temporary index mutation retry metadata", async () => {
+      mockPost.mockResolvedValueOnce({
+        data: undefined,
+        error: {
+          error: "index_probe_unavailable",
+          message: "model probe is temporarily unavailable",
+          retryable: true,
+        },
+        response: {
+          status: 503,
+          headers: new Headers({ "Retry-After": "4" }),
+        },
+      });
+
+      try {
+        await client.indexes.create("wikipedia", "thumbnail", {
+          type: "embeddings",
+          dimension: 512,
+        });
+        expect.fail("expected temporary index mutation failure");
+      } catch (error) {
+        expect(error).toBeInstanceOf(IndexMutationTemporarilyUnavailableError);
+        expect(error).toMatchObject({
+          status: 503,
+          code: "index_probe_unavailable",
+          retryable: true,
+          retryAfterSeconds: 4,
+        });
+      }
     });
   });
 

@@ -1274,6 +1274,7 @@ pub const ArtifactRepairReason = enum {
     corrupt_artifact,
     unreadable_artifact,
     enrichment_failed,
+    resource_limit_exceeded,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -1281,6 +1282,7 @@ pub const ArtifactRepairReason = enum {
             .corrupt_artifact => "corrupt_artifact",
             .unreadable_artifact => "unreadable_artifact",
             .enrichment_failed => "enrichment_failed",
+            .resource_limit_exceeded => "resource_limit_exceeded",
         };
         try jw.write(s);
     }
@@ -1295,6 +1297,36 @@ pub const ArtifactRepairReason = enum {
             .{ "corrupt_artifact", .corrupt_artifact },
             .{ "unreadable_artifact", .unreadable_artifact },
             .{ "enrichment_failed", .enrichment_failed },
+            .{ "resource_limit_exceeded", .resource_limit_exceeded },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Whether artifact-backed index mutations are accepted now, temporarily fenced during a distributed rolling upgrade, or permanently unsupported by this deployment.
+pub const ArtifactSourcesCapabilityState = enum {
+    available,
+    upgrade_pending,
+    unsupported,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .available => "available",
+            .upgrade_pending => "upgrade_pending",
+            .unsupported => "unsupported",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "available", .available },
+            .{ "upgrade_pending", .upgrade_pending },
+            .{ "unsupported", .unsupported },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -2410,6 +2442,7 @@ pub const ClusterStatus = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
     storage: ?StorageRuntimeStatus = null,
@@ -2420,6 +2453,7 @@ pub const ClusterStatus = struct {
         .{ "message", "message", true },
         .{ "auth_enabled", "auth_enabled", true },
         .{ "deployment_mode", "deployment_mode", true },
+        .{ "index_capabilities", "index_capabilities", true },
         .{ "secret_store", "secret_store", true },
         .{ "runtime_config", "runtime_config", true },
         .{ "storage", "storage", true },
@@ -2449,6 +2483,10 @@ pub const ClusterStatus = struct {
             try jw.objectField("deployment_mode");
             try jw.write(value);
         }
+        if (self.index_capabilities) |value| {
+            try jw.objectField("index_capabilities");
+            try jw.write(value);
+        }
         if (self.secret_store) |value| {
             try jw.objectField("secret_store");
             try jw.write(value);
@@ -2473,6 +2511,7 @@ pub const ClusterTopology = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
     storage: ?StorageRuntimeStatus = null,
@@ -2484,6 +2523,7 @@ pub const ClusterTopology = struct {
         .{ "message", "message", true },
         .{ "auth_enabled", "auth_enabled", true },
         .{ "deployment_mode", "deployment_mode", true },
+        .{ "index_capabilities", "index_capabilities", true },
         .{ "secret_store", "secret_store", true },
         .{ "runtime_config", "runtime_config", true },
         .{ "storage", "storage", true },
@@ -2512,6 +2552,10 @@ pub const ClusterTopology = struct {
         }
         if (self.deployment_mode) |value| {
             try jw.objectField("deployment_mode");
+            try jw.write(value);
+        }
+        if (self.index_capabilities) |value| {
+            try jw.objectField("index_capabilities");
             try jw.write(value);
         }
         if (self.secret_store) |value| {
@@ -4785,9 +4829,23 @@ pub const IncompleteDetails = struct {
     reason: []const u8,
 };
 
+/// A retryable index mutation failure, including a distributed artifact-source protocol fence or a temporarily unavailable model probe.
+pub const IndexMutationServiceUnavailableError = struct {
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
+/// Deployment-level index capabilities clients can inspect before submitting index mutations.
+pub const IndexRuntimeCapabilities = struct {
+    /// Whether full-text, embedding, and graph indexes may currently consume generated artifact streams through either single-source or multi-source request forms. Equivalent to artifact_sources_state=available.
+    artifact_sources: bool,
+    artifact_sources_state: ArtifactSourcesCapabilityState,
+};
+
 pub const IndexStatus = struct {
     shard_status: std.json.ArrayHashMap(antfly_indexes_openapi.IndexStats),
-    config: antfly_indexes_openapi.IndexConfig,
+    config: antfly_indexes_openapi.CreatedIndex,
     status: antfly_indexes_openapi.IndexStats,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
@@ -6613,7 +6671,18 @@ pub const QueryConflictError = union(enum) {
     }
 };
 
-/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+/// A public filter or exclusion query contains an invalid or unsupported node.
+pub const QueryFilterError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    field: []const u8,
+    /// Stable name of the first invalid or unsupported filter node.
+    offending_node: []const u8,
+    retryable: bool,
+};
+
+/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit source-grouped result shape.
 pub const QueryHierarchy = struct {
     group_by: ?HierarchyGroupBy = null,
     ancestors: ?HierarchyAncestors = null,
@@ -6663,7 +6732,7 @@ pub const QueryHit = struct {
     /// Scores partitioned by index when using RRF search.
     _index_scores: ?std.json.ArrayHashMap(f64) = null,
     _source: ?std.json.ArrayHashMap(std.json.Value) = null,
-    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. Legacy rollup requests continue to use `chunks` instead of `matches`.
+    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. V0.2-compatible implicit rollup requests continue to use the deprecated `chunks` field instead of `matches`.
     hierarchy: ?QueryHitHierarchy = null,
     /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
     _sort: ?[]const std.json.Value = null,
@@ -6725,6 +6794,8 @@ pub const QueryHitHierarchy = struct {
     /// Unit identifier when the hit is attached to a document unit.
     parent_unit_id: ?[]const u8 = null,
     artifact: ?HierarchyArtifact = null,
+    /// Artifact member that supplied the score for a source-level grouped hit.
+    matched_artifact: ?HierarchyArtifact = null,
     ancestors: ?QueryHitHierarchyAncestors = null,
     evidence: ?HierarchyEvidence = null,
     /// Matching descendant hits attached by the canonical hierarchy.group_by request.
@@ -6733,7 +6804,7 @@ pub const QueryHitHierarchy = struct {
     position: ?[]const u8 = null,
     /// Composite source hierarchy revision to which the position and cursor are bound.
     revision: ?[]const u8 = null,
-    /// Legacy child chunk hits included for source-level rollups.
+    /// Deprecated child chunk hits included by the v0.2-compatible implicit source rollup.
     chunks: ?[]const HierarchyMatchHit = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
@@ -6742,6 +6813,7 @@ pub const QueryHitHierarchy = struct {
         .{ "parent_doc_key", "parent_doc_key", true },
         .{ "parent_unit_id", "parent_unit_id", true },
         .{ "artifact", "artifact", true },
+        .{ "matched_artifact", "matched_artifact", true },
         .{ "ancestors", "ancestors", true },
         .{ "evidence", "evidence", true },
         .{ "matches", "matches", true },
@@ -6774,6 +6846,10 @@ pub const QueryHitHierarchy = struct {
         }
         if (self.artifact) |value| {
             try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        if (self.matched_artifact) |value| {
+            try jw.objectField("matched_artifact");
             try jw.write(value);
         }
         if (self.ancestors) |value| {
@@ -6983,11 +7059,13 @@ pub const QueryRequest = struct {
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?RawQuery = null,
+    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index. This selector is invalid without `full_text_search` or a scoring text clause in `query` and receives HTTP 422. This semantic relationship is enforced after the recursive query AST is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses from filter-only or exclusion-only trees.
+    full_text_index: ?[]const u8 = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
     /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
-    /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
+    /// Embedding index names selected for `semantic_search` or explicit `embeddings`. Dense and sparse indexes are supported when the corresponding query representation is supplied. Provisioned deployments require at least one index for `semantic_search`; serverless may infer its single published dense index when this field is omitted. When `embeddings` is supplied without this field, the embedding map keys select the indexes. Provisioned results from multiple indexes are merged using RRF. Serverless currently executes at most one dense and one sparse index per request; it rejects multiple same-kind selectors and omitted selectors when more than one corresponding index is published rather than choosing an index by catalog order.
     indexes: ?[]const []const u8 = null,
     /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
     filter_prefix: ?[]const u8 = null,
@@ -7045,6 +7123,7 @@ pub const QueryRequest = struct {
         .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
+        .{ "full_text_index", "full_text_index", true },
         .{ "semantic_search", "semantic_search", true },
         .{ "embedding_template", "embedding_template", true },
         .{ "indexes", "indexes", true },
@@ -7096,6 +7175,10 @@ pub const QueryRequest = struct {
         }
         if (self.full_text_search) |value| {
             try jw.objectField("full_text_search");
+            try jw.write(value);
+        }
+        if (self.full_text_index) |value| {
+            try jw.objectField("full_text_index");
             try jw.write(value);
         }
         if (self.semantic_search) |value| {
@@ -7421,58 +7504,38 @@ pub const QueryTemporarilyUnavailableError = struct {
 };
 
 pub const QueryUnprocessableError = union(enum) {
-    exact_sort_error: ExactSortError,
-    query_candidate_budget_exceeded_error: QueryCandidateBudgetExceededError,
-    graph_distinct_budget_exceeded_error: GraphDistinctBudgetExceededError,
-    graph_work_budget_exceeded_error: GraphWorkBudgetExceededError,
-    graph_path_weight_domain_error: GraphPathWeightDomainError,
-    graph_anchor_filter_requires_index_error: GraphAnchorFilterRequiresIndexError,
-    graph_query_unsupported_error: GraphQueryUnsupportedError,
-    graph_match_operation_limit_exceeded_error: GraphMatchOperationLimitExceededError,
+    unsupported_hierarchy_grouping_error: *UnsupportedHierarchyGroupingError,
+    graph_work_budget_exceeded_error: *GraphWorkBudgetExceededError,
+    exact_sort_error: *ExactSortError,
+    graph_path_weight_domain_error: *GraphPathWeightDomainError,
+    query_candidate_budget_exceeded_error: *QueryCandidateBudgetExceededError,
+    graph_query_unsupported_error: *GraphQueryUnsupportedError,
+    graph_distinct_budget_exceeded_error: *GraphDistinctBudgetExceededError,
+    graph_match_operation_limit_exceeded_error: *GraphMatchOperationLimitExceededError,
+    graph_anchor_filter_requires_index_error: *GraphAnchorFilterRequiresIndexError,
+    unsupported_query_error: *UnsupportedQueryError,
+    query_filter_error: *QueryFilterError,
 
-    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const DiscriminatorProbe = union(enum) {
-            missing,
-            value: []const u8,
-            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
-                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
-            }
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
         };
-        const Probe = struct { @"error": DiscriminatorProbe = .missing };
-        var probe_options = options;
-        probe_options.ignore_unknown_fields = true;
-        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        const disc_str = switch (probe.@"error") {
-            .value => |value| value,
-            .missing => {
-                return error.MissingField;
-            },
-        };
-        if (std.mem.eql(u8, disc_str, "unsupported_exact_sort")) {
-            return .{ .exact_sort_error = try std.json.parseFromSliceLeaky(ExactSortError, allocator, input, options) };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectStringEquals(object: std.json.ObjectMap, comptime key: []const u8, comptime expected: []const u8) bool {
+        const value = object.get(key) orelse return false;
+        return value == .string and std.mem.eql(u8, value.string, expected);
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
         }
-        if (std.mem.eql(u8, disc_str, "query_candidate_budget_exceeded")) {
-            return .{ .query_candidate_budget_exceeded_error = try std.json.parseFromSliceLeaky(QueryCandidateBudgetExceededError, allocator, input, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "graph_distinct_budget_exceeded")) {
-            return .{ .graph_distinct_budget_exceeded_error = try std.json.parseFromSliceLeaky(GraphDistinctBudgetExceededError, allocator, input, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "graph_work_budget_exceeded")) {
-            return .{ .graph_work_budget_exceeded_error = try std.json.parseFromSliceLeaky(GraphWorkBudgetExceededError, allocator, input, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "graph_path_weight_domain_error")) {
-            return .{ .graph_path_weight_domain_error = try std.json.parseFromSliceLeaky(GraphPathWeightDomainError, allocator, input, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
-            return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromSliceLeaky(GraphAnchorFilterRequiresIndexError, allocator, input, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "graph_query_unsupported")) {
-            return .{ .graph_query_unsupported_error = try std.json.parseFromSliceLeaky(GraphQueryUnsupportedError, allocator, input, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "graph_match_operation_limit_exceeded")) {
-            return .{ .graph_match_operation_limit_exceeded_error = try std.json.parseFromSliceLeaky(GraphMatchOperationLimitExceededError, allocator, input, options) };
-        }
-        return error.UnexpectedToken;
+        return false;
     }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -7482,50 +7545,159 @@ pub const QueryUnprocessableError = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("error") orelse {
-            return error.MissingField;
-        };
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "unsupported_exact_sort")) {
-            return .{ .exact_sort_error = try std.json.parseFromValueLeaky(ExactSortError, allocator, source, options) };
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
+            "reason",
+            "action",
+            "retryable",
+        }) and
+            objectStringEquals(source.object, "error", "unsupported_hierarchy_grouping") and
+            objectStringEquals(source.object, "reason", "unit_identity_unavailable") and
+            objectStringEquals(source.object, "action", "use_source_grouping_or_direct_members"))
+        {
+            if (try parseStructuralVariant(UnsupportedHierarchyGroupingError, allocator, source, options)) |parsed| return .{ .unsupported_hierarchy_grouping_error = parsed };
         }
-        if (std.mem.eql(u8, disc_str, "query_candidate_budget_exceeded")) {
-            return .{ .query_candidate_budget_exceeded_error = try std.json.parseFromValueLeaky(QueryCandidateBudgetExceededError, allocator, source, options) };
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
+            "retryable",
+            "operation",
+            "mode",
+            "dimension",
+            "maximum",
+            "remediation",
+        }) and
+            objectStringEquals(source.object, "error", "graph_work_budget_exceeded"))
+        {
+            if (try parseStructuralVariant(GraphWorkBudgetExceededError, allocator, source, options)) |parsed| return .{ .graph_work_budget_exceeded_error = parsed };
         }
-        if (std.mem.eql(u8, disc_str, "graph_distinct_budget_exceeded")) {
-            return .{ .graph_distinct_budget_exceeded_error = try std.json.parseFromValueLeaky(GraphDistinctBudgetExceededError, allocator, source, options) };
+        if (objectHasAnyKey(source.object, &.{
+            "error",
+            "message",
+            "reason",
+            "sort_rejection_reason",
+            "budget_rejection_reason",
+            "sort_rejection_detail",
+            "sort_rejection_field",
+            "status",
+        }) and
+            objectStringEquals(source.object, "error", "unsupported_exact_sort"))
+        {
+            if (try parseStructuralVariant(ExactSortError, allocator, source, options)) |parsed| return .{ .exact_sort_error = parsed };
         }
-        if (std.mem.eql(u8, disc_str, "graph_work_budget_exceeded")) {
-            return .{ .graph_work_budget_exceeded_error = try std.json.parseFromValueLeaky(GraphWorkBudgetExceededError, allocator, source, options) };
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
+            "retryable",
+            "operation",
+            "mode",
+            "allowed_range",
+            "remediation",
+        }) and
+            objectStringEquals(source.object, "error", "graph_path_weight_domain_error"))
+        {
+            if (try parseStructuralVariant(GraphPathWeightDomainError, allocator, source, options)) |parsed| return .{ .graph_path_weight_domain_error = parsed };
         }
-        if (std.mem.eql(u8, disc_str, "graph_path_weight_domain_error")) {
-            return .{ .graph_path_weight_domain_error = try std.json.parseFromValueLeaky(GraphPathWeightDomainError, allocator, source, options) };
+        if (objectHasAnyKey(source.object, &.{
+            "error",
+            "message",
+            "reason",
+            "budget_rejection_reason",
+            "sort_rejection_reason",
+            "sort_rejection_detail",
+            "sort_rejection_field",
+            "status",
+        }) and
+            objectStringEquals(source.object, "error", "query_candidate_budget_exceeded"))
+        {
+            if (try parseStructuralVariant(QueryCandidateBudgetExceededError, allocator, source, options)) |parsed| return .{ .query_candidate_budget_exceeded_error = parsed };
         }
-        if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
-            return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromValueLeaky(GraphAnchorFilterRequiresIndexError, allocator, source, options) };
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
+            "retryable",
+            "operation",
+            "feature",
+            "reason",
+        }) and
+            objectStringEquals(source.object, "error", "graph_query_unsupported"))
+        {
+            if (try parseStructuralVariant(GraphQueryUnsupportedError, allocator, source, options)) |parsed| return .{ .graph_query_unsupported_error = parsed };
         }
-        if (std.mem.eql(u8, disc_str, "graph_query_unsupported")) {
-            return .{ .graph_query_unsupported_error = try std.json.parseFromValueLeaky(GraphQueryUnsupportedError, allocator, source, options) };
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
+            "retryable",
+            "max_distinct_identities",
+            "max_distinct_state_bytes",
+        }) and
+            objectStringEquals(source.object, "error", "graph_distinct_budget_exceeded"))
+        {
+            if (try parseStructuralVariant(GraphDistinctBudgetExceededError, allocator, source, options)) |parsed| return .{ .graph_distinct_budget_exceeded_error = parsed };
         }
-        if (std.mem.eql(u8, disc_str, "graph_match_operation_limit_exceeded")) {
-            return .{ .graph_match_operation_limit_exceeded_error = try std.json.parseFromValueLeaky(GraphMatchOperationLimitExceededError, allocator, source, options) };
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
+            "retryable",
+            "maximum",
+            "actual",
+        }) and
+            objectStringEquals(source.object, "error", "graph_match_operation_limit_exceeded"))
+        {
+            if (try parseStructuralVariant(GraphMatchOperationLimitExceededError, allocator, source, options)) |parsed| return .{ .graph_match_operation_limit_exceeded_error = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
+            "retryable",
+        }) and
+            objectStringEquals(source.object, "error", "graph_anchor_filter_requires_index"))
+        {
+            if (try parseStructuralVariant(GraphAnchorFilterRequiresIndexError, allocator, source, options)) |parsed| return .{ .graph_anchor_filter_requires_index_error = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
+            "retryable",
+        }) and
+            objectStringEquals(source.object, "error", "unsupported_query_request"))
+        {
+            if (try parseStructuralVariant(UnsupportedQueryError, allocator, source, options)) |parsed| return .{ .unsupported_query_error = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+            "error",
+            "message",
+            "offending_node",
+            "retryable",
+        })) {
+            if (try parseStructuralVariant(QueryFilterError, allocator, source, options)) |parsed| return .{ .query_filter_error = parsed };
         }
         return error.UnexpectedToken;
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
-            .exact_sort_error => |v| try jw.write(v),
-            .query_candidate_budget_exceeded_error => |v| try jw.write(v),
-            .graph_distinct_budget_exceeded_error => |v| try jw.write(v),
-            .graph_work_budget_exceeded_error => |v| try jw.write(v),
-            .graph_path_weight_domain_error => |v| try jw.write(v),
-            .graph_anchor_filter_requires_index_error => |v| try jw.write(v),
-            .graph_query_unsupported_error => |v| try jw.write(v),
-            .graph_match_operation_limit_exceeded_error => |v| try jw.write(v),
+            .unsupported_hierarchy_grouping_error => |v| try jw.write(v.*),
+            .graph_work_budget_exceeded_error => |v| try jw.write(v.*),
+            .exact_sort_error => |v| try jw.write(v.*),
+            .graph_path_weight_domain_error => |v| try jw.write(v.*),
+            .query_candidate_budget_exceeded_error => |v| try jw.write(v.*),
+            .graph_query_unsupported_error => |v| try jw.write(v.*),
+            .graph_distinct_budget_exceeded_error => |v| try jw.write(v.*),
+            .graph_match_operation_limit_exceeded_error => |v| try jw.write(v.*),
+            .graph_anchor_filter_requires_index_error => |v| try jw.write(v.*),
+            .unsupported_query_error => |v| try jw.write(v.*),
+            .query_filter_error => |v| try jw.write(v.*),
         }
     }
 };
@@ -8779,11 +8951,13 @@ pub const RetrievalQueryRequest = struct {
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?RawQuery = null,
+    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index. This selector is invalid without `full_text_search` or a scoring text clause in `query` and receives HTTP 422. This semantic relationship is enforced after the recursive query AST is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses from filter-only or exclusion-only trees.
+    full_text_index: ?[]const u8 = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
     /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
-    /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
+    /// Embedding index names selected for `semantic_search` or explicit `embeddings`. Dense and sparse indexes are supported when the corresponding query representation is supplied. Provisioned deployments require at least one index for `semantic_search`; serverless may infer its single published dense index when this field is omitted. When `embeddings` is supplied without this field, the embedding map keys select the indexes. Provisioned results from multiple indexes are merged using RRF. Serverless currently executes at most one dense and one sparse index per request; it rejects multiple same-kind selectors and omitted selectors when more than one corresponding index is published rather than choosing an index by catalog order.
     indexes: ?[]const []const u8 = null,
     /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
     filter_prefix: ?[]const u8 = null,
@@ -8843,6 +9017,7 @@ pub const RetrievalQueryRequest = struct {
         .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
+        .{ "full_text_index", "full_text_index", true },
         .{ "semantic_search", "semantic_search", true },
         .{ "embedding_template", "embedding_template", true },
         .{ "indexes", "indexes", true },
@@ -8895,6 +9070,10 @@ pub const RetrievalQueryRequest = struct {
         }
         if (self.full_text_search) |value| {
             try jw.objectField("full_text_search");
+            try jw.write(value);
+        }
+        if (self.full_text_index) |value| {
+            try jw.objectField("full_text_index");
             try jw.write(value);
         }
         if (self.semantic_search) |value| {
@@ -9792,11 +9971,13 @@ pub const StatefulQueryRequest = struct {
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?RawQuery = null,
+    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index. This selector is invalid without `full_text_search` or a scoring text clause in `query` and receives HTTP 422. This semantic relationship is enforced after the recursive query AST is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses from filter-only or exclusion-only trees.
+    full_text_index: ?[]const u8 = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
     /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
     embedding_template: ?[]const u8 = null,
-    /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
+    /// Embedding index names selected for `semantic_search` or explicit `embeddings`. Dense and sparse indexes are supported when the corresponding query representation is supplied. Provisioned deployments require at least one index for `semantic_search`; serverless may infer its single published dense index when this field is omitted. When `embeddings` is supplied without this field, the embedding map keys select the indexes. Provisioned results from multiple indexes are merged using RRF. Serverless currently executes at most one dense and one sparse index per request; it rejects multiple same-kind selectors and omitted selectors when more than one corresponding index is published rather than choosing an index by catalog order.
     indexes: ?[]const []const u8 = null,
     /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
     filter_prefix: ?[]const u8 = null,
@@ -9858,6 +10039,7 @@ pub const StatefulQueryRequest = struct {
         .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
+        .{ "full_text_index", "full_text_index", true },
         .{ "semantic_search", "semantic_search", true },
         .{ "embedding_template", "embedding_template", true },
         .{ "indexes", "indexes", true },
@@ -9911,6 +10093,10 @@ pub const StatefulQueryRequest = struct {
         }
         if (self.full_text_search) |value| {
             try jw.objectField("full_text_search");
+            try jw.write(value);
+        }
+        if (self.full_text_index) |value| {
+            try jw.objectField("full_text_index");
             try jw.write(value);
         }
         if (self.semantic_search) |value| {
@@ -10323,7 +10509,7 @@ pub const Table = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
-    indexes: std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig),
+    indexes: std.json.ArrayHashMap(antfly_indexes_openapi.CreatedIndex),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?antfly_schema_openapi.TableSchema = null,
     /// Present only when the table is migrating between schema versions. Absent means the table is stable.
@@ -10579,6 +10765,8 @@ pub const TableRepairIssue = struct {
     parent_doc_key: ?[]const u8 = null,
     /// Unit identifier for unit-scoped artifacts, when applicable.
     unit_id: ?[]const u8 = null,
+    /// Canonical artifact stream configured on the affected index. This is the authoritative source-readiness identity and is distinct from the producer input and the derived artifact being repaired.
+    index_source_artifact_name: ?[]const u8 = null,
     /// Source artifact stream used to produce this artifact, when applicable.
     source_artifact_name: ?[]const u8 = null,
     /// Derived artifact name that must be reprocessed or made readable.
@@ -10614,6 +10802,7 @@ pub const TableRepairIssue = struct {
         .{ "doc_key", "doc_key", false },
         .{ "parent_doc_key", "parent_doc_key", true },
         .{ "unit_id", "unit_id", true },
+        .{ "index_source_artifact_name", "index_source_artifact_name", true },
         .{ "source_artifact_name", "source_artifact_name", true },
         .{ "artifact_name", "artifact_name", false },
         .{ "artifact_key", "artifact_key", true },
@@ -10652,6 +10841,10 @@ pub const TableRepairIssue = struct {
         }
         if (self.unit_id) |value| {
             try jw.objectField("unit_id");
+            try jw.write(value);
+        }
+        if (self.index_source_artifact_name) |value| {
+            try jw.objectField("index_source_artifact_name");
             try jw.write(value);
         }
         if (self.source_artifact_name) |value| {
@@ -11132,7 +11325,7 @@ pub const TableStatus = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
-    indexes: std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig),
+    indexes: std.json.ArrayHashMap(antfly_indexes_openapi.CreatedIndex),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?antfly_schema_openapi.TableSchema = null,
     /// Present only when the table is migrating between schema versions. Absent means the table is stable.
@@ -12154,6 +12347,41 @@ pub const TreeSearchConfig = struct {
         }
         try jw.endObject();
     }
+};
+
+/// A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity.
+pub const UnsupportedHierarchyGroupingError = struct {
+    status: i32,
+    /// Stable machine-readable error code.
+    @"error": []const u8,
+    /// Human-readable remediation using only public query fields.
+    message: []const u8,
+    /// Stable reason the requested hierarchy level is unavailable.
+    reason: []const u8,
+    /// Public request field that selected the unsupported grouping level.
+    field: []const u8,
+    /// Select source grouping, omit group_by for direct members, or use an index whose every source is unit-backed.
+    action: []const u8,
+    /// Retrying the same request cannot succeed without changing its hierarchy grouping.
+    retryable: bool,
+};
+
+/// The requested index depends on a capability unavailable in the current deployment.
+pub const UnsupportedIndexCapabilityError = struct {
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
+/// A query requests an unsupported feature without a more specific structured diagnostic.
+pub const UnsupportedQueryError = struct {
+    status: i32,
+    /// Stable machine-readable error code.
+    @"error": []const u8,
+    /// Human-readable error summary.
+    message: []const u8,
+    /// Retrying the same request cannot succeed without changing it.
+    retryable: bool,
 };
 
 pub const UpdatePasswordRequest = struct {

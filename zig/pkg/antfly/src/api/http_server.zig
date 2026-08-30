@@ -949,6 +949,10 @@ pub const ApiHttpServerConfig = struct {
     /// Engine-owned durable storage for restore jobs. The caller retains
     /// ownership and must keep the store alive until server deinit completes.
     restore_job_store: ?*backend_erased.Store = null,
+    /// Engine-owned durable L2 for exact incoming-graph route observations.
+    /// The caller retains ownership and must keep the store alive until all
+    /// API/read-source caches using it have been deinitialized.
+    incoming_graph_route_store: ?*backend_erased.Store = null,
     restore_job_store_path: ?[]const u8 = null,
     restore_execution_guard: ?RestoreExecutionGuard = null,
     /// Local scratch root for remote backup upload staging. When omitted, the
@@ -1565,6 +1569,7 @@ fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []co
     var updated_record = table.*;
     updated_record.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, expanded_index_json);
     defer alloc.free(updated_record.indexes_json);
+    try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated_record.indexes_json);
     try svc.replaceTableDefinition(table.*, updated_record);
     try svc.runRound();
 }
@@ -2056,12 +2061,14 @@ pub const ApiHttpServer = struct {
     local_resource_manager: resource_manager_mod.ResourceManager,
     shared_resource_manager: ?*resource_manager_mod.ResourceManager,
     query_embedding_cache: query_embedding_cache.QueryEmbeddingCache,
+    incoming_graph_routes: distributed_graph.IncomingSourceGroupCache,
 
     pub const RequestStats = struct {
         request_count: u64 = 0,
         first_request_started_at_ns: u64 = 0,
         first_request_elapsed_ms: u64 = 0,
         query_embedding_cache: query_embedding_cache.Stats = .{},
+        incoming_graph_routes: distributed_graph.IncomingSourceGroupCache.Stats = .{},
         inference_cache_budget: cache_budget.CacheBudget.Stats = .{
             .max_bytes = 0,
             .used_bytes = 0,
@@ -2075,6 +2082,7 @@ pub const ApiHttpServer = struct {
         session_maintenance: u64 = 0,
         backup_maintenance: u64 = 0,
         index_installation: u64 = 0,
+        incoming_graph_routes: u64 = 0,
     };
 
     fn allocRuntimeOwnerIds(runtime: ?*db_mod.background_runtime.BackendRuntime) !RuntimeOwnerIds {
@@ -2092,6 +2100,7 @@ pub const ApiHttpServer = struct {
         ids.session_maintenance = try active.allocOwnerId();
         ids.backup_maintenance = try active.allocOwnerId();
         ids.index_installation = try active.allocOwnerId();
+        ids.incoming_graph_routes = try active.allocOwnerId();
         return ids;
     }
 
@@ -2132,6 +2141,13 @@ pub const ApiHttpServer = struct {
             table_read_source,
             table_write_source,
         );
+    }
+
+    /// Bind a routing-aware source after the server reaches its final address.
+    /// The cache pointer must never target the temporary returned-by-value
+    /// server used during construction.
+    pub fn bindIncomingGraphRoutes(self: *ApiHttpServer, source: table_reads.TableReadSource) void {
+        source.bindIncomingGraphRoutes(&self.incoming_graph_routes);
     }
 
     pub fn initForTestingWithRequestAllocator(
@@ -2179,6 +2195,16 @@ pub const ApiHttpServer = struct {
     ) ApiHttpServer {
         const effective_query_embedding_cache = effectiveQueryEmbeddingCacheConfig(cfg);
         const api_io = queryEmbeddingCacheIo(cfg);
+        var incoming_graph_routes = distributed_graph.IncomingSourceGroupCache.initWithDurableStore(
+            owner_alloc,
+            cfg.incoming_graph_route_store,
+        );
+        if (cfg.backend_runtime) |runtime| {
+            incoming_graph_routes.attachDurableJobLane(
+                runtime.durable_jobs,
+                owner_ids.incoming_graph_routes,
+            );
+        }
         return .{
             .alloc = request_alloc,
             .owner_alloc = owner_alloc,
@@ -2190,6 +2216,7 @@ pub const ApiHttpServer = struct {
             .table_reads = table_read_source,
             .table_writes = table_write_source,
             .foreign_registry = cfg.foreign_registry,
+            .incoming_graph_routes = incoming_graph_routes,
             .created_at_ns = platform_time.monotonicNs(),
             .txn_sessions = blk: {
                 var registry = transactions_api.SessionRegistry.initWithOptions(
@@ -2278,6 +2305,7 @@ pub const ApiHttpServer = struct {
             else
                 @intCast(@divTrunc(first_request_started_at_ns - self.created_at_ns, std.time.ns_per_ms)),
             .query_embedding_cache = self.query_embedding_cache.stats(self.inferenceCacheBudget()),
+            .incoming_graph_routes = self.incoming_graph_routes.stats(),
             .inference_cache_budget = self.inferenceCacheBudget().stats(),
         };
     }
@@ -2350,14 +2378,78 @@ pub const ApiHttpServer = struct {
         return storageRuntimeStatus(maintenance.status());
     }
 
-    /// Transport-neutral status operation shared by direct callers and every
-    /// HTTP adapter. Ownership of nested allocations follows `alloc`.
-    pub fn loadClusterStatus(self: *ApiHttpServer, alloc: std.mem.Allocator) !cluster.ClusterStatus {
+    fn artifactSourcesSupportedByStores(stores: []const metadata_table_manager.StoreRecord) bool {
+        var saw_live_data_store = false;
+        for (stores) |store| {
+            if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
+            saw_live_data_store = true;
+            if (!metadata_table_manager.artifactSourcesProtocolSupported(
+                store.reporter_incarnation,
+                store.artifact_sources_protocol_version,
+            )) return false;
+        }
+        return saw_live_data_store;
+    }
+
+    fn artifactSourcesSupportedBySnapshot(snapshot: *const metadata_api.AdminSnapshot) bool {
+        return artifactSourcesSupportedByStores(snapshot.stores);
+    }
+
+    fn artifactSourcesCapabilityState(
+        self: *const ApiHttpServer,
+        snapshot: ?*const metadata_api.AdminSnapshot,
+    ) cluster.ArtifactSourcesCapabilityState {
+        return switch (self.cfg.deployment_mode) {
+            .serverless => .unsupported,
+            .distributed => if (snapshot) |value|
+                if (artifactSourcesSupportedBySnapshot(value)) .available else .upgrade_pending
+            else
+                .upgrade_pending,
+            else => .available,
+        };
+    }
+
+    const ArtifactSourcesAdmissionError = error{
+        UnsupportedArtifactIndexSources,
+        ArtifactIndexSourcesTemporarilyUnavailable,
+        Canceled,
+        DeadlineExceeded,
+    };
+
+    /// Enforce the deployment-wide artifact-source protocol fence before any
+    /// catalog mutation can publish a definition that older stores cannot run.
+    fn admitArtifactSources(
+        self: *ApiHttpServer,
+        request: api_operation.RequestContext,
+        uses_artifact_sources: bool,
+    ) ArtifactSourcesAdmissionError!void {
+        if (!uses_artifact_sources) return;
+        if (self.cfg.deployment_mode == .serverless)
+            return error.UnsupportedArtifactIndexSources;
+        if (self.cfg.deployment_mode != .distributed) return;
+
+        var snapshot = self.source.linearizableSnapshot(request) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => return error.ArtifactIndexSourcesTemporarilyUnavailable,
+        } orelse return error.ArtifactIndexSourcesTemporarilyUnavailable;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        if (!artifactSourcesSupportedBySnapshot(&snapshot))
+            return error.ArtifactIndexSourcesTemporarilyUnavailable;
+    }
+
+    fn loadClusterStatusWithSnapshot(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        snapshot: ?*const metadata_api.AdminSnapshot,
+    ) !cluster.ClusterStatus {
         const metadata_status = try self.source.status();
         var status = try cluster.fromMetadataStatus(alloc, metadata_status);
         errdefer status.deinit(alloc);
         status.auth_enabled = self.cfg.auth_enabled;
         status.deployment_mode = self.cfg.deployment_mode;
+        status.index_capabilities.artifact_sources_state = self.artifactSourcesCapabilityState(snapshot);
+        status.index_capabilities.artifact_sources = status.index_capabilities.artifact_sources_state == .available;
         status.storage = self.currentStorageRuntimeStatus();
         if (self.cfg.secret_store) |secret_store| {
             _ = secret_store.refreshIfChanged() catch |err| {
@@ -2371,18 +2463,35 @@ pub const ApiHttpServer = struct {
         return status;
     }
 
+    /// Transport-neutral status operation shared by direct callers and every
+    /// HTTP adapter. Ownership of nested allocations follows `alloc`.
+    pub fn loadClusterStatus(self: *ApiHttpServer, alloc: std.mem.Allocator) !cluster.ClusterStatus {
+        if (self.cfg.deployment_mode != .distributed) {
+            return self.loadClusterStatusWithSnapshot(alloc, null);
+        }
+        var snapshot_opt = self.source.cachedAdminSnapshot() catch null;
+        if (snapshot_opt == null) snapshot_opt = self.source.adminSnapshot() catch null;
+        if (snapshot_opt) |*snapshot| {
+            defer self.source.freeAdminSnapshot(snapshot);
+            return self.loadClusterStatusWithSnapshot(alloc, snapshot);
+        }
+        return self.loadClusterStatusWithSnapshot(alloc, null);
+    }
+
     /// Transport-neutral topology operation. It composes the shared status
     /// operation with the best available metadata snapshot and returns one
     /// typed result instead of serialized HTTP bytes.
     pub fn loadClusterTopology(self: *ApiHttpServer, alloc: std.mem.Allocator) !cluster.ClusterTopology {
-        var status = try self.loadClusterStatus(alloc);
-        defer status.deinit(alloc);
         var snapshot_opt = try self.source.cachedAdminSnapshot();
         if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
         if (snapshot_opt) |*snapshot| {
             defer self.source.freeAdminSnapshot(snapshot);
+            var status = try self.loadClusterStatusWithSnapshot(alloc, snapshot);
+            defer status.deinit(alloc);
             return try cluster.topologyFromStatusAndSnapshot(alloc, status, snapshot);
         }
+        var status = try self.loadClusterStatusWithSnapshot(alloc, null);
+        defer status.deinit(alloc);
         return try cluster.topologyFromStatus(alloc, status);
     }
 
@@ -2547,6 +2656,7 @@ pub const ApiHttpServer = struct {
         }
         self.connections_cache.deinit();
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
+        self.incoming_graph_routes.deinit();
         self.local_resource_manager.deinit(self.owner_alloc);
         self.* = undefined;
     }
@@ -3472,8 +3582,8 @@ pub const ApiHttpServer = struct {
             if (!std.mem.eql(u8, index.name, target.name)) continue;
             const identity = target.identity orelse return 2;
             return if (index.coverage_identity_ready and
-                index.coverage_generation == identity.coverage_generation and
-                index.coverage_config_hash == identity.coverage_config_hash)
+                index.coverage_generation == identity.incarnation and
+                index.coverage_config_hash == identity.config_hash)
                 2
             else
                 1;
@@ -3764,6 +3874,8 @@ pub const ApiHttpServer = struct {
             for (indexes[0..initialized]) |item| {
                 alloc.free(item.name);
                 if (item.load_error) |value| alloc.free(value);
+                for (item.source_replay) |source| alloc.free(source.artifact_name);
+                if (item.source_replay.len > 0) alloc.free(item.source_replay);
             }
             if (indexes.len > 0) alloc.free(indexes);
         }
@@ -3774,6 +3886,21 @@ pub const ApiHttpServer = struct {
             errdefer alloc.free(name);
             const load_error = if (index.load_error) |value| try alloc.dupe(u8, value) else null;
             errdefer if (load_error) |value| alloc.free(value);
+            const source_replay = try alloc.alloc(db_mod.types.IndexSourceReplayStatus, index.source_replay.len);
+            var source_count: usize = 0;
+            errdefer {
+                for (source_replay[0..source_count]) |source| alloc.free(source.artifact_name);
+                if (source_replay.len > 0) alloc.free(source_replay);
+            }
+            for (index.source_replay, 0..) |source, source_i| {
+                source_replay[source_i] = .{
+                    .artifact_name = try alloc.dupe(u8, source.artifact_name),
+                    .published_sequence = source.published_sequence,
+                    .target_sequence = source.target_sequence,
+                    .failed = source.failed,
+                };
+                source_count += 1;
+            }
             indexes[i] = .{
                 .name = name,
                 .kind = kind,
@@ -3795,6 +3922,7 @@ pub const ApiHttpServer = struct {
                 .replay_applied_sequence = index.replay_applied_sequence,
                 .replay_target_sequence = index.replay_target_sequence,
                 .replay_catch_up_required = index.replay_catch_up_required,
+                .source_replay = source_replay,
                 .index_repair_status = index.repair_status,
                 .index_repair_active_generation_serviceable = index.repair_active_generation_serviceable,
                 .catch_up_active = dense_catch_up_active,
@@ -5952,6 +6080,8 @@ pub const ApiHttpServer = struct {
                     .vtable = &.{
                         .execute_graph_expand = executeGraphExpand,
                         .execute_graph_hydrate = executeGraphHydrate,
+                        .resolve_incoming_source_groups = resolveIncomingSourceGroups,
+                        .record_incoming_source_groups = recordIncomingSourceGroups,
                         .fanout_io = fanoutIo,
                     },
                 };
@@ -5984,6 +6114,27 @@ pub const ApiHttpServer = struct {
                     req,
                     consistency,
                 )) orelse error.TableNotFound;
+            }
+
+            fn resolveIncomingSourceGroups(
+                ptr: *anyopaque,
+                inner_alloc: std.mem.Allocator,
+                inner_table_name: []const u8,
+                req: distributed_graph.IncomingSourceGroupsRequest,
+                _: raft_mod.ReadConsistency,
+            ) !distributed_graph.IncomingSourceGroupsResponse {
+                const worker: *@This() = @ptrCast(@alignCast(ptr));
+                return try worker.server.incoming_graph_routes.resolveAlloc(inner_alloc, inner_table_name, req);
+            }
+
+            fn recordIncomingSourceGroups(
+                ptr: *anyopaque,
+                inner_table_name: []const u8,
+                req: distributed_graph.IncomingSourceGroupsRequest,
+                response: distributed_graph.IncomingSourceGroupsResponse,
+            ) !void {
+                const worker: *@This() = @ptrCast(@alignCast(ptr));
+                try worker.server.incoming_graph_routes.record(inner_table_name, req, response);
             }
 
             fn fanoutIo(ptr: *anyopaque) ?std.Io {
@@ -8501,6 +8652,8 @@ pub const ApiHttpServer = struct {
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
+            error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
+            error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.Timeout => return error.ReadUnavailable,
             error.IdentityReadGenerationChanged => return error.ReadUnavailable,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
@@ -8693,6 +8846,7 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedExclusionQueryRequest,
                 => return err,
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
+                error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
@@ -8754,6 +8908,7 @@ pub const ApiHttpServer = struct {
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
+            error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
@@ -8844,6 +8999,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExclusionQueryRequest,
             => return err,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
+            error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.TableNotFound => return error.NotFound,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
@@ -9191,6 +9347,7 @@ pub const ApiHttpServer = struct {
 
     fn validateSupportedForeignPublicQueryRequest(request: anytype) !void {
         if (request.full_text_search != null) return error.UnsupportedQueryRequest;
+        if (request.full_text_index != null) return error.UnsupportedQueryRequest;
         if (request.semantic_search != null) return error.UnsupportedQueryRequest;
         if (request.embedding_template != null) return error.UnsupportedQueryRequest;
         if (request.indexes != null) return error.UnsupportedQueryRequest;
@@ -9795,6 +9952,16 @@ pub const ApiHttpServer = struct {
                 if (backups_api.isArtifactIntegrityError(err)) return error.BackupIntegrityFailure;
                 return error.InvalidBackupRequest;
             };
+            const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
+                self.alloc,
+                manifest.indexes_json,
+            ) catch return error.InvalidBackupRequest;
+            self.admitArtifactSources(request, uses_artifact_sources) catch |err| return switch (err) {
+                error.UnsupportedArtifactIndexSources => error.UnsupportedArtifactIndexSources,
+                error.ArtifactIndexSourcesTemporarilyUnavailable => error.ArtifactIndexSourcesTemporarilyUnavailable,
+                error.Canceled => error.Canceled,
+                error.DeadlineExceeded => error.DeadlineExceeded,
+            };
             self.admitExternalRestoreArtifactIntegrity(
                 self.sharedApiIo() orelse return error.InternalFailure,
                 location,
@@ -10383,6 +10550,10 @@ pub const ApiHttpServer = struct {
             },
         };
 
+        const uses_artifact_sources = indexes_api.indexConfigUsesArtifactSources(alloc, normalized_index_json) catch
+            return error.InvalidIndexRequest;
+        try self.admitArtifactSources(request, uses_artifact_sources);
+
         const destination_principal = if (request.destination_authorization_principal.len > 0)
             request.destination_authorization_principal
         else
@@ -10411,6 +10582,10 @@ pub const ApiHttpServer = struct {
             else => return error.InternalFailure,
         };
         defer alloc.free(expected_indexes_json);
+        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
+            error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidIndexRequest,
+            else => return error.InternalFailure,
+        };
         const stored_index_json = (indexes_api.storedIndexConfigJsonAlloc(alloc, expected_indexes_json, index_name) catch return error.InternalFailure) orelse return error.InternalFailure;
         defer alloc.free(stored_index_json);
 
@@ -11474,6 +11649,16 @@ pub const ApiHttpServer = struct {
                     statuses[i].@"error" = "table backup manifest does not match table";
                     continue;
                 }
+                const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
+                    op_alloc,
+                    table_manifest.indexes_json,
+                ) catch return error.InvalidRequest;
+                self.admitArtifactSources(.{}, uses_artifact_sources) catch |err| return switch (err) {
+                    error.UnsupportedArtifactIndexSources => error.UnsupportedArtifactIndexSources,
+                    error.ArtifactIndexSourcesTemporarilyUnavailable => error.ArtifactIndexSourcesTemporarilyUnavailable,
+                    error.Canceled => error.Cancelled,
+                    error.DeadlineExceeded => error.ArtifactIndexSourcesTemporarilyUnavailable,
+                };
                 self.admitExternalRestoreArtifactIntegrity(
                     restore_io,
                     location,
@@ -11621,6 +11806,16 @@ pub const ApiHttpServer = struct {
                 artifact_backup_id,
             ) catch return error.InvalidRequest;
             defer authorized_manifest.deinit(op_alloc);
+            const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
+                op_alloc,
+                authorized_manifest.indexes_json,
+            ) catch return error.InvalidRequest;
+            self.admitArtifactSources(.{}, uses_artifact_sources) catch |err| return switch (err) {
+                error.UnsupportedArtifactIndexSources => error.UnsupportedArtifactIndexSources,
+                error.ArtifactIndexSourcesTemporarilyUnavailable => error.ArtifactIndexSourcesTemporarilyUnavailable,
+                error.Canceled => error.Cancelled,
+                error.DeadlineExceeded => error.ArtifactIndexSourcesTemporarilyUnavailable,
+            };
             const destination_authorization_fingerprint = stored_destination_authorization.destinationConfigFingerprintAlloc(
                 op_alloc,
                 authorized_manifest.replication_sources_json,
@@ -11970,7 +12165,7 @@ pub const ApiHttpServer = struct {
             },
         ) catch |err| return switch (err) {
             error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
-            error.EmbeddingProbeUnavailable => try contextual_operations.textAlloc(self.alloc, 503, "table index validation probe unavailable"),
+            error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
             else => return err,
         };
@@ -11978,6 +12173,16 @@ pub const ApiHttpServer = struct {
         request.indexes_json = normalized_indexes_json;
         tables_api.validatePublicAlgebraicIndexesJson(self.alloc, request.indexes_json orelse tables_api.default_indexes_json) catch
             return try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration");
+
+        const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
+            self.alloc,
+            request.indexes_json orelse tables_api.default_indexes_json,
+        ) catch return try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration");
+        self.admitArtifactSources(.{}, uses_artifact_sources) catch |err| return switch (err) {
+            error.UnsupportedArtifactIndexSources => try contextualUnsupportedArtifactSourcesResponse(self.alloc),
+            error.ArtifactIndexSourcesTemporarilyUnavailable => try contextualArtifactSourcesUpgradePendingResponse(self.alloc),
+            error.Canceled, error.DeadlineExceeded => return err,
+        };
 
         const destinations_allowed = (replicationDestinationsAllowedForIdentity(
             self.alloc,
@@ -12241,7 +12446,8 @@ pub const ApiHttpServer = struct {
             error.UnsupportedQueryRequest => if (queryBodyHasSortPageControls(self.alloc, body))
                 try contextualUnsupportedExactSortResponse(self.alloc)
             else
-                try contextual_operations.textAlloc(self.alloc, 422, "unsupported query request"),
+                try contextualUnsupportedQueryResponse(self.alloc),
+            error.UnsupportedHierarchyGrouping => try contextualUnsupportedHierarchyGroupingResponse(self.alloc),
             error.IdentityReadGenerationChanged => try contextualRetryableTextResponse(self.alloc, 409, "identity read generation changed"),
             error.HierarchyCursorStale => try contextualHierarchyCursorStaleResponse(self.alloc),
             error.TopologyChanged => contextual_operations.jsonWithStatus(
@@ -13219,6 +13425,15 @@ pub const ApiHttpServer = struct {
             parsed.value.backup_id,
         ) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup manifest");
         defer manifest.deinit(self.alloc);
+        const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
+            self.alloc,
+            manifest.indexes_json,
+        ) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup manifest");
+        self.admitArtifactSources(.{}, uses_artifact_sources) catch |err| return switch (err) {
+            error.UnsupportedArtifactIndexSources => try contextualUnsupportedArtifactSourcesResponse(self.alloc),
+            error.ArtifactIndexSourcesTemporarilyUnavailable => try contextualArtifactSourcesUpgradePendingResponse(self.alloc),
+            error.Canceled, error.DeadlineExceeded => return err,
+        };
         const destinations_allowed = (replicationDestinationsAllowedForIdentity(
             self.alloc,
             authenticated_identity,
@@ -14238,6 +14453,7 @@ const RestoreJobWork = struct {
 fn restoreJobErrorIsFenced(err: anyerror) bool {
     return err == error.RestoreJobFenced or
         err == error.RestoreJobPersistenceUnavailable or
+        err == error.ArtifactIndexSourcesTemporarilyUnavailable or
         metadata_authority.isRetryableError(err);
 }
 
@@ -14254,6 +14470,7 @@ test "restore job ownership failures remain retryable" {
     try std.testing.expect(restoreJobErrorIsFenced(error.RestoreJobFenced));
     try std.testing.expect(restoreJobErrorIsFenced(error.RestoreJobPersistenceUnavailable));
     try std.testing.expect(restoreJobErrorIsFenced(error.NotLeader));
+    try std.testing.expect(restoreJobErrorIsFenced(error.ArtifactIndexSourcesTemporarilyUnavailable));
     try std.testing.expect(!restoreJobErrorIsFenced(error.InvalidArguments));
     try std.testing.expect(restoreJobFailureRequiresRecovery(false, error.OutOfMemory));
     try std.testing.expect(!restoreJobFailureRequiresRecovery(true, error.OutOfMemory));
@@ -15325,6 +15542,42 @@ fn contextualJsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: [
     return try contextualJsonResponse(alloc, status, .{ .@"error" = message });
 }
 
+fn contextualUnsupportedArtifactSourcesResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    return try contextualJsonResponse(alloc, 400, .{
+        .@"error" = "unsupported_index_capability",
+        .message = "artifact-backed index sources are not supported by this deployment",
+        .retryable = false,
+    });
+}
+
+fn contextualArtifactSourcesUpgradePendingResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    var response = try contextualJsonResponse(alloc, 503, .{
+        .@"error" = "index_capability_upgrade_pending",
+        .message = "artifact-backed index sources are temporarily unavailable until every live table-serving store supports them",
+        .retryable = true,
+    });
+    errdefer response.deinit(alloc);
+    var retry_after = try ownedContextualHeader(alloc, "Retry-After", "1");
+    errdefer retry_after.deinit(alloc);
+    response.headers = try alloc.alloc(contextual_operations.Header, 1);
+    response.headers[0] = retry_after;
+    return response;
+}
+
+fn contextualIndexProbeUnavailableResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    var response = try contextualJsonResponse(alloc, 503, .{
+        .@"error" = "index_probe_unavailable",
+        .message = "index validation probe unavailable",
+        .retryable = true,
+    });
+    errdefer response.deinit(alloc);
+    var retry_after = try ownedContextualHeader(alloc, "Retry-After", "1");
+    errdefer retry_after.deinit(alloc);
+    response.headers = try alloc.alloc(contextual_operations.Header, 1);
+    response.headers[0] = retry_after;
+    return response;
+}
+
 fn contextualPublicFilterQueryErrorResponseForBody(
     alloc: std.mem.Allocator,
     body: []const u8,
@@ -15378,6 +15631,22 @@ fn contextualHierarchyCursorStaleResponse(alloc: std.mem.Allocator) !contextual_
     };
 }
 
+fn contextualUnsupportedHierarchyGroupingResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    return .{
+        .status = 422,
+        .content_type = "application/json",
+        .body = try public_table_http.unsupportedHierarchyGroupingBody(alloc),
+    };
+}
+
+fn contextualUnsupportedQueryResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    return .{
+        .status = 422,
+        .content_type = "application/json",
+        .body = try public_table_http.unsupportedQueryBody(alloc),
+    };
+}
+
 fn contextualQueryTemporarilyUnavailableResponse(
     alloc: std.mem.Allocator,
     reason: public_table_http.QueryTemporarilyUnavailableReason,
@@ -15425,6 +15694,40 @@ fn cloneContextualResponse(alloc: std.mem.Allocator, response: contextual_operat
         .public_cors = response.public_cors,
         .headers = headers,
     };
+}
+
+test "artifact source capability waits for every live data store reporter" {
+    var stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 1,
+            .node_id = 1,
+            .reporter_incarnation = 11,
+            .artifact_sources_protocol_version = metadata_table_manager.artifact_sources_protocol_version,
+        },
+        .{
+            .store_id = 2,
+            .node_id = 2,
+            .reporter_incarnation = 22,
+        },
+        .{
+            .store_id = 3,
+            .node_id = 3,
+            .role = "metadata",
+        },
+    };
+    try std.testing.expect(!ApiHttpServer.artifactSourcesSupportedByStores(&stores));
+
+    stores[1].artifact_sources_protocol_version = metadata_table_manager.artifact_sources_protocol_version;
+    try std.testing.expect(ApiHttpServer.artifactSourcesSupportedByStores(&stores));
+
+    stores[1].role = "hot";
+    try std.testing.expect(ApiHttpServer.artifactSourcesSupportedByStores(&stores));
+    stores[1].artifact_sources_protocol_version = 0;
+    try std.testing.expect(!ApiHttpServer.artifactSourcesSupportedByStores(&stores));
+
+    stores[1].live = false;
+    stores[0].artifact_sources_protocol_version = 0;
+    try std.testing.expect(!ApiHttpServer.artifactSourcesSupportedByStores(&stores));
 }
 
 fn contextualResponseFromPublicTable(
@@ -17025,9 +17328,9 @@ fn normalizePublicQueryParseError(err: anyerror) anyerror {
     return normalizeQueryEmbeddingOperationalError(err) orelse error.InvalidQueryRequest;
 }
 
-fn unsupportedPublicTableQueryDispatchError(alloc: std.mem.Allocator, body: []const u8) error{ InvalidQueryRequest, UnsupportedExactSort } {
+fn unsupportedPublicTableQueryDispatchError(alloc: std.mem.Allocator, body: []const u8) error{ UnsupportedQueryRequest, UnsupportedExactSort } {
     if (queryBodyHasSortPageControls(alloc, body)) return error.UnsupportedExactSort;
-    return error.InvalidQueryRequest;
+    return error.UnsupportedQueryRequest;
 }
 
 fn queryBodyHasSortPageControls(alloc: std.mem.Allocator, body: []const u8) bool {
@@ -19465,15 +19768,18 @@ test "api http unsupported filter query response names the offending node" {
     try std.testing.expect(!parsed.value.retryable);
 }
 
-test "api http unsupported unsorted query response remains generic" {
+test "api http unsupported unsorted query response is machine readable" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
-    var resp = try contextual_operations.textAlloc(alloc, 422, "unsupported query request");
+    var resp = try contextualUnsupportedQueryResponse(alloc);
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("text/plain", resp.content_type);
-    try std.testing.expectEqualStrings("unsupported query request", resp.body);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
+    var parsed = try std.json.parseFromSlice(public_table_http.UnsupportedQueryError, alloc, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("unsupported_query_request", parsed.value.@"error");
+    try std.testing.expect(!parsed.value.retryable);
 }
 
 test "api http stale hierarchy cursor response is actionable and machine readable" {
@@ -19497,6 +19803,26 @@ test "api http stale hierarchy cursor response is actionable and machine readabl
     try std.testing.expectEqualStrings("hierarchy_cursor_stale", parsed.value.@"error");
     try std.testing.expectEqualStrings("restart_hierarchy_traversal", parsed.value.action);
     try std.testing.expectEqualStrings("search_after", parsed.value.restart_without);
+    try std.testing.expect(!parsed.value.retryable);
+}
+
+test "api http unsupported hierarchy grouping response uses the public contract" {
+    const alloc = std.testing.allocator;
+    var resp = try contextualUnsupportedHierarchyGroupingResponse(alloc);
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
+    var parsed = try std.json.parseFromSlice(
+        public_table_http.UnsupportedHierarchyGroupingError,
+        alloc,
+        resp.body,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("unsupported_hierarchy_grouping", parsed.value.@"error");
+    try std.testing.expectEqualStrings("hierarchy.group_by.level", parsed.value.field);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "return_mode") == null);
     try std.testing.expect(!parsed.value.retryable);
 }
 
@@ -20433,7 +20759,7 @@ test "api http public table dispatch preserves unsupported sorted query as exact
         alloc,
         "{\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
     ));
-    try std.testing.expectEqual(error.InvalidQueryRequest, unsupportedPublicTableQueryDispatchError(
+    try std.testing.expectEqual(error.UnsupportedQueryRequest, unsupportedPublicTableQueryDispatchError(
         alloc,
         "{\"join\":{}}",
     ));
@@ -25764,9 +26090,11 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.startsWith(u8, query_request_description.string, "Raw canonical Antfly query body"));
     const query_request_contract_schema = query_request_schema.object.get("anyOf").?.array.items[0];
     try std.testing.expect(query_properties.object.get("fullTextSearchField") != null);
+    try std.testing.expect(query_properties.object.get("fullTextIndex") != null);
     try std.testing.expect(query_properties.object.get("full_text_search") != null);
     const query_request_properties = query_request_contract_schema.object.get("properties") orelse return error.TestExpectedEqual;
     try std.testing.expect(query_request_properties.object.get("full_text_search") != null);
+    try std.testing.expect(query_request_properties.object.get("full_text_index") != null);
     const hierarchy_schema = query_request_properties.object.get("hierarchy") orelse return error.TestExpectedEqual;
     try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_query_hierarchy_schema.json"), hierarchy_schema);
     const hierarchy_properties = hierarchy_schema.object.get("properties").?.object;
@@ -31172,7 +31500,7 @@ test "api http server serves table index metadata routes" {
 
         fn snapshot() metadata_api.AdminSnapshot {
             const indexes_json =
-                "{\"search_idx\":{\"type\":\"full_text\"},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384,\"enrichments\":[{\"name\":\"body_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512},{\"name\":\"body_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"body_chunks_v1\",\"expected_dims\":384}]},\"alg\":{\"type\":\"algebraic\"}}";
+                "{\"search_idx\":{\"type\":\"full_text\"},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384,\"sources\":[{\"artifact\":\"body_dense_v1\"}],\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"enrichments\":[{\"name\":\"body_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512},{\"name\":\"body_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"body_chunks_v1\",\"expected_dims\":384}]},\"alg\":{\"type\":\"algebraic\"}}";
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{
@@ -31293,7 +31621,7 @@ test "api http server serves table index metadata routes" {
     try std.testing.expectEqual(@as(u16, 404), algebraic_child_resp.status);
 }
 
-test "api http server index status is cache only" {
+test "api http server index status falls back when the metadata cache is cold" {
     const FakeSource = struct {
         admin_snapshot_calls: usize = 0,
         cached_snapshot_calls: usize = 0,
@@ -31322,7 +31650,7 @@ test "api http server index status is cache only" {
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}}",
+                    .indexes_json = "{\"embed_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":384}}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -31350,9 +31678,9 @@ test "api http server index status is cache only" {
         .uri = "/tables/docs/indexes/embed_idx",
     });
     defer detail_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 404), detail_resp.status);
+    try std.testing.expectEqual(@as(u16, 200), detail_resp.status);
     try std.testing.expectEqual(@as(usize, 1), source.cached_snapshot_calls);
-    try std.testing.expectEqual(@as(usize, 0), source.admin_snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 1), source.admin_snapshot_calls);
 }
 
 test "api http server reports table storage empty from read visibility" {
@@ -31695,8 +32023,12 @@ test "api http server storage status does not block on a direct lsm probe" {
     try std.testing.expectEqual(@as(u32, 0), reads.lsm_status_calls.load(.monotonic));
 }
 
-test "api http server serves local index runtime backfill status" {
+test "api http server serves local index runtime status" {
     const alloc = std.testing.allocator;
+    const index_config_json = "{\"type\":\"full_text\"}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, alloc, index_config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexes_api.indexRuntimeIdentity(alloc, "search_idx", parsed_config.value)).?;
     const LocalIndexStatusResponse = struct {
         const Stats = struct {
             rebuilding: ?bool = null,
@@ -31730,12 +32062,8 @@ test "api http server serves local index runtime backfill status" {
         .name = "search_idx",
         .kind = .full_text,
         .config_json = "{}",
+        .coverage_generation = identity.incarnation,
     });
-
-    const index_root = try std.fmt.allocPrint(alloc, "{s}/indexes/search_idx", .{path});
-    defer alloc.free(index_root);
-    const rebuild_state = db_mod.backfill_state.RebuildState.init(index_root);
-    try rebuild_state.update("doc:a");
 
     var read_source = table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.noopReadableLeaseRequester());
 
@@ -31762,7 +32090,7 @@ test "api http server serves local index runtime backfill status" {
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\"}}",
+                    .indexes_json = "{\"search_idx\":" ++ index_config_json ++ "}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
@@ -32002,7 +32330,7 @@ test "api http server create index installs exact visible config and defers lagg
         .method = .POST,
         .uri = "/tables/docs/indexes/invalid_graph",
         .content_type = "application/json",
-        .body = "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}",
+        .body = "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}",
     });
     defer invalid_graph_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_graph_resp.status);
@@ -33228,7 +33556,7 @@ test "api http server create table with local writes waits for projected presenc
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
-        .body = "{\"indexes\":{\"relations\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}}",
+        .body = "{\"indexes\":{\"relations\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}}",
     });
     defer invalid_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
@@ -33716,6 +34044,10 @@ test "api runtime status quarantine wins same-producer status generation" {
 
 test "api index status uses read runtime status without consulting write source" {
     const alloc = std.testing.allocator;
+    const index_config_json = "{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, alloc, index_config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexes_api.indexRuntimeIdentity(alloc, "vec", parsed_config.value)).?;
 
     const Response = struct {
         const Stats = struct {
@@ -33759,7 +34091,7 @@ test "api index status uses read runtime status without consulting write source"
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .indexes_json = "{\"vec\":" ++ index_config_json ++ "}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
@@ -33784,6 +34116,7 @@ test "api index status uses read runtime status without consulting write source"
 
     const FakeReads = struct {
         status_calls: std.atomic.Value(u32) = .init(0),
+        identity: indexes_api.IndexRuntimeIdentity,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
@@ -33822,6 +34155,9 @@ test "api index status uses read runtime status without consulting write source"
                 .replay_applied_sequence = 3,
                 .replay_target_sequence = 7,
                 .replay_catch_up_required = true,
+                .coverage_generation = self.identity.incarnation,
+                .coverage_config_hash = self.identity.config_hash,
+                .coverage_identity_ready = true,
             };
 
             const items = try inner_alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
@@ -33900,7 +34236,7 @@ test "api index status uses read runtime status without consulting write source"
     };
 
     var source = FakeSource{};
-    var reads = FakeReads{};
+    var reads = FakeReads{ .identity = identity };
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
 
@@ -33917,9 +34253,8 @@ test "api index status uses read runtime status without consulting write source"
     try std.testing.expectEqual(@as(?u64, 9), parsed.value.status.doc_count);
     try std.testing.expectEqual(@as(?u64, 9), parsed.value.status.total_indexed);
     try std.testing.expectEqual(@as(?u64, 17), parsed.value.status.node_count);
-    // This legacy-shaped observation has no generation-scoped coverage
-    // witness. Preserve its authoritative replay debt instead of inferring
-    // readiness from physical index cardinality alone.
+    // A current-generation cached observation is authoritative for replay
+    // debt, so the status fast path does not need to consult the writer.
     try std.testing.expectEqual(@as(?u64, 3), parsed.value.status.replay_applied_sequence);
     try std.testing.expectEqual(@as(?u64, 7), parsed.value.status.replay_target_sequence);
     try std.testing.expectEqual(@as(?bool, true), parsed.value.status.replay_catch_up_required);
@@ -34001,11 +34336,11 @@ test "api index status refreshes writer when read snapshot omits requested index
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(current_statuses[0..], .{
         .name = "older_idx",
-        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+        .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
     try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(current_statuses[0..], .{
         .name = "older_idx",
-        .identity = .{ .coverage_generation = 42, .coverage_config_hash = 99 },
+        .identity = .{ .incarnation = 42, .config_hash = 99 },
     }));
 
     const unrelated_incomplete_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
@@ -34021,7 +34356,7 @@ test "api index status refreshes writer when read snapshot omits requested index
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(unrelated_incomplete_statuses[0..], .{
         .name = "older_idx",
-        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+        .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
 
     var incomplete_index = current;
@@ -34041,14 +34376,14 @@ test "api index status refreshes writer when read snapshot omits requested index
     }};
     try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(incomplete_statuses[0..], .{
         .name = "older_idx",
-        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+        .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
 
     var retained_live_incomplete = incomplete_statuses[0];
     retained_live_incomplete.metadata.source = .live_writer_publish;
     try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(&.{retained_live_incomplete}, .{
         .name = "older_idx",
-        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+        .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
 
     var terminal_index = incomplete_index;
@@ -34066,7 +34401,7 @@ test "api index status refreshes writer when read snapshot omits requested index
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(terminal_statuses[0..], .{
         .name = "older_idx",
-        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+        .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
 
     var terminal_phase_index = incomplete_index;
@@ -34083,7 +34418,7 @@ test "api index status refreshes writer when read snapshot omits requested index
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(terminal_phase_statuses[0..], .{
         .name = "older_idx",
-        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+        .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
 }
 
@@ -34210,7 +34545,7 @@ test "api index status prefers current same-name incarnation from write source" 
             defer parsed.deinit();
             const identity = (try indexes_api.indexRuntimeIdentity(inner_alloc, "vec", parsed.value)) orelse
                 return error.TestUnexpectedResult;
-            var statuses = try StatusFactory.make(inner_alloc, identity.coverage_generation, identity.coverage_config_hash, .cached_snapshot, .fresh, 7);
+            var statuses = try StatusFactory.make(inner_alloc, identity.incarnation, identity.config_hash, .cached_snapshot, .fresh, 7);
             statuses.items[0].stats.repair_summary_ready = false;
             statuses.items[0].stats.repair_degraded = true;
             statuses.items[0].stats.indexes[0].repair_summary_ready = false;
@@ -34251,7 +34586,7 @@ test "api index status prefers current same-name incarnation from write source" 
                 return error.TestUnexpectedResult;
             // The current writer may legitimately be catching up. Its matching
             // incarnation must still beat a fresh retained read snapshot.
-            return try StatusFactory.make(inner_alloc, identity.coverage_generation, identity.coverage_config_hash, .live_writer_publish, .catching_up, 11);
+            return try StatusFactory.make(inner_alloc, identity.incarnation, identity.config_hash, .live_writer_publish, .catching_up, 11);
         }
     };
 
@@ -34301,6 +34636,10 @@ test "api index status prefers current same-name incarnation from write source" 
 
 test "api index status uses propagated remote store runtime status" {
     const alloc = std.testing.allocator;
+    const index_config_json = "{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, alloc, index_config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexes_api.indexRuntimeIdentity(alloc, "vec", parsed_config.value)).?;
 
     const Response = struct {
         const Stats = struct {
@@ -34322,6 +34661,11 @@ test "api index status uses propagated remote store runtime status" {
     };
 
     const FakeSource = struct {
+        identity: indexes_api.IndexRuntimeIdentity,
+        index_reports: [1]metadata_table_manager.RuntimeIndexStatusReport = undefined,
+        group_reports: [1]metadata_table_manager.RuntimeGroupStatusReport = undefined,
+        stores: [1]metadata_table_manager.StoreRecord = undefined,
+
         fn iface(self: *@This()) StatusSource {
             return .{
                 .ptr = self,
@@ -34338,13 +34682,14 @@ test "api index status uses propagated remote store runtime status" {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .indexes_json = "{\"vec\":" ++ index_config_json ++ "}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
@@ -34353,31 +34698,7 @@ test "api index status uses propagated remote store runtime status" {
                     .start_key = "",
                     .end_key = null,
                 }})[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{.{
-                    .store_id = 20,
-                    .node_id = 30,
-                    .runtime_statuses = @constCast((&[_]metadata_table_manager.RuntimeGroupStatusReport{.{
-                        .table_id = 1,
-                        .table_name = "docs",
-                        .group_id = 10,
-                        .store_id = 20,
-                        .node_id = 30,
-                        .updated_at_ns = 99,
-                        .freshness = "fresh",
-                        .doc_count = 12,
-                        .index_count = 1,
-                        .async_dense_catch_up_active = true,
-                        .indexes = @constCast((&[_]metadata_table_manager.RuntimeIndexStatusReport{.{
-                            .name = "vec",
-                            .kind = "dense_vector",
-                            .doc_count = 12,
-                            .node_count = 19,
-                            .replay_applied_sequence = 4,
-                            .replay_target_sequence = 8,
-                            .replay_catch_up_required = true,
-                        }})[0..]),
-                    }})[0..]),
-                }})[0..]),
+                .stores = self.stores[0..],
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
@@ -34449,7 +34770,37 @@ test "api index status uses propagated remote store runtime status" {
         }
     };
 
-    var source = FakeSource{};
+    var source = FakeSource{ .identity = identity };
+    source.index_reports[0] = .{
+        .name = "vec",
+        .kind = "dense_vector",
+        .doc_count = 12,
+        .node_count = 19,
+        .replay_applied_sequence = 4,
+        .replay_target_sequence = 8,
+        .replay_catch_up_required = true,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
+    };
+    source.group_reports[0] = .{
+        .table_id = 1,
+        .table_name = "docs",
+        .group_id = 10,
+        .store_id = 20,
+        .node_id = 30,
+        .updated_at_ns = 99,
+        .freshness = "fresh",
+        .doc_count = 12,
+        .index_count = 1,
+        .async_dense_catch_up_active = true,
+        .indexes = source.index_reports[0..],
+    };
+    source.stores[0] = .{
+        .store_id = 20,
+        .node_id = 30,
+        .runtime_statuses = source.group_reports[0..],
+    };
     var reads = FakeReads{};
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
@@ -34782,7 +35133,7 @@ test "api index status ignores propagated runtime status from removed owner" {
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
@@ -34948,7 +35299,7 @@ test "api index status reports missing remote shard as not ready" {
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{

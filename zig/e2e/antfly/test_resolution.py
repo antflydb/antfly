@@ -66,7 +66,6 @@ DOCUMENTS_INDEXES = {
     "relations_graph": {
         "type": "graph",
         "source": {
-            "kind": "artifact",
             "artifact": "relations_v1",
             "path": "$.relations[*]",
             "format": "extraction_relation",

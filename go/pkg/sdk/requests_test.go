@@ -20,6 +20,26 @@ func TestQueryRequestMarshalOmitsZeroJoin(t *testing.T) {
 	}
 }
 
+func TestQueryRequestMarshalPreservesNamedFullTextIndex(t *testing.T) {
+	body, err := json.Marshal(QueryRequest{
+		Table:         "files",
+		FullTextIndex: "document_text",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"full_text_index":"document_text"`)) {
+		t.Fatalf("named full-text index missing from request: %s", body)
+	}
+	var roundTrip QueryRequest
+	if err := json.Unmarshal(body, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip.FullTextIndex != "document_text" {
+		t.Fatalf("named full-text index lost during unmarshal: %#v", roundTrip.FullTextIndex)
+	}
+}
+
 func TestQueryRequestMarshalValidatesCanonicalGraphOperationNames(t *testing.T) {
 	for _, name := range []string{" bad", "bad\u200bname", "*", "$reserved"} {
 		_, err := json.Marshal(QueryRequest{GraphQueries: map[string]GraphQuery{name: {}}})

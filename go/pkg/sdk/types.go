@@ -68,15 +68,17 @@ type (
 	TableArtifactEnrichmentList              = oapi.TableArtifactEnrichmentList
 
 	// Index config types
-	EmbeddingsIndexConfig = oapi.EmbeddingsIndexConfig
-	DistanceMetric        = oapi.DistanceMetric
-	EmbeddingsIndexStats  = oapi.EmbeddingsIndexStats
-	EnrichmentConfig      = oapi.EnrichmentConfig
-	EnrichmentKind        = oapi.EnrichmentKind
-	ExecutionPolicy       = oapi.ExecutionPolicy
-	FullTextIndexConfig   = oapi.FullTextIndexConfig
-	AlgebraicIndexConfig  = oapi.AlgebraicIndexConfig
-	FullTextIndexStats    = oapi.FullTextIndexStats
+	EmbeddingsIndexConfig       = oapi.EmbeddingsIndexConfig
+	ArtifactIndexSource         = oapi.ArtifactIndexSource
+	FullTextArtifactIndexSource = oapi.FullTextArtifactIndexSource
+	DistanceMetric              = oapi.DistanceMetric
+	EmbeddingsIndexStats        = oapi.EmbeddingsIndexStats
+	EnrichmentConfig            = oapi.EnrichmentConfig
+	EnrichmentKind              = oapi.EnrichmentKind
+	ExecutionPolicy             = oapi.ExecutionPolicy
+	FullTextIndexConfig         = oapi.FullTextIndexConfig
+	AlgebraicIndexConfig        = oapi.AlgebraicIndexConfig
+	FullTextIndexStats          = oapi.FullTextIndexStats
 
 	EmbedderProvider         = oapi.EmbedderProvider
 	GeneratorProvider        = oapi.GeneratorProvider
@@ -274,7 +276,6 @@ type (
 	GraphIndexStats                       = oapi.GraphIndexStats
 	GraphArtifactSourceConfig             = oapi.GraphArtifactSourceConfig
 	GraphArtifactSourceConfigFormat       = oapi.GraphArtifactSourceConfigFormat
-	GraphArtifactSourceConfigKind         = oapi.GraphArtifactSourceConfigKind
 	GraphArtifactProducerConfig           = oapi.GraphArtifactProducerConfig
 	GraphArtifactProducerConfigKind       = oapi.GraphArtifactProducerConfigKind
 	GraphArtifactProducerSourceConfig     = oapi.GraphArtifactProducerSourceConfig
@@ -831,7 +832,6 @@ const (
 	EdgeTypeConfigTopologyTree  = oapi.EdgeTypeConfigTopologyTree
 
 	// Graph artifact mapping values
-	GraphArtifactSourceConfigKindArtifact             = oapi.GraphArtifactSourceConfigKindArtifact
 	GraphArtifactSourceConfigFormatExtractionGraph    = oapi.GraphArtifactSourceConfigFormatExtractionGraph
 	GraphArtifactSourceConfigFormatExtractionRelation = oapi.GraphArtifactSourceConfigFormatExtractionRelation
 	GraphArtifactProducerConfigKindAsset              = oapi.GraphArtifactProducerConfigKindAsset

@@ -1825,6 +1825,17 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_rejected_admissions_total", "counter", "Query embedding results rejected by cache admission control", api_request_stats.query_embedding_cache.rejected_admissions);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_entries", "gauge", "Live query embedding cache entries", api_request_stats.query_embedding_cache.entries);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_live_bytes", "gauge", "Accounted live query embedding cache bytes", api_request_stats.query_embedding_cache.live_bytes);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_hits_total", "counter", "Durable incoming-graph route directory hits", api_request_stats.incoming_graph_routes.durable_hits);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_misses_total", "counter", "Durable incoming-graph route directory misses, including stale fences", api_request_stats.incoming_graph_routes.durable_misses);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_read_failures_total", "counter", "Durable incoming-graph route directory read or decode failures", api_request_stats.incoming_graph_routes.durable_read_failures);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_write_failures_total", "counter", "Durable incoming-graph route directory write failures", api_request_stats.incoming_graph_routes.durable_write_failures);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_write_retries_total", "counter", "Durable incoming-graph route directory background write retries", api_request_stats.incoming_graph_routes.durable_write_retries);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_writes_coalesced_total", "counter", "Durable incoming-graph route hints superseded in the bounded write coalescer", api_request_stats.incoming_graph_routes.durable_writes_coalesced);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_writes_dropped_total", "counter", "Best-effort durable incoming-graph route hints dropped under bounded queue pressure", api_request_stats.incoming_graph_routes.durable_writes_dropped);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_batches_committed_total", "counter", "Bounded durable incoming-graph route batches committed", api_request_stats.incoming_graph_routes.durable_batches_committed);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_collision_evictions_total", "counter", "Durable incoming-graph route entries evicted after all bounded hash candidates were occupied", api_request_stats.incoming_graph_routes.durable_collision_evictions);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_pending_entries", "gauge", "Durable incoming-graph route hints awaiting background persistence", api_request_stats.incoming_graph_routes.pending_durable_entries);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_pending_bytes", "gauge", "Encoded durable incoming-graph route hint bytes awaiting background persistence", api_request_stats.incoming_graph_routes.pending_durable_bytes);
         try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_bytes", "gauge", "Shared inference cache bytes in use", api_request_stats.inference_cache_budget.used_bytes);
         try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_limit_bytes", "gauge", "Shared inference cache byte limit", api_request_stats.inference_cache_budget.max_bytes);
         try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_rejected_reservations_total", "counter", "Shared inference cache reservations rejected by the hard limit", api_request_stats.inference_cache_budget.rejected_reservations);
@@ -2930,6 +2941,7 @@ const CachedSplitKey = union(enum) {
 const StoreStatusHeartbeatCache = struct {
     reporter_incarnation: u64 = 0,
     status_generation: u64 = 0,
+    artifact_sources_protocol_version: u16 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     owns_health_class: bool = false,
@@ -4933,6 +4945,8 @@ pub const DataServer = struct {
     distributed_entity_sink: ?antfly.public_api.DistributedEntitySink = null,
     status_source: antfly.public_api.http_server.StatusSource,
     http_server: ?antfly.public_api.ApiHttpServer = null,
+    owned_incoming_graph_route_backend: ?lsm_backend_mod.BackendHandle = null,
+    owned_incoming_graph_route_store: ?antfly.storage_backend_erased.Store = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     ha_cfg: DataServerHAConfig = .{},
     /// Immutable startup role used by lock-free ingress policy snapshots.
@@ -5283,6 +5297,30 @@ pub const DataServer = struct {
     pub fn initApiServer(self: *DataServer) !void {
         if (self.http_server != null) return;
         var api_server_cfg = self.api_server_cfg;
+        if (api_server_cfg.incoming_graph_route_store == null and
+            api_server_cfg.deployment_mode != .serverless)
+        {
+            const route_root = try std.fmt.allocPrint(
+                self.alloc,
+                "{s}/incoming-graph-routes",
+                .{self.write_source.replica_root_dir},
+            );
+            defer self.alloc.free(route_root);
+            self.owned_incoming_graph_route_backend = try lsm_backend_mod.BackendHandle.open(self.alloc, route_root, .{});
+            errdefer {
+                self.owned_incoming_graph_route_backend.?.close();
+                self.owned_incoming_graph_route_backend = null;
+            }
+            self.owned_incoming_graph_route_store = try self.owned_incoming_graph_route_backend.?.backend.runtimeStore(
+                self.alloc,
+                .{ .name = "system/incoming-graph-routes" },
+            );
+            errdefer {
+                self.owned_incoming_graph_route_store.?.deinit();
+                self.owned_incoming_graph_route_store = null;
+            }
+            api_server_cfg.incoming_graph_route_store = &self.owned_incoming_graph_route_store.?;
+        }
         var owned_restore_job_store_path: ?[]u8 = null;
         defer if (owned_restore_job_store_path) |path| self.alloc.free(path);
         // Runtimes that do not supply engine-owned persistence keep API job
@@ -5408,6 +5446,10 @@ pub const DataServer = struct {
             self.read_source.source(),
             self.write_source.source(),
         );
+        // Graph queries issued through the provisioned source and auxiliary
+        // API helpers share one fenced directory. This prevents duplicate L1s
+        // from diverging and gives both paths the configured durable L2.
+        self.http_server.?.bindIncomingGraphRoutes(self.read_source.source());
         antfly.public_api.kernel_bridge.setAntflyProvider(&self.http_server.?, self.read_source.antfly_provider);
     }
 
@@ -6946,6 +6988,8 @@ pub const DataServer = struct {
         self.store_status_heartbeat_cache.clear(self.alloc);
         self.provisioned_storage.deinit();
         self.write_source.deinit();
+        if (self.owned_incoming_graph_route_store) |*store| store.deinit();
+        if (self.owned_incoming_graph_route_backend) |*backend| backend.close();
         if (self.remote_metadata) |remote_metadata| {
             remote_metadata.deinit();
             self.alloc.destroy(remote_metadata);
@@ -6965,6 +7009,8 @@ pub const DataServer = struct {
         self.owned_backend_runtime = null;
         self.backend_runtime = null;
         self.query_io_impl = null;
+        self.owned_incoming_graph_route_store = null;
+        self.owned_incoming_graph_route_backend = null;
     }
 
     fn ensureHttpRuntime(self: *DataServer) !*httpx.HttpRuntime {
@@ -10899,6 +10945,7 @@ pub const DataServer = struct {
             .store_id = registration.store_id,
             .node_id = registration.node_id,
             .reporter_incarnation = try self.reporterIncarnation(),
+            .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
             .api_url = api_url,
             .raft_url = raft_url,
@@ -11583,6 +11630,7 @@ pub const DataServer = struct {
             .store_id = registration.store_id,
             .reporter_incarnation = reporter_incarnation,
             .status_generation = status_generation,
+            .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .live = true,
             .health_class = "healthy",
             .capacity_bytes = capacity.capacity_bytes,
@@ -11966,6 +12014,7 @@ pub const DataServer = struct {
             .store_id = store_id,
             .reporter_incarnation = cache.reporter_incarnation,
             .status_generation = cache.status_generation,
+            .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
             .live = cache.live,
             .health_class = try self.alloc.dupe(u8, cache.health_class),
             .capacity_bytes = cache.capacity_bytes,
@@ -11995,6 +12044,7 @@ pub const DataServer = struct {
         var next: StoreStatusHeartbeatCache = .{
             .reporter_incarnation = report.reporter_incarnation,
             .status_generation = report.status_generation,
+            .artifact_sources_protocol_version = report.artifact_sources_protocol_version,
             .live = report.live,
             .health_class = health_class,
             .owns_health_class = true,
@@ -16795,6 +16845,24 @@ fn runtimeIndexStatusReportFromLocalIndex(
     errdefer alloc.free(kind);
     const load_error = if (index.load_error) |value| try alloc.dupe(u8, value) else null;
     errdefer if (load_error) |value| alloc.free(value);
+    const source_replay = try alloc.alloc(
+        antfly.metadata.table_manager.RuntimeIndexSourceReplayStatusReport,
+        index.source_replay.len,
+    );
+    var source_count: usize = 0;
+    errdefer {
+        for (source_replay[0..source_count]) |source| alloc.free(source.artifact_name);
+        if (source_replay.len > 0) alloc.free(source_replay);
+    }
+    for (index.source_replay, 0..) |source, i| {
+        source_replay[i] = .{
+            .artifact_name = try alloc.dupe(u8, source.artifact_name),
+            .published_sequence = source.published_sequence,
+            .target_sequence = source.target_sequence,
+            .failed = source.failed,
+        };
+        source_count += 1;
+    }
     return .{
         .name = name,
         .kind = kind,
@@ -16816,6 +16884,7 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .replay_applied_sequence = index.replay_applied_sequence,
         .replay_target_sequence = index.replay_target_sequence,
         .replay_catch_up_required = index.replay_catch_up_required,
+        .source_replay = source_replay,
         .repair_status = index.index_repair_status,
         .repair_active_generation_serviceable = index.index_repair_active_generation_serviceable,
     };
@@ -16841,6 +16910,27 @@ test "data runtime report preserves compact managed repair admission state" {
         "{\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
         encoded,
     );
+}
+
+test "data runtime report preserves per-source replay watermarks" {
+    const alloc = std.testing.allocator;
+    const report = try runtimeIndexStatusReportFromLocalIndex(alloc, .{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .source_replay = @constCast(&[_]antfly.db.types.IndexSourceReplayStatus{
+            .{
+                .artifact_name = "document_chunks_v1",
+                .published_sequence = 17,
+                .target_sequence = 19,
+            },
+        }),
+    });
+    defer antfly.metadata.table_manager.freeRuntimeIndexStatusReport(alloc, report);
+
+    try std.testing.expectEqual(@as(usize, 1), report.source_replay.len);
+    try std.testing.expectEqualStrings("document_chunks_v1", report.source_replay[0].artifact_name);
+    try std.testing.expectEqual(@as(u64, 17), report.source_replay[0].published_sequence);
+    try std.testing.expectEqual(@as(u64, 19), report.source_replay[0].target_sequence);
 }
 
 fn progressMillis(progress: f64) u16 {
@@ -27180,6 +27270,15 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight_limit 16") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_live_bytes 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_hits_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_misses_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_read_failures_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_write_failures_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_writes_coalesced_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_writes_dropped_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_batches_committed_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_pending_entries 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_pending_bytes 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_limit_bytes 67108864") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_rejected_reservations_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_resource_disk_reserved_bytes 0") != null);

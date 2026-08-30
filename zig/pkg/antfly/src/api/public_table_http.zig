@@ -119,6 +119,8 @@ pub const TableApi = struct {
         InvalidExclusionQueryRequest,
         UnsupportedFilterQueryRequest,
         UnsupportedExclusionQueryRequest,
+        UnsupportedQueryRequest,
+        UnsupportedHierarchyGrouping,
         NotFound,
         DocIdentityUnavailable,
         ReadRequiresPrimary,
@@ -202,6 +204,8 @@ pub const TableApi = struct {
         RestoreDurabilityConfirmed,
         BackupIntegrityFailure,
         RestoreDestinationReauthorizationRequired,
+        UnsupportedArtifactIndexSources,
+        ArtifactIndexSourcesTemporarilyUnavailable,
         InvalidBackupRequest,
         InternalFailure,
     };
@@ -228,6 +232,8 @@ pub const TableApi = struct {
         Conflict,
         MethodNotAllowed,
         InvalidIndexRequest,
+        UnsupportedArtifactIndexSources,
+        ArtifactIndexSourcesTemporarilyUnavailable,
         ProbeUnavailable,
         ModelNotFound,
         Backpressured,
@@ -725,6 +731,38 @@ pub fn topologyChangedBody(alloc: std.mem.Allocator) ![]u8 {
         .action = "retry_query",
         .retryable = true,
     }, .{});
+}
+
+/// Stable, non-retryable public error for hierarchy grouping that cannot be
+/// represented because at least one selected member lacks durable unit
+/// identity. Keep this in
+/// sync with UnsupportedHierarchyGroupingError in the public OpenAPI contract.
+pub const UnsupportedHierarchyGroupingError = struct {
+    status: u16 = 422,
+    @"error": []const u8 = "unsupported_hierarchy_grouping",
+    message: []const u8 = "the selected index contains members without durable unit identity; use hierarchy.group_by.level=source, omit hierarchy.group_by for direct members, or query an index whose every source is unit-backed",
+    reason: []const u8 = "unit_identity_unavailable",
+    field: []const u8 = "hierarchy.group_by.level",
+    action: []const u8 = "use_source_grouping_or_direct_members",
+    retryable: bool = false,
+};
+
+pub fn unsupportedHierarchyGroupingBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, UnsupportedHierarchyGroupingError{}, .{});
+}
+
+/// Stable fallback for unsupported queries that do not have a more specific
+/// structured diagnostic. Keep this in sync with UnsupportedQueryError in the
+/// public OpenAPI contract.
+pub const UnsupportedQueryError = struct {
+    status: u16 = 422,
+    @"error": []const u8 = "unsupported_query_request",
+    message: []const u8 = "unsupported query request",
+    retryable: bool = false,
+};
+
+pub fn unsupportedQueryBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, UnsupportedQueryError{}, .{});
 }
 
 pub fn isNonRetryableTableStorageReadError(err: anyerror) bool {
@@ -1234,7 +1272,7 @@ pub fn handleTableQueryRequest(
     query_contract.validatePublicQuerySortTupleContract(alloc, body) catch |err| switch (err) {
         error.InvalidQueryRequest => {
             std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
-            return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
+            return .{ .status = 422, .body = try unsupportedExactSortBody(alloc), .json = true };
         },
     };
     const response_body = api.executeTableQueryRequest(alloc, table_name, body, row_filter_json) catch |err| {
@@ -1242,7 +1280,7 @@ pub fn handleTableQueryRequest(
             error.InvalidQueryRequest => {
                 if (db_mod.peekLastSortRejectionDiagnostic() != null) {
                     std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
-                    return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
+                    return .{ .status = 422, .body = try unsupportedExactSortBody(alloc), .json = true };
                 }
                 std.log.err("public table query invalid table={s} err={}", .{ table_name, err });
                 return .{ .status = 400, .body = try alloc.dupe(u8, "invalid query request") };
@@ -1271,6 +1309,16 @@ pub fn handleTableQueryRequest(
                 "exclusion_query",
                 .unsupported,
             ),
+            error.UnsupportedQueryRequest => return .{
+                .status = 422,
+                .body = try unsupportedQueryBody(alloc),
+                .json = true,
+            },
+            error.UnsupportedHierarchyGrouping => return .{
+                .status = 422,
+                .body = try unsupportedHierarchyGroupingBody(alloc),
+                .json = true,
+            },
             error.NotFound => {
                 std.log.err("public table query missing table={s} err={}", .{ table_name, err });
                 return .{ .status = 404, .body = try alloc.dupe(u8, "not found") };
@@ -1301,7 +1349,7 @@ pub fn handleTableQueryRequest(
             },
             error.QueryCandidateBudgetExceeded => {
                 std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
-                return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc) };
+                return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc), .json = true };
             },
             error.GraphWorkBudgetExceeded => {
                 std.log.warn("public table graph work budget exceeded table={s}", .{table_name});
@@ -1388,7 +1436,7 @@ pub fn handleTableQueryRequest(
             },
             error.UnsupportedExactSort => {
                 std.log.warn("public table query unsupported exact sort table={s} err={}", .{ table_name, err });
-                return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
+                return .{ .status = 422, .body = try unsupportedExactSortBody(alloc), .json = true };
             },
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
@@ -1632,6 +1680,17 @@ pub fn handleTableRestore(
             .status = 409,
             .body = try alloc.dupe(u8, "restore was queued before destination authorization was recorded; resubmit it to reauthorize CDC and graph destinations"),
         },
+        error.UnsupportedArtifactIndexSources => return .{
+            .status = 400,
+            .body = try alloc.dupe(u8, "{\"error\":\"unsupported_index_capability\",\"message\":\"artifact-backed index sources are not supported by this deployment\",\"retryable\":false}"),
+            .json = true,
+        },
+        error.ArtifactIndexSourcesTemporarilyUnavailable => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, "{\"error\":\"index_capability_upgrade_pending\",\"message\":\"artifact-backed index sources are temporarily unavailable until every live table-serving store supports them\",\"retryable\":true}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.InvalidBackupRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "restore failed") },
     };
@@ -1726,7 +1785,19 @@ pub fn handleTableCreateIndex(
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"table_mutation_conflict\",\"message\":\"table mutation conflict; retry request\",\"retryable\":true}"), .json = true },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "{\"error\":\"method_not_allowed\",\"message\":\"method not allowed\",\"retryable\":false}"), .json = true },
         error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_index_request\",\"message\":\"unsupported index configuration\",\"retryable\":false}"), .json = true },
-        error.ProbeUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "{\"error\":\"index_probe_unavailable\",\"message\":\"index validation probe unavailable\",\"retryable\":true}"), .json = true },
+        error.UnsupportedArtifactIndexSources => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"unsupported_index_capability\",\"message\":\"artifact-backed index sources are not supported by this deployment\",\"retryable\":false}"), .json = true },
+        error.ArtifactIndexSourcesTemporarilyUnavailable => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, "{\"error\":\"index_capability_upgrade_pending\",\"message\":\"artifact-backed index sources are temporarily unavailable until every live table-serving store supports them\",\"retryable\":true}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
+        error.ProbeUnavailable => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, "{\"error\":\"index_probe_unavailable\",\"message\":\"index validation probe unavailable\",\"retryable\":true}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"model_not_found\",\"message\":\"model not found\",\"retryable\":false}"), .json = true },
         error.Backpressured => return .{
             .status = 429,
@@ -2464,6 +2535,57 @@ test "public create index exposes retryable storage descriptor exhaustion" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "storage_resource_exhausted") != null);
 }
 
+test "public create index exposes unsupported deployment capability" {
+    const Backend = struct {
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = executeCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteBatchError!void {}
+
+        fn executeCreateIndex(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteCreateIndexError![]u8 {
+            return error.UnsupportedArtifactIndexSources;
+        }
+    };
+
+    var backend = Backend{};
+    var resp = try handleTableCreateIndex(std.testing.allocator, "docs", "search", "{}", backend.iface());
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expect(resp.json);
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"unsupported_index_capability\",\"message\":\"artifact-backed index sources are not supported by this deployment\",\"retryable\":false}",
+        resp.body,
+    );
+}
+
 test "public create index returns normalized created resource" {
     const Backend = struct {
         fn iface(self: *@This()) TableApi {
@@ -3045,7 +3167,7 @@ test "public table query handler maps doc identity unavailable errors" {
     );
 }
 
-test "public table query handler preserves structured filter diagnostics" {
+test "public table query handler preserves structured filter and hierarchy diagnostics" {
     const Backend = struct {
         err: TableApi.ExecuteQueryError,
 
@@ -3125,6 +3247,43 @@ test "public table query handler preserves structured filter diagnostics" {
         try std.testing.expectEqualStrings("query_string", parsed.value.offending_node);
         try std.testing.expect(!parsed.value.retryable);
     }
+
+    var hierarchy_backend = Backend{ .err = error.UnsupportedHierarchyGrouping };
+    var hierarchy_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{}",
+        null,
+        hierarchy_backend.iface(),
+    );
+    defer hierarchy_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), hierarchy_resp.status);
+    try std.testing.expect(hierarchy_resp.json);
+    var hierarchy_error = try std.json.parseFromSlice(UnsupportedHierarchyGroupingError, std.testing.allocator, hierarchy_resp.body, .{});
+    defer hierarchy_error.deinit();
+    try std.testing.expectEqualStrings("unsupported_hierarchy_grouping", hierarchy_error.value.@"error");
+    try std.testing.expectEqualStrings("unit_identity_unavailable", hierarchy_error.value.reason);
+    try std.testing.expectEqualStrings("hierarchy.group_by.level", hierarchy_error.value.field);
+    try std.testing.expectEqualStrings("use_source_grouping_or_direct_members", hierarchy_error.value.action);
+    try std.testing.expect(std.mem.indexOf(u8, hierarchy_error.value.message, "return_mode") == null);
+    try std.testing.expect(!hierarchy_error.value.retryable);
+
+    var unsupported_backend = Backend{ .err = error.UnsupportedQueryRequest };
+    var unsupported_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{}",
+        null,
+        unsupported_backend.iface(),
+    );
+    defer unsupported_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), unsupported_resp.status);
+    try std.testing.expect(unsupported_resp.json);
+    var unsupported_error = try std.json.parseFromSlice(UnsupportedQueryError, std.testing.allocator, unsupported_resp.body, .{});
+    defer unsupported_error.deinit();
+    try std.testing.expectEqualStrings("unsupported_query_request", unsupported_error.value.@"error");
+    try std.testing.expectEqualStrings("unsupported query request", unsupported_error.value.message);
+    try std.testing.expect(!unsupported_error.value.retryable);
 }
 
 test "public table query handler preserves retryable failure status" {
@@ -3471,6 +3630,7 @@ test "public table query handler maps invalid exact sort diagnostics" {
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expect(resp.json);
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,
@@ -3529,6 +3689,7 @@ test "public table query handler rejects unknown sort tuple properties before di
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expect(resp.json);
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,
@@ -3589,6 +3750,7 @@ test "public table query handler maps candidate budget exhaustion" {
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expect(resp.json);
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,
@@ -4126,6 +4288,7 @@ test "public table query handler maps unsupported exact sort" {
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expect(resp.json);
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,

@@ -137,11 +137,12 @@ func (c *AntflyClient) Query(ctx context.Context, opts ...QueryRequest) (*QueryR
 	e := json.NewEncoder(request)
 	for _, opt := range opts {
 		// Validate options
-		if len(opt.Indexes) > 0 && opt.SemanticSearch == "" {
-			return nil, errors.New("semantic_search required when indexes are specified")
+		hasEmbeddingQuery := opt.SemanticSearch != "" || len(opt.Embeddings) > 0
+		if len(opt.Indexes) > 0 && !hasEmbeddingQuery {
+			return nil, errors.New("semantic_search or embeddings required when indexes are specified")
 		}
-		if len(opt.Indexes) > 0 && opt.Offset > 0 {
-			return nil, errors.New("offset not available when indexes are specified")
+		if hasEmbeddingQuery && opt.Offset > 0 {
+			return nil, errors.New("offset not available for semantic_search or embeddings")
 		}
 
 		// MarshalJSON now handles the conversion to oapi.QueryRequest automatically

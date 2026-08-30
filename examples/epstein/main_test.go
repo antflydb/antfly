@@ -184,13 +184,23 @@ func TestCreateArtifactGraphIndexIncludesProducerConfig(t *testing.T) {
 	if source["artifact"] != DefaultAutographAsset || source["path"] != "$.relations[*]" {
 		t.Fatalf("unexpected source config: %#v", source)
 	}
+	if _, exists := source["kind"]; exists {
+		t.Fatalf("graph source must not contain a kind discriminator: %#v", source)
+	}
 	artifact, ok := got["artifact"].(map[string]any)
 	if !ok {
 		t.Fatalf("artifact missing from graph index: %s", encoded)
 	}
+	if _, exists := artifact["field"]; exists {
+		t.Fatalf("graph artifact producer must use source instead of root field: %#v", artifact)
+	}
 	producer, ok := artifact["producer_json"].(map[string]any)
 	if !ok {
 		t.Fatalf("producer_json missing from artifact config: %#v", artifact)
+	}
+	artifactSource, ok := artifact["source"].(map[string]any)
+	if !ok || artifactSource["type"] != "field" || artifactSource["value"] != "content" {
+		t.Fatalf("unexpected artifact producer source: %#v", artifact["source"])
 	}
 	cfg, ok := producer["config"].(map[string]any)
 	if !ok {
@@ -249,11 +259,12 @@ func TestCreateArtifactGraphIndexDefaultsToExtractorConfig(t *testing.T) {
 	if len(schema["entities"].([]any)) != 2 || len(schema["relations"].([]any)) != 1 {
 		t.Fatalf("unexpected extractor schema: %#v", schema)
 	}
-	nodes := got["nodes"].(map[string]any)
+	source := got["source"].(map[string]any)
+	nodes := source["nodes"].(map[string]any)
 	if nodes["target"] != "{{ _item.target.text }}" {
 		t.Fatalf("unexpected extractor node mapping: %#v", nodes)
 	}
-	edge := got["edge"].(map[string]any)
+	edge := source["edge"].(map[string]any)
 	if edge["weight"] != "{{ _item.score }}" {
 		t.Fatalf("unexpected extractor edge mapping: %#v", edge)
 	}

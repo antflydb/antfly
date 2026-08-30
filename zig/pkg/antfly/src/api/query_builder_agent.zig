@@ -1017,12 +1017,17 @@ fn buildQueryPreflightPlanSummary(
     var full_text_indexes = std.ArrayListUnmanaged([]const u8).empty;
     errdefer deinitOwnedStringItems(alloc, full_text_indexes.items);
     errdefer full_text_indexes.deinit(alloc);
-    if (summary.full_text_indexes.len > 0) {
-        if (context) |table_context| {
-            for (table_context.full_text_index_metadata) |metadata| try appendUniqueOwnedString(alloc, &full_text_indexes, metadata.name);
-        }
-        if (full_text_indexes.items.len == 0) {
-            for (summary.full_text_indexes) |index_name| try appendUniqueOwnedString(alloc, &full_text_indexes, index_name);
+    for (summary.full_text_indexes) |index_name| {
+        if (std.mem.eql(u8, index_name, "full_text")) {
+            if (context) |table_context| {
+                if (table_context.full_text_index_metadata.len > 0) {
+                    for (table_context.full_text_index_metadata) |metadata| try appendUniqueOwnedString(alloc, &full_text_indexes, metadata.name);
+                    continue;
+                }
+            }
+            try appendUniqueOwnedString(alloc, &full_text_indexes, index_name);
+        } else {
+            try appendUniqueOwnedString(alloc, &full_text_indexes, index_name);
         }
     }
 
@@ -7523,6 +7528,32 @@ test "query builder preflight plan mode summarizes bound indexes and result refs
     try std.testing.expect(!plan_summary.count_only);
     try std.testing.expect(plan_summary.include_stored);
     try std.testing.expectEqual(@as(u32, 1), plan_summary.aggregation_count);
+}
+
+test "query builder preflight plan preserves exact named full text selection" {
+    const metadata = [_]QueryBuilderFullTextIndex{
+        .{ .name = "document_text" },
+        .{ .name = "chunk_text" },
+    };
+    var plan = try buildQueryPreflightPlanSummary(std.testing.allocator, &.{
+        .full_text_index_metadata = &metadata,
+    }, .{
+        .full_text_indexes = &.{"document_text"},
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.full_text_indexes.len);
+    try std.testing.expectEqualStrings("document_text", plan.full_text_indexes[0]);
+
+    var filtered_plan = try buildQueryPreflightPlanSummary(std.testing.allocator, &.{
+        .full_text_index_metadata = metadata[0..1],
+    }, .{
+        .full_text_indexes = &.{ "document_text", "full_text" },
+    });
+    defer filtered_plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), filtered_plan.full_text_indexes.len);
+    try std.testing.expectEqualStrings("document_text", filtered_plan.full_text_indexes[0]);
 }
 
 test "query builder collected context drives final validation" {

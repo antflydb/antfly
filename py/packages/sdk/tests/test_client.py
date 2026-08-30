@@ -15,6 +15,7 @@ from antfly import (  # noqa: E402
     CreatedEmbeddingsIndex,
     CreateEmbeddingsIndexRequest,
     CreateEmbeddingsIndexRequestType,
+    IndexMutationTemporarilyUnavailableError,
     StorageResourceExhaustedError,
     antfly_embedder,
     count_graph_alias,
@@ -257,6 +258,25 @@ class TestAntflyClient:
         assert "table already exists" in str(exc_info.value)
 
     @patch("antfly.client.Client")
+    def test_create_table_rejects_invalid_inline_index_before_transport(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(ValueError, match=r"invalid index 'semantic'.*embedding_name"):
+            client.create_table(
+                name="test_table",
+                indexes={
+                    "semantic": {
+                        "type": "embeddings",
+                        "source_artifact_name": "document_chunks_v1",
+                    }
+                },
+            )
+
+        mock_httpx.stream.assert_not_called()
+
+    @patch("antfly.client.Client")
     def test_create_index_uses_path_identity_and_returns_config(self, mock_client_class: MagicMock) -> None:
         mock_httpx = MagicMock()
         created = {"name": "thumbnail", "type": "embeddings", "dimension": 512}
@@ -317,6 +337,20 @@ class TestAntflyClient:
             client.indexes.create("docs", "search", {"name": "other", "type": "full_text"})
 
     @patch("antfly.client.Client")
+    def test_create_index_rejects_invalid_relationships_before_transport(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(ValueError, match="requires a non-empty embedding_name"):
+            client.indexes.create(
+                "docs",
+                "vectors",
+                {"type": "embeddings", "source_artifact_name": "chunks_v1"},
+            )
+        mock_httpx.stream.assert_not_called()
+
+    @patch("antfly.client.Client")
     def test_create_index_preserves_storage_admission_retry(self, mock_client_class: MagicMock) -> None:
         mock_httpx = MagicMock()
         response = configure_response(
@@ -342,6 +376,30 @@ class TestAntflyClient:
         assert exc_info.value.retryable is True
         assert exc_info.value.retry_after_ms == 1250
         assert exc_info.value.retry_after_seconds == 2
+
+    @patch("antfly.client.Client")
+    def test_create_index_preserves_temporary_mutation_retry(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        response = configure_response(
+            mock_httpx,
+            503,
+            {
+                "error": "index_probe_unavailable",
+                "message": "model probe is temporarily unavailable",
+                "retryable": True,
+            },
+        )
+        response.headers = {"Retry-After": "4"}
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        with pytest.raises(IndexMutationTemporarilyUnavailableError) as exc_info:
+            client.indexes.create("docs", "vectors", {"type": "embeddings", "dimension": 512})
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.code == "index_probe_unavailable"
+        assert exc_info.value.retryable is True
+        assert exc_info.value.retry_after_seconds == 4
 
     @patch("antfly.client.Client")
     def test_query_preserves_sorted_cursor_contract(self, mock_client_class: MagicMock) -> None:
@@ -397,6 +455,28 @@ class TestAntflyClient:
         hit = query_result.hits.hits[0]
         assert hit.field_id == "doc:2"
         assert hit.field_sort == ["2026-01-01T00:00:00Z", "doc:2"]
+
+    @patch("antfly.client.Client")
+    def test_query_forwards_named_full_text_index(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        configure_response(mock_httpx, 200, {"responses": []})
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        client.query(
+            table="docs",
+            full_text_search={"match": "singularity", "field": "text"},
+            full_text_index="document_text",
+        )
+
+        mock_httpx.stream.assert_called_once_with(
+            "POST",
+            "/db/v1/tables/docs/query",
+            json={
+                "full_text_search": {"match": "singularity", "field": "text"},
+                "full_text_index": "document_text",
+            },
+        )
 
     def test_query_rejects_ambiguous_aggregation_aliases(self) -> None:
         client = AntflyClient(base_url="http://localhost:8080")
