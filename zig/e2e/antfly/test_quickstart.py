@@ -939,7 +939,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
             "embedder": {
                 "provider": "openai",
                 "model": "text-embedding-3-small",
-                "url": progressive_openai_embedder,
+                "url": progressive_openai_embedder.url,
             },
         },
     )
@@ -948,6 +948,9 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     # the v0.2 default instead of relying on an explicit test-only override.
     assert created["publication_policy"] == "progressive"
     backup_api.wait_index_ready(table_name, index_name, timeout_s=30.0)
+    progressive_openai_embedder.rate_limit_after_next_requests(
+        10, input_substring="progressive publication document"
+    )
 
     # Match the quickstart's index-before-load ordering. Separate durable write
     # revisions make the first checkpoint queryable while later documents are
@@ -1001,6 +1004,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     assert 0 < coverage["covered"] < coverage["source_total"] == 100
     assert coverage["complete"] is False
 
+    progressive_openai_embedder.allow_rate_limited_requests()
     result = backup_api.query_table(
         table_name,
         {
