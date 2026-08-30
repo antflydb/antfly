@@ -1825,6 +1825,19 @@ fn effectiveTextRenderMode(state: TextRunState) !i64 {
     return paint_mode + if (mode >= 4) @as(i64, 4) else 0;
 }
 
+/// A selected tiling pattern owns the outer Pattern color-space state, but
+/// its cell content is a separate content stream. The current RGBA values are
+/// already resolved at `scn`/`SCN` time and are the inherited base paint for
+/// an uncolored (PaintType 2) cell. Materialize those values as device paint
+/// while parsing the cell so ordinary paths, text, and image masks remain
+/// visible. A nested `/Pattern cs` in the cell will select Pattern again.
+fn materializePatternCellColorSpace(color_space: ColorSpaceKind) ColorSpaceKind {
+    return switch (color_space) {
+        .pattern => .device_rgb,
+        else => color_space,
+    };
+}
+
 fn selectFillColorSpace(state: anytype, name: []const u8) void {
     state.fill_color_space = colorSpaceKindFromName(name);
     state.fill_color = initialColorForColorSpace(state.fill_color_space);
@@ -13892,8 +13905,8 @@ fn buildPatternTextState(state: GraphicsState) TextRunState {
         .group_parent_id = state.group_parent_id,
         .group_isolated = state.group_isolated,
         .group_knockout = state.group_knockout,
-        .fill_color_space = state.fill_color_space,
-        .stroke_color_space = state.stroke_color_space,
+        .fill_color_space = materializePatternCellColorSpace(state.fill_color_space),
+        .stroke_color_space = materializePatternCellColorSpace(state.stroke_color_space),
         .fill_pattern_name = null,
         .stroke_pattern_name = null,
     };
@@ -13905,6 +13918,8 @@ fn buildPatternGraphicsState(state: GraphicsState) GraphicsState {
     next.group_isolated = state.group_isolated;
     next.group_knockout = state.group_knockout;
     next.group_parent_id = state.group_parent_id;
+    next.fill_color_space = materializePatternCellColorSpace(state.fill_color_space);
+    next.stroke_color_space = materializePatternCellColorSpace(state.stroke_color_space);
     next.fill_pattern_name = null;
     next.stroke_pattern_name = null;
     next.clip_box = null;
@@ -22069,8 +22084,91 @@ test "reader extracts uncolored tiling pattern base color" {
         alloc.free(runs);
     }
     try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(usize, 1), runs[0].tile_shape_runs.len);
     try std.testing.expect(runs[0].base_color != null);
     try std.testing.expectEqual([4]u8{ 0x00, 0xff, 0x00, 0xff }, runs[0].base_color.?);
+}
+
+test "pattern cell materializes inherited paint for every content parser" {
+    const outer = GraphicsState{
+        .fill_color = .{ 0x11, 0x22, 0x33, 0xff },
+        .stroke_color = .{ 0x44, 0x55, 0x66, 0xff },
+        .fill_color_space = .pattern,
+        .stroke_color_space = .pattern,
+        .fill_pattern_name = "FillPattern",
+        .stroke_pattern_name = "StrokePattern",
+    };
+
+    const graphics = buildPatternGraphicsState(outer);
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, graphics.fill_color_space);
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, graphics.stroke_color_space);
+    try std.testing.expect(graphics.fill_pattern_name == null);
+    try std.testing.expect(graphics.stroke_pattern_name == null);
+    try std.testing.expectEqual(outer.fill_color, graphics.fill_color);
+    try std.testing.expectEqual(outer.stroke_color, graphics.stroke_color);
+    try std.testing.expect(try solidShapePaintAvailable(graphics.fill_color_space));
+
+    var text = buildPatternTextState(outer);
+    text.render_mode = 2;
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, text.fill_color_space);
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, text.stroke_color_space);
+    try std.testing.expectEqual(@as(i64, 2), try effectiveTextRenderMode(text));
+}
+
+test "reader applies uncolored tiling pattern base color to image masks" {
+    const alloc = std.testing.allocator;
+    const page_content = "/Pattern cs\n0 1 0 /P1 scn\n0 0 20 20 re\nf\n";
+    const pattern_content = "q\n5 0 0 5 0 0 cm\n/Im1 Do\nQ\n";
+    const image_data = [_]u8{0};
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
+        try std.fmt.allocPrint(
+            alloc,
+            "5 0 obj\n<< /Type /Pattern /PatternType 1 /PaintType 2 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Resources << /XObject << /Im1 6 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+            .{ pattern_content.len, pattern_content },
+        ),
+        try std.fmt.allocPrint(
+            alloc,
+            "6 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true /Width 1 /Height 1 /BitsPerComponent 1 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            .{ image_data.len, image_data },
+        ),
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[4]);
+    defer alloc.free(objects[5]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |obj_src, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, obj_src);
+    }
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 7\n0000000000 65535 f \n");
+    for (offsets) |off| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{off});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 7 /Root 1 0 R >>\n");
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
+
+    var parsed = try Reader.init(alloc, sample);
+    defer parsed.deinit();
+    const runs = try parsed.extractPagePatternRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(usize, 1), runs[0].tile_image_runs.len);
+    try std.testing.expectEqual(@as(?[4]u8, .{ 0x00, 0xff, 0x00, 0xff }), runs[0].tile_image_runs[0].stencil_color);
 }
 
 test "reader extracts vector text pattern runs" {

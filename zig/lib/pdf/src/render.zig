@@ -4023,6 +4023,71 @@ test "draw pattern run recolors uncolored cell content" {
     try std.testing.expect(canvas[green_px + 1] > 0x80);
 }
 
+test "reader and renderer preserve uncolored tiling pattern cell geometry" {
+    const alloc = std.testing.allocator;
+    const pattern_content = "0 0 5 10 re\nf\n";
+    const page_content = "/Pattern cs\n0 1 0 /P1 scn\n0 0 20 20 re\nf\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
+        try std.fmt.allocPrint(
+            alloc,
+            "5 0 obj\n<< /Type /Pattern /PatternType 1 /PaintType 2 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+            .{ pattern_content.len, pattern_content },
+        ),
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[4]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |obj_src, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, obj_src);
+    }
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 6\n0000000000 65535 f \n");
+    for (offsets) |off| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{off});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
+
+    var parsed = try reader.Reader.init(alloc, sample);
+    defer parsed.deinit();
+    var runs = try parsed.extractPageRenderRunsAlloc(1);
+    defer runs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), runs.shape_runs.len);
+    try std.testing.expectEqual(@as(usize, 1), runs.pattern_runs.len);
+    try std.testing.expectEqual(@as(usize, 1), runs.pattern_runs[0].tile_shape_runs.len);
+    const raw = try renderPageContentRgbaInBoxAlloc(
+        alloc,
+        runs.page_box,
+        runs.text_runs,
+        runs.image_runs,
+        runs.shading_runs,
+        runs.pattern_runs,
+        runs.shape_runs,
+        .{},
+    );
+    defer alloc.free(raw.rgba);
+
+    var green_pixels: usize = 0;
+    for (0..raw.width * raw.height) |pixel| {
+        const offset = pixel * 4;
+        if (raw.rgba[offset] < 0x40 and raw.rgba[offset + 1] > 0xc0 and raw.rgba[offset + 2] < 0x40)
+            green_pixels += 1;
+    }
+    try std.testing.expect(green_pixels > 0);
+}
+
 test "nonzero glyph paths preserve counter contours" {
     var points = [_][2]f64{
         .{ 0, 0 }, .{ 10, 0 }, .{ 10, 10 }, .{ 0, 10 },
