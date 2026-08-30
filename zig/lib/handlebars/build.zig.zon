@@ -16,7 +16,7 @@
     .name = .handlebars_zig,
     .version = "0.1.0",
     .fingerprint = 0xab6d919f7c2dfeaf,
-    .minimum_zig_version = "0.17.0-dev.1933",
+    .minimum_zig_version = "0.17.0-dev.1936",
     .paths = .{
         "build.zig",
         "build.zig.zon",

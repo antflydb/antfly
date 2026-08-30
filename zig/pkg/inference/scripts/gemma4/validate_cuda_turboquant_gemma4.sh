@@ -47,7 +47,7 @@ done
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)"
 inference_dir="$repo_root/zig/pkg/inference"
-zig_bin="${ZIG_BIN:-$repo_root/.tools/zig-x86_64-linux-0.17.0-dev.1933+e19a73c2d/zig}"
+zig_bin="${ZIG_BIN:-$repo_root/.tools/zig-x86_64-linux-0.17.0-dev.1936+5a625d5f3/zig}"
 antfly_bin="${ANTFLY_BIN:-${ANTFY_BIN:-$inference_dir/zig-out/bin/antfly-inference}}"
 out_dir="${OUT_DIR:-/tmp/antfly-cuda-turboquant-gate-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$out_dir"

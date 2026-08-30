@@ -33,8 +33,8 @@ resolve_zig() {
     printf '%s\n' "$ZIG"
   elif command -v zig >/dev/null 2>&1; then
     command -v zig
-  elif [[ -x "../../../.tools/zig-x86_64-linux-0.17.0-dev.1933+e19a73c2d/zig" ]]; then
-    printf '%s\n' "../../../.tools/zig-x86_64-linux-0.17.0-dev.1933+e19a73c2d/zig"
+  elif [[ -x "../../../.tools/zig-x86_64-linux-0.17.0-dev.1936+5a625d5f3/zig" ]]; then
+    printf '%s\n' "../../../.tools/zig-x86_64-linux-0.17.0-dev.1936+5a625d5f3/zig"
   else
     echo "zig not found; set ZIG=/path/to/zig" >&2
     return 1

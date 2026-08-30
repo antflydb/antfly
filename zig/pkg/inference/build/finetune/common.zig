@@ -222,9 +222,9 @@ fn configureSystemBlas(ctx: Context, module: *std.Build.Module) void {
         return;
     }
     if (ctx.blas_root) |root| {
-        module.addIncludePath(.{ .cwd_relative = ctx.b.fmt("{s}/include", .{root}) });
-        module.addLibraryPath(.{ .cwd_relative = ctx.b.fmt("{s}/lib", .{root}) });
-        module.addRPath(.{ .cwd_relative = ctx.b.fmt("{s}/lib", .{root}) });
+        module.addIncludePath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/include", .{root})));
+        module.addLibraryPath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/lib", .{root})));
+        module.addRPath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/lib", .{root})));
     }
     module.linkSystemLibrary("openblas", .{});
 }
@@ -250,7 +250,7 @@ fn addMacosSdkPaths(ctx: Context, module: *std.Build.Module) void {
     const sdk_root = ctx.b.graph.environ_map.get("SDK_PATH") orelse
         std.zig.system.darwin.getSdk(ctx.b.allocator, ctx.b.graph.io, &ctx.target.result) orelse
         return;
-    module.addSystemIncludePath(.{ .cwd_relative = ctx.b.fmt("{s}/usr/include", .{sdk_root}) });
-    module.addLibraryPath(.{ .cwd_relative = ctx.b.fmt("{s}/usr/lib", .{sdk_root}) });
-    module.addFrameworkPath(.{ .cwd_relative = ctx.b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+    module.addSystemIncludePath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/usr/include", .{sdk_root})));
+    module.addLibraryPath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/usr/lib", .{sdk_root})));
+    module.addFrameworkPath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
 }

@@ -604,7 +604,7 @@ class L4ReleaseGateTest(unittest.TestCase):
     def test_provenance_errors_fail_closed_on_git_absence_and_source_drift(self) -> None:
         tool = {"returncode": 0, "path": "/tool", "sha256": "f" * 64, "version": "ok"}
         toolchains = {name: dict(tool) for name in ("python", "git", "cuobjdump", "nvidia_smi")}
-        toolchains["zig"] = {**tool, "version": "0.17.0-dev.1933+e19a73c2d"}
+        toolchains["zig"] = {**tool, "version": "0.17.0-dev.1936+5a625d5f3"}
         toolchains["nvcc"] = {**tool, "version": "Cuda compilation tools, release 13.2"}
         base = {
             "git": {

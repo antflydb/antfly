@@ -146,7 +146,7 @@ the inference package directory:
 
 ```sh
 cd zig/pkg/inference
-ZIG=../../../.tools/zig-x86_64-linux-0.17.0-dev.1933+e19a73c2d/zig
+ZIG=../../../.tools/zig-x86_64-linux-0.17.0-dev.1936+5a625d5f3/zig
 MODEL=../../../path/to/model.gguf
 
 $ZIG build quant-kernel-codegen -- --inspect-model "$MODEL"
@@ -247,7 +247,7 @@ cancellation-heavy inputs:
 
 ```sh
 cd zig/pkg/inference
-../../../.tools/zig-x86_64-linux-0.17.0-dev.1933+e19a73c2d/zig build \
+../../../.tools/zig-x86_64-linux-0.17.0-dev.1936+5a625d5f3/zig build \
   quant-kernel-cuda-attention-diff -Dcuda=true -Dmetal=false \
   -Dcuda-artifacts=sm89 -Doptimize=ReleaseFast -- --kv-len 1024
 ```
@@ -267,7 +267,7 @@ with quiet NaNs, and fails on any bit mismatch against
 
 ```sh
 cd zig/pkg/inference
-../../../.tools/zig-x86_64-linux-0.17.0-dev.1933+e19a73c2d/zig build \
+../../../.tools/zig-x86_64-linux-0.17.0-dev.1936+5a625d5f3/zig build \
   quant-kernel-cuda-paged-attention-diff -Dcuda=true -Dmetal=false \
   -Dcuda-artifacts=sm89 -Doptimize=ReleaseFast -- \
   --head-dim all --kv-len 2003 --pattern all --key-format all \
@@ -301,7 +301,7 @@ with NaN-poisoned unused storage and device-side argument audits:
 
 ```sh
 cd zig/pkg/inference
-../../../.tools/zig-x86_64-linux-0.17.0-dev.1933+e19a73c2d/zig build \
+../../../.tools/zig-x86_64-linux-0.17.0-dev.1936+5a625d5f3/zig build \
   quant-kernel-cuda-paged-prefill-diff -Dcuda=true -Dmetal=false \
   -Dcuda-artifacts=sm89 -Doptimize=ReleaseFast -- --json
 ```
@@ -453,7 +453,7 @@ profile. The 255/256 request values are intentional benchmark accounting.
 
 ```sh
 (cd zig/pkg/inference && \
-  ../../../.tools/zig-x86_64-linux-0.17.0-dev.1933+e19a73c2d/zig build \
+  ../../../.tools/zig-x86_64-linux-0.17.0-dev.1936+5a625d5f3/zig build \
     -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 -Doptimize=ReleaseFast)
 
 OUT_DIR=/tmp/antfly-gemma4-l4-256 \
@@ -594,7 +594,7 @@ Strict candidate profiles also carry a release-grade provenance contract.
 Before timing, the validator records the repository commit and Git dirty-state
 status digest, hashes the validator and its shared provenance helpers, and
 captures the exact Zig and NVCC executable hashes and version strings. Zig
-0.17.0-dev.1933+e19a73c2d and CUDA 13.2 are required. A dirty development tree is allowed for
+0.17.0-dev.1936+5a625d5f3 and CUDA 13.2 are required. A dirty development tree is allowed for
 candidate work, but its recorded state must remain identical through the
 qualification; changing the commit or dirty-state digest invalidates the run.
 

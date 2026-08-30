@@ -343,9 +343,9 @@ jobs:
         if: needs.changes.outputs.zig_tests == 'true'
         working-directory: zig
         run: |
-          zig build wasm
+          zig build wasm --cache-poison=disallowed
           cd pkg/inference
-          zig build -Dwasm=true -Dwasm-memory-model=wasm32 wasm
+          zig build -Dwasm=true -Dwasm-memory-model=wasm32 wasm --cache-poison=disallowed
 
       - name: Test bounded-build tooling
         working-directory: zig
@@ -509,7 +509,7 @@ jobs:
 
           (
             set +e
-            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}" 2>&1 | tee -a "$unit_log"
+            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test ZIG_BUILD_FLAGS="--cache-poison=disallowed --build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}" 2>&1 | tee -a "$unit_log"
             exit "${PIPESTATUS[0]}"
           ) &
           unit_pid="$!"
@@ -647,7 +647,7 @@ jobs:
       - name: Run full Zig unit tests
         run: |
           set +e
-          taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}"
+          taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--cache-poison=disallowed --build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}"
           status="$?"
           if [ "$status" -ne 0 ] && [ -d /sys/fs/cgroup ]; then
             echo "::group::unit failure cgroup memory"

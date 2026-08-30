@@ -270,7 +270,7 @@ pub fn create(config: Config) Graph {
     });
     inference_audio_mod.addImport("build_options", build_options_mod);
     if (backend.ffmpeg_paths) |ffmpeg_paths| {
-        inference_audio_mod.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
+        inference_audio_mod.addIncludePath(b.graph.cwdRelativePath(ffmpeg_paths.include_dir));
     }
 
     const inference_chunker_mod = addOrCreateModule(b, config.register_public_modules, "inference_chunker", .{
@@ -410,14 +410,14 @@ fn createCBindings(
         .optimize = .Debug,
         .link_libc = true,
     });
-    onnx.addIncludePath(.{ .cwd_relative = include_dir });
+    onnx.addIncludePath(b.graph.cwdRelativePath(include_dir));
     const ortgenai = b.addTranslateC(.{
         .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/ortgenai_c.h")),
         .target = target,
         .optimize = .Debug,
         .link_libc = true,
     });
-    ortgenai.addIncludePath(.{ .cwd_relative = include_dir });
+    ortgenai.addIncludePath(b.graph.cwdRelativePath(include_dir));
     return .{ .onnx = onnx.createModule(), .ortgenai = ortgenai.createModule() };
 }
 
@@ -680,7 +680,7 @@ fn addInferenceApiModule(
         "yaml_to_json.py",
     });
     convert.addFileArg(b.path(spec_path_override.?));
-    const json_spec = convert.addOutputFileArg("inference.openapi.json");
+    const json_spec = convert.addOutputFileArg2("inference.openapi.json", .{});
     const codegen = b.addRunArtifact(openapi_dep.artifact("openapi-zig"));
     codegen.addArg("--spec");
     codegen.addFileArg(json_spec);
@@ -691,7 +691,7 @@ fn addInferenceApiModule(
     codegen.addArg(b.fmt("{s}={s}", .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" }));
     codegen.addArg(b.fmt("{s}={s}", .{ "../ai/extraction.yaml", "antfly_extraction_openapi" }));
     codegen.addArg("--output");
-    const gen_dir = codegen.addOutputDirectoryArg("inference_api");
+    const gen_dir = codegen.addOutputDirectoryArg2("inference_api", .{});
     const mod = addOrCreateModule(b, register_public_modules, "inference_api", .{
         .root_source_file = gen_dir.path(b, "root.zig"),
         .target = target,
@@ -761,7 +761,7 @@ fn addSentencePieceProtoModule(
     codegen.addArg("--desc");
     codegen.addFileArg(b.path(pathJoin(b, paths.shared_lib_root, "lib/tokenizer/proto/sentencepiece_model.desc")));
     codegen.addArg("--output");
-    const raw_dir = codegen.addOutputDirectoryArg("sentencepiece_proto_raw");
+    const raw_dir = codegen.addOutputDirectoryArg2("sentencepiece_proto_raw", .{});
 
     const fixup_tool = b.addExecutable(.{
         .name = "patch_sentencepiece_proto",
@@ -774,7 +774,7 @@ fn addSentencePieceProtoModule(
     const fixup_run = b.addRunArtifact(fixup_tool);
     fixup_run.addFileArg(raw_dir.path(b, "root.zig"));
     fixup_run.addFileArg(raw_dir.path(b, "sentencepiece.zig"));
-    const gen_dir = fixup_run.addOutputDirectoryArg("sentencepiece_proto");
+    const gen_dir = fixup_run.addOutputDirectoryArg2("sentencepiece_proto", .{});
 
     const mod = addOrCreateModule(b, register_public_modules, "sentencepiece_proto", .{
         .root_source_file = gen_dir.path(b, "root.zig"),
@@ -836,9 +836,9 @@ fn configureRuntimeLinks(
     configureOnnxRuntime(b, module, backend.enable_onnx, backend.onnx_root);
     configureMetal(b, module, target, backend.enable_metal, paths);
     if (backend.ffmpeg_paths) |ffmpeg_paths| {
-        module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
-        module.addLibraryPath(.{ .cwd_relative = ffmpeg_paths.lib_dir });
-        module.addRPath(.{ .cwd_relative = ffmpeg_paths.lib_dir });
+        module.addIncludePath(b.graph.cwdRelativePath(ffmpeg_paths.include_dir));
+        module.addLibraryPath(b.graph.cwdRelativePath(ffmpeg_paths.lib_dir));
+        module.addRPath(b.graph.cwdRelativePath(ffmpeg_paths.lib_dir));
         module.linkSystemLibrary("avformat", .{});
         module.linkSystemLibrary("avcodec", .{});
         module.linkSystemLibrary("avutil", .{});
@@ -858,9 +858,9 @@ pub fn configureSystemBlas(
         return;
     }
     if (blas_root) |root| {
-        module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{root}) });
-        module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
-        module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
+        module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{root})));
+        module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{root})));
+        module.addRPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{root})));
     }
     module.linkSystemLibrary("openblas", .{});
 }
@@ -872,11 +872,11 @@ pub fn configureOnnxRuntime(
     onnx_root: []const u8,
 ) void {
     if (!enable_onnx) return;
-    module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{onnx_root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
-    module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
+    module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{onnx_root})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
+    module.addRPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
     if (std.mem.startsWith(u8, onnx_root, "pkg/")) {
-        module.addRPath(.{ .cwd_relative = b.fmt("zig/{s}/lib", .{onnx_root}) });
+        module.addRPath(b.graph.cwdRelativePath(b.fmt("zig/{s}/lib", .{onnx_root})));
     }
     module.linkSystemLibrary("onnxruntime", .{});
     module.linkSystemLibrary("onnxruntime-genai", .{});
@@ -908,9 +908,9 @@ fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.
     const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse
         std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
         return;
-    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
-    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+    module.addSystemIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/usr/include", .{sdk_root})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk_root})));
+    module.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
 }
 
 fn pathJoin(b: *std.Build, root: []const u8, relative_path: []const u8) []const u8 {

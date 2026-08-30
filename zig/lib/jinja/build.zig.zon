@@ -16,7 +16,7 @@
     .fingerprint = 0xb46014b159d9ba21,
     .name = .jinja,
     .version = "0.1.0",
-    .minimum_zig_version = "0.17.0-dev.1933",
+    .minimum_zig_version = "0.17.0-dev.1936",
     .dependencies = .{},
     .paths = .{
         "build.zig",

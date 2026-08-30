@@ -16,7 +16,7 @@
     .name = .structlog,
     .version = "0.1.0",
     .fingerprint = 0x6d94a225933e82b8,
-    .minimum_zig_version = "0.17.0-dev.1933",
+    .minimum_zig_version = "0.17.0-dev.1936",
     .dependencies = .{},
     .paths = .{
         "build.zig",

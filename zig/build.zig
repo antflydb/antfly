@@ -126,9 +126,9 @@ fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.
     const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse
         std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
         return;
-    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
-    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+    module.addSystemIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/usr/include", .{sdk_root})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk_root})));
+    module.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
 }
 
 fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const []const u8) *std.Build.Step.Run {
@@ -141,6 +141,8 @@ fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const
         "python",
     });
     run.setCwd(b.path("."));
+    run.addFileInput(b.path("../scripts/pyproject.toml"));
+    run.addFileInput(b.path("../scripts/uv.lock"));
     run.addFileArg(b.path(script_path));
     run.addArgs(args);
     return run;
@@ -522,7 +524,7 @@ fn addSpngBinding(
             .optimize = .Debug,
             .link_libc = true,
         });
-        translate.addIncludePath(.{ .cwd_relative = paths.include_dir });
+        translate.addIncludePath(b.graph.cwdRelativePath(paths.include_dir));
         mod.addImport("spng_c", translate.createModule());
     } else {
         mod.addImport("spng_c", b.createModule(.{
@@ -540,7 +542,7 @@ fn addLocalSentencePieceProtoModule(
     codegen.addArg("--desc");
     codegen.addFileArg(b.path("lib/tokenizer/proto/sentencepiece_model.desc"));
     codegen.addArg("--output");
-    const raw_dir = codegen.addOutputDirectoryArg("sentencepiece_proto_raw");
+    const raw_dir = codegen.addOutputDirectoryArg2("sentencepiece_proto_raw", .{});
 
     const fixup_tool = b.addExecutable(.{
         .name = "patch_sentencepiece_proto",
@@ -553,7 +555,7 @@ fn addLocalSentencePieceProtoModule(
     const fixup_run = b.addRunArtifact(fixup_tool);
     fixup_run.addFileArg(raw_dir.path(b, "root.zig"));
     fixup_run.addFileArg(raw_dir.path(b, "sentencepiece.zig"));
-    const gen_dir = fixup_run.addOutputDirectoryArg("sentencepiece_proto");
+    const gen_dir = fixup_run.addOutputDirectoryArg2("sentencepiece_proto", .{});
 
     const mod = b.createModule(.{
         .root_source_file = gen_dir.path(b, "root.zig"),
@@ -638,21 +640,20 @@ fn addYaccSteps(
 
     const regen_run = b.addRunArtifact(yacc_codegen);
     regen_run.addFileArg(b.path(sql_grammar_source));
-    const regen_output = regen_run.addOutputFileArg("regen_sql_grammar_root.zig");
+    const regen_output = regen_run.addOutputFileArg2("regen_sql_grammar_root.zig", .{});
     regen_run.addArg(sql_grammar_source);
     const update = b.addUpdateSourceFiles();
     update.addCopyFileToSource(regen_output, sql_grammar_generated_root);
-    const regen_fmt = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt", sql_grammar_generated_root });
+    const regen_fmt = b.addFmt(.{ .paths = &.{b.path(sql_grammar_generated_root)} });
     regen_fmt.step.dependOn(&update.step);
     const regen_step = b.step("regen-sql-grammar", "Regenerate checked-in Antfly SQL grammar metadata");
     regen_step.dependOn(&regen_fmt.step);
 
     const check_run = b.addRunArtifact(yacc_codegen);
     check_run.addFileArg(b.path(sql_grammar_source));
-    const check_output = check_run.addOutputFileArg("check_sql_grammar_root.zig");
+    const check_output = check_run.addOutputFileArg2("check_sql_grammar_root.zig", .{});
     check_run.addArg(sql_grammar_source);
-    const check_fmt = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt" });
-    check_fmt.addFileArg(check_output);
+    const check_fmt = b.addFmt(.{ .paths = &.{check_output} });
     const compare = b.addRunArtifact(addFileCompareTool(b));
     compare.step.dependOn(&check_fmt.step);
     compare.addFileArg(check_output);
@@ -986,7 +987,7 @@ fn addSnowballGeneratedOutputs(
         run.addFileArg(snowball_dep.path(b, b.fmt("algorithms/{s}.sbl", .{lang})));
         run.addArg("-zig");
         run.addArg("-o");
-        stemmers[idx] = run.addOutputFileArg(b.fmt("{s}_stemmer.zig", .{lang}));
+        stemmers[idx] = run.addOutputFileArg2(b.fmt("{s}_stemmer.zig", .{lang}), .{});
     }
 
     return .{
@@ -1008,11 +1009,7 @@ fn addSnowballRegenStep(b: *std.Build) void {
         update.addCopyFileToSource(generated.stemmers[idx], snowballGeneratedPath(b, "{s}_stemmer.zig", .{lang}));
     }
 
-    const fmt = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "fmt",
-        snowball_generated_root,
-    });
+    const fmt = b.addFmt(.{ .paths = &.{b.path(snowball_generated_root)} });
     fmt.step.dependOn(&update.step);
     regen_step.dependOn(&fmt.step);
 }
@@ -1022,15 +1019,13 @@ fn addSnowballCheckStep(b: *std.Build) void {
     const snowball_compiler = addSnowballCompiler(b);
     const generated = addSnowballGeneratedOutputs(b, snowball_compiler);
 
-    const fmt = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "fmt",
-    });
-    fmt.addFileArg(generated.root);
-    fmt.addFileArg(generated.env);
+    const fmt_paths = b.allocator.alloc(std.Build.LazyPath, 2 + snowball_languages.len) catch @panic("OOM");
+    fmt_paths[0] = generated.root;
+    fmt_paths[1] = generated.env;
     for (snowball_languages, 0..) |_, idx| {
-        fmt.addFileArg(generated.stemmers[idx]);
+        fmt_paths[2 + idx] = generated.stemmers[idx];
     }
+    const fmt = b.addFmt(.{ .paths = fmt_paths });
 
     const compare_tool = addFileCompareTool(b);
     const compare = b.addRunArtifact(compare_tool);
@@ -1062,7 +1057,7 @@ fn addOpenApiModuleFromYamlPath(
 
     const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
     convert.addFileArg(source_path);
-    const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{output_dir_name}));
+    const json_spec = convert.addOutputFileArg2(b.fmt("{s}.json", .{output_dir_name}), .{});
 
     const codegen = b.addRunArtifact(openapi_codegen);
     codegen.addArgs(&.{"--spec"});
@@ -1074,7 +1069,7 @@ fn addOpenApiModuleFromYamlPath(
         codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
     }
     codegen.addArgs(&.{"--output"});
-    const gen_dir = codegen.addOutputDirectoryArg(output_dir_name);
+    const gen_dir = codegen.addOutputDirectoryArg2(output_dir_name, .{});
 
     return b.addModule(package_name, .{
         .root_source_file = gen_dir.path(b, "root.zig"),
@@ -1116,13 +1111,13 @@ fn addOpenApiRootCheckStep(b: *std.Build) *std.Build.Step.Run {
 fn addJoinedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_openapi.py", &.{"--joined-only"});
     addOpenApiJoinInputs(b, join);
-    return join.addOutputFileArg("openapi.public.joined.yaml");
+    return join.addOutputFileArg2("openapi.public.joined.yaml", .{});
 }
 
 fn addPrefixedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{});
     addOpenApiJoinInputs(b, join);
-    return join.addOutputFileArg("openapi.public.prefixed.yaml");
+    return join.addOutputFileArg2("openapi.public.prefixed.yaml", .{});
 }
 
 fn addPublicOpenApiModule(
@@ -1201,7 +1196,7 @@ fn addOpenApiModuleWithHttpxFromYamlPath(
 
     const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
     convert.addFileArg(source_path);
-    const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{output_dir_name}));
+    const json_spec = convert.addOutputFileArg2(b.fmt("{s}.json", .{output_dir_name}), .{});
 
     const codegen = b.addRunArtifact(openapi_codegen);
     codegen.addArgs(&.{"--spec"});
@@ -1213,7 +1208,7 @@ fn addOpenApiModuleWithHttpxFromYamlPath(
         codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
     }
     codegen.addArgs(&.{"--output"});
-    const gen_dir = codegen.addOutputDirectoryArg(output_dir_name);
+    const gen_dir = codegen.addOutputDirectoryArg2(output_dir_name, .{});
 
     const mod = b.addModule(package_name, .{
         .root_source_file = gen_dir.path(b, "root.zig"),
@@ -1286,7 +1281,7 @@ fn addOpenApiRegenRun(
 ) *std.Build.Step.Run {
     const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
     convert.addFileArg(source_path);
-    const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{package_name}));
+    const json_spec = convert.addOutputFileArg2(b.fmt("{s}.json", .{package_name}), .{});
 
     const codegen = b.addRunArtifact(openapi_codegen);
     codegen.addArgs(&.{"--spec"});
@@ -1409,12 +1404,10 @@ fn addOpenApiRegenStep(
         addOpenApiRegenRun(b, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_generated_root ++ "/openai_api", "types", &.{}),
     };
 
-    const fmt = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "fmt",
-        antfly_generated_root,
-        inference_generated_root,
-    });
+    const fmt = b.addFmt(.{ .paths = &.{
+        b.path(antfly_generated_root),
+        b.path(inference_generated_root),
+    } });
     for (runs) |run| {
         fmt.step.dependOn(&run.step);
     }
@@ -3177,15 +3170,15 @@ pub fn build(b: *std.Build) void {
     lib_image_bench_mod.addOptions("build_options", lib_image_bench_build_options);
     addSpngBinding(b, lib_image_bench_mod, target, lib_image_spng_paths);
     if (lib_image_spng_paths) |spng_paths| {
-        lib_image_bench_mod.addIncludePath(.{ .cwd_relative = spng_paths.include_dir });
+        lib_image_bench_mod.addIncludePath(b.graph.cwdRelativePath(spng_paths.include_dir));
     }
     const lib_image_bench = b.addExecutable(.{
         .name = "lib-image-bench",
         .root_module = lib_image_bench_mod,
     });
     if (lib_image_spng_paths) |spng_paths| {
-        lib_image_bench.root_module.addLibraryPath(.{ .cwd_relative = spng_paths.lib_dir });
-        lib_image_bench.root_module.addRPath(.{ .cwd_relative = spng_paths.lib_dir });
+        lib_image_bench.root_module.addLibraryPath(b.graph.cwdRelativePath(spng_paths.lib_dir));
+        lib_image_bench.root_module.addRPath(b.graph.cwdRelativePath(spng_paths.lib_dir));
         lib_image_bench.root_module.linkSystemLibrary("spng", .{});
         lib_image_bench.root_module.link_libc = true;
     }
@@ -3281,15 +3274,15 @@ pub fn build(b: *std.Build) void {
     lib_image_corpus_mod.addOptions("build_options", lib_image_corpus_build_options);
     addSpngBinding(b, lib_image_corpus_mod, target, lib_image_spng_paths);
     if (lib_image_spng_paths) |spng_paths| {
-        lib_image_corpus_mod.addIncludePath(.{ .cwd_relative = spng_paths.include_dir });
+        lib_image_corpus_mod.addIncludePath(b.graph.cwdRelativePath(spng_paths.include_dir));
     }
     const lib_image_corpus = b.addExecutable(.{
         .name = "lib-image-corpus",
         .root_module = lib_image_corpus_mod,
     });
     if (lib_image_spng_paths) |spng_paths| {
-        lib_image_corpus.root_module.addLibraryPath(.{ .cwd_relative = spng_paths.lib_dir });
-        lib_image_corpus.root_module.addRPath(.{ .cwd_relative = spng_paths.lib_dir });
+        lib_image_corpus.root_module.addLibraryPath(b.graph.cwdRelativePath(spng_paths.lib_dir));
+        lib_image_corpus.root_module.addRPath(b.graph.cwdRelativePath(spng_paths.lib_dir));
         lib_image_corpus.root_module.linkSystemLibrary("spng", .{});
         lib_image_corpus.root_module.link_libc = true;
     }
@@ -7127,7 +7120,7 @@ pub fn build(b: *std.Build) void {
     });
     lib_audio_xiph_conformance.root_module.addImport("build_options", inference_build_options_mod);
     if (inference_ffmpeg_paths) |ffmpeg_paths| {
-        lib_audio_xiph_conformance.root_module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
+        lib_audio_xiph_conformance.root_module.addIncludePath(b.graph.cwdRelativePath(ffmpeg_paths.include_dir));
     }
     lib_audio_xiph_conformance.root_module.link_libc = true;
 
@@ -7141,7 +7134,7 @@ pub fn build(b: *std.Build) void {
     });
     lib_audio_misc_conformance.root_module.addImport("build_options", inference_build_options_mod);
     if (inference_ffmpeg_paths) |ffmpeg_paths| {
-        lib_audio_misc_conformance.root_module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
+        lib_audio_misc_conformance.root_module.addIncludePath(b.graph.cwdRelativePath(ffmpeg_paths.include_dir));
     }
     lib_audio_misc_conformance.root_module.link_libc = true;
 
@@ -8087,7 +8080,7 @@ pub fn build(b: *std.Build) void {
     const unit_storage_shard_audit = b.addSystemCommand(&.{"python3"});
     unit_storage_shard_audit.addFileArg(b.path("tools/audit_storage_test_shards.py"));
     unit_storage_shard_audit.addArg("--root");
-    unit_storage_shard_audit.addDirectoryArg(b.path("pkg/antfly/src/storage"));
+    unit_storage_shard_audit.addDirectoryArg2(b.path("pkg/antfly/src/storage"), .{});
     unit_storage_shard_audit.addArg("--manifest");
     unit_storage_shard_audit.addFileArg(b.path("pkg/antfly/src/storage/test_manifest.zig"));
     for (unit_storage_shard_filters) |shard_filters| {
@@ -8258,12 +8251,12 @@ pub fn build(b: *std.Build) void {
     compare_unit_storage_inventory.addFileArg(b.path("tools/compare_test_inventories.py"));
     compare_unit_storage_inventory.addArg("--baseline");
     for (unit_storage_baseline_tests) |baseline_tests| {
-        compare_unit_storage_inventory.addArtifactArg(baseline_tests);
+        compare_unit_storage_inventory.addArtifactArg2(baseline_tests, .{});
     }
     compare_unit_storage_inventory.addArg("--candidate");
-    compare_unit_storage_inventory.addArtifactArg(unit_storage_support_tests);
-    compare_unit_storage_inventory.addArtifactArg(unit_storage_engine_tests);
-    compare_unit_storage_inventory.addArtifactArg(unit_storage_db_core_tests);
+    compare_unit_storage_inventory.addArtifactArg2(unit_storage_support_tests, .{});
+    compare_unit_storage_inventory.addArtifactArg2(unit_storage_engine_tests, .{});
+    compare_unit_storage_inventory.addArtifactArg2(unit_storage_db_core_tests, .{});
     compare_unit_storage_inventory.addArgs(&.{ "--label", "storage consolidation" });
     const unit_storage_inventory_step = b.step(
         "unit-storage-test-inventory",
@@ -8279,7 +8272,7 @@ pub fn build(b: *std.Build) void {
         run_db_core_partitioned_tests.setName("run test storage-db-core-tests partitioned");
         run_db_core_partitioned_tests.addFileArg(b.path("tools/run_test_partitions.py"));
         run_db_core_partitioned_tests.addArg("--executable");
-        run_db_core_partitioned_tests.addArtifactArg(unit_storage_db_core_tests);
+        run_db_core_partitioned_tests.addArtifactArg2(unit_storage_db_core_tests, .{});
         for (unit_storage_db_core_lane_filters) |lane_filter| {
             run_db_core_partitioned_tests.addArgs(&.{ "--partition-filter", lane_filter });
         }
@@ -8487,9 +8480,9 @@ pub fn build(b: *std.Build) void {
     compare_unit_metadata_inventory.setName("compare consolidated metadata test inventory");
     compare_unit_metadata_inventory.addFileArg(b.path("tools/compare_test_inventories.py"));
     compare_unit_metadata_inventory.addArg("--baseline");
-    for (unit_metadata_baseline_tests) |tests| compare_unit_metadata_inventory.addArtifactArg(tests);
+    for (unit_metadata_baseline_tests) |tests| compare_unit_metadata_inventory.addArtifactArg2(tests, .{});
     compare_unit_metadata_inventory.addArg("--candidate");
-    for (unit_metadata_tests) |tests| compare_unit_metadata_inventory.addArtifactArg(tests);
+    for (unit_metadata_tests) |tests| compare_unit_metadata_inventory.addArtifactArg2(tests, .{});
     compare_unit_metadata_inventory.addArgs(&.{ "--label", "metadata consolidation" });
     const unit_metadata_inventory_step = b.step(
         "unit-metadata-test-inventory",
@@ -10324,11 +10317,11 @@ pub fn build(b: *std.Build) void {
     run_recall_checks.setName("run storage and per-metric recall checks concurrently");
     run_recall_checks.addFileArg(b.path("tools/run_recall_checks.py"));
     run_recall_checks.addArg("--test-executable");
-    run_recall_checks.addArtifactArg(compiled_recall_tests);
+    run_recall_checks.addArtifactArg2(compiled_recall_tests, .{});
     run_recall_checks.addArg("--harness-executable");
-    run_recall_checks.addArtifactArg(recall_harness);
+    run_recall_checks.addArtifactArg2(recall_harness, .{});
     run_recall_checks.addArg("--dataset-dir");
-    run_recall_checks.addDirectoryArg(b.path("testdata/vectorsets"));
+    run_recall_checks.addDirectoryArg2(b.path("testdata/vectorsets"), .{});
     run_recall_checks.stdio = .inherit;
     run_recall_checks.step.max_rss = 12 * 1024 * 1024 * 1024;
     const recall_ci_test_step = b.step(
@@ -10577,9 +10570,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_lite_core_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_lite_core_cli_smoke.addArtifactArg(lite_core_main);
+    run_lite_core_cli_smoke.addArtifactArg2(lite_core_main, .{});
     const run_lite_full_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_lite_full_cli_smoke.addArtifactArg(antfly_main);
+    run_lite_full_cli_smoke.addArtifactArg2(antfly_main, .{});
     const lite_cli_smoke_step = b.step("lite-cli-smoke", "Run black-box Antfly Lite CLI smoke tests");
     lite_cli_smoke_step.dependOn(&run_lite_core_cli_smoke.step);
     lite_cli_smoke_step.dependOn(&run_lite_full_cli_smoke.step);

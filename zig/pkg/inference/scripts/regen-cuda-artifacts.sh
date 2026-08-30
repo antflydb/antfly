@@ -122,8 +122,8 @@ elif [ -n "${ANTFLY_ZIG:-}" ]; then
   zig_bin="$ANTFLY_ZIG"
 elif [ -n "${ZIG:-}" ]; then
   zig_bin="$ZIG"
-elif [ -x "$repo_dir/.tools/zig-x86_64-linux-0.17.0-dev.1933+e19a73c2d/zig" ]; then
-  zig_bin="$repo_dir/.tools/zig-x86_64-linux-0.17.0-dev.1933+e19a73c2d/zig"
+elif [ -x "$repo_dir/.tools/zig-x86_64-linux-0.17.0-dev.1936+5a625d5f3/zig" ]; then
+  zig_bin="$repo_dir/.tools/zig-x86_64-linux-0.17.0-dev.1936+5a625d5f3/zig"
 elif command -v zig >/dev/null 2>&1; then
   zig_bin="$(command -v zig)"
 else

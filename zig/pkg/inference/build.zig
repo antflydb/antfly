@@ -80,15 +80,15 @@ fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.
     const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse
         std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
         return;
-    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
-    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+    module.addSystemIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/usr/include", .{sdk_root})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk_root})));
+    module.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
 }
 
 fn addRootedLibraryPaths(b: *std.Build, module: *std.Build.Module, root: []const u8) void {
-    module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
-    module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
+    module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{root})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{root})));
+    module.addRPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{root})));
 }
 
 fn configureSystemBlas(
@@ -131,9 +131,9 @@ fn configureOnnxRuntime(
     onnx_root: []const u8,
 ) void {
     if (!enable_onnx) return;
-    module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{onnx_root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
-    module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
+    module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{onnx_root})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
+    module.addRPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
     module.linkSystemLibrary("onnxruntime", .{});
     module.linkSystemLibrary("onnxruntime-genai", .{});
 }
@@ -494,7 +494,7 @@ pub fn build(b: *std.Build) void {
         run_quant_kernel_metal_runtime_route_all.has_side_effects = true;
         run_quant_kernel_metal_runtime_route_all.addArg("--evidence-out");
         const route_all_evidence_name = "antfly-quant-metal-runtime-route-all-evidence.json";
-        const route_all_evidence = run_quant_kernel_metal_runtime_route_all.addOutputFileArg(route_all_evidence_name);
+        const route_all_evidence = run_quant_kernel_metal_runtime_route_all.addOutputFileArg2(route_all_evidence_name, .{});
         run_quant_kernel_metal_runtime_route_all.addArg("--runtime-route-all");
         const check_quant_kernel_metal_runtime_route_all = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
         check_quant_kernel_metal_runtime_route_all.addArg("--check-evidence");
@@ -511,7 +511,7 @@ pub fn build(b: *std.Build) void {
         run_quant_kernel_metal_production_regression.has_side_effects = true;
         run_quant_kernel_metal_production_regression.addArg("--evidence-out");
         const production_regression_evidence_name = "antfly-quant-metal-production-regression-evidence.json";
-        _ = run_quant_kernel_metal_production_regression.addOutputFileArg(production_regression_evidence_name);
+        _ = run_quant_kernel_metal_production_regression.addOutputFileArg2(production_regression_evidence_name, .{});
         run_quant_kernel_metal_production_regression.addArgs(&.{
             "--repeat-runs",
             "5",
@@ -532,7 +532,7 @@ pub fn build(b: *std.Build) void {
             "--blocker-evidence-dir",
         });
         const blocker_evidence_dir_name = "antfly-quant-metal-blocker-evidence";
-        const blocker_evidence_dir = refresh_quant_kernel_metal_blocker_evidence.addOutputDirectoryArg(blocker_evidence_dir_name);
+        const blocker_evidence_dir = refresh_quant_kernel_metal_blocker_evidence.addOutputDirectoryArg2(blocker_evidence_dir_name, .{});
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             refresh_quant_kernel_metal_blocker_evidence.step.dependOn(metal_artifact_check_step);
         }
@@ -544,7 +544,7 @@ pub fn build(b: *std.Build) void {
             "--check-blocker-evidence",
             "--blocker-evidence-dir",
         });
-        check_quant_kernel_metal_blocker_evidence.addDirectoryArg(blocker_evidence_dir);
+        check_quant_kernel_metal_blocker_evidence.addDirectoryArg2(blocker_evidence_dir, .{});
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             check_quant_kernel_metal_blocker_evidence.step.dependOn(metal_artifact_check_step);
         }
@@ -558,7 +558,7 @@ pub fn build(b: *std.Build) void {
             "--fail-on-cleared-blocker",
             "--blocker-evidence-dir",
         });
-        strict_quant_kernel_metal_blocker_evidence.addDirectoryArg(blocker_evidence_dir);
+        strict_quant_kernel_metal_blocker_evidence.addDirectoryArg2(blocker_evidence_dir, .{});
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             strict_quant_kernel_metal_blocker_evidence.step.dependOn(metal_artifact_check_step);
         }
@@ -650,7 +650,7 @@ pub fn build(b: *std.Build) void {
             &.{},
         );
         compile_score_prework_hd256.addFileArg(b.path("src/ops/cuda/generated/attention_decode_score_prework_hd256.cu"));
-        const score_prework_hd256_cubin = compile_score_prework_hd256.addOutputFileArg("attention_decode_score_prework_hd256.sm89.cubin");
+        const score_prework_hd256_cubin = compile_score_prework_hd256.addOutputFileArg2("attention_decode_score_prework_hd256.sm89.cubin", .{});
 
         const compile_score_prework_hd512 = addTrackedScriptCommand(
             b,
@@ -659,7 +659,7 @@ pub fn build(b: *std.Build) void {
             &.{},
         );
         compile_score_prework_hd512.addFileArg(b.path("src/ops/cuda/generated/attention_decode_score_prework_hd512.cu"));
-        const score_prework_hd512_cubin = compile_score_prework_hd512.addOutputFileArg("attention_decode_score_prework_hd512.sm89.cubin");
+        const score_prework_hd512_cubin = compile_score_prework_hd512.addOutputFileArg2("attention_decode_score_prework_hd512.sm89.cubin", .{});
 
         const quant_kernel_cuda_paged_attention_diff_exe = b.addExecutable(.{
             .name = "antfly-quant-kernel-cuda-paged-attention-diff",
