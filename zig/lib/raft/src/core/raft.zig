@@ -1371,6 +1371,11 @@ pub const Raft = struct {
 
         var snapshot = try self.storage.snapshot(self.alloc);
         errdefer snapshot.deinit(self.alloc);
+        // Snapshot transport is permitted to outlive this Ready turn. Promote
+        // the immutable payload before the message is cloned so asynchronous
+        // delivery retains only a reference instead of copying potentially
+        // gigabytes once per queue boundary.
+        try snapshot.shareOwnedData(self.alloc, null);
 
         try self.send(.{
             .msg_type = .snapshot,

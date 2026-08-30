@@ -283,6 +283,15 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_async_send_queue_full_total", "counter", "Total async raft HTTP global queue-full events", host_metrics.async_send_queue_full);
         try append(writer, "antfly_raft_async_send_peer_queue_full_total", "counter", "Total async raft HTTP per-peer queue-full events", host_metrics.async_send_peer_queue_full);
         try append(writer, "antfly_raft_async_send_pending", "gauge", "Pending async raft HTTP frames", @intCast(host_metrics.async_send_pending));
+        try append(writer, "antfly_raft_async_snapshot_send_enqueued_total", "counter", "Total raft snapshots admitted to the bounded async HTTP send lane", host_metrics.async_snapshot_send_enqueued);
+        try append(writer, "antfly_raft_async_snapshot_send_failed_total", "counter", "Total async raft snapshot HTTP send failures", host_metrics.async_snapshot_send_failed);
+        try append(writer, "antfly_raft_async_snapshot_send_retried_total", "counter", "Total async raft snapshot sends requeued for retry", host_metrics.async_snapshot_send_retried);
+        try append(writer, "antfly_raft_async_snapshot_send_dropped_total", "counter", "Total async raft snapshot sends dropped after permanent failure or retry exhaustion", host_metrics.async_snapshot_send_dropped);
+        try append(writer, "antfly_raft_async_snapshot_send_deduplicated_total", "counter", "Total duplicate raft snapshot sends coalesced into an existing job", host_metrics.async_snapshot_send_deduplicated);
+        try append(writer, "antfly_raft_async_snapshot_send_queue_full_total", "counter", "Total async raft snapshot global queue or byte-budget denials", host_metrics.async_snapshot_send_queue_full);
+        try append(writer, "antfly_raft_async_snapshot_send_peer_queue_full_total", "counter", "Total async raft snapshot per-peer queue denials", host_metrics.async_snapshot_send_peer_queue_full);
+        try append(writer, "antfly_raft_async_snapshot_send_pending", "gauge", "Queued and active async raft snapshot sends", @intCast(host_metrics.async_snapshot_send_pending));
+        try append(writer, "antfly_raft_async_snapshot_send_pending_bytes", "gauge", "Logical snapshot payload bytes retained by the async send lane", @intCast(host_metrics.async_snapshot_send_pending_bytes));
 
         try append(writer, "antfly_service_queued_updates", "gauge", "Pending metadata updates waiting to apply", @intCast(svc_metrics.queued_updates));
         try append(writer, "antfly_service_applied_updates_total", "counter", "Total applied metadata updates", @intCast(svc_metrics.applied_updates));

@@ -7353,6 +7353,10 @@ pub const ProvisionedTableWriteSource = struct {
     // Serializes journal publication/recovery and tracks in-flight plans so a
     // scanner cannot classify a just-prepared record before its catalog CAS.
     replica_retirement_intent_mutex: std.atomic.Mutex = .unlocked,
+    // Journal I/O is serialized only for the same deterministic batch stripe;
+    // unrelated topology changes never hold the ownership mutex across disk
+    // access or fsync.
+    replica_retirement_journal_locks: [256]std.atomic.Mutex = [_]std.atomic.Mutex{.unlocked} ** 256,
     active_replica_retirement_intents: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     // A recovery lease is group-scoped. Directory scans and ownership probes
     // never hold the intent mutex, so a slow replica cannot convoy unrelated
@@ -8334,7 +8338,10 @@ pub const ProvisionedTableWriteSource = struct {
     fn removeDroppedTableRepairIntent(path: []const u8) !void {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        const io = io_impl.io();
+        try removeDroppedTableRepairIntentWithIo(io_impl.io(), path);
+    }
+
+    fn removeDroppedTableRepairIntentWithIo(io: std.Io, path: []const u8) !void {
         std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
@@ -8679,45 +8686,52 @@ pub const ProvisionedTableWriteSource = struct {
         return retry_required;
     }
 
+    fn replicaRetirementJournalLock(self: *ProvisionedTableWriteSource, path: []const u8) *std.atomic.Mutex {
+        const index: usize = @intCast(std.hash.Wyhash.hash(0, path) % self.replica_retirement_journal_locks.len);
+        return &self.replica_retirement_journal_locks[index];
+    }
+
+    fn releaseActiveReplicaRetirementIntents(
+        self: *ProvisionedTableWriteSource,
+        intents: []const PersistedReplicaRetirementIntent,
+    ) bool {
+        var any_active = false;
+        lockAtomic(&self.replica_retirement_intent_mutex);
+        defer self.replica_retirement_intent_mutex.unlock();
+        for (intents) |intent| {
+            const active = self.active_replica_retirement_intents.getPtr(intent.group_id) orelse continue;
+            std.debug.assert(active.* > 0);
+            active.* -= 1;
+            if (active.* == 0) {
+                _ = self.active_replica_retirement_intents.remove(intent.group_id);
+            } else {
+                any_active = true;
+            }
+        }
+        return any_active;
+    }
+
     pub fn prepareReplicaRetirements(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         targets: []const ReplicaRetirementTarget,
     ) !PreparedReplicaRetirements {
-        // Reject malformed or unpersistable batches before taking the global
-        // retirement lock, growing registries, or cloning caller-owned names.
         try preflightReplicaRetirementBatch(targets);
-        lockAtomic(&self.replica_retirement_intent_mutex);
-        defer self.replica_retirement_intent_mutex.unlock();
         if (targets.len == 0) return .{
             .alloc = alloc,
             .intents = try alloc.alloc(PersistedReplicaRetirementIntent, 0),
         };
-        for (targets) |target| {
-            if (self.recovering_replica_retirement_intents.contains(target.group_id))
-                return error.ReplicaRetirementRecoveryInProgress;
-        }
-        try self.active_replica_retirement_intents.ensureUnusedCapacity(
-            std.heap.page_allocator,
-            std.math.cast(u32, targets.len) orelse return error.ReplicaRetirementBatchTooLarge,
-        );
+
+        // Clone and canonicalize caller memory before reserving any shared
+        // state. The short ownership phase below contains no filesystem work.
         const intents = try alloc.alloc(PersistedReplicaRetirementIntent, targets.len);
         var initialized: usize = 0;
-        var batch_path: ?[]u8 = null;
-        var batch_created = false;
         errdefer {
             for (intents[0..initialized]) |intent| {
-                if (self.active_replica_retirement_intents.getPtr(intent.group_id)) |active| {
-                    std.debug.assert(active.* > 0);
-                    active.* -= 1;
-                    if (active.* == 0) _ = self.active_replica_retirement_intents.remove(intent.group_id);
-                }
                 var owned_intent = intent;
                 owned_intent.deinit(alloc);
             }
             alloc.free(intents);
-            if (batch_created) removeDroppedTableRepairIntent(batch_path.?) catch {};
-            if (batch_path) |path| alloc.free(path);
         }
         for (targets, intents) |target, *intent| {
             const name = if (target.table_name) |value| try alloc.dupe(u8, value) else null;
@@ -8739,13 +8753,45 @@ pub const ProvisionedTableWriteSource = struct {
 
         const dir_path = try replicaRetirementDirPath(alloc, self.replica_root_dir);
         defer alloc.free(dir_path);
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
+        const batch_path = try replicaRetirementBatchPath(alloc, self.replica_root_dir, intents);
+        errdefer alloc.free(batch_path);
+
+        lockAtomic(&self.replica_retirement_intent_mutex);
+        for (intents) |intent| {
+            if (self.recovering_replica_retirement_intents.contains(intent.group_id)) {
+                self.replica_retirement_intent_mutex.unlock();
+                return error.ReplicaRetirementRecoveryInProgress;
+            }
+        }
+        self.active_replica_retirement_intents.ensureUnusedCapacity(
+            std.heap.page_allocator,
+            std.math.cast(u32, intents.len) orelse {
+                self.replica_retirement_intent_mutex.unlock();
+                return error.ReplicaRetirementBatchTooLarge;
+            },
+        ) catch |err| {
+            self.replica_retirement_intent_mutex.unlock();
+            return err;
+        };
+        for (intents) |intent| {
+            const active = self.active_replica_retirement_intents.getOrPutAssumeCapacity(intent.group_id);
+            if (!active.found_existing) active.value_ptr.* = 0;
+            active.value_ptr.* += 1;
+        }
+        self.replica_retirement_intent_mutex.unlock();
+        errdefer _ = self.releaseActiveReplicaRetirementIntents(intents);
+
+        // Same-batch publication is serialized by a bounded stripe while
+        // unrelated batches proceed independently on the source-owned I/O
+        // service. Active claims keep recovery from classifying the record.
+        const journal_lock = self.replicaRetirementJournalLock(batch_path);
+        lockAtomic(journal_lock);
+        defer journal_lock.unlock();
+        const io = self.table_activity_threaded.io();
         try fs_paths.createDirPathPortable(io, dir_path);
-        batch_path = try replicaRetirementBatchPath(alloc, self.replica_root_dir, intents);
-        if (std.Io.Dir.cwd().access(io, batch_path.?, .{})) |_| {
-            var persisted = try loadReplicaRetirementBatch(alloc, io, batch_path.?);
+        var batch_created = false;
+        if (std.Io.Dir.cwd().access(io, batch_path, .{})) |_| {
+            var persisted = try loadReplicaRetirementBatch(alloc, io, batch_path);
             defer persisted.deinit(alloc);
             if (persisted.intents.len != intents.len)
                 return error.InvalidReplicaRetirementIntent;
@@ -8756,15 +8802,10 @@ pub const ProvisionedTableWriteSource = struct {
             }
         } else |err| switch (err) {
             error.FileNotFound => {
-                try writeReplicaRetirementBatch(alloc, io, dir_path, batch_path.?, intents, .prepared);
+                try writeReplicaRetirementBatch(alloc, io, dir_path, batch_path, intents, .prepared);
                 batch_created = true;
             },
             else => return err,
-        }
-        for (intents) |intent| {
-            const active = self.active_replica_retirement_intents.getOrPutAssumeCapacity(intent.group_id);
-            if (!active.found_existing) active.value_ptr.* = 0;
-            active.value_ptr.* += 1;
         }
         return .{
             .alloc = alloc,
@@ -8779,18 +8820,9 @@ pub const ProvisionedTableWriteSource = struct {
         prepared: *const PreparedReplicaRetirements,
     ) void {
         var recovery_required = false;
-        lockAtomic(&self.replica_retirement_intent_mutex);
-        var any_active = false;
-        for (prepared.intents) |intent| {
-            const active = self.active_replica_retirement_intents.getPtr(intent.group_id) orelse continue;
-            std.debug.assert(active.* > 0);
-            active.* -= 1;
-            if (active.* != 0) {
-                any_active = true;
-                continue;
-            }
-            _ = self.active_replica_retirement_intents.remove(intent.group_id);
-            if (prepared.batch_path != null) continue;
+        const any_active = self.releaseActiveReplicaRetirementIntents(prepared.intents);
+        const io = self.table_activity_threaded.io();
+        if (prepared.batch_path == null) for (prepared.intents) |intent| {
             // A pre-existing record may belong to an earlier committed
             // retirement. This failed preparation did not create it and must
             // not cancel its recovery ownership.
@@ -8798,11 +8830,11 @@ pub const ProvisionedTableWriteSource = struct {
                 recovery_required = true;
                 continue;
             }
-            removeDroppedTableRepairIntent(intent.path) catch |err| {
+            removeDroppedTableRepairIntentWithIo(io, intent.path) catch |err| {
                 std.log.warn("uncommitted replica-retirement intent retained path={s} err={s}", .{ intent.path, @errorName(err) });
                 recovery_required = true;
             };
-        }
+        };
         if (prepared.batch_path) |path| batch_cancel: {
             if (any_active) break :batch_cancel;
             if (!prepared.batch_created) {
@@ -8811,9 +8843,10 @@ pub const ProvisionedTableWriteSource = struct {
             }
             // Another holder may have committed this shared batch before the
             // creator cancelled. Never erase a committed recovery proof.
-            var io_impl = std.Io.Threaded.init(prepared.alloc, .{});
-            defer io_impl.deinit();
-            var loaded_batch = loadReplicaRetirementBatch(prepared.alloc, io_impl.io(), path) catch |err| {
+            const journal_lock = self.replicaRetirementJournalLock(path);
+            lockAtomic(journal_lock);
+            defer journal_lock.unlock();
+            var loaded_batch = loadReplicaRetirementBatch(prepared.alloc, io, path) catch |err| {
                 std.log.warn("uncommitted replica-retirement batch inspection deferred path={s} err={s}", .{ path, @errorName(err) });
                 recovery_required = true;
                 break :batch_cancel;
@@ -8823,12 +8856,11 @@ pub const ProvisionedTableWriteSource = struct {
                 recovery_required = true;
                 break :batch_cancel;
             }
-            removeDroppedTableRepairIntent(path) catch |err| {
+            removeDroppedTableRepairIntentWithIo(io, path) catch |err| {
                 std.log.warn("uncommitted replica-retirement batch retained path={s} err={s}", .{ path, @errorName(err) });
                 recovery_required = true;
             };
         }
-        self.replica_retirement_intent_mutex.unlock();
         if (recovery_required and self.backend_runtime != null) self.scheduleDroppedTableRecovery();
     }
 
@@ -8838,23 +8870,24 @@ pub const ProvisionedTableWriteSource = struct {
     ) !void {
         var first_error: ?anyerror = null;
 
-        // Publish the committed phase before releasing the in-process fence.
-        // If a phase write fails, catalog classification still repairs it on
-        // the next scan without ever guessing whether the CAS committed.
-        lockAtomic(&self.replica_retirement_intent_mutex);
+        // Publish the committed phase while the active claims still fence
+        // recovery, but never hold the ownership mutex across allocation,
+        // filesystem access, or fsync.
         const dir_path = replicaRetirementDirPath(prepared.alloc, self.replica_root_dir) catch |err| blk: {
             first_error = err;
             break :blk null;
         };
         defer if (dir_path) |path| prepared.alloc.free(path);
-        var io_impl = std.Io.Threaded.init(prepared.alloc, .{});
-        defer io_impl.deinit();
+        const io = self.table_activity_threaded.io();
         var directory_dirty = false;
         if (prepared.batch_path) |path| {
             if (dir_path) |directory| {
+                const journal_lock = self.replicaRetirementJournalLock(path);
+                lockAtomic(journal_lock);
+                defer journal_lock.unlock();
                 writeReplicaRetirementBatch(
                     prepared.alloc,
-                    io_impl.io(),
+                    io,
                     directory,
                     path,
                     prepared.intents,
@@ -8865,15 +8898,17 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         for (prepared.intents) |intent| {
-            const group_id = intent.group_id;
             if (prepared.batch_path == null) if (dir_path) |path| {
                 const wrote = wrote: {
+                    const journal_lock = self.replicaRetirementJournalLock(intent.path);
+                    lockAtomic(journal_lock);
+                    defer journal_lock.unlock();
                     writeReplicaRetirementIntent(
                         prepared.alloc,
-                        io_impl.io(),
+                        io,
                         path,
                         intent.path,
-                        group_id,
+                        intent.group_id,
                         intent.table_name,
                         .committed,
                         false,
@@ -8885,18 +8920,13 @@ pub const ProvisionedTableWriteSource = struct {
                 };
                 directory_dirty = directory_dirty or wrote;
             };
-            if (self.active_replica_retirement_intents.getPtr(group_id)) |active| {
-                std.debug.assert(active.* > 0);
-                active.* -= 1;
-                if (active.* == 0) _ = self.active_replica_retirement_intents.remove(group_id);
-            }
         }
         if (directory_dirty) {
-            if (dir_path) |path| fs_paths.syncDirPortable(io_impl.io(), path) catch |err| {
+            if (dir_path) |path| fs_paths.syncDirPortable(io, path) catch |err| {
                 first_error = first_error orelse err;
             };
         }
-        self.replica_retirement_intent_mutex.unlock();
+        _ = self.releaseActiveReplicaRetirementIntents(prepared.intents);
 
         // Catalog removal and the committed sidecar are the synchronous
         // durability boundary. Cache drains, exclusive read-cache waits,

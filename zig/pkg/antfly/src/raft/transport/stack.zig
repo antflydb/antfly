@@ -30,7 +30,7 @@ pub const HttpTransportStack = struct {
     alloc: std.mem.Allocator,
     driver: *http_driver.HttpFrameDriver,
     transport_host: raft_engine.runtime.CodecTransportHost,
-    snapshot_transport: http_snapshot.HttpSnapshotTransport,
+    snapshot_transport: *http_snapshot.HttpSnapshotTransport,
     owned_io_impl: ?*std.Io.Threaded = null,
 
     pub fn init(
@@ -63,6 +63,18 @@ pub const HttpTransportStack = struct {
         } else {
             driver.* = http_driver.HttpFrameDriver.init(alloc, cfg.driver, executor, driver_io);
         }
+        errdefer driver.deinit();
+        const snapshot_transport = try alloc.create(http_snapshot.HttpSnapshotTransport);
+        errdefer alloc.destroy(snapshot_transport);
+        snapshot_transport.* = try http_snapshot.HttpSnapshotTransport.initShared(
+            alloc,
+            cfg.snapshot,
+            executor,
+            snapshot_resolver,
+            driver_io,
+        );
+        errdefer snapshot_transport.deinit();
+        try snapshot_transport.startAsyncSender();
         return .{
             .alloc = alloc,
             .driver = driver,
@@ -72,13 +84,7 @@ pub const HttpTransportStack = struct {
                 driver.frameDriver(),
                 cfg.retry_policy,
             ),
-            .snapshot_transport = try http_snapshot.HttpSnapshotTransport.initShared(
-                alloc,
-                cfg.snapshot,
-                executor,
-                snapshot_resolver,
-                driver_io,
-            ),
+            .snapshot_transport = snapshot_transport,
             .owned_io_impl = owned_io_impl,
         };
     }
@@ -86,6 +92,7 @@ pub const HttpTransportStack = struct {
     pub fn deinit(self: *HttpTransportStack) void {
         self.transport_host.deinit();
         self.snapshot_transport.deinit();
+        self.alloc.destroy(self.snapshot_transport);
         self.driver.deinit();
         self.alloc.destroy(self.driver);
         if (self.owned_io_impl) |io_impl| {
@@ -104,6 +111,10 @@ pub const HttpTransportStack = struct {
 
     pub fn asyncSendMetricsSnapshot(self: *HttpTransportStack) http_driver.AsyncSendMetricsSnapshot {
         return self.driver.metricsSnapshot();
+    }
+
+    pub fn asyncSnapshotSendMetricsSnapshot(self: *HttpTransportStack) http_snapshot.AsyncSnapshotSendMetricsSnapshot {
+        return self.snapshot_transport.asyncSendMetricsSnapshot();
     }
 
     pub fn makeServer(

@@ -154,6 +154,17 @@ pub const FileSnapshotStore = struct {
 
         const io_ctx = io(self);
         try fs_paths.createDirPathPortable(io_ctx, self.root_dir);
+        if (self.committedSnapshotMatches(io_ctx, committed_path, body)) |matches| {
+            // Snapshot identifiers are immutable generation keys. A sender may
+            // legitimately retry after losing the successful response, so an
+            // exact replay is success without consuming a second quota slot.
+            // Reusing the identifier for different bytes is always a conflict.
+            if (matches) return;
+            return error.SnapshotGenerationMismatch;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
         try self.admitArtifact(staging_path, body.len);
         var file = try fs_paths.createFilePortable(io_ctx, staging_path, .{ .truncate = true });
         var file_open = true;
@@ -170,6 +181,28 @@ pub const FileSnapshotStore = struct {
         // artifact or the new complete artifact, never a torn body.
         try std.Io.Dir.rename(std.Io.Dir.cwd(), staging_path, std.Io.Dir.cwd(), committed_path, io_ctx);
         try fs_paths.syncDirPortable(io_ctx, self.root_dir);
+    }
+
+    fn committedSnapshotMatches(
+        self: *FileSnapshotStore,
+        io_ctx: std.Io,
+        path: []const u8,
+        expected: []const u8,
+    ) !bool {
+        _ = self;
+        var file = try std.Io.Dir.cwd().openFile(io_ctx, path, .{});
+        defer file.close(io_ctx);
+        if ((try file.stat(io_ctx)).size != expected.len) return false;
+        var reader = file.reader(io_ctx, &.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        var offset: usize = 0;
+        while (offset < expected.len) {
+            const read = try reader.interface.readSliceShort(&buffer);
+            if (read == 0 or !std.mem.eql(u8, buffer[0..read], expected[offset .. offset + read]))
+                return false;
+            offset += read;
+        }
+        return (try reader.interface.readSliceShort(buffer[0..1])) == 0;
     }
 
     fn getSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8) ![]u8 {
@@ -1066,6 +1099,38 @@ test "file snapshot store resumes chunks and atomically verifies commit" {
         error.FileNotFound,
         iface.vtable.get_snapshot_manifest.?(iface.ptr, std.testing.allocator, "snap-v2"),
     );
+}
+
+test "legacy snapshot retry is idempotent under a full artifact quota" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/raft-snaps-legacy-retry",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root_dir);
+    const body = "immutable-legacy-snapshot";
+    var store = try FileSnapshotStore.init(std.testing.allocator, .{
+        .root_dir = root_dir,
+        .artifact_policy = .{ .max_bytes = body.len, .max_count = 1 },
+    });
+    defer store.deinit();
+    const iface = store.store();
+
+    try iface.putSnapshot(std.testing.allocator, "legacy-retry", body);
+    try iface.putSnapshot(std.testing.allocator, "legacy-retry", body);
+    try std.testing.expectError(
+        error.SnapshotGenerationMismatch,
+        iface.putSnapshot(std.testing.allocator, "legacy-retry", "different-legacy-bytes"),
+    );
+
+    const persisted = try iface.getSnapshot(std.testing.allocator, "legacy-retry");
+    defer std.testing.allocator.free(persisted);
+    try std.testing.expectEqualStrings(body, persisted);
+    const usage = try store.artifactUsage();
+    try std.testing.expectEqual(@as(usize, 1), usage.count);
+    try std.testing.expectEqual(@as(u64, body.len), usage.bytes);
 }
 
 test "committed chunked snapshot protocol retry reuses one artifact quota" {

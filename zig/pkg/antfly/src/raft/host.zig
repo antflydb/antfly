@@ -214,6 +214,15 @@ pub const HostMetrics = struct {
     async_send_queue_full: u64 = 0,
     async_send_peer_queue_full: u64 = 0,
     async_send_pending: usize = 0,
+    async_snapshot_send_enqueued: u64 = 0,
+    async_snapshot_send_failed: u64 = 0,
+    async_snapshot_send_retried: u64 = 0,
+    async_snapshot_send_dropped: u64 = 0,
+    async_snapshot_send_deduplicated: u64 = 0,
+    async_snapshot_send_queue_full: u64 = 0,
+    async_snapshot_send_peer_queue_full: u64 = 0,
+    async_snapshot_send_pending: usize = 0,
+    async_snapshot_send_pending_bytes: usize = 0,
 };
 
 pub const HttpHostConfig = struct {
@@ -1286,6 +1295,16 @@ pub const HttpHost = struct {
         snapshot.async_send_queue_full = async_send.queue_full;
         snapshot.async_send_peer_queue_full = async_send.peer_queue_full;
         snapshot.async_send_pending = async_send.pending;
+        const async_snapshot_send = self.transport_stack.asyncSnapshotSendMetricsSnapshot();
+        snapshot.async_snapshot_send_enqueued = async_snapshot_send.enqueued;
+        snapshot.async_snapshot_send_failed = async_snapshot_send.failed;
+        snapshot.async_snapshot_send_retried = async_snapshot_send.retried;
+        snapshot.async_snapshot_send_dropped = async_snapshot_send.dropped;
+        snapshot.async_snapshot_send_deduplicated = async_snapshot_send.deduplicated;
+        snapshot.async_snapshot_send_queue_full = async_snapshot_send.queue_full;
+        snapshot.async_snapshot_send_peer_queue_full = async_snapshot_send.peer_queue_full;
+        snapshot.async_snapshot_send_pending = async_snapshot_send.pending;
+        snapshot.async_snapshot_send_pending_bytes = async_snapshot_send.pending_bytes;
         return snapshot;
     }
 
