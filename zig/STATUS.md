@@ -187,8 +187,8 @@ look current.
 Admission-critical facts remain in the metadata Raft projection: reporter
 incarnation/fence, repair state, native-restore identity, and the durable
 coverage/checkpoint identities used by readiness. That codec negotiates only
-the released v12 profile or current v15; it decodes historical versions 1–12
-and rejects unreleased v13/v14 artifacts.
+the exact v12 profile released by v0.2.0 or current v15. Every other numeric
+version is an unreleased development artifact and is rejected.
 
 Embedding work telemetry is a versioned, readiness-neutral heartbeat. The data
 owner publishes exact phase transitions and coalesced counter progress; the

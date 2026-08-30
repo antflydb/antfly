@@ -28,7 +28,10 @@ Antfly Lite uses two file types with different jobs:
 Do not use `.aflite` as an archival backup format. Create an `.afb` when you
 need a portable backup, a migration artifact, or a restore source for normal
 Antfly. AFB1 portable archives remain readable; new bundles use AFB2 and declare
-their representation explicitly.
+their representation explicitly. Current Lite backup/export commands emit a
+self-contained `full` bundle. AFB2 also defines exact-base `delta` bundles for
+incremental repository workflows; those are never silently treated as
+self-contained archives.
 
 <Callout type="info">
 Lite v1 does not include legacy fallback readers for pre-release directory or
@@ -242,6 +245,12 @@ Create an AFB2 bundle with the portable representation:
 ```bash
 antfly lite backup app.aflite --out app.afb
 ```
+
+This produces a self-contained `portable` + `full` bundle. Its manifest maps
+logical records to unique content digests, and a fixed trailer locates the
+digest index for bounded-memory restore. A delta bundle, when supplied by a
+repository/export workflow, requires the exact base-manifest digest named in
+the bundle and fails closed if that base is unavailable.
 
 `export` is an alias for backup:
 

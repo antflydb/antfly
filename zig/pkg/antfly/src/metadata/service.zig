@@ -7686,6 +7686,18 @@ test "metadata activity cache is versioned TTL-bound and incarnation scoped" {
     try std.testing.expectEqual(@as(u64, 77), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
     try std.testing.expectEqual(metadata_table_manager.RuntimeEmbeddingActivityStatusReport.Phase.embedding, current[0].runtime_statuses[0].indexes[0].embedding_activity.phase);
 
+    // Leadership does not transfer ephemeral observations. A newly elected
+    // metadata service starts unavailable, then resumes projection from the
+    // next current-incarnation owner heartbeat.
+    var new_leader_cache: EmbeddingActivityCache = .{};
+    defer new_leader_cache.deinit(alloc);
+    current[0].runtime_statuses[0].indexes[0].embedding_activity = .{};
+    new_leader_cache.overlay(alloc, &current, 102);
+    try std.testing.expectEqual(@as(u64, 0), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+    try new_leader_cache.update(alloc, &.{committed}, &.{report}, 103);
+    new_leader_cache.overlay(alloc, &current, 104);
+    try std.testing.expectEqual(@as(u64, 77), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+
     // Activity-only reports do not advance durable StoreRecord state. The
     // cache's own sequence fence must reject reordered observations.
     var stale_report = report;

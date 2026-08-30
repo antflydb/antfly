@@ -4363,9 +4363,7 @@ fn decodeMetadataIncarnationRecord(encoded: []const u8) !MetadataIncarnationReco
     pos += @sizeOf(u16);
     if (extension_version != metadata_incarnation_extension_version) return error.InvalidMetadataIncarnation;
     const runtime_status_record_version = std.mem.readInt(u16, encoded[pos..][0..@sizeOf(u16)], .little);
-    if (runtime_status_record_version < runtime_status_protocol.repair_status_record_version or
-        runtime_status_record_version > runtime_status_protocol.current_record_version)
-    {
+    if (runtime_status_record_version != runtime_status_protocol.current_record_version) {
         return error.InvalidMetadataIncarnation;
     }
     return .{
@@ -4389,8 +4387,8 @@ fn activateRuntimeStatusProtocolTxn(
         else => return err,
     };
     const decoded = try decodeMetadataIncarnationRecord(existing);
-    if (target_version < runtime_status_protocol.repair_status_record_version or
-        target_version > runtime_status_protocol.current_record_version) return error.InvalidMetadataTransitionEncoding;
+    if (target_version != runtime_status_protocol.current_record_version)
+        return error.InvalidMetadataTransitionEncoding;
     if (decoded.runtime_status_record_version >= target_version) return;
 
     const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);

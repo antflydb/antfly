@@ -68,11 +68,27 @@ blobs/sha256/<sha256>     -> immutable artifact bytes
 
 Every manifest declares table/catalog identity, an explicit `portable` or
 `native` representation, shard ranges, capture/checkpoint revisions,
-compatibility requirements, compression/encryption metadata, and the complete
-materialized blob inventory. A delta writes only blobs absent from its parent,
-but its manifest still lists the complete current inventory. The parent digest
-is therefore lineage and reachability information, not a restore dependency
-chain.
+compatibility requirements, compression/encryption metadata, and two complete
+inventories:
+
+- `objects`, sorted by logical path, map each restorable path and semantic role
+  to a blob digest. Shards list object paths, not bare digests.
+- `blobs`, sorted by digest, describe each unique stored byte sequence once.
+  Several objects may reference one blob without losing either path.
+
+That split is required for native restore: a digest-only inventory can prove
+bytes exist but cannot reconstruct their filenames. Manifest validation rejects
+unsafe/duplicate paths, dangling object references, size disagreement, missing
+catalog identity, non-canonical ordering, and shard membership outside the
+complete object inventory.
+
+A delta uploads only blobs absent from its parent, but its manifest still lists
+the complete current object and blob inventories. The parent digest is therefore
+lineage, accounting, and reachability information—not a chain that ordinary
+repository restore must replay. A repository restore resolves its ref once,
+pins that immutable manifest digest, downloads each unique blob once into a
+private staging cache, rehashes it, materializes all logical objects, and only
+then permits the owner to publish the generation.
 
 Refs are published with compare-and-swap semantics after all immutable objects
 are durable. Garbage collection marks manifests and blobs reachable from refs
@@ -80,14 +96,34 @@ and active leases, then applies a grace period before deletion. Failed writers
 cannot expose partial snapshots, and concurrent writers cannot silently replace
 one another.
 
+Publication order is part of the durability contract:
+
+1. stream and verify all missing `blobs/sha256/<digest>` objects with
+   create-if-absent semantics;
+2. write canonical manifest JSON to `manifests/<digest>` immutably;
+3. conditionally update `refs/<backup-id>` with the expected prior digest and
+   generation.
+
+A crash before step 3 leaves unreachable immutable content but no visible
+partial backup. Competing writers cannot silently replace one another. GC marks
+from live refs and unexpired restore/export leases, follows parent links for
+retention, and deletes only unmarked objects older than a grace cutoff.
+
 `.afb` is the transport layer over that model:
 
 - AFB1 remains readable as the released v0.2.0 portable format.
-- AFB2 has a representation-neutral root manifest, digest-addressed blob
-  records, bounded chunks, and a footer index from digest to byte offset.
+- AFB2 has a representation-neutral root manifest with the same logical-object
+  and unique-blob split. Each included digest has exactly one physical blob
+  record, even when several paths or portable records share its bytes. Payloads
+  use bounded chunks, the footer maps each digest to its byte offset, and a
+  fixed-size checksummed trailer locates that footer without scanning payloads.
 - AFB2 `full` is self-contained and is the normal offline/superquickstart
   artifact.
-- AFB2 `delta` declares a base manifest and carries only absent blobs.
+- AFB2 `delta` declares an immutable base-manifest digest and carries only
+  absent blobs. Both native and portable readers require an exact matching base
+  provider, rehash every supplied base blob, and reject missing or mismatched
+  bases. Delta manifests remain complete inventories; only their physical
+  payload is partial.
 - Native and portable are manifest values, never inferred from file extension
   or CLI flags during restore.
 - Compression and encryption are declared capabilities, not hints. Current
@@ -96,9 +132,13 @@ one another.
   codec/key-provider implementation is installed.
 
 Remote repositories stay unpacked for deduplication, range access, and
-incremental capture. Exporting one snapshot to a file packs its reachable
-manifest and blobs into AFB2; importing verifies the same hashes before
-publishing them into a repository or native restore staging generation.
+incremental capture. The repository backend contract has streamed file upload
+and materialization operations so native artifacts do not become whole-object
+heap allocations. Exporting one snapshot to a file packs its reachable manifest
+and blobs into AFB2; importing verifies the same hashes before publishing them
+into a repository or native restore staging generation. Portable replay uses
+the footer index for bounded-memory positional reads rather than caching the
+whole archive.
 
 - The Go OpenAPI remains the public contract source.
 - Zig must use the same public request and response structure as the Go

@@ -18,6 +18,8 @@ pub const max_manifest_bytes: usize = 16 * 1024 * 1024;
 pub const max_objects: usize = 1_000_000;
 pub const max_path_bytes: usize = 4096;
 pub const native_chunk_target_bytes: usize = 4 * 1024 * 1024;
+pub const trailer_magic = [8]u8{ 'A', 'F', 'B', '2', 'I', 'D', 'X', '\n' };
+pub const trailer_size: usize = 32;
 
 pub const Representation = enum { portable, native };
 pub const SnapshotMode = enum { full, delta };
@@ -39,9 +41,16 @@ pub const ObjectDescriptor = struct {
     role: []const u8,
     size_bytes: u64,
     sha256: []const u8,
-    /// Full bundles include every object. Delta manifests still describe the
-    /// complete materialized snapshot, but set this false for objects supplied
-    /// by the declared base manifest.
+};
+
+pub const BlobDescriptor = struct {
+    sha256: []const u8,
+    logical_size_bytes: u64,
+    stored_size_bytes: u64,
+    compression: Compression = .none,
+    /// Full bundles include every unique blob. Delta manifests still describe
+    /// the complete materialized snapshot, but set this false for content
+    /// supplied by the exact declared base manifest.
     included: bool = true,
 };
 
@@ -62,9 +71,12 @@ pub const Manifest = struct {
     compression: Compression = .none,
     encryption: ?Encryption = null,
     /// Complete materialized inventory. In delta mode only descriptors marked
-    /// `included` have blob records in this container; restore resolves the
-    /// others from the exact parent manifest before atomic publication.
+    /// by the unique blob inventory have records in this container; restore
+    /// resolves the others from the exact parent manifest before publication.
     objects: []const ObjectDescriptor = &.{},
+    /// Digest-sorted unique physical inventory. Logical objects map paths and
+    /// roles to these blobs, so duplicate content is emitted exactly once.
+    blobs: []const BlobDescriptor = &.{},
 };
 
 pub fn encodeManifestAlloc(alloc: std.mem.Allocator, manifest: Manifest) ![]u8 {
@@ -109,7 +121,24 @@ pub fn validateManifest(manifest: Manifest) !void {
             try validateSha256(parent);
         },
     }
-    if (manifest.objects.len > max_objects) return error.BackupManifestTooLarge;
+    if (manifest.objects.len > max_objects or manifest.blobs.len > max_objects)
+        return error.BackupManifestTooLarge;
+    if ((manifest.objects.len == 0) != (manifest.blobs.len == 0))
+        return error.IncompleteBackupInventory;
+
+    var previous_digest: ?[]const u8 = null;
+    for (manifest.blobs) |blob| {
+        try validateSha256(blob.sha256);
+        if (blob.compression == .none and blob.logical_size_bytes != blob.stored_size_bytes)
+            return error.InvalidBackupManifest;
+        if (manifest.mode == .full and !blob.included)
+            return error.IncompleteBackupInventory;
+        if (previous_digest) |previous| {
+            if (std.mem.order(u8, previous, blob.sha256) != .lt)
+                return error.NonCanonicalBackupManifest;
+        }
+        previous_digest = blob.sha256;
+    }
     var previous_path: ?[]const u8 = null;
     for (manifest.objects) |object| {
         try validateRelativePath(object.logical_path);
@@ -121,14 +150,35 @@ pub fn validateManifest(manifest: Manifest) !void {
                 return error.NonCanonicalBackupManifest;
         }
         previous_path = object.logical_path;
-        if (manifest.mode == .full and !object.included)
+        const blob = findBlob(manifest.blobs, object.sha256) orelse
             return error.IncompleteBackupInventory;
+        if (blob.logical_size_bytes != object.size_bytes)
+            return error.InvalidBackupManifest;
     }
     if (manifest.encryption) |encryption| {
         if (encryption.algorithm.len == 0 or encryption.algorithm.len > 64 or
             encryption.key_id.len == 0 or encryption.key_id.len > 1024)
             return error.InvalidBackupManifest;
     }
+}
+
+pub fn findBlob(blobs: []const BlobDescriptor, digest: []const u8) ?*const BlobDescriptor {
+    var low: usize = 0;
+    var high: usize = blobs.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        switch (std.mem.order(u8, blobs[mid].sha256, digest)) {
+            .lt => low = mid + 1,
+            .gt => high = mid,
+            .eq => return &blobs[mid],
+        }
+    }
+    return null;
+}
+
+pub fn blobIndex(blobs: []const BlobDescriptor, digest: []const u8) ?usize {
+    const found = findBlob(blobs, digest) orelse return null;
+    return (@intFromPtr(found) - @intFromPtr(blobs.ptr)) / @sizeOf(BlobDescriptor);
 }
 
 /// Validates payload capabilities implemented by the current reader. Schema
@@ -279,6 +329,42 @@ pub const FooterIndexEntry = struct {
     stored_size_bytes: u64,
 };
 
+pub const Trailer = struct {
+    footer_offset: u64,
+    footer_payload_size: u64,
+};
+
+/// Fixed final bytes make the footer range-addressable without an O(bundle)
+/// scan. CRC covers magic, offsets, and reserved bytes so a torn or fabricated
+/// locator fails before any positional blob read.
+pub fn encodeTrailer(trailer: Trailer) [trailer_size]u8 {
+    var out: [trailer_size]u8 = @splat(0);
+    @memcpy(out[0..trailer_magic.len], &trailer_magic);
+    std.mem.writeInt(u64, out[8..16], trailer.footer_offset, .little);
+    std.mem.writeInt(u64, out[16..24], trailer.footer_payload_size, .little);
+    std.mem.writeInt(u32, out[28..32], std.hash.Crc32.hash(out[0..28]), .little);
+    return out;
+}
+
+pub fn decodeTrailer(encoded: *const [trailer_size]u8, bundle_size: u64) !Trailer {
+    if (bundle_size < trailer_size) return error.InvalidBundleFooter;
+    if (!std.mem.eql(u8, encoded[0..trailer_magic.len], &trailer_magic) or
+        std.mem.readInt(u32, encoded[28..32], .little) != std.hash.Crc32.hash(encoded[0..28]))
+        return error.InvalidBundleFooter;
+    const trailer: Trailer = .{
+        .footer_offset = std.mem.readInt(u64, encoded[8..16], .little),
+        .footer_payload_size = std.mem.readInt(u64, encoded[16..24], .little),
+    };
+    const body_end = bundle_size - trailer_size;
+    // Framing belongs to backup_codec. This representation-neutral layer only
+    // proves the locator is in bounds; the reader must prove that the located
+    // block is the final footer and has the declared payload size.
+    if (trailer.footer_offset >= body_end or
+        trailer.footer_payload_size > body_end - trailer.footer_offset)
+        return error.InvalidBundleFooter;
+    return trailer;
+}
+
 pub fn encodeFooterIndexAlloc(alloc: std.mem.Allocator, entries: []const FooterIndexEntry) ![]u8 {
     if (entries.len > max_objects) return error.BackupManifestTooLarge;
     const entry_size = std.crypto.hash.sha2.Sha256.digest_length + 8 + 8;
@@ -328,6 +414,11 @@ test "AFB2 manifest separates representation from snapshot mode" {
             .size_bytes = 42,
             .sha256 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
         }},
+        .blobs = &.{.{
+            .sha256 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            .logical_size_bytes = 42,
+            .stored_size_bytes = 42,
+        }},
     });
     defer alloc.free(encoded);
     var parsed = try parseManifest(alloc, encoded);
@@ -355,4 +446,18 @@ test "AFB2 readers fail closed on declared unsupported payload features" {
         .representation = .portable,
         .encryption = .{ .algorithm = "aes-256-gcm", .key_id = "quickstart" },
     }));
+}
+
+test "AFB2 trailer locates the footer without scanning payloads" {
+    const encoded = encodeTrailer(.{ .footer_offset = 100, .footer_payload_size = 42 });
+    const decoded = try decodeTrailer(&encoded, 100 + 10 + 42 + trailer_size);
+    try std.testing.expectEqual(@as(u64, 100), decoded.footer_offset);
+    try std.testing.expectEqual(@as(u64, 42), decoded.footer_payload_size);
+
+    var corrupt = encoded;
+    corrupt[12] ^= 1;
+    try std.testing.expectError(
+        error.InvalidBundleFooter,
+        decodeTrailer(&corrupt, 100 + 10 + 42 + trailer_size),
+    );
 }

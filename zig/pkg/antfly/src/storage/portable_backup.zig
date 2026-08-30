@@ -59,11 +59,19 @@ const PortableObject = struct {
     }
 };
 
+const PortableBlob = struct {
+    sha256: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    size_bytes: u64,
+};
+
 const PortableOutputMode = union(enum) {
     inventory: *std.ArrayListUnmanaged(PortableObject),
     bundle: struct {
         expected: []const PortableObject,
         next_ordinal: *usize,
+        blobs: []const PortableBlob,
+        included: []const bool,
+        emitted: []bool,
         footer: *std.ArrayListUnmanaged(backup_bundle.FooterIndexEntry),
     },
 };
@@ -108,16 +116,24 @@ const PortableOutput = struct {
                 if (expected.block_type != block_type or expected.size_bytes != payload.len or
                     !std.crypto.timing_safe.eql(@TypeOf(digest), expected.sha256, digest))
                     return error.NonDeterministicBackupCapture;
+                const blob_index = portableBlobIndex(state.blobs, digest) orelse
+                    return error.NonDeterministicBackupCapture;
+                state.next_ordinal.* += 1;
+                if (state.emitted[blob_index] or !state.included[blob_index]) return;
+                state.emitted[blob_index] = true;
                 const sink = self.writer orelse return error.InvalidBackupWriter;
                 try state.footer.append(self.alloc, .{
                     .sha256 = digest,
                     .header_offset = self.bundle_offset,
                     .stored_size_bytes = payload.len,
                 });
+                const digest_hex = std.fmt.bytesToHex(digest, .lower);
+                const blob_path = try std.fmt.allocPrint(self.alloc, "blobs/{s}", .{digest_hex});
+                defer self.alloc.free(blob_path);
                 const header_payload = try backup_bundle.encodeBlobHeaderAlloc(self.alloc, .{
-                    .ordinal = @intCast(ordinal),
-                    .logical_path = expected.logicalPath(),
-                    .role = @tagName(block_type),
+                    .ordinal = @intCast(blob_index),
+                    .logical_path = blob_path,
+                    .role = "portable_blob",
                     .logical_size_bytes = payload.len,
                     .stored_size_bytes = payload.len,
                     .sha256 = digest,
@@ -129,7 +145,7 @@ const PortableOutput = struct {
                 while (offset < payload.len) {
                     const end = @min(payload.len, offset + backup_bundle.native_chunk_target_bytes);
                     const chunk_payload = try backup_bundle.encodeBlobChunkAlloc(self.alloc, .{
-                        .ordinal = @intCast(ordinal),
+                        .ordinal = @intCast(blob_index),
                         .offset = offset,
                         .bytes = payload[offset..end],
                     });
@@ -138,11 +154,24 @@ const PortableOutput = struct {
                     self.bundle_offset += backup_codec.block_envelope_overhead + chunk_payload.len;
                     offset = end;
                 }
-                state.next_ordinal.* += 1;
             },
         }
     }
 };
+
+fn portableBlobIndex(blobs: []const PortableBlob, digest: [std.crypto.hash.sha2.Sha256.digest_length]u8) ?usize {
+    var low: usize = 0;
+    var high: usize = blobs.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        switch (std.mem.order(u8, &blobs[mid].sha256, &digest)) {
+            .lt => low = mid + 1,
+            .gt => high = mid,
+            .eq => return mid,
+        }
+    }
+    return null;
+}
 
 /// Export all portable data from the DocStore into AFB format.
 /// The caller provides an allocator for temporary buffers. The output is
@@ -154,6 +183,41 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
 }
 
 pub fn exportPortableToWriter(alloc: Allocator, store: *DocStore, sink_writer: *std.Io.Writer) !void {
+    return try exportPortableToWriterWithOptions(alloc, store, sink_writer, .{});
+}
+
+pub const ExportOptions = struct {
+    header_backup_id: [16]u8 = [_]u8{0} ** 16,
+    backup_id: []const u8 = "",
+    table_name: []const u8 = "",
+    created_at_unix_ns: i64 = 0,
+    mode: backup_bundle.SnapshotMode = .full,
+    parent_manifest_sha256: ?[]const u8 = null,
+    /// Digest-sorted complete base inventory.
+    base_blob_sha256: []const []const u8 = &.{},
+};
+
+pub fn exportPortableToWriterWithOptions(
+    alloc: Allocator,
+    store: *DocStore,
+    sink_writer: *std.Io.Writer,
+    options: ExportOptions,
+) !void {
+    switch (options.mode) {
+        .full => if (options.parent_manifest_sha256 != null or options.base_blob_sha256.len != 0)
+            return error.InvalidBackupManifest,
+        .delta => {
+            try backup_bundle.validateSha256(options.parent_manifest_sha256 orelse
+                return error.InvalidBackupManifest);
+            var previous: ?[]const u8 = null;
+            for (options.base_blob_sha256) |digest| {
+                try backup_bundle.validateSha256(digest);
+                if (previous) |value| if (std.mem.order(u8, value, digest) != .lt)
+                    return error.NonCanonicalBackupManifest;
+                previous = digest;
+            }
+        },
+    }
     var scan = try store.beginReadTxn();
     defer scan.abort();
 
@@ -175,20 +239,60 @@ pub fn exportPortableToWriter(alloc: Allocator, store: *DocStore, sink_writer: *
             .sha256 = &digest_strings[index],
         };
     }
+    var unique_blobs = std.ArrayListUnmanaged(PortableBlob).empty;
+    defer unique_blobs.deinit(alloc);
+    try unique_blobs.ensureTotalCapacity(alloc, objects.items.len);
+    for (objects.items) |object| unique_blobs.appendAssumeCapacity(.{
+        .sha256 = object.sha256,
+        .size_bytes = object.size_bytes,
+    });
+    std.mem.sort(PortableBlob, unique_blobs.items, {}, struct {
+        fn lessThan(_: void, lhs: PortableBlob, rhs: PortableBlob) bool {
+            return std.mem.order(u8, &lhs.sha256, &rhs.sha256) == .lt;
+        }
+    }.lessThan);
+    var unique_len: usize = 0;
+    for (unique_blobs.items) |candidate| {
+        if (unique_len > 0 and std.mem.eql(u8, &unique_blobs.items[unique_len - 1].sha256, &candidate.sha256)) {
+            if (unique_blobs.items[unique_len - 1].size_bytes != candidate.size_bytes)
+                return error.NonDeterministicBackupCapture;
+            continue;
+        }
+        unique_blobs.items[unique_len] = candidate;
+        unique_len += 1;
+    }
+    unique_blobs.items.len = unique_len;
+    const blob_descriptors = try alloc.alloc(backup_bundle.BlobDescriptor, unique_blobs.items.len);
+    defer alloc.free(blob_descriptors);
+    var blob_digest_strings = try alloc.alloc([std.crypto.hash.sha2.Sha256.digest_length * 2]u8, unique_blobs.items.len);
+    defer alloc.free(blob_digest_strings);
+    for (unique_blobs.items, 0..) |blob, index| {
+        blob_digest_strings[index] = std.fmt.bytesToHex(blob.sha256, .lower);
+        blob_descriptors[index] = .{
+            .sha256 = &blob_digest_strings[index],
+            .logical_size_bytes = blob.size_bytes,
+            .stored_size_bytes = blob.size_bytes,
+            .included = !digestInSortedStringSet(options.base_blob_sha256, &blob_digest_strings[index]),
+        };
+    }
     const manifest = try backup_bundle.encodeManifestAlloc(alloc, .{
+        .backup_id = options.backup_id,
+        .table_name = options.table_name,
         .representation = .portable,
-        .mode = .full,
+        .mode = options.mode,
+        .parent_manifest_sha256 = options.parent_manifest_sha256,
+        .created_at_unix_ns = options.created_at_unix_ns,
         .compatibility = .{ .storage_engine = "logical" },
         .objects = descriptors,
+        .blobs = blob_descriptors,
     });
     defer alloc.free(manifest);
 
-    const backup_id = [_]u8{0} ** 16;
     try backup_codec.writeHeaderTo(sink_writer, .{
         .format_version = backup_codec.format_version,
         .flags = 0,
-        .created_at_ns = 0,
-        .backup_id = backup_id,
+        .created_at_ns = options.created_at_unix_ns,
+        .backup_id = options.header_backup_id,
         .table_count = 1,
         .shard_count = 1,
     });
@@ -197,12 +301,21 @@ pub fn exportPortableToWriter(alloc: Allocator, store: *DocStore, sink_writer: *
     var footer = std.ArrayListUnmanaged(backup_bundle.FooterIndexEntry).empty;
     defer footer.deinit(alloc);
     var next_ordinal: usize = 0;
+    const emitted = try alloc.alloc(bool, unique_blobs.items.len);
+    defer alloc.free(emitted);
+    @memset(emitted, false);
+    const included = try alloc.alloc(bool, blob_descriptors.len);
+    defer alloc.free(included);
+    for (blob_descriptors, 0..) |blob, index| included[index] = blob.included;
     var bundle_out: PortableOutput = .{
         .alloc = alloc,
         .writer = sink_writer,
         .mode = .{ .bundle = .{
             .expected = objects.items,
             .next_ordinal = &next_ordinal,
+            .blobs = unique_blobs.items,
+            .included = included,
+            .emitted = emitted,
             .footer = &footer,
         } },
         .bundle_offset = backup_codec.header_size + backup_codec.block_envelope_overhead + manifest.len,
@@ -211,7 +324,27 @@ pub fn exportPortableToWriter(alloc: Allocator, store: *DocStore, sink_writer: *
     if (next_ordinal != objects.items.len) return error.NonDeterministicBackupCapture;
     const footer_payload = try backup_bundle.encodeFooterIndexAlloc(alloc, footer.items);
     defer alloc.free(footer_payload);
+    const footer_offset = bundle_out.bundle_offset;
     try backup_codec.writeBlockTo(sink_writer, .footer_index, footer_payload);
+    const trailer = backup_bundle.encodeTrailer(.{
+        .footer_offset = footer_offset,
+        .footer_payload_size = footer_payload.len,
+    });
+    try sink_writer.writeAll(&trailer);
+}
+
+fn digestInSortedStringSet(sorted: []const []const u8, digest: []const u8) bool {
+    var low: usize = 0;
+    var high: usize = sorted.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        switch (std.mem.order(u8, sorted[mid], digest)) {
+            .lt => low = mid + 1,
+            .gt => high = mid,
+            .eq => return true,
+        }
+    }
+    return false;
 }
 
 fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutput) !void {
@@ -1003,6 +1136,43 @@ fn appendEdgeBatchEntry(
 // Import
 // ============================================================================
 
+/// Exact parent content provider for portable AFB2 deltas. Each returned
+/// allocation is one logical portable block and is rehashed before use.
+pub const PortableBaseBlobSource = struct {
+    manifest_sha256: []const u8,
+    context: *anyopaque,
+    read_alloc: *const fn (
+        context: *anyopaque,
+        alloc: Allocator,
+        sha256: []const u8,
+        logical_size_bytes: u64,
+        limit: usize,
+    ) anyerror![]u8,
+};
+
+fn readAndLimitAfb2Trailer(comptime RawReader: type, raw: *RawReader) !backup_bundle.Trailer {
+    if (RawReader == backup_codec.SliceReader) {
+        if (raw.data.len < backup_codec.header_size + backup_bundle.trailer_size)
+            return error.InvalidBundleFooter;
+        const bundle_size: u64 = @intCast(raw.data.len);
+        const encoded = raw.data[raw.data.len - backup_bundle.trailer_size ..][0..backup_bundle.trailer_size].*;
+        const trailer = try backup_bundle.decodeTrailer(&encoded, bundle_size);
+        raw.data = raw.data[0 .. raw.data.len - backup_bundle.trailer_size];
+        return trailer;
+    }
+    if (RawReader == backup_codec.FileReader) {
+        if (raw.size < backup_codec.header_size + backup_bundle.trailer_size)
+            return error.InvalidBundleFooter;
+        var encoded: [backup_bundle.trailer_size]u8 = undefined;
+        if (try raw.file.readPositionalAll(raw.io, &encoded, raw.size - backup_bundle.trailer_size) != encoded.len)
+            return error.InvalidBundleFooter;
+        const trailer = try backup_bundle.decodeTrailer(&encoded, raw.size);
+        raw.size -= backup_bundle.trailer_size;
+        return trailer;
+    }
+    @compileError("AFB2 portable reader requires a positional slice or file reader");
+}
+
 /// Presents both the released AFB1 typed stream and an AFB2 portable object
 /// bundle as the same logical sequence of portable blocks. AFB2 is verified
 /// object-by-object, so file restore retains the one-block memory bound.
@@ -1016,20 +1186,35 @@ fn PortableArchiveReader(comptime RawReader: type) type {
         manifest_pending: bool,
         next_ordinal: u32 = 0,
         done: bool = false,
-        observed_footer: std.ArrayListUnmanaged(backup_bundle.FooterIndexEntry) = .empty,
+        indexed: bool = false,
+        blob_offsets: []?backup_bundle.FooterIndexEntry = &.{},
+        base: ?PortableBaseBlobSource = null,
+        trailer: ?backup_bundle.Trailer = null,
 
         fn init(raw: *RawReader) !Self {
+            return initWithBase(raw, null);
+        }
+
+        fn initWithBase(raw: *RawReader, base: ?PortableBaseBlobSource) !Self {
             const header = try raw.readHeader();
+            if (header.format_version == backup_codec.legacy_format_version and base != null)
+                return error.UnexpectedBackupBase;
+            const trailer = if (header.format_version == backup_codec.format_version)
+                try readAndLimitAfb2Trailer(RawReader, raw)
+            else
+                null;
             return .{
                 .raw = raw,
                 .header = header,
                 .manifest_pending = header.format_version == backup_codec.format_version,
+                .base = base,
+                .trailer = trailer,
             };
         }
 
         fn deinit(self: *Self, alloc: Allocator) void {
             if (self.manifest) |*manifest| manifest.deinit();
-            self.observed_footer.deinit(alloc);
+            if (self.blob_offsets.len > 0) alloc.free(self.blob_offsets);
             self.* = undefined;
         }
 
@@ -1056,9 +1241,21 @@ fn PortableArchiveReader(comptime RawReader: type) type {
                 var manifest = try backup_bundle.parseManifest(alloc, manifest_block.payload);
                 errdefer manifest.deinit();
                 try backup_bundle.validateReadablePayloadFeatures(manifest.value);
-                if (manifest.value.representation != .portable or manifest.value.mode != .full or
-                    manifest.value.objects.len == 0)
+                if (manifest.value.representation != .portable or manifest.value.objects.len == 0 or
+                    manifest.value.blobs.len == 0)
                     return error.BackupArtifactFormatMismatch;
+                switch (manifest.value.mode) {
+                    .full => if (self.base != null) return error.UnexpectedBackupBase,
+                    .delta => {
+                        const supplied = self.base orelse return error.BackupBaseRequired;
+                        try backup_bundle.validateSha256(supplied.manifest_sha256);
+                        if (!std.mem.eql(
+                            u8,
+                            manifest.value.parent_manifest_sha256.?,
+                            supplied.manifest_sha256,
+                        )) return error.BackupBaseMismatch;
+                    },
+                }
                 self.manifest = manifest;
                 self.manifest_pending = false;
                 return manifest_block;
@@ -1066,70 +1263,127 @@ fn PortableArchiveReader(comptime RawReader: type) type {
 
             const manifest = &(self.manifest orelse return error.InvalidBackupManifest).value;
             if (self.next_ordinal >= manifest.objects.len) return error.IncompleteBackupInventory;
-            const header_offset = self.raw.pos;
-            const raw_header = try self.raw.readBlock(alloc);
-            defer alloc.free(raw_header.payload);
-            if (raw_header.block_type != .blob_header) return error.InvalidBackupManifest;
-            var blob_header = try backup_bundle.decodeBlobHeader(alloc, raw_header.payload);
-            defer blob_header.deinit(alloc);
-            if (blob_header.ordinal != self.next_ordinal or blob_header.compression != .none or
-                blob_header.logical_size_bytes != blob_header.stored_size_bytes or
-                blob_header.stored_size_bytes > backup_codec.max_block_payload_bytes)
-                return error.InvalidBackupManifest;
-
             const descriptor = manifest.objects[self.next_ordinal];
-            const digest_hex = std.fmt.bytesToHex(blob_header.sha256, .lower);
-            if (!std.mem.eql(u8, descriptor.logical_path, blob_header.logical_path) or
-                !std.mem.eql(u8, descriptor.role, blob_header.role) or
-                descriptor.size_bytes != blob_header.logical_size_bytes or
-                !std.mem.eql(u8, descriptor.sha256, &digest_hex))
-                return error.BackupArtifactIntegrityMismatch;
-            const block_type = std.meta.stringToEnum(backup_codec.BlockType, blob_header.role) orelse
+            const blob_index = backup_bundle.blobIndex(manifest.blobs, descriptor.sha256) orelse
+                return error.IncompleteBackupInventory;
+            try self.ensureIndex(alloc);
+            const block_type = std.meta.stringToEnum(backup_codec.BlockType, descriptor.role) orelse
                 return error.InvalidBackupManifest;
             switch (block_type) {
                 .bundle_manifest, .blob_header, .blob_chunk, .footer_index => return error.InvalidBackupManifest,
                 else => {},
             }
+            const payload = if (manifest.blobs[blob_index].included) blk: {
+                const footer_entry = self.blob_offsets[blob_index] orelse
+                    return error.IncompleteBackupInventory;
+                break :blk try self.readBlobAt(alloc, blob_index, footer_entry.header_offset);
+            } else try self.readBaseBlob(alloc, blob_index);
+            self.next_ordinal += 1;
+            if (self.next_ordinal == manifest.objects.len) self.done = true;
+            return .{ .block_type = block_type, .payload = payload };
+        }
 
-            const payload = try alloc.alloc(u8, @intCast(blob_header.stored_size_bytes));
+        /// Scans and verifies physical blobs once, retaining only the bounded
+        /// digest-to-offset index. Logical objects can then be replayed in path
+        /// order without retaining an archive-sized payload cache.
+        fn ensureIndex(self: *Self, alloc: Allocator) !void {
+            if (self.indexed) return;
+            const manifest = &(self.manifest orelse return error.InvalidBackupManifest).value;
+            const trailer = self.trailer orelse return error.InvalidBundleFooter;
+            const offsets = try alloc.alloc(?backup_bundle.FooterIndexEntry, manifest.blobs.len);
+            errdefer alloc.free(offsets);
+            @memset(offsets, null);
+            var cursor = self.raw.*;
+            cursor.pos = @intCast(trailer.footer_offset);
+            const raw_footer = try cursor.readBlock(alloc);
+            defer alloc.free(raw_footer.payload);
+            if (raw_footer.block_type != .footer_index or
+                raw_footer.payload.len != trailer.footer_payload_size or cursor.hasRemaining())
+                return error.InvalidBundleFooter;
+            const footer = try backup_bundle.decodeFooterIndexAlloc(alloc, raw_footer.payload);
+            defer alloc.free(footer);
+            for (footer) |entry| {
+                const digest_hex = std.fmt.bytesToHex(entry.sha256, .lower);
+                const blob_index = backup_bundle.blobIndex(manifest.blobs, &digest_hex) orelse
+                    return error.InvalidBundleFooter;
+                const blob = manifest.blobs[blob_index];
+                if (!blob.included or offsets[blob_index] != null or
+                    entry.header_offset >= trailer.footer_offset or
+                    entry.stored_size_bytes != blob.stored_size_bytes)
+                    return error.InvalidBundleFooter;
+                offsets[blob_index] = entry;
+            }
+            for (manifest.blobs, offsets) |blob, entry| {
+                if (blob.included != (entry != null)) return error.IncompleteBackupInventory;
+            }
+            self.blob_offsets = offsets;
+            self.indexed = true;
+        }
+
+        fn readBlobAt(self: *Self, alloc: Allocator, blob_index: usize, header_offset: u64) ![]u8 {
+            const manifest = &(self.manifest orelse return error.InvalidBackupManifest).value;
+            const blob = manifest.blobs[blob_index];
+            var cursor = self.raw.*;
+            cursor.pos = @intCast(header_offset);
+            const raw_header = try cursor.readBlock(alloc);
+            defer alloc.free(raw_header.payload);
+            if (raw_header.block_type != .blob_header) return error.InvalidBackupManifest;
+            var blob_header = try backup_bundle.decodeBlobHeader(alloc, raw_header.payload);
+            defer blob_header.deinit(alloc);
+            const digest_hex = std.fmt.bytesToHex(blob_header.sha256, .lower);
+            const expected_path = try std.fmt.allocPrint(alloc, "blobs/{s}", .{digest_hex});
+            defer alloc.free(expected_path);
+            if (blob_header.ordinal != blob_index or blob_header.compression != .none or
+                !std.mem.eql(u8, blob.sha256, &digest_hex) or
+                !std.mem.eql(u8, blob_header.logical_path, expected_path) or
+                !std.mem.eql(u8, blob_header.role, "portable_blob") or
+                blob_header.logical_size_bytes != blob.logical_size_bytes or
+                blob_header.stored_size_bytes != blob.stored_size_bytes or
+                blob.stored_size_bytes > backup_codec.max_block_payload_bytes)
+                return error.BackupArtifactIntegrityMismatch;
+            const payload = try alloc.alloc(u8, @intCast(blob.stored_size_bytes));
             errdefer alloc.free(payload);
             var written: usize = 0;
             while (written < payload.len) {
-                const raw_chunk = try self.raw.readBlock(alloc);
+                const raw_chunk = try cursor.readBlock(alloc);
                 defer alloc.free(raw_chunk.payload);
                 if (raw_chunk.block_type != .blob_chunk) return error.InvalidBackupManifest;
                 const chunk = try backup_bundle.decodeBlobChunk(raw_chunk.payload);
-                if (chunk.ordinal != self.next_ordinal or chunk.offset != written or
+                if (chunk.ordinal != blob_header.ordinal or chunk.offset != written or
                     chunk.bytes.len > payload.len - written)
                     return error.InvalidNativeFileChunk;
                 @memcpy(payload[written..][0..chunk.bytes.len], chunk.bytes);
                 written += chunk.bytes.len;
             }
+            if (@as(u64, @intCast(cursor.pos)) > (self.trailer orelse return error.InvalidBundleFooter).footer_offset)
+                return error.InvalidBundleFooter;
             var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(payload, &actual, .{});
             if (!std.crypto.timing_safe.eql(@TypeOf(actual), actual, blob_header.sha256))
                 return error.BackupArtifactIntegrityMismatch;
-            try self.observed_footer.append(alloc, .{
-                .sha256 = actual,
-                .header_offset = header_offset,
-                .stored_size_bytes = payload.len,
-            });
-            self.next_ordinal += 1;
+            return payload;
+        }
 
-            if (self.next_ordinal == manifest.objects.len) {
-                const raw_footer = try self.raw.readBlock(alloc);
-                defer alloc.free(raw_footer.payload);
-                if (raw_footer.block_type != .footer_index) return error.InvalidBundleFooter;
-                const footer = try backup_bundle.decodeFooterIndexAlloc(alloc, raw_footer.payload);
-                defer alloc.free(footer);
-                if (footer.len != self.observed_footer.items.len) return error.InvalidBundleFooter;
-                for (footer, self.observed_footer.items) |declared, observed| {
-                    if (!std.meta.eql(declared, observed)) return error.InvalidBundleFooter;
-                }
-                if (self.raw.hasRemaining()) return error.InvalidBundleFooter;
-                self.done = true;
-            }
-            return .{ .block_type = block_type, .payload = payload };
+        fn readBaseBlob(self: *Self, alloc: Allocator, blob_index: usize) ![]u8 {
+            const blob = (self.manifest orelse return error.InvalidBackupManifest).value.blobs[blob_index];
+            const source = self.base orelse return error.BackupBaseRequired;
+            if (blob.logical_size_bytes > backup_codec.max_block_payload_bytes)
+                return error.BackupBlockTooLarge;
+            const payload = try source.read_alloc(
+                source.context,
+                alloc,
+                blob.sha256,
+                blob.logical_size_bytes,
+                backup_codec.max_block_payload_bytes,
+            );
+            errdefer alloc.free(payload);
+            if (payload.len != blob.logical_size_bytes) return error.BackupArtifactIntegrityMismatch;
+            var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(payload, &actual, .{});
+            const actual_hex = std.fmt.bytesToHex(actual, .lower);
+            if (!std.mem.eql(u8, &actual_hex, blob.sha256))
+                return error.BackupArtifactIntegrityMismatch;
+            return payload;
         }
     };
 }
@@ -1144,6 +1398,7 @@ pub const ImportOptions = struct {
     prefer_existing_identity_namespace: bool = false,
     import_derived_indexes: bool = true,
     embedding_source_fields: []const EmbeddingSourceField = &.{},
+    bundle_base: ?PortableBaseBlobSource = null,
 };
 
 /// Import AFB data into the DocStore.
@@ -1165,8 +1420,18 @@ pub fn visitPortableBlocks(
     context: anytype,
     comptime visit: fn (@TypeOf(context), backup_codec.BlockType, []const u8) anyerror!void,
 ) !void {
+    return try visitPortableBlocksWithBase(alloc, data, null, context, visit);
+}
+
+pub fn visitPortableBlocksWithBase(
+    alloc: Allocator,
+    data: []const u8,
+    base: ?PortableBaseBlobSource,
+    context: anytype,
+    comptime visit: fn (@TypeOf(context), backup_codec.BlockType, []const u8) anyerror!void,
+) !void {
     var raw = backup_codec.SliceReader.init(data);
-    var reader = try PortableArchiveReader(backup_codec.SliceReader).init(&raw);
+    var reader = try PortableArchiveReader(backup_codec.SliceReader).initWithBase(&raw, base);
     defer reader.deinit(alloc);
     _ = try reader.readHeader();
     while (reader.hasRemaining()) {
@@ -1178,19 +1443,19 @@ pub fn visitPortableBlocks(
 
 pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []const u8, opts: ImportOptions) !void {
     var validation_raw = backup_codec.SliceReader.init(data);
-    var validation_reader = try PortableArchiveReader(backup_codec.SliceReader).init(&validation_raw);
+    var validation_reader = try PortableArchiveReader(backup_codec.SliceReader).initWithBase(&validation_raw, opts.bundle_base);
     defer validation_reader.deinit(alloc);
     try validatePortableImportReader(alloc, &validation_reader, opts);
 
     var raw = backup_codec.SliceReader.init(data);
-    var reader = try PortableArchiveReader(backup_codec.SliceReader).init(&raw);
+    var reader = try PortableArchiveReader(backup_codec.SliceReader).initWithBase(&raw, opts.bundle_base);
     defer reader.deinit(alloc);
     const imported_identity = try importPortablePrimaryBlocks(alloc, store, &reader);
 
     try finishPortableIdentityImport(alloc, store, opts, imported_identity);
     if (opts.import_derived_indexes) {
         var derived_raw = backup_codec.SliceReader.init(data);
-        var derived_reader = try PortableArchiveReader(backup_codec.SliceReader).init(&derived_raw);
+        var derived_reader = try PortableArchiveReader(backup_codec.SliceReader).initWithBase(&derived_raw, opts.bundle_base);
         defer derived_reader.deinit(alloc);
         try importPortableDerivedBlocks(alloc, store, &derived_reader, opts);
     }
@@ -1216,18 +1481,18 @@ pub fn importPortableFileWithOptions(
     if (initial_stat.size != file_size) return error.SourceFileChanged;
 
     var validation_raw = backup_codec.FileReader.init(io, file, file_size);
-    var validation_reader = try PortableArchiveReader(backup_codec.FileReader).init(&validation_raw);
+    var validation_reader = try PortableArchiveReader(backup_codec.FileReader).initWithBase(&validation_raw, opts.bundle_base);
     defer validation_reader.deinit(alloc);
     try validatePortableImportReader(alloc, &validation_reader, opts);
 
     var raw = backup_codec.FileReader.init(io, file, file_size);
-    var reader = try PortableArchiveReader(backup_codec.FileReader).init(&raw);
+    var reader = try PortableArchiveReader(backup_codec.FileReader).initWithBase(&raw, opts.bundle_base);
     defer reader.deinit(alloc);
     const imported_identity = try importPortablePrimaryBlocks(alloc, store, &reader);
     try finishPortableIdentityImport(alloc, store, opts, imported_identity);
     if (opts.import_derived_indexes) {
         var derived_raw = backup_codec.FileReader.init(io, file, file_size);
-        var derived_reader = try PortableArchiveReader(backup_codec.FileReader).init(&derived_raw);
+        var derived_reader = try PortableArchiveReader(backup_codec.FileReader).initWithBase(&derived_raw, opts.bundle_base);
         defer derived_reader.deinit(alloc);
         try importPortableDerivedBlocks(alloc, store, &derived_reader, opts);
     }
@@ -1290,7 +1555,7 @@ fn importPortableDerivedBlocks(alloc: Allocator, store: *DocStore, reader: anyty
 
 fn validatePortableImportBlocks(alloc: Allocator, data: []const u8, opts: ImportOptions) !void {
     var raw = backup_codec.SliceReader.init(data);
-    var reader = try PortableArchiveReader(backup_codec.SliceReader).init(&raw);
+    var reader = try PortableArchiveReader(backup_codec.SliceReader).initWithBase(&raw, opts.bundle_base);
     defer reader.deinit(alloc);
     return try validatePortableImportReader(alloc, &reader, opts);
 }
@@ -2027,6 +2292,38 @@ const PortableTimestampInspection = struct {
     }
 };
 
+const TestPortableBaseContext = struct {
+    data: []const u8,
+};
+
+fn readTestPortableBaseBlob(
+    context_ptr: *anyopaque,
+    alloc: Allocator,
+    sha256: []const u8,
+    logical_size_bytes: u64,
+    limit: usize,
+) ![]u8 {
+    if (logical_size_bytes > limit) return error.BackupBlockTooLarge;
+    const context: *TestPortableBaseContext = @ptrCast(@alignCast(context_ptr));
+    var raw = backup_codec.SliceReader.init(context.data);
+    var reader = try PortableArchiveReader(backup_codec.SliceReader).init(&raw);
+    defer reader.deinit(alloc);
+    _ = try reader.readHeader();
+    while (reader.hasRemaining()) {
+        const block = try reader.readBlock(alloc);
+        if (block.block_type == .bundle_manifest) {
+            alloc.free(block.payload);
+            continue;
+        }
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(block.payload, &digest, .{});
+        const digest_hex = std.fmt.bytesToHex(digest, .lower);
+        if (std.mem.eql(u8, &digest_hex, sha256)) return @constCast(block.payload);
+        alloc.free(block.payload);
+    }
+    return error.BackupBlobMissing;
+}
+
 test "exportPortable empty store" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2116,6 +2413,72 @@ test "export and import documents round trip" {
         const val = try file_dst.get(alloc, store_key);
         defer alloc.free(val);
         try std.testing.expectEqualStrings(expected, val);
+    }
+}
+
+test "portable AFB2 delta resolves exact base and deduplicates physical blobs" {
+    const alloc = std.testing.allocator;
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const first_key = try internal_keys.documentKeyAlloc(alloc, "doc1");
+    defer alloc.free(first_key);
+    try src.putBatch(&.{.{ .key = first_key, .value = "{\"id\":\"doc1\"}" }}, &.{});
+    var base_archive: ArrayList(u8) = .empty;
+    defer base_archive.deinit(alloc);
+    try exportPortable(alloc, &src, &base_archive);
+
+    var base_raw = backup_codec.SliceReader.init(base_archive.items);
+    _ = try base_raw.readHeader();
+    const manifest_block = try base_raw.readBlock(alloc);
+    defer alloc.free(manifest_block.payload);
+    try std.testing.expectEqual(backup_codec.BlockType.bundle_manifest, manifest_block.block_type);
+    var base_manifest = try backup_bundle.parseManifest(alloc, manifest_block.payload);
+    defer base_manifest.deinit();
+    // The logical cluster/table manifests both contain `{}`; they remain two
+    // objects but share one physical digest-addressed record.
+    try std.testing.expect(base_manifest.value.objects.len > base_manifest.value.blobs.len);
+    var parent_digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(manifest_block.payload, &parent_digest_bytes, .{});
+    const parent_digest = std.fmt.bytesToHex(parent_digest_bytes, .lower);
+    const base_digests = try alloc.alloc([]const u8, base_manifest.value.blobs.len);
+    defer alloc.free(base_digests);
+    for (base_manifest.value.blobs, 0..) |blob, index| base_digests[index] = blob.sha256;
+
+    const second_key = try internal_keys.documentKeyAlloc(alloc, "doc2");
+    defer alloc.free(second_key);
+    try src.putBatch(&.{.{ .key = second_key, .value = "{\"id\":\"doc2\"}" }}, &.{});
+    var delta_archive: ArrayList(u8) = .empty;
+    defer delta_archive.deinit(alloc);
+    var delta_writer = std.Io.Writer.Allocating.fromArrayList(alloc, &delta_archive);
+    try exportPortableToWriterWithOptions(alloc, &src, &delta_writer.writer, .{
+        .mode = .delta,
+        .parent_manifest_sha256 = &parent_digest,
+        .base_blob_sha256 = base_digests,
+    });
+    delta_archive = delta_writer.toArrayList();
+    try std.testing.expectError(error.BackupBaseRequired, validatePortable(alloc, delta_archive.items));
+
+    var base_context: TestPortableBaseContext = .{ .data = base_archive.items };
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortableWithOptions(alloc, &dst, delta_archive.items, .{
+        .bundle_base = .{
+            .manifest_sha256 = &parent_digest,
+            .context = &base_context,
+            .read_alloc = readTestPortableBaseBlob,
+        },
+    });
+    for ([_][]const u8{ "doc1", "doc2" }) |doc_key| {
+        const store_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+        defer alloc.free(store_key);
+        const value = try dst.get(alloc, store_key);
+        defer alloc.free(value);
+        try std.testing.expect(std.mem.indexOf(u8, value, doc_key) != null);
     }
 }
 

@@ -17,6 +17,10 @@
 
 const std = @import("std");
 const bundle = @import("backup_bundle.zig");
+const fs_paths = @import("../common/fs_paths.zig");
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const io_buffer_bytes: usize = 256 * 1024;
 
 pub const manifest_schema_version: u32 = 1;
 pub const ref_schema_version: u32 = 1;
@@ -32,14 +36,26 @@ pub const BlobRef = struct {
     stored_size_bytes: u64,
     compression: bundle.Compression = .none,
     encryption_key_id: ?[]const u8 = null,
+};
+
+/// A logical snapshot object is independently named and points at immutable
+/// content. Keeping path/role outside BlobRef is what permits one physical
+/// blob to back multiple files without losing the information needed to
+/// reconstruct the captured generation.
+pub const ObjectRef = struct {
+    logical_path: []const u8,
     role: []const u8,
+    blob_sha256: []const u8,
+    logical_size_bytes: u64,
 };
 
 pub const Shard = struct {
     group_id: u64,
     start_key_base64: []const u8,
     end_key_base64: ?[]const u8 = null,
-    blob_sha256: []const []const u8,
+    /// Canonical, path-sorted logical object membership. Global catalog
+    /// objects need not belong to a shard.
+    object_paths: []const []const u8,
     capture_revision: u64,
     checkpoint_revision: u64,
 };
@@ -58,7 +74,9 @@ pub const Manifest = struct {
     compression: bundle.Compression = .none,
     encryption: ?bundle.Encryption = null,
     shards: []const Shard,
-    /// Complete, digest-sorted materialized inventory for this snapshot.
+    /// Complete, path-sorted logical inventory for this snapshot.
+    objects: []const ObjectRef,
+    /// Complete, digest-sorted unique physical inventory for this snapshot.
     blobs: []const BlobRef,
 };
 
@@ -102,6 +120,27 @@ pub const Backend = struct {
         expected_generation: ?u64,
     ) anyerror!void,
     delete_if_older_than: *const fn (context: *anyopaque, path: []const u8, cutoff_unix_ns: i128) anyerror!bool,
+    /// Stream a verified local file into an immutable repository object. The
+    /// backend must use create-if-absent semantics; an existing object is
+    /// success only when its bytes match the declared digest and size.
+    put_blob_from_file: *const fn (
+        context: *anyopaque,
+        io: std.Io,
+        path: []const u8,
+        source_path: []const u8,
+        logical_size_bytes: u64,
+        sha256: []const u8,
+    ) anyerror!void,
+    /// Stream one immutable repository blob into a new local file. Restore
+    /// revalidates size and digest before exposing the staging generation.
+    materialize_blob_to_file: *const fn (
+        context: *anyopaque,
+        io: std.Io,
+        path: []const u8,
+        destination_path: []const u8,
+        logical_size_bytes: u64,
+        sha256: []const u8,
+    ) anyerror!void,
 };
 
 pub fn refPathAlloc(alloc: std.mem.Allocator, backup_id: []const u8) ![]u8 {
@@ -133,6 +172,7 @@ pub fn encodeManifestCanonicalAlloc(alloc: std.mem.Allocator, manifest: Manifest
 }
 
 pub const ParsedManifest = std.json.Parsed(Manifest);
+pub const ParsedRef = std.json.Parsed(Ref);
 
 pub fn parseManifestCanonical(alloc: std.mem.Allocator, encoded: []const u8) !ParsedManifest {
     try validateManifestEncodedSize(encoded.len);
@@ -146,6 +186,66 @@ pub fn parseManifestCanonical(alloc: std.mem.Allocator, encoded: []const u8) !Pa
     defer alloc.free(canonical);
     if (!std.mem.eql(u8, canonical, encoded)) return error.NonCanonicalBackupManifest;
     return parsed;
+}
+
+pub fn parseRefCanonical(alloc: std.mem.Allocator, encoded: []const u8) !ParsedRef {
+    if (encoded.len == 0 or encoded.len > 64 * 1024) return error.InvalidBackupRef;
+    var parsed = std.json.parseFromSlice(Ref, alloc, encoded, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return error.InvalidBackupRef;
+    errdefer parsed.deinit();
+    try validateRef(parsed.value);
+    const canonical = try encodeRefCanonicalAlloc(alloc, parsed.value);
+    defer alloc.free(canonical);
+    if (!std.mem.eql(u8, canonical, encoded)) return error.NonCanonicalBackupRef;
+    return parsed;
+}
+
+pub const ResolvedSnapshot = struct {
+    ref: ParsedRef,
+    manifest: ParsedManifest,
+
+    pub fn deinit(self: *@This()) void {
+        self.manifest.deinit();
+        self.ref.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Resolves a mutable ref once, then reads the immutable manifest it names.
+/// Callers retain that digest for the whole operation; a later ref update can
+/// never splice a different snapshot into an in-flight restore.
+pub fn resolveSnapshot(
+    alloc: std.mem.Allocator,
+    backend: Backend,
+    backup_id: []const u8,
+) !ResolvedSnapshot {
+    const ref_path = try refPathAlloc(alloc, backup_id);
+    defer alloc.free(ref_path);
+    const encoded_ref = try backend.read_alloc(backend.context, alloc, ref_path, 64 * 1024);
+    defer alloc.free(encoded_ref);
+    var parsed_ref = try parseRefCanonical(alloc, encoded_ref);
+    errdefer parsed_ref.deinit();
+    if (!std.mem.eql(u8, parsed_ref.value.backup_id, backup_id)) return error.InvalidBackupRef;
+    const manifest_path = try manifestPathAlloc(alloc, parsed_ref.value.manifest_sha256);
+    defer alloc.free(manifest_path);
+    const encoded_manifest = try backend.read_alloc(
+        backend.context,
+        alloc,
+        manifest_path,
+        max_manifest_bytes,
+    );
+    defer alloc.free(encoded_manifest);
+    var parsed_manifest = try parseManifestCanonical(alloc, encoded_manifest);
+    errdefer parsed_manifest.deinit();
+    if (!std.mem.eql(u8, parsed_manifest.value.backup_id, backup_id))
+        return error.InvalidBackupRef;
+    const actual_digest = try manifestDigestHexAlloc(alloc, encoded_manifest);
+    defer alloc.free(actual_digest);
+    if (!std.mem.eql(u8, actual_digest, parsed_ref.value.manifest_sha256))
+        return error.BackupArtifactIntegrityMismatch;
+    return .{ .ref = parsed_ref, .manifest = parsed_manifest };
 }
 
 fn validateManifestEncodedSize(encoded_len: usize) !void {
@@ -200,6 +300,149 @@ pub fn publishSnapshot(
     return digest;
 }
 
+/// Uploads each unique blob from a captured local generation. Object paths are
+/// the authoritative mapping back to source files; duplicate objects select
+/// one representative and therefore upload their shared content only once.
+pub fn uploadSnapshotBlobsFromDirectory(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    backend: Backend,
+    manifest: Manifest,
+    source_root: []const u8,
+) !void {
+    try validateManifest(manifest);
+    if (manifest.encryption != null) return error.UnsupportedBackupEncryption;
+    for (manifest.blobs) |blob| {
+        if (blob.compression != .none or blob.encryption_key_id != null)
+            return error.UnsupportedBackupCompression;
+        const object = findObjectForBlob(manifest.objects, blob.sha256) orelse
+            return error.IncompleteBackupInventory;
+        const source_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ source_root, object.logical_path });
+        defer alloc.free(source_path);
+        try verifyFileDigest(io, source_path, blob.logical_size_bytes, blob.sha256);
+        const repository_path = try blobPathAlloc(alloc, blob.sha256);
+        defer alloc.free(repository_path);
+        try backend.put_blob_from_file(
+            backend.context,
+            io,
+            repository_path,
+            source_path,
+            blob.logical_size_bytes,
+            blob.sha256,
+        );
+    }
+}
+
+/// Materializes one complete immutable manifest into a caller-owned staging
+/// generation. Every unique blob is downloaded once into a private cache,
+/// verified, then copied to all logical object paths. The destination is never
+/// partially exposed and is removed on failure.
+pub fn materializeSnapshotToStagingDirectory(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    backend: Backend,
+    manifest: Manifest,
+    staging_root: []const u8,
+) !void {
+    try validateManifest(manifest);
+    if (manifest.encryption != null) return error.UnsupportedBackupEncryption;
+    if (pathExists(io, staging_root)) return error.PathAlreadyExists;
+    const blob_root = try std.fmt.allocPrint(alloc, "{s}.repository-blobs", .{staging_root});
+    defer alloc.free(blob_root);
+    if (pathExists(io, blob_root)) return error.PathAlreadyExists;
+    try fs_paths.createDirPathPortable(io, staging_root);
+    errdefer std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
+    try fs_paths.createDirPathPortable(io, blob_root);
+    defer std.Io.Dir.cwd().deleteTree(io, blob_root) catch {};
+
+    for (manifest.blobs) |blob| {
+        if (blob.compression != .none or blob.encryption_key_id != null)
+            return error.UnsupportedBackupCompression;
+        const repository_path = try blobPathAlloc(alloc, blob.sha256);
+        defer alloc.free(repository_path);
+        const cached_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ blob_root, blob.sha256 });
+        defer alloc.free(cached_path);
+        try backend.materialize_blob_to_file(
+            backend.context,
+            io,
+            repository_path,
+            cached_path,
+            blob.logical_size_bytes,
+            blob.sha256,
+        );
+        try verifyFileDigest(io, cached_path, blob.logical_size_bytes, blob.sha256);
+    }
+    for (manifest.objects) |object| {
+        const cached_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ blob_root, object.blob_sha256 });
+        defer alloc.free(cached_path);
+        const destination = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ staging_root, object.logical_path });
+        defer alloc.free(destination);
+        if (std.fs.path.dirname(destination)) |parent| try fs_paths.createDirPathPortable(io, parent);
+        try copyFileBounded(io, cached_path, destination, object.logical_size_bytes);
+    }
+    try fs_paths.syncDirPortable(io, staging_root);
+}
+
+fn findObjectForBlob(objects: []const ObjectRef, digest: []const u8) ?*const ObjectRef {
+    for (objects) |*object| {
+        if (std.mem.eql(u8, object.blob_sha256, digest)) return object;
+    }
+    return null;
+}
+
+fn verifyFileDigest(io: std.Io, path: []const u8, expected_size: u64, expected_hex: []const u8) !void {
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size != expected_size) return error.BackupArtifactIntegrityMismatch;
+    var hasher = Sha256.init(.{});
+    var buffer: [io_buffer_bytes]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < stat.size) {
+        const wanted: usize = @intCast(@min(@as(u64, buffer.len), stat.size - offset));
+        const read = try file.readPositionalAll(io, buffer[0..wanted], offset);
+        if (read != wanted) return error.BackupArtifactIntegrityMismatch;
+        hasher.update(buffer[0..wanted]);
+        offset += wanted;
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const actual_hex = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &actual_hex, expected_hex)) return error.BackupArtifactIntegrityMismatch;
+}
+
+fn copyFileBounded(io: std.Io, source_path: []const u8, destination_path: []const u8, size: u64) !void {
+    var source = if (std.fs.path.isAbsolute(source_path))
+        try std.Io.Dir.openFileAbsolute(io, source_path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, source_path, .{});
+    defer source.close(io);
+    var destination = try fs_paths.createFilePortable(io, destination_path, .{ .truncate = true, .exclusive = true });
+    defer destination.close(io);
+    var buffer: [io_buffer_bytes]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < size) {
+        const wanted: usize = @intCast(@min(@as(u64, buffer.len), size - offset));
+        const read = try source.readPositionalAll(io, buffer[0..wanted], offset);
+        if (read != wanted) return error.BackupArtifactIntegrityMismatch;
+        try destination.writePositionalAll(io, buffer[0..wanted], offset);
+        offset += wanted;
+    }
+    try destination.sync(io);
+}
+
+fn pathExists(io: std.Io, path: []const u8) bool {
+    var dir = if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.openDirAbsolute(io, path, .{}) catch return false
+    else
+        std.Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+    dir.close(io);
+    return true;
+}
+
 pub fn validateManifest(manifest: Manifest) !void {
     if (manifest.schema_version != manifest_schema_version) return error.UnsupportedBackupManifestVersion;
     try validateBackupId(manifest.backup_id);
@@ -209,14 +452,17 @@ pub fn validateManifest(manifest: Manifest) !void {
         .full => if (manifest.parent_manifest_sha256 != null) return error.InvalidBackupManifest,
         .delta => try bundle.validateSha256(manifest.parent_manifest_sha256 orelse return error.InvalidBackupManifest),
     }
-    if (manifest.blobs.len == 0 or manifest.blobs.len > max_blobs or
+    if (manifest.objects.len == 0 or manifest.objects.len > max_blobs or
+        manifest.blobs.len == 0 or manifest.blobs.len > max_blobs or
         manifest.shards.len == 0 or manifest.shards.len > max_shards)
         return error.InvalidBackupManifest;
 
     var previous_digest: ?[]const u8 = null;
     for (manifest.blobs) |blob| {
         try bundle.validateSha256(blob.sha256);
-        if (blob.role.len == 0)
+        if (blob.compression == .none and blob.logical_size_bytes != blob.stored_size_bytes)
+            return error.InvalidBackupManifest;
+        if ((blob.encryption_key_id == null) != (manifest.encryption == null))
             return error.InvalidBackupManifest;
         if (previous_digest) |previous| {
             if (std.mem.order(u8, previous, blob.sha256) != .lt)
@@ -227,21 +473,42 @@ pub fn validateManifest(manifest: Manifest) !void {
     if (!containsBlob(manifest.blobs, manifest.catalog_sha256))
         return error.IncompleteBackupInventory;
 
+    var previous_path: ?[]const u8 = null;
+    var catalog_object_found = false;
+    for (manifest.objects) |object| {
+        try bundle.validateRelativePath(object.logical_path);
+        if (object.role.len == 0 or object.role.len > 128)
+            return error.InvalidBackupManifest;
+        try bundle.validateSha256(object.blob_sha256);
+        const blob = findBlob(manifest.blobs, object.blob_sha256) orelse
+            return error.IncompleteBackupInventory;
+        if (blob.logical_size_bytes != object.logical_size_bytes)
+            return error.InvalidBackupManifest;
+        if (previous_path) |previous| {
+            if (std.mem.order(u8, previous, object.logical_path) != .lt)
+                return error.NonCanonicalBackupManifest;
+        }
+        previous_path = object.logical_path;
+        if (std.mem.eql(u8, object.role, "catalog") and
+            std.mem.eql(u8, object.blob_sha256, manifest.catalog_sha256))
+            catalog_object_found = true;
+    }
+    if (!catalog_object_found) return error.IncompleteBackupInventory;
     var previous_group_id: u64 = 0;
     for (manifest.shards, 0..) |shard, shard_index| {
         if (shard.group_id == 0 or (shard_index > 0 and shard.group_id <= previous_group_id) or
-            shard.blob_sha256.len == 0 or shard.checkpoint_revision > shard.capture_revision)
+            shard.object_paths.len == 0 or shard.checkpoint_revision > shard.capture_revision)
             return error.NonCanonicalBackupManifest;
         previous_group_id = shard.group_id;
-        var previous_shard_digest: ?[]const u8 = null;
-        for (shard.blob_sha256) |digest| {
-            try bundle.validateSha256(digest);
-            if (previous_shard_digest) |previous| {
-                if (std.mem.order(u8, previous, digest) != .lt)
+        var previous_shard_path: ?[]const u8 = null;
+        for (shard.object_paths) |path| {
+            try bundle.validateRelativePath(path);
+            if (previous_shard_path) |previous| {
+                if (std.mem.order(u8, previous, path) != .lt)
                     return error.NonCanonicalBackupManifest;
             }
-            if (!containsBlob(manifest.blobs, digest)) return error.IncompleteBackupInventory;
-            previous_shard_digest = digest;
+            if (!containsObjectPath(manifest.objects, path)) return error.IncompleteBackupInventory;
+            previous_shard_path = path;
         }
     }
 }
@@ -283,11 +550,29 @@ pub fn incrementalBlobIndicesAlloc(
 }
 
 fn containsBlob(blobs: []const BlobRef, digest: []const u8) bool {
+    return findBlob(blobs, digest) != null;
+}
+
+fn findBlob(blobs: []const BlobRef, digest: []const u8) ?*const BlobRef {
     var low: usize = 0;
     var high: usize = blobs.len;
     while (low < high) {
         const mid = low + (high - low) / 2;
         switch (std.mem.order(u8, blobs[mid].sha256, digest)) {
+            .lt => low = mid + 1,
+            .gt => high = mid,
+            .eq => return &blobs[mid],
+        }
+    }
+    return null;
+}
+
+fn containsObjectPath(objects: []const ObjectRef, path: []const u8) bool {
+    var low: usize = 0;
+    var high: usize = objects.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        switch (std.mem.order(u8, objects[mid].logical_path, path)) {
             .lt => low = mid + 1,
             .gt => high = mid,
             .eq => return true,
@@ -486,13 +771,17 @@ test "repository manifest is a complete canonical materialized inventory" {
         .shards = &.{.{
             .group_id = 9,
             .start_key_base64 = "",
-            .blob_sha256 = &.{ digest_a, digest_b },
+            .object_paths = &.{"shards/9/dense/segment-1"},
             .capture_revision = 42,
             .checkpoint_revision = 42,
         }},
+        .objects = &.{
+            .{ .logical_path = "catalog/table.json", .role = "catalog", .blob_sha256 = digest_a, .logical_size_bytes = 10 },
+            .{ .logical_path = "shards/9/dense/segment-1", .role = "dense_projection", .blob_sha256 = digest_b, .logical_size_bytes = 20 },
+        },
         .blobs = &.{
-            .{ .sha256 = digest_a, .logical_size_bytes = 10, .stored_size_bytes = 10, .role = "primary" },
-            .{ .sha256 = digest_b, .logical_size_bytes = 20, .stored_size_bytes = 20, .role = "dense_projection" },
+            .{ .sha256 = digest_a, .logical_size_bytes = 10, .stored_size_bytes = 10 },
+            .{ .sha256 = digest_b, .logical_size_bytes = 20, .stored_size_bytes = 20 },
         },
     };
     try validateManifest(manifest);
@@ -502,6 +791,43 @@ test "repository manifest is a complete canonical materialized inventory" {
     const digest = try manifestDigestHexAlloc(alloc, encoded);
     defer alloc.free(digest);
     try bundle.validateSha256(digest);
+}
+
+test "repository inventory preserves logical paths while deduplicating bytes" {
+    const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const manifest: Manifest = .{
+        .backup_id = "deduplicated",
+        .table_id = 7,
+        .table_name = "docs",
+        .catalog_sha256 = digest,
+        .representation = .native,
+        .created_at_unix_ns = 1,
+        .shards = &.{.{
+            .group_id = 9,
+            .start_key_base64 = "",
+            .object_paths = &.{ "shards/9/copy-a", "shards/9/copy-b" },
+            .capture_revision = 1,
+            .checkpoint_revision = 1,
+        }},
+        .objects = &.{
+            .{ .logical_path = "catalog/table.json", .role = "catalog", .blob_sha256 = digest, .logical_size_bytes = 10 },
+            .{ .logical_path = "shards/9/copy-a", .role = "native_file", .blob_sha256 = digest, .logical_size_bytes = 10 },
+            .{ .logical_path = "shards/9/copy-b", .role = "native_file", .blob_sha256 = digest, .logical_size_bytes = 10 },
+        },
+        .blobs = &.{.{ .sha256 = digest, .logical_size_bytes = 10, .stored_size_bytes = 10 }},
+    };
+    try validateManifest(manifest);
+    try std.testing.expectEqual(@as(usize, 3), manifest.objects.len);
+    try std.testing.expectEqual(@as(usize, 1), manifest.blobs.len);
+
+    var invalid = manifest;
+    invalid.objects = &.{.{
+        .logical_path = "shards/../escape",
+        .role = "catalog",
+        .blob_sha256 = digest,
+        .logical_size_bytes = 10,
+    }};
+    try std.testing.expectError(error.InvalidBackupPath, validateManifest(invalid));
 }
 
 test "repository manifest parsing is bounded before allocation" {
@@ -548,11 +874,12 @@ test "incremental plan uploads only blobs absent from complete parent" {
         .shards = &.{.{
             .group_id = 9,
             .start_key_base64 = "",
-            .blob_sha256 = &.{digest_a},
+            .object_paths = &.{"catalog/table.json"},
             .capture_revision = 41,
             .checkpoint_revision = 41,
         }},
-        .blobs = &.{.{ .sha256 = digest_a, .logical_size_bytes = 10, .stored_size_bytes = 10, .role = "catalog" }},
+        .objects = &.{.{ .logical_path = "catalog/table.json", .role = "catalog", .blob_sha256 = digest_a, .logical_size_bytes = 10 }},
+        .blobs = &.{.{ .sha256 = digest_a, .logical_size_bytes = 10, .stored_size_bytes = 10 }},
     };
     const child: Manifest = .{
         .backup_id = "daily",
@@ -566,16 +893,240 @@ test "incremental plan uploads only blobs absent from complete parent" {
         .shards = &.{.{
             .group_id = 9,
             .start_key_base64 = "",
-            .blob_sha256 = &.{ digest_a, digest_child },
+            .object_paths = &.{"shards/9/store.bin"},
             .capture_revision = 42,
             .checkpoint_revision = 42,
         }},
+        .objects = &.{
+            .{ .logical_path = "catalog/table.json", .role = "catalog", .blob_sha256 = digest_a, .logical_size_bytes = 10 },
+            .{ .logical_path = "shards/9/store.bin", .role = "primary", .blob_sha256 = digest_child, .logical_size_bytes = 20 },
+        },
         .blobs = &.{
-            .{ .sha256 = digest_a, .logical_size_bytes = 10, .stored_size_bytes = 10, .role = "catalog" },
-            .{ .sha256 = digest_child, .logical_size_bytes = 20, .stored_size_bytes = 20, .role = "primary" },
+            .{ .sha256 = digest_a, .logical_size_bytes = 10, .stored_size_bytes = 10 },
+            .{ .sha256 = digest_child, .logical_size_bytes = 20, .stored_size_bytes = 20 },
         },
     };
     const changed = try incrementalBlobIndicesAlloc(std.testing.allocator, digest_child, child, digest_b, parent);
     defer std.testing.allocator.free(changed);
     try std.testing.expectEqualSlices(usize, &.{1}, changed);
+}
+
+const TestFilesystemBackend = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    put_blob_calls: usize = 0,
+    materialize_blob_calls: usize = 0,
+
+    fn backend(self: *@This()) Backend {
+        return .{
+            .context = self,
+            .put_immutable = putImmutable,
+            .read_alloc = readAlloc,
+            .contains = contains,
+            .publish_ref = publishRef,
+            .delete_if_older_than = deleteIfOlderThan,
+            .put_blob_from_file = putBlobFromFile,
+            .materialize_blob_to_file = materializeBlobToFile,
+        };
+    }
+
+    fn pathAlloc(self: *@This(), suffix: []const u8) ![]u8 {
+        return try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.root, suffix });
+    }
+
+    fn putImmutable(context: *anyopaque, path: []const u8, bytes: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        const absolute = try self.pathAlloc(path);
+        defer self.alloc.free(absolute);
+        const existing = std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            absolute,
+            self.alloc,
+            .limited(max_manifest_bytes),
+        ) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (existing) |value| {
+            defer self.alloc.free(value);
+            if (!std.mem.eql(u8, value, bytes)) return error.ImmutableBackupObjectConflict;
+            return;
+        }
+        if (std.fs.path.dirname(absolute)) |parent| try fs_paths.createDirPathPortable(self.io, parent);
+        try writeTestFile(self.io, absolute, bytes);
+    }
+
+    fn readAlloc(context: *anyopaque, alloc: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        const absolute = try self.pathAlloc(path);
+        defer self.alloc.free(absolute);
+        return try std.Io.Dir.cwd().readFileAlloc(self.io, absolute, alloc, .limited(limit));
+    }
+
+    fn contains(context: *anyopaque, path: []const u8) !bool {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        const absolute = try self.pathAlloc(path);
+        defer self.alloc.free(absolute);
+        var file = std.Io.Dir.cwd().openFile(self.io, absolute, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        file.close(self.io);
+        return true;
+    }
+
+    fn publishRef(
+        context: *anyopaque,
+        path: []const u8,
+        encoded: []const u8,
+        expected_manifest_sha256: ?[]const u8,
+        expected_generation: ?u64,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        var next = try parseRefCanonical(self.alloc, encoded);
+        defer next.deinit();
+        const absolute = try self.pathAlloc(path);
+        defer self.alloc.free(absolute);
+        const existing_bytes = std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            absolute,
+            self.alloc,
+            .limited(64 * 1024),
+        ) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        defer if (existing_bytes) |value| self.alloc.free(value);
+        var current: ?ParsedRef = if (existing_bytes) |value| try parseRefCanonical(self.alloc, value) else null;
+        defer if (current) |*value| value.deinit();
+        try validateRefPublication(.{
+            .next = next.value,
+            .expected_manifest_sha256 = expected_manifest_sha256,
+            .expected_generation = expected_generation,
+        }, if (current) |value| value.value else null);
+        if (std.fs.path.dirname(absolute)) |parent| try fs_paths.createDirPathPortable(self.io, parent);
+        try writeTestFile(self.io, absolute, encoded);
+    }
+
+    fn deleteIfOlderThan(_: *anyopaque, _: []const u8, _: i128) !bool {
+        return false;
+    }
+
+    fn putBlobFromFile(
+        context: *anyopaque,
+        io: std.Io,
+        path: []const u8,
+        source_path: []const u8,
+        logical_size_bytes: u64,
+        sha256: []const u8,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.put_blob_calls += 1;
+        const absolute = try self.pathAlloc(path);
+        defer self.alloc.free(absolute);
+        if (try contains(context, path)) {
+            return try verifyFileDigest(io, absolute, logical_size_bytes, sha256);
+        }
+        if (std.fs.path.dirname(absolute)) |parent| try fs_paths.createDirPathPortable(io, parent);
+        try copyFileBounded(io, source_path, absolute, logical_size_bytes);
+        try verifyFileDigest(io, absolute, logical_size_bytes, sha256);
+    }
+
+    fn materializeBlobToFile(
+        context: *anyopaque,
+        io: std.Io,
+        path: []const u8,
+        destination_path: []const u8,
+        logical_size_bytes: u64,
+        sha256: []const u8,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.materialize_blob_calls += 1;
+        const absolute = try self.pathAlloc(path);
+        defer self.alloc.free(absolute);
+        try verifyFileDigest(io, absolute, logical_size_bytes, sha256);
+        try copyFileBounded(io, absolute, destination_path, logical_size_bytes);
+    }
+};
+
+fn writeTestFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+    try file.sync(io);
+}
+
+test "repository publishes resolves and materializes one complete deduplicated snapshot" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
+    defer alloc.free(source_root);
+    const repository_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repository", .{tmp.sub_path});
+    defer alloc.free(repository_root);
+    try fs_paths.createDirPathPortable(io, source_root);
+    try fs_paths.createDirPathPortable(io, repository_root);
+    for ([_][]const u8{ "catalog/table.json", "shards/9/copy-a", "shards/9/copy-b" }) |logical_path| {
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ source_root, logical_path });
+        defer alloc.free(path);
+        try writeTestFile(io, path, "same-bytes");
+    }
+    var digest_bytes: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash("same-bytes", &digest_bytes, .{});
+    const digest = std.fmt.bytesToHex(digest_bytes, .lower);
+    const manifest: Manifest = .{
+        .backup_id = "daily",
+        .table_id = 7,
+        .table_name = "docs",
+        .catalog_sha256 = &digest,
+        .representation = .native,
+        .created_at_unix_ns = 1,
+        .shards = &.{.{
+            .group_id = 9,
+            .start_key_base64 = "",
+            .object_paths = &.{ "shards/9/copy-a", "shards/9/copy-b" },
+            .capture_revision = 1,
+            .checkpoint_revision = 1,
+        }},
+        .objects = &.{
+            .{ .logical_path = "catalog/table.json", .role = "catalog", .blob_sha256 = &digest, .logical_size_bytes = 10 },
+            .{ .logical_path = "shards/9/copy-a", .role = "native_file", .blob_sha256 = &digest, .logical_size_bytes = 10 },
+            .{ .logical_path = "shards/9/copy-b", .role = "native_file", .blob_sha256 = &digest, .logical_size_bytes = 10 },
+        },
+        .blobs = &.{.{ .sha256 = &digest, .logical_size_bytes = 10, .stored_size_bytes = 10 }},
+    };
+    var filesystem = TestFilesystemBackend{ .alloc = alloc, .io = io, .root = repository_root };
+    const backend = filesystem.backend();
+    try uploadSnapshotBlobsFromDirectory(alloc, io, backend, manifest, source_root);
+    try std.testing.expectEqual(@as(usize, 1), filesystem.put_blob_calls);
+
+    const encoded = try encodeManifestCanonicalAlloc(alloc, manifest);
+    defer alloc.free(encoded);
+    const manifest_digest = try manifestDigestHexAlloc(alloc, encoded);
+    defer alloc.free(manifest_digest);
+    const published_digest = try publishSnapshot(alloc, backend, manifest, .{ .next = .{
+        .backup_id = "daily",
+        .manifest_sha256 = manifest_digest,
+        .generation = 1,
+        .updated_at_unix_ns = 2,
+    } });
+    defer alloc.free(published_digest);
+
+    var resolved = try resolveSnapshot(alloc, backend, "daily");
+    defer resolved.deinit();
+    try std.testing.expectEqualStrings(manifest_digest, resolved.ref.value.manifest_sha256);
+    const restore_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore", .{tmp.sub_path});
+    defer alloc.free(restore_root);
+    try materializeSnapshotToStagingDirectory(alloc, io, backend, resolved.manifest.value, restore_root);
+    try std.testing.expectEqual(@as(usize, 1), filesystem.materialize_blob_calls);
+    for (manifest.objects) |object| {
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ restore_root, object.logical_path });
+        defer alloc.free(path);
+        const restored = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(32));
+        defer alloc.free(restored);
+        try std.testing.expectEqualStrings("same-bytes", restored);
+    }
 }

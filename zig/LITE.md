@@ -251,7 +251,11 @@ maintenance capabilities; it does not expose the database path or credentials.
 Backup and restore remain normal `/db/v1` operations. A physical `.aflite`
 copy is a stable snapshot, not the archival contract. `.afb` is the common
 bundle envelope; Lite reads and writes its portable logical representation,
-while normal Antfly may also package an explicitly native representation.
+while normal Antfly may also package an explicitly native representation. Lite
+backup/export emits a self-contained `full` bundle. AFB2 `delta` is an
+exact-base repository/export representation: import must receive the named
+base-manifest digest and must never guess a base or silently treat the delta as
+self-contained.
 
 Once an artifact has been opened by standalone, the offline `antfly lite
 backup` command refuses to emit a misleading root-only archive. Use the
