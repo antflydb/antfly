@@ -140,12 +140,30 @@ pub fn validateStoredIndexesJson(alloc: std.mem.Allocator, indexes_json: []const
     try validateIndexesValue(parsed.value, true);
 }
 
-fn normalizeRawCreateTableIndexesAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+fn normalizeRawCreateTableIndexesAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    comptime preserve_canonical_default: bool,
+) ![]u8 {
     if (value != .object) return error.InvalidCreateTableRequest;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try out.appendSlice(alloc, default_indexes_json);
+    if (preserve_canonical_default) {
+        if (value.object.get(default_full_text_index_name)) |canonical_default| {
+            const encoded = try stringifyJsonValue(alloc, canonical_default);
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, "{\"");
+            try out.appendSlice(alloc, default_full_text_index_name);
+            try out.appendSlice(alloc, "\":");
+            try out.appendSlice(alloc, encoded);
+            try out.append(alloc, '}');
+        } else {
+            try out.appendSlice(alloc, default_indexes_json);
+        }
+    } else {
+        try out.appendSlice(alloc, default_indexes_json);
+    }
 
     var it = value.object.iterator();
     while (it.next()) |entry| {
@@ -838,7 +856,11 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
     if (root.get("indexes")) |value| {
         if (value != .null) {
             try validateIndexesValue(value, allow_private_index_fields);
-            const normalized_indexes_json = try normalizeRawCreateTableIndexesAlloc(alloc, value);
+            const normalized_indexes_json = try normalizeRawCreateTableIndexesAlloc(
+                alloc,
+                value,
+                allow_private_index_fields,
+            );
             defer alloc.free(normalized_indexes_json);
             req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, normalized_indexes_json);
         } else req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, default_indexes_json);

@@ -330,6 +330,12 @@ pub const RouteConvergence = enum {
     retrying,
 };
 
+pub const RouteConvergenceDiagnostics = struct {
+    status: RouteConvergence,
+    attempts: u32 = 0,
+    next_retry_ns: u64 = 0,
+};
+
 const RouteRetryState = struct {
     attempts: u32 = 0,
     next_retry_ns: u64 = 0,
@@ -337,6 +343,8 @@ const RouteRetryState = struct {
 
 const route_retry_initial_ns: u64 = 50 * std.time.ns_per_ms;
 const route_retry_max_ns: u64 = 5 * std.time.ns_per_s;
+const policy_recheck_ns: u64 = std.time.ns_per_s;
+const max_live_retry_groups_per_round: usize = 64;
 
 const PreparedEnsure = struct {
     intent_index: usize,
@@ -344,6 +352,118 @@ const PreparedEnsure = struct {
     prepare_bootstrap: bool,
     replica: ?host_mod.PreparedReplica = null,
     restart_policy_blocked: bool = false,
+};
+
+const PreparedRoutePeer = struct {
+    node_id: u64,
+    prepared: ?host_mod.PreparedPeerEndpoints = null,
+    prepare_error: ?anyerror = null,
+};
+
+const PreparedRouteGroup = struct {
+    intent_index: usize,
+    first_peer: usize,
+    peer_count: usize,
+};
+
+const PreparedPolicyValidation = struct {
+    intent_index: usize,
+    prepared: ?host_mod.PreparedAdmissionValidation = null,
+    prepare_error: ?anyerror = null,
+};
+
+/// Fallible endpoint discovery and descriptor construction are completed in
+/// `prepare` without the Raft owner lock. `commit` only publishes immutable
+/// results after the caller re-enters its serialized runtime phase.
+pub const PreparedLiveConvergence = struct {
+    owner: *Reconciler,
+    intents: []const PlacementIntent,
+    route_groups: []PreparedRouteGroup,
+    route_peers: []PreparedRoutePeer,
+    policies: []PreparedPolicyValidation,
+    prepared: bool = false,
+    committed: bool = false,
+
+    pub fn deinit(self: *PreparedLiveConvergence) void {
+        for (self.route_peers) |*peer| {
+            if (peer.prepared) |*prepared| prepared.deinit(self.owner.alloc);
+        }
+        for (self.policies) |*policy| {
+            if (policy.prepared) |*prepared| prepared.deinit(self.owner.alloc);
+        }
+        self.owner.alloc.free(self.route_groups);
+        self.owner.alloc.free(self.route_peers);
+        self.owner.alloc.free(self.policies);
+        self.* = undefined;
+    }
+
+    pub fn prepare(self: *PreparedLiveConvergence) !void {
+        if (self.prepared or self.committed) return error.InvalidReconcilePhase;
+        for (self.route_groups) |group| {
+            const intent = self.intents[group.intent_index];
+            for (self.route_peers[group.first_peer..][0..group.peer_count]) |*peer| {
+                peer.prepared = self.owner.host.preparePeerEndpoints(
+                    intent.record.group_id,
+                    peer.node_id,
+                ) catch |err| failed: {
+                    peer.prepare_error = err;
+                    break :failed null;
+                };
+            }
+        }
+        for (self.policies) |*policy| {
+            policy.prepared = self.owner.host.prepareReplicaAdmissionValidation(
+                self.intents[policy.intent_index].record,
+            ) catch |err| failed: {
+                policy.prepare_error = err;
+                break :failed null;
+            };
+        }
+        self.prepared = true;
+    }
+
+    pub fn commit(self: *PreparedLiveConvergence, result: *ReconcileResult) !void {
+        if (!self.prepared or self.committed) return error.InvalidReconcilePhase;
+        for (self.route_groups) |group| {
+            const intent = self.intents[group.intent_index];
+            var refreshed: usize = 0;
+            var last_error: ?anyerror = null;
+            for (self.route_peers[group.first_peer..][0..group.peer_count]) |*peer| {
+                if (peer.prepare_error) |err| {
+                    last_error = err;
+                    continue;
+                }
+                const prepared = if (peer.prepared) |*value| value else {
+                    last_error = error.InvalidReconcilePhase;
+                    continue;
+                };
+                const endpoint_count = self.owner.host.commitPreparedPeerEndpoints(prepared) catch |err| {
+                    last_error = err;
+                    continue;
+                };
+                if (endpoint_count == 0 and last_error == null) last_error = error.NoPeerEndpoints;
+                refreshed += endpoint_count;
+            }
+            result.refreshed_peers += refreshed;
+            self.owner.recordRouteRefreshResult(intent.record.group_id, last_error);
+        }
+        for (self.policies) |*policy| {
+            const intent = self.intents[policy.intent_index];
+            if (policy.prepare_error) |err| {
+                self.owner.recordPolicyValidationResult(intent.record.group_id, null, err);
+                continue;
+            }
+            const prepared = if (policy.prepared) |*value| value else continue;
+            const conflict = self.owner.host.commitReplicaAdmissionValidation(prepared) catch |err| {
+                self.owner.recordPolicyValidationResult(intent.record.group_id, null, err);
+                continue;
+            };
+            self.owner.recordPolicyValidationResult(intent.record.group_id, conflict != null, null);
+        }
+        result.admission_blocked = self.owner.countAdmissionBlocked(self.intents);
+        result.route_retrying_groups = self.owner.countRouteRetrying(self.intents);
+        self.committed = true;
+    }
 };
 
 /// An immutable desired-state snapshot split into a blocking durability phase
@@ -358,6 +478,7 @@ pub const PreparedReconcile = struct {
     removals: []u64,
     catalog_upserts: []catalog.ReplicaRecord,
     catalog_revision: ?u64,
+    live: PreparedLiveConvergence,
     /// Set immediately after the atomic replica-catalog batch is durable.
     /// Callers that stage sidecar cleanup intents use this to distinguish a
     /// retryable pre-commit failure from a committed removal whose live host
@@ -369,6 +490,7 @@ pub const PreparedReconcile = struct {
     aborted: bool = false,
 
     pub fn deinit(self: *PreparedReconcile) void {
+        self.live.deinit();
         for (self.ensures) |*entry| {
             if (entry.replica) |*replica| replica.deinit(self.owner.alloc);
         }
@@ -403,6 +525,7 @@ pub const PreparedReconcile = struct {
                 return err;
             };
         }
+        try self.live.prepare();
         self.durability_complete = true;
     }
 
@@ -431,7 +554,6 @@ pub const PreparedReconcile = struct {
         for (self.ensures) |*entry| {
             const intent = self.intents[entry.intent_index];
             if (entry.restart_policy_blocked) {
-                result.admission_blocked += 1;
                 // The desired record is durable and will take effect on the
                 // next replica restart. Remember its fingerprint so an
                 // unchanged restart-scoped policy does not fsync the catalog
@@ -440,9 +562,6 @@ pub const PreparedReconcile = struct {
                     intent.record.group_id,
                     entry.intent_hash,
                 );
-                const route = self.owner.refreshPeerEndpointsBestEffort(intent);
-                result.refreshed_peers += route.refreshed;
-                if (route.status == .retrying) result.route_retrying_groups += 1;
                 continue;
             }
             const prepared = if (entry.replica) |*replica| replica else return error.InvalidReconcilePhase;
@@ -452,10 +571,8 @@ pub const PreparedReconcile = struct {
                 intent.record.group_id,
                 entry.intent_hash,
             );
-            const route = self.owner.refreshPeerEndpointsBestEffort(intent);
-            result.refreshed_peers += route.refreshed;
-            if (route.status == .retrying) result.route_retrying_groups += 1;
         }
+        try self.live.commit(&result);
         for (self.intents) |intent| {
             const outcome = try self.owner.reconcileRaftMembership(intent);
             self.owner.membership_convergence.putAssumeCapacity(intent.record.group_id, outcome);
@@ -467,6 +584,7 @@ pub const PreparedReconcile = struct {
             _ = self.owner.membership_convergence.remove(group_id);
             _ = self.owner.route_convergence.remove(group_id);
             _ = self.owner.route_retries.remove(group_id);
+            _ = self.owner.policy_retries.remove(group_id);
             result.removed += 1;
         }
         self.owner.host.metrics.reconcile_rounds += 1;
@@ -497,6 +615,8 @@ pub const Reconciler = struct {
     membership_convergence: std.AutoHashMapUnmanaged(u64, MembershipConvergence) = .empty,
     route_convergence: std.AutoHashMapUnmanaged(u64, RouteConvergence) = .empty,
     route_retries: std.AutoHashMapUnmanaged(u64, RouteRetryState) = .empty,
+    policy_retries: std.AutoHashMapUnmanaged(u64, RouteRetryState) = .empty,
+    live_retry_cursor: usize = 0,
 
     pub fn deinit(self: *Reconciler) void {
         self.last_intent_hashes.deinit(self.alloc);
@@ -507,6 +627,8 @@ pub const Reconciler = struct {
         self.route_convergence = .empty;
         self.route_retries.deinit(self.alloc);
         self.route_retries = .empty;
+        self.policy_retries.deinit(self.alloc);
+        self.policy_retries = .empty;
     }
 
     pub fn membershipStatus(self: *const Reconciler, group_id: u64) ?MembershipConvergence {
@@ -515,6 +637,125 @@ pub const Reconciler = struct {
 
     pub fn routeStatus(self: *const Reconciler, group_id: u64) ?RouteConvergence {
         return self.route_convergence.get(group_id);
+    }
+
+    pub fn routeDiagnostics(self: *const Reconciler, group_id: u64) ?RouteConvergenceDiagnostics {
+        const status = self.route_convergence.get(group_id) orelse return null;
+        const retry = self.route_retries.get(group_id) orelse RouteRetryState{};
+        return .{
+            .status = status,
+            .attempts = retry.attempts,
+            .next_retry_ns = retry.next_retry_ns,
+        };
+    }
+
+    pub fn prepareLiveConvergence(
+        self: *Reconciler,
+        intents: []const PlacementIntent,
+    ) !PreparedLiveConvergence {
+        try self.ensureConvergenceCapacity(intents.len);
+        return try self.buildLiveConvergence(intents, null);
+    }
+
+    fn ensureConvergenceCapacity(self: *Reconciler, intent_count: usize) !void {
+        const convergence_capacity = std.math.cast(
+            u32,
+            @as(usize, self.membership_convergence.count()) +| intent_count,
+        ) orelse return error.TooManyPlacementIntents;
+        try self.membership_convergence.ensureTotalCapacity(self.alloc, convergence_capacity);
+        const route_capacity = std.math.cast(
+            u32,
+            @as(usize, self.route_convergence.count()) +| intent_count,
+        ) orelse return error.TooManyPlacementIntents;
+        try self.route_convergence.ensureTotalCapacity(self.alloc, route_capacity);
+        const route_retry_capacity = std.math.cast(
+            u32,
+            @as(usize, self.route_retries.count()) +| intent_count,
+        ) orelse return error.TooManyPlacementIntents;
+        try self.route_retries.ensureTotalCapacity(self.alloc, route_retry_capacity);
+        const policy_retry_capacity = std.math.cast(
+            u32,
+            @as(usize, self.policy_retries.count()) +| intent_count,
+        ) orelse return error.TooManyPlacementIntents;
+        try self.policy_retries.ensureTotalCapacity(self.alloc, policy_retry_capacity);
+    }
+
+    fn appendRouteGroup(
+        self: *Reconciler,
+        route_groups: *std.ArrayListUnmanaged(PreparedRouteGroup),
+        route_peers: *std.ArrayListUnmanaged(PreparedRoutePeer),
+        intents: []const PlacementIntent,
+        intent_index: usize,
+    ) !void {
+        const intent = intents[intent_index];
+        const first_peer = route_peers.items.len;
+        for (intent.peer_node_ids) |node_id| {
+            if (node_id == self.host.cfg.local_node_id) continue;
+            try route_peers.append(self.alloc, .{ .node_id = node_id });
+        }
+        for (intent.learner_node_ids) |node_id| {
+            if (node_id == self.host.cfg.local_node_id or containsNodeId(intent.peer_node_ids, node_id)) continue;
+            try route_peers.append(self.alloc, .{ .node_id = node_id });
+        }
+        try route_groups.append(self.alloc, .{
+            .intent_index = intent_index,
+            .first_peer = first_peer,
+            .peer_count = route_peers.items.len - first_peer,
+        });
+    }
+
+    fn buildLiveConvergence(
+        self: *Reconciler,
+        intents: []const PlacementIntent,
+        force_routes: ?[]const bool,
+    ) !PreparedLiveConvergence {
+        var route_groups = std.ArrayListUnmanaged(PreparedRouteGroup).empty;
+        errdefer route_groups.deinit(self.alloc);
+        var route_peers = std.ArrayListUnmanaged(PreparedRoutePeer).empty;
+        errdefer route_peers.deinit(self.alloc);
+        var policies = std.ArrayListUnmanaged(PreparedPolicyValidation).empty;
+        errdefer policies.deinit(self.alloc);
+        const now_ns = platform_time.monotonicNs();
+
+        if (force_routes) |flags| {
+            for (flags, 0..) |forced, intent_index| {
+                if (forced) try self.appendRouteGroup(&route_groups, &route_peers, intents, intent_index);
+            }
+        }
+
+        var scanned: usize = 0;
+        var scheduled: usize = 0;
+        var cursor = if (intents.len == 0) 0 else self.live_retry_cursor % intents.len;
+        while (scanned < intents.len and scheduled < max_live_retry_groups_per_round) : (scanned += 1) {
+            const intent_index = cursor;
+            cursor = (cursor + 1) % intents.len;
+            const intent = intents[intent_index];
+            const forced = if (force_routes) |flags| flags[intent_index] else false;
+            const route_due = !forced and
+                self.route_convergence.get(intent.record.group_id) == .retrying and
+                now_ns >= (self.route_retries.get(intent.record.group_id) orelse RouteRetryState{}).next_retry_ns;
+            const has_policy_conflict = self.host.replicaAdmissionConflict(intent.record.group_id) != null;
+            const policy_due = has_policy_conflict and
+                now_ns >= (self.policy_retries.get(intent.record.group_id) orelse RouteRetryState{}).next_retry_ns;
+            if (!route_due and !policy_due) continue;
+            if (route_due) try self.appendRouteGroup(&route_groups, &route_peers, intents, intent_index);
+            if (policy_due) try policies.append(self.alloc, .{ .intent_index = intent_index });
+            scheduled += 1;
+        }
+        if (intents.len > 0) self.live_retry_cursor = cursor;
+        const owned_route_groups = try route_groups.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(owned_route_groups);
+        const owned_route_peers = try route_peers.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(owned_route_peers);
+        const owned_policies = try policies.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(owned_policies);
+        return .{
+            .owner = self,
+            .intents = intents,
+            .route_groups = owned_route_groups,
+            .route_peers = owned_route_peers,
+            .policies = owned_policies,
+        };
     }
 
     pub fn prepare(self: *Reconciler) !PreparedReconcile {
@@ -575,26 +816,18 @@ pub const Reconciler = struct {
             self.host.replicaCatalogRevision()
         else
             null;
-        const convergence_capacity = std.math.cast(
-            u32,
-            @as(usize, self.membership_convergence.count()) +| intents.len,
-        ) orelse return error.TooManyPlacementIntents;
-        try self.membership_convergence.ensureTotalCapacity(self.alloc, convergence_capacity);
-        const route_capacity = std.math.cast(
-            u32,
-            @as(usize, self.route_convergence.count()) +| intents.len,
-        ) orelse return error.TooManyPlacementIntents;
-        try self.route_convergence.ensureTotalCapacity(self.alloc, route_capacity);
-        const route_retry_capacity = std.math.cast(
-            u32,
-            @as(usize, self.route_retries.count()) +| intents.len,
-        ) orelse return error.TooManyPlacementIntents;
-        try self.route_retries.ensureTotalCapacity(self.alloc, route_retry_capacity);
+        try self.ensureConvergenceCapacity(intents.len);
         const intent_hash_capacity = std.math.cast(
             u32,
             @as(usize, self.last_intent_hashes.count()) +| owned_ensures.len,
         ) orelse return error.TooManyPlacementIntents;
         try self.last_intent_hashes.ensureTotalCapacity(self.alloc, intent_hash_capacity);
+        const force_routes = try self.alloc.alloc(bool, intents.len);
+        defer self.alloc.free(force_routes);
+        @memset(force_routes, false);
+        for (owned_ensures) |entry| force_routes[entry.intent_index] = true;
+        var live = try self.buildLiveConvergence(intents, force_routes);
+        errdefer live.deinit();
         return .{
             .owner = self,
             .intents = intents,
@@ -602,6 +835,7 @@ pub const Reconciler = struct {
             .removals = owned_removals,
             .catalog_upserts = catalog_upserts,
             .catalog_revision = catalog_revision,
+            .live = live,
         };
     }
 
@@ -624,108 +858,93 @@ pub const Reconciler = struct {
         self: *Reconciler,
         intents: []const PlacementIntent,
     ) !ReconcileResult {
-        const convergence_capacity = std.math.cast(
-            u32,
-            @as(usize, self.membership_convergence.count()) +| intents.len,
-        ) orelse return error.TooManyPlacementIntents;
-        try self.membership_convergence.ensureTotalCapacity(self.alloc, convergence_capacity);
-        const route_capacity = std.math.cast(
-            u32,
-            @as(usize, self.route_convergence.count()) +| intents.len,
-        ) orelse return error.TooManyPlacementIntents;
-        try self.route_convergence.ensureTotalCapacity(self.alloc, route_capacity);
-        const route_retry_capacity = std.math.cast(
-            u32,
-            @as(usize, self.route_retries.count()) +| intents.len,
-        ) orelse return error.TooManyPlacementIntents;
-        try self.route_retries.ensureTotalCapacity(self.alloc, route_retry_capacity);
+        try self.ensureConvergenceCapacity(intents.len);
         var result: ReconcileResult = .{};
         for (intents) |intent| {
             try intent.desiredMembership().validate();
-            if (self.host.replicaAdmissionConflict(intent.record.group_id) != null) {
-                const conflict = self.host.revalidateReplicaAdmissionConflict(intent.record) catch |err| retry: {
-                    std.log.warn(
-                        "replica admission conflict revalidation deferred group_id={d} err={s}",
-                        .{ intent.record.group_id, @errorName(err) },
-                    );
-                    result.admission_blocked += 1;
-                    break :retry null;
-                };
-                if (conflict != null) result.admission_blocked += 1;
-            }
-            if (self.route_convergence.get(intent.record.group_id) == .retrying) {
-                const retry = self.route_retries.get(intent.record.group_id) orelse RouteRetryState{};
-                if (platform_time.monotonicNs() >= retry.next_retry_ns) {
-                    const route = self.refreshPeerEndpointsBestEffort(intent);
-                    result.refreshed_peers += route.refreshed;
-                    if (route.status == .retrying) result.route_retrying_groups += 1;
-                } else {
-                    result.route_retrying_groups += 1;
-                }
-            }
             const outcome = try self.reconcileRaftMembership(intent);
             self.membership_convergence.putAssumeCapacity(intent.record.group_id, outcome);
             result.recordMembership(outcome);
         }
+        result.admission_blocked = self.countAdmissionBlocked(intents);
+        result.route_retrying_groups = self.countRouteRetrying(intents);
         self.publishConvergenceMetrics(result);
         return result;
     }
 
-    const RouteRefreshResult = struct {
-        refreshed: usize = 0,
-        status: RouteConvergence = .converged,
-    };
-
-    /// Endpoint discovery is retryable convergence, not durable replica
-    /// admission. Failures are retained and retried by stable-epoch rounds;
-    /// they must never replay an already-committed catalog transaction.
-    fn refreshPeerEndpointsBestEffort(self: *Reconciler, intent: PlacementIntent) RouteRefreshResult {
-        var refreshed: usize = 0;
-        var last_error: ?anyerror = null;
-        for (intent.peer_node_ids) |node_id| {
-            if (node_id == self.host.cfg.local_node_id) continue;
-            const endpoint_count = self.host.refreshPeerEndpoints(intent.record.group_id, node_id) catch |err| retry: {
-                last_error = err;
-                break :retry 0;
-            };
-            if (endpoint_count == 0 and last_error == null) last_error = error.NoPeerEndpoints;
-            refreshed += endpoint_count;
-        }
-        for (intent.learner_node_ids) |node_id| {
-            if (node_id == self.host.cfg.local_node_id or containsNodeId(intent.peer_node_ids, node_id)) continue;
-            const endpoint_count = self.host.refreshPeerEndpoints(intent.record.group_id, node_id) catch |err| retry: {
-                last_error = err;
-                break :retry 0;
-            };
-            if (endpoint_count == 0 and last_error == null) last_error = error.NoPeerEndpoints;
-            refreshed += endpoint_count;
-        }
+    fn recordRouteRefreshResult(self: *Reconciler, group_id: u64, last_error: ?anyerror) void {
         const status: RouteConvergence = if (last_error == null) .converged else .retrying;
-        const previous = self.route_convergence.get(intent.record.group_id);
-        self.route_convergence.putAssumeCapacity(intent.record.group_id, status);
+        const previous = self.route_convergence.get(group_id);
+        self.route_convergence.putAssumeCapacity(group_id, status);
         switch (status) {
-            .converged => _ = self.route_retries.remove(intent.record.group_id),
+            .converged => _ = self.route_retries.remove(group_id),
             .retrying => {
-                const previous_retry = self.route_retries.get(intent.record.group_id) orelse RouteRetryState{};
+                const previous_retry = self.route_retries.get(group_id) orelse RouteRetryState{};
                 const attempts = previous_retry.attempts +| 1;
-                self.route_retries.putAssumeCapacity(intent.record.group_id, .{
+                self.route_retries.putAssumeCapacity(group_id, .{
                     .attempts = attempts,
                     .next_retry_ns = platform_time.monotonicNs() +|
-                        routeRetryDelayNs(intent.record.group_id, attempts),
+                        routeRetryDelayNs(group_id, attempts),
                 });
             },
         }
         if (previous == null or previous.? != status) switch (status) {
             .converged => std.log.info(
                 "raft peer routes converged group_id={d}",
-                .{intent.record.group_id},
+                .{group_id},
             ),
             .retrying => std.log.warn(
                 "raft peer route convergence deferred group_id={d} err={s}",
-                .{ intent.record.group_id, @errorName(last_error.?) },
+                .{ group_id, @errorName(last_error.?) },
             ),
         };
-        return .{ .refreshed = refreshed, .status = status };
+    }
+
+    fn recordPolicyValidationResult(
+        self: *Reconciler,
+        group_id: u64,
+        conflict_remains: ?bool,
+        last_error: ?anyerror,
+    ) void {
+        const now_ns = platform_time.monotonicNs();
+        if (last_error) |err| {
+            const previous = self.policy_retries.get(group_id) orelse RouteRetryState{};
+            const attempts = previous.attempts +| 1;
+            self.policy_retries.putAssumeCapacity(group_id, .{
+                .attempts = attempts,
+                .next_retry_ns = now_ns +| routeRetryDelayNs(group_id ^ 0x706f6c696379, attempts),
+            });
+            if (attempts == 1 or (attempts & (attempts - 1)) == 0) {
+                std.log.warn(
+                    "replica admission conflict revalidation deferred group_id={d} attempts={d} err={s}",
+                    .{ group_id, attempts, @errorName(err) },
+                );
+            }
+            return;
+        }
+        if (conflict_remains orelse true) {
+            self.policy_retries.putAssumeCapacity(group_id, .{
+                .next_retry_ns = now_ns +| policy_recheck_ns,
+            });
+        } else {
+            _ = self.policy_retries.remove(group_id);
+        }
+    }
+
+    fn countRouteRetrying(self: *const Reconciler, intents: []const PlacementIntent) usize {
+        var count: usize = 0;
+        for (intents) |intent| {
+            if (self.route_convergence.get(intent.record.group_id) == .retrying) count += 1;
+        }
+        return count;
+    }
+
+    fn countAdmissionBlocked(self: *const Reconciler, intents: []const PlacementIntent) usize {
+        var count: usize = 0;
+        for (intents) |intent| {
+            if (self.host.replicaAdmissionConflict(intent.record.group_id) != null) count += 1;
+        }
+        return count;
     }
 
     fn publishConvergenceMetrics(self: *Reconciler, result: ReconcileResult) void {
@@ -1367,22 +1586,14 @@ test "restart-scoped policy conflicts are isolated and durably deduplicated" {
     const durable_revision = catalog_iface.revision();
     const unchanged = try owner.reconcileOnce();
     try std.testing.expectEqual(@as(usize, 0), unchanged.ensured);
-    try std.testing.expectEqual(@as(usize, 0), unchanged.admission_blocked);
+    try std.testing.expectEqual(@as(usize, 1), unchanged.admission_blocked);
     try std.testing.expectEqual(durable_revision, catalog_iface.revision());
 
     // A policy rollback is independent of placement metadata. Stable rounds
     // must clear the restart requirement without rebuilding the catalog.
     factory.election_tick = 5;
-    const stable_intents = [_]PlacementIntent{.{
-        .record = .{
-            .group_id = 504,
-            .replica_id = 1,
-            .local_node_id = 1,
-            .metadata_version = 2,
-        },
-        .peer_node_ids = &.{1},
-    }};
-    const revalidated = try owner.reconcileMembershipOnly(&stable_intents);
+    owner.policy_retries.getPtr(504).?.next_retry_ns = 0;
+    const revalidated = try owner.reconcileOnce();
     try std.testing.expectEqual(@as(usize, 0), revalidated.admission_blocked);
     try std.testing.expect(host.replicaAdmissionConflict(504) == null);
     try std.testing.expectEqual(durable_revision, catalog_iface.revision());
@@ -1457,15 +1668,60 @@ test "route convergence retries without replaying durable admission" {
     try std.testing.expectEqual(@as(usize, 1), admitted.ensured);
     try std.testing.expectEqual(@as(usize, 1), admitted.route_retrying_groups);
     try std.testing.expectEqual(RouteConvergence.retrying, owner.routeStatus(505).?);
+    const retry_diagnostics = owner.routeDiagnostics(505).?;
+    try std.testing.expectEqual(@as(u32, 1), retry_diagnostics.attempts);
+    try std.testing.expect(retry_diagnostics.next_retry_ns > 0);
     const durable_revision = catalog_iface.revision();
 
     resolver.fail = false;
     owner.route_retries.getPtr(505).?.next_retry_ns = 0;
-    const converged = try owner.reconcileMembershipOnly(&intents);
+    const converged = try owner.reconcileOnce();
     try std.testing.expectEqual(@as(usize, 1), converged.refreshed_peers);
     try std.testing.expectEqual(@as(usize, 0), converged.route_retrying_groups);
     try std.testing.expectEqual(RouteConvergence.converged, owner.routeStatus(505).?);
     try std.testing.expectEqual(durable_revision, catalog_iface.revision());
+}
+
+test "live convergence retry work is bounded and rotates fairly" {
+    var host = host_mod.Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{});
+    defer host.deinit();
+    var provider = MemoryPlacementProvider.init(std.testing.allocator);
+    defer provider.deinit();
+    var owner = Reconciler{
+        .alloc = std.testing.allocator,
+        .host = &host,
+        .provider = provider.provider(),
+    };
+    defer owner.deinit();
+
+    const intent_count = max_live_retry_groups_per_round + 1;
+    const intents = try std.testing.allocator.alloc(PlacementIntent, intent_count);
+    defer std.testing.allocator.free(intents);
+    for (intents, 0..) |*intent, index| {
+        intent.* = .{
+            .record = .{
+                .group_id = @intCast(index + 1),
+                .replica_id = 1,
+                .local_node_id = 1,
+            },
+            .peer_node_ids = &.{ 1, 2 },
+        };
+    }
+    try owner.ensureConvergenceCapacity(intents.len);
+    for (intents) |intent| {
+        owner.route_convergence.putAssumeCapacity(intent.record.group_id, .retrying);
+        owner.route_retries.putAssumeCapacity(intent.record.group_id, .{});
+    }
+
+    var first = try owner.prepareLiveConvergence(intents);
+    defer first.deinit();
+    try std.testing.expectEqual(max_live_retry_groups_per_round, first.route_groups.len);
+    try std.testing.expectEqual(@as(usize, 0), first.route_groups[0].intent_index);
+
+    var second = try owner.prepareLiveConvergence(intents);
+    defer second.deinit();
+    try std.testing.expectEqual(max_live_retry_groups_per_round, second.route_groups.len);
+    try std.testing.expectEqual(max_live_retry_groups_per_round, second.route_groups[0].intent_index);
 }
 
 test "prepared reconcile failure never publishes an unprepared replica" {

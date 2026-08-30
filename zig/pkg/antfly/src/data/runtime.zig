@@ -11905,9 +11905,21 @@ pub const DataServer = struct {
             // directly, avoiding topology-index construction and per-group
             // voter/learner duplication while still advancing Raft state.
             const local_intents = self.last_data_raft_local_intents;
+            var live = live: {
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                break :live try raft.host.prepareLiveConvergence(local_intents);
+            };
+            defer live.deinit();
+            // Resolver and descriptor work is intentionally outside the Raft
+            // owner lock. The immutable plan is published below only after
+            // re-entering the serialized runtime phase.
+            try live.prepare();
             {
                 lockAtomic(&self.data_raft_mutex);
                 defer self.data_raft_mutex.unlock();
+                var result: antfly.raft.ReconcileResult = .{};
+                try live.commit(&result);
                 _ = try raft.host.reconcileMembershipOnly(local_intents);
             }
             const status_fingerprint = self.maintainDataRaftLeadership(snapshot, local_intents, registration.node_id);

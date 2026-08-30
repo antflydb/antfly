@@ -13,6 +13,11 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
+
+fn lockAtomic(mutex: *std.atomic.Mutex) void {
+    platform_sync.lockYielding(mutex);
+}
 
 pub const Protocol = enum {
     http,
@@ -39,6 +44,13 @@ pub const PeerResolver = struct {
             group_id: u64,
             node_id: u64,
         ) anyerror![]PeerEndpoint,
+        /// Optional per-route generation used to fence a resolved snapshot
+        /// across prepare/publish phases. Immutable resolvers may omit it.
+        route_generation: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            node_id: u64,
+        ) u64 = null,
     };
 
     pub fn resolveGroupPeer(
@@ -49,11 +61,23 @@ pub const PeerResolver = struct {
     ) ![]PeerEndpoint {
         return try self.vtable.resolve_group_peer(self.ptr, alloc, group_id, node_id);
     }
+
+    pub fn routeGeneration(self: PeerResolver, group_id: u64, node_id: u64) ?u64 {
+        const get_generation = self.vtable.route_generation orelse return null;
+        return get_generation(self.ptr, group_id, node_id);
+    }
 };
 
 pub const MemoryPeerResolver = struct {
+    const Route = struct {
+        endpoints: []PeerEndpoint,
+        generation: u64,
+    };
+
     alloc: std.mem.Allocator,
-    routes: std.AutoHashMapUnmanaged(u128, []PeerEndpoint) = .empty,
+    mutex: std.atomic.Mutex = .unlocked,
+    routes: std.AutoHashMapUnmanaged(u128, Route) = .empty,
+    next_generation: u64 = 1,
 
     pub fn init(alloc: std.mem.Allocator) MemoryPeerResolver {
         return .{ .alloc = alloc };
@@ -61,12 +85,12 @@ pub const MemoryPeerResolver = struct {
 
     pub fn deinit(self: *MemoryPeerResolver) void {
         var it = self.routes.valueIterator();
-        while (it.next()) |endpoints| {
-            for (endpoints.*) |endpoint| {
+        while (it.next()) |route| {
+            for (route.endpoints) |endpoint| {
                 self.alloc.free(endpoint.address);
                 self.alloc.free(endpoint.metadata);
             }
-            self.alloc.free(endpoints.*);
+            self.alloc.free(route.endpoints);
         }
         self.routes.deinit(self.alloc);
         self.* = undefined;
@@ -77,27 +101,39 @@ pub const MemoryPeerResolver = struct {
             .ptr = self,
             .vtable = &.{
                 .resolve_group_peer = resolveGroupPeer,
+                .route_generation = routeGeneration,
             },
         };
     }
 
     pub fn upsert(self: *MemoryPeerResolver, group_id: u64, node_id: u64, endpoints: []const PeerEndpoint) !void {
-        const gop = try self.routes.getOrPut(self.alloc, key(group_id, node_id));
-        if (gop.found_existing) {
-            if (endpointsEqual(gop.value_ptr.*, endpoints)) return;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const route_key = key(group_id, node_id);
+        if (self.routes.getPtr(route_key)) |route| {
+            if (endpointsEqual(route.endpoints, endpoints)) return;
             const cloned = try self.cloneEndpoints(endpoints);
-            freeEndpoints(self.alloc, gop.value_ptr.*);
-            gop.value_ptr.* = cloned;
+            freeEndpoints(self.alloc, route.endpoints);
+            route.* = .{
+                .endpoints = cloned,
+                .generation = self.takeGeneration(),
+            };
             return;
         }
         const cloned = try self.cloneEndpoints(endpoints);
-        gop.value_ptr.* = cloned;
+        errdefer freeEndpoints(self.alloc, cloned);
+        try self.routes.put(self.alloc, route_key, .{
+            .endpoints = cloned,
+            .generation = self.takeGeneration(),
+        });
     }
 
     pub fn remove(self: *MemoryPeerResolver, group_id: u64, node_id: u64) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
         const removed = self.routes.fetchRemove(key(group_id, node_id));
         if (removed) |entry| {
-            freeEndpoints(self.alloc, entry.value);
+            freeEndpoints(self.alloc, entry.value.endpoints);
             return true;
         }
         return false;
@@ -105,7 +141,10 @@ pub const MemoryPeerResolver = struct {
 
     fn resolveGroupPeer(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64) ![]PeerEndpoint {
         const self: *MemoryPeerResolver = @ptrCast(@alignCast(ptr));
-        const endpoints = self.routes.get(key(group_id, node_id)) orelse return error.UnknownPeer;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const route = self.routes.get(key(group_id, node_id)) orelse return error.UnknownPeer;
+        const endpoints = route.endpoints;
         var out = try alloc.alloc(PeerEndpoint, endpoints.len);
         errdefer alloc.free(out);
         for (endpoints, 0..) |endpoint, i| {
@@ -116,6 +155,21 @@ pub const MemoryPeerResolver = struct {
             };
         }
         return out;
+    }
+
+    fn routeGeneration(ptr: *anyopaque, group_id: u64, node_id: u64) u64 {
+        const self: *MemoryPeerResolver = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const route = self.routes.get(key(group_id, node_id)) orelse return 0;
+        return route.generation;
+    }
+
+    fn takeGeneration(self: *MemoryPeerResolver) u64 {
+        const generation = self.next_generation;
+        self.next_generation +%= 1;
+        if (self.next_generation == 0) self.next_generation = 1;
+        return generation;
     }
 
     fn cloneEndpoints(self: *MemoryPeerResolver, endpoints: []const PeerEndpoint) ![]PeerEndpoint {
@@ -180,6 +234,15 @@ test "memory peer resolver clones and resolves endpoints" {
             .metadata = "zone=b",
         },
     });
+    const route_generation = resolver.resolver().routeGeneration(9, 2).?;
+    try resolver.upsert(9, 2, &.{
+        .{
+            .protocol = .http,
+            .address = "http://n2",
+            .metadata = "zone=b",
+        },
+    });
+    try std.testing.expectEqual(route_generation, resolver.resolver().routeGeneration(9, 2).?);
 
     const endpoints = try resolver.resolver().resolveGroupPeer(std.testing.allocator, 9, 2);
     defer {
@@ -205,5 +268,6 @@ test "memory peer resolver can remove routes" {
         },
     });
     try std.testing.expect(resolver.remove(9, 2));
+    try std.testing.expectEqual(@as(?u64, 0), resolver.resolver().routeGeneration(9, 2));
     try std.testing.expectError(error.UnknownPeer, resolver.resolver().resolveGroupPeer(std.testing.allocator, 9, 2));
 }

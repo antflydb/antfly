@@ -528,7 +528,7 @@ pub const MemoryReplicaCatalog = struct {
         defer self.mutex.unlock();
         if (self.current_revision != expected_revision) return error.ReplicaCatalogRevisionChanged;
         if (upserts.len == 0 and removals.len == 0) return;
-        const next_revision = try nextRevision(self.current_revision);
+        if (replicaBatchClearlyNoOp(&self.records, upserts, removals)) return;
 
         var next = try cloneReplicaMapFromMap(self.alloc, &self.records);
         errdefer deinitReplicaMap(self.alloc, &next);
@@ -537,6 +537,7 @@ pub const MemoryReplicaCatalog = struct {
             deinitReplicaMap(self.alloc, &next);
             return;
         }
+        const next_revision = try nextRevision(self.current_revision);
         deinitReplicaMap(self.alloc, &self.records);
         self.records = next;
         self.current_revision = next_revision;
@@ -675,7 +676,7 @@ pub const FileReplicaCatalog = struct {
         defer self.mutex.unlock();
         if (self.current_revision != expected_revision) return error.ReplicaCatalogRevisionChanged;
         if (upserts.len == 0 and removals.len == 0) return;
-        const next_revision = try nextRevision(self.current_revision);
+        if (replicaBatchClearlyNoOp(&self.records, upserts, removals)) return;
 
         var next = try cloneReplicaMapFromMap(self.alloc, &self.records);
         errdefer deinitReplicaMap(self.alloc, &next);
@@ -684,6 +685,7 @@ pub const FileReplicaCatalog = struct {
             deinitReplicaMap(self.alloc, &next);
             return;
         }
+        const next_revision = try nextRevision(self.current_revision);
 
         var previous = self.records;
         self.records = next;
@@ -871,6 +873,24 @@ fn replicaMapsEqual(
     while (it.next()) |entry| {
         const other = right.get(entry.key_ptr.*) orelse return false;
         if (!eqlReplicaRecord(entry.value_ptr.*, other)) return false;
+    }
+    return true;
+}
+
+/// Allocation-free fast path for the overwhelmingly common idempotent batch.
+/// Ambiguous remove+upsert overlaps deliberately fall through to the exact
+/// cloned-map comparison below rather than spending memory on a second index.
+fn replicaBatchClearlyNoOp(
+    records: *const std.AutoHashMapUnmanaged(u64, ReplicaRecord),
+    upserts: []const ReplicaRecord,
+    removals: []const u64,
+) bool {
+    for (upserts) |record| {
+        const existing = records.get(record.group_id) orelse return false;
+        if (!eqlReplicaRecord(existing, record)) return false;
+    }
+    for (removals) |group_id| {
+        if (records.contains(group_id)) return false;
     }
     return true;
 }

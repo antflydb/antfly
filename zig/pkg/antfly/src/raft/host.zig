@@ -149,6 +149,37 @@ pub const PreparedReplica = struct {
     }
 };
 
+/// Resolver-owned endpoint snapshot prepared without the Raft owner lock and
+/// published only after the caller re-enters the serialized runtime phase.
+pub const PreparedPeerEndpoints = struct {
+    group_id: u64,
+    node_id: u64,
+    resolver_generation: ?u64,
+    endpoints: []peer_resolver.PeerEndpoint,
+
+    pub fn deinit(self: *PreparedPeerEndpoints, alloc: std.mem.Allocator) void {
+        for (self.endpoints) |endpoint| {
+            alloc.free(endpoint.address);
+            alloc.free(endpoint.metadata);
+        }
+        alloc.free(self.endpoints);
+        self.* = undefined;
+    }
+};
+
+/// A lightweight admission observation prepared outside the Raft owner lock.
+/// Descriptor ownership remains with the factory until commit/deinit.
+pub const PreparedAdmissionValidation = struct {
+    record: catalog.ReplicaRecord,
+    factory: ReplicaDescriptorFactory,
+    descriptor: raft_engine.runtime.ReplicaDescriptor,
+
+    pub fn deinit(self: *PreparedAdmissionValidation, alloc: std.mem.Allocator) void {
+        self.factory.freeDescriptor(alloc, &self.descriptor);
+        self.* = undefined;
+    }
+};
+
 pub const BootstrapStatusKind = enum {
     backup_db_snapshot_restore,
 };
@@ -488,6 +519,32 @@ pub const Host = struct {
         return self.admission_conflicts.get(group_id);
     }
 
+    pub fn prepareReplicaAdmissionValidation(
+        self: *Host,
+        record: catalog.ReplicaRecord,
+    ) !PreparedAdmissionValidation {
+        const factory = self.deps.descriptor_factory orelse return error.MissingReplicaDescriptorFactory;
+        var descriptor = try factory.buildDescriptor(record);
+        errdefer factory.freeDescriptor(self.alloc, &descriptor);
+        descriptor.group.raft_config.trace_logger = self.cfg.trace_logger orelse
+            if (comptime build_options.with_tla) tracing.stderrRaftTraceLogger() else null;
+        try descriptor.validateForAdmission();
+        return .{
+            .record = record,
+            .factory = factory,
+            .descriptor = descriptor,
+        };
+    }
+
+    /// Commits only the in-memory observation. Callers must serialize this
+    /// with other runtime-owner mutations and may discard a stale preparation.
+    pub fn commitReplicaAdmissionValidation(
+        self: *Host,
+        prepared: *PreparedAdmissionValidation,
+    ) !?raft_engine.runtime.group.ReplicaAdmissionConflict {
+        return try self.observeReplicaAdmissionConflict(prepared.record, prepared.descriptor);
+    }
+
     /// Rechecks a previously blocked restart-scoped policy without touching
     /// the durable catalog or live runtime. Stable control rounds use this to
     /// observe configuration rollback and clear stale restart requirements.
@@ -495,13 +552,9 @@ pub const Host = struct {
         self: *Host,
         record: catalog.ReplicaRecord,
     ) !?raft_engine.runtime.group.ReplicaAdmissionConflict {
-        const factory = self.deps.descriptor_factory orelse return error.MissingReplicaDescriptorFactory;
-        var descriptor = try factory.buildDescriptor(record);
-        defer factory.freeDescriptor(self.alloc, &descriptor);
-        descriptor.group.raft_config.trace_logger = self.cfg.trace_logger orelse
-            if (comptime build_options.with_tla) tracing.stderrRaftTraceLogger() else null;
-        try descriptor.validateForAdmission();
-        return try self.observeReplicaAdmissionConflict(record, descriptor);
+        var prepared = try self.prepareReplicaAdmissionValidation(record);
+        defer prepared.deinit(self.alloc);
+        return try self.commitReplicaAdmissionValidation(&prepared);
     }
 
     fn observeReplicaAdmissionConflict(
@@ -664,17 +717,48 @@ pub const Host = struct {
     }
 
     pub fn refreshPeerEndpoints(self: *Host, group_id: u64, node_id: u64) !usize {
-        const resolver = self.deps.peer_resolver orelse return 0;
-        const endpoints = try resolver.resolveGroupPeer(self.alloc, group_id, node_id);
-        defer {
-            for (endpoints) |endpoint| {
-                self.alloc.free(endpoint.address);
-                self.alloc.free(endpoint.metadata);
-            }
-            self.alloc.free(endpoints);
-        }
+        var prepared = self.preparePeerEndpoints(group_id, node_id) catch |err| switch (err) {
+            error.MissingPeerResolver => return 0,
+            else => return err,
+        };
+        defer prepared.deinit(self.alloc);
+        return try self.commitPreparedPeerEndpoints(&prepared);
+    }
 
-        return try self.upsertResolvedPeerEndpoints(group_id, node_id, endpoints);
+    pub fn preparePeerEndpoints(
+        self: *Host,
+        group_id: u64,
+        node_id: u64,
+    ) !PreparedPeerEndpoints {
+        const resolver = self.deps.peer_resolver orelse return error.MissingPeerResolver;
+        const generation_before = resolver.routeGeneration(group_id, node_id);
+        var prepared = PreparedPeerEndpoints{
+            .group_id = group_id,
+            .node_id = node_id,
+            .resolver_generation = null,
+            .endpoints = try resolver.resolveGroupPeer(self.alloc, group_id, node_id),
+        };
+        errdefer prepared.deinit(self.alloc);
+        const generation_after = resolver.routeGeneration(group_id, node_id);
+        if (generation_before != generation_after) return error.PeerRouteChanged;
+        prepared.resolver_generation = generation_after;
+        return prepared;
+    }
+
+    pub fn commitPreparedPeerEndpoints(
+        self: *Host,
+        prepared: *const PreparedPeerEndpoints,
+    ) !usize {
+        if (prepared.resolver_generation) |generation| {
+            const resolver = self.deps.peer_resolver orelse return error.PeerRouteChanged;
+            if (resolver.routeGeneration(prepared.group_id, prepared.node_id) != generation)
+                return error.PeerRouteChanged;
+        }
+        return try self.upsertResolvedPeerEndpoints(
+            prepared.group_id,
+            prepared.node_id,
+            prepared.endpoints,
+        );
     }
 
     pub fn upsertResolvedPeerEndpoints(self: *Host, group_id: u64, node_id: u64, endpoints: []const peer_resolver.PeerEndpoint) !usize {
@@ -1566,6 +1650,27 @@ pub fn mergeRuntimeHooks(base: RuntimeHooks, overlay: RuntimeHooks) RuntimeHooks
     if (overlay.replica_catalog != null) merged.replica_catalog = overlay.replica_catalog;
     if (overlay.replica_factory != null) merged.replica_factory = overlay.replica_factory;
     return merged;
+}
+
+test "host rejects stale prepared peer endpoints" {
+    var resolver = peer_resolver.MemoryPeerResolver.init(std.testing.allocator);
+    defer resolver.deinit();
+    try resolver.upsert(9, 2, &.{.{
+        .protocol = .http,
+        .address = "http://old",
+    }});
+    var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .peer_resolver = resolver.resolver(),
+    });
+    defer host.deinit();
+
+    var prepared = try host.preparePeerEndpoints(9, 2);
+    defer prepared.deinit(std.testing.allocator);
+    try resolver.upsert(9, 2, &.{.{
+        .protocol = .http,
+        .address = "http://new",
+    }});
+    try std.testing.expectError(error.PeerRouteChanged, host.commitPreparedPeerEndpoints(&prepared));
 }
 
 test "host can ensure and remove a replica" {

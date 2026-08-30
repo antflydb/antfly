@@ -247,6 +247,13 @@ pub const ManagedHost = struct {
         return try self.reconciler_loop.prepare();
     }
 
+    pub fn prepareLiveConvergence(
+        self: *ManagedHost,
+        intents: []const reconciler.PlacementIntent,
+    ) !reconciler.PreparedLiveConvergence {
+        return try self.reconciler_loop.prepareLiveConvergence(intents);
+    }
+
     pub fn reconcileMembershipOnly(
         self: *ManagedHost,
         intents: []const reconciler.PlacementIntent,
@@ -260,6 +267,13 @@ pub const ManagedHost = struct {
 
     pub fn routeStatus(self: *const ManagedHost, group_id: u64) ?reconciler.RouteConvergence {
         return self.reconciler_loop.routeStatus(group_id);
+    }
+
+    pub fn routeDiagnostics(
+        self: *const ManagedHost,
+        group_id: u64,
+    ) ?reconciler.RouteConvergenceDiagnostics {
+        return self.reconciler_loop.routeDiagnostics(group_id);
     }
 
     pub fn replicaAdmissionConflict(
@@ -552,6 +566,13 @@ pub const ManagedHttpHost = struct {
         return try self.reconciler_loop.prepare();
     }
 
+    pub fn prepareLiveConvergence(
+        self: *ManagedHttpHost,
+        intents: []const reconciler.PlacementIntent,
+    ) !reconciler.PreparedLiveConvergence {
+        return try self.reconciler_loop.prepareLiveConvergence(intents);
+    }
+
     pub fn reconcileMembershipOnly(
         self: *ManagedHttpHost,
         intents: []const reconciler.PlacementIntent,
@@ -565,6 +586,13 @@ pub const ManagedHttpHost = struct {
 
     pub fn routeStatus(self: *const ManagedHttpHost, group_id: u64) ?reconciler.RouteConvergence {
         return self.reconciler_loop.routeStatus(group_id);
+    }
+
+    pub fn routeDiagnostics(
+        self: *const ManagedHttpHost,
+        group_id: u64,
+    ) ?reconciler.RouteConvergenceDiagnostics {
+        return self.reconciler_loop.routeDiagnostics(group_id);
     }
 
     pub fn replicaAdmissionConflict(
