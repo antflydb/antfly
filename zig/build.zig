@@ -542,7 +542,7 @@ fn addLocalSentencePieceProtoModule(
     codegen.addArg("--desc");
     codegen.addFileArg(b.path("lib/tokenizer/proto/sentencepiece_model.desc"));
     codegen.addArg("--output");
-    const raw_dir = codegen.addOutputDirectoryArg2("sentencepiece_proto_raw", .{});
+    const raw_dir = codegen.addOutputDirectoryArg2("sentencepiece_proto_raw", .{ .make_absolute = true });
 
     const fixup_tool = b.addExecutable(.{
         .name = "patch_sentencepiece_proto",
@@ -555,7 +555,7 @@ fn addLocalSentencePieceProtoModule(
     const fixup_run = b.addRunArtifact(fixup_tool);
     fixup_run.addFileArg(raw_dir.path(b, "root.zig"));
     fixup_run.addFileArg(raw_dir.path(b, "sentencepiece.zig"));
-    const gen_dir = fixup_run.addOutputDirectoryArg2("sentencepiece_proto", .{});
+    const gen_dir = fixup_run.addOutputDirectoryArg2("sentencepiece_proto", .{ .make_absolute = true });
 
     const mod = b.createModule(.{
         .root_source_file = gen_dir.path(b, "root.zig"),
@@ -640,7 +640,7 @@ fn addYaccSteps(
 
     const regen_run = b.addRunArtifact(yacc_codegen);
     regen_run.addFileArg(b.path(sql_grammar_source));
-    const regen_output = regen_run.addOutputFileArg2("regen_sql_grammar_root.zig", .{});
+    const regen_output = regen_run.addOutputFileArg2("regen_sql_grammar_root.zig", .{ .make_absolute = true });
     regen_run.addArg(sql_grammar_source);
     const update = b.addUpdateSourceFiles();
     update.addCopyFileToSource(regen_output, sql_grammar_generated_root);
@@ -651,7 +651,7 @@ fn addYaccSteps(
 
     const check_run = b.addRunArtifact(yacc_codegen);
     check_run.addFileArg(b.path(sql_grammar_source));
-    const check_output = check_run.addOutputFileArg2("check_sql_grammar_root.zig", .{});
+    const check_output = check_run.addOutputFileArg2("check_sql_grammar_root.zig", .{ .make_absolute = true });
     check_run.addArg(sql_grammar_source);
     const check_fmt = b.addFmt(.{ .paths = &.{check_output} });
     const compare = b.addRunArtifact(addFileCompareTool(b));
@@ -987,7 +987,7 @@ fn addSnowballGeneratedOutputs(
         run.addFileArg(snowball_dep.path(b, b.fmt("algorithms/{s}.sbl", .{lang})));
         run.addArg("-zig");
         run.addArg("-o");
-        stemmers[idx] = run.addOutputFileArg2(b.fmt("{s}_stemmer.zig", .{lang}), .{});
+        stemmers[idx] = run.addOutputFileArg2(b.fmt("{s}_stemmer.zig", .{lang}), .{ .make_absolute = true });
     }
 
     return .{
@@ -1057,7 +1057,7 @@ fn addOpenApiModuleFromYamlPath(
 
     const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
     convert.addFileArg(source_path);
-    const json_spec = convert.addOutputFileArg2(b.fmt("{s}.json", .{output_dir_name}), .{});
+    const json_spec = convert.addOutputFileArg2(b.fmt("{s}.json", .{output_dir_name}), .{ .make_absolute = true });
 
     const codegen = b.addRunArtifact(openapi_codegen);
     codegen.addArgs(&.{"--spec"});
@@ -1069,7 +1069,7 @@ fn addOpenApiModuleFromYamlPath(
         codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
     }
     codegen.addArgs(&.{"--output"});
-    const gen_dir = codegen.addOutputDirectoryArg2(output_dir_name, .{});
+    const gen_dir = codegen.addOutputDirectoryArg2(output_dir_name, .{ .make_absolute = true });
 
     return b.addModule(package_name, .{
         .root_source_file = gen_dir.path(b, "root.zig"),
@@ -1111,13 +1111,13 @@ fn addOpenApiRootCheckStep(b: *std.Build) *std.Build.Step.Run {
 fn addJoinedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_openapi.py", &.{"--joined-only"});
     addOpenApiJoinInputs(b, join);
-    return join.addOutputFileArg2("openapi.public.joined.yaml", .{});
+    return join.addOutputFileArg2("openapi.public.joined.yaml", .{ .make_absolute = true });
 }
 
 fn addPrefixedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{});
     addOpenApiJoinInputs(b, join);
-    return join.addOutputFileArg2("openapi.public.prefixed.yaml", .{});
+    return join.addOutputFileArg2("openapi.public.prefixed.yaml", .{ .make_absolute = true });
 }
 
 fn addPublicOpenApiModule(
@@ -1196,7 +1196,7 @@ fn addOpenApiModuleWithHttpxFromYamlPath(
 
     const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
     convert.addFileArg(source_path);
-    const json_spec = convert.addOutputFileArg2(b.fmt("{s}.json", .{output_dir_name}), .{});
+    const json_spec = convert.addOutputFileArg2(b.fmt("{s}.json", .{output_dir_name}), .{ .make_absolute = true });
 
     const codegen = b.addRunArtifact(openapi_codegen);
     codegen.addArgs(&.{"--spec"});
@@ -1208,7 +1208,7 @@ fn addOpenApiModuleWithHttpxFromYamlPath(
         codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
     }
     codegen.addArgs(&.{"--output"});
-    const gen_dir = codegen.addOutputDirectoryArg2(output_dir_name, .{});
+    const gen_dir = codegen.addOutputDirectoryArg2(output_dir_name, .{ .make_absolute = true });
 
     const mod = b.addModule(package_name, .{
         .root_source_file = gen_dir.path(b, "root.zig"),
@@ -1281,7 +1281,7 @@ fn addOpenApiRegenRun(
 ) *std.Build.Step.Run {
     const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
     convert.addFileArg(source_path);
-    const json_spec = convert.addOutputFileArg2(b.fmt("{s}.json", .{package_name}), .{});
+    const json_spec = convert.addOutputFileArg2(b.fmt("{s}.json", .{package_name}), .{ .make_absolute = true });
 
     const codegen = b.addRunArtifact(openapi_codegen);
     codegen.addArgs(&.{"--spec"});
@@ -8080,7 +8080,7 @@ pub fn build(b: *std.Build) void {
     const unit_storage_shard_audit = b.addSystemCommand(&.{"python3"});
     unit_storage_shard_audit.addFileArg(b.path("tools/audit_storage_test_shards.py"));
     unit_storage_shard_audit.addArg("--root");
-    unit_storage_shard_audit.addDirectoryArg2(b.path("pkg/antfly/src/storage"), .{});
+    unit_storage_shard_audit.addDirectoryArg2(b.path("pkg/antfly/src/storage"), .{ .make_absolute = true });
     unit_storage_shard_audit.addArg("--manifest");
     unit_storage_shard_audit.addFileArg(b.path("pkg/antfly/src/storage/test_manifest.zig"));
     for (unit_storage_shard_filters) |shard_filters| {
@@ -8251,12 +8251,12 @@ pub fn build(b: *std.Build) void {
     compare_unit_storage_inventory.addFileArg(b.path("tools/compare_test_inventories.py"));
     compare_unit_storage_inventory.addArg("--baseline");
     for (unit_storage_baseline_tests) |baseline_tests| {
-        compare_unit_storage_inventory.addArtifactArg2(baseline_tests, .{});
+        compare_unit_storage_inventory.addArtifactArg2(baseline_tests, .{ .make_absolute = true });
     }
     compare_unit_storage_inventory.addArg("--candidate");
-    compare_unit_storage_inventory.addArtifactArg2(unit_storage_support_tests, .{});
-    compare_unit_storage_inventory.addArtifactArg2(unit_storage_engine_tests, .{});
-    compare_unit_storage_inventory.addArtifactArg2(unit_storage_db_core_tests, .{});
+    compare_unit_storage_inventory.addArtifactArg2(unit_storage_support_tests, .{ .make_absolute = true });
+    compare_unit_storage_inventory.addArtifactArg2(unit_storage_engine_tests, .{ .make_absolute = true });
+    compare_unit_storage_inventory.addArtifactArg2(unit_storage_db_core_tests, .{ .make_absolute = true });
     compare_unit_storage_inventory.addArgs(&.{ "--label", "storage consolidation" });
     const unit_storage_inventory_step = b.step(
         "unit-storage-test-inventory",
@@ -8272,7 +8272,7 @@ pub fn build(b: *std.Build) void {
         run_db_core_partitioned_tests.setName("run test storage-db-core-tests partitioned");
         run_db_core_partitioned_tests.addFileArg(b.path("tools/run_test_partitions.py"));
         run_db_core_partitioned_tests.addArg("--executable");
-        run_db_core_partitioned_tests.addArtifactArg2(unit_storage_db_core_tests, .{});
+        run_db_core_partitioned_tests.addArtifactArg2(unit_storage_db_core_tests, .{ .make_absolute = true });
         for (unit_storage_db_core_lane_filters) |lane_filter| {
             run_db_core_partitioned_tests.addArgs(&.{ "--partition-filter", lane_filter });
         }
@@ -8480,9 +8480,9 @@ pub fn build(b: *std.Build) void {
     compare_unit_metadata_inventory.setName("compare consolidated metadata test inventory");
     compare_unit_metadata_inventory.addFileArg(b.path("tools/compare_test_inventories.py"));
     compare_unit_metadata_inventory.addArg("--baseline");
-    for (unit_metadata_baseline_tests) |tests| compare_unit_metadata_inventory.addArtifactArg2(tests, .{});
+    for (unit_metadata_baseline_tests) |tests| compare_unit_metadata_inventory.addArtifactArg2(tests, .{ .make_absolute = true });
     compare_unit_metadata_inventory.addArg("--candidate");
-    for (unit_metadata_tests) |tests| compare_unit_metadata_inventory.addArtifactArg2(tests, .{});
+    for (unit_metadata_tests) |tests| compare_unit_metadata_inventory.addArtifactArg2(tests, .{ .make_absolute = true });
     compare_unit_metadata_inventory.addArgs(&.{ "--label", "metadata consolidation" });
     const unit_metadata_inventory_step = b.step(
         "unit-metadata-test-inventory",
@@ -10317,11 +10317,11 @@ pub fn build(b: *std.Build) void {
     run_recall_checks.setName("run storage and per-metric recall checks concurrently");
     run_recall_checks.addFileArg(b.path("tools/run_recall_checks.py"));
     run_recall_checks.addArg("--test-executable");
-    run_recall_checks.addArtifactArg2(compiled_recall_tests, .{});
+    run_recall_checks.addArtifactArg2(compiled_recall_tests, .{ .make_absolute = true });
     run_recall_checks.addArg("--harness-executable");
-    run_recall_checks.addArtifactArg2(recall_harness, .{});
+    run_recall_checks.addArtifactArg2(recall_harness, .{ .make_absolute = true });
     run_recall_checks.addArg("--dataset-dir");
-    run_recall_checks.addDirectoryArg2(b.path("testdata/vectorsets"), .{});
+    run_recall_checks.addDirectoryArg2(b.path("testdata/vectorsets"), .{ .make_absolute = true });
     run_recall_checks.stdio = .inherit;
     run_recall_checks.step.max_rss = 12 * 1024 * 1024 * 1024;
     const recall_ci_test_step = b.step(
@@ -10570,9 +10570,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_lite_core_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_lite_core_cli_smoke.addArtifactArg2(lite_core_main, .{});
+    run_lite_core_cli_smoke.addArtifactArg2(lite_core_main, .{ .make_absolute = true });
     const run_lite_full_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_lite_full_cli_smoke.addArtifactArg2(antfly_main, .{});
+    run_lite_full_cli_smoke.addArtifactArg2(antfly_main, .{ .make_absolute = true });
     const lite_cli_smoke_step = b.step("lite-cli-smoke", "Run black-box Antfly Lite CLI smoke tests");
     lite_cli_smoke_step.dependOn(&run_lite_core_cli_smoke.step);
     lite_cli_smoke_step.dependOn(&run_lite_full_cli_smoke.step);

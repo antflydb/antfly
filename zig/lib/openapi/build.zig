@@ -147,7 +147,7 @@ pub fn addOpenApiModule(dep: *std.Build.Dependency, b: *std.Build, opts: OpenApi
     }
 
     codegen.addArgs(&.{"--output"});
-    const gen_dir = codegen.addOutputDirectoryArg2(opts.package_name, .{});
+    const gen_dir = codegen.addOutputDirectoryArg2(opts.package_name, .{ .make_absolute = true });
 
     return b.addModule(opts.package_name, .{
         .root_source_file = gen_dir.path(b, "root.zig"),

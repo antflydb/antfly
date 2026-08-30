@@ -680,7 +680,7 @@ fn addInferenceApiModule(
         "yaml_to_json.py",
     });
     convert.addFileArg(b.path(spec_path_override.?));
-    const json_spec = convert.addOutputFileArg2("inference.openapi.json", .{});
+    const json_spec = convert.addOutputFileArg2("inference.openapi.json", .{ .make_absolute = true });
     const codegen = b.addRunArtifact(openapi_dep.artifact("openapi-zig"));
     codegen.addArg("--spec");
     codegen.addFileArg(json_spec);
@@ -691,7 +691,7 @@ fn addInferenceApiModule(
     codegen.addArg(b.fmt("{s}={s}", .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" }));
     codegen.addArg(b.fmt("{s}={s}", .{ "../ai/extraction.yaml", "antfly_extraction_openapi" }));
     codegen.addArg("--output");
-    const gen_dir = codegen.addOutputDirectoryArg2("inference_api", .{});
+    const gen_dir = codegen.addOutputDirectoryArg2("inference_api", .{ .make_absolute = true });
     const mod = addOrCreateModule(b, register_public_modules, "inference_api", .{
         .root_source_file = gen_dir.path(b, "root.zig"),
         .target = target,
@@ -761,7 +761,7 @@ fn addSentencePieceProtoModule(
     codegen.addArg("--desc");
     codegen.addFileArg(b.path(pathJoin(b, paths.shared_lib_root, "lib/tokenizer/proto/sentencepiece_model.desc")));
     codegen.addArg("--output");
-    const raw_dir = codegen.addOutputDirectoryArg2("sentencepiece_proto_raw", .{});
+    const raw_dir = codegen.addOutputDirectoryArg2("sentencepiece_proto_raw", .{ .make_absolute = true });
 
     const fixup_tool = b.addExecutable(.{
         .name = "patch_sentencepiece_proto",
@@ -774,7 +774,7 @@ fn addSentencePieceProtoModule(
     const fixup_run = b.addRunArtifact(fixup_tool);
     fixup_run.addFileArg(raw_dir.path(b, "root.zig"));
     fixup_run.addFileArg(raw_dir.path(b, "sentencepiece.zig"));
-    const gen_dir = fixup_run.addOutputDirectoryArg2("sentencepiece_proto", .{});
+    const gen_dir = fixup_run.addOutputDirectoryArg2("sentencepiece_proto", .{ .make_absolute = true });
 
     const mod = addOrCreateModule(b, register_public_modules, "sentencepiece_proto", .{
         .root_source_file = gen_dir.path(b, "root.zig"),

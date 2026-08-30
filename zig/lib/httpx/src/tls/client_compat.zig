@@ -18,14 +18,14 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
-//! Zig 0.16 TLS client compatibility copy.
+//! Zig TLS client compatibility copy.
 //!
-//! Derived from Zig 0.16.0 `std.crypto.tls.Client` under the Zig contributors'
-//! MIT license above. The only protocol change accepts an optional TLS 1.2 or
-//! TLS 1.3 initial-handshake CertificateRequest and sends an empty client
-//! Certificate message, as required when bearer authentication is used without
-//! a client certificate. Remove this copy after upstream Zig provides the same
-//! behavior and Antfly's minimum Zig revision includes it.
+//! Derived from the pinned Zig 0.17 nightly's `std.crypto.tls.Client` under the
+//! Zig contributors' MIT license above. The protocol change accepts an optional
+//! TLS 1.2 or TLS 1.3 initial-handshake CertificateRequest and sends an empty
+//! client Certificate message, as required when bearer authentication is used
+//! without a client certificate. Remove this copy after upstream Zig provides
+//! the same behavior and Antfly's minimum Zig revision includes it.
 
 const builtin = @import("builtin");
 const native_endian = builtin.cpu.arch.endian();
