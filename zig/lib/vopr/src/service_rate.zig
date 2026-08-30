@@ -195,7 +195,8 @@ fn multiplyChecked(left: u64, right: u64) !u64 {
 
 fn scaleCeilChecked(cost: u64, multiplier_ppm: u64) !u64 {
     const wide: u128 = @as(u128, cost) * @as(u128, multiplier_ppm);
-    const scaled = (wide + parts_per_million - 1) / parts_per_million;
+    const rounded = std.math.add(u128, wide, parts_per_million - 1) catch return error.ServiceRateCostOverflow;
+    const scaled = rounded / parts_per_million;
     if (scaled > std.math.maxInt(u64)) return error.ServiceRateCostOverflow;
     return @intCast(scaled);
 }
@@ -261,4 +262,18 @@ test "service-rate cost is independent of fault activation order" {
     try std.testing.expectEqual(expected, try descending.effectiveCostNs(node.id, operation.id, 1));
     try descending.heal(low.fault_id);
     try std.testing.expectEqual(@as(u64, 4), try descending.effectiveCostNs(node.id, operation.id, 1));
+}
+
+test "service-rate scaling reports every arithmetic overflow" {
+    const node = Node{ .id = 1, .name = "node" };
+    const operation = Operation.named("overflow", std.math.maxInt(u64));
+    var model = try Model.init(std.testing.allocator, &.{node}, &.{operation});
+    defer model.deinit();
+    try std.testing.expectError(error.ServiceRateCostOverflow, model.effectiveCostNs(node.id, operation.id, 2));
+    try model.activate(.{
+        .fault_id = 1,
+        .node_id = node.id,
+        .multiplier_ppm = std.math.maxInt(u64),
+    });
+    try std.testing.expectError(error.ServiceRateCostOverflow, model.effectiveCostNs(node.id, operation.id, 1));
 }

@@ -775,8 +775,9 @@ test "bounded NDJSON stream backpressure is diagnostic-only at the runner bounda
     const plain_bytes = try plain.renderAlloc(std.testing.allocator);
     defer std.testing.allocator.free(plain_bytes);
     try std.testing.expectEqualSlices(u8, plain_bytes, streamed_bytes);
-    try std.testing.expectEqual(@as(u64, 1), stream.stats.enqueued);
-    try std.testing.expectEqual(@as(u64, 1), stream.stats.dropped_full);
+    const stream_stats = stream.stats();
+    try std.testing.expectEqual(@as(u64, 1), stream_stats.enqueued);
+    try std.testing.expectEqual(@as(u64, 1), stream_stats.dropped_full);
     try std.testing.expectEqual(@as(usize, 1), stream.pending());
 }
 
