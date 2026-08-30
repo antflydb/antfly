@@ -50,7 +50,7 @@ from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import pytest
 import requests
@@ -313,7 +313,10 @@ def _created_table_from_path(path: str) -> str | None:
 
 
 def ready_index_status(
-    index_info: dict[str, Any], *, require_query_fresh: bool = False
+    index_info: dict[str, Any],
+    *,
+    until: Literal["queryable", "complete"] | None = None,
+    require_query_fresh: bool = False,
 ) -> dict[str, Any] | None:
     status = index_info.get("status")
     if status is None:
@@ -343,6 +346,10 @@ def ready_index_status(
         return None
     if status.get("catch_up_active", False):
         return None
+    if until is not None:
+        readiness = status.get("readiness")
+        if not isinstance(readiness, dict) or readiness.get(until) is not True:
+            return None
     coverage = status.get("coverage")
     if isinstance(coverage, dict):
         if coverage.get("observation_complete") is not True:
@@ -370,13 +377,14 @@ def ready_index_status(
 def _index_ready_timeout_message(
     table_name: str,
     index_name: str,
+    until: Literal["queryable", "complete"],
     timeout_s: float,
     last_info: dict[str, Any] | None,
     last_error: BaseException | None,
     server: Any,
 ) -> str:
     parts = [
-        f"index did not become ready within {timeout_s}s table={table_name!r} index={index_name!r}",
+        f"index did not reach {until} within {timeout_s}s table={table_name!r} index={index_name!r}",
     ]
     if last_info is not None:
         parts.append("[last index response]")
@@ -2083,6 +2091,7 @@ def serverless_api(serverless_runtime):
             *,
             timeout_s: float = 30.0,
             interval_s: float = 0.5,
+            until: Literal["queryable", "complete"] = "queryable",
             require_query_fresh: bool = False,
         ) -> dict:
             deadline = time.monotonic() + timeout_s
@@ -2092,7 +2101,9 @@ def serverless_api(serverless_runtime):
                 try:
                     last_info = self.get(f"/tables/{table_name}/indexes/{index_name}")
                     ready = ready_index_status(
-                        last_info, require_query_fresh=require_query_fresh
+                        last_info,
+                        until=until,
+                        require_query_fresh=require_query_fresh,
                     )
                     if ready is not None:
                         return ready
@@ -2103,6 +2114,7 @@ def serverless_api(serverless_runtime):
                         _index_ready_timeout_message(
                             table_name,
                             index_name,
+                            until,
                             timeout_s,
                             last_info,
                             last_error,
@@ -3244,6 +3256,7 @@ def backup_api(request: pytest.FixtureRequest):
             *,
             timeout_s: float = 30.0,
             interval_s: float = 0.5,
+            until: Literal["queryable", "complete"] = "queryable",
             require_query_fresh: bool = False,
         ) -> dict:
             deadline = time.monotonic() + timeout_s
@@ -3253,7 +3266,9 @@ def backup_api(request: pytest.FixtureRequest):
                 try:
                     last_info = self.get(f"/tables/{table_name}/indexes/{index_name}")
                     ready = ready_index_status(
-                        last_info, require_query_fresh=require_query_fresh
+                        last_info,
+                        until=until,
+                        require_query_fresh=require_query_fresh,
                     )
                     if ready is not None:
                         return ready
@@ -3264,6 +3279,7 @@ def backup_api(request: pytest.FixtureRequest):
                         _index_ready_timeout_message(
                             table_name,
                             index_name,
+                            until,
                             timeout_s,
                             last_info,
                             last_error,
@@ -3500,6 +3516,7 @@ def table_api(request):
             *,
             timeout_s: float = 30.0,
             interval_s: float = 0.5,
+            until: Literal["queryable", "complete"] = "queryable",
             require_query_fresh: bool = False,
         ) -> dict:
             deadline = time.monotonic() + timeout_s
@@ -3509,7 +3526,9 @@ def table_api(request):
                 try:
                     last_info = self.get_index(table_name, index_name)
                     ready = ready_index_status(
-                        last_info, require_query_fresh=require_query_fresh
+                        last_info,
+                        until=until,
+                        require_query_fresh=require_query_fresh,
                     )
                     if ready is not None:
                         return ready
@@ -3520,6 +3539,7 @@ def table_api(request):
                         _index_ready_timeout_message(
                             table_name,
                             index_name,
+                            until,
                             timeout_s,
                             last_info,
                             last_error,

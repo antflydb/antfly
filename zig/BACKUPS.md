@@ -130,8 +130,11 @@ Publication order is part of the durability contract:
    manifest immutably (a lease whose manifest is temporarily missing makes GC
    abort and retry);
 3. stream only newly required `blobs/sha256/<storage-sha256>` objects with
-   create-if-absent semantics, keeping the source file generation pinned and
-   post-verifying the stored object generation;
+   create-if-absent semantics. Each digest-sorted blob entry names one
+   path-sorted representative logical object with the same digest and size,
+   making source lookup bounded (`O(log objects)` per blob) while the source
+   file generation remains pinned and the stored object generation is
+   post-verified;
 4. validate the backend receipts, write the completion seal, consume the lease,
    and conditionally update `refs/<backup-id>` with the expected prior digest
    and generation.
@@ -141,6 +144,12 @@ partial backup. Competing writers cannot silently replace one another. GC marks
 from live refs and unexpired restore/export leases, retains an active delta's
 exact base proof while publication is in flight, and deletes only unmarked
 objects older than a grace cutoff from the same stable repository epoch.
+Stable epochs are even. A backend writes the next odd epoch before changing a
+lease or ref and the following even epoch after the new root set is durable.
+Mark and sweep take the repository coordinator and reject odd epochs; if a
+writer crashed, the next coordinator owner advances the abandoned odd value to
+an even value before GC can enumerate roots. This prevents an epoch-first lease
+activation or renewal from briefly looking like a complete namespace.
 
 `.afb` is the transport layer over that model:
 

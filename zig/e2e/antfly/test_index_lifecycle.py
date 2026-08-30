@@ -210,6 +210,10 @@ def test_ready_index_status_requires_current_coverage_observation():
             "dense_publish_pending": False,
             "replay_catch_up_required": False,
             "catch_up_active": False,
+            "readiness": {
+                "queryable": True,
+                "complete": False,
+            },
             "coverage": {
                 "observation_complete": True,
                 "config_mismatch_group_count": 0,
@@ -217,6 +221,18 @@ def test_ready_index_status_requires_current_coverage_observation():
         }
     }
     assert ready_index_status(ready_status) is ready_status["status"]
+    assert (
+        ready_index_status(ready_status, until="queryable")
+        is ready_status["status"]
+    )
+    assert ready_index_status(ready_status, until="complete") is None
+
+    complete_status = json.loads(json.dumps(ready_status))
+    complete_status["status"]["readiness"]["complete"] = True
+    assert (
+        ready_index_status(complete_status, until="complete")
+        is complete_status["status"]
+    )
 
     stale_incarnation = json.loads(json.dumps(ready_status))
     stale_incarnation["status"]["coverage"]["observation_complete"] = False

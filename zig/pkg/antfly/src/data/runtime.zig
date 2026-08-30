@@ -7384,6 +7384,13 @@ pub const DataServer = struct {
         remote_metadata.test_faults.force_snapshot_cache_miss = fetch_error != null;
     }
 
+    pub fn remoteMetadataLifecycleLinearizableReadsForTest(self: *DataServer) u64 {
+        comptime std.debug.assert(@import("builtin").is_test);
+        const remote_metadata = self.remote_metadata orelse
+            @panic("remote metadata is unavailable");
+        return remote_metadata.test_faults.lifecycle_linearizable_snapshot_calls.load(.acquire);
+    }
+
     pub fn localShardOperationAdapter(self: *DataServer) antfly.raft.ShardOperationAdapter {
         return .{
             .ptr = self,
@@ -15363,6 +15370,7 @@ const RemoteMetadataSource = struct {
     const TestFaults = if (@import("builtin").is_test) struct {
         fetch_head_error: ?anyerror = null,
         force_snapshot_cache_miss: bool = false,
+        lifecycle_linearizable_snapshot_calls: std.atomic.Value(u64) = .init(0),
     } else struct {};
 
     alloc: std.mem.Allocator,
@@ -16363,9 +16371,13 @@ const RemoteMetadataSource = struct {
         const timeout_ns = 30 * std.time.ns_per_s;
         const poll_interval_ms: u64 = 10;
         const start_ns = platform_time.monotonicNs();
+        var needs_authoritative_fence = true;
 
         while (true) {
-            var snapshot = try self.fetchSnapshot();
+            var snapshot = if (needs_authoritative_fence) blk: {
+                needs_authoritative_fence = false;
+                break :blk try self.fetchLifecycleSnapshot();
+            } else try self.fetchSnapshot();
 
             if (remoteTableLifecycleMatches(&snapshot, table_name, expected)) {
                 freeAdminSnapshotOwned(self.alloc, &snapshot);
@@ -16387,9 +16399,13 @@ const RemoteMetadataSource = struct {
         const timeout_ns = 30 * std.time.ns_per_s;
         const poll_interval_ms: u64 = 10;
         const start_ns = platform_time.monotonicNs();
+        var needs_authoritative_fence = true;
 
         while (true) {
-            var snapshot = try self.fetchSnapshot();
+            var snapshot = if (needs_authoritative_fence) blk: {
+                needs_authoritative_fence = false;
+                break :blk try self.fetchLifecycleSnapshot();
+            } else try self.fetchSnapshot();
 
             if (remoteTableProjectionMatches(&snapshot, table_name, schema_json, indexes_json)) {
                 freeAdminSnapshotOwned(self.alloc, &snapshot);
@@ -16399,6 +16415,19 @@ const RemoteMetadataSource = struct {
             if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
             platform_clock.Clock.real().sleepMs(poll_interval_ms);
         }
+    }
+
+    /// Lifecycle barriers guard name reuse and generation publication. An
+    /// ordinary cached/follower snapshot may legitimately lag and therefore
+    /// cannot prove absence or that a matching definition is the new
+    /// incarnation. Prefer the metadata service's linearizable snapshot,
+    /// which also installs the fenced result in the process cache. The
+    /// fallback is only for servers that do not expose that capability.
+    fn fetchLifecycleSnapshot(self: *RemoteMetadataSource) !antfly.metadata_api.AdminSnapshot {
+        if (@import("builtin").is_test)
+            _ = self.test_faults.lifecycle_linearizable_snapshot_calls.fetchAdd(1, .release);
+        if (try remoteLinearizableSnapshot(self, .{})) |snapshot| return snapshot;
+        return try self.fetchSnapshot();
     }
 
     fn registerNode(self: *RemoteMetadataSource, record: antfly.metadata.table_manager.StoreRecord) !void {

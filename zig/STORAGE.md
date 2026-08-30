@@ -30,15 +30,18 @@ repository is `refs/` plus immutable `manifests/<sha256>` and
 native physical representation and always carries the complete materialized
 inventory for its snapshot. Logical objects map safe paths and roles to a
 separate digest-sorted unique blob inventory, so content can be deduplicated
-without losing native filenames. Parent links make incremental capture,
+without losing native filenames. Every blob names a validated representative
+logical path, avoiding a scan of the complete object inventory during upload.
+Parent links make incremental capture,
 accounting, and reachability GC efficient; repository restore pins one immutable
 manifest and does not replay a parent chain.
 
 Repository publication is a fenced session: an immutable candidate manifest
 is leased before upload, verified blob generations produce fence-bound
 receipts, and finalization consumes those receipts without an O(total blobs)
-remote existence scan. Lease/ref changes advance a repository epoch, so a GC
-sweep can delete only from the stable epoch it marked.
+remote existence scan. Lease/ref changes are enclosed by an odd in-progress
+and even stable repository epoch, so GC cannot accept a partially changed root
+namespace and can delete only from the stable even epoch it marked.
 
 `.afb` is the Antfly Backup Bundle transport envelope. AFB1 remains readable as
 the v0.2.0 portable stream. AFB2 identifies native versus portable and full

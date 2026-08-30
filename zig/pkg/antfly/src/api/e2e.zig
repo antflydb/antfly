@@ -2711,7 +2711,10 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     try backups_api.validateRestorableManifestLayout(&backup_manifest);
     try std.testing.expectEqualStrings("docs", backup_manifest.table_name);
 
+    const lifecycle_reads_before_drop = data_server.remoteMetadataLifecycleLinearizableReadsForTest();
     _ = try client.dropTable(base_uri, "docs");
+    const lifecycle_reads_after_drop = data_server.remoteMetadataLifecycleLinearizableReadsForTest();
+    try std.testing.expect(lifecycle_reads_after_drop > lifecycle_reads_before_drop);
 
     const restore_body =
         \\{"backup_id":"standalone-like-roundtrip-snap","location":"file:///","connection":"test-backups"}
@@ -2776,6 +2779,11 @@ test "public api standalone-like e2e backs up drops and restores a table" {
         try io_impl.io().sleep(.fromMilliseconds(1), .awake);
     }
     if (!restore_succeeded) return error.RestoreJobTimeout;
+    // Recreate must also fence projection against the authoritative metadata
+    // incarnation rather than accepting an identical stale definition.
+    try std.testing.expect(
+        data_server.remoteMetadataLifecycleLinearizableReadsForTest() > lifecycle_reads_after_drop,
+    );
 
     var lookup = try client.fetchLookup(base_uri, "docs", "doc:a", null);
     defer lookup.deinit(std.testing.allocator);

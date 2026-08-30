@@ -746,7 +746,13 @@ def test_public_managed_semantic_full_index_pipeline(backup_api, openai_embedder
     )
     assert batch["inserted"] == 2
 
-    backup_api.wait_index_ready(table_name, index_name, timeout_s=30.0, interval_s=0.25)
+    backup_api.wait_index_ready(
+        table_name,
+        index_name,
+        timeout_s=30.0,
+        interval_s=0.25,
+        until="complete",
+    )
     index = backup_api.get_index(table_name, index_name)
     assert index["config"]["name"] == index_name
     status = index["status"]
@@ -804,7 +810,13 @@ def test_inline_managed_index_create_load_ready_query_pipeline(
     )
     assert batch["inserted"] == 2
 
-    backup_api.wait_index_ready(table_name, index_name, timeout_s=30.0, interval_s=0.25)
+    backup_api.wait_index_ready(
+        table_name,
+        index_name,
+        timeout_s=30.0,
+        interval_s=0.25,
+        until="complete",
+    )
     index = backup_api.get_index(table_name, index_name)
     assert index["config"]["name"] == index_name
     status = index["status"]
@@ -1001,7 +1013,6 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     coverage = partial_status["coverage"]
     source_coverage = partial_status["source_coverage"]
     milestones = partial_status["milestones"]
-    activity = partial_status["activity"]
     assert readiness["queryable"] is True
     assert readiness["complete"] is False
     assert readiness["state"] != "failed"
@@ -1017,20 +1028,38 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     assert milestones["queryable"]["blockers"] == []
     assert milestones["complete"]["reached"] is False
     assert "source_coverage" in milestones["complete"]["blockers"]
-    # Activity is best-effort, leader-local telemetry. Readiness and durable
-    # coverage must remain truthful even during a leader transition where no
-    # heartbeat is currently available.
-    if activity is not None:
-        assert activity["epoch"].startswith("a-")
-        assert activity["phase"] in {
-            "idle",
-            "preparing",
-            "embedding",
-            "publishing",
-            "waiting_retry",
-        }
-        assert activity["embeddings_computed"] > 0
     assert partial_status["searchable_vectors"] == partial_status["total_indexed"]
+
+    # Activity is leader-local and can be briefly absent during handoff, but
+    # the delivery pipeline must produce a heartbeat for the current index
+    # incarnation while durable readiness remains independently queryable.
+    def current_activity_status() -> dict | None:
+        status = backup_api.get_index(table_name, index_name)["status"]
+        readiness = status.get("readiness") or {}
+        if readiness.get("incarnation") != partial_status["readiness"]["incarnation"]:
+            return None
+        if status.get("activity") is None:
+            return None
+        return status
+
+    activity_status = wait_until(
+        current_activity_status,
+        timeout_s=10.0,
+        interval_s=0.05,
+    )
+    assert activity_status is not None, "current incarnation emitted no activity heartbeat"
+    activity = activity_status["activity"]
+    assert activity["epoch"].startswith("a-")
+    assert activity["phase"] in {
+        "idle",
+        "preparing",
+        "embedding",
+        "publishing",
+        "waiting_retry",
+    }
+    assert activity["embeddings_computed"] > 0
+    assert activity_status["readiness"]["queryable"] is True
+    assert activity_status["readiness"]["complete"] is False
 
     result = backup_api.query_table(
         table_name,
@@ -1054,6 +1083,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         index_name,
         timeout_s=120.0,
         interval_s=0.1,
+        until="complete",
         require_query_fresh=True,
     )
     assert complete["readiness"]["state"] == "ready"
@@ -1130,6 +1160,7 @@ def test_500_document_chunked_backfill_is_bounded_idempotent_and_allows_second_i
             # stalled backfill.
             timeout_s=600.0,
             interval_s=0.5,
+            until="complete",
             require_query_fresh=True,
         )
         coverage = status.get("coverage")
