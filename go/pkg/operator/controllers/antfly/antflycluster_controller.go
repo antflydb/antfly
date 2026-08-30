@@ -6245,7 +6245,10 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 // an already-running artifact action from mutating storage after the disable
 // boundary, this releases target PVCs promptly: completed Job Pods still count
 // as PVC consumers, so retaining them for their diagnostic TTL can otherwise
-// deadlock replacement-PVC deletion behind the pvc-protection finalizer.
+// deadlock replacement-PVC deletion behind the pvc-protection finalizer. Pods
+// are deleted explicitly before their Jobs: some Kubernetes installations
+// orphan completed Job Pods during controller deletion, and an orphan that
+// still references a target PVC is an unbounded storage leak.
 func (r *AntflyClusterReconciler) deleteDisabledHAAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
 	if r == nil || r.Client == nil || cluster == nil || cluster.UID == "" || cluster.Status.HAStatus == nil {
 		return nil
@@ -6255,6 +6258,18 @@ func (r *AntflyClusterReconciler) deleteDisabledHAAdminJobs(ctx context.Context,
 		name := strings.TrimSpace(cluster.Status.HAStatus.PlannedActions[i].AdminJobName)
 		if name != "" && name != haAdminDirectAPIName {
 			jobNames[name] = struct{}{}
+		}
+	}
+	candidatePods := &corev1.PodList{}
+	if len(jobNames) > 0 {
+		if err := r.List(ctx, candidatePods,
+			client.InNamespace(cluster.Namespace),
+			client.MatchingLabels{
+				"app.kubernetes.io/component": "ha-admin",
+				"app.kubernetes.io/instance":  cluster.Name,
+			},
+		); err != nil {
+			return fmt.Errorf("list disabled HA admin Job Pods in %s: %w", cluster.Namespace, err)
 		}
 	}
 	for name := range jobNames {
@@ -6268,11 +6283,29 @@ func (r *AntflyClusterReconciler) deleteDisabledHAAdminJobs(ctx context.Context,
 		if !metav1.IsControlledBy(job, cluster) {
 			continue
 		}
+		zero := int64(0)
+		for i := range candidatePods.Items {
+			pod := &candidatePods.Items[i]
+			if !metav1.IsControlledBy(pod, job) {
+				continue
+			}
+			uid := pod.UID
+			resourceVersion := pod.ResourceVersion
+			if err := r.Delete(ctx, pod, &client.DeleteOptions{
+				GracePeriodSeconds: &zero,
+				Preconditions: &metav1.Preconditions{
+					UID: &uid, ResourceVersion: &resourceVersion,
+				},
+			}); err != nil && !errors.IsNotFound(err) {
+				return fmt.Errorf("delete Pod %s/%s for disabled HA admin Job: %w", pod.Namespace, pod.Name, err)
+			}
+		}
 		uid := job.UID
 		resourceVersion := job.ResourceVersion
+		foreground := metav1.DeletePropagationForeground
 		if err := r.Delete(ctx, job, &client.DeleteOptions{Preconditions: &metav1.Preconditions{
 			UID: &uid, ResourceVersion: &resourceVersion,
-		}}); err != nil && !errors.IsNotFound(err) {
+		}, PropagationPolicy: &foreground}); err != nil && !errors.IsNotFound(err) {
 			return fmt.Errorf("delete disabled HA admin Job %s/%s: %w", job.Namespace, job.Name, err)
 		}
 	}

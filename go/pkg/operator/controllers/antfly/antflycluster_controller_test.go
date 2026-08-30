@@ -7311,6 +7311,7 @@ func TestDisabledHADeletesExactOwnedAdminJobs(t *testing.T) {
 	s := runtime.NewScheme()
 	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
 	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
 
 	controller := true
 	cluster := &antflyv1.AntflyCluster{
@@ -7325,7 +7326,7 @@ func TestDisabledHADeletesExactOwnedAdminJobs(t *testing.T) {
 	}
 	owned := func(name string) *batchv1.Job {
 		return &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
-			Name: name, Namespace: cluster.Namespace,
+			Name: name, Namespace: cluster.Namespace, UID: types.UID(name + "-uid"),
 			Labels: map[string]string{
 				"app.kubernetes.io/component": "ha-admin",
 				"app.kubernetes.io/instance":  cluster.Name,
@@ -7340,8 +7341,27 @@ func TestDisabledHADeletesExactOwnedAdminJobs(t *testing.T) {
 	terminal := owned("terminal-ha-job")
 	unrelated := owned("newer-cluster-ha-job")
 	unrelated.OwnerReferences[0].UID = types.UID("newer-cluster-uid")
+	ownedPod := func(job *batchv1.Job) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: job.Name + "-pod", Namespace: job.Namespace, UID: types.UID(job.Name + "-pod-uid"),
+			Labels: map[string]string{
+				batchv1.ControllerUidLabel:    string(job.UID),
+				"app.kubernetes.io/component": "ha-admin",
+				"app.kubernetes.io/instance":  cluster.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: batchv1.SchemeGroupVersion.String(), Kind: "Job", Name: job.Name,
+				UID: job.UID, Controller: &controller,
+			}},
+		}}
+	}
+	activePod := ownedPod(active)
+	terminalPod := ownedPod(terminal)
+	unrelatedPod := ownedPod(unrelated)
 
-	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, active, terminal, unrelated).Build()
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		cluster, active, terminal, unrelated, activePod, terminalPod, unrelatedPod,
+	).Build()
 	r := &AntflyClusterReconciler{Client: client, Scheme: s}
 	g.Expect(r.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 
@@ -7350,10 +7370,18 @@ func TestDisabledHADeletesExactOwnedAdminJobs(t *testing.T) {
 		err := client.Get(context.Background(), types.NamespacedName{Name: name, Namespace: cluster.Namespace}, observed)
 		g.Expect(errors.IsNotFound(err)).To(BeTrue(), "disabled HA must cancel owned Job %s", name)
 	}
+	for _, name := range []string{activePod.Name, terminalPod.Name} {
+		observed := &corev1.Pod{}
+		err := client.Get(context.Background(), types.NamespacedName{Name: name, Namespace: cluster.Namespace}, observed)
+		g.Expect(errors.IsNotFound(err)).To(BeTrue(), "disabled HA must delete the exact Job Pod %s", name)
+	}
 	observed := &batchv1.Job{}
 	g.Expect(client.Get(context.Background(), types.NamespacedName{
 		Name: unrelated.Name, Namespace: cluster.Namespace,
 	}, observed)).To(Succeed(), "UID fencing must preserve a same-name cluster incarnation's Job")
+	g.Expect(client.Get(context.Background(), types.NamespacedName{
+		Name: unrelatedPod.Name, Namespace: cluster.Namespace,
+	}, &corev1.Pod{})).To(Succeed(), "UID fencing must preserve a different-incarnation Job Pod")
 }
 
 func TestActivationJobBindsReceiptToObservedTargetPVCInstance(t *testing.T) {
