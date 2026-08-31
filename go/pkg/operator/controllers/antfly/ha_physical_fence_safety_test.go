@@ -103,6 +103,81 @@ func TestReconcilePhysicalIsolationCheckpointsFinalReceiptBeforeReleasingDepende
 	}
 }
 
+func TestCompletedPhysicalIsolationAcceptsExactFrozenLeaseBoundary(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	cluster, action := validPhysicalIsolationReceiptFixture(now)
+	receipt := action.PhysicalIsolationReceipt
+	receipt.FrozenBoundaryLSN = 17
+	action.TargetLSN = 17
+	action.ObservedLSN = 17
+
+	_, lease := currentPhysicalIsolationObjects(cluster, now)
+	scope, ok := haPhysicalIsolationReceiptScope(receipt)
+	if !ok {
+		t.Fatal("fixture receipt has no exact Lease scope")
+	}
+	frozenScope := scope
+	frozenScope.primaryLSN = receipt.FrozenBoundaryLSN
+	for key, value := range frozenScope.annotations() {
+		lease.Annotations[key] = value
+	}
+
+	if !haPhysicalIsolationSucceededStructurallyWithEvidence(action) {
+		t.Fatal("fixture must carry complete physical-isolation evidence")
+	}
+	if err := validateCurrentPhysicalIsolationLease(lease, &action, scope); err != nil {
+		t.Fatalf("exact one-way Lease boundary strengthening was rejected: %v", err)
+	}
+}
+
+func TestPhysicalIsolationRefreshesExactCompletedCheckpointBeforeLeaseValidation(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	live, completed := validPhysicalIsolationReceiptFixture(now)
+	completed.TargetLSN = 17
+	completed.ObservedLSN = 17
+	completed.PhysicalIsolationReceipt.FrozenBoundaryLSN = 17
+	live.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{completed}
+
+	working := live.DeepCopy()
+	stale := completed.DeepCopy()
+	stale.AdminJobPhase = haAdminJobPhaseRunning
+	stale.TargetLSN = 12
+	stale.ObservedLSN = 0
+	stale.CompletedAt = nil
+	stale.PhysicalIsolationReceipt.FrozenBoundaryLSN = 0
+	stale.PhysicalIsolationReceipt.ObservedAt = nil
+	stale.PhysicalIsolationReceipt.CompletedAt = nil
+	working.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{*stale}
+
+	reconciler := testHAReconciler(t, live)
+	if err := reconciler.refreshCompletedHAFormerPrimaryIsolation(context.Background(), working); err != nil {
+		t.Fatalf("refresh completed isolation checkpoint: %v", err)
+	}
+	got := working.Status.HAStatus.PlannedActions[0]
+	if got.AdminJobPhase != haAdminJobPhaseSucceeded || got.TargetLSN != 17 ||
+		got.PhysicalIsolationReceipt == nil || got.PhysicalIsolationReceipt.FrozenBoundaryLSN != 17 {
+		t.Fatalf("uncached completed checkpoint did not replace stale working status: %#v", got)
+	}
+}
+
+func TestPhysicalIsolationRefreshRejectsDifferentOperationIdentity(t *testing.T) {
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	live, completed := validPhysicalIsolationReceiptFixture(now)
+	live.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{completed}
+
+	working := live.DeepCopy()
+	working.Status.HAStatus.PlannedActions[0].OperationID = "haop-v1-different"
+	working.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseRunning
+
+	reconciler := testHAReconciler(t, live)
+	if err := reconciler.refreshCompletedHAFormerPrimaryIsolation(context.Background(), working); err != nil {
+		t.Fatalf("refresh different isolation operation: %v", err)
+	}
+	if got := working.Status.HAStatus.PlannedActions[0].AdminJobPhase; got != haAdminJobPhaseRunning {
+		t.Fatalf("different operation identity imported terminal authority: %s", got)
+	}
+}
+
 // A persisted Succeeded phase is not enough after an operator process or
 // leader restart. The new controller instance has no local monotonic grace
 // observation and must fail closed before any dependent action can run.

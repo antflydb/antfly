@@ -72,6 +72,9 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 	if r == nil || r.Client == nil || cluster == nil || cluster.Status.HAStatus == nil {
 		return nil
 	}
+	if err := r.refreshCompletedHAFormerPrimaryIsolation(ctx, cluster); err != nil {
+		return err
+	}
 	for i := range cluster.Status.HAStatus.PlannedActions {
 		action := &cluster.Status.HAStatus.PlannedActions[i]
 		if haActionKind(action.Kind) != haActionIsolateFormerPrimary {
@@ -339,6 +342,51 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 			return fmt.Errorf("isolate former primary: persist final isolation receipt: %w", err)
 		}
 		return errHAStatusCheckpointed
+	}
+	return nil
+}
+
+// The action status checkpoint and the shared Lease are separate Kubernetes
+// objects. The main reconciler normally starts from its informer cache while
+// the physical-fence path deliberately reads the Lease through the uncached
+// boundary reader. Immediately after the final isolation checkpoint, that can
+// otherwise pair a pre-checkpoint Running action with the post-checkpoint Lease
+// boundary and reject a transition that is already durably complete.
+//
+// Refresh only an exact, fully validated terminal isolation receipt. This is
+// not a general status refresh and cannot manufacture progress: CR identity,
+// spec generation, operation identity, topology, Pod/process evidence, and the
+// completed receipt all have to match before the cached working copy advances.
+func (r *AntflyClusterReconciler) refreshCompletedHAFormerPrimaryIsolation(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if r == nil || cluster == nil || cluster.Status.HAStatus == nil {
+		return nil
+	}
+	live := &antflyv1.AntflyCluster{}
+	if err := r.haBoundaryReader().Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("isolate former primary: refresh durable action checkpoint: %w", err)
+	}
+	if live.UID != cluster.UID || live.Generation != cluster.Generation || live.Status.HAStatus == nil {
+		return nil
+	}
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		working := &cluster.Status.HAStatus.PlannedActions[i]
+		if haActionKind(working.Kind) != haActionIsolateFormerPrimary || working.AdminJobPhase == haAdminJobPhaseSucceeded {
+			continue
+		}
+		for j := range live.Status.HAStatus.PlannedActions {
+			persisted := &live.Status.HAStatus.PlannedActions[j]
+			if haActionKind(persisted.Kind) != haActionIsolateFormerPrimary ||
+				!haSamePlannedActionIdentity(*working, *persisted) ||
+				persisted.AdminJobPhase != haAdminJobPhaseSucceeded ||
+				!haPhysicalIsolationSucceededWithEvidence(live, *persisted) {
+				continue
+			}
+			*working = *persisted.DeepCopy()
+			break
+		}
 	}
 	return nil
 }
