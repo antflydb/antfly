@@ -2,7 +2,15 @@
 Antfly SDK - Python client for Antfly distributed key-value store and search engine.
 """
 
-from .client import AntflyClient, CreatedIndex, CreateIndexRequest, IndexOperations, antfly_embedder
+from .client import (
+    AntflyClient,
+    CreatedIndex,
+    CreateIndexRequest,
+    GraphQueriesInput,
+    GraphQueryInput,
+    IndexOperations,
+    antfly_embedder,
+)
 from .client_generated.models import (
     CreateAlgebraicIndexRequest,
     CreateAlgebraicIndexRequestType,
@@ -31,6 +39,19 @@ from .exceptions import (
     InferenceAPIError,
     InferenceCapacityError,
     StorageResourceExhaustedError,
+)
+from .graph_identifier_policy_generated import (
+    GRAPH_IDENTIFIER_POLICY_VERSION,
+    GRAPH_IDENTIFIER_UNICODE_VERSION,
+    is_valid_graph_identifier,
+)
+from .graph_queries import (
+    GraphCountAggregate,
+    count_graph_alias,
+    count_graph_rows,
+    graph_date_range_filter,
+    graph_numeric_range_filter,
+    graph_term_range_filter,
 )
 from .index_config import (
     ArtifactEmbeddingSource,
@@ -61,6 +82,8 @@ __all__ = [
     "CreateAlgebraicIndexRequest",
     "CreateAlgebraicIndexRequestType",
     "CreatedIndex",
+    "GraphQueryInput",
+    "GraphQueriesInput",
     "CreatedFullTextIndex",
     "CreatedEmbeddingsIndex",
     "CreatedGraphIndex",
@@ -77,6 +100,15 @@ __all__ = [
     "InferenceAPIError",
     "InferenceCapacityError",
     "StorageResourceExhaustedError",
+    "GRAPH_IDENTIFIER_POLICY_VERSION",
+    "GRAPH_IDENTIFIER_UNICODE_VERSION",
+    "is_valid_graph_identifier",
+    "GraphCountAggregate",
+    "count_graph_alias",
+    "count_graph_rows",
+    "graph_date_range_filter",
+    "graph_numeric_range_filter",
+    "graph_term_range_filter",
     "SparseEmbedding",
     "PackedSparseEmbedding",
     "ArtifactEmbeddingSource",

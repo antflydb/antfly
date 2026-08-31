@@ -74,7 +74,7 @@ fn leanSimHttpAllocator() std.mem.Allocator {
     return std.heap.smp_allocator;
 }
 
-const SimSplitRuntime = struct {
+pub const SimSplitRuntime = struct {
     const Entry = struct {
         transition_id: u64,
         attempt_epoch: u64,
@@ -98,13 +98,13 @@ const SimSplitRuntime = struct {
     len: usize = 0,
     replica_root_dir: ?[]const u8 = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.entries[0..self.len]) |*entry| self.releaseCoordinator(entry);
         self.len = 0;
         self.replica_root_dir = null;
     }
 
-    fn iface(self: *@This()) transition_runtime.SplitRuntime {
+    pub fn iface(self: *@This()) transition_runtime.SplitRuntime {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -597,7 +597,7 @@ fn runtimeDocIdentityStatusReportFromStats(
     };
 }
 
-fn reportRuntimeDocIdentityForActiveReplicas(
+pub fn reportRuntimeDocIdentityForActiveReplicas(
     cluster: *MetadataHttpClusterSimulation,
     node: anytype,
     replica_root_dirs: []const []const u8,
@@ -661,6 +661,9 @@ fn reportRuntimeDocIdentityForActiveReplicas(
                 .disk_bytes = 1,
                 .created_at_millis = now_ms,
                 .index_count = stats.index_count,
+                .enrichment = .{
+                    .projection_checkpoint_status = try alloc.dupe(u8, "clean"),
+                },
                 .doc_identity = runtimeDocIdentityStatusReportFromStats(stats.doc_identity),
             });
         }
@@ -940,7 +943,7 @@ fn waitForMedianKeyEquals(
     return try cluster.runUntil(max_rounds, &ctx, medianKeyEqualsProgressPredicate);
 }
 
-fn mirrorGroupBatchToActiveReplicas(
+pub fn mirrorGroupBatchToActiveReplicas(
     cluster: *MetadataHttpClusterSimulation,
     client: *api_http_client.ApiHttpClient,
     api_base_uris: []const []const u8,
@@ -2245,10 +2248,11 @@ fn projectedTableFieldContainsOnNode(
     return (std.mem.indexOf(u8, haystack, needle) != null) == expected_present;
 }
 
-const SimMergeRuntime = struct {
+pub const SimMergeRuntime = struct {
     const Entry = struct {
         donor_group_id: u64,
         receiver_group_id: u64,
+        coord: ?*transition_runtime.MergeCoordinatorRuntime = null,
         status: data_mod.MergeTransitionStatus = .{
             .phase = .prepare,
             .donor_group_id = 0,
@@ -2266,8 +2270,15 @@ const SimMergeRuntime = struct {
 
     entries: [16]Entry = undefined,
     len: usize = 0,
+    replica_root_dir: ?[]const u8 = null,
 
-    fn iface(self: *@This()) transition_runtime.MergeRuntime {
+    pub fn deinit(self: *@This()) void {
+        for (self.entries[0..self.len]) |*entry| self.releaseCoordinator(entry);
+        self.len = 0;
+        self.replica_root_dir = null;
+    }
+
+    pub fn iface(self: *@This()) transition_runtime.MergeRuntime {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -2307,19 +2318,63 @@ const SimMergeRuntime = struct {
         return &self.entries[self.len - 1];
     }
 
+    fn releaseCoordinator(self: *@This(), entry: *Entry) void {
+        _ = self;
+        if (entry.coord) |coord| {
+            coord.deinit();
+            std.heap.page_allocator.destroy(coord);
+            entry.coord = null;
+        }
+    }
+
+    fn withCoordinator(self: *@This(), donor_group_id: u64, receiver_group_id: u64) !*transition_runtime.MergeCoordinatorRuntime {
+        const entry = self.entryFor(donor_group_id, receiver_group_id);
+        if (entry.coord == null) {
+            const alloc = std.heap.page_allocator;
+            const replica_root_dir = self.replica_root_dir orelse return error.UnsupportedOperation;
+            const donor_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, donor_group_id);
+            defer alloc.free(donor_root_dir);
+            const receiver_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, receiver_group_id);
+            defer alloc.free(receiver_root_dir);
+
+            try SimSplitRuntime.ensureSourceApplyStoreSeeded(alloc, donor_root_dir, donor_group_id);
+
+            const coord = try alloc.create(transition_runtime.MergeCoordinatorRuntime);
+            errdefer alloc.destroy(coord);
+            coord.* = try transition_runtime.MergeCoordinatorRuntime.init(alloc, .{
+                .donor_root_dir = donor_root_dir,
+                .receiver_root_dir = receiver_root_dir,
+                .donor_group_id = donor_group_id,
+                .receiver_group_id = receiver_group_id,
+                .receiver = .{ .root_dir = receiver_root_dir },
+            });
+            entry.coord = coord;
+        }
+        return entry.coord.?;
+    }
+
     fn observeStatus(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !data_mod.MergeTransitionStatus {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            return try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().observeStatus(donor_group_id, receiver_group_id);
+        }
         return self.entryFor(donor_group_id, receiver_group_id).status;
     }
 
     fn recordDocIdentityReassignment(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            return try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().recordDocIdentityReassignment(donor_group_id, receiver_group_id);
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.allow_doc_identity_reassignment = true;
     }
 
     fn acceptReceiver(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            return try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().acceptReceiver(donor_group_id, receiver_group_id);
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .bootstrap_peer;
         entry.status.receiver_accepts_donor_range = true;
@@ -2327,6 +2382,9 @@ const SimMergeRuntime = struct {
 
     fn catchUpReceiver(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !usize {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            return try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().catchUpReceiver(donor_group_id, receiver_group_id);
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .cutover_ready;
         entry.status.bootstrapped = true;
@@ -2341,6 +2399,11 @@ const SimMergeRuntime = struct {
 
     fn finalizeMerge(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            const finalized = try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().finalizeMerge(donor_group_id, receiver_group_id);
+            if (finalized) self.releaseCoordinator(self.entryFor(donor_group_id, receiver_group_id));
+            return finalized;
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .finalized;
         entry.status.replay_required = false;
@@ -2349,6 +2412,11 @@ const SimMergeRuntime = struct {
 
     fn rollbackMerge(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            const rolled_back = try (try self.withCoordinator(donor_group_id, receiver_group_id)).runtime().rollbackMerge(donor_group_id, receiver_group_id);
+            if (rolled_back) self.releaseCoordinator(self.entryFor(donor_group_id, receiver_group_id));
+            return rolled_back;
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .rolled_back;
         entry.status.receiver_accepts_donor_range = false;
@@ -3864,7 +3932,7 @@ fn metadataMergeTransitionFinalizedProgressPredicate(cluster: *MetadataHttpClust
     return observation.receiver.phase == .finalized;
 }
 
-fn waitForSplitTransitionFinalized(
+pub fn waitForSplitTransitionFinalized(
     cluster: *MetadataHttpClusterSimulation,
     transition_id: u64,
     observer_index: ?usize,
@@ -4312,12 +4380,12 @@ fn reconcileUntilNodeGroupStatus(
     return false;
 }
 
-const SplitRetirementSummary = struct {
+pub const SplitRetirementSummary = struct {
     terminal: metadata_control_loop.ReconcileSummary,
     removal: metadata_control_loop.ReconcileSummary,
 };
 
-fn retireFinalizedSplitTransition(
+pub fn retireFinalizedSplitTransition(
     node: MetadataHttpNodeSimulation,
     loop: *metadata_control_loop.MetadataControlLoop,
 ) !SplitRetirementSummary {
@@ -4336,12 +4404,12 @@ fn retireFinalizedSplitTransition(
     return .{ .terminal = terminal, .removal = removal };
 }
 
-const MergeRetirementSummary = struct {
+pub const MergeRetirementSummary = struct {
     terminal: metadata_control_loop.ReconcileSummary,
     removal: metadata_control_loop.ReconcileSummary,
 };
 
-fn retireFinalizedMergeTransition(
+pub fn retireFinalizedMergeTransition(
     node: MetadataHttpNodeSimulation,
     loop: *metadata_control_loop.MetadataControlLoop,
 ) !MergeRetirementSummary {

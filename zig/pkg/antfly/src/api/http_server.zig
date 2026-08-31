@@ -31,6 +31,12 @@ const restore_jobs = @import("restore_jobs.zig");
 const batch_api = @import("batch.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
+const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
+const graph_request_diagnostics = @import("graph_request_diagnostics.zig");
+const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
+const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
+const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
+const graph_wire_envelope = @import("graph_wire_envelope.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const cluster = @import("cluster.zig");
 const indexes_api = @import("indexes.zig");
@@ -144,7 +150,7 @@ const ArdOpenApiSpec = struct {
 };
 
 const ParsedGlobalQueryTable = struct {
-    parsed: std.json.Parsed(metadata_openapi.QueryRequest),
+    parsed: std.json.Parsed(metadata_openapi.StatefulQueryRequest),
     table_name: []const u8,
 
     fn deinit(self: *@This()) void {
@@ -161,12 +167,12 @@ fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlob
     };
 }
 
-fn parsePublicGlobalQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.QueryRequest) {
+fn parsePublicGlobalQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.StatefulQueryRequest) {
     try query_contract.validatePublicQuerySortTupleContract(alloc, body);
     return metadata_openapi.server.parseGlobalQueryBody(alloc, body);
 }
 
-fn parsePublicTableQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.QueryRequest) {
+fn parsePublicTableQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.StatefulQueryRequest) {
     try query_contract.validatePublicQuerySortTupleContract(alloc, body);
     return metadata_openapi.server.parseQueryTableBody(alloc, body);
 }
@@ -175,6 +181,78 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
     const value = content_type orelse return false;
     const media_type = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, value, ';')) |idx| value[0..idx] else value, " \t");
     return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
+}
+
+fn appendOwnedResponseHeader(
+    alloc: std.mem.Allocator,
+    response: *contextual_operations.OwnedResponse,
+    name: []const u8,
+    value: []const u8,
+) !void {
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    const headers = try alloc.alloc(contextual_operations.Header, response.headers.len + 1);
+    errdefer alloc.free(headers);
+    @memcpy(headers[0..response.headers.len], response.headers);
+    headers[response.headers.len] = .{ .name = owned_name, .value = owned_value };
+    if (response.headers.len > 0) alloc.free(response.headers);
+    response.headers = headers;
+}
+
+fn markLegacyGraphSearchResponse(
+    alloc: std.mem.Allocator,
+    response: *contextual_operations.OwnedResponse,
+) !void {
+    // RFC 9745 requires an RFC 9651 Structured Field Date, not a boolean.
+    // This is the UTC date on which the canonical replacement contract was
+    // published for migration.
+    try appendOwnedResponseHeader(
+        alloc,
+        response,
+        graph_wire_envelope.deprecation_header_name,
+        graph_wire_envelope.deprecation_header_value,
+    );
+    // Deliberately omit table, operation, and query values. The stable message
+    // is a low-cardinality fleet signal that log aggregation can count without
+    // exposing request data or creating unbounded metric labels.
+    std.log.info("deprecated graph_searches request accepted surface=stateful replacement=graph_queries", .{});
+}
+
+/// Convert an executed query response into its public HTTP representation.
+/// Dialect provenance is carried from admission through response encoding, so
+/// emitting compatibility telemetry never reparses or can invalidate completed
+/// query work.
+fn publicQuerySuccessResponse(
+    alloc: std.mem.Allocator,
+    query_response: query_api.QueryResponse,
+) !contextual_operations.OwnedResponse {
+    var response = contextual_operations.json(query_response.json, false);
+    errdefer response.deinit(alloc);
+    if (query_response.graph_dialect == .legacy) {
+        try markLegacyGraphSearchResponse(alloc, &response);
+    }
+    return response;
+}
+
+test "admitted graph dialect drives the owned deprecation signal" {
+    const alloc = std.testing.allocator;
+    var canonical = try publicQuerySuccessResponse(alloc, .{
+        .json = try alloc.dupe(u8, "{}"),
+        .graph_dialect = .canonical,
+    });
+    defer canonical.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), canonical.headers.len);
+
+    var legacy = try publicQuerySuccessResponse(alloc, .{
+        .json = try alloc.dupe(u8, "{}"),
+        .graph_dialect = .legacy,
+    });
+    defer legacy.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), legacy.headers.len);
+    try std.testing.expectEqualStrings(graph_wire_envelope.deprecation_header_name, legacy.headers[0].name);
+    try std.testing.expectEqualStrings(graph_wire_envelope.deprecation_header_value, legacy.headers[0].value);
 }
 
 fn mcpSampleDocumentsJsonAlloc(alloc: std.mem.Allocator, ndjson: []const u8) ![]u8 {
@@ -797,6 +875,9 @@ pub const ApiHttpServerConfig = struct {
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     /// Node-local inference request admission capacity. Zero is unlimited.
     inference_max_concurrent_requests: u32 = common_config.default_inference_max_concurrent_requests,
+    /// Per-request graph execution ceilings owned by the operator. These are
+    /// never populated from the public graph-query DSL.
+    graph_execution_limits: @import("../graph/work_budget.zig").Limits = .{},
     /// Shared owner used when inference runs in this process. When present it
     /// supersedes the local fallback so every inference endpoint shares one cap.
     inference_request_admission_source: ?InferenceRequestAdmissionSource = null,
@@ -3271,7 +3352,7 @@ pub const ApiHttpServer = struct {
 
     fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.executePublicTableQueryDispatchWithIdentity(
+        const response = try self.executePublicTableQueryDispatchWithIdentity(
             alloc,
             source,
             table_name,
@@ -3281,6 +3362,7 @@ pub const ApiHttpServer = struct {
             execution_deadline_ns,
             cancellation,
         );
+        return response.json;
     }
 
     fn joinCtxBuildOwnedSearchRequest(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror!query_api.OwnedQueryRequest {
@@ -5421,6 +5503,7 @@ pub const ApiHttpServer = struct {
                 .route_query_to_read_schema = routeInternalGroupQueryToReadSchema,
             },
             .query_planning = self.internalQueryPlanningContext(),
+            .graph_execution_limits = self.cfg.graph_execution_limits,
         };
     }
 
@@ -6876,7 +6959,10 @@ pub const ApiHttpServer = struct {
             table_name,
             storage_statuses,
         )) orelse return null;
-        return try std.json.Stringify.valueAlloc(alloc, response, .{});
+        // The debug envelope extends TableStatus but is not itself generated.
+        // Preserve the OpenAPI absent-vs-null contract used by TableStatus:
+        // optional non-nullable fields are omitted when unset.
+        return try std.json.Stringify.valueAlloc(alloc, response, .{ .emit_null_optional_fields = false });
     }
 
     pub fn encodeIndexRuntimeSchemaDebugAlloc(
@@ -9006,7 +9092,7 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_reads orelse return error.NotFound;
         try ensureTableOperationActive(request);
-        return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation) catch |err| switch (err) {
+        const response = self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -9017,6 +9103,7 @@ pub const ApiHttpServer = struct {
             error.Timeout => return error.ReadUnavailable,
             error.IdentityReadGenerationChanged => return error.ReadUnavailable,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
+            error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.IndexRebuilding => return error.IndexRebuilding,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
@@ -9030,6 +9117,17 @@ pub const ApiHttpServer = struct {
             error.ModelNotFound => return error.ModelNotFound,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
+            error.GraphMinWeightDomainViolation => return error.GraphMinWeightDomainViolation,
+            error.GraphMaxWeightDomainViolation => return error.GraphMaxWeightDomainViolation,
+            error.GraphPathWeightOverflow => return error.GraphPathWeightOverflow,
+            error.GraphDistinctBudgetExceeded => return error.GraphDistinctBudgetExceeded,
+            error.GraphAnchorFilterRequiresIndex => return error.GraphAnchorFilterRequiresIndex,
+            error.GraphMatchOperationLimitExceeded => return error.GraphMatchOperationLimitExceeded,
+            error.GraphQueryModeUnsupported => return error.GraphQueryModeUnsupported,
+            error.GraphExternalAliasDocumentFilterUnsupported => return error.GraphExternalAliasDocumentFilterUnsupported,
+            error.GraphExternalAliasSourceUnsupported => return error.GraphExternalAliasSourceUnsupported,
+            error.GraphReverseVariablePathUnsupported => return error.GraphReverseVariablePathUnsupported,
             error.QueryEmbeddingInputTooLarge => return error.QueryEmbeddingInputTooLarge,
             error.QueryEmbeddingOverloaded => return error.QueryEmbeddingOverloaded,
             error.EmbedRateLimited => return error.EmbedRateLimited,
@@ -9048,6 +9146,7 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
+        return response.json;
     }
 
     fn executePublicTableQueryDispatch(
@@ -9059,7 +9158,7 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
     ) ![]u8 {
         const execution_deadline_ns = try query_contract.queryExecutionDeadlineNsFromBody(alloc, body);
-        return try self.executePublicTableQueryDispatchWithIdentity(
+        const response = try self.executePublicTableQueryDispatchWithIdentity(
             alloc,
             source,
             table_name,
@@ -9069,6 +9168,7 @@ pub const ApiHttpServer = struct {
             execution_deadline_ns,
             null,
         );
+        return response.json;
     }
 
     fn executePublicTableQueryDispatchWithReadinessRetry(
@@ -9080,7 +9180,7 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?CancellationToken,
-    ) ![]u8 {
+    ) !query_api.QueryResponse {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const start_ns = platform_time.monotonicNs();
@@ -9170,11 +9270,11 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         request_deadline_ns: ?u64,
         cancellation: ?CancellationToken,
-    ) ![]u8 {
+    ) !query_api.QueryResponse {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         if (try shouldDispatchPlainPublicSearch(alloc, body)) {
-            var result = self.executePlainPublicTableQuery(
+            const result = self.executePlainPublicTableQuery(
                 alloc,
                 source,
                 table_name,
@@ -9197,8 +9297,21 @@ pub const ApiHttpServer = struct {
                 error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
                 error.HierarchyCursorStale => return error.HierarchyCursorStale,
+                error.TopologyChanged => return error.TopologyChanged,
                 error.ModelNotFound => return error.ModelNotFound,
                 error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+                error.GraphWorkBudgetExceeded,
+                error.GraphMinWeightDomainViolation,
+                error.GraphMaxWeightDomainViolation,
+                error.GraphPathWeightOverflow,
+                error.GraphDistinctBudgetExceeded,
+                error.GraphAnchorFilterRequiresIndex,
+                error.GraphMatchOperationLimitExceeded,
+                error.GraphQueryModeUnsupported,
+                error.GraphExternalAliasDocumentFilterUnsupported,
+                error.GraphExternalAliasSourceUnsupported,
+                error.GraphReverseVariablePathUnsupported,
+                => return err,
                 error.QueryEmbeddingInputTooLarge,
                 error.QueryEmbeddingOverloaded,
                 error.EmbedRateLimited,
@@ -9230,8 +9343,7 @@ pub const ApiHttpServer = struct {
                     return error.InternalFailure;
                 },
             };
-            defer result.deinit(alloc);
-            return try alloc.dupe(u8, result.json);
+            return result;
         }
 
         var contract_req = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
@@ -9246,6 +9358,18 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.GraphWorkBudgetExceeded,
+            error.GraphMinWeightDomainViolation,
+            error.GraphMaxWeightDomainViolation,
+            error.GraphPathWeightOverflow,
+            error.GraphDistinctBudgetExceeded,
+            error.GraphAnchorFilterRequiresIndex,
+            error.GraphMatchOperationLimitExceeded,
+            error.GraphQueryModeUnsupported,
+            error.GraphExternalAliasDocumentFilterUnsupported,
+            error.GraphExternalAliasSourceUnsupported,
+            error.GraphReverseVariablePathUnsupported,
+            => return err,
             error.QueryEmbeddingInputTooLarge,
             error.QueryEmbeddingOverloaded,
             error.EmbedRateLimited,
@@ -9254,6 +9378,7 @@ pub const ApiHttpServer = struct {
             => return err,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
+            error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.IndexRebuilding => return error.IndexRebuilding,
             error.TableNotFound, error.NotFound => return error.NotFound,
@@ -9280,7 +9405,7 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         }) |json| {
-            return json;
+            return .{ .json = json };
         }
 
         const join_req = distributed_join.parseSupportedJoinRequestWithSecrets(alloc, body, self.cfg.secret_store) catch |err| switch (err) {
@@ -9299,10 +9424,10 @@ pub const ApiHttpServer = struct {
                 try applyAuthenticatedIdentityToJoinRequest(alloc, identity, &parsed_join.join);
             }
             const join_ctx = self.joinContext().withExecutionDeadline(request_deadline_ns).withCancellation(cancellation);
-            return distributed_join.executeSupportedJoinedPublicTableQueryRequest(join_ctx, &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources);
+            return .{ .json = try distributed_join.executeSupportedJoinedPublicTableQueryRequest(join_ctx, &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources) };
         }
 
-        var result = self.executePlainPublicTableQuery(
+        const result = self.executePlainPublicTableQuery(
             alloc,
             source,
             table_name,
@@ -9325,8 +9450,21 @@ pub const ApiHttpServer = struct {
             error.TableNotFound => return error.NotFound,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
+            error.TopologyChanged => return error.TopologyChanged,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.GraphWorkBudgetExceeded,
+            error.GraphMinWeightDomainViolation,
+            error.GraphMaxWeightDomainViolation,
+            error.GraphPathWeightOverflow,
+            error.GraphDistinctBudgetExceeded,
+            error.GraphAnchorFilterRequiresIndex,
+            error.GraphMatchOperationLimitExceeded,
+            error.GraphQueryModeUnsupported,
+            error.GraphExternalAliasDocumentFilterUnsupported,
+            error.GraphExternalAliasSourceUnsupported,
+            error.GraphReverseVariablePathUnsupported,
+            => return err,
             error.QueryEmbeddingInputTooLarge,
             error.QueryEmbeddingOverloaded,
             error.EmbedRateLimited,
@@ -9358,8 +9496,7 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
-        defer result.deinit(alloc);
-        return try alloc.dupe(u8, result.json);
+        return result;
     }
 
     fn shouldDispatchPlainPublicSearch(alloc: std.mem.Allocator, body: []const u8) !bool {
@@ -9414,8 +9551,8 @@ pub const ApiHttpServer = struct {
         try ensureRequestDeadline(request_deadline_ns);
         const request = &parsed_request.value;
         var injected_filter_owned = false;
-        defer if (injected_filter_owned) if (request.filter_query) |*value|
-            json_helpers.deinitJsonValue(alloc, value);
+        defer if (injected_filter_owned) if (request.filter_query) |value|
+            alloc.free(@constCast(value.bytes));
         if (row_filter_json) |value| {
             try injectRowFilterIntoOpenApiQueryRequest(alloc, request, value);
             injected_filter_owned = true;
@@ -9483,10 +9620,9 @@ pub const ApiHttpServer = struct {
         try ensureRequestDeadline(request_deadline_ns);
 
         const raw_filter_query_json = if (request.filter_query) |query|
-            try stringifyJsonValueAlloc(alloc, query)
+            query.bytes
         else
             null;
-        defer if (raw_filter_query_json) |query| alloc.free(query);
         const filter_query_json = try foreign_sources_api.buildEffectiveFilterQueryJsonAlloc(
             alloc,
             foreign_source,
@@ -9608,8 +9744,8 @@ pub const ApiHttpServer = struct {
         var primary_request = try parsePublicTableQueryBody(alloc, primary_body);
         defer primary_request.deinit();
         var injected_filter_owned = false;
-        defer if (injected_filter_owned) if (primary_request.value.filter_query) |*value|
-            json_helpers.deinitJsonValue(alloc, value);
+        defer if (injected_filter_owned) if (primary_request.value.filter_query) |value|
+            alloc.free(@constCast(value.bytes));
         if (row_filter_json) |value| {
             try injectRowFilterIntoOpenApiQueryRequest(alloc, &primary_request.value, value);
             injected_filter_owned = true;
@@ -9667,7 +9803,7 @@ pub const ApiHttpServer = struct {
         if (request.merge_config != null) return error.UnsupportedQueryRequest;
         if (request.reranker != null) return error.UnsupportedQueryRequest;
         if (request.analyses != null) return error.UnsupportedQueryRequest;
-        if (request.graph_searches != null) return error.UnsupportedQueryRequest;
+        if (request.graph_queries != null or request.graph_searches != null) return error.UnsupportedQueryRequest;
         if (request.expand_strategy != null) return error.UnsupportedQueryRequest;
         if (request.document_renderer != null) return error.UnsupportedQueryRequest;
         if (request.pruner != null) return error.UnsupportedQueryRequest;
@@ -12307,6 +12443,10 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) ![]u8 {
+        var diagnostic_context: graph_request_diagnostics.Context = .{};
+        const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+        defer diagnostic_scope.deinit();
+
         comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.query) == .query);
         if (!self.tryAcquireQuery()) return error.RequestAdmissionExhausted;
         defer self.releaseQuery();
@@ -12314,7 +12454,11 @@ pub const ApiHttpServer = struct {
         defer if (row_filter_json) |value| self.alloc.free(value);
         const source = self.table_reads orelse return error.TableNotFound;
         db_mod.resetLastSortRejectionDiagnostic();
-        const response_body = try self.executePublicTableQueryDispatchWithReadinessRetry(
+        graph_query_diagnostic.reset();
+        graph_distinct_budget_diagnostic.reset();
+        graph_path_weight_diagnostic.reset();
+        graph_work_budget_diagnostic.reset();
+        var query_response = try self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
             table_name,
@@ -12323,8 +12467,8 @@ pub const ApiHttpServer = struct {
             authenticated_identity,
             null,
         );
-        defer self.alloc.free(response_body);
-        return try result_alloc.dupe(u8, response_body);
+        defer query_response.deinit(self.alloc);
+        return try result_alloc.dupe(u8, query_response.json);
     }
 
     pub fn executeMcpApplicationOperation(
@@ -12817,7 +12961,57 @@ pub const ApiHttpServer = struct {
             error.UnsupportedHierarchyGrouping => try contextualUnsupportedHierarchyGroupingResponse(self.alloc),
             error.IdentityReadGenerationChanged => try contextualRetryableTextResponse(self.alloc, 409, "identity read generation changed"),
             error.HierarchyCursorStale => try contextualHierarchyCursorStaleResponse(self.alloc),
+            error.TopologyChanged => contextual_operations.jsonWithStatus(
+                409,
+                try public_table_http.topologyChangedBody(self.alloc),
+                false,
+            ),
             error.QueryCandidateBudgetExceeded => try contextualQueryCandidateBudgetExceededResponse(self.alloc),
+            error.GraphWorkBudgetExceeded => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphWorkBudgetExceededBody(self.alloc),
+                false,
+            ),
+            error.GraphMinWeightDomainViolation, error.GraphMaxWeightDomainViolation, error.GraphPathWeightOverflow => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphPathWeightDomainErrorBody(self.alloc),
+                false,
+            ),
+            error.GraphDistinctBudgetExceeded => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphDistinctBudgetExceededBody(self.alloc),
+                false,
+            ),
+            error.GraphAnchorFilterRequiresIndex => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphAnchorFilterRequiresIndexBody(self.alloc),
+                false,
+            ),
+            error.GraphMatchOperationLimitExceeded => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphMatchOperationLimitExceededBody(self.alloc, body),
+                false,
+            ),
+            error.GraphQueryModeUnsupported => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphQueryUnsupportedBody(self.alloc, body),
+                false,
+            ),
+            error.GraphExternalAliasDocumentFilterUnsupported => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphQueryCapabilityUnsupportedBody(self.alloc, body, "external_alias_document_filter_not_supported"),
+                false,
+            ),
+            error.GraphExternalAliasSourceUnsupported => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphQueryCapabilityUnsupportedBody(self.alloc, body, "external_alias_source_not_supported"),
+                false,
+            ),
+            error.GraphReverseVariablePathUnsupported => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphQueryCapabilityUnsupportedBody(self.alloc, body, "reverse_variable_path_not_supported"),
+                false,
+            ),
             error.QueryEmbeddingInputTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "query embedding input too large"),
             error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(self.alloc, 429, "query embedding overloaded"),
             error.EmbedRateLimited => try contextualRetryableTextResponse(self.alloc, 429, "query embedding rate limited"),
@@ -12858,6 +13052,10 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
+        var diagnostic_context: graph_request_diagnostics.Context = .{};
+        const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+        defer diagnostic_scope.deinit();
+
         // `/query` selects its table from the body, so path middleware cannot
         // establish this authorization boundary. Keep the check in the query
         // service so every transport and direct caller is covered.
@@ -12868,7 +13066,11 @@ pub const ApiHttpServer = struct {
 
         const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
         db_mod.resetLastSortRejectionDiagnostic();
-        const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
+        graph_query_diagnostic.reset();
+        graph_distinct_budget_diagnostic.reset();
+        graph_path_weight_diagnostic.reset();
+        graph_work_budget_diagnostic.reset();
+        const query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
             table_name,
@@ -12877,7 +13079,7 @@ pub const ApiHttpServer = struct {
             authenticated_identity,
             if (cancellation) |value| value.token() else null,
         ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, body, err);
-        return contextual_operations.json(response_body, false);
+        return try publicQuerySuccessResponse(self.alloc, query_response);
     }
 
     fn handlePublicTableMultiQuery(
@@ -12896,6 +13098,10 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
+        var diagnostic_context: graph_request_diagnostics.Context = .{};
+        const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+        defer diagnostic_scope.deinit();
+
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
@@ -12904,6 +13110,7 @@ pub const ApiHttpServer = struct {
         defer out.deinit();
         try out.writer.writeAll("{\"responses\":[");
         var emitted: usize = 0;
+        var accepted_legacy_graph_search = false;
 
         var lines = std.mem.splitScalar(u8, body, '\n');
         while (lines.next()) |raw_line| {
@@ -12940,7 +13147,11 @@ pub const ApiHttpServer = struct {
 
             const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
             db_mod.resetLastSortRejectionDiagnostic();
-            const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
+            graph_query_diagnostic.reset();
+            graph_distinct_budget_diagnostic.reset();
+            graph_path_weight_diagnostic.reset();
+            graph_work_budget_diagnostic.reset();
+            var query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
                 self.alloc,
                 source,
                 table_name,
@@ -12949,9 +13160,11 @@ pub const ApiHttpServer = struct {
                 authenticated_identity,
                 if (cancellation) |value| value.token() else null,
             ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
-            defer self.alloc.free(response_body);
+            defer query_response.deinit(self.alloc);
+            accepted_legacy_graph_search = accepted_legacy_graph_search or
+                query_response.graph_dialect == .legacy;
 
-            var parsed = std.json.parseFromSlice(std.json.Value, arena, response_body, .{
+            var parsed = std.json.parseFromSlice(std.json.Value, arena, query_response.json, .{
                 .allocate = .alloc_always,
             }) catch return try contextual_operations.textAlloc(self.alloc, 500, "query failed");
             defer parsed.deinit();
@@ -12973,7 +13186,12 @@ pub const ApiHttpServer = struct {
 
         if (emitted == 0) return try contextual_operations.textAlloc(self.alloc, 400, "invalid query request");
         try out.writer.writeAll("]}");
-        return contextual_operations.json(try self.alloc.dupe(u8, out.written()), false);
+        var response = contextual_operations.json(try self.alloc.dupe(u8, out.written()), false);
+        errdefer response.deinit(self.alloc);
+        if (accepted_legacy_graph_search) {
+            try markLegacyGraphSearchResponse(self.alloc, &response);
+        }
+        return response;
     }
 
     const PublicRepairListRequest = struct {
@@ -17904,9 +18122,9 @@ pub fn parseCreateUserRequest(alloc: std.mem.Allocator, body: []const u8, path_u
     const password = try alloc.dupe(u8, parsed.value.password);
     errdefer alloc.free(password);
 
-    const initial_policies = try clonePermissionsFromOpenApi(alloc, parsed.value.initial_policies);
+    const initial_policies = try clonePermissionsFromOpenApi(alloc, parsed.value.initial_policies.valueOrNull());
     errdefer freePermissions(alloc, initial_policies);
-    const metadata_json = try normalizeMetadataFromOpenApi(alloc, parsed.value.metadata);
+    const metadata_json = try normalizeMetadataFromOpenApi(alloc, parsed.value.metadata.valueOrNull());
     errdefer alloc.free(metadata_json);
 
     return .{
@@ -17931,10 +18149,10 @@ pub fn parseCreateApiKeyRequest(alloc: std.mem.Allocator, body: []const u8) !Own
     const name = try alloc.dupe(u8, parsed.value.name);
     errdefer alloc.free(name);
 
-    const permissions = try clonePermissionsFromOpenApi(alloc, parsed.value.permissions);
+    const permissions = try clonePermissionsFromOpenApi(alloc, parsed.value.permissions.valueOrNull());
     errdefer freePermissions(alloc, permissions);
 
-    const row_filter = try cloneRowFiltersFromOpenApi(alloc, parsed.value.row_filter);
+    const row_filter = try cloneRowFiltersFromOpenApi(alloc, parsed.value.row_filter.valueOrNull());
     errdefer freeRowFilters(alloc, row_filter);
 
     const expires_at_ns = if (parsed.value.expires_in) |expires_in_value| blk: {
@@ -18151,10 +18369,19 @@ pub fn apiKeyToOpenApi(
         .key_id = api_key.key_id,
         .name = api_key.name,
         .username = api_key.username,
-        .permissions = if (api_key.permissions.len > 0) try clonePermissionsToOpenApi(alloc, api_key.permissions) else null,
-        .row_filter = if (api_key.row_filter.len > 0) try rowFilterMapToOpenApi(alloc, api_key.row_filter) else null,
+        .permissions = if (api_key.permissions.len > 0)
+            .{ .value = try clonePermissionsToOpenApi(alloc, api_key.permissions) }
+        else
+            .null_value,
+        .row_filter = if (api_key.row_filter.len > 0)
+            .{ .value = try rowFilterMapToOpenApi(alloc, api_key.row_filter) }
+        else
+            .null_value,
         .created_at = try formatTimestampOwned(alloc, api_key.created_at_ns),
-        .expires_at = if (api_key.expires_at_ns) |value| try formatTimestampOwned(alloc, value) else null,
+        .expires_at = if (api_key.expires_at_ns) |value|
+            .{ .value = try formatTimestampOwned(alloc, value) }
+        else
+            .null_value,
     };
 }
 
@@ -19387,6 +19614,12 @@ pub fn injectRowFilterIntoSearchRequest(
     req: *db_mod.types.SearchRequest,
     row_filter_json: []const u8,
 ) !void {
+    if (req.authorization_filter_query_json.len != 0) return error.InvalidQueryRequest;
+    req.authorization_filter_query_json = try alloc.dupe(u8, row_filter_json);
+    errdefer {
+        alloc.free(req.authorization_filter_query_json);
+        req.authorization_filter_query_json = "";
+    }
     if (req.filter_query_json.len == 0) {
         req.filter_query_json = try alloc.dupe(u8, row_filter_json);
         return;
@@ -19405,7 +19638,10 @@ test "retrieval agent authenticated row filter conjoins generated filter" {
     var req = db_mod.types.SearchRequest{
         .filter_query_json = try alloc.dupe(u8, "{\"term\":{\"status\":\"active\"}}"),
     };
-    defer alloc.free(req.filter_query_json);
+    defer {
+        alloc.free(req.filter_query_json);
+        alloc.free(req.authorization_filter_query_json);
+    }
 
     try injectRowFilterIntoSearchRequest(
         alloc,
@@ -19416,6 +19652,10 @@ test "retrieval agent authenticated row filter conjoins generated filter" {
     try std.testing.expect(std.mem.indexOf(u8, req.filter_query_json, "\"conjuncts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.filter_query_json, "\"status\":\"active\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.filter_query_json, "\"tenant\":\"visible\"") != null);
+    try std.testing.expectEqualStrings(
+        "{\"term\":{\"tenant\":\"visible\"}}",
+        req.authorization_filter_query_json,
+    );
 }
 
 test "query builder runtime preflight injects mandatory row filter" {
@@ -19545,9 +19785,9 @@ fn injectRowFilterIntoOpenApiQueryRequest(
     row_filter_json: []const u8,
 ) !void {
     var combined = try distributed_join.combineFilterQueryWithRowFilterJson(alloc, req.filter_query, row_filter_json);
-    errdefer json_helpers.deinitJsonValue(alloc, &combined);
-    if (req.filter_query) |*existing| json_helpers.deinitJsonValue(alloc, existing);
-    req.filter_query = combined;
+    defer json_helpers.deinitJsonValue(alloc, &combined);
+    const encoded = try std.json.Stringify.valueAlloc(alloc, combined, .{});
+    req.filter_query = .{ .bytes = encoded };
 }
 
 pub fn injectRowFilterIntoScanRequest(
@@ -19678,7 +19918,10 @@ pub fn userToOpenApi(alloc: std.mem.Allocator, user: usermgr.User) !usermgr_open
     return .{
         .username = user.username,
         .password_hash = user.password_hash,
-        .metadata = if (user.metadata_json.len > 0) try parseOwnedJsonObjectMapAlloc(alloc, user.metadata_json) else null,
+        .metadata = if (user.metadata_json.len > 0)
+            .{ .value = try parseOwnedJsonObjectMapAlloc(alloc, user.metadata_json) }
+        else
+            .null_value,
     };
 }
 
@@ -19896,7 +20139,11 @@ test "api http server serves status" {
     var parsed = try std.json.parseFromSlice(cluster.ClusterStatus, std.testing.allocator, resp.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(cluster.ClusterHealth.healthy, parsed.value.health);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"data\"") == null);
+    var parsed_public = try ant_json.parseFromSlice(metadata_openapi.ClusterStatus, std.testing.allocator, resp.body, .{});
+    defer parsed_public.deinit();
+    var parsed_status_json = try ant_json.parseFromSlice(std.json.Value, std.testing.allocator, resp.body, .{});
+    defer parsed_status_json.deinit();
+    try std.testing.expect(parsed_status_json.value.object.get("data") == null);
 
     var cluster_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.cluster });
     defer cluster_resp.deinit(std.testing.allocator);
@@ -19905,6 +20152,8 @@ test "api http server serves status" {
     defer parsed_cluster.deinit();
     try std.testing.expectEqual(cluster.ClusterHealth.healthy, parsed_cluster.value.health);
     try std.testing.expectEqual(@as(usize, 0), parsed_cluster.value.data.nodes.len);
+    var parsed_public_cluster = try ant_json.parseFromSlice(metadata_openapi.ClusterTopology, std.testing.allocator, cluster_resp.body, .{});
+    defer parsed_public_cluster.deinit();
 
     const request_stats = server.requestStats();
     try std.testing.expectEqual(@as(u64, 2), request_stats.request_count);
@@ -25547,7 +25796,11 @@ test "api http server serves user management routes when auth is enabled" {
     var created_user = try std.json.parseFromSlice(usermgr_openapi.User, alloc, create_resp.body, .{});
     defer created_user.deinit();
     try std.testing.expectEqualStrings("alice", created_user.value.username);
-    try std.testing.expectEqualStrings("acme", created_user.value.metadata.?.map.get("tenant_id").?.string);
+    const created_metadata = switch (created_user.value.metadata) {
+        .value => |metadata| metadata,
+        .absent, .null_value => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("acme", created_metadata.map.get("tenant_id").?.string);
 
     var me_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -26461,7 +26714,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     const query_properties = query_tool.inputSchema.object.get("properties") orelse return error.TestExpectedEqual;
     const query_request_schema = query_properties.object.get("queryRequest") orelse return error.TestExpectedEqual;
     const query_request_description = query_request_schema.object.get("description") orelse return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.startsWith(u8, query_request_description.string, "Raw Antfly QueryRequest body"));
+    try std.testing.expect(std.mem.startsWith(u8, query_request_description.string, "Raw canonical Antfly query body"));
     const query_request_contract_schema = query_request_schema.object.get("anyOf").?.array.items[0];
     try std.testing.expect(query_properties.object.get("fullTextSearchField") != null);
     try std.testing.expect(query_properties.object.get("fullTextIndex") != null);
@@ -27795,8 +28048,7 @@ test "api http server serves query builder response envelope" {
     try std.testing.expectEqual(@as(i64, 2), parsed.value.remaining_user_clarifications.?);
     try std.testing.expect(parsed.value.steps != null);
     try std.testing.expectEqualStrings("query_builder", parsed.value.steps.?[0].name);
-    try std.testing.expect(parsed.value.query == .object);
-    try std.testing.expect(parsed.value.query.object.get("conjuncts") != null);
+    try std.testing.expect(parsed.value.query.map.get("conjuncts") != null);
     try std.testing.expect(parsed.value.query_request != null);
     try std.testing.expectEqualStrings("docs", parsed.value.query_request.?.table.?);
     try std.testing.expect(parsed.value.query_request.?.full_text_search != null);
@@ -28200,9 +28452,10 @@ test "api http server query builder handles tree graph indexes" {
     var graph_inferred = try std.json.parseFromSlice(metadata_openapi.QueryBuilderResult, alloc, graph_inferred_resp.body, .{});
     defer graph_inferred.deinit();
     try std.testing.expectEqualStrings("graph", graph_inferred.value.specialist.?);
-    const graph_query = graph_inferred.value.query_request.?.graph_searches.?.map.get("graph_search").?;
-    try std.testing.expectEqualStrings("doc_hierarchy", graph_query.index_name);
-    try std.testing.expectEqualStrings("$full_text_results", graph_query.start_nodes.?.result_ref.?);
+    const graph_query = graph_inferred.value.query_request.?.graph_queries.?.map.get("graph_search").?;
+    const traversal = graph_query.graph_traverse_query;
+    try std.testing.expectEqualStrings("doc_hierarchy", traversal.index);
+    try std.testing.expectEqualStrings("$query_results", traversal.traverse.start.graph_result_ref_node_selector.result_ref);
 
     var question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -28250,8 +28503,8 @@ test "api http server query builder handles tree graph indexes" {
     var graph_answer = try std.json.parseFromSlice(metadata_openapi.QueryBuilderResult, alloc, graph_answer_resp.body, .{});
     defer graph_answer.deinit();
     try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, graph_answer.value.status.?);
-    const graph_answer_query = graph_answer.value.query_request.?.graph_searches.?.map.get("graph_search").?;
-    try std.testing.expectEqualStrings("topic_graph", graph_answer_query.index_name);
+    const graph_answer_query = graph_answer.value.query_request.?.graph_queries.?.map.get("graph_search").?;
+    try std.testing.expectEqualStrings("topic_graph", graph_answer_query.graph_traverse_query.index);
 }
 
 test "api http server query builder replays clarification decisions" {
@@ -28343,7 +28596,14 @@ test "api http server query builder replays clarification decisions" {
     var field_answer = try std.json.parseFromSlice(metadata_openapi.QueryBuilderResult, alloc, field_answer_resp.body, .{});
     defer field_answer.deinit();
     try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, field_answer.value.status.?);
-    try std.testing.expectEqualStrings("title", field_answer.value.query_request.?.full_text_search.?.object.get("field").?.string);
+    var full_text_search = try ant_json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        field_answer.value.query_request.?.full_text_search.?.bytes,
+        .{},
+    );
+    defer full_text_search.deinit();
+    try std.testing.expectEqualStrings("title", full_text_search.value.object.get("field").?.string);
 
     var semantic_question_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,

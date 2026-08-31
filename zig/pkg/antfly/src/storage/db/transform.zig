@@ -52,7 +52,7 @@ pub fn validateDocumentTransform(alloc: Allocator, transform: types.DocumentTran
 
 pub fn validateTransformOpType(op: types.TransformOpType) !void {
     switch (op) {
-        .set, .set_on_insert, .unset, .inc, .push, .add_to_set, .min, .max => {},
+        .set, .set_on_insert, .unset, .inc, .push, .pull, .add_to_set, .min, .max => {},
         else => return error.UnsupportedTransformOperation,
     }
 }
@@ -181,7 +181,7 @@ fn prepareTransformOp(
         .unset => {
             if (op.value_json != null) return error.InvalidArgument;
         },
-        .set, .set_on_insert, .push, .add_to_set => {
+        .set, .set_on_insert, .push, .pull, .add_to_set => {
             const value_json = op.value_json orelse return error.InvalidArgument;
             var parsed = std.json.parseFromSlice(
                 std.json.Value,
@@ -241,6 +241,11 @@ fn applyPreparedTransformOp(
             var value = try op.takeJson();
             try pushPreparedValue(alloc, &root.object, path, &value);
         },
+        .pull => {
+            var value = try op.takeJson();
+            defer freeJsonValue(alloc, &value);
+            try pullPreparedValue(alloc, &root.object, path, value);
+        },
         .add_to_set => {
             var value = try op.takeJson();
             try addPreparedValueToSet(alloc, &root.object, path, &value);
@@ -249,6 +254,30 @@ fn applyPreparedTransformOp(
         .max => try applyNumericOp(alloc, &root.object, path, try op.number(), .max),
         else => return error.UnsupportedTransformOperation,
     }
+}
+
+fn pullPreparedValue(
+    alloc: Allocator,
+    obj: *std.json.ObjectMap,
+    parts: []const []const u8,
+    value: std.json.Value,
+) !void {
+    if (parts.len == 0) return error.InvalidArgument;
+    const existing = getNestedValue(obj, parts) orelse return;
+    if (existing.* != .array) return error.InvalidArgument;
+
+    var write_index: usize = 0;
+    for (existing.array.items, 0..) |*item, read_index| {
+        if (jsonValuesEqual(item.*, value)) {
+            freeJsonValue(alloc, item);
+            continue;
+        }
+        if (write_index != read_index) {
+            existing.array.items[write_index] = item.*;
+        }
+        write_index += 1;
+    }
+    existing.array.shrinkRetainingCapacity(write_index);
 }
 
 fn pushPreparedValue(
@@ -602,7 +631,7 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
     }
 }
 
-test "resolve document transform supports set setOnInsert min max inc push and addToSet" {
+test "resolve document transform supports set setOnInsert min max inc push pull and addToSet" {
     const alloc = std.testing.allocator;
 
     const transform: types.DocumentTransform = .{
@@ -615,13 +644,14 @@ test "resolve document transform supports set setOnInsert min max inc push and a
             .{ .op = .set, .path = "status", .value_json = "\"updated\"" },
             .{ .op = .inc, .path = "views", .value_json = "2" },
             .{ .op = .push, .path = "events", .value_json = "{\"type\":\"published\"}" },
+            .{ .op = .pull, .path = "tags", .value_json = "\"remove\"" },
             .{ .op = .add_to_set, .path = "tags", .value_json = "\"zig\"" },
         },
     };
 
     const resolved = try resolveDocumentTransform(
         alloc,
-        "{\"priority\":5,\"version\":5,\"views\":1,\"tags\":[\"db\"]}",
+        "{\"priority\":5,\"version\":5,\"views\":1,\"tags\":[\"db\",\"remove\",\"remove\"]}",
         transform,
     );
     defer alloc.free(resolved.?);
@@ -766,7 +796,7 @@ test "resolve document transform skips missing document without upsert" {
 test "unsupported transforms fail atomically instead of reporting success" {
     const alloc = std.testing.allocator;
     const unsupported = [_]types.TransformOpType{
-        .pull, .pop, .mul, .current_date, .rename,
+        .pop, .mul, .current_date, .rename,
     };
     for (unsupported) |op| {
         const operations = [_]types.TransformOp{

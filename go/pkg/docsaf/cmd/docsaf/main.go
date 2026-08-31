@@ -320,7 +320,7 @@ func loadCmd(args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read file: %w", err)
 	}
-	var records map[string]any
+	var records antfly.LinearMergeRecords
 	if err := json.Unmarshal(jsonData, &records); err != nil {
 		return fmt.Errorf("failed to unmarshal JSON: %w", err)
 	}
@@ -694,7 +694,7 @@ type linearMergeRunOptions struct {
 	dryRun          bool
 }
 
-func executeLinearMergeRecords(ctx context.Context, client *antfly.AntflyClient, tableName string, records map[string]any, opts linearMergeRunOptions) (*antfly.ExecuteLinearMergeResult, error) {
+func executeLinearMergeRecords(ctx context.Context, client *antfly.AntflyClient, tableName string, records antfly.LinearMergeRecords, opts linearMergeRunOptions) (*antfly.ExecuteLinearMergeResult, error) {
 	if opts.batchSize <= 0 {
 		return nil, fmt.Errorf("batch size must be positive")
 	}
@@ -713,7 +713,7 @@ func executeLinearMergeRecords(ctx context.Context, client *antfly.AntflyClient,
 	}
 	fmt.Printf("Linear merge pages: %d (max %d records/page, max %d bytes/request)\n", len(pages), opts.batchSize, opts.maxRequestBytes)
 
-	pageSeq := func(yield func(map[string]any) bool) {
+	pageSeq := func(yield func(antfly.LinearMergeRecords) bool) {
 		for _, page := range pages {
 			if !yield(page) {
 				return

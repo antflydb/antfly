@@ -235,7 +235,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 24.x
+          node-version-file: ts/package.json
           registry-url: https://registry.npmjs.org/
 
       - name: Set up Zig
@@ -318,7 +318,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 24.x
+          node-version-file: ts/package.json
           registry-url: https://registry.npmjs.org/
 
       - name: Upgrade npm for OIDC support

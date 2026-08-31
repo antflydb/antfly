@@ -161,9 +161,9 @@ pub fn stringifyAlloc(alloc: Allocator, cfg: Config) ![]u8 {
         const parsed = try json.parseFromSlice(json.Value, alloc, cfg.full_text_index_json, .{});
         defer parsed.deinit();
         generated.full_text_index = parsed.value;
-        return try json.Stringify.valueAlloc(alloc, generated, .{});
+        return try json.Stringify.valueAlloc(alloc, generated, .{ .emit_null_optional_fields = false });
     }
-    return try json.Stringify.valueAlloc(alloc, generated, .{});
+    return try json.Stringify.valueAlloc(alloc, generated, .{ .emit_null_optional_fields = false });
 }
 
 fn configFromOpenApi(
@@ -277,6 +277,10 @@ test "chunker config round trip" {
 
     const encoded = try stringifyAlloc(alloc, cfg);
     defer alloc.free(encoded);
+    var encoded_value = try json.parseFromSlice(json.Value, alloc, encoded, .{});
+    defer encoded_value.deinit();
+    try std.testing.expect(encoded_value.value.object.get("audio") == null);
+    try std.testing.expect(encoded_value.value.object.get("url") == null);
     var reparsed = try parseConfigFromSlice(alloc, encoded);
     defer reparsed.deinit(alloc);
     try std.testing.expectEqual(.antfly, reparsed.provider);

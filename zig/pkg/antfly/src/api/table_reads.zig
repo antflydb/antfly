@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const ant_json = @import("antfly-json");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const scraping = @import("antfly_scraping");
@@ -46,6 +47,10 @@ const db_query_search = @import("../storage/db/query/search_exec.zig");
 const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const introducer_mod = @import("../introducer.zig");
 const graph_mod = @import("../graph/graph.zig");
+const graph_edge_type = @import("../graph/edge_type.zig");
+const graph_edge_weight = @import("../graph/edge_weight.zig");
+const graph_node_identity = @import("../graph/node_identity.zig");
+const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const reranking_runtime = @import("../reranking/mod.zig");
@@ -55,6 +60,7 @@ const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
+const public_limits = @import("public_limits.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const table_read_source = @import("table_read_source.zig");
@@ -1475,6 +1481,7 @@ const FanoutPlanReason = enum {
     no_io,
     single_group,
     small_request,
+    graph_memory_bound,
     parallel,
 };
 
@@ -1503,6 +1510,7 @@ pub const ParallelFanoutMetricsSnapshot = struct {
     query_plan_no_io_total: u64 = 0,
     query_plan_single_group_total: u64 = 0,
     query_plan_small_request_total: u64 = 0,
+    query_plan_graph_memory_bound_total: u64 = 0,
     preflight_parallel_total: u64 = 0,
     preflight_parallel_ns_total: u64 = 0,
     preflight_fallback_total: u64 = 0,
@@ -1532,6 +1540,7 @@ var planned_width_query_total: std.atomic.Value(u64) = .init(0);
 var planned_no_io_query_total: std.atomic.Value(u64) = .init(0);
 var planned_single_group_query_total: std.atomic.Value(u64) = .init(0);
 var planned_small_request_query_total: std.atomic.Value(u64) = .init(0);
+var planned_graph_memory_bound_query_total: std.atomic.Value(u64) = .init(0);
 var parallel_preflight_total: std.atomic.Value(u64) = .init(0);
 var parallel_preflight_ns_total: std.atomic.Value(u64) = .init(0);
 var fallback_preflight_total: std.atomic.Value(u64) = .init(0);
@@ -1555,6 +1564,7 @@ fn recordFanoutPlan(kind: ParallelFanoutKind, plan: FanoutPlan) void {
                 .no_io => _ = planned_no_io_text_stats_total.fetchAdd(1, .monotonic),
                 .single_group => _ = planned_single_group_text_stats_total.fetchAdd(1, .monotonic),
                 .small_request => _ = planned_small_request_text_stats_total.fetchAdd(1, .monotonic),
+                .graph_memory_bound => {},
                 .parallel => {},
             }
         },
@@ -1569,6 +1579,7 @@ fn recordFanoutPlan(kind: ParallelFanoutKind, plan: FanoutPlan) void {
                 .no_io => _ = planned_no_io_query_total.fetchAdd(1, .monotonic),
                 .single_group => _ = planned_single_group_query_total.fetchAdd(1, .monotonic),
                 .small_request => _ = planned_small_request_query_total.fetchAdd(1, .monotonic),
+                .graph_memory_bound => _ = planned_graph_memory_bound_query_total.fetchAdd(1, .monotonic),
                 .parallel => {},
             }
         },
@@ -1583,6 +1594,7 @@ fn recordFanoutPlan(kind: ParallelFanoutKind, plan: FanoutPlan) void {
                 .no_io => _ = planned_no_io_preflight_total.fetchAdd(1, .monotonic),
                 .single_group => _ = planned_single_group_preflight_total.fetchAdd(1, .monotonic),
                 .small_request => _ = planned_small_request_preflight_total.fetchAdd(1, .monotonic),
+                .graph_memory_bound => {},
                 .parallel => {},
             }
         },
@@ -1634,6 +1646,7 @@ pub fn parallelFanoutMetricsSnapshot() ParallelFanoutMetricsSnapshot {
         .query_plan_no_io_total = planned_no_io_query_total.load(.monotonic),
         .query_plan_single_group_total = planned_single_group_query_total.load(.monotonic),
         .query_plan_small_request_total = planned_small_request_query_total.load(.monotonic),
+        .query_plan_graph_memory_bound_total = planned_graph_memory_bound_query_total.load(.monotonic),
         .preflight_parallel_total = parallel_preflight_total.load(.monotonic),
         .preflight_parallel_ns_total = parallel_preflight_ns_total.load(.monotonic),
         .preflight_fallback_total = fallback_preflight_total.load(.monotonic),
@@ -1698,6 +1711,18 @@ fn planQueryFanout(
         .parallel = false,
         .width = 1,
         .reason = .single_group,
+    };
+    // Search fanout retains every completed slot until the final merge. The
+    // current std.Io.Group API reports only whole-batch completion, so a
+    // parallel graph batch cannot charge the request-wide retained-state and
+    // exact-distinct budgets before several results coexist. Keep graph phases
+    // sequential until completion-aware admission is available; ordinary
+    // search fanout remains parallel and graph execution inside each shard is
+    // unaffected.
+    if (req.graph_queries.len > 0) return .{
+        .parallel = false,
+        .width = 1,
+        .reason = .graph_memory_bound,
     };
     if (group_count <= 2 and req.limit > 0 and req.limit <= 32) return .{
         .parallel = false,
@@ -2503,7 +2528,14 @@ pub const BoundTableReadSource = struct {
         if (req.topology_epoch != 0) return error.TopologyChanged;
         try distributed_graph.validateGraphEdgesTensorAccessPath(alloc, req);
         const graph_entry = self.db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-        const edges = try graph_entry.index.getEdgesByTypes(alloc, req.key, req.edge_types, req.direction);
+        const edges = try graph_entry.index.getEdgesByTypesBounded(
+            alloc,
+            req.key,
+            req.edge_types,
+            req.direction,
+            req.max_edges,
+            req.max_owned_bytes,
+        );
         return .{ .edges = edges };
     }
 };
@@ -2840,7 +2872,7 @@ pub const ProvisionedTableReadSource = struct {
         kind: ReadPreparation.Kind,
     ) !PreparedKeyRead {
         var attempt: usize = 0;
-        while (attempt < topology_read_attempt_limit) : (attempt += 1) {
+        while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
             if (consistency == .stale) {
                 var activity = self.beginPreparedRead(table_name, kind);
                 errdefer if (activity) |*held| held.deinit();
@@ -3117,12 +3149,16 @@ pub const ProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
+        // Graph retries re-run the base scan and every shard fanout. Keep one
+        // fresh topology retry, matching the hosted path, instead of applying
+        // the generic point-read retry multiplier to expensive graph work.
+        const attempt_limit = queryTopologyAttemptLimit(req);
         var attempt: usize = 0;
-        while (attempt < topology_read_attempt_limit) : (attempt += 1) {
+        while (attempt < attempt_limit) : (attempt += 1) {
             checkQueryDeadline(req) catch |err| return err;
             return self.queryAttempt(alloc, table_name, req, consistency) catch |err| switch (err) {
-                error.TopologyChanged => if (attempt + 1 < topology_read_attempt_limit) continue else return err,
-                error.ResidentDbRetryRequired => if (attempt + 1 < topology_read_attempt_limit) continue else return error.StorageReadTemporarilyUnavailable,
+                error.TopologyChanged => if (attempt + 1 < attempt_limit) continue else return err,
+                error.ResidentDbRetryRequired => if (attempt + 1 < attempt_limit) continue else return error.StorageReadTemporarilyUnavailable,
                 else => return err,
             };
         }
@@ -3142,6 +3178,7 @@ pub const ProvisionedTableReadSource = struct {
         const group_ids = prepared.group_ids;
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
+        try rejectUnsupportedGraphQueryMode(group_ids.len, req);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             var execution = queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, .stale) catch |err| switch (err) {
@@ -3171,9 +3208,7 @@ pub const ProvisionedTableReadSource = struct {
         }
 
         if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
-            var base_req = req;
-            base_req.graph_queries = &.{};
-            base_req.expand_strategy = null;
+            const base_req = graphCoordinatorBaseRequest(req);
             var merged = queryProvisionedAcrossGroups(self, alloc, group_ids, base_req, table_name, .stale) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     prepared.releaseActivity();
@@ -3184,6 +3219,22 @@ pub const ProvisionedTableReadSource = struct {
             };
             try checkQueryDeadline(base_req);
             defer merged.deinit();
+            var match_anchor_generations: []?u64 = &.{};
+            defer if (match_anchor_generations.len > 0) alloc.free(match_anchor_generations);
+            var match_anchor_pager: ProvisionedMatchAnchorPager = undefined;
+            var match_anchor_source: ?distributed_graph.MatchAnchorSource = null;
+            if (distributed_graph.requiresCompleteMatchAnchors(req)) {
+                match_anchor_generations = try distributedIdentityGenerationsForGroupsAlloc(alloc, group_ids, merged);
+                match_anchor_pager = .{
+                    .source = self,
+                    .group_ids = group_ids,
+                    .request = req,
+                    .table_name = table_name,
+                    .consistency = .stale,
+                    .generations = match_anchor_generations,
+                };
+                match_anchor_source = .{ .paged = .{ .ctx = &match_anchor_pager, .fetch_fn = ProvisionedMatchAnchorPager.fetch } };
+            }
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
             // Distributed graph execution can cross table boundaries. Do not
@@ -3196,7 +3247,16 @@ pub const ProvisionedTableReadSource = struct {
 
             var worker_ctx = ProvisionedGraphWorkerContext.init(self);
             const worker = worker_ctx.worker();
-            const graph_results = try distributed_graph.executeCrossRange(alloc, self.catalog, worker, table_name, graph_req, merged, consistency);
+            const graph_results = try distributed_graph.executeCrossRangeWithMatchAnchors(
+                alloc,
+                self.catalog,
+                worker,
+                table_name,
+                graph_req,
+                merged,
+                match_anchor_source,
+                consistency,
+            );
             merged.graph_results = graph_results;
 
             // Aggregation may return to the source table after graph fanout.
@@ -3716,6 +3776,31 @@ pub const ProvisionedTableReadSource = struct {
     }
 };
 
+fn queryTopologyAttemptLimit(req: db_mod.types.SearchRequest) usize {
+    return if (req.graph_queries.len > 0)
+        2
+    else
+        ProvisionedTableReadSource.topology_read_attempt_limit;
+}
+
+test "graph table queries have one fresh-topology retry" {
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        queryTopologyAttemptLimit(.{ .graph_queries = &.{.{
+            .name = "walk",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "graph",
+                .start_nodes = .{ .keys = &.{"doc:a"} },
+            },
+        }} }),
+    );
+    try std.testing.expectEqual(
+        ProvisionedTableReadSource.topology_read_attempt_limit,
+        queryTopologyAttemptLimit(.{}),
+    );
+}
+
 fn freeObservedDynamicFieldCapabilitySets(
     alloc: std.mem.Allocator,
     sets: []ObservedDynamicFieldCapabilitySet,
@@ -4205,11 +4290,34 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        // A graph retry re-runs its base scan and every shard fanout. Keep the
+        // public retry budget to one fresh topology snapshot so churn cannot
+        // amplify an expensive query up to the generic point-read limit.
+        const attempt_limit = queryTopologyAttemptLimit(req);
+        var attempt: usize = 0;
+        while (attempt < attempt_limit) : (attempt += 1) {
+            checkQueryDeadline(req) catch |err| return err;
+            return self.queryAttempt(alloc, table_name, req, consistency) catch |err| switch (err) {
+                error.TopologyChanged => if (attempt + 1 < attempt_limit) continue else return err,
+                else => return err,
+            };
+        }
+        unreachable;
+    }
+
+    fn queryAttempt(
+        self: *HostedProvisionedTableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?query_api.QueryResponse {
         try checkQueryDeadline(req);
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
+        try rejectUnsupportedGraphQueryMode(group_ids.len, req);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
@@ -4237,16 +4345,39 @@ pub const HostedProvisionedTableReadSource = struct {
         }
 
         if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
-            var base_req = req;
-            base_req.graph_queries = &.{};
-            base_req.expand_strategy = null;
+            const base_req = graphCoordinatorBaseRequest(req);
             var merged = try queryHostedAcrossGroups(self, alloc, group_ids, base_req, table_name, consistency);
             try checkQueryDeadline(base_req);
             defer merged.deinit();
+            var match_anchor_generations: []?u64 = &.{};
+            defer if (match_anchor_generations.len > 0) alloc.free(match_anchor_generations);
+            var match_anchor_pager: HostedMatchAnchorPager = undefined;
+            var match_anchor_source: ?distributed_graph.MatchAnchorSource = null;
+            if (distributed_graph.requiresCompleteMatchAnchors(req)) {
+                match_anchor_generations = try distributedIdentityGenerationsForGroupsAlloc(alloc, group_ids, merged);
+                match_anchor_pager = .{
+                    .source = self,
+                    .group_ids = group_ids,
+                    .request = req,
+                    .table_name = table_name,
+                    .consistency = consistency,
+                    .generations = match_anchor_generations,
+                };
+                match_anchor_source = .{ .paged = .{ .ctx = &match_anchor_pager, .fetch_fn = HostedMatchAnchorPager.fetch } };
+            }
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
             const worker = hostedGraphWorker(self);
-            const graph_results = try distributed_graph.executeCrossRange(alloc, self.catalog, worker, table_name, graph_req, merged, consistency);
+            const graph_results = try distributed_graph.executeCrossRangeWithMatchAnchors(
+                alloc,
+                self.catalog,
+                worker,
+                table_name,
+                graph_req,
+                merged,
+                match_anchor_source,
+                consistency,
+            );
             merged.graph_results = graph_results;
 
             var meta: query_api.QueryResponseMeta = .{
@@ -4960,6 +5091,7 @@ fn queryProvisionedAcrossGroupsParallel(
     result_identity_generations: []?u64,
 ) !db_mod.types.SearchResult {
     const start_ns = platform_time.monotonicNs();
+    std.debug.assert(req.graph_queries.len == 0);
     const slots = try initSearchFanoutSlots(alloc, group_ids.len);
     defer deinitSearchFanoutSlots(alloc, slots);
 
@@ -5005,21 +5137,21 @@ fn queryProvisionedAcrossGroupsParallel(
             group.async(io, Fiber.run, .{ self, &slots[i], group_id, table_name, shard_req, consistency, required_generation });
         }
         group.await(io) catch {};
-    }
-
-    for (slots) |slot| {
-        if (slot.err) |err| return err;
+        for (slots[start..end], start..end) |slot, i| {
+            if (slot.err) |err| return err;
+            const result = slot.result orelse return error.InvalidRemoteResponse;
+            if (result.graph_results.len != 0) return error.InvalidRemoteResponse;
+            result_identity_generations[i] = result.identity_read_generation;
+            if (required_identity_generations) |generations| {
+                if (result_identity_generations[i] != generations[i])
+                    return error.IdentityReadGenerationChanged;
+            }
+        }
     }
 
     const shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     defer alloc.free(shard_results);
-    for (slots, 0..) |slot, i| {
-        shard_results[i] = slot.result.?;
-        result_identity_generations[i] = shard_results[i].identity_read_generation;
-        if (required_identity_generations) |generations| {
-            if (result_identity_generations[i] != generations[i]) return error.IdentityReadGenerationChanged;
-        }
-    }
+    for (slots, 0..) |slot, i| shard_results[i] = slot.result.?;
     var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, req.offset, req.limit);
     errdefer merged.deinit();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
@@ -5041,6 +5173,7 @@ fn queryHostedAcrossGroupsParallel(
     result_identity_generations: []?u64,
 ) !db_mod.types.SearchResult {
     const start_ns = platform_time.monotonicNs();
+    std.debug.assert(req.graph_queries.len == 0);
     const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency);
     defer deinitHostedShardRoutes(alloc, routes);
 
@@ -5093,21 +5226,21 @@ fn queryHostedAcrossGroupsParallel(
             group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, shard_req, consistency, required_generation });
         }
         group.await(io) catch {};
-    }
-
-    for (slots) |slot| {
-        if (slot.err) |err| return err;
+        for (slots[start..end], start..end) |slot, i| {
+            if (slot.err) |err| return err;
+            const result = slot.result orelse return error.InvalidRemoteResponse;
+            if (result.graph_results.len != 0) return error.InvalidRemoteResponse;
+            result_identity_generations[i] = result.identity_read_generation;
+            if (required_identity_generations) |generations| {
+                if (result_identity_generations[i] != generations[i])
+                    return error.IdentityReadGenerationChanged;
+            }
+        }
     }
 
     const shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     defer alloc.free(shard_results);
-    for (slots, 0..) |slot, i| {
-        shard_results[i] = slot.result.?;
-        result_identity_generations[i] = shard_results[i].identity_read_generation;
-        if (required_identity_generations) |generations| {
-            if (result_identity_generations[i] != generations[i]) return error.IdentityReadGenerationChanged;
-        }
-    }
+    for (slots, 0..) |slot, i| shard_results[i] = slot.result.?;
     var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, req.offset, req.limit);
     errdefer merged.deinit();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
@@ -5119,6 +5252,262 @@ fn distributedSearchShardLimit(req: db_mod.types.SearchRequest) u32 {
     if (req.search_after.len > 0 or req.search_before.len > 0) return req.limit;
     const shard_limit = req.limit +| req.offset;
     return if (shard_limit == 0) req.limit else shard_limit;
+}
+
+const complete_match_anchor_order = [_]db_mod.types.SortField{.{ .field = "_id" }};
+
+/// Canonical MATCH is a graph relation over the authorized source-table
+/// universe, not over the public retrieval page. Build one stable identity-only
+/// cursor page. The caller adds only the trusted authorization predicate and
+/// the selected MATCH anchor's explicit filter.
+fn completeGraphMatchAnchorRequest(
+    req: db_mod.types.SearchRequest,
+    search_after: []const std.json.Value,
+) db_mod.types.SearchRequest {
+    return .{
+        .index_name = req.index_name,
+        .primary_text_index_name = req.primary_text_index_name,
+        .include_all_fields = false,
+        .include_stored = false,
+        .order_by = &complete_match_anchor_order,
+        .search_after = search_after,
+        .limit = distributed_graph.complete_match_anchor_page_size,
+        .graph_table_read_authorizer = req.graph_table_read_authorizer,
+        .execution_deadline_ns = req.execution_deadline_ns,
+        .cancellation = req.cancellation,
+    };
+}
+
+/// Builds the identity-scan predicate for one canonical MATCH. Named operations
+/// deliberately get independent scans so an unrelated pattern cannot expand a
+/// query's anchor relation or consume its transient page budget.
+fn completeGraphMatchAnchorFilterAlloc(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    graph_query: db_mod.types.NamedGraphQuery,
+) !?[]u8 {
+    const pattern = graph_query.query.match_pattern orelse return error.InvalidQueryRequest;
+    const anchor = graph_pattern_mod.selectConjunctiveAnchor(pattern) orelse return error.InvalidQueryRequest;
+    const filter = anchor.filter.filter_query_json;
+    const authorization = req.authorization_filter_query_json;
+    if (filter == null and authorization.len == 0) return null;
+    if (filter == null) return try alloc.dupe(u8, authorization);
+    if (authorization.len == 0) return try alloc.dupe(u8, filter.?);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"bool\":{\"must\":[");
+    try out.appendSlice(alloc, filter.?);
+    try out.append(alloc, ',');
+    try out.appendSlice(alloc, authorization);
+    try out.appendSlice(alloc, "]}}");
+    return try out.toOwnedSlice(alloc);
+}
+
+fn graphMatchAnchorScanError(has_filter: bool, err: anyerror) anyerror {
+    if (has_filter and err == error.UnsupportedQueryRequest)
+        return error.GraphAnchorFilterRequiresIndex;
+    return err;
+}
+
+fn installCompleteGraphMatchAnchorFilter(
+    req: *db_mod.types.SearchRequest,
+    filter: ?[]const u8,
+) void {
+    const value = filter orelse return;
+    req.filter_query_json = value;
+    // Exact MATCH anchor enumeration must use a complete native predicate
+    // path. Never allow the controlled identity scan to fall through to a
+    // stored-document or text-index fallback.
+    req.require_algebraic_filter_resolution = true;
+}
+
+const ProvisionedMatchAnchorPager = struct {
+    source: *ProvisionedTableReadSource,
+    group_ids: []const u64,
+    request: db_mod.types.SearchRequest,
+    table_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    generations: []const ?u64,
+
+    fn fetch(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        graph_query: db_mod.types.NamedGraphQuery,
+        search_after: []const std.json.Value,
+    ) !db_mod.types.SearchResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var anchor_req = completeGraphMatchAnchorRequest(self.request, search_after);
+        const pattern = graph_query.query.match_pattern orelse return error.InvalidQueryRequest;
+        const anchor = graph_pattern_mod.selectConjunctiveAnchor(pattern) orelse return error.InvalidQueryRequest;
+        anchor_req.filter_prefix = anchor.filter.filter_prefix;
+        const anchor_filter = try completeGraphMatchAnchorFilterAlloc(alloc, self.request, graph_query);
+        defer if (anchor_filter) |value| alloc.free(value);
+        installCompleteGraphMatchAnchorFilter(&anchor_req, anchor_filter);
+        return queryProvisionedAcrossGroupsAtGenerations(
+            self.source,
+            alloc,
+            self.group_ids,
+            anchor_req,
+            self.table_name,
+            self.consistency,
+            self.generations,
+        ) catch |err| {
+            // The anchor scan is a controlled `_id` cursor query. When its
+            // combined MATCH/auth filter cannot be resolved by native storage
+            // filtering, exact enumeration must fail closed with graph-specific
+            // remediation instead of exposing an internal sort-planner error.
+            return graphMatchAnchorScanError(anchor_filter != null, err);
+        };
+    }
+};
+
+const HostedMatchAnchorPager = struct {
+    source: *HostedProvisionedTableReadSource,
+    group_ids: []const u64,
+    request: db_mod.types.SearchRequest,
+    table_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    generations: []const ?u64,
+
+    fn fetch(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        graph_query: db_mod.types.NamedGraphQuery,
+        search_after: []const std.json.Value,
+    ) !db_mod.types.SearchResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var anchor_req = completeGraphMatchAnchorRequest(self.request, search_after);
+        const pattern = graph_query.query.match_pattern orelse return error.InvalidQueryRequest;
+        const anchor = graph_pattern_mod.selectConjunctiveAnchor(pattern) orelse return error.InvalidQueryRequest;
+        anchor_req.filter_prefix = anchor.filter.filter_prefix;
+        const anchor_filter = try completeGraphMatchAnchorFilterAlloc(alloc, self.request, graph_query);
+        defer if (anchor_filter) |value| alloc.free(value);
+        installCompleteGraphMatchAnchorFilter(&anchor_req, anchor_filter);
+        return queryHostedAcrossGroupsAtGenerations(
+            self.source,
+            alloc,
+            self.group_ids,
+            anchor_req,
+            self.table_name,
+            self.consistency,
+            self.generations,
+        ) catch |err| {
+            return graphMatchAnchorScanError(anchor_filter != null, err);
+        };
+    }
+};
+
+test "complete graph match anchors discard retrieval shaping" {
+    const filter_ids = [_]u64{ 3, 7 };
+    const excluded_ids = [_]u64{11};
+    const filter_doc_ids = [_][]const u8{"visible"};
+    const excluded_doc_ids = [_][]const u8{"hidden"};
+    const order_by = [_]db_mod.types.SortField{.{ .field = "rank", .desc = true }};
+    const cursor = [_]std.json.Value{.{ .integer = 42 }};
+
+    const anchors = completeGraphMatchAnchorRequest(.{
+        .index_name = "content",
+        .primary_text_index_name = "body",
+        .aggregations_json = "{\"count\":{}}",
+        .count_only = true,
+        .profile = true,
+        .full_text = .match_all,
+        .filter_text = .match_all,
+        .exclusion_text = .match_none,
+        .filter_query_json = "{\"term\":{\"tenant\":\"one\"}}",
+        .exclusion_query_json = "{\"term\":{\"deleted\":true}}",
+        .authorization_filter_query_json = "{\"term\":{\"tenant\":\"authorized\"}}",
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .include_all_fields = true,
+        .include_stored = true,
+        .offset = 80,
+        .limit = 20,
+        .filter_prefix = "tenant-one:",
+        .filter_ids = &filter_ids,
+        .exclude_ids = &excluded_ids,
+        .filter_doc_ids = &filter_doc_ids,
+        .filter_doc_ids_positive = true,
+        .exclude_doc_ids = &excluded_doc_ids,
+        .execution_deadline_ns = 1234,
+        .require_algebraic_filter_resolution = true,
+    }, &.{});
+
+    try std.testing.expectEqual(std.meta.Tag(db_mod.types.Query).match_all, std.meta.activeTag(anchors.query));
+    try std.testing.expect(anchors.full_text == null);
+    try std.testing.expectEqual(@as(usize, 0), anchors.graph_queries.len);
+    try std.testing.expectEqual(@as(usize, 1), anchors.order_by.len);
+    try std.testing.expectEqualStrings("_id", anchors.order_by[0].field);
+    try std.testing.expectEqual(@as(usize, 0), anchors.search_after.len);
+    try std.testing.expectEqual(@as(u32, 0), anchors.offset);
+    try std.testing.expectEqual(distributed_graph.complete_match_anchor_page_size, anchors.limit);
+    try std.testing.expect(!anchors.include_all_fields);
+    try std.testing.expect(!anchors.include_stored);
+    try std.testing.expectEqualStrings("", anchors.aggregations_json);
+    try std.testing.expect(!anchors.count_only);
+    try std.testing.expect(!anchors.profile);
+
+    try std.testing.expect(anchors.filter_text == null);
+    try std.testing.expect(anchors.exclusion_text == null);
+    try std.testing.expectEqualStrings("", anchors.filter_query_json);
+    try std.testing.expectEqualStrings("", anchors.exclusion_query_json);
+    try std.testing.expectEqualStrings("", anchors.filter_prefix);
+    try std.testing.expectEqual(@as(usize, 0), anchors.filter_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), anchors.exclude_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), anchors.filter_doc_ids.len);
+    try std.testing.expect(!anchors.filter_doc_ids_positive);
+    try std.testing.expectEqual(@as(usize, 0), anchors.exclude_doc_ids.len);
+    try std.testing.expect(anchors.resolved_doc_filter == null);
+    try std.testing.expect(anchors.resolved_text_doc_filter == null);
+    try std.testing.expectEqual(@as(?u64, 1234), anchors.execution_deadline_ns);
+    try std.testing.expect(!anchors.require_algebraic_filter_resolution);
+
+    var filtered_anchors = anchors;
+    installCompleteGraphMatchAnchorFilter(&filtered_anchors, "{\"term\":{\"status\":\"active\"}}");
+    try std.testing.expectEqualStrings("{\"term\":{\"status\":\"active\"}}", filtered_anchors.filter_query_json);
+    try std.testing.expect(filtered_anchors.require_algebraic_filter_resolution);
+}
+
+test "complete graph match anchor scan is independent per named operation" {
+    const nodes_a = [_]graph_pattern_mod.MatchNode{
+        .{ .alias = "unfiltered" },
+        .{ .alias = "selected", .filter = .{ .filter_query_json = "{\"ids\":[\"a\"]}" } },
+    };
+    const nodes_b = [_]graph_pattern_mod.MatchNode{
+        .{ .alias = "selected", .filter = .{ .filter_query_json = "{\"ids\":[\"b\"]}" } },
+        .{ .alias = "unfiltered" },
+    };
+    const queries = [_]db_mod.types.NamedGraphQuery{
+        .{ .name = "a", .query = .{ .query_type = .pattern, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .match_pattern = .{ .anchor_alias = "selected", .nodes = &nodes_a, .edges = &.{} } } },
+        .{ .name = "b", .query = .{ .query_type = .pattern, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .match_pattern = .{ .anchor_alias = "selected", .nodes = &nodes_b, .edges = &.{} } } },
+    };
+    const combined = (try completeGraphMatchAnchorFilterAlloc(std.testing.allocator, .{
+        .filter_query_json = "{\"term\":{\"retrieval\":\"ignored\"}}",
+        .authorization_filter_query_json = "{\"term\":{\"tenant\":\"one\"}}",
+        .graph_queries = &queries,
+    }, queries[0])).?;
+    defer std.testing.allocator.free(combined);
+
+    try std.testing.expectEqualStrings(
+        "{\"bool\":{\"must\":[{\"ids\":[\"a\"]},{\"term\":{\"tenant\":\"one\"}}]}}",
+        combined,
+    );
+}
+
+test "complete graph match anchor scan reports native filter coverage failures" {
+    try std.testing.expectEqual(
+        error.GraphAnchorFilterRequiresIndex,
+        graphMatchAnchorScanError(true, error.UnsupportedQueryRequest),
+    );
+    try std.testing.expectEqual(
+        error.UnsupportedQueryRequest,
+        graphMatchAnchorScanError(false, error.UnsupportedQueryRequest),
+    );
+    try std.testing.expectEqual(
+        error.ReadUnavailable,
+        graphMatchAnchorScanError(true, error.ReadUnavailable),
+    );
 }
 
 fn distributedSearchShardRequest(
@@ -6537,8 +6926,95 @@ fn requiresDistributedGraphCoordinator(
     group_count: usize,
     req: db_mod.types.SearchRequest,
 ) bool {
+    if (req.graph_queries.len == 0) return false;
+    // This callback carries the authenticated caller and is deliberately not
+    // serializable. Never let a generic owner proxy silently discard it.
+    if (req.graph_table_read_authorizer != null) return true;
     return distributed_graph.supportsCrossRange(req) and
-        (group_count > 1 or req.graph_table_read_authorizer != null);
+        (group_count > 1 or
+            distributed_graph.requiresCompleteMatchAnchors(req) or
+            graphRequestHasQualifiedIdentity(req) or
+            graphRequestHasResultRef(req));
+}
+
+/// Remove graph operations before shard fanout. Graph-only public requests do
+/// not imply a retrieval lane, even though the storage request's scalar query
+/// field defaults to match_all. An explicit match-none preserves that contract
+/// on the generic shard wire and obtains only the snapshot-generation stamp.
+fn graphCoordinatorBaseRequest(req: db_mod.types.SearchRequest) db_mod.types.SearchRequest {
+    var base = req;
+    base.clearGraphQueries();
+    base.expand_strategy = null;
+    if (!graphRequestHasRetrievalLane(req)) base.query = .{ .match_none = {} };
+    return base;
+}
+
+fn graphRequestHasRetrievalLane(req: db_mod.types.SearchRequest) bool {
+    if (req.full_text != null or
+        req.filter_text != null or
+        req.dense != null or
+        req.sparse != null or
+        req.full_text_queries.len > 0 or
+        req.dense_queries.len > 0 or
+        req.sparse_queries.len > 0)
+        return true;
+    return switch (req.query) {
+        .match_all => false,
+        else => true,
+    };
+}
+
+/// Graph results cannot be merged from independently evaluated shard-local
+/// traversals: limits, deduplication, path selection, and MATCH bindings are
+/// global semantics. Legacy and embedded callers may still use local-only
+/// modes on one unauthenticated group, but public execution fails closed when
+/// the exact coordinator cannot preserve their semantics and authorization.
+fn rejectUnsupportedGraphQueryMode(
+    group_count: usize,
+    req: db_mod.types.SearchRequest,
+) !void {
+    if (req.graph_queries.len > 0 and
+        !distributed_graph.supportsCrossRange(req) and
+        (group_count > 1 or req.graph_table_read_authorizer != null))
+    {
+        return error.GraphQueryModeUnsupported;
+    }
+}
+
+fn graphRequestHasQualifiedIdentity(req: db_mod.types.SearchRequest) bool {
+    for (req.graph_queries) |graph_query| {
+        if (selectorHasQualifiedIdentity(graph_query.query.start_nodes)) return true;
+        if (graph_query.query.target_nodes) |selector| {
+            if (selectorHasQualifiedIdentity(selector)) return true;
+        }
+    }
+    return false;
+}
+
+fn graphRequestHasResultRef(req: db_mod.types.SearchRequest) bool {
+    for (req.graph_queries) |graph_query| {
+        if (selectorIsResultRef(graph_query.query.start_nodes)) return true;
+        if (graph_query.query.target_nodes) |selector| {
+            if (selectorIsResultRef(selector)) return true;
+        }
+    }
+    return false;
+}
+
+fn selectorIsResultRef(selector: graph_query_mod.NodeSelector) bool {
+    return switch (selector) {
+        .result_ref => true,
+        .keys, .identities => false,
+    };
+}
+
+fn selectorHasQualifiedIdentity(selector: graph_query_mod.NodeSelector) bool {
+    return switch (selector) {
+        .identities => |identities| for (identities) |identity| {
+            if (identity.table != null) break true;
+        } else false,
+        .keys, .result_ref => false,
+    };
 }
 
 fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrateRequest, db: *db_mod.DB) !void {
@@ -6555,6 +7031,8 @@ fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_mod.
         .filter_query_json = req.filter_query_json,
         .exclusion_query_json = req.exclusion_query_json,
         .include_stored = req.include_stored,
+        .fields = req.fields,
+        .include_all_fields = req.include_all_fields,
         .resolved_doc_filter = req.resolved_doc_filter,
         .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
         .identity_read_generation = req.identity_read_generation,
@@ -7772,6 +8250,11 @@ fn queryProvisionedAcrossGroupsPhase(
 
     var shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     var initialized: usize = 0;
+    var graph_accumulator: ?query_api.GraphSearchResultsAccumulator = if (req.graph_queries.len > 0)
+        try query_api.GraphSearchResultsAccumulator.init(alloc, req.graph_queries, req.graph_execution_limits)
+    else
+        null;
+    defer if (graph_accumulator) |*accumulator| accumulator.deinit();
     defer {
         for (shard_results[0..initialized]) |*result| result.deinit();
         alloc.free(shard_results);
@@ -7782,13 +8265,19 @@ fn queryProvisionedAcrossGroupsPhase(
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
         shard_results[i] = try queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, group_req, consistency);
         initialized += 1;
+        if (graph_accumulator) |*accumulator|
+            try accumulator.appendOwned(shard_results[i].alloc, &shard_results[i].graph_results);
         result_identity_generations[i] = shard_results[i].identity_read_generation;
         if (required_identity_generations) |generations| {
             if (result_identity_generations[i] != generations[i]) return error.IdentityReadGenerationChanged;
         }
     }
-    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results[0..initialized], req.offset, req.limit);
+    var merge_req = req;
+    if (graph_accumulator != null) merge_req.clearGraphQueries();
+    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, merge_req, shard_results[0..initialized], req.offset, req.limit);
     errdefer merged.deinit();
+    if (graph_accumulator) |*accumulator|
+        merged.graph_results = try accumulator.toOwned();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
     return merged;
 }
@@ -7817,6 +8306,11 @@ fn queryHostedAcrossGroupsPhase(
 
     var shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     var initialized: usize = 0;
+    var graph_accumulator: ?query_api.GraphSearchResultsAccumulator = if (req.graph_queries.len > 0)
+        try query_api.GraphSearchResultsAccumulator.init(alloc, req.graph_queries, req.graph_execution_limits)
+    else
+        null;
+    defer if (graph_accumulator) |*accumulator| accumulator.deinit();
     defer {
         for (shard_results[0..initialized]) |*result| result.deinit();
         alloc.free(shard_results);
@@ -7832,13 +8326,19 @@ fn queryHostedAcrossGroupsPhase(
             .remote => |remote| try queryRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, group_req),
         };
         initialized += 1;
+        if (graph_accumulator) |*accumulator|
+            try accumulator.appendOwned(shard_results[i].alloc, &shard_results[i].graph_results);
         result_identity_generations[i] = shard_results[i].identity_read_generation;
         if (required_identity_generations) |generations| {
             if (result_identity_generations[i] != generations[i]) return error.IdentityReadGenerationChanged;
         }
     }
-    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results[0..initialized], req.offset, req.limit);
+    var merge_req = req;
+    if (graph_accumulator != null) merge_req.clearGraphQueries();
+    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, merge_req, shard_results[0..initialized], req.offset, req.limit);
     errdefer merged.deinit();
+    if (graph_accumulator) |*accumulator|
+        merged.graph_results = try accumulator.toOwned();
     try attachDistributedIdentityGenerations(alloc, &merged, group_ids, result_identity_generations);
     return merged;
 }
@@ -8224,7 +8724,14 @@ fn executeProvisionedGraphGetEdgesAttempt(
     _ = try currentIdentityReadGenerationForDb(req.identity_read_generation, db_owner.db());
 
     const graph_entry = db_owner.db().core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    return .{ .edges = try graph_entry.index.getEdgesByTypes(alloc, req.key, req.edge_types, req.direction) };
+    return .{ .edges = try graph_entry.index.getEdgesByTypesBounded(
+        alloc,
+        req.key,
+        req.edge_types,
+        req.direction,
+        req.max_edges,
+        req.max_owned_bytes,
+    ) };
 }
 
 fn executeHostedGraphGetEdges(
@@ -8270,7 +8777,14 @@ fn graphGetEdgesLocal(
     try reads.reads.prepareLookupWithConsistency(group_id, req.key, .{}, consistency);
 
     const graph_entry = db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    const edges = try graph_entry.index.getEdgesByTypes(alloc, req.key, req.edge_types, req.direction);
+    const edges = try graph_entry.index.getEdgesByTypesBounded(
+        alloc,
+        req.key,
+        req.edge_types,
+        req.direction,
+        req.max_edges,
+        req.max_owned_bytes,
+    );
     return .{ .edges = edges };
 }
 
@@ -16564,6 +17078,13 @@ test "internal scan content hash mode round trips without public document fields
 
 fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
+    // Cross-table authorization is a request-local callback and has no trusted
+    // generic JSON representation. Supported graph requests execute through
+    // the coordinator; unsupported authenticated modes are rejected during
+    // routing. Keep this last-line guard so a future route cannot proxy them
+    // without their target-table authorization policy.
+    if (req.graph_queries.len > 0 and req.graph_table_read_authorizer != null)
+        return error.UnsupportedQueryRequest;
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.append(alloc, '{');
@@ -16645,7 +17166,7 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
         try appendTextQueryField(alloc, &out, &first, "exclusion_query", exclusion_text);
     }
     if (req.graph_queries.len > 0) {
-        try appendGraphQueriesField(alloc, &out, &first, req.graph_queries);
+        try appendGraphQueriesField(alloc, &out, &first, req.graph_queries, req.graph_query_transport);
     }
     if (req.expand_strategy) |expand_strategy| {
         try appendJsonFieldString(alloc, &out, &first, "expand_strategy", switch (expand_strategy) {
@@ -16693,6 +17214,109 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
 
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+test "generic shard query wire preserves admitted canonical graph operations without reparsing" {
+    const graph_operations =
+        \\{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}}
+    ;
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        },
+    }};
+    const encoded = try encodeQueryRequest(std.testing.allocator, .{
+        .graph_queries = &graph_queries,
+        .graph_query_transport = .{
+            .dialect = .canonical,
+            .operations_json = graph_operations,
+            .admitted_operations_ptr = @ptrCast(graph_queries[0..].ptr),
+            .admitted_operations_len = graph_queries.len,
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+    var parsed = try ant_json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const graph_queries_value = parsed.value.object.get("graph_queries") orelse return error.TestUnexpectedResult;
+    const neighbors = graph_queries_value.object.get("neighbors") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("graph_idx", neighbors.object.get("index").?.string);
+    try std.testing.expect(neighbors.object.get("traverse") != null);
+}
+
+test "generic shard query wire fails closed without an admitted graph fragment" {
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{ .query_type = .neighbors, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"doc:a"} } },
+    }};
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        encodeQueryRequest(std.testing.allocator, .{ .graph_queries = &graph_queries }),
+    );
+}
+
+test "generic shard query wire never drops graph table authorization" {
+    const Authorizer = struct {
+        fn authorize(
+            _: ?*const anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+        ) !db_mod.types.GraphTableReadAuthorization {
+            return .{ .allowed = false };
+        }
+    };
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        },
+    }};
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, encodeQueryRequest(std.testing.allocator, .{
+        .graph_queries = &graph_queries,
+        .graph_query_transport = .{
+            .dialect = .canonical,
+            .operations_json =
+            \\{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}}
+            ,
+            .admitted_operations_ptr = @ptrCast(graph_queries[0..].ptr),
+            .admitted_operations_len = graph_queries.len,
+        },
+        .graph_table_read_authorizer = .{
+            .ctx = null,
+            .authorize_table = Authorizer.authorize,
+        },
+    }));
+}
+
+/// Append the exact bounded graph operation map captured during admission.
+/// Reconstructing this from the execution AST would duplicate the public DSL
+/// and eventually drift as the OpenAPI contract evolves.
+fn appendGraphQueriesField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    graph_queries: []const db_mod.types.NamedGraphQuery,
+    graph_query_transport: ?db_mod.types.GraphQueryTransport,
+) !void {
+    if (graph_queries.len == 0) return;
+    const transport = graph_query_transport orelse return error.UnsupportedQueryRequest;
+    if (!transport.matchesOperations(graph_queries) or
+        transport.operations_json.len < 2 or
+        transport.operations_json[0] != '{' or
+        transport.operations_json[transport.operations_json.len - 1] != '}')
+        return error.UnsupportedQueryRequest;
+    // Legacy is a public stateful edge contract, not a node-to-node protocol.
+    // Distributed graph coordination clears graph operations before generic
+    // shard fanout and performs compatibility conversion only at final egress.
+    if (transport.dialect != .canonical) return error.UnsupportedQueryRequest;
+
+    try appendJsonFieldName(alloc, out, first, "graph_queries");
+    try out.appendSlice(alloc, transport.operations_json);
 }
 
 fn appendQueryHierarchyField(
@@ -16934,105 +17558,6 @@ fn appendPrunerField(
     if (pruner.std_dev_threshold > 0) {
         try appendJsonFieldF64(alloc, out, &pruner_first, "std_dev_threshold", pruner.std_dev_threshold);
     }
-    try out.append(alloc, '}');
-}
-
-fn appendGraphQueriesField(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    first: *bool,
-    graph_queries: []const db_mod.types.NamedGraphQuery,
-) !void {
-    try appendJsonFieldName(alloc, out, first, "graph_searches");
-    try out.append(alloc, '{');
-    for (graph_queries, 0..) |graph_query, i| {
-        if (i > 0) try out.append(alloc, ',');
-        try appendJsonString(alloc, out, graph_query.name);
-        try out.append(alloc, ':');
-        try appendGraphQueryValue(alloc, out, graph_query.query);
-    }
-    try out.append(alloc, '}');
-}
-
-fn appendGraphQueryValue(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    query: graph_query_mod.GraphQuery,
-) !void {
-    try out.append(alloc, '{');
-    var first = true;
-    try appendJsonFieldString(alloc, out, &first, "type", switch (query.query_type) {
-        .traverse => "traverse",
-        .neighbors => "neighbors",
-        .shortest_path => "shortest_path",
-        .k_shortest_paths => "k_shortest_paths",
-        .pattern => "pattern",
-    });
-    try appendJsonFieldString(alloc, out, &first, "index_name", query.index_name);
-    try appendGraphNodeSelectorField(alloc, out, &first, "start_nodes", query.start_nodes);
-    if (query.target_nodes) |target_nodes| {
-        try appendGraphNodeSelectorField(alloc, out, &first, "target_nodes", target_nodes);
-    }
-    try appendGraphQueryParamsField(alloc, out, &first, query.params, query.k);
-    try out.append(alloc, '}');
-}
-
-fn appendGraphNodeSelectorField(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    first: *bool,
-    name: []const u8,
-    selector: graph_query_mod.NodeSelector,
-) !void {
-    try appendJsonFieldName(alloc, out, first, name);
-    try out.append(alloc, '{');
-    var selector_first = true;
-    switch (selector) {
-        .keys => |keys| {
-            try appendJsonFieldName(alloc, out, &selector_first, "keys");
-            try out.append(alloc, '[');
-            for (keys, 0..) |key, i| {
-                if (i > 0) try out.append(alloc, ',');
-                try appendJsonString(alloc, out, key);
-            }
-            try out.append(alloc, ']');
-        },
-        .result_ref => |result_ref| {
-            try appendJsonFieldString(alloc, out, &selector_first, "result_ref", result_ref.ref);
-            if (result_ref.limit > 0) try appendJsonFieldU32(alloc, out, &selector_first, "limit", result_ref.limit);
-        },
-    }
-    try out.append(alloc, '}');
-}
-
-fn appendGraphQueryParamsField(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    first: *bool,
-    params: graph_query_mod.QueryParams,
-    k: u32,
-) !void {
-    try appendJsonFieldName(alloc, out, first, "params");
-    try out.append(alloc, '{');
-    var params_first = true;
-    if (params.edge_types.len > 0) try appendJsonFieldNames(alloc, out, &params_first, "edge_types", params.edge_types);
-    if (params.direction != .out) try appendJsonFieldString(alloc, out, &params_first, "direction", switch (params.direction) {
-        .out => "out",
-        .in => "in",
-        .both => "both",
-    });
-    if (params.max_depth != 3) try appendJsonFieldU32(alloc, out, &params_first, "max_depth", params.max_depth);
-    if (params.min_weight != 0) try appendJsonFieldF64(alloc, out, &params_first, "min_weight", params.min_weight);
-    if (params.max_weight != 0) try appendJsonFieldF64(alloc, out, &params_first, "max_weight", params.max_weight);
-    if (params.max_results != 100) try appendJsonFieldU32(alloc, out, &params_first, "max_results", params.max_results);
-    if (!params.deduplicate) try appendJsonFieldBool(alloc, out, &params_first, "deduplicate_nodes", false);
-    if (params.include_paths) try appendJsonFieldBool(alloc, out, &params_first, "include_paths", true);
-    if (params.weight_mode != .min_hops) try appendJsonFieldString(alloc, out, &params_first, "weight_mode", switch (params.weight_mode) {
-        .min_hops => "min_hops",
-        .min_weight => "min_weight",
-        .max_weight => "max_weight",
-    });
-    if (k > 1) try appendJsonFieldU32(alloc, out, &params_first, "k", k);
     try out.append(alloc, '}');
 }
 
@@ -17665,6 +18190,18 @@ fn appendOptionalTextQueryBoostField(
 }
 
 fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+    return parseRemoteSearchResultInner(alloc, body) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidRemoteResponse,
+    };
+}
+
+/// Decode data received from another Antfly node behind one trust boundary.
+/// The inner decoder may reuse local contract helpers whose errors are phrased
+/// for client requests; the public wrapper above deliberately collapses every
+/// non-resource failure to InvalidRemoteResponse so an owner can never make a
+/// malformed shard response look like a caller error.
+fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, body, .{});
     defer parsed.deinit();
     const responses = parsed.value.responses orelse return error.InvalidQueryRequest;
@@ -17673,6 +18210,8 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
     const hits_obj = response.hits orelse return error.InvalidQueryRequest;
     const total_obj = hits_obj.total orelse return error.InvalidQueryRequest;
     const hits_value = hits_obj.hits orelse return error.InvalidQueryRequest;
+    const total_hits = try query_contract.queryHitsTotalValueToU32(total_obj);
+    const total_hits_relation = try query_contract.parseTotalHitsRelation(total_obj.relation);
 
     const hits = try alloc.alloc(db_mod.types.SearchHit, hits_value.len);
     var initialized: usize = 0;
@@ -17681,18 +18220,18 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
         alloc.free(hits);
     }
     for (hits_value, 0..) |item, i| {
-        hits[i] = .{
-            .id = try alloc.dupe(u8, item._id),
-            .score = item._score,
-            .distance = item._distance,
-            .index_scores = try parseRemoteIndexScoresAlloc(alloc, item._index_scores),
-            .sort_values = try db_mod.types.cloneJsonValues(alloc, item._sort orelse &.{}),
-            .stored_data = if (item._source) |value| try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}) else null,
-            .ancestor_source_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .source),
-            .ancestor_unit_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .unit),
-            .artifact_ref = try parseRemoteHierarchyArtifactRefAlloc(alloc, item.hierarchy),
-            .chunk_hits = try parseRemoteHierarchyMatchesAlloc(alloc, item.hierarchy),
-        };
+        var hit: db_mod.types.SearchHit = .{ .id = try alloc.dupe(u8, item._id) };
+        errdefer hit.deinit(alloc);
+        hit.score = item._score;
+        hit.distance = item._distance;
+        hit.index_scores = try parseRemoteIndexScoresAlloc(alloc, item._index_scores);
+        hit.sort_values = try db_mod.types.cloneJsonValues(alloc, item._sort orelse &.{});
+        hit.stored_data = if (item._source) |value| try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}) else null;
+        hit.ancestor_source_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .source);
+        hit.ancestor_unit_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .unit);
+        hit.artifact_ref = try parseRemoteHierarchyArtifactRefAlloc(alloc, item.hierarchy);
+        hit.chunk_hits = try parseRemoteHierarchyMatchesAlloc(alloc, item.hierarchy);
+        hits[i] = hit;
         initialized += 1;
     }
 
@@ -17704,8 +18243,8 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
     return .{
         .alloc = alloc,
         .hits = hits,
-        .total_hits = try query_contract.queryHitsTotalValueToU32(total_obj),
-        .total_hits_relation = try query_contract.parseTotalHitsRelation(total_obj.relation),
+        .total_hits = total_hits,
+        .total_hits_relation = total_hits_relation,
         .graph_results = graph_results,
     };
 }
@@ -17806,11 +18345,10 @@ fn parseRemoteArtifactKind(value: []const u8) !db_mod.types.ArtifactKind {
 
 fn parseRemoteIndexScoresAlloc(
     alloc: std.mem.Allocator,
-    maybe_value: ?std.json.Value,
+    maybe_value: ?std.json.ArrayHashMap(f64),
 ) ![]fusion_mod.IndexScore {
     const value = maybe_value orelse return &.{};
-    if (value != .object) return &.{};
-    const object = value.object;
+    const object = value.map;
     if (object.count() == 0) return &.{};
 
     var scores = try alloc.alloc(fusion_mod.IndexScore, object.count());
@@ -17822,15 +18360,9 @@ fn parseRemoteIndexScoresAlloc(
 
     var it = object.iterator();
     while (it.next()) |entry| {
-        const score: f64 = switch (entry.value_ptr.*) {
-            .float => |v| v,
-            .integer => |v| @floatFromInt(v),
-            .number_string => |v| std.fmt.parseFloat(f64, v) catch continue,
-            else => continue,
-        };
         scores[initialized] = .{
             .index_name = try alloc.dupe(u8, entry.key_ptr.*),
-            .score = score,
+            .score = entry.value_ptr.*,
         };
         initialized += 1;
     }
@@ -17893,10 +18425,52 @@ test "parseRemoteSearchResult preserves grouped hierarchy matches" {
     try std.testing.expectEqual(db_mod.types.ArtifactKind.asset, match.artifact_ref.?.source.?.kind);
 }
 
+test "parseRemoteSearchResult preserves typed graph rows and hydrated documents" {
+    const alloc = std.testing.allocator;
+    var result = try parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"matched":{"kind":"bindings","rows":[{"person":{"key":"person:1","table":"people","document":{"title":"Ada"}},"missing":null}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"messages"}]}
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    const graph_result = result.graph_results[0];
+    try std.testing.expectEqualStrings("matched", graph_result.name);
+    try std.testing.expectEqual(@as(usize, 1), graph_result.matches.len);
+    try std.testing.expectEqual(@as(usize, 1), graph_result.matches[0].bindings.len);
+    try std.testing.expectEqualStrings("person", graph_result.matches[0].bindings[0].alias);
+    try std.testing.expectEqualStrings("people", graph_result.matches[0].bindings[0].node.table.?);
+    try std.testing.expectEqual(@as(usize, 1), graph_result.matches[0].null_aliases.len);
+    try std.testing.expectEqualStrings("missing", graph_result.matches[0].null_aliases[0]);
+    try std.testing.expectEqual(@as(usize, 1), graph_result.hits.len);
+    try std.testing.expectEqualStrings("people", graph_result.hits[0].source_table.?);
+    var document = try std.json.parseFromSlice(std.json.Value, alloc, graph_result.hits[0].stored_data.?, .{});
+    defer document.deinit();
+    try std.testing.expectEqualStrings("Ada", document.value.object.get("title").?.string);
+}
+
+test "parseRemoteSearchResult preserves canonical graph path table identities" {
+    const alloc = std.testing.allocator;
+    var result = try parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"paths","paths":[{"path":{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"direction":"in","type":"external","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":1}}},"took":1,"status":200,"table":"docs"}]}
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results[0].nodes.len);
+    try std.testing.expectEqualStrings("shared", result.graph_results[0].nodes[0].key);
+    try std.testing.expectEqualStrings("entities", result.graph_results[0].nodes[0].table.?);
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results[0].paths.len);
+    try std.testing.expectEqualStrings("shared", result.graph_results[0].paths[0].nodes[1]);
+    try std.testing.expectEqualStrings("entities", result.graph_results[0].paths[0].node_tables[1].?);
+    try std.testing.expectEqual(graph_mod.EdgeDirection.in, result.graph_results[0].paths[0].edges[0].traversal_direction.?);
+}
+
 fn parseRemoteGraphResults(
     alloc: std.mem.Allocator,
-    value: std.json.ArrayHashMap(indexes_openapi.GraphQueryResult),
+    value: std.json.ArrayHashMap(indexes_openapi.GraphResult),
 ) ![]db_mod.types.GraphSearchResult {
+    if (value.map.count() > graph_query_mod.max_named_queries)
+        return error.InvalidRemoteResponse;
     const results = try alloc.alloc(db_mod.types.GraphSearchResult, value.map.count());
     var initialized: usize = 0;
     errdefer {
@@ -17907,37 +18481,140 @@ fn parseRemoteGraphResults(
     var it = value.map.iterator();
     while (it.next()) |entry| {
         const result_value = entry.value_ptr.*;
-        const parsed_nodes = if (result_value.nodes) |nodes_value|
+        // Inter-node responses are always canonical, even when the coordinator
+        // is serving a legacy stateful client. Compatibility conversion occurs
+        // once at public egress and never widens the trusted shard protocol.
+        if (!graph_query_mod.isValidQueryName(entry.key_ptr.*))
+            return error.InvalidRemoteResponse;
+        const ResultView = struct {
+            canonical_nodes: ?[]const indexes_openapi.GraphResultNode = null,
+            canonical_path_results: ?[]const indexes_openapi.GraphPathResult = null,
+            rows: ?[]const indexes_openapi.GraphResultRow = null,
+            aggregates: ?std.json.ArrayHashMap(indexes_openapi.GraphAggregateValue) = null,
+            truncated: bool = false,
+        };
+        const view: ResultView = switch (result_value) {
+            .graph_nodes_result => |result| blk: {
+                if (result.nodes.len > public_limits.max_graph_result_items)
+                    return error.InvalidRemoteResponse;
+                if (!remoteGraphReturnedItemsMatch(result.stats.returned_items, result.nodes.len))
+                    return error.InvalidRemoteResponse;
+                break :blk .{
+                    .canonical_nodes = result.nodes,
+                    .truncated = result.stats.truncated,
+                };
+            },
+            .graph_paths_result => |result| blk: {
+                if (result.paths.len > public_limits.max_graph_result_items or
+                    !remoteGraphReturnedItemsMatch(result.stats.returned_items, result.paths.len))
+                    return error.InvalidRemoteResponse;
+                break :blk .{ .canonical_path_results = result.paths };
+            },
+            .graph_bindings_result => |result| blk: {
+                if (result.rows.len > public_limits.max_graph_result_items or
+                    !remoteGraphReturnedItemsMatch(result.stats.returned_items, result.rows.len))
+                    return error.InvalidRemoteResponse;
+                break :blk .{
+                    .rows = result.rows,
+                    .truncated = result.stats.truncated,
+                };
+            },
+            .graph_aggregates_result => |result| blk: {
+                if (result.aggregates.map.count() == 0 or
+                    result.aggregates.map.count() > graph_pattern_mod.max_count_aggregates or
+                    !remoteGraphReturnedItemsMatch(result.stats.returned_items, result.aggregates.map.count()))
+                    return error.InvalidRemoteResponse;
+                break :blk .{
+                    .aggregates = result.aggregates,
+                    .truncated = false,
+                };
+            },
+        };
+        var parsed_nodes = if (view.canonical_nodes) |nodes_value|
             try parseRemoteGraphNodes(alloc, nodes_value)
+        else if (view.canonical_path_results) |path_results|
+            try parseRemoteGraphPathResultNodes(alloc, path_results)
         else
             ParsedRemoteGraphNodes{};
         errdefer parsed_nodes.deinit(alloc);
-        const parsed_matches = if (result_value.matches) |matches_value|
-            try parseRemoteGraphMatches(alloc, matches_value)
+        var parsed_matches = if (view.rows) |rows_value|
+            try parseRemoteGraphRows(alloc, rows_value)
         else
             ParsedRemoteGraphMatches{};
         errdefer parsed_matches.deinit(alloc);
-        const paths: []graph_paths.Path = if (result_value.paths) |paths_value|
-            try parseRemoteGraphPaths(alloc, paths_value)
+        const paths: []graph_paths.Path = if (view.canonical_path_results) |path_results|
+            try parseRemoteCanonicalGraphPathResults(alloc, path_results)
         else
             @constCast((&[_]graph_paths.Path{})[0..]);
         errdefer {
             for (paths) |path| graph_paths.freePath(alloc, path);
             if (paths.len > 0) alloc.free(paths);
         }
+        const aggregates = if (view.aggregates) |aggregates_value|
+            try parseRemoteGraphAggregates(alloc, aggregates_value)
+        else
+            @constCast((&[_]db_mod.types.GraphAggregateResult{})[0..]);
+        errdefer {
+            for (aggregates) |*aggregate| aggregate.deinit(alloc);
+            if (aggregates.len > 0) alloc.free(aggregates);
+        }
+
+        const joined_hits = try concatGraphResultHits(alloc, parsed_nodes.hits, parsed_matches.hits);
+        errdefer {
+            for (joined_hits) |*hit| hit.deinit(alloc);
+            if (joined_hits.len > 0) alloc.free(joined_hits);
+        }
+        for (parsed_nodes.hits) |*hit| hit.deinit(alloc);
+        if (parsed_nodes.hits.len > 0) alloc.free(parsed_nodes.hits);
+        parsed_nodes.hits = &.{};
+        for (parsed_matches.hits) |*hit| hit.deinit(alloc);
+        if (parsed_matches.hits.len > 0) alloc.free(parsed_matches.hits);
+        parsed_matches.hits = &.{};
 
         results[initialized] = .{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
             .nodes = parsed_nodes.nodes,
             .paths = paths,
             .matches = parsed_matches.matches,
-            .hits = try concatGraphResultHits(alloc, parsed_nodes.hits, parsed_matches.hits),
-            .total_hits = @intCast(result_value.total),
+            .aggregates = aggregates,
+            .hits = joined_hits,
+            .total_hits = @intCast(@max(parsed_nodes.nodes.len, @max(paths.len, parsed_matches.matches.len))),
+            .truncated = view.truncated,
         };
         initialized += 1;
     }
 
     return results;
+}
+
+fn remoteGraphReturnedItemsMatch(value: i64, actual: usize) bool {
+    const parsed = std.math.cast(usize, value) orelse return false;
+    return parsed == actual;
+}
+
+fn parseRemoteGraphAggregates(
+    alloc: std.mem.Allocator,
+    value: std.json.ArrayHashMap(indexes_openapi.GraphAggregateValue),
+) ![]db_mod.types.GraphAggregateResult {
+    const aggregates = try alloc.alloc(db_mod.types.GraphAggregateResult, value.map.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (aggregates[0..initialized]) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(aggregates);
+    }
+    var it = value.map.iterator();
+    while (it.next()) |entry| {
+        if (!graph_query_mod.isValidIdentifier(entry.key_ptr.*) or !entry.value_ptr.exact)
+            return error.InvalidRemoteResponse;
+        const parsed_value = std.fmt.parseInt(u128, entry.value_ptr.value, 10) catch return error.InvalidRemoteResponse;
+        aggregates[initialized] = .{
+            .name = try alloc.dupe(u8, entry.key_ptr.*),
+            .value = parsed_value,
+            .exact = entry.value_ptr.exact,
+        };
+        initialized += 1;
+    }
+    return aggregates;
 }
 
 const ParsedRemoteGraphNodes = struct {
@@ -17968,6 +18645,8 @@ fn parseRemoteGraphNodes(
     alloc: std.mem.Allocator,
     value: []const indexes_openapi.GraphResultNode,
 ) !ParsedRemoteGraphNodes {
+    if (value.len > public_limits.max_graph_result_items)
+        return error.InvalidRemoteResponse;
     const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, value.len);
     var initialized: usize = 0;
     errdefer {
@@ -17981,22 +18660,11 @@ fn parseRemoteGraphNodes(
     }
 
     for (value, 0..) |item, i| {
-        nodes[i] = .{
-            .key = try alloc.dupe(u8, item.key),
-            .depth = @intCast(item.depth orelse 0),
-            .distance = item.distance orelse 0,
-            .path = if (item.path) |path| try cloneRemoteGraphNodePath(alloc, path) else null,
-            .path_edges = if (item.path_edges) |path_edges| try cloneRemoteGraphNodePathEdges(alloc, path_edges) else null,
-            .provenance = if (item.provenance) |provenance| try cloneRemoteGraphNodePath(alloc, provenance) else null,
-        };
-        if (item.document) |document| {
-            try hits.append(alloc, .{
-                .id = try alloc.dupe(u8, item.key),
-                .score = null,
-                .stored_data = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(document, .{})}),
-            });
-        }
+        nodes[i] = try parseRemoteGraphNodeWithKey(alloc, item.key, item);
         initialized += 1;
+        if (item.document) |document| {
+            try appendRemoteGraphDocumentHit(alloc, &hits, item.key, item.table, document);
+        }
     }
     return .{
         .nodes = nodes,
@@ -18004,76 +18672,239 @@ fn parseRemoteGraphNodes(
     };
 }
 
-fn parseRemoteGraphNodeWithKey(
+fn parseRemoteGraphPathResultNodes(
     alloc: std.mem.Allocator,
-    key: []const u8,
-    item: indexes_openapi.GraphResultNode,
-) !graph_query_mod.GraphResultNode {
-    return .{
-        .key = try alloc.dupe(u8, key),
-        .depth = @intCast(item.depth orelse 0),
-        .distance = item.distance orelse 0,
-        .path = if (item.path) |path| try cloneRemoteGraphNodePath(alloc, path) else null,
-        .path_edges = if (item.path_edges) |path_edges| try cloneRemoteGraphNodePathEdges(alloc, path_edges) else null,
-        .provenance = if (item.provenance) |provenance| try cloneRemoteGraphNodePath(alloc, provenance) else null,
-    };
-}
-
-fn parseRemoteGraphMatches(
-    alloc: std.mem.Allocator,
-    value: []const indexes_openapi.PatternMatch,
-) !ParsedRemoteGraphMatches {
-    const matches = try alloc.alloc(db_mod.types.GraphPatternMatch, value.len);
-    var initialized_matches: usize = 0;
+    value: []const indexes_openapi.GraphPathResult,
+) !ParsedRemoteGraphNodes {
+    const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, value.len);
+    var initialized: usize = 0;
     errdefer {
-        for (matches[0..initialized_matches]) |*match| match.deinit(alloc);
-        alloc.free(matches);
+        for (nodes[0..initialized]) |*node| node.deinit(alloc);
+        if (nodes.len > 0) alloc.free(nodes);
     }
     var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
     errdefer {
         for (hits.items) |*hit| hit.deinit(alloc);
         hits.deinit(alloc);
     }
-
     for (value, 0..) |item, i| {
-        const bindings_value = item.bindings orelse return error.InvalidQueryRequest;
+        if (item.path.nodes.len == 0) return error.InvalidRemoteResponse;
+        const terminal = item.path.nodes[item.path.nodes.len - 1];
+        nodes[i] = try parseRemoteGraphNodeWithKey(alloc, terminal.key, .{
+            .key = terminal.key,
+            .table = terminal.table,
+            .depth = item.path.length,
+            .document = item.document,
+        });
+        initialized += 1;
+        if (item.document) |document|
+            try appendRemoteGraphDocumentHit(alloc, &hits, terminal.key, terminal.table, document);
+    }
+    return .{ .nodes = nodes, .hits = try hits.toOwnedSlice(alloc) };
+}
 
-        const bindings = try alloc.alloc(db_mod.types.GraphPatternBinding, bindings_value.map.count());
-        var initialized_bindings: usize = 0;
+const OwnedRemoteGraphNodePath = struct {
+    nodes: [][]const u8,
+    tables: ?[]const ?[]const u8,
+
+    fn deinit(self: OwnedRemoteGraphNodePath, alloc: std.mem.Allocator) void {
+        freeRemoteGraphNodePath(alloc, self.nodes);
+        if (self.tables) |tables| {
+            for (tables) |table| if (table) |value| alloc.free(value);
+            if (tables.len > 0) alloc.free(tables);
+        }
+    }
+};
+
+fn cloneRemoteCanonicalGraphNodePath(
+    alloc: std.mem.Allocator,
+    value: []const indexes_openapi.GraphPathEndpoint,
+) !OwnedRemoteGraphNodePath {
+    const nodes = try alloc.alloc([]const u8, value.len);
+    var initialized_nodes: usize = 0;
+    errdefer {
+        for (nodes[0..initialized_nodes]) |node| alloc.free(node);
+        if (nodes.len > 0) alloc.free(nodes);
+    }
+    const tables = try alloc.alloc(?[]const u8, value.len);
+    @memset(tables, null);
+    var initialized_tables: usize = 0;
+    errdefer {
+        for (tables[0..initialized_tables]) |table| if (table) |item| alloc.free(item);
+        if (tables.len > 0) alloc.free(tables);
+    }
+    var has_qualified_identity = false;
+    for (value, 0..) |endpoint, i| {
+        nodes[i] = try alloc.dupe(u8, endpoint.key);
+        initialized_nodes += 1;
+        tables[i] = if (endpoint.table) |table| blk: {
+            has_qualified_identity = true;
+            break :blk try alloc.dupe(u8, table);
+        } else null;
+        initialized_tables += 1;
+    }
+    if (!has_qualified_identity) {
+        if (tables.len > 0) alloc.free(tables);
+        return .{ .nodes = nodes, .tables = null };
+    }
+    return .{ .nodes = nodes, .tables = tables };
+}
+
+fn parseRemoteGraphNodeWithKey(
+    alloc: std.mem.Allocator,
+    key: []const u8,
+    item: indexes_openapi.GraphResultNode,
+) !graph_query_mod.GraphResultNode {
+    try validateRemoteCanonicalGraphIdentity(key, item.table);
+    const depth = std.math.cast(u32, item.depth) orelse return error.InvalidRemoteResponse;
+    if (depth > graph_pattern_mod.max_pattern_hops) return error.InvalidRemoteResponse;
+    const distance: f64 = @floatFromInt(depth);
+    if (item.path) |path| {
+        try validateRemoteCanonicalGraphPathNodes(path);
+        if (depth != path.len - 1 or !graphPathEndpointEql(path[path.len - 1], .{
+            .key = key,
+            .table = item.table,
+        })) return error.InvalidRemoteResponse;
+    }
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_table = if (item.table) |table| try alloc.dupe(u8, table) else null;
+    errdefer if (owned_table) |table| alloc.free(table);
+    const owned_path = if (item.path) |value| try cloneRemoteCanonicalGraphNodePath(alloc, value) else null;
+    errdefer if (owned_path) |value| value.deinit(alloc);
+    const path_edges = if (item.path_edges) |value| blk: {
+        const path = item.path orelse return error.InvalidRemoteResponse;
+        try validateRemoteCanonicalGraphPathEdges(path, value);
+        break :blk try cloneRemoteCanonicalGraphNodePathEdges(alloc, value);
+    } else null;
+    errdefer if (path_edges) |value| freeRemoteGraphNodePathEdges(alloc, value);
+    const provenance = if (item.provenance) |value| try cloneRemoteGraphNodePath(alloc, value) else null;
+    errdefer if (provenance) |value| freeRemoteGraphNodePath(alloc, value);
+    return .{
+        .key = owned_key,
+        .table = owned_table,
+        .depth = depth,
+        .distance = distance,
+        .path = if (owned_path) |value| value.nodes else null,
+        .path_tables = if (owned_path) |value| value.tables else null,
+        .path_edges = path_edges,
+        .provenance = provenance,
+    };
+}
+
+fn remoteGraphDocumentHit(
+    alloc: std.mem.Allocator,
+    key: []const u8,
+    table: ?[]const u8,
+    document: std.json.ArrayHashMap(std.json.Value),
+) !db_mod.types.SearchHit {
+    const id = try alloc.dupe(u8, key);
+    errdefer alloc.free(id);
+    const source_table = if (table) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (source_table) |value| alloc.free(value);
+    const stored_data = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(document, .{})});
+    errdefer alloc.free(stored_data);
+    return .{ .id = id, .source_table = source_table, .score = null, .stored_data = stored_data };
+}
+
+fn appendRemoteGraphDocumentHit(
+    alloc: std.mem.Allocator,
+    hits: *std.ArrayListUnmanaged(db_mod.types.SearchHit),
+    key: []const u8,
+    table: ?[]const u8,
+    document: std.json.ArrayHashMap(std.json.Value),
+) !void {
+    var hit = try remoteGraphDocumentHit(alloc, key, table, document);
+    errdefer hit.deinit(alloc);
+    try hits.append(alloc, hit);
+}
+
+fn appendRemoteGraphBinding(
+    alloc: std.mem.Allocator,
+    bindings: *std.ArrayListUnmanaged(db_mod.types.GraphPatternBinding),
+    alias: []const u8,
+    node_value: indexes_openapi.GraphBindingNode,
+) !void {
+    const owned_alias = try alloc.dupe(u8, alias);
+    errdefer alloc.free(owned_alias);
+    try validateRemoteCanonicalGraphIdentity(node_value.key, node_value.table);
+    const owned_key = try alloc.dupe(u8, node_value.key);
+    errdefer alloc.free(owned_key);
+    const owned_table = if (node_value.table) |table| try alloc.dupe(u8, table) else null;
+    errdefer if (owned_table) |table| alloc.free(table);
+    var node = graph_query_mod.GraphResultNode{
+        .key = owned_key,
+        .table = owned_table,
+        .depth = 0,
+        .distance = 0,
+    };
+    errdefer node.deinit(alloc);
+    try bindings.append(alloc, .{ .alias = owned_alias, .node = node });
+}
+
+fn parseRemoteGraphRows(
+    alloc: std.mem.Allocator,
+    value: []const indexes_openapi.GraphResultRow,
+) !ParsedRemoteGraphMatches {
+    if (value.len > public_limits.max_graph_result_items)
+        return error.InvalidRemoteResponse;
+    const matches = try alloc.alloc(db_mod.types.GraphPatternMatch, value.len);
+    var initialized_matches: usize = 0;
+    errdefer {
+        for (matches[0..initialized_matches]) |*match| match.deinit(alloc);
+        if (matches.len > 0) alloc.free(matches);
+    }
+    var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
+    errdefer {
+        for (hits.items) |*hit| hit.deinit(alloc);
+        hits.deinit(alloc);
+    }
+    for (value, 0..) |row, i| {
+        if (row.map.count() > graph_pattern_mod.max_conjunctive_nodes)
+            return error.InvalidRemoteResponse;
+        var bindings = std.ArrayListUnmanaged(db_mod.types.GraphPatternBinding).empty;
         errdefer {
-            for (bindings[0..initialized_bindings]) |*binding| binding.deinit(alloc);
-            if (bindings.len > 0) alloc.free(bindings);
+            for (bindings.items) |*binding| binding.deinit(alloc);
+            bindings.deinit(alloc);
         }
-
-        var binding_it = bindings_value.map.iterator();
-        while (binding_it.next()) |binding_entry| {
-            const node_value = binding_entry.value_ptr.*;
-            const node = try parseRemoteGraphNodeWithKey(alloc, node_value.key, node_value);
-            bindings[initialized_bindings] = .{
-                .alias = try alloc.dupe(u8, binding_entry.key_ptr.*),
-                .node = node,
+        var null_aliases = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (null_aliases.items) |alias| alloc.free(alias);
+            null_aliases.deinit(alloc);
+        }
+        var it = row.map.iterator();
+        while (it.next()) |entry| {
+            if (!graph_query_mod.isValidIdentifier(entry.key_ptr.*))
+                return error.InvalidRemoteResponse;
+            const node_value = entry.value_ptr.* orelse {
+                const alias = try alloc.dupe(u8, entry.key_ptr.*);
+                errdefer alloc.free(alias);
+                try null_aliases.append(alloc, alias);
+                continue;
             };
+            try appendRemoteGraphBinding(alloc, &bindings, entry.key_ptr.*, node_value);
             if (node_value.document) |document| {
-                try hits.append(alloc, .{
-                    .id = try alloc.dupe(u8, node_value.key),
-                    .score = null,
-                    .stored_data = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(document, .{})}),
-                });
+                try appendRemoteGraphDocumentHit(alloc, &hits, node_value.key, node_value.table, document);
             }
-            initialized_bindings += 1;
         }
-
+        const owned_bindings = try bindings.toOwnedSlice(alloc);
+        errdefer {
+            for (owned_bindings) |*binding| binding.deinit(alloc);
+            if (owned_bindings.len > 0) alloc.free(owned_bindings);
+        }
+        const owned_null_aliases = try null_aliases.toOwnedSlice(alloc);
+        errdefer {
+            for (owned_null_aliases) |alias| alloc.free(alias);
+            if (owned_null_aliases.len > 0) alloc.free(owned_null_aliases);
+        }
         matches[i] = .{
-            .bindings = bindings,
-            .path = if (item.path) |path_value| try cloneRemoteGraphNodePathEdges(alloc, path_value) else @constCast((&[_]graph_query_mod.PathEdgeInfo{})[0..]),
+            .bindings = owned_bindings,
+            .path = &.{},
+            .null_aliases = owned_null_aliases,
         };
         initialized_matches += 1;
     }
-
-    return .{
-        .matches = matches,
-        .hits = try hits.toOwnedSlice(alloc),
-    };
+    return .{ .matches = matches, .hits = try hits.toOwnedSlice(alloc) };
 }
 
 fn concatGraphResultHits(
@@ -18100,32 +18931,81 @@ fn concatGraphResultHits(
 
 fn cloneRemoteGraphNodePath(alloc: std.mem.Allocator, value: []const []const u8) ![][]const u8 {
     const out = try alloc.alloc([]const u8, value.len);
-    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(item);
+        alloc.free(out);
+    }
     for (value, 0..) |item, i| {
         out[i] = try alloc.dupe(u8, item);
+        initialized += 1;
     }
     return out;
 }
 
-fn cloneRemoteGraphNodePathEdges(
+fn freeRemoteGraphNodePath(alloc: std.mem.Allocator, value: []const []const u8) void {
+    for (value) |item| alloc.free(item);
+    if (value.len > 0) alloc.free(value);
+}
+
+fn cloneRemoteCanonicalGraphNodePathEdges(
     alloc: std.mem.Allocator,
-    value: []const indexes_openapi.PathEdge,
+    value: []const indexes_openapi.GraphPathEdge,
 ) ![]graph_query_mod.PathEdgeInfo {
     const edges = try alloc.alloc(graph_query_mod.PathEdgeInfo, value.len);
-    errdefer alloc.free(edges);
+    var initialized: usize = 0;
+    errdefer freeRemoteGraphNodePathEdgeItems(alloc, edges, initialized);
     for (value, 0..) |item, i| {
+        const source_key = if (item.direction == .out) item.from.key else item.to.key;
+        const target_key = if (item.direction == .out) item.to.key else item.from.key;
+        const source = try alloc.dupe(u8, source_key);
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, target_key);
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, item.type);
+        errdefer alloc.free(edge_type);
+        const metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "";
+        errdefer if (metadata.len > 0) alloc.free(metadata);
         edges[i] = .{
-            .source = try alloc.dupe(u8, item.source orelse return error.InvalidQueryRequest),
-            .target = try alloc.dupe(u8, item.target orelse return error.InvalidQueryRequest),
-            .edge_type = try alloc.dupe(u8, item.type orelse return error.InvalidQueryRequest),
-            .weight = item.weight orelse return error.InvalidQueryRequest,
-            .metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "",
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
+            .weight = item.weight,
+            .metadata = metadata,
+            .traversal_direction = switch (item.direction) {
+                .out => .out,
+                .in => .in,
+            },
         };
+        initialized += 1;
     }
     return edges;
 }
 
-fn parseRemoteGraphPaths(alloc: std.mem.Allocator, value: []const indexes_openapi.Path) ![]graph_paths.Path {
+fn freeRemoteGraphNodePathEdgeItems(
+    alloc: std.mem.Allocator,
+    edges: []const graph_query_mod.PathEdgeInfo,
+    initialized: usize,
+) void {
+    for (edges[0..initialized]) |edge| {
+        alloc.free(edge.source);
+        alloc.free(edge.target);
+        alloc.free(edge.edge_type);
+        if (edge.metadata.len > 0) alloc.free(edge.metadata);
+    }
+    if (edges.len > 0) alloc.free(edges);
+}
+
+fn freeRemoteGraphNodePathEdges(alloc: std.mem.Allocator, edges: []const graph_query_mod.PathEdgeInfo) void {
+    freeRemoteGraphNodePathEdgeItems(alloc, edges, edges.len);
+}
+
+fn parseRemoteCanonicalGraphPaths(
+    alloc: std.mem.Allocator,
+    value: []const indexes_openapi.GraphPath,
+) ![]graph_paths.Path {
+    if (value.len > public_limits.max_graph_result_items)
+        return error.InvalidRemoteResponse;
     const paths = try alloc.alloc(graph_paths.Path, value.len);
     var initialized: usize = 0;
     errdefer {
@@ -18133,30 +19013,361 @@ fn parseRemoteGraphPaths(alloc: std.mem.Allocator, value: []const indexes_openap
         alloc.free(paths);
     }
     for (value, 0..) |item, i| {
-        paths[i] = .{
-            .nodes = try cloneRemoteGraphNodePath(alloc, item.nodes orelse return error.InvalidQueryRequest),
-            .edges = try parseRemotePathEdges(alloc, item.edges orelse return error.InvalidQueryRequest),
-            .total_weight = item.total_weight orelse return error.InvalidQueryRequest,
-            .length = @intCast(item.length orelse return error.InvalidQueryRequest),
-        };
+        paths[i] = try parseRemoteCanonicalGraphPath(alloc, item);
         initialized += 1;
     }
     return paths;
 }
 
-fn parseRemotePathEdges(alloc: std.mem.Allocator, value: []const indexes_openapi.PathEdge) ![]graph_paths.PathEdge {
-    const edges = try alloc.alloc(graph_paths.PathEdge, value.len);
-    errdefer alloc.free(edges);
+fn parseRemoteCanonicalGraphPathResults(
+    alloc: std.mem.Allocator,
+    value: []const indexes_openapi.GraphPathResult,
+) ![]graph_paths.Path {
+    const paths = try alloc.alloc(graph_paths.Path, value.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (paths[0..initialized]) |path| graph_paths.freePath(alloc, path);
+        if (paths.len > 0) alloc.free(paths);
+    }
     for (value, 0..) |item, i| {
+        paths[i] = try parseRemoteCanonicalGraphPath(alloc, item.path);
+        initialized += 1;
+    }
+    return paths;
+}
+
+fn parseRemoteCanonicalGraphPath(
+    alloc: std.mem.Allocator,
+    item: indexes_openapi.GraphPath,
+) !graph_paths.Path {
+    if (item.length < 0 or item.length > graph_pattern_mod.max_pattern_hops or
+        @as(u64, @intCast(item.length)) != item.edges.len)
+        return error.InvalidRemoteResponse;
+    try validateRemoteCanonicalGraphPathScores(item);
+    const nodes = try alloc.alloc([]const u8, item.nodes.len);
+    var initialized_nodes: usize = 0;
+    errdefer {
+        for (nodes[0..initialized_nodes]) |node| alloc.free(node);
+        alloc.free(nodes);
+    }
+    const has_qualified_node = for (item.nodes) |node| {
+        if (node.table != null) break true;
+    } else false;
+    const node_tables: []?[]const u8 = if (has_qualified_node)
+        try alloc.alloc(?[]const u8, item.nodes.len)
+    else
+        @constCast((&[_]?[]const u8{})[0..]);
+    if (node_tables.len > 0) @memset(node_tables, null);
+    var initialized_tables: usize = 0;
+    errdefer {
+        for (node_tables[0..initialized_tables]) |table| if (table) |value| alloc.free(value);
+        if (node_tables.len > 0) alloc.free(node_tables);
+    }
+    for (item.nodes, 0..) |node, i| {
+        nodes[i] = try alloc.dupe(u8, node.key);
+        initialized_nodes += 1;
+        if (has_qualified_node) {
+            node_tables[i] = if (node.table) |table| try alloc.dupe(u8, table) else null;
+            initialized_tables += 1;
+        }
+    }
+    try validateRemoteCanonicalGraphPathEdges(item.nodes, item.edges);
+    const edges = try parseRemoteCanonicalPathEdges(alloc, item.edges);
+    errdefer {
+        for (edges) |edge| {
+            alloc.free(edge.source);
+            alloc.free(edge.target);
+            alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
+        }
+        alloc.free(edges);
+    }
+    return .{
+        .nodes = nodes,
+        .node_tables = node_tables,
+        .edges = edges,
+        .total_weight = item.weight_sum,
+        .length = std.math.cast(u32, item.length) orelse return error.InvalidRemoteResponse,
+    };
+}
+
+fn validateRemoteCanonicalGraphPathScores(item: indexes_openapi.GraphPath) !void {
+    if (!std.math.isFinite(item.weight_sum) or !std.math.isFinite(item.objective_value))
+        return error.InvalidRemoteResponse;
+    var sum: f64 = 0;
+    var product: f64 = 1;
+    for (item.edges) |edge| {
+        graph_edge_weight.validateStored(edge.weight) catch return error.InvalidRemoteResponse;
+        switch (item.objective) {
+            .min_hops => {},
+            .min_weight_sum => _ = graph_paths.pathEdgeCost(.min_weight, edge.weight) catch
+                return error.InvalidRemoteResponse,
+            .max_weight_product => _ = graph_paths.pathEdgeCost(.max_weight, edge.weight) catch
+                return error.InvalidRemoteResponse,
+        }
+        sum += edge.weight;
+        if (!std.math.isFinite(sum)) return error.InvalidRemoteResponse;
+        if (item.objective == .max_weight_product) {
+            product *= edge.weight;
+            if (!std.math.isFinite(product)) return error.InvalidRemoteResponse;
+        }
+    }
+    if (!graphPathScoreEql(item.weight_sum, sum)) return error.InvalidRemoteResponse;
+    const objective: f64 = switch (item.objective) {
+        .min_hops => @floatFromInt(item.edges.len),
+        .min_weight_sum => sum,
+        .max_weight_product => product,
+    };
+    if (!std.math.isFinite(objective) or !graphPathScoreEql(item.objective_value, objective))
+        return error.InvalidRemoteResponse;
+}
+
+fn graphPathScoreEql(left: f64, right: f64) bool {
+    if (!std.math.isFinite(left) or !std.math.isFinite(right)) return false;
+    const scale = @max(@as(f64, 1), @max(@abs(left), @abs(right)));
+    return @abs(left - right) <= 1e-12 * scale;
+}
+
+fn parseRemoteCanonicalPathEdges(
+    alloc: std.mem.Allocator,
+    value: []const indexes_openapi.GraphPathEdge,
+) ![]graph_paths.PathEdge {
+    const edges = try alloc.alloc(graph_paths.PathEdge, value.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (edges[0..initialized]) |edge| {
+            alloc.free(edge.source);
+            alloc.free(edge.target);
+            alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
+        }
+        if (edges.len > 0) alloc.free(edges);
+    }
+    for (value, 0..) |item, i| {
+        const source_key = if (item.direction == .out) item.from.key else item.to.key;
+        const target_key = if (item.direction == .out) item.to.key else item.from.key;
+        const source = try alloc.dupe(u8, source_key);
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, target_key);
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, item.type);
+        errdefer alloc.free(edge_type);
+        const metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "";
+        errdefer if (metadata.len > 0) alloc.free(metadata);
         edges[i] = .{
-            .source = try alloc.dupe(u8, item.source orelse return error.InvalidQueryRequest),
-            .target = try alloc.dupe(u8, item.target orelse return error.InvalidQueryRequest),
-            .edge_type = try alloc.dupe(u8, item.type orelse return error.InvalidQueryRequest),
-            .weight = item.weight orelse return error.InvalidQueryRequest,
-            .metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "",
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
+            .weight = item.weight,
+            .metadata = metadata,
+            .traversal_direction = switch (item.direction) {
+                .out => .out,
+                .in => .in,
+            },
         };
+        initialized += 1;
     }
     return edges;
+}
+
+fn validateRemoteCanonicalGraphPathEdges(
+    nodes: []const indexes_openapi.GraphPathEndpoint,
+    edges: []const indexes_openapi.GraphPathEdge,
+) !void {
+    try validateRemoteCanonicalGraphPathNodes(nodes);
+    if (edges.len != nodes.len - 1) return error.InvalidRemoteResponse;
+    for (edges, 0..) |edge, i| {
+        graph_edge_type.validateStored(edge.type) catch return error.InvalidRemoteResponse;
+        graph_edge_weight.validateStored(edge.weight) catch return error.InvalidRemoteResponse;
+        try validateRemoteCanonicalGraphIdentity(edge.from.key, edge.from.table);
+        try validateRemoteCanonicalGraphIdentity(edge.to.key, edge.to.table);
+        if (!graphPathEndpointEql(edge.from, nodes[i]) or
+            !graphPathEndpointEql(edge.to, nodes[i + 1]))
+            return error.InvalidRemoteResponse;
+    }
+}
+
+fn validateRemoteCanonicalGraphPathNodes(
+    nodes: []const indexes_openapi.GraphPathEndpoint,
+) !void {
+    if (nodes.len == 0 or nodes.len > graph_pattern_mod.max_pattern_hops + 1)
+        return error.InvalidRemoteResponse;
+    for (nodes) |node| try validateRemoteCanonicalGraphIdentity(node.key, node.table);
+}
+
+fn validateRemoteCanonicalGraphIdentity(key: []const u8, table: ?[]const u8) !void {
+    if (key.len == 0) return error.InvalidRemoteResponse;
+    if (table) |value| if (value.len == 0) return error.InvalidRemoteResponse;
+}
+
+fn graphPathEndpointEql(
+    left: indexes_openapi.GraphPathEndpoint,
+    right: indexes_openapi.GraphPathEndpoint,
+) bool {
+    return graph_node_identity.equal(
+        .{ .table = left.table, .key = left.key },
+        .{ .table = right.table, .key = right.key },
+    );
+}
+
+test "remote canonical graph nodes reject invalid identity and depth domains" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "", .{
+        .key = "",
+        .depth = 0,
+    }));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
+        .key = "node",
+        .table = "",
+        .depth = 0,
+    }));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
+        .key = "node",
+        .depth = -1,
+    }));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
+        .key = "node",
+        .depth = graph_pattern_mod.max_pattern_hops + 1,
+    }));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
+        .key = "node",
+        .depth = 0,
+        .path = &.{ .{ .key = "start" }, .{ .key = "node" } },
+    }));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
+        .key = "node",
+        .depth = 1,
+        .path = &.{ .{ .key = "start" }, .{ .key = "wrong" } },
+    }));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
+        .key = "node",
+        .table = "entities",
+        .depth = 1,
+        .path = &.{ .{ .key = "start" }, .{ .key = "node" } },
+    }));
+
+    const too_many_path_nodes = [_]indexes_openapi.GraphPathEndpoint{.{ .key = "node" }} **
+        (graph_pattern_mod.max_pattern_hops + 2);
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        validateRemoteCanonicalGraphPathNodes(&too_many_path_nodes),
+    );
+}
+
+test "remote canonical graph result stats and aggregate exactness fail closed" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc, "{"));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
+        \\{"responses":[{}]}
+    ));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"walk":{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
+    ));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"counted":{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":true}}},"took":0,"status":200,"table":"docs"}]}
+    ));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"}],"edges":[],"objective":"min_hops","weight_sum":0,"objective_value":0,"length":0}}],"stats":{"returned_items":2}}},"took":0,"status":200,"table":"docs"}]}
+    ));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b","table":"entities"}],"edges":[{"from":{"key":"a"},"to":{"key":"wrong","table":"entities"},"direction":"out","type":"related","weight":1}],"objective":"min_hops","weight_sum":1,"objective_value":1,"length":1}}],"stats":{"returned_items":1}}},"took":0,"status":200,"table":"docs"}]}
+    ));
+}
+
+test "remote canonical graph paths reject impossible shapes and weight domains" {
+    const alloc = std.testing.allocator;
+    const nodes = [_]indexes_openapi.GraphPathEndpoint{
+        .{ .key = "a" },
+        .{ .key = "b", .table = "entities" },
+    };
+    var edges = [_]indexes_openapi.GraphPathEdge{.{
+        .from = nodes[0],
+        .to = nodes[1],
+        .direction = .out,
+        .type = "related",
+        .weight = 0.5,
+    }};
+    var path = indexes_openapi.GraphPath{
+        .nodes = &nodes,
+        .edges = &edges,
+        .objective = .max_weight_product,
+        .weight_sum = 0.5,
+        .objective_value = 0.5,
+        .length = 1,
+    };
+    try validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges);
+    try validateRemoteCanonicalGraphPathScores(path);
+
+    edges[0].direction = .in;
+    const decoded_edges = try parseRemoteCanonicalPathEdges(alloc, &edges);
+    defer {
+        for (decoded_edges) |edge| {
+            alloc.free(edge.source);
+            alloc.free(edge.target);
+            alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
+        }
+        alloc.free(decoded_edges);
+    }
+    try std.testing.expectEqualStrings("b", decoded_edges[0].source);
+    try std.testing.expectEqualStrings("a", decoded_edges[0].target);
+    edges[0].direction = .out;
+
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        validateRemoteCanonicalGraphPathEdges(&.{}, &.{}),
+    );
+
+    edges[0].type = "";
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges),
+    );
+    edges[0].type = "x" ** (graph_edge_type.max_bytes + 1);
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges),
+    );
+    edges[0].type = "related";
+
+    edges[0].weight = -0.1;
+    path.objective = .min_hops;
+    path.weight_sum = -0.1;
+    path.objective_value = 1;
+    try std.testing.expectError(error.InvalidRemoteResponse, validateRemoteCanonicalGraphPathScores(path));
+
+    edges[0].weight = 1.1;
+    path.objective = .max_weight_product;
+    path.weight_sum = 1.1;
+    path.objective_value = 1.1;
+    try std.testing.expectError(error.InvalidRemoteResponse, validateRemoteCanonicalGraphPathScores(path));
+
+    const product_overflow_edges = [_]indexes_openapi.GraphPathEdge{
+        .{ .from = .{ .key = "a" }, .to = .{ .key = "b" }, .direction = .out, .type = "e", .weight = 1e200 },
+        .{ .from = .{ .key = "b" }, .to = .{ .key = "c" }, .direction = .out, .type = "e", .weight = 1e200 },
+    };
+    try validateRemoteCanonicalGraphPathScores(.{
+        .nodes = &.{ .{ .key = "a" }, .{ .key = "b" }, .{ .key = "c" } },
+        .edges = &product_overflow_edges,
+        .objective = .min_hops,
+        .weight_sum = 2e200,
+        .objective_value = 2,
+        .length = 2,
+    });
+
+    const overflow_edges = [_]indexes_openapi.GraphPathEdge{
+        .{ .from = .{ .key = "a" }, .to = .{ .key = "b" }, .direction = .out, .type = "e", .weight = std.math.floatMax(f64) },
+        .{ .from = .{ .key = "b" }, .to = .{ .key = "c" }, .direction = .out, .type = "e", .weight = std.math.floatMax(f64) },
+    };
+    try std.testing.expectError(error.InvalidRemoteResponse, validateRemoteCanonicalGraphPathScores(.{
+        .nodes = &.{ .{ .key = "a" }, .{ .key = "b" }, .{ .key = "c" } },
+        .edges = &overflow_edges,
+        .objective = .min_hops,
+        .weight_sum = 0,
+        .objective_value = 2,
+        .length = 2,
+    }));
+    try std.testing.expect(!graphPathScoreEql(0, std.math.inf(f64)));
 }
 
 fn appendJsonFieldName(
@@ -18322,7 +19533,7 @@ fn appendScanProjectedFields(
 }
 
 fn parseJsonTestBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
-    return try std.json.parseFromSlice(T, alloc, body, .{});
+    return try ant_json.parseFromSlice(T, alloc, body, .{});
 }
 
 test "scan ndjson keeps _id reserved for server document identity" {
@@ -18905,6 +20116,22 @@ test "fanout planner uses io cap and request shape" {
     try std.testing.expect(larger_query_plan.parallel);
     try std.testing.expectEqual(@as(usize, 6), larger_query_plan.width);
     try std.testing.expectEqual(FanoutPlanReason.parallel, larger_query_plan.reason);
+
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "walk",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph",
+            .start_nodes = .{ .keys = &.{} },
+        },
+    }};
+    const graph_query_plan = planQueryFanout(&io_impl, 6, .{
+        .graph_queries = &graph_queries,
+        .limit = 100,
+    });
+    try std.testing.expect(!graph_query_plan.parallel);
+    try std.testing.expectEqual(@as(usize, 1), graph_query_plan.width);
+    try std.testing.expectEqual(FanoutPlanReason.graph_memory_bound, graph_query_plan.reason);
 }
 
 test "provisioned table read source merges query results across ranges" {
@@ -20337,7 +21564,7 @@ test "provisioned table read source preflights every local group" {
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "graph_v1",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$embeddings_results", .limit = 1 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
                     .params = .{ .edge_types = &.{}, .max_depth = 1 },
                 },
             },
@@ -25612,7 +26839,7 @@ test "hosted table read source preflights every local group" {
                 .query = .{
                     .query_type = .neighbors,
                     .index_name = "graph_v1",
-                    .start_nodes = .{ .result_ref = .{ .ref = "$embeddings_results", .limit = 1 } },
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
                     .params = .{ .edge_types = &.{}, .max_depth = 1 },
                 },
             },
@@ -25774,9 +27001,189 @@ test "authenticated single-group graph queries require distributed coordination"
     };
 
     try std.testing.expect(requiresDistributedGraphCoordinator(1, req));
+
+    var unsupported = graph_queries;
+    unsupported[0].query.params.direction = .both;
+    req.graph_queries = &unsupported;
+    try std.testing.expect(requiresDistributedGraphCoordinator(1, req));
+
+    req.graph_queries = &graph_queries;
     req.graph_table_read_authorizer = null;
     try std.testing.expect(!requiresDistributedGraphCoordinator(1, req));
     try std.testing.expect(requiresDistributedGraphCoordinator(2, req));
+}
+
+test "graph coordinator base request avoids an implicit retrieval scan" {
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "links",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_v1",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .params = .{},
+        },
+    }};
+
+    const graph_only = graphCoordinatorBaseRequest(.{
+        .graph_queries = &graph_queries,
+        .graph_query_transport = .{
+            .dialect = .canonical,
+            .operations_json = "{\"links\":{}}",
+            .admitted_operations_ptr = @ptrCast(graph_queries[0..].ptr),
+            .admitted_operations_len = graph_queries.len,
+        },
+        .expand_strategy = .@"union",
+    });
+    try std.testing.expectEqual(@as(usize, 0), graph_only.graph_queries.len);
+    try std.testing.expect(graph_only.graph_query_transport == null);
+    try std.testing.expectEqual(@as(?graph_query_mod.ExpandStrategy, null), graph_only.expand_strategy);
+    try std.testing.expect(graph_only.query == .match_none);
+    try std.testing.expect(graph_only.full_text == null);
+
+    const retrieval = graphCoordinatorBaseRequest(.{
+        .full_text = .{ .match = .{ .field = "body", .text = "hello" } },
+        .graph_queries = &graph_queries,
+    });
+    try std.testing.expect(retrieval.full_text.? == .match);
+}
+
+test "unsupported graph query modes fail closed" {
+    const Authorizer = struct {
+        fn authorize(
+            _: ?*const anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+        ) !db_mod.types.GraphTableReadAuthorization {
+            return .{ .allowed = false };
+        }
+    };
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "links",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_v1",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .params = .{ .direction = .both },
+        },
+    }};
+    const req = db_mod.types.SearchRequest{ .graph_queries = &graph_queries };
+
+    try rejectUnsupportedGraphQueryMode(1, req);
+    // Incoming and bidirectional execution now use exact reverse-index probes,
+    // so they are safe through the distributed coordinator as well.
+    try rejectUnsupportedGraphQueryMode(2, req);
+    try rejectUnsupportedGraphQueryMode(1, .{
+        .graph_queries = &graph_queries,
+        .graph_table_read_authorizer = .{
+            .ctx = null,
+            .authorize_table = Authorizer.authorize,
+        },
+    });
+
+    const nondeduplicated_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "links",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_v1",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .params = .{ .deduplicate = false },
+        },
+    }};
+    try std.testing.expectError(error.GraphQueryModeUnsupported, rejectUnsupportedGraphQueryMode(2, .{
+        .graph_queries = &nondeduplicated_queries,
+    }));
+    try std.testing.expectError(error.GraphQueryModeUnsupported, rejectUnsupportedGraphQueryMode(1, .{
+        .graph_queries = &nondeduplicated_queries,
+        .graph_table_read_authorizer = .{
+            .ctx = null,
+            .authorize_table = Authorizer.authorize,
+        },
+    }));
+
+    const legacy_pattern = [_]graph_pattern_mod.PatternStep{
+        .{ .alias = "entity" },
+        .{ .alias = "memory", .edge = .{ .direction = .in } },
+    };
+    const legacy_pattern_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "mentions",
+        .query = .{
+            .query_type = .pattern,
+            .index_name = "graph_v1",
+            .start_nodes = .{ .keys = &.{"entity:ada"} },
+            .pattern = &legacy_pattern,
+        },
+    }};
+    try rejectUnsupportedGraphQueryMode(2, .{
+        .graph_queries = &legacy_pattern_queries,
+    });
+    try rejectUnsupportedGraphQueryMode(1, .{
+        .graph_queries = &legacy_pattern_queries,
+        .graph_table_read_authorizer = .{
+            .ctx = null,
+            .authorize_table = Authorizer.authorize,
+        },
+    });
+    try rejectUnsupportedGraphQueryMode(2, .{});
+}
+
+test "qualified graph endpoint requires coordination for a single source group" {
+    const starts = [_]graph_query_mod.NodeIdentity{.{ .key = "shared" }};
+    const targets = [_]graph_query_mod.NodeIdentity{.{ .key = "shared", .table = "companies" }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "path",
+        .query = .{
+            .query_type = .shortest_path,
+            .index_name = "graph_v1",
+            .start_nodes = .{ .identities = &starts },
+            .target_nodes = .{ .identities = &targets },
+        },
+    }};
+
+    try std.testing.expect(requiresDistributedGraphCoordinator(1, .{ .graph_queries = &graph_queries }));
+}
+
+test "graph result dependencies require coordination for a single source group" {
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{
+        .{
+            .name = "first",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "graph_v1",
+                .start_nodes = .{ .keys = &.{"doc:a"} },
+                .params = .{},
+            },
+        },
+        .{
+            .name = "second",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "graph_v1",
+                .start_nodes = .{ .result_ref = .{ .ref = "$graph_results.first", .limit = 10 } },
+                .params = .{},
+            },
+        },
+    };
+
+    try std.testing.expect(requiresDistributedGraphCoordinator(1, .{ .graph_queries = &graph_queries }));
+}
+
+test "conjunctive graph match requires coordination for a single source group" {
+    const nodes = [_]graph_pattern_mod.MatchNode{
+        .{ .alias = "a" },
+        .{ .alias = "b" },
+    };
+    const edges = [_]graph_pattern_mod.MatchEdge{.{ .from = "a", .to = "b" }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "match",
+        .query = .{
+            .query_type = .pattern,
+            .index_name = "graph_v1",
+            .start_nodes = .{ .keys = &.{} },
+            .match_pattern = .{ .nodes = &nodes, .edges = &edges },
+        },
+    }};
+
+    try std.testing.expect(requiresDistributedGraphCoordinator(1, .{ .graph_queries = &graph_queries }));
 }
 
 test "hosted cross-range graph query expands explicit local start keys" {

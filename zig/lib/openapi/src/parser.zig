@@ -194,6 +194,7 @@ pub const Parser = struct {
         // enum
         if (obj.get("enum")) |enum_val| {
             schema.enum_values = try self.parseStringArray(enum_val);
+            schema.enum_has_null = enumContainsNull(enum_val);
         }
 
         // properties
@@ -280,6 +281,15 @@ pub const Parser = struct {
         }
 
         return schema;
+    }
+
+    fn enumContainsNull(val: std.json.Value) bool {
+        const arr = switch (val) {
+            .array => |items| items,
+            else => return false,
+        };
+        for (arr.items) |item| if (item == .null) return true;
+        return false;
     }
 
     pub fn parseSchemaOrRef(self: *Parser, val: std.json.Value) ParseError!types.SchemaOrRef {
@@ -757,6 +767,21 @@ test "parse enum schema" {
     try std.testing.expectEqualStrings("string", schema.primaryType().?);
     try std.testing.expectEqual(@as(usize, 3), schema.enum_values.len);
     try std.testing.expectEqualStrings("text", schema.enum_values[0]);
+}
+
+test "parse null-only enum schema" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, "{\"enum\":[null]}", .{});
+    var p = Parser.init(arena);
+    const schema = try p.parseSchema(parsed.value);
+
+    try std.testing.expect(schema.enum_has_null);
+    try std.testing.expect(schema.isNullable());
+    try std.testing.expectEqual(@as(usize, 0), schema.enum_values.len);
 }
 
 test "parse 3.1 type array" {

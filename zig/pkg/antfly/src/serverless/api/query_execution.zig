@@ -134,8 +134,19 @@ pub fn parseSupportedJoinRequest(
 ) !?ParsedSupportedJoinRequest {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidQueryRequest;
-    const join_value = parsed.value.object.get("join") orelse return null;
+    return parseSupportedJoinRequestValueAlloc(alloc, body, parsed.value);
+}
+
+/// Parse a join from an admitted raw request envelope. The typed decode remains
+/// the schema authority, while routing callers can reuse the JSON tree they
+/// already own instead of reparsing the full body.
+pub fn parseSupportedJoinRequestValueAlloc(
+    alloc: Allocator,
+    body: []const u8,
+    root: std.json.Value,
+) !?ParsedSupportedJoinRequest {
+    if (root != .object) return error.InvalidQueryRequest;
+    const join_value = root.object.get("join") orelse return null;
     if (join_value == .null) return null;
     var parsed_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, alloc, body, .{
         .allocate = .alloc_always,
