@@ -41,12 +41,12 @@ pub const DistributedEntitySink = struct {
     /// Sync level for entity upserts. `write` (durable, not full-index) keeps
     /// promotion latency low; the entity shard indexes asynchronously.
     sync_level: db_mod.types.SyncLevel = .write,
-    /// When set, commit the entity upsert through the distributed-transaction
-    /// (2PC) path rather than a plain batch. Single participant today (the entity
-    /// table), so it behaves like a transactional batch; it is the reachable
-    /// foundation for the deferred multi-participant entity+edge coupling
-    /// (RESOLUTION.md option 1). Falls back to a batch when the write source does
-    /// not implement the transaction path.
+    /// When set, commit the entity upsert through the source's atomic batch
+    /// contract. First-party sources collapse a single participant to one
+    /// fenced shard batch and use 2PC only when operations span groups. This is
+    /// the reachable foundation for deferred multi-participant entity+edge
+    /// coupling (RESOLUTION.md option 1). Falls back to a plain table batch when
+    /// the write source does not implement an atomic commit path.
     transactional: bool = false,
 
     pub fn entitySink(self: *DistributedEntitySink) EntitySink {
@@ -100,7 +100,12 @@ pub const DistributedEntitySink = struct {
             try reqs.append(a, .{ .table_name = t, .transforms = table_ops.items[i].items });
         }
 
-        const outcome = try self.writes.commitTransaction(allocator, reqs.items, self.sync_level);
+        // Promotion is a stateless, idempotent batch. Use the batch commit
+        // contract so first-party sources can safely retry topology races and
+        // collapse a single-shard promotion to one fenced Raft batch. The
+        // implementation still uses 2PC when the entities span groups, so the
+        // document-level atomicity contract is unchanged.
+        const outcome = try self.writes.commitBatch(allocator, reqs.items, self.sync_level);
         if (outcome) |result| {
             switch (result) {
                 .committed => return,
@@ -130,10 +135,10 @@ pub const DistributedEntitySink = struct {
         const transform = db_mod.types.DocumentTransform{ .key = key, .operations = ops, .upsert = true };
 
         if (self.transactional) {
-            // Commit the merge through the 2PC path. A null outcome means the
-            // write source does not implement the transaction vtable, so fall
-            // back to a plain batch.
-            const outcome = try self.writes.commitTransaction(allocator, &.{.{ .table_name = table, .transforms = &.{transform} }}, self.sync_level);
+            // Commit the merge through the atomic batch path. A null outcome
+            // means the write source has no atomic commit callback, so fall
+            // back to a plain table batch.
+            const outcome = try self.writes.commitBatch(allocator, &.{.{ .table_name = table, .transforms = &.{transform} }}, self.sync_level);
             if (outcome) |result| {
                 switch (result) {
                     .committed => return,
@@ -206,7 +211,10 @@ const FakeTableWriteSource = struct {
     transforms_json: std.ArrayListUnmanaged([]u8) = .empty,
     /// Set so the source advertises the transaction vtable method.
     support_transactions: bool = false,
+    /// Set so the source advertises the optimized stateless batch commit.
+    support_commit_batch: bool = false,
     commit_calls: usize = 0,
+    commit_batch_calls: usize = 0,
 
     fn deinit(self: *FakeTableWriteSource) void {
         for (self.keys.items) |k| self.alloc.free(k);
@@ -216,11 +224,21 @@ const FakeTableWriteSource = struct {
     }
 
     fn source(self: *FakeTableWriteSource) table_writes.TableWriteSource {
-        return .{ .ptr = self, .vtable = if (self.support_transactions) &txn_vtable else &vtable };
+        return .{ .ptr = self, .vtable = if (self.support_commit_batch)
+            &batch_commit_vtable
+        else if (self.support_transactions)
+            &txn_vtable
+        else
+            &vtable };
     }
 
     const vtable = table_writes.TableWriteSource.VTable{ .batch = batch };
     const txn_vtable = table_writes.TableWriteSource.VTable{ .batch = batch, .commit_transaction = commitTransaction };
+    const batch_commit_vtable = table_writes.TableWriteSource.VTable{
+        .batch = batch,
+        .commit_transaction = commitTransaction,
+        .commit_batch = commitBatch,
+    };
 
     fn commitTransaction(
         ptr: *anyopaque,
@@ -231,6 +249,22 @@ const FakeTableWriteSource = struct {
         _ = sync_level;
         const self: *FakeTableWriteSource = @ptrCast(@alignCast(ptr));
         self.commit_calls += 1;
+        for (tables) |t| {
+            if (!std.mem.eql(u8, t.table_name, self.table)) return null;
+            try recordTransforms(self, alloc, t.transforms);
+        }
+        return .{ .committed = .{ .participant_count = tables.len } };
+    }
+
+    fn commitBatch(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+    ) anyerror!?distributed_txn.CommitOutcome {
+        _ = sync_level;
+        const self: *FakeTableWriteSource = @ptrCast(@alignCast(ptr));
+        self.commit_batch_calls += 1;
         for (tables) |t| {
             if (!std.mem.eql(u8, t.table_name, self.table)) return null;
             try recordTransforms(self, alloc, t.transforms);
@@ -358,7 +392,42 @@ test "DistributedEntitySink skips a malformed document" {
     try testing.expectEqual(@as(usize, 0), fake.keys.items.len);
 }
 
-test "DistributedEntitySink transactional mode commits through the 2PC path" {
+test "DistributedEntitySink transactional promotion batch prefers stateless batch commit" {
+    const alloc = testing.allocator;
+    var fake = FakeTableWriteSource{
+        .alloc = alloc,
+        .table = "entities",
+        .support_transactions = true,
+        .support_commit_batch = true,
+    };
+    defer fake.deinit();
+
+    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .transactional = true };
+    const sink = sink_impl.entitySink();
+
+    try sink.upsertBatch(alloc, &.{
+        .{
+            .table = "entities",
+            .key = "person/ada_lovelace",
+            .doc_json = "{\"entity_type\":\"person\",\"canonical_name\":\"Ada Lovelace\",\"aliases\":[\"Ada Lovelace\"]}",
+        },
+        .{
+            .table = "entities",
+            .key = "org/antfly",
+            .doc_json = "{\"entity_type\":\"org\",\"canonical_name\":\"Antfly\",\"aliases\":[\"Antfly\"]}",
+        },
+    });
+
+    // Routed through the stateless batch contract rather than forcing 2PC.
+    try testing.expectEqual(@as(usize, 0), fake.commit_calls);
+    try testing.expectEqual(@as(usize, 1), fake.commit_batch_calls);
+    try testing.expectEqual(@as(usize, 2), fake.keys.items.len);
+    try testing.expectEqualStrings("person/ada_lovelace", fake.keys.items[0]);
+    try testing.expectEqualStrings("org/antfly", fake.keys.items[1]);
+    try testing.expect(std.mem.indexOf(u8, fake.transforms_json.items[0], "add_to_set aliases=\"Ada Lovelace\"") != null);
+}
+
+test "DistributedEntitySink batch commit remains compatible with transaction-only sources" {
     const alloc = testing.allocator;
     var fake = FakeTableWriteSource{ .alloc = alloc, .table = "entities", .support_transactions = true };
     defer fake.deinit();
@@ -370,11 +439,11 @@ test "DistributedEntitySink transactional mode commits through the 2PC path" {
         \\{"entity_type":"person","canonical_name":"Ada Lovelace","aliases":["Ada Lovelace"]}
     );
 
-    // Routed through commitTransaction, not batch, and carried the merge ops.
+    // TableWriteSource.commitBatch falls back to the transaction callback for
+    // older/custom sources that have not implemented the optimized contract.
     try testing.expectEqual(@as(usize, 1), fake.commit_calls);
+    try testing.expectEqual(@as(usize, 0), fake.commit_batch_calls);
     try testing.expectEqual(@as(usize, 1), fake.keys.items.len);
-    try testing.expectEqualStrings("person/ada_lovelace", fake.keys.items[0]);
-    try testing.expect(std.mem.indexOf(u8, fake.transforms_json.items[0], "add_to_set aliases=\"Ada Lovelace\"") != null);
 }
 
 test "DistributedEntitySink transactional mode falls back to batch when unsupported" {
