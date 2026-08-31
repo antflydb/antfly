@@ -328,6 +328,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .reconcile_table_group_local = reconcileTableGroupLocal,
                 .reconcile_table_group_local_transient = reconcileTableGroupLocalTransient,
                 .retire_table_group_local = retireTableGroupLocal,
+                .reconcile_table_group_local_transient_observed = reconcileTableGroupLocalTransientObserved,
+                .local_runtime_status_group_local = localRuntimeStatusGroupLocal,
             },
         };
     }
@@ -581,8 +583,45 @@ pub const ProvisionedKernelOwnerSource = struct {
         group_id: u64,
         table_name: []const u8,
     ) !?void {
-        try retireGroupForPublication(ptr, group_id, table_name);
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.retireGroupAndWait(group_id, table_name);
         return {};
+    }
+
+    /// Prevent new admissions to every resident generation for a dropped
+    /// group, then wait for already-admitted work to release its leases before
+    /// the caller moves or deletes the physical root.
+    fn retireGroupAndWait(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) !void {
+        var wait_io_impl = std.Io.Threaded.init(self.alloc, .{});
+        defer wait_io_impl.deinit();
+        const wait_io = wait_io_impl.io();
+        const deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+        while (true) {
+            var active = false;
+            {
+                lock(&self.mutex);
+                defer self.mutex.unlock();
+                var i = self.entries.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const entry = self.entries.items[i];
+                    if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+                    entry.retired = true;
+                    if (entry.active_users == 0) {
+                        self.destroyEntryAtIndexLocked(i);
+                    } else {
+                        active = true;
+                    }
+                }
+            }
+            if (!active) return;
+            if (platform_time.monotonicNs() >= deadline_ns) return error.StorageBusy;
+            try wait_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+        }
     }
 
     fn prepareSnapshot(
@@ -1048,6 +1087,96 @@ pub const ProvisionedKernelOwnerSource = struct {
             false,
         );
         return localStructuralReconcileResult(result);
+    }
+
+    fn reconcileTableGroupLocalTransientObserved(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+        advance_index_repair: bool,
+    ) !?table_write_source.LocalStructuralReconcileObservation {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
+        defer descriptor.deinit(self.alloc);
+        var lease = try self.acquireDescriptorExclusive(
+            group_id,
+            table_name,
+            descriptor.path,
+            descriptor.view(),
+        );
+        const retire_after = lease.created;
+        var lease_active = true;
+        errdefer if (retire_after) retireGroupForPublication(self, group_id, table_name) catch {};
+        defer if (lease_active) lease.deinit();
+
+        const result = try lease.owner().reconcile(
+            table_name,
+            descriptor.schema_json,
+            descriptor.indexes_json,
+            target_index_name,
+            advance_index_repair,
+        );
+        var response = try lease.owner().runtimeStatusJson(table_name);
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(
+            runtime_status.LocalTableRuntimeStatus,
+            alloc,
+            response.bytes(),
+            .{},
+        );
+        defer parsed.deinit();
+        var observed = try parsed.value.clone(alloc);
+        errdefer observed.deinit(alloc);
+        observed.group_id = group_id;
+        observed.metadata = .{
+            .updated_at_ns = platform_time.monotonicNs(),
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .lsm_root_generation = lease.entry.generation,
+        };
+        const retain_for_background_work = runtimeStatusNeedsResidentOwner(observed);
+
+        lease.deinit();
+        lease_active = false;
+        // A transient startup inspection normally gives the cold owner back
+        // immediately. Managed enrichment and index catch-up are different:
+        // their retry scheduler lives inside that owner, so retiring it here
+        // strands durable work until an unrelated foreground request happens
+        // to reopen the group. Keep only owners with observed background debt;
+        // idle groups preserve the bounded transient-open contract.
+        if (retire_after and !retain_for_background_work) retireGroupForPublication(self, group_id, table_name) catch {};
+        return .{
+            .result = localStructuralReconcileResult(result),
+            .runtime_status = observed,
+        };
+    }
+
+    fn runtimeStatusNeedsResidentOwner(status: runtime_status.LocalTableRuntimeStatus) bool {
+        const enrichment = status.stats.enrichment;
+        if (enrichment.retrying or
+            enrichment.target_sequence > enrichment.applied_sequence or
+            enrichment.active_embed_batch_items != 0)
+        {
+            return true;
+        }
+        if (status.stats.async_indexing.startup.active or
+            status.stats.async_indexing.dense_catch_up.active or
+            status.stats.async_indexing.bulk_coalescing.active_session)
+        {
+            return true;
+        }
+        for (status.stats.indexes) |index| {
+            if (index.backfill_active or
+                index.catch_up_active or
+                index.replay_catch_up_required or
+                index.replay_target_sequence > index.replay_applied_sequence)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn preflightWriteAdmissionGroupLocal(
@@ -1529,6 +1658,36 @@ pub const ProvisionedKernelOwnerSource = struct {
         descriptor: descriptor_contract.Descriptor,
     ) !Lease {
         return try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, false);
+    }
+
+    /// Lease only an already-resident owner whose complete catalog descriptor
+    /// still matches. Observability uses this path so a cold status read never
+    /// opens storage or discards query-warmed physical coverage.
+    fn acquireIfPresent(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?Lease {
+        var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
+        defer descriptor.deinit(self.alloc);
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.retired or
+                entry.generation != descriptor.generation or
+                !entry.identity.eql(descriptor.identity) or
+                !std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
+                !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json))
+            {
+                return null;
+            }
+            if (!tryReserveEntryLeaseLocked(entry, false))
+                return error.StorageReadTemporarilyUnavailable;
+            _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
+            return .{ .source = self, .entry = entry, .created = false, .exclusive = false };
+        }
+        return null;
     }
 
     fn acquireDescriptorExclusive(
@@ -2744,36 +2903,64 @@ pub const ProvisionedKernelOwnerSource = struct {
             alloc.free(items);
         }
         for (group_ids) |group_id| {
-            const retire_after = status: {
-                var lease = try self.acquire(group_id, table_name);
-                defer lease.deinit();
-                var response = try lease.owner().runtimeStatusJson(table_name);
-                defer response.deinit();
-                var parsed = try std.json.parseFromSlice(
-                    runtime_status.LocalTableRuntimeStatus,
-                    alloc,
-                    response.bytes(),
-                    .{},
-                );
-                defer parsed.deinit();
-                items[initialized] = try parsed.value.clone(alloc);
-                items[initialized].group_id = group_id;
-                items[initialized].metadata = .{
-                    .updated_at_ns = platform_time.monotonicNs(),
-                    .source = .live_writer_publish,
-                    .freshness = .fresh,
-                    .lsm_root_generation = lease.entry.generation,
-                };
-                break :status lease.created;
+            // Runtime status is observational. The control plane owns the
+            // durable published status cache; never map a cold physical owner
+            // merely to synthesize a fresh-looking zero-value placeholder.
+            var lease = (try self.acquireIfPresent(group_id, table_name)) orelse {
+                for (items[0..initialized]) |*item| item.deinit(alloc);
+                alloc.free(items);
+                return null;
             };
-            // Status collection is observational. Keep a foreground owner,
-            // but do not pin a writer merely because the status cache was
-            // cold. A concurrent adopter makes retirement report StorageBusy
-            // and legitimately retains the owner.
-            if (retire_after) retireGroupForPublication(self, group_id, table_name) catch {};
+            defer lease.deinit();
+            var response = try lease.owner().runtimeStatusJson(table_name);
+            defer response.deinit();
+            var parsed = try std.json.parseFromSlice(
+                runtime_status.LocalTableRuntimeStatus,
+                alloc,
+                response.bytes(),
+                .{},
+            );
+            defer parsed.deinit();
+            items[initialized] = try parsed.value.clone(alloc);
+            items[initialized].group_id = group_id;
+            items[initialized].metadata = .{
+                .updated_at_ns = platform_time.monotonicNs(),
+                .source = .live_writer_publish,
+                .freshness = .fresh,
+                .lsm_root_generation = lease.entry.generation,
+            };
             initialized += 1;
         }
         return .{ .items = items };
+    }
+
+    fn localRuntimeStatusGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?runtime_status.LocalTableRuntimeStatus {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = (try self.acquireIfPresent(group_id, table_name)) orelse return null;
+        defer lease.deinit();
+        var response = try lease.owner().runtimeStatusJson(table_name);
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(
+            runtime_status.LocalTableRuntimeStatus,
+            alloc,
+            response.bytes(),
+            .{},
+        );
+        defer parsed.deinit();
+        var observed = try parsed.value.clone(alloc);
+        observed.group_id = group_id;
+        observed.metadata = .{
+            .updated_at_ns = platform_time.monotonicNs(),
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .lsm_root_generation = lease.entry.generation,
+        };
+        return observed;
     }
 
     const ObservationCancellationDispatch = struct {
@@ -2814,29 +3001,29 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
 
         for (group_ids) |group_id| {
-            var retire_after = false;
-            {
-                var lease = try self.acquire(group_id, table_name);
-                defer lease.deinit();
-                retire_after = lease.created;
-                var response = try lease.owner().observedDynamicFieldCapabilitySetsJson(
-                    table_name,
-                    request_json,
-                    observation.execution_deadline_ns,
-                    if (observation.cancellation != null) @ptrCast(&cancellation) else null,
-                    if (observation.cancellation != null) ObservationCancellationDispatch.requested else null,
-                );
-                defer response.deinit();
-                var parsed = try std.json.parseFromSlice(
-                    []table_reads.ObservedDynamicFieldCapabilitySet,
-                    alloc,
-                    response.bytes(),
-                    .{},
-                );
-                defer parsed.deinit();
-                for (parsed.value) |set| try table_reads.mergeObservedDynamicFieldCapabilitySet(alloc, &merged, set);
-            }
-            if (retire_after) retireGroupForPublication(self, group_id, table_name) catch {};
+            // Observation is best effort and must not map a cold text index.
+            // Query admission owns the warm-and-retry protocol and installs a
+            // resident owner whose validated coverage remains visible to the
+            // subsequent status read.
+            var lease = (try self.acquireIfPresent(group_id, table_name)) orelse
+                return error.StorageReadTemporarilyUnavailable;
+            defer lease.deinit();
+            var response = try lease.owner().observedDynamicFieldCapabilitySetsJson(
+                table_name,
+                request_json,
+                observation.execution_deadline_ns,
+                if (observation.cancellation != null) @ptrCast(&cancellation) else null,
+                if (observation.cancellation != null) ObservationCancellationDispatch.requested else null,
+            );
+            defer response.deinit();
+            var parsed = try std.json.parseFromSlice(
+                []table_reads.ObservedDynamicFieldCapabilitySet,
+                alloc,
+                response.bytes(),
+                .{},
+            );
+            defer parsed.deinit();
+            for (parsed.value) |set| try table_reads.mergeObservedDynamicFieldCapabilitySet(alloc, &merged, set);
         }
         return try merged.toOwnedSlice(alloc);
     }

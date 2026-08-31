@@ -52,6 +52,19 @@ pub const LocalStructuralReconcileResult = struct {
     next_retry_at_ms: u64 = 0,
 };
 
+/// One exact structural observation captured before a transient compiled
+/// owner is retired. The control plane publishes `runtime_status` under the
+/// same table epoch that admitted the reconcile operation.
+pub const LocalStructuralReconcileObservation = struct {
+    result: LocalStructuralReconcileResult,
+    runtime_status: ?runtime_status.LocalTableRuntimeStatus = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.runtime_status) |*status| status.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const TableWriteSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -487,6 +500,20 @@ pub const TableWriteSource = struct {
             req: db_mod.types.TransactionIntentRequest,
             context: distributed_txn.PreDecisionContext,
         ) anyerror!?void = null,
+        reconcile_table_group_local_transient_observed: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            target_index_name: ?[]const u8,
+            advance_index_repair: bool,
+        ) anyerror!?LocalStructuralReconcileObservation = null,
+        local_runtime_status_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+        ) anyerror!?runtime_status.LocalTableRuntimeStatus = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -1107,6 +1134,21 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("local_runtime_statuses", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
     }
 
+    pub fn localRuntimeStatusGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?runtime_status.LocalTableRuntimeStatus {
+        const fn_ptr = self.vtable.local_runtime_status_group_local orelse return null;
+        return try BoundaryAbi.call("local_runtime_status_group_local", self.boundary_dispatch, fn_ptr, .{
+            self.ptr,
+            alloc,
+            group_id,
+            table_name,
+        });
+    }
+
     pub fn textMemoryAttributionStatsBestEffort(
         self: TableWriteSource,
     ) db_mod.TextMemoryAttributionStats {
@@ -1180,6 +1222,33 @@ pub const TableWriteSource = struct {
                 advance_index_repair,
             );
         return try BoundaryAbi.call("reconcile_table_group_local_transient", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, target_index_name, advance_index_repair });
+    }
+
+    pub fn reconcileTableGroupLocalTransientObserved(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+        advance_index_repair: bool,
+    ) !?LocalStructuralReconcileObservation {
+        const fn_ptr = self.vtable.reconcile_table_group_local_transient_observed orelse {
+            const result = (try self.reconcileTableGroupLocalTransient(
+                group_id,
+                table_name,
+                target_index_name,
+                advance_index_repair,
+            )) orelse return null;
+            return .{ .result = result };
+        };
+        return try BoundaryAbi.call("reconcile_table_group_local_transient_observed", self.boundary_dispatch, fn_ptr, .{
+            self.ptr,
+            alloc,
+            group_id,
+            table_name,
+            target_index_name,
+            advance_index_repair,
+        });
     }
 
     pub fn retireTableGroupLocal(

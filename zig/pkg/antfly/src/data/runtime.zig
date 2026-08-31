@@ -8576,7 +8576,14 @@ pub const DataServer = struct {
                         // visibility can complete later inside the compiled
                         // owner, so publish a second status-only wake at the
                         // exact synchronization boundary observed by the API.
-                        self.write_source.publishStorageOwnerRuntimeStatusChange(table_name),
+                        {
+                            self.write_source.publishStorageOwnerRuntimeStatusChange(alloc, group_id, table_name);
+                            // A full visibility response is also a public
+                            // status barrier. Report the just-published group
+                            // before returning so metadata cannot serve the
+                            // pre-write snapshot as fresh and complete.
+                            self.reportStoreStatusAfterStructuralChange(table_name);
+                        },
                         .propose, .write => {},
                     }
                 } else {
@@ -23629,13 +23636,12 @@ test "data runtime provisioned cache warmup populates runtime status without pin
         try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
         const owner_cache = owner_source.cacheStats();
         try std.testing.expectEqual(@as(u64, 0), owner_cache.hit_count);
-        // A control-only consumer observes three deliberately transient
-        // phases through the compiled owner: open validation, authoritative
-        // status, and startup reconciliation. The earlier hybrid experiment
-        // counted only the first in this cache because the other two still
-        // opened DBs inside the distributed unit.
+        // A control-only consumer performs two deliberately transient owner
+        // opens. Startup reconciliation reuses its resident owner to replace
+        // the synthetic status placeholder with an authoritative snapshot.
+        // Once published, subsequent status reads do not reopen a cold owner.
         try std.testing.expectEqual(
-            @as(u64, if (control_only_storage_sources) 3 else 1),
+            @as(u64, if (control_only_storage_sources) 2 else 1),
             owner_cache.miss_count,
         );
     } else {
@@ -23660,13 +23666,26 @@ test "data runtime provisioned cache warmup populates runtime status without pin
     defer snapshot_statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), snapshot_statuses.items.len);
     try std.testing.expectEqual(@as(u64, 77), snapshot_statuses.items[0].group_id);
-    // Warmup performs synchronous startup reconciliation in tests. Both the
-    // physical and compiled-owner paths publish the authoritative observation
-    // made through that transient writer, then close the writer before this
-    // assertion. The source describes how the snapshot was produced; it does
-    // not mean that a writer remains pinned in either cache.
-    try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, snapshot_statuses.items[0].metadata.source);
-    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, snapshot_statuses.items[0].metadata.freshness);
+    // A transient startup reconciliation may publish before it retires its
+    // owner. If it does not, the catalog placeholder remains conservative;
+    // either state is valid while no foreground owner is resident. A later
+    // mutation or query publishes the authoritative snapshot.
+    if (comptime control_only_storage_sources) {
+        switch (snapshot_statuses.items[0].metadata.source) {
+            .live_writer_publish => try std.testing.expectEqual(
+                runtime_status.RuntimeStatusFreshness.fresh,
+                snapshot_statuses.items[0].metadata.freshness,
+            ),
+            .synthetic_config => try std.testing.expectEqual(
+                runtime_status.RuntimeStatusFreshness.stale,
+                snapshot_statuses.items[0].metadata.freshness,
+            ),
+            else => return error.TestUnexpectedRuntimeStatusSource,
+        }
+    } else {
+        try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, snapshot_statuses.items[0].metadata.source);
+        try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, snapshot_statuses.items[0].metadata.freshness);
+    }
     try std.testing.expectEqual(@as(u64, 0), snapshot_statuses.items[0].stats.doc_count);
 
     var warmed_lookup = (try server.read_source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
@@ -23678,7 +23697,7 @@ test "data runtime provisioned cache warmup populates runtime status without pin
         const owner_cache = owner_source.cacheStats();
         try std.testing.expectEqual(@as(u64, 0), owner_cache.hit_count);
         try std.testing.expectEqual(
-            @as(u64, if (control_only_storage_sources) 4 else 2),
+            @as(u64, if (control_only_storage_sources) 3 else 2),
             owner_cache.miss_count,
         );
     } else {
@@ -23696,7 +23715,7 @@ test "data runtime provisioned cache warmup populates runtime status without pin
         const owner_cache = server.kernel_owner_source.?.cacheStats();
         try std.testing.expectEqual(@as(u64, 1), owner_cache.hit_count);
         try std.testing.expectEqual(
-            @as(u64, if (control_only_storage_sources) 4 else 2),
+            @as(u64, if (control_only_storage_sources) 3 else 2),
             owner_cache.miss_count,
         );
     } else {
@@ -23722,6 +23741,40 @@ test "data runtime provisioned cache warmup populates runtime status without pin
     } else {
         try std.testing.expectEqual(pre_live_lookup_read_cache.hit_count, post_live_lookup_read_cache.hit_count);
         try std.testing.expectEqual(pre_live_lookup_read_cache.miss_count, post_live_lookup_read_cache.miss_count);
+    }
+
+    if (comptime control_only_storage_sources) {
+        server.provisioned_storage.runtime_status_cache.invalidateTable("docs");
+        const synthetic_token = try server.provisioned_storage.runtime_status_cache.capturePublicationToken("docs");
+        try std.testing.expectEqual(
+            runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
+            try server.provisioned_storage.runtime_status_cache.publishGroup(synthetic_token, "docs", .{
+                .group_id = 77,
+                .metadata = .{
+                    .source = .synthetic_config,
+                    .freshness = .stale,
+                },
+                .stats = .{},
+            }),
+        );
+
+        var promoted = (try server.write_source.source().localRuntimeStatuses(alloc, "docs")).?;
+        defer promoted.deinit(alloc);
+        try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, promoted.items[0].metadata.source);
+        // This fixture has no configured index, so indexed `doc_count` is
+        // correctly zero. The live owner still proves that both primary
+        // documents replaced the synthetic empty observation.
+        try std.testing.expectEqual(@as(u64, 0), promoted.items[0].stats.doc_count);
+        try std.testing.expectEqual(@as(u64, 2), promoted.items[0].stats.source_doc_count);
+        try std.testing.expectEqual(@as(u64, 2), promoted.items[0].stats.doc_identity.live_ordinals);
+
+        var published = (try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")).?;
+        defer published.deinit(alloc);
+        try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, published.items[0].metadata.source);
+        try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, published.items[0].metadata.freshness);
+        try std.testing.expectEqual(@as(u64, 0), published.items[0].stats.doc_count);
+        try std.testing.expectEqual(@as(u64, 2), published.items[0].stats.source_doc_count);
+        try std.testing.expectEqual(@as(u64, 2), published.items[0].stats.doc_identity.live_ordinals);
     }
 }
 

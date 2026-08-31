@@ -5230,6 +5230,7 @@ pub fn storageOwnerScanNdjson(
         .fields = parsed.value.fields,
         .include_all_fields = parsed.value.include_all_fields,
         .filter_query_json = parsed.value.filter_query_json,
+        .include_content_hashes = parsed.value.include_content_hashes,
     };
     handle.prepareScanRequest(parsed.value.from_key, parsed.value.to_key, opts) catch |err| return storageOwnerStatusFromError(err);
     var result = handle.db.scan(handle.alloc, parsed.value.from_key, parsed.value.to_key, opts) catch |err| return storageOwnerStatusFromError(err);

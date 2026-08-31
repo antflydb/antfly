@@ -7036,6 +7036,7 @@ pub fn executeStorageKernelGraphHydrate(
 ) !distributed_graph.GraphHydrateResponse {
     if (req.topology_epoch != 0) return error.InvalidArgument;
     try validateGraphHydrateResolvedDocFilterForDb(req, db);
+    try validateGraphHydrateIncomingIndexIdentity(req, db);
     const search_req = graphHydrateSearchRequest(req);
     try checkQueryDeadline(search_req);
     const hits = if (req.include_hits)
@@ -7053,7 +7054,11 @@ pub fn executeStorageKernelGraphHydrate(
         @constCast((&[_]bool{})[0..]);
     errdefer if (has_incoming.len > 0) alloc.free(has_incoming);
     try checkQueryDeadline(search_req);
-    return .{ .hits = hits, .has_incoming = has_incoming };
+    return .{
+        .hits = hits,
+        .has_incoming = has_incoming,
+        .incoming_index_identity = req.incoming_index_identity,
+    };
 }
 
 pub fn executeStorageKernelGraphEdges(
@@ -7114,17 +7119,7 @@ fn graphHydrateOnPreparedDb(
     req: distributed_graph.GraphHydrateRequest,
     search_req: db_mod.types.SearchRequest,
 ) !distributed_graph.GraphHydrateResponse {
-    if (req.incoming_index_name.len > 0) {
-        if (!req.incoming_index_identity.valid()) return error.IndexGenerationMismatch;
-        const actual = db.core.index_manager.coverageIdentityForIndex(req.incoming_index_name) orelse
-            return error.IndexGenerationMismatch;
-        if (actual.generation != req.incoming_index_identity.incarnation or
-            actual.config_fingerprint == null or
-            actual.config_fingerprint.? != req.incoming_index_identity.config_hash)
-        {
-            return error.IndexGenerationMismatch;
-        }
-    }
+    try validateGraphHydrateIncomingIndexIdentity(req, db);
     const hits = if (req.include_hits)
         try db.graphHydrateKeysForInternalRead(alloc, search_req, req.keys)
     else
@@ -7145,6 +7140,33 @@ fn graphHydrateOnPreparedDb(
             @constCast((&[_]bool{})[0..]),
         .incoming_index_identity = req.incoming_index_identity,
     };
+}
+
+fn validateGraphHydrateIncomingIndexIdentity(
+    req: distributed_graph.GraphHydrateRequest,
+    db: *db_mod.DB,
+) !void {
+    if (req.incoming_index_name.len > 0) {
+        if (!req.incoming_index_identity.valid()) return error.IndexGenerationMismatch;
+        const actual = db.core.index_manager.coverageIdentityForIndex(req.incoming_index_name) orelse
+            return error.IndexGenerationMismatch;
+        if (actual.generation != req.incoming_index_identity.incarnation or
+            actual.config_fingerprint == null or
+            actual.config_fingerprint.? != req.incoming_index_identity.config_hash)
+        {
+            std.log.warn(
+                "graph incoming index identity mismatch index={s} expected_incarnation={d} actual_generation={d} expected_config_hash={d} actual_config_hash={?d}",
+                .{
+                    req.incoming_index_name,
+                    req.incoming_index_identity.incarnation,
+                    actual.generation,
+                    req.incoming_index_identity.config_hash,
+                    actual.config_fingerprint,
+                },
+            );
+            return error.IndexGenerationMismatch;
+        }
+    }
 }
 
 fn canonicalGroupedMatchExpansionPlanAlloc(
@@ -17455,6 +17477,7 @@ pub const StorageKernelScanWireRequest = struct {
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     filter_query_json: []const u8 = "",
+    include_content_hashes: bool = false,
 };
 
 pub fn encodeStorageKernelScanRequest(
@@ -17473,7 +17496,21 @@ pub fn encodeStorageKernelScanRequest(
         .fields = opts.fields,
         .include_all_fields = opts.include_all_fields,
         .filter_query_json = opts.filter_query_json,
+        .include_content_hashes = opts.include_content_hashes,
     }, .{});
+}
+
+test "storage kernel scan wire preserves internal content hash projection" {
+    const encoded = try encodeStorageKernelScanRequest(std.testing.allocator, "doc:a", "doc:z", .{
+        .include_documents = false,
+        .include_content_hashes = true,
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(StorageKernelScanWireRequest, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.include_documents);
+    try std.testing.expect(parsed.value.include_content_hashes);
 }
 
 pub fn encodeStorageKernelScanNdjson(
@@ -27043,7 +27080,7 @@ test "hosted cross-range graph query expands explicit local start keys" {
     defer alloc.free(right_path);
 
     const graph_indexes_json =
-        \\{"relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}]}}
+        \\{"relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}],"_index_incarnation":42}}
     ;
 
     {
@@ -27051,7 +27088,12 @@ test "hosted cross-range graph query expands explicit local start keys" {
             .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
         });
         defer left_db.close();
-        try left_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
+        try left_db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}",
+            .coverage_generation = 42,
+        });
         try left_db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"left\"}" }},
             .graph_writes = &.{.{
@@ -27069,7 +27111,12 @@ test "hosted cross-range graph query expands explicit local start keys" {
             .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 },
         });
         defer right_db.close();
-        try right_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
+        try right_db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}",
+            .coverage_generation = 42,
+        });
         try right_db.batch(.{
             .writes = &.{.{ .key = "zdoc:a", .value = "{\"title\":\"right\"}" }},
             .graph_writes = &.{.{

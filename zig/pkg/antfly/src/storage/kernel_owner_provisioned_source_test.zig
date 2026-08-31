@@ -18,6 +18,7 @@ const kernel_owner_source = @import("../api/kernel_owner_source.zig");
 const backup_contract = @import("../api/backup_contract.zig");
 const db_mod = @import("db/mod.zig");
 const distributed_graph = @import("../api/distributed_graph.zig");
+const indexes_api = @import("../api/indexes.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -540,9 +541,24 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expectEqualStrings("doc:a", expand_response.expansions[0].frontier_key);
     try std.testing.expect(expand_response.expansions[0].graph_result.nodes.len > 0);
 
+    var graph_lookup = (try indexes_api.lookupSingleIndexConfig(
+        alloc,
+        Catalog.indexes_json,
+        "relations_graph",
+    )).?;
+    defer graph_lookup.deinit();
+    const graph_identity = (try indexes_api.indexRuntimeIdentity(
+        alloc,
+        "relations_graph",
+        graph_lookup.config,
+    )).?;
     var hydrate_req = distributed_graph.GraphHydrateRequest{
         .keys = try alloc.alloc([]u8, 2),
         .incoming_index_name = try alloc.dupe(u8, "relations_graph"),
+        .incoming_index_identity = .{
+            .incarnation = graph_identity.incarnation,
+            .config_hash = graph_identity.config_hash,
+        },
         .incoming_index_name_owned = true,
     };
     hydrate_req.keys[0] = try alloc.dupe(u8, "doc:a");
@@ -558,6 +574,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     defer hydrate_response.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), hydrate_response.hits.len);
     try std.testing.expectEqualSlices(bool, &.{ false, true }, hydrate_response.has_incoming);
+    try std.testing.expect(hydrate_response.incoming_index_identity.eql(hydrate_req.incoming_index_identity));
 
     const graph_path = db_mod.algebraic.ir.graphEdgeAccessPath("relations_graph");
     var edges_req = distributed_graph.GraphEdgesRequest{
@@ -742,6 +759,13 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
 
     const lease_count_before_reopen = lease_capture.count;
     try std.testing.expectEqual(@as(usize, 1), owner_source.retireTable("articles"));
+    try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
+    try std.testing.expect((try read_source.source().localRuntimeStatuses(alloc, "articles")) == null);
+    try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
+    try std.testing.expectError(
+        error.StorageReadTemporarilyUnavailable,
+        read_source.source().observedDynamicFieldCapabilitySets(alloc, "articles", .{}),
+    );
     try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
     var reopened_lookup = (try read_source.source().lookup(
         alloc,

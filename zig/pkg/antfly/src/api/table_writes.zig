@@ -10666,12 +10666,34 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            const result = (try local_source.reconcileTableGroupLocalTransient(
+            const publication_token = if (self.runtime_status_cache) |snapshot_cache|
+                try snapshot_cache.capturePublicationToken(table_name)
+            else
+                null;
+            var observation = (try local_source.reconcileTableGroupLocalTransientObserved(
+                alloc,
                 group_id,
                 table_name,
                 metadata.target_index_name,
                 metadata.advance_index_repairs,
             )) orelse return error.StorageKernelOwnerUnavailable;
+            defer observation.deinit(alloc);
+            if (publication_token) |token| {
+                if (observation.runtime_status) |status| {
+                    publishRuntimeStatusGroupAfterObservation(
+                        self.runtime_status_cache.?,
+                        token,
+                        table_name,
+                        status,
+                    ) catch |err| {
+                        std.log.warn(
+                            "compiled owner reconcile status publication failed table={s} group_id={d} err={s}",
+                            .{ table_name, group_id, @errorName(err) },
+                        );
+                    };
+                }
+            }
+            const result = observation.result;
             const progressed = result.indexes_added != 0 or
                 result.indexes_removed != 0 or
                 result.repair_attempted != 0 or
@@ -11964,7 +11986,15 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatus {
         if (comptime control_only_storage_sources) {
             const local_source = self.local_write_source orelse return null;
-            var statuses = (try local_source.localRuntimeStatuses(alloc, table_name)) orelse return null;
+            var statuses = (local_source.localRuntimeStatuses(alloc, table_name) catch |err| switch (err) {
+                // This probe is used by observational control loops such as
+                // schema-migration finalization. A resident owner can be
+                // momentarily retiring or publishing its generation; absence
+                // is the truthful best-effort result and must not terminate
+                // the node's control loop.
+                error.StorageReadTemporarilyUnavailable => return null,
+                else => return err,
+            }) orelse return null;
             defer statuses.deinit(alloc);
             for (statuses.items) |status| {
                 if (status.group_id == group_id) return try status.clone(alloc);
@@ -13330,8 +13360,42 @@ pub const ProvisionedTableWriteSource = struct {
     /// enrichment state reached by a full synchronization request.
     pub fn publishStorageOwnerRuntimeStatusChange(
         self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
         table_name: []const u8,
     ) void {
+        if (self.runtime_status_cache) |snapshot_cache| publish: {
+            const owner = self.local_write_source orelse break :publish;
+            const token = snapshot_cache.capturePublicationToken(table_name) catch |err| {
+                std.log.warn("storage owner visibility status token failed table={s} group_id={d} err={s}", .{
+                    table_name,
+                    group_id,
+                    @errorName(err),
+                });
+                break :publish;
+            };
+            var status = (owner.localRuntimeStatusGroupLocal(alloc, group_id, table_name) catch |err| {
+                std.log.warn("storage owner visibility status sample failed table={s} group_id={d} err={s}", .{
+                    table_name,
+                    group_id,
+                    @errorName(err),
+                });
+                break :publish;
+            }) orelse break :publish;
+            defer status.deinit(alloc);
+            publishRuntimeStatusGroupAfterObservation(
+                snapshot_cache,
+                token,
+                table_name,
+                status,
+            ) catch |err| {
+                std.log.warn("storage owner visibility status publication failed table={s} group_id={d} err={s}", .{
+                    table_name,
+                    group_id,
+                    @errorName(err),
+                });
+            };
+        }
         self.notifyLocalChange(table_name, .runtime_status);
     }
 
@@ -18284,8 +18348,44 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (comptime control_only_storage_sources) {
-            const owner = self.local_write_source orelse return null;
-            return try owner.localRuntimeStatuses(alloc, table_name);
+            // A resident compiled owner may have advanced since its last
+            // publication. Sample only that resident owner, merge the result
+            // through the monotonic cache, and return the merged snapshot.
+            // Cold and structurally fenced paths stay cache-only.
+            var cached = if (self.runtime_status_cache) |snapshot_cache|
+                try snapshot_cache.snapshot(alloc, table_name)
+            else
+                null;
+            errdefer if (cached) |*statuses| statuses.deinit(alloc);
+            if (self.structuralStatusSnapshotOnlyBestEffort(table_name)) return cached;
+
+            const owner = self.local_write_source orelse return cached;
+            const publication_token = if (self.runtime_status_cache) |snapshot_cache|
+                try snapshot_cache.capturePublicationToken(table_name)
+            else
+                null;
+            var observed = (owner.localRuntimeStatuses(alloc, table_name) catch |err| switch (err) {
+                error.StorageReadTemporarilyUnavailable => return cached,
+                else => return err,
+            }) orelse return cached;
+            errdefer observed.deinit(alloc);
+            if (publication_token) |token| {
+                _ = self.runtime_status_cache.?.publishGroups(token, table_name, observed.items) catch |err| {
+                    std.log.warn(
+                        "compiled owner live status publication failed table={s} err={s}",
+                        .{ table_name, @errorName(err) },
+                    );
+                };
+                if (try self.runtime_status_cache.?.snapshot(alloc, table_name)) |merged| {
+                    observed.deinit(alloc);
+                    if (cached) |*statuses| statuses.deinit(alloc);
+                    cached = null;
+                    return merged;
+                }
+            }
+            if (cached) |*statuses| statuses.deinit(alloc);
+            cached = null;
+            return observed;
         }
         if (self.local_write_source) |source_override| {
             if (try source_override.localRuntimeStatuses(alloc, table_name)) |statuses| return statuses;
@@ -20757,6 +20857,38 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse return null;
+            if (try local_source.localRuntimeStatuses(alloc, table_name)) |statuses| {
+                var observed = statuses;
+                var needs_owner_warm = false;
+                for (observed.items) |status| {
+                    if (status.metadata.source == .synthetic_config and status.stats.indexes.len != 0) {
+                        needs_owner_warm = true;
+                        break;
+                    }
+                }
+                if (!needs_owner_warm) return observed;
+                observed.deinit(alloc);
+            }
+
+            // The low-level owner status operation is deliberately
+            // observational and resident-only. Standalone has no DataServer
+            // refresh worker to establish that first resident owner after a
+            // process restart. A provisioned source can still return its
+            // synthetic configuration cache in that state, so treat that as
+            // a cache miss and let the hosted control plane own one bounded
+            // reconcile/warm step. A pending step still leaves the owner
+            // resident and exposes truthful catch-up status to this poll;
+            // later polls continue normal reconciliation.
+            self.reconcileLocalOwnerGroups(alloc, table_name, null) catch |err| switch (err) {
+                // These are runtime states to report, not failures of the
+                // status refresh itself. Reconciliation has established the
+                // resident owner in both cases, so sample its exact pending or
+                // degraded diagnostics below.
+                error.StorageKernelReconcilePending,
+                error.StorageKernelReconcileDegraded,
+                => {},
+                else => return err,
+            };
             return try local_source.localRuntimeStatuses(alloc, table_name);
         }
         if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |hosted_cache| {
