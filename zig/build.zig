@@ -6912,6 +6912,7 @@ pub fn build(b: *std.Build) void {
         "table provisioner accepts target schema index when retained read index has inflated doc count",
         "table provisioner runtime schema progress requires authoritative O(1) identity coverage",
         "catalog table topology is order independent and detects range mutation",
+        "metadata route wire conversion preserves its absolute deadline",
         "metadata http server serves status and filtered admin routes",
         "metadata admin linearizable snapshot propagates request context",
         "metadata linearizable snapshot fences and frees one owned response",

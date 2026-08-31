@@ -1236,20 +1236,28 @@ fn routeQueryFromWire(query: metadata_api.CatalogRouteQuery) api_table_catalog.R
     };
 }
 
-fn cloneRoutePlanForWire(
+fn cloneRoutePlanForWireUntil(
     alloc: std.mem.Allocator,
     plan: api_table_catalog.CatalogRoutePlan,
+    deadline_ns: u64,
 ) !metadata_api.CatalogRoutePlan {
+    const budget = api_table_catalog.RoutingBudget.init(deadline_ns);
+    try budget.checkpoint();
     const groups = try alloc.alloc(metadata_api.CatalogGroupRoute, plan.groups.len);
-    for (plan.groups, groups) |source_group, *target_group| target_group.* = .{
-        .group_id = source_group.group_id,
-        .range_id = source_group.range_id,
-        .identity_namespace = .{
-            .table_id = source_group.identity_namespace.table_id,
-            .shard_id = source_group.identity_namespace.shard_id,
-            .range_id = source_group.identity_namespace.range_id,
-        },
-    };
+    errdefer alloc.free(groups);
+    for (plan.groups, groups, 0..) |source_group, *target_group, index| {
+        try budget.checkpointIndex(index);
+        target_group.* = .{
+            .group_id = source_group.group_id,
+            .range_id = source_group.range_id,
+            .identity_namespace = .{
+                .table_id = source_group.identity_namespace.table_id,
+                .shard_id = source_group.identity_namespace.shard_id,
+                .range_id = source_group.identity_namespace.range_id,
+            },
+        };
+    }
+    try budget.checkpoint();
     return .{
         .metadata_group_id = plan.metadata_group_id,
         .metadata_incarnation = plan.metadata_incarnation,
@@ -1408,6 +1416,26 @@ pub const MetadataHttpServer = struct {
         return response;
     }
 
+    /// Do not publish a successful or authoritative-negative route result if
+    /// response encoding consumed the remainder of the caller's budget.
+    fn trackedCatalogRouteResultUntil(
+        self: *MetadataHttpServer,
+        ctx: *httpx.Context,
+        value: metadata_api.CatalogRouteResolveResult,
+        deadline_ns: u64,
+    ) !httpx.Response {
+        var response = try ctx.json(value);
+        if (value.disposition == .timed_out or platform_time.monotonicNs() < deadline_ns) {
+            self.source.recordJsonResponseAllocation(if (response.body) |body| body.len else 0);
+            return response;
+        }
+        response.deinit();
+        return try self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{
+            .disposition = .timed_out,
+            .token = value.token,
+        });
+    }
+
     fn executeTypedHandlerForTest(
         self: *MetadataHttpServer,
         method: httpx.Method,
@@ -1561,13 +1589,16 @@ pub const MetadataHttpServer = struct {
             self.source.freeRoutingSnapshot(&snapshot);
             if (local_plan) |*plan| {
                 defer plan.deinit(ctx.allocator);
-                var wire_plan = try cloneRoutePlanForWire(ctx.allocator, plan.*);
+                var wire_plan = cloneRoutePlanForWireUntil(ctx.allocator, plan.*, deadline_ns) catch |err| switch (err) {
+                    error.CatalogRoutingSnapshotTimeout => return self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{ .disposition = .timed_out, .token = token }),
+                    else => return metadataReadError(ctx, err),
+                };
                 defer wire_plan.deinit(ctx.allocator);
-                return self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{
+                return self.trackedCatalogRouteResultUntil(ctx, metadata_api.CatalogRouteResolveResult{
                     .disposition = .found,
                     .token = token,
                     .plan = wire_plan,
-                });
+                }, deadline_ns);
             }
 
             const change = self.source.waitForRoutingChange(token, deadline_ns, true) catch |err| switch (err) {
@@ -1575,14 +1606,14 @@ pub const MetadataHttpServer = struct {
                 else => return metadataReadError(ctx, err),
             };
             switch (change.effectiveDisposition()) {
-                .unchanged => return self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{
+                .unchanged => return self.trackedCatalogRouteResultUntil(ctx, metadata_api.CatalogRouteResolveResult{
                     .disposition = .not_found,
                     .token = change.token,
-                }),
-                .authority_changed => return self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{
+                }, deadline_ns),
+                .authority_changed => return self.trackedCatalogRouteResultUntil(ctx, metadata_api.CatalogRouteResolveResult{
                     .disposition = .authority_changed,
                     .token = change.token,
-                }),
+                }, deadline_ns),
                 .advanced, .replica_behind => continue,
             }
         }
@@ -3388,6 +3419,92 @@ fn deriveGroupId(table_name: []const u8, key: []const u8, seed: u64, reserved: u
 
 fn jsonBodyOrEmptyObject(body: []const u8) []const u8 {
     return if (body.len == 0) "{}" else body;
+}
+
+test "metadata route wire conversion preserves its absolute deadline" {
+    const Source = struct {
+        json_responses: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .record_json_response_allocation = recordJsonResponseAllocation,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn recordJsonResponseAllocation(ptr: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.json_responses += 1;
+        }
+    };
+
+    var groups = [_]api_table_catalog.CatalogGroupRoute{
+        .{
+            .group_id = 7001,
+            .range_id = 71,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 71 },
+        },
+        .{
+            .group_id = 7002,
+            .range_id = 72,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 72 },
+        },
+    };
+    const local_plan = api_table_catalog.CatalogRoutePlan{
+        .metadata_group_id = 91,
+        .metadata_incarnation = null,
+        .catalog_revision = 12,
+        .table_id = 7,
+        .topology_epoch = 8,
+        .groups = groups[0..],
+    };
+
+    var wire_plan = try cloneRoutePlanForWireUntil(
+        std.testing.allocator,
+        local_plan,
+        platform_time.monotonicNs() + std.time.ns_per_s,
+    );
+    defer wire_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), wire_plan.groups.len);
+    try std.testing.expectEqual(@as(u64, 7002), wire_plan.groups[1].group_id);
+    try std.testing.expectError(
+        error.CatalogRoutingSnapshotTimeout,
+        cloneRoutePlanForWireUntil(
+            std.testing.allocator,
+            local_plan,
+            platform_time.monotonicNs(),
+        ),
+    );
+
+    var source = Source{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var request = try httpx.Request.init(std.testing.allocator, .POST, routes.Routes.internal_await_route);
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try server.trackedCatalogRouteResultUntil(
+        &ctx,
+        .{ .disposition = .not_found, .token = .{ .metadata_group_id = 91, .revision = 12 } },
+        platform_time.monotonicNs(),
+    );
+    defer response.deinit();
+    const parsed = try std.json.parseFromSlice(metadata_api.CatalogRouteResolveResult, std.testing.allocator, response.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(metadata_api.CatalogRouteResolveResult.Disposition.timed_out, parsed.value.disposition);
+    try std.testing.expectEqual(@as(u64, 12), parsed.value.token.revision);
+    try std.testing.expectEqual(@as(usize, 1), source.json_responses);
 }
 
 fn freeStoreStatusReport(alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) void {
