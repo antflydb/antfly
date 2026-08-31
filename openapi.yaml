@@ -20910,8 +20910,10 @@ components:
           description: Dense-only exact publication status; absent for sparse indexes and when the target
             proof is unavailable.
         activity:
-          $ref: '#/components/schemas/EmbeddingIndexActivity'
+          x-go-type-skip-optional-pointer: false
           nullable: true
+          allOf:
+            - $ref: '#/components/schemas/EmbeddingIndexActivity'
           description: Fresh owner-reported activity, or null when no heartbeat for this index incarnation
             is available.
         error:

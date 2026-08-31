@@ -645,6 +645,22 @@ The first migration slice implemented here is narrower:
 This keeps replay bounded to stable identities and removes the previous
 "second payload store" behavior for generated chunk/dense/sparse work.
 
+The reconstructed request carries an explicit embedding input contract:
+`document`, `inline_chunks`, or `materialized_chunks`. The catalog planner owns
+that classification because it can distinguish an embedding output name from a
+registered chunk producer and a durable upstream artifact. Runtime, retry, and
+precompute paths must not infer chunk semantics from a non-empty
+`artifact_name`; that field names an output for document embeddings and an
+input for chunk-backed embeddings.
+
+Managed index admission also keeps corpus discovery out of the structural DDL
+critical section. A durable repair intent pages the primary document range,
+appends generated replay debt, and checkpoints a separate source-replay cursor
+after each bounded page. Its final replay target is the producer fence before
+the artifact-scoped shadow build begins. A crash may repeat an idempotent page,
+but cannot skip source rows; an exact page-sized corpus may require one final
+empty page to certify completion.
+
 Tradeoff in this migration slice:
 
 - replay reconstruction uses the current catalog, not a historical snapshot of

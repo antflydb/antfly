@@ -9180,7 +9180,7 @@ pub const EmbeddingsIndexStats = struct {
     /// Dense-only exact publication status; absent for sparse indexes and when the target proof is unavailable.
     publication: ?DenseVectorPublicationStatus = null,
     /// Fresh owner-reported activity, or null when no heartbeat for this index incarnation is available.
-    activity: ?EmbeddingIndexActivity = null,
+    activity: OpenApiOptionalNullable(EmbeddingIndexActivity) = .absent,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Number of vectors/documents in the index
@@ -9274,7 +9274,7 @@ pub const EmbeddingsIndexStats = struct {
         .{ "source_coverage", "source_coverage", true },
         .{ "searchable_vectors", "searchable_vectors", true },
         .{ "publication", "publication", true },
-        .{ "activity", "activity", true },
+        .{ "activity", "activity", false },
         .{ "error", "error", true },
         .{ "total_indexed", "total_indexed", true },
         .{ "disk_usage", "disk_usage", true },
@@ -9379,9 +9379,16 @@ pub const EmbeddingsIndexStats = struct {
             try jw.objectField("publication");
             try jw.write(value);
         }
-        if (self.activity) |value| {
-            try jw.objectField("activity");
-            try jw.write(value);
+        switch (self.activity) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("activity");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("activity");
+                try jw.write(value);
+            },
         }
         if (self.@"error") |value| {
             try jw.objectField("error");

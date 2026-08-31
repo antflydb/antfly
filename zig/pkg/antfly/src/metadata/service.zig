@@ -6361,7 +6361,7 @@ pub const MetadataHttpService = struct {
             snapshot.tables = try cloneProjectedTablesOwned(self.alloc, catalog.tables);
             snapshot.ranges = try cloneProjectedRangesOwned(self.alloc, catalog.ranges);
             snapshot.nodes = try store.listNodes(self.alloc, self.metadata_group_id);
-            snapshot.stores = try cloneProjectedStoresOwned(self.alloc, core.stores);
+            snapshot.stores = try self.cloneProjectedStoresWithActivityLocked(self.alloc, core.stores);
             snapshot.placement_intents = try cloneProjectedPlacementIntentsOwned(self.alloc, core.placement_intents);
             snapshot.shuffle_join_leases = try cloneProjectedShuffleJoinLeasesOwned(self.alloc, core.shuffle_join_leases);
             snapshot.restore_progresses = try cloneProjectedRestoreProgressesOwned(self.alloc, core.restore_progresses);
@@ -6831,7 +6831,24 @@ pub const MetadataHttpService = struct {
         self.lockRuntime();
         defer self.unlockRuntime();
         const snapshot = try self.projectedCoreSnapshotLocked();
-        const records = try cloneProjectedStoresOwned(alloc, snapshot.stores);
+        return try self.cloneProjectedStoresWithActivityLocked(alloc, snapshot.stores);
+    }
+
+    /// Clone the exact durable store projection and apply optional owner
+    /// telemetry as one read contract. Both the generic projection API and the
+    /// optimized admin snapshot path use this helper; otherwise callers can
+    /// flicker between activity and `unavailable` solely because they reached
+    /// different snapshot implementations.
+    ///
+    /// Requires `runtime_mutex` so `projected` remains tied to the caller's
+    /// catalog/core snapshot while it is cloned. Activity has its own bounded,
+    /// incarnation-scoped cache locks and is intentionally best effort.
+    fn cloneProjectedStoresWithActivityLocked(
+        self: *MetadataHttpService,
+        alloc: std.mem.Allocator,
+        projected: []const metadata_table_manager.StoreRecord,
+    ) ![]metadata_table_manager.StoreRecord {
+        const records = try cloneProjectedStoresOwned(alloc, projected);
         self.embedding_activity_cache.overlay(self.alloc, records, platform_time.monotonicNs());
         return records;
     }

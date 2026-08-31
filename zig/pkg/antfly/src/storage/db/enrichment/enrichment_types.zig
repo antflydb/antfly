@@ -83,11 +83,21 @@ pub const GeneratedEnrichmentKind = enum {
     asset,
 };
 
+pub const EmbeddingInputKind = enum {
+    document,
+    inline_chunks,
+    materialized_chunks,
+};
+
 pub const GeneratedEnrichmentRequest = struct {
     kind: GeneratedEnrichmentKind,
     index_name: []const u8,
     artifact_name: []const u8 = "",
     embedding_name: []const u8 = "",
+    /// Exact semantic input owned by this embedding request. `artifact_name`
+    /// names an embedding output for document requests and a chunk input for
+    /// chunk requests, so its presence cannot safely answer this question.
+    input_kind: EmbeddingInputKind = .document,
     doc_key: []const u8,
     source_field: []const u8,
     /// Handlebars template to render document fields for embedding.
@@ -164,6 +174,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .index_name = index_name,
         .artifact_name = artifact_name,
         .embedding_name = embedding_name,
+        .input_kind = request.input_kind,
         .doc_key = doc_key,
         .source_field = source_field,
         .source_template = source_template,
@@ -301,6 +312,7 @@ test "generated enrichment request clone round trip" {
             .index_name = "dv_v1",
             .artifact_name = "body_chunks_v1",
             .embedding_name = "body_dense_v1",
+            .input_kind = .materialized_chunks,
             .doc_key = "doc:a",
             .source_field = "body",
             .source_template = "{{title}} {{body}}",
@@ -317,6 +329,7 @@ test "generated enrichment request clone round trip" {
     try std.testing.expectEqualStrings("dv_v1", cloned[0].index_name);
     try std.testing.expectEqualStrings("body_chunks_v1", cloned[0].artifact_name);
     try std.testing.expectEqualStrings("body_dense_v1", cloned[0].embedding_name);
+    try std.testing.expectEqual(EmbeddingInputKind.materialized_chunks, cloned[0].input_kind);
     try std.testing.expectEqualStrings("doc:a", cloned[0].doc_key);
     try std.testing.expectEqualStrings("body", cloned[0].source_field);
     try std.testing.expectEqualStrings("{{title}} {{body}}", cloned[0].source_template);

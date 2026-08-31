@@ -22,10 +22,11 @@ const types = @import("../types.zig");
 
 const file_name = "index_repair.checkpoint";
 const magic = "AFIDXRP1";
-// Version 10 adds the durable `rolling_back` phase without changing field
-// layout. Older readers reject the newer semantic explicitly at the header
-// instead of misclassifying its phase byte as generic checkpoint corruption.
-const format_version: u32 = 10;
+// Version 11 adds a separate resumable source-replay cursor for managed index
+// admission. It deliberately does not overload the shadow candidate's build
+// cursor: source replay precedes candidate creation and has a different crash
+// boundary.
+const format_version: u32 = 11;
 const max_file_bytes: usize = 16 * 1024 * 1024;
 const max_entries: usize = 65_536;
 const max_index_name_bytes: usize = 4 * 1024;
@@ -81,6 +82,16 @@ pub const Trigger = enum(u8) {
     /// Rebuild the missing coverage in a shadow while retaining query access
     /// until the replacement reaches its fenced activation boundary.
     replay_artifact_unavailable = 8,
+};
+
+/// Durable admission work which discovers generated-enrichment requests from
+/// pre-existing primary rows. Older checkpoint formats imply `not_required`:
+/// those binaries completed this scan synchronously before persisting repair
+/// debt.
+pub const SourceReplayState = enum(u8) {
+    not_required = 0,
+    pending = 1,
+    complete = 2,
 };
 
 pub const Phase = enum(u8) {
@@ -154,6 +165,12 @@ pub const IndexRepairIntent = struct {
     /// count is diagnostic/accounting state and is not used for correctness.
     build_resume_key: ?[]u8 = null,
     build_reprocessed: u64 = 0,
+    /// Last primary-store key whose generated enrichment requests were
+    /// durably appended for a managed admission. Cursor publication follows
+    /// replay append, so a crash can repeat a page but can never skip one.
+    source_replay_resume_key: ?[]u8 = null,
+    source_replay_reprocessed: u64 = 0,
+    source_replay_state: SourceReplayState = .not_required,
     /// Durable candidate replay progress before activation. Once `phase`
     /// reaches `activating`, this is the immutable sequence certified by the
     /// ready manifest and installed by the pointer publication. Later serving
@@ -183,6 +200,7 @@ pub const IndexRepairIntent = struct {
         alloc.free(self.index_name);
         if (self.candidate_relative_path) |value| alloc.free(value);
         if (self.build_resume_key) |value| alloc.free(value);
+        if (self.source_replay_resume_key) |value| alloc.free(value);
         if (self.previous_active_relative_path) |value| alloc.free(value);
         if (self.last_error) |value| alloc.free(value);
         self.* = undefined;
@@ -197,6 +215,8 @@ pub const IndexRepairIntent = struct {
         errdefer if (previous_active) |value| alloc.free(value);
         const build_resume_key = if (self.build_resume_key) |value| try alloc.dupe(u8, value) else null;
         errdefer if (build_resume_key) |value| alloc.free(value);
+        const source_replay_resume_key = if (self.source_replay_resume_key) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (source_replay_resume_key) |value| alloc.free(value);
         const last_error = if (self.last_error) |value| try alloc.dupe(u8, value) else null;
         errdefer if (last_error) |value| alloc.free(value);
         var out = self;
@@ -204,6 +224,7 @@ pub const IndexRepairIntent = struct {
         out.candidate_relative_path = candidate;
         out.previous_active_relative_path = previous_active;
         out.build_resume_key = build_resume_key;
+        out.source_replay_resume_key = source_replay_resume_key;
         out.last_error = last_error;
         return out;
     }
@@ -643,6 +664,12 @@ fn validateEntry(entry: Entry) !void {
             return error.InvalidIndexRepairState;
         }
     }
+    if (intent.source_replay_resume_key) |value| {
+        if (value.len == 0 or value.len > max_build_resume_key_bytes or intent.source_replay_state != .pending)
+            return error.InvalidIndexRepairState;
+    }
+    if (intent.source_replay_state == .not_required and intent.source_replay_reprocessed != 0)
+        return error.InvalidIndexRepairState;
     if ((intent.operator_job_id == 0) != (intent.operator_job_created_at_ms == 0)) return error.InvalidIndexRepairState;
     if (intent.planned_disk_bytes != 0 and intent.planned_disk_bytes < intent.estimated_candidate_bytes) return error.InvalidIndexRepairState;
     if (entry.pin) |pin| {
@@ -762,6 +789,9 @@ fn encode(alloc: Allocator, state: *const State) ![]u8 {
         try appendInt(alloc, &out, u64, intent.build_floor_sequence);
         try appendOptionalString(alloc, &out, intent.build_resume_key, max_build_resume_key_bytes);
         try appendInt(alloc, &out, u64, intent.build_reprocessed);
+        try appendOptionalString(alloc, &out, intent.source_replay_resume_key, max_build_resume_key_bytes);
+        try appendInt(alloc, &out, u64, intent.source_replay_reprocessed);
+        try appendInt(alloc, &out, u8, @intFromEnum(intent.source_replay_state));
         try appendInt(alloc, &out, u64, intent.candidate_applied_sequence);
         try appendInt(alloc, &out, u64, intent.estimated_candidate_bytes);
         // Format versions 2 and 3 called this value "reserved". Its on-disk
@@ -850,6 +880,16 @@ fn decode(alloc: Allocator, raw: []const u8) !State {
         if (decoded_format_version >= 6) {
             intent.build_resume_key = try readOptionalString(alloc, raw[0..payload_end], &pos, max_build_resume_key_bytes);
             intent.build_reprocessed = try readInt(raw[0..payload_end], &pos, u64);
+        }
+        if (decoded_format_version >= 11) {
+            intent.source_replay_resume_key = try readOptionalString(alloc, raw[0..payload_end], &pos, max_build_resume_key_bytes);
+            intent.source_replay_reprocessed = try readInt(raw[0..payload_end], &pos, u64);
+            intent.source_replay_state = switch (try readInt(raw[0..payload_end], &pos, u8)) {
+                0 => .not_required,
+                1 => .pending,
+                2 => .complete,
+                else => return error.InvalidIndexRepairState,
+            };
         }
         intent.candidate_applied_sequence = try readInt(raw[0..payload_end], &pos, u64);
         if (decoded_format_version >= 2) {
@@ -1027,6 +1067,9 @@ test "index repair state persists intent and provisional replay pin atomically" 
     entry.intent.build_floor_sequence = 11;
     entry.intent.build_resume_key = try alloc.dupe(u8, "artifact-key:42");
     entry.intent.build_reprocessed = 42;
+    entry.intent.source_replay_resume_key = try alloc.dupe(u8, "document-key:17");
+    entry.intent.source_replay_reprocessed = 17;
+    entry.intent.source_replay_state = .pending;
     entry.intent.failure_streak = 3;
     entry.intent.trigger = .projection_generation_invalid;
     entry.intent.operator_job_id = 77;
@@ -1053,6 +1096,9 @@ test "index repair state persists intent and provisional replay pin atomically" 
     try std.testing.expectEqual(Phase.building, reopened.entries.items[0].intent.phase);
     try std.testing.expectEqualStrings("artifact-key:42", reopened.entries.items[0].intent.build_resume_key.?);
     try std.testing.expectEqual(@as(u64, 42), reopened.entries.items[0].intent.build_reprocessed);
+    try std.testing.expectEqualStrings("document-key:17", reopened.entries.items[0].intent.source_replay_resume_key.?);
+    try std.testing.expectEqual(@as(u64, 17), reopened.entries.items[0].intent.source_replay_reprocessed);
+    try std.testing.expectEqual(SourceReplayState.pending, reopened.entries.items[0].intent.source_replay_state);
     try std.testing.expectEqual(@as(u32, 3), reopened.entries.items[0].intent.failure_streak);
     try std.testing.expectEqual(Trigger.projection_generation_invalid, reopened.entries.items[0].intent.trigger);
     try std.testing.expectEqual(@as(u64, 77), reopened.entries.items[0].intent.operator_job_id);

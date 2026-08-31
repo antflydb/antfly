@@ -3033,7 +3033,7 @@ pub const EmbeddingsIndexStats = struct {
     /// Dense-only exact publication status; absent for sparse indexes and when the target proof is unavailable.
     publication: ?DenseVectorPublicationStatus = null,
     /// Fresh owner-reported activity, or null when no heartbeat for this index incarnation is available.
-    activity: ?EmbeddingIndexActivity = null,
+    activity: OpenApiOptionalNullable(EmbeddingIndexActivity) = .absent,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Number of vectors/documents in the index
@@ -3127,7 +3127,7 @@ pub const EmbeddingsIndexStats = struct {
         .{ "source_coverage", "source_coverage", true },
         .{ "searchable_vectors", "searchable_vectors", true },
         .{ "publication", "publication", true },
-        .{ "activity", "activity", true },
+        .{ "activity", "activity", false },
         .{ "error", "error", true },
         .{ "total_indexed", "total_indexed", true },
         .{ "disk_usage", "disk_usage", true },
@@ -3232,9 +3232,16 @@ pub const EmbeddingsIndexStats = struct {
             try jw.objectField("publication");
             try jw.write(value);
         }
-        if (self.activity) |value| {
-            try jw.objectField("activity");
-            try jw.write(value);
+        switch (self.activity) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("activity");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("activity");
+                try jw.write(value);
+            },
         }
         if (self.@"error") |value| {
             try jw.objectField("error");
@@ -8805,6 +8812,51 @@ pub const TraversalRules = struct {
         try jw.endObject();
     }
 };
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+            if (source == .null) return .null_value;
+            return .{ .value = try std.json.parseFromValueLeaky(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}
 
 /// Parse an OpenAPI object without materializing a second JSON tree while
 /// rejecting explicit null for optional properties whose schemas are non-nullable.

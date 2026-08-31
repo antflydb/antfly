@@ -588,7 +588,7 @@ fn summarizeStats(stats: anytype) IndexSummary {
         indexed;
     const readiness = if (@hasField(Stats, "readiness")) stats.readiness else null;
     const milestones = if (@hasField(Stats, "milestones")) stats.milestones else null;
-    const activity = if (@hasField(Stats, "activity")) stats.activity else null;
+    const activity = if (@hasField(Stats, "activity")) stats.activity.valueOrNull() else null;
     const publication = if (@hasField(Stats, "publication")) stats.publication else null;
     const repair = if (@hasField(Stats, "repair")) stats.repair else null;
     const state = if (readiness) |value| @tagName(value.state) else legacy_state;
@@ -1609,7 +1609,7 @@ test "index summary prefers typed embedding milestones coverage and activity" {
             .searchable_vectors = 44,
             .complete = false,
         },
-        .activity = .{
+        .activity = .{ .value = .{
             .epoch = "a-current",
             .phase = .embedding,
             .chunks_created = 80,
@@ -1617,7 +1617,7 @@ test "index summary prefers typed embedding milestones coverage and activity" {
             .embeddings_computed = 32,
             .active_batch_size = 8,
             .last_progress_at = "2026-08-29T12:00:00Z",
-        },
+        } },
     });
     try std.testing.expectEqualStrings("queryable_partial", summary.state);
     try std.testing.expect(summary.queryable);
@@ -1641,6 +1641,33 @@ test "index summary prefers typed embedding milestones coverage and activity" {
     var advanced = summary;
     advanced.embeddings_computed = 42;
     try std.testing.expectApproxEqAbs(@as(f64, 10.0), reporter.observeEmbeddingRate(advanced, std.time.ns_per_s).?, 0.0001);
+}
+
+test "index status distinguishes absent and explicitly unavailable embedding activity" {
+    const legacy_body =
+        \\{"shard_status":{},"config":{"name":"external_idx","type":"embeddings","external":true,"dimension":3},"status":{"index_type":"embeddings"}}
+    ;
+    const unavailable_body =
+        \\{"shard_status":{},"config":{"name":"external_idx","type":"embeddings","external":true,"dimension":3},"status":{"index_type":"embeddings","activity":null}}
+    ;
+    const active_body =
+        \\{"shard_status":{},"config":{"name":"external_idx","type":"embeddings","external":true,"dimension":3},"status":{"index_type":"embeddings","activity":{"epoch":"a-current","phase":"preparing","chunks_created":1,"embedding_batches_completed":0,"embeddings_computed":0,"active_batch_size":0,"last_progress_at":null}}}
+    ;
+
+    inline for (.{ legacy_body, unavailable_body, active_body }, 0..) |body, expected_state| {
+        var parsed = try std.json.parseFromSlice(antfly_client.types.IndexStatus, std.testing.allocator, body, .{});
+        defer parsed.deinit();
+        const stats = parsed.value.status.embeddings_index_stats;
+        switch (expected_state) {
+            0 => try std.testing.expect(stats.activity == .absent),
+            1 => try std.testing.expect(stats.activity == .null_value),
+            2 => {
+                try std.testing.expect(stats.activity == .value);
+                try std.testing.expectEqualStrings("a-current", stats.activity.value.epoch);
+            },
+            else => unreachable,
+        }
+    }
 }
 
 test "index wait disposition retries mismatch and fails only terminal states" {

@@ -11981,7 +11981,7 @@ pub const DB = struct {
             alloc,
             intent.index_name,
             intent.config_hash,
-            marker.replay_target_sequence,
+            @max(marker.replay_target_sequence, intent.target_sequence),
         );
     }
 
@@ -12026,7 +12026,7 @@ pub const DB = struct {
         if (self.core.index_manager.loadFailure(intent.index_name) != null) return false;
         const checkpoint = try self.core.loadProjectionCheckpoint(alloc, intent.index_name);
         if (checkpoint.status != .clean or checkpoint.config_hash != intent.config_hash or
-            checkpoint.applied_sequence <= marker.replay_target_sequence)
+            checkpoint.applied_sequence <= @max(marker.replay_target_sequence, intent.target_sequence))
         {
             return false;
         }
@@ -12483,6 +12483,10 @@ pub const DB = struct {
         build_resume_key: ?[]const u8 = null,
         replace_build_resume_key: bool = false,
         build_reprocessed: ?u64 = null,
+        source_replay_resume_key: ?[]const u8 = null,
+        replace_source_replay_resume_key: bool = false,
+        source_replay_reprocessed: ?u64 = null,
+        source_replay_state: ?index_repair_state.SourceReplayState = null,
         estimated_candidate_bytes: ?u64 = null,
         planned_disk_bytes: ?u64 = null,
         target_sequence: ?u64 = null,
@@ -12661,6 +12665,13 @@ pub const DB = struct {
         var replacement_build_resume_key_owned = replacement_build_resume_key != null;
         errdefer if (replacement_build_resume_key_owned) alloc.free(replacement_build_resume_key.?);
 
+        const replacement_source_replay_resume_key = if (update.replace_source_replay_resume_key)
+            if (update.source_replay_resume_key) |value| try alloc.dupe(u8, value) else null
+        else
+            null;
+        var replacement_source_replay_resume_key_owned = replacement_source_replay_resume_key != null;
+        errdefer if (replacement_source_replay_resume_key_owned) alloc.free(replacement_source_replay_resume_key.?);
+
         const replaces_last_error = update.attempt_failure != null or update.replace_last_error;
         const replacement_last_error_source = if (update.attempt_failure) |failure|
             @as(?[]const u8, failure.err_name)
@@ -12704,6 +12715,13 @@ pub const DB = struct {
             replacement_build_resume_key_owned = false;
         }
         if (update.build_reprocessed) |value| entry.intent.build_reprocessed = value;
+        if (update.replace_source_replay_resume_key) {
+            if (entry.intent.source_replay_resume_key) |value| alloc.free(value);
+            entry.intent.source_replay_resume_key = replacement_source_replay_resume_key;
+            replacement_source_replay_resume_key_owned = false;
+        }
+        if (update.source_replay_reprocessed) |value| entry.intent.source_replay_reprocessed = value;
+        if (update.source_replay_state) |value| entry.intent.source_replay_state = value;
         if (update.estimated_candidate_bytes) |value| entry.intent.estimated_candidate_bytes = value;
         if (update.planned_disk_bytes) |value| entry.intent.planned_disk_bytes = value;
         if (update.target_sequence) |value| entry.intent.target_sequence = value;
@@ -13049,6 +13067,7 @@ pub const DB = struct {
             operator_job_created_at_ms,
             last_error,
             null,
+            .not_required,
         );
     }
 
@@ -13061,6 +13080,7 @@ pub const DB = struct {
         operator_job_created_at_ms: u64,
         last_error: ?[]const u8,
         minimum_target_sequence: ?u64,
+        source_replay_state: index_repair_state.SourceReplayState,
     ) !u128 {
         lockAtomic(&self.async_context.index_repair_control_mutex);
         var control_locked = true;
@@ -13098,6 +13118,7 @@ pub const DB = struct {
             .updated_at_ms = now_ms,
             .owner_epoch = 0,
             .last_error = owned_last_error,
+            .source_replay_state = source_replay_state,
         };
         intent_allocations_transferred = true;
         defer intent.deinit(alloc);
@@ -13224,6 +13245,10 @@ pub const DB = struct {
 
         if (!indexKindSupportsManagedGenerationRepair(cfg.kind))
             return error.InvalidManagedIndexAdmission;
+        const source_replay_state: index_repair_state.SourceReplayState = if (try self.core.indexRequiresEnrichmentReplay(index_name))
+            .pending
+        else
+            .not_required;
         return try self.createGenerationRepairIntentAtTarget(
             alloc,
             cfg.*,
@@ -13232,6 +13257,7 @@ pub const DB = struct {
             0,
             managed_catalog_admission_rebuild_reason,
             marker.replay_target_sequence,
+            source_replay_state,
         );
     }
 
@@ -14964,6 +14990,43 @@ pub const DB = struct {
             return result;
         }
 
+        if (entry.intent.phase == .detected and entry.intent.source_replay_state == .pending) {
+            // Managed DDL installs the generator for future writes under the
+            // synchronous structural fence, but existing-row discovery belongs
+            // to this durable bounded owner. Append one primary-store page,
+            // then publish its cursor. A crash before the cursor repeats an
+            // idempotent page; a crash after it can never skip source rows.
+            const artifact_names = try self.core.index_manager.artifactSourceNamesForIndexAlloc(
+                alloc,
+                entry.intent.index_name,
+            );
+            defer {
+                for (artifact_names) |name| alloc.free(name);
+                alloc.free(artifact_names);
+            }
+            var page = try self.appendGeneratedEnrichmentsFromStoredDocsPage(
+                alloc,
+                artifact_names,
+                true,
+                entry.intent.source_replay_resume_key,
+                128,
+            );
+            defer page.deinit(alloc);
+            try self.updateIndexRepairIntent(alloc, repair_id, .{
+                .source_replay_resume_key = page.next_resume_key,
+                .replace_source_replay_resume_key = true,
+                .source_replay_reprocessed = entry.intent.source_replay_reprocessed +| @as(u64, @intCast(page.documents_scanned)),
+                .source_replay_state = if (page.complete) .complete else .pending,
+                .target_sequence = @max(entry.intent.target_sequence, page.target_sequence),
+                .failure_streak = 0,
+                .next_retry_at_ms = 0,
+            });
+            result.attempted = true;
+            result.documents_reprocessed = @intCast(page.documents_scanned);
+            result.deferred = true;
+            return result;
+        }
+
         // Activation recovery is structural O(1) work and precedes corpus
         // validation or capacity admission. `rolling_back` is an explicit
         // durable decision: if restart finds the candidate healthy before the
@@ -15092,14 +15155,10 @@ pub const DB = struct {
             return result;
         }
 
-        if (entry.intent.trigger == .projection_generation_invalid and
-            entry.intent.last_error != null and
-            std.mem.eql(u8, entry.intent.last_error.?, managed_catalog_admission_rebuild_reason) and
-            entry.intent.phase == .detected)
-        {
-            // Managed admission posts its complete source replay before the
-            // intent is materialized, so the initial intent target is also a
-            // producer-completion fence. Starting a shadow from artifacts
+        if (entry.intent.phase == .detected and entry.intent.source_replay_state == .complete) {
+            // The bounded source-replay phase advances the intent target after
+            // every durable page, so its final value is the producer-completion
+            // fence. Starting a shadow from artifacts
             // below that fence can snapshot a later artifact value and then
             // replay the earlier delete which produced it, permanently
             // removing deterministic chunk identities from the candidate.
@@ -18702,6 +18761,7 @@ pub const DB = struct {
                     0,
                     @tagName(invalid.reason),
                     native_generation.value().capture_target_sequence,
+                    .not_required,
                 );
             }
             try restored.core.index_manager.syncAll(true);
@@ -20894,14 +20954,14 @@ pub const DB = struct {
                     }});
                 }
             }
-            if (self.enrichment_runtime != null) {
-                // Managed admission deliberately leaves the serving generation
-                // empty and fail-closed while its shadow repair runs. It still
-                // must append source-document enrichment work: the shadow
-                // generation consumes those durable artifacts, and deletion
-                // may have retired every artifact from the prior incarnation.
+            if (self.enrichment_runtime != null and !installed.managed_admission_pending) {
+                // Ordinary embedded admission retains its synchronous
+                // readiness contract. Managed admission persists a repair
+                // intent below; that owner pages source-document replay after
+                // the write-capability barrier is released, so DDL remains
+                // O(groups) rather than O(corpus).
                 const refs = try self.replayGeneratedEnrichmentsFromStoredDocs(self.alloc);
-                if (refs == 0 and !installed.managed_admission_pending) {
+                if (refs == 0) {
                     const target_sequence = self.core.nextDerivedSequence();
                     try self.core.saveAppliedSequence(cfg.name, target_sequence);
                     try self.markEnrichmentAppliedIfNoPendingThrough(target_sequence);
@@ -20910,16 +20970,10 @@ pub const DB = struct {
         }
 
         const repair_id = if (installed.managed_admission_pending) repair_blk: {
-            // Post every generated-enrichment source record before projecting
-            // the admission marker into a repair intent. The intent's initial
-            // target is the producer fence: the repair scheduler must not
-            // snapshot a partially materialized artifact generation and then
-            // replay the remainder of that same generation over it.
-            //
-            // Wake the durable outbox only after that seed boundary. A crash
-            // before this point is safe: startup discovers the persisted
-            // admission marker, while any returned post-commit error enters
-            // recoverCommittedIndexAdmission and requests the same drain.
+            // Project the admission marker into a durable repair intent before
+            // releasing structural ownership. For generated indexes the same
+            // intent owns resumable source replay and advances its producer
+            // fence page by page before shadow construction can begin.
             self.requestManagedAdmissionMaterialization();
             // Drain the complete outbox, not only this index. A prior admission
             // may have committed before a transient checkpoint failure.
@@ -24960,6 +25014,68 @@ pub const DB = struct {
         generated_ref_count: usize = 0,
         target_sequence: u64 = 0,
     };
+
+    const GeneratedEnrichmentReplayPageResult = struct {
+        generated_ref_count: usize = 0,
+        target_sequence: u64 = 0,
+        documents_scanned: usize = 0,
+        next_resume_key: ?[]u8 = null,
+        complete: bool = false,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.next_resume_key) |key| alloc.free(key);
+            self.* = .{};
+        }
+    };
+
+    fn appendGeneratedEnrichmentsFromStoredDocsPage(
+        self: *DB,
+        alloc: Allocator,
+        force_generated_artifact_names: []const []const u8,
+        skip_terminally_covered: bool,
+        resume_key: ?[]const u8,
+        limit: usize,
+    ) !GeneratedEnrichmentReplayPageResult {
+        if (self.enrichment_runtime == null) return .{ .complete = true };
+        if (limit == 0) return error.InvalidArgument;
+
+        const initial_lower = if (resume_key == null) try self.core.documentRangeLowerAlloc("") else null;
+        defer if (initial_lower) |key| self.core.alloc.free(key);
+        const lower = resume_key orelse initial_lower.?;
+        var replay_batch = try self.collectStoredGeneratedReplayBatch(alloc, lower, resume_key != null, limit);
+        defer replay_batch.deinit(alloc);
+        if (replay_batch.writes.len == 0) return .{ .complete = true };
+
+        var pending_batch = derived_types.DerivedBatch{};
+        defer derived_types.deinitDerivedBatch(self.alloc, &pending_batch);
+        try appendGeneratedEnrichments(self, &pending_batch, .{
+            .writes = replay_batch.writes,
+            .sync_level = .write,
+        }, replay_batch.extracted, force_generated_artifact_names, skip_terminally_covered);
+        var target_sequence: u64 = 0;
+        if (pending_batch.generated_enrichment_refs.len != 0) {
+            target_sequence = try appendDerivedBatchRecord(self, pending_batch);
+            self.executor.notifySequence(target_sequence);
+            if (self.enrichment_runtime) |runtime| runtime.notifySequence(target_sequence);
+            self.notifyResolverReplayRuntimes(target_sequence);
+        }
+
+        const complete = replay_batch.writes.len < limit;
+        const next_resume_key = if (complete)
+            null
+        else blk: {
+            const key = replay_batch.next_lower orelse return error.InvalidDerivedReplayCursor;
+            replay_batch.next_lower = null;
+            break :blk key;
+        };
+        return .{
+            .generated_ref_count = pending_batch.generated_enrichment_refs.len,
+            .target_sequence = target_sequence,
+            .documents_scanned = replay_batch.writes.len,
+            .next_resume_key = next_resume_key,
+            .complete = complete,
+        };
+    }
 
     fn appendGeneratedEnrichmentsFromStoredDocs(
         self: *DB,
@@ -37321,6 +37437,10 @@ fn computeDenseRequestDerived(
     return computeDenseRequestImpl(alloc, db, doc_value, request, artifact_writes, dense_embeddings, cache, true, appendDerivedDenseEmbeddingForConsumers);
 }
 
+fn requestUsesChunkSource(request: enrichment_types.GeneratedEnrichmentRequest) bool {
+    return request.input_kind != .document;
+}
+
 fn computeDenseMaterializedChunkRequestImpl(
     alloc: Allocator,
     db: *DB,
@@ -37409,7 +37529,7 @@ fn computeDenseRequestImpl(
     }
     if (consumer_indexes.len == 0) return;
 
-    if (request.artifact_name.len > 0) {
+    if (requestUsesChunkSource(request)) {
         if (requestUsesMaterializedChunkArtifact(db, request.artifact_name)) {
             try computeDenseMaterializedChunkRequestImpl(alloc, db, runtime, request, artifact_writes, dense_embeddings, skip_unchanged_artifacts, appendForConsumers, dense_embedder, embedding_name, consumer_indexes);
             return;
@@ -37603,7 +37723,7 @@ fn computeSparseRequestDerived(
     }
     if (consumer_indexes.len == 0) return;
 
-    if (request.artifact_name.len > 0) {
+    if (requestUsesChunkSource(request)) {
         if (requestUsesMaterializedChunkArtifact(db, request.artifact_name)) {
             try computeSparseMaterializedChunkRequest(alloc, db, runtime, request, artifact_writes, sparse_embeddings, sparse_embedder, embedding_name, consumer_indexes);
             return;
@@ -43513,9 +43633,20 @@ fn accountDenseCoverage(
 ) !void {
     const external = ctx.index_manager.denseIndexUsesExternalCoverage(index_name);
     const direct = ctx.index_manager.denseIndexUsesManagedDirectField(index_name);
+    var deleted_artifacts = std.StringHashMapUnmanaged(void).empty;
+    defer deleted_artifacts.deinit(ctx.alloc);
+    for (batch.deleted_keys) |key| try deleted_artifacts.put(ctx.alloc, key, {});
     var produced = std.StringHashMapUnmanaged(void).empty;
     defer produced.deinit(ctx.alloc);
     for (writes) |write| {
+        // Replay represents an artifact deletion as an empty lazy write for
+        // the same key so the projection can remove its prior member. That is
+        // negative evidence, not a produced source outcome. Positive cached
+        // artifact loads use the same empty-vector representation but never
+        // carry their artifact key in the batch deletion set.
+        if (write.artifact_key) |artifact_key| {
+            if (deleted_artifacts.contains(artifact_key)) continue;
+        } else if (write.vector.len == 0) continue;
         try produced.put(ctx.alloc, write.parent_doc_key orelse write.doc_key, {});
     }
     var outcomes = std.ArrayListUnmanaged(DerivedCoverageDocOutcome).empty;
@@ -43554,9 +43685,15 @@ fn accountSparseCoverage(
 ) !void {
     const external = ctx.index_manager.sparseIndexUsesExternalCoverage(index_name);
     const direct = ctx.index_manager.sparseIndexUsesManagedDirectField(index_name);
+    var deleted_artifacts = std.StringHashMapUnmanaged(void).empty;
+    defer deleted_artifacts.deinit(ctx.alloc);
+    for (batch.deleted_keys) |key| try deleted_artifacts.put(ctx.alloc, key, {});
     var produced = std.StringHashMapUnmanaged(void).empty;
     defer produced.deinit(ctx.alloc);
     for (writes) |write| {
+        if (write.artifact_key) |artifact_key| {
+            if (deleted_artifacts.contains(artifact_key)) continue;
+        } else if (write.indices.len == 0) continue;
         try produced.put(ctx.alloc, write.doc_key, {});
     }
     var outcomes = std.ArrayListUnmanaged(DerivedCoverageDocOutcome).empty;
@@ -43646,6 +43783,34 @@ fn deleteDerivedCoverageForDocKeys(
         counter_write_count += 1;
     }
     try store.putBatch(counter_writes[0..counter_write_count], deletes.items);
+}
+
+fn pendingGeneratedCoverageDocKeysForIndexAlloc(
+    alloc: Allocator,
+    index_manager: *index_manager_mod.IndexManager,
+    index_name: []const u8,
+    kind: types.IndexKind,
+    refs: []const enrichment_types.GeneratedEnrichmentRef,
+) ![]const []const u8 {
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer keys.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+
+    for (refs) |ref| {
+        const embedding_name = if (ref.embedding_name.len > 0) ref.embedding_name else ref.index_name;
+        const targets_index = switch (kind) {
+            .dense_vector => ref.kind == .dense_embedding and
+                index_manager.denseIndexConsumesEmbedding(index_name, embedding_name),
+            .sparse_vector => ref.kind == .sparse_embedding and
+                index_manager.sparseIndexConsumesEmbedding(index_name, embedding_name),
+            else => false,
+        };
+        if (!targets_index or seen.contains(ref.doc_key)) continue;
+        try seen.put(alloc, ref.doc_key, {});
+        try keys.append(alloc, ref.doc_key);
+    }
+    return try keys.toOwnedSlice(alloc);
 }
 
 fn artifactRepairIssueKeyForIssueAlloc(alloc: Allocator, issue: types.ArtifactRepairIssue) ![]u8 {
@@ -44860,7 +45025,24 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 try ctx.index_manager.deleteDenseBatchByNameWithOptions(ctx.store, index_ref.name, batch.overwritten_doc_keys, batch_options);
             }
             try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
-            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
+            if (ctx.index_manager.denseIndexUsesManagedDirectField(index_ref.name) or
+                ctx.index_manager.denseIndexUsesExternalCoverage(index_ref.name))
+            {
+                try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
+            } else {
+                // Producer-owned exact outcomes are committed atomically with
+                // the source update. Only a request retained for asynchronous
+                // replay makes the prior generated outcome pending.
+                const pending_doc_keys = try pendingGeneratedCoverageDocKeysForIndexAlloc(
+                    ctx.alloc,
+                    ctx.index_manager,
+                    index_ref.name,
+                    .dense_vector,
+                    batch.generated_enrichment_refs,
+                );
+                defer ctx.alloc.free(pending_doc_keys);
+                try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, pending_doc_keys);
+            }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
 
             var dense_embedding_doc_keys = try denseEmbeddingDocKeySet(ctx.alloc, dense_embeddings.writes);
@@ -44926,7 +45108,21 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.deleted_keys, batch_options);
             try ctx.index_manager.deleteSparseBatchByNameWithOptions(index_ref.name, batch.overwritten_doc_keys, batch_options);
             try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
-            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
+            if (ctx.index_manager.sparseIndexUsesManagedDirectField(index_ref.name) or
+                ctx.index_manager.sparseIndexUsesExternalCoverage(index_ref.name))
+            {
+                try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
+            } else {
+                const pending_doc_keys = try pendingGeneratedCoverageDocKeysForIndexAlloc(
+                    ctx.alloc,
+                    ctx.index_manager,
+                    index_ref.name,
+                    .sparse_vector,
+                    batch.generated_enrichment_refs,
+                );
+                defer ctx.alloc.free(pending_doc_keys);
+                try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, pending_doc_keys);
+            }
             if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
 
             var sparse_embedding_doc_keys = try sparseEmbeddingDocKeySet(ctx.alloc, sparse_embeddings.writes);
@@ -82889,55 +83085,99 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
+    const document_count: usize = 129;
+    const writes = try alloc.alloc(types.BatchWrite, document_count);
+    defer {
+        for (writes) |write| alloc.free(@constCast(write.key));
+        alloc.free(writes);
+    }
+    for (writes, 0..) |*write, i| {
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i}),
+            .value = "{\"body\":\"before admission\"}",
+        };
+    }
+
+    var repair_id: u128 = 0;
+    var first_page_target: u64 = 0;
+    {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .start_optional_runtime_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+            .enrichment = .{ .dense_embedder = deterministic.interface() },
+        });
+        defer db.close();
+        try db.batch(.{ .writes = writes, .sync_level = .write });
+        try db.addEnrichment(.{
+            .name = "semantic_embedding",
+            .kind = .embedding,
+            .field = "body",
+            .expected_dims = 3,
+        });
+
+        const before_admission = db.core.nextDerivedSequence();
+        repair_id = (try db.admitManagedIndex(.{
+            .name = "semantic_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"semantic_embedding\"}",
+        })) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(repair_id != 0);
+
+        // Admission installs the generator and durable repair owner, but does
+        // no corpus-sized source scan while holding structural ownership.
+        try std.testing.expectEqual(before_admission, db.core.nextDerivedSequence());
+        try std.testing.expectEqual(
+            before_admission,
+            try db.core.loadAppliedSequence(alloc, "semantic_idx"),
+        );
+        var initial = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer initial.deinit(alloc);
+        try std.testing.expect(initial.intent.source_replay_resume_key == null);
+        try std.testing.expectEqual(@as(u64, 0), initial.intent.source_replay_reprocessed);
+        try std.testing.expectEqual(index_repair_state.SourceReplayState.pending, initial.intent.source_replay_state);
+
+        // One owner quantum scans exactly one bounded page and publishes the
+        // cursor only after its generated requests are durable.
+        const first = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+        try std.testing.expect(first.attempted);
+        try std.testing.expect(first.deferred);
+        try std.testing.expect(!first.repaired);
+        try std.testing.expectEqual(@as(u64, 128), first.documents_reprocessed);
+        var after_first = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer after_first.deinit(alloc);
+        try std.testing.expect(after_first.intent.source_replay_resume_key != null);
+        try std.testing.expectEqual(@as(u64, 128), after_first.intent.source_replay_reprocessed);
+        try std.testing.expectEqual(index_repair_state.SourceReplayState.pending, after_first.intent.source_replay_state);
+        try std.testing.expect(after_first.intent.target_sequence > before_admission);
+        first_page_target = after_first.intent.target_sequence;
+
+        const canonical = db.core.denseIndex("semantic_idx") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u64, 0), canonical.index.stats().active_count);
+        try std.testing.expect(db.core.index_manager.repairUnavailable("semantic_idx"));
+    }
+
+    // Restart resumes after the durable primary-store cursor instead of
+    // rescanning the first page or skipping the uncommitted suffix.
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     });
-    defer db.close();
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"before admission\"}" }},
-        .sync_level = .write,
-    });
-    try db.addEnrichment(.{
-        .name = "semantic_embedding",
-        .kind = .embedding,
-        .field = "body",
-        .expected_dims = 3,
-    });
-
-    const before_admission = db.core.nextDerivedSequence();
-    const repair_id = (try db.admitManagedIndex(.{
-        .name = "semantic_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"semantic_embedding\"}",
-    })) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(repair_id != 0);
-
-    // The canonical worker begins at the durable admission fence. Existing
-    // corpus state is owned by the snapshot/seed path, so a newly admitted
-    // index must never replay pre-admission source or generated history.
-    try std.testing.expectEqual(
-        before_admission,
-        try db.core.loadAppliedSequence(alloc, "semantic_idx"),
-    );
-
-    // Artifact production is a durable replay record owned by the enrichment
-    // worker, while the canonical serving generation remains empty and gated.
-    // Repair cannot consume those artifacts until the producer fence drains.
-    try std.testing.expect(db.core.nextDerivedSequence() > before_admission);
-    var repair = try db.loadIndexRepairEntryById(alloc, repair_id);
-    defer repair.deinit(alloc);
-    try std.testing.expectEqual(db.core.nextDerivedSequence(), repair.intent.target_sequence);
-    const premature = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
-    try std.testing.expect(premature.deferred);
-    try std.testing.expect(!premature.attempted);
-    try std.testing.expect(!premature.repaired);
-    const canonical = db.core.denseIndex("semantic_idx") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u64, 0), canonical.index.stats().active_count);
-    try std.testing.expect(db.core.index_manager.repairUnavailable("semantic_idx"));
+    defer reopened.close();
+    const final_page = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+    try std.testing.expect(final_page.attempted);
+    try std.testing.expect(final_page.deferred);
+    try std.testing.expectEqual(@as(u64, 1), final_page.documents_reprocessed);
+    var seeded = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+    defer seeded.deinit(alloc);
+    try std.testing.expect(seeded.intent.source_replay_resume_key == null);
+    try std.testing.expectEqual(@as(u64, document_count), seeded.intent.source_replay_reprocessed);
+    try std.testing.expectEqual(index_repair_state.SourceReplayState.complete, seeded.intent.source_replay_state);
+    try std.testing.expect(seeded.intent.target_sequence > first_page_target);
 }
 
 test "db managed repair scheduler defers canonical worker until shadow activation" {

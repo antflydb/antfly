@@ -1349,9 +1349,11 @@ fn updateFailureFingerprintBytes(hasher: *std.hash.Wyhash, value: []const u8) vo
 
 fn updateFailureFingerprintForRequest(hasher: *std.hash.Wyhash, request: enrichment_types.GeneratedEnrichmentRequest) void {
     const kind: u8 = @intFromEnum(request.kind);
+    const input_kind: u8 = @intFromEnum(request.input_kind);
     var sequence_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &sequence_bytes, request.sequence, .little);
     hasher.update(&.{kind});
+    hasher.update(&.{input_kind});
     hasher.update(&sequence_bytes);
     updateFailureFingerprintBytes(hasher, request.doc_key);
     updateFailureFingerprintBytes(hasher, requestArtifactName(request));
@@ -1369,6 +1371,7 @@ fn sameRequestFailureIdentity(
     rhs: enrichment_types.GeneratedEnrichmentRequest,
 ) bool {
     return lhs.kind == rhs.kind and
+        lhs.input_kind == rhs.input_kind and
         lhs.sequence == rhs.sequence and
         std.mem.eql(u8, lhs.doc_key, rhs.doc_key) and
         std.mem.eql(u8, requestArtifactName(lhs), requestArtifactName(rhs)) and
@@ -2408,12 +2411,15 @@ test "enrichment batch retry identity covers every work item" {
         .chunk_key = second.chunk_key,
         .source_hash = 21,
     };
+    var changed_input = second;
+    changed_input.request.input_kind = .materialized_chunks;
     const original = [_]TestItem{ first, second };
     const changed = [_]TestItem{ first, replacement };
     const changed_content = [_]TestItem{ first, changed_materialization };
     const reordered = [_]TestItem{ second, first };
     try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(&changed));
     try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(&changed_content));
+    try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(&.{ first, changed_input }));
     try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(&reordered));
     try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(original[0..1]));
 }
@@ -2463,13 +2469,9 @@ fn requestHasChunking(request: enrichment_types.GeneratedEnrichmentRequest) bool
     return request.chunk_size > 0 or request.chunker_json.len > 0;
 }
 
-/// Embedding requests use `artifact_name` as an explicit chunk-source
-/// identity. Source ownership must not be inferred from local chunker knobs:
-/// materialized producers can intentionally emit zero chunks and may not carry
-/// an inline chunk size at all.
 fn requestHasChunkSource(request: enrichment_types.GeneratedEnrichmentRequest) bool {
     return switch (request.kind) {
-        .dense_embedding, .sparse_embedding => request.artifact_name.len > 0,
+        .dense_embedding, .sparse_embedding => request.input_kind != .document,
         .asset, .chunk_text => false,
     };
 }
@@ -2485,6 +2487,7 @@ fn samePlainDenseBatchKey(
     rhs: enrichment_types.GeneratedEnrichmentRequest,
 ) bool {
     return lhs.expected_dims == rhs.expected_dims and
+        lhs.input_kind == rhs.input_kind and
         std.mem.eql(u8, requestEmbeddingName(lhs), requestEmbeddingName(rhs)) and
         std.mem.eql(u8, lhs.execution_json, rhs.execution_json);
 }
