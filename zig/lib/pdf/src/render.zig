@@ -257,6 +257,8 @@ const GroupMeta = struct {
     parent_index: ?usize = null,
     isolated: bool,
     knockout: bool,
+    alpha: u8,
+    blend_mode: reader.BlendMode,
     min_paint_order: usize,
     min_paint_phase: usize,
 };
@@ -297,6 +299,8 @@ fn addOrUpdateGroupMeta(
     parent_id: ?u32,
     isolated: bool,
     knockout: bool,
+    alpha: u8,
+    blend_mode: reader.BlendMode,
     paint_order: usize,
     paint_phase: usize,
 ) anyerror!void {
@@ -305,6 +309,8 @@ fn addOrUpdateGroupMeta(
         group.parent_id = parent_id;
         group.isolated = isolated;
         group.knockout = knockout;
+        if (group.alpha != alpha or group.blend_mode != blend_mode)
+            return error.InvalidRenderGroup;
         if (paint_order < group.min_paint_order) {
             group.min_paint_order = paint_order;
             group.min_paint_phase = paint_phase;
@@ -319,6 +325,8 @@ fn addOrUpdateGroupMeta(
         .parent_id = parent_id,
         .isolated = isolated,
         .knockout = knockout,
+        .alpha = alpha,
+        .blend_mode = blend_mode,
         .min_paint_order = paint_order,
         .min_paint_phase = paint_phase,
     });
@@ -444,11 +452,11 @@ fn buildRenderPlanAlloc(
     var group_indices = std.AutoHashMapUnmanaged(u32, usize).empty;
     defer group_indices.deinit(alloc);
 
-    for (text_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
-    for (image_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
-    for (shading_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
-    for (pattern_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
-    for (shape_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
+    for (text_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.group_alpha, run.group_blend_mode, run.paint_order, run.paint_phase);
+    for (image_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.group_alpha, run.group_blend_mode, run.paint_order, run.paint_phase);
+    for (shading_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.group_alpha, run.group_blend_mode, run.paint_order, run.paint_phase);
+    for (pattern_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.group_alpha, run.group_blend_mode, run.paint_order, run.paint_phase);
+    for (shape_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.group_alpha, run.group_blend_mode, run.paint_order, run.paint_phase);
 
     // A parent group may contain only nested transparency groups. Propagate
     // descendant minima so its position in its own parent remains the true
@@ -530,14 +538,15 @@ fn renderChildGroupAlloc(
     const meta = plan.groups[group_index];
     const child = try alloc.alloc(u8, width * height * 4);
     defer alloc.free(child);
-    if (meta.isolated) {
+    const needs_boundary_composite = meta.isolated or meta.alpha != 0xff or meta.blend_mode != .normal;
+    if (needs_boundary_composite) {
         @memset(child, 0);
     } else {
         @memcpy(child, target);
     }
     try renderGroupChildrenAlloc(alloc, child, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout, cancellation, bilevel_sample_budget);
-    if (meta.isolated) {
-        try compositeGroupCanvasCancelable(target, child, cancellation);
+    if (needs_boundary_composite) {
+        try compositeGroupCanvasModeCancelable(target, child, meta.alpha, meta.blend_mode, cancellation);
     } else {
         try copyCanvasCancelable(target, child, width, height, cancellation);
     }
@@ -981,10 +990,83 @@ fn drawImageRunCancelable(
                 sample[2] = color[2];
                 sample[3] = @intCast((@as(u16, sample[3]) * @as(u16, color[3]) + 127) / 255);
             }
+            if (run.opacity_mask_rgba != null) {
+                const mask_alpha = imageRunOpacityMaskSample(run, u, 1.0 - v, filtered);
+                sample[3] = @intCast((@as(u16, sample[3]) * @as(u16, mask_alpha) + 127) / 255);
+            }
             sample[3] = @intCast((@as(u16, sample[3]) * @as(u16, run.alpha) + 127) / 255);
             blendPixelMode(canvas, dst, sample, run.blend_mode);
         }
     }
+}
+
+fn imageRunOpacityMaskSample(run: reader.ImageRun, u: f64, v: f64, filtered: bool) u8 {
+    const rgba = run.opacity_mask_rgba orelse return 0xff;
+    const width = run.opacity_mask_width;
+    const height = run.opacity_mask_height;
+    if (width == 0 or height == 0 or rgba.len != @as(usize, width) * @as(usize, height) * 4) return 0;
+    if (!filtered) {
+        const sx = @min(width - 1, @as(u32, @intFromFloat(@floor(u * @as(f64, @floatFromInt(width))))));
+        const sy = @min(height - 1, @as(u32, @intFromFloat(@floor(v * @as(f64, @floatFromInt(height))))));
+        return softMaskPixel(rgba, (@as(usize, sy) * width + sx) * 4, run.opacity_mask_luminosity);
+    }
+
+    const width_f: f64 = @floatFromInt(width);
+    const height_f: f64 = @floatFromInt(height);
+    const x = std.math.clamp(u * width_f - 0.5, 0.0, @max(0.0, width_f - 1.0));
+    const y = std.math.clamp(v * height_f - 0.5, 0.0, @max(0.0, height_f - 1.0));
+    const x0: u32 = @intFromFloat(@floor(x));
+    const y0: u32 = @intFromFloat(@floor(y));
+    const x1 = @min(width - 1, x0 + 1);
+    const y1 = @min(height - 1, y0 + 1);
+    const tx = x - @as(f64, @floatFromInt(x0));
+    const ty = y - @as(f64, @floatFromInt(y0));
+    const weights = [4]f64{ (1.0 - tx) * (1.0 - ty), tx * (1.0 - ty), (1.0 - tx) * ty, tx * ty };
+    const indices = [4]usize{
+        (@as(usize, y0) * width + x0) * 4,
+        (@as(usize, y0) * width + x1) * 4,
+        (@as(usize, y1) * width + x0) * 4,
+        (@as(usize, y1) * width + x1) * 4,
+    };
+    var value: f64 = 0;
+    for (weights, indices) |weight, index|
+        value += weight * @as(f64, @floatFromInt(softMaskPixel(rgba, index, run.opacity_mask_luminosity)));
+    return @intFromFloat(@round(std.math.clamp(value, 0.0, 255.0)));
+}
+
+fn softMaskPixel(rgba: []const u8, index: usize, luminosity: bool) u8 {
+    const alpha: u32 = rgba[index + 3];
+    if (!luminosity) return @intCast(alpha);
+    const luminance = (@as(u32, rgba[index]) * 77 + @as(u32, rgba[index + 1]) * 150 + @as(u32, rgba[index + 2]) * 29 + 128) / 256;
+    return @intCast((luminance * alpha + 127) / 255);
+}
+
+test "image-backed luminosity soft mask samples normalized coverage" {
+    var image_rgba = [_]u8{ 0, 0, 0, 255 } ** 2;
+    var mask = [_]u8{ 0, 0, 0, 255, 255, 255, 255, 255 };
+    const run = reader.ImageRun{
+        .rgba = &image_rgba,
+        .width = 2,
+        .height = 1,
+        .opacity_mask_rgba = &mask,
+        .opacity_mask_width = 2,
+        .opacity_mask_height = 1,
+        .opacity_mask_luminosity = true,
+        .a = 2,
+        .b = 0,
+        .c = 0,
+        .d = 1,
+        .e = 0,
+        .f = 0,
+        .x = 0,
+        .y = 0,
+        .draw_width = 2,
+        .draw_height = 1,
+    };
+    try std.testing.expectEqual(@as(u8, 0), imageRunOpacityMaskSample(run, 0.25, 0.5, false));
+    try std.testing.expectEqual(@as(u8, 255), imageRunOpacityMaskSample(run, 0.75, 0.5, false));
+    const midpoint = imageRunOpacityMaskSample(run, 0.5, 0.5, true);
+    try std.testing.expect(midpoint >= 127 and midpoint <= 129);
 }
 
 const SourceFootprint = struct {
@@ -1460,10 +1542,19 @@ fn drawShadingRunCancelable(canvas: []u8, canvas_w: usize, canvas_h: usize, min_
                 .radial => radialShadingT(world_x, world_y, run),
             };
             const t = t_opt orelse continue;
-            const color = lerpColor(run.c0, run.c1, t);
+            const color = shadingColorAt(run, t);
             blendPixelMode(canvas, (py * canvas_w + px) * 4, color, run.blend_mode);
         }
     }
+}
+
+fn shadingColorAt(run: reader.ShadingRun, t: f64) [4]u8 {
+    if (run.color_sample_count < 2) return lerpColor(run.c0, run.c1, t);
+    const count: usize = run.color_sample_count;
+    const position = std.math.clamp(t, 0.0, 1.0) * @as(f64, @floatFromInt(count - 1));
+    const lower: usize = @intFromFloat(@floor(position));
+    const upper = @min(lower + 1, count - 1);
+    return lerpColor(run.color_samples[lower], run.color_samples[upper], position - @as(f64, @floatFromInt(lower)));
 }
 
 fn drawPatternRun(
@@ -1501,6 +1592,7 @@ fn patternTargetShape(run: reader.PatternRun) reader.ShapeRun {
         .clip_fill_rule = run.clip_fill_rule,
         .points = run.points,
         .subpath_starts = run.subpath_starts,
+        .subpath_closed = run.subpath_closed,
     };
 }
 
@@ -1866,6 +1958,8 @@ fn pointInStrokeShape(x: f64, y: f64, run: reader.ShapeRun) bool {
             var subpath = run;
             subpath.points = run.points[start..end];
             subpath.subpath_starts = null;
+            subpath.subpath_closed = null;
+            subpath.closed = if (run.subpath_closed) |closed| closed[i] else run.closed;
             if (pointInStrokeShapeSingle(x, y, subpath)) return true;
         }
         return false;
@@ -1884,6 +1978,8 @@ fn pointInStrokeShapeSingle(x: f64, y: f64, run: reader.ShapeRun) bool {
             const prev = if (i == 0) run.points[run.points.len - 1] else run.points[i - 1];
             const curr = run.points[i];
             const next = if (i + 1 == run.points.len) run.points[0] else run.points[i + 1];
+            if (segmentLengthSquared(prev, curr) <= 0.000001 or
+                segmentLengthSquared(curr, next) <= 0.000001) continue;
             switch (run.line_join) {
                 .round => {
                     if (pointDistance(x, y, curr) <= radius) return true;
@@ -1924,6 +2020,10 @@ fn strokeContainsPoint(x: f64, y: f64, run: reader.ShapeRun, radius: f64) bool {
         const a = run.points[i];
         const b = run.points[i + 1];
         const hit = pointSegmentDistanceAndAlong(x, y, a, b);
+        // A zero-length segment has no direction and a butt cap contributes no
+        // area. Treating its endpoint distance as a stroked segment turns PDF
+        // producer cleanup paths into large discs when the line width is high.
+        if (hit.length <= 0.000001 and run.line_cap != .round) continue;
         if (hit.distance <= radius and dashIsOn(offset + hit.along, dash)) return true;
         offset += hit.length;
     }
@@ -1949,6 +2049,9 @@ fn polygonEdgeDistanceWithCap(
     while (i + 1 < points.len) : (i += 1) {
         const point = points[i];
         const next = points[i + 1];
+        const dx = next[0] - point[0];
+        const dy = next[1] - point[1];
+        if (dx * dx + dy * dy <= 0.000001) continue;
         var extend_start: f64 = 0.0;
         var extend_end: f64 = 0.0;
         if (!closed and line_cap == .square) {
@@ -1958,7 +2061,11 @@ fn polygonEdgeDistanceWithCap(
         best = @min(best, pointSegmentDistanceExtended(x, y, point, next, extend_start, extend_end));
     }
     if (closed and points.len > 2) {
-        best = @min(best, pointSegmentDistanceExtended(x, y, points[points.len - 1], points[0], 0, 0));
+        const last = points[points.len - 1];
+        const first = points[0];
+        if (segmentLengthSquared(last, first) > 0.000001) {
+            best = @min(best, pointSegmentDistanceExtended(x, y, last, first, 0, 0));
+        }
     }
     if (!closed and line_cap == .round) {
         best = @min(best, pointDistance(x, y, points[0]));
@@ -2009,6 +2116,12 @@ fn pointSegmentDistanceAndAlong(x: f64, y: f64, a: [2]f64, b: [2]f64) struct { d
         .along = t * len,
         .length = len,
     };
+}
+
+fn segmentLengthSquared(a: [2]f64, b: [2]f64) f64 {
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    return dx * dx + dy * dy;
 }
 
 fn pointSegmentDistanceExtended(x: f64, y: f64, a: [2]f64, b: [2]f64, extend_start: f64, extend_end: f64) f64 {
@@ -2446,11 +2559,16 @@ fn compositeGroupCanvas(canvas: []u8, group_canvas: []const u8) void {
 }
 
 fn compositeGroupCanvasCancelable(canvas: []u8, group_canvas: []const u8, cancellation: reader.CancellationProbe) !void {
+    return try compositeGroupCanvasModeCancelable(canvas, group_canvas, 0xff, .normal, cancellation);
+}
+
+fn compositeGroupCanvasModeCancelable(canvas: []u8, group_canvas: []const u8, alpha: u8, blend_mode: reader.BlendMode, cancellation: reader.CancellationProbe) !void {
     var i: usize = 0;
     while (i + 3 < group_canvas.len) : (i += 4) {
         if (i & 65_535 == 0) try cancellation.check();
         if (group_canvas[i + 3] == 0) continue;
-        blendPixelMode(canvas, i, .{ group_canvas[i + 0], group_canvas[i + 1], group_canvas[i + 2], group_canvas[i + 3] }, .normal);
+        const source_alpha: u8 = @intCast((@as(u16, group_canvas[i + 3]) * @as(u16, alpha) + 127) / 255);
+        blendPixelMode(canvas, i, .{ group_canvas[i + 0], group_canvas[i + 1], group_canvas[i + 2], source_alpha }, blend_mode);
     }
 }
 
@@ -2660,6 +2778,13 @@ test "blend pixel mode normal alpha blends without blend channel math" {
     var canvas = [_]u8{ 0x20, 0x40, 0x60, 0xff };
     blendPixelMode(&canvas, 0, .{ 0x80, 0x90, 0xa0, 0x80 }, .normal);
     try std.testing.expectEqualSlices(u8, &.{ 0x50, 0x68, 0x80, 0xff }, &canvas);
+}
+
+test "transparency group boundary applies alpha and blend mode once" {
+    var canvas = [_]u8{ 0xff, 0xff, 0xff, 0xff };
+    const group = [_]u8{ 0x00, 0x00, 0x00, 0xff };
+    try compositeGroupCanvasModeCancelable(&canvas, &group, 0x80, .multiply, .{});
+    try std.testing.expectEqualSlices(u8, &.{ 0x7f, 0x7f, 0x7f, 0xff }, &canvas);
 }
 
 test "knockout groups remove prior sibling contribution before compositing" {
@@ -3945,6 +4070,28 @@ test "draw shape run round cap paints endpoint beyond segment" {
 
     const endpoint_pixel = ((11 * 24) + 10) * 4;
     try std.testing.expectEqual(@as(u8, 0), canvas[endpoint_pixel]);
+}
+
+test "draw shape run butt cap ignores zero-length segments" {
+    const alloc = std.testing.allocator;
+    const points = try alloc.dupe([2]f64, &.{ .{ 10, 10 }, .{ 10, 10 } });
+    defer alloc.free(points);
+
+    var canvas: [24 * 24 * 4]u8 = undefined;
+    @memset(&canvas, 0xff);
+    drawShapeRun(&canvas, 24, 24, 0, 24, .{
+        .kind = .stroke,
+        .fill_rule = .nonzero,
+        .line_cap = .butt,
+        .line_join = .miter,
+        .miter_limit = 10,
+        .color = .{ 0, 0, 0, 0xff },
+        .stroke_width = 20,
+        .closed = false,
+        .points = points,
+    });
+
+    for (canvas) |channel| try std.testing.expectEqual(@as(u8, 0xff), channel);
 }
 
 test "draw shape run square cap extends beyond endpoint" {

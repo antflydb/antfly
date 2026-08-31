@@ -215,9 +215,10 @@ pub const FourComponentMode = enum {
     /// Adobe CMYK/YCCK samples use the inverted convention expected by
     /// ordinary standalone JPEG viewers.
     jpeg_display,
-    /// Preserve PDF DeviceCMYK sample meaning: zero ink is white and one is
-    /// full ink. This is intentionally opt-in so existing JPEG callers retain
-    /// display-compatible behavior.
+    /// Apply PDF DeviceCMYK sample polarity after DCT reconstruction. This is
+    /// intentionally opt-in so standalone JPEG callers retain the convention
+    /// used by ordinary image viewers. For YCCK this preserves the resulting
+    /// PDF DeviceCMYK component polarity after the APP14 color transform.
     pdf_device_cmyk,
 };
 
@@ -3496,12 +3497,13 @@ fn renderColorPlanesToRgba(
                     const m = samplePlaneValue(planes[1], components[1], max_h, max_v, bits_per_sample, x, y);
                     const yy = samplePlaneValue(planes[2], components[2], max_h, max_v, bits_per_sample, x, y);
                     const k = samplePlaneValue(planes[3], components[3], max_h, max_v, bits_per_sample, x, y);
-                    break :blk if (four_component_mode == .pdf_device_cmyk)
-                        cmykToRgbWide(c, m, yy, k, bits_per_sample)
-                    else if (bits_per_sample == 8)
-                        invertedCmykToRgb(@intCast(c), @intCast(m), @intCast(yy), @intCast(k))
+                    break :blk if (four_component_mode == .jpeg_display)
+                        if (bits_per_sample == 8)
+                            invertedCmykToRgb(@intCast(c), @intCast(m), @intCast(yy), @intCast(k))
+                        else
+                            invertedCmykToRgbWide(c, m, yy, k, bits_per_sample)
                     else
-                        invertedCmykToRgbWide(c, m, yy, k, bits_per_sample);
+                        cmykToRgbWide(c, m, yy, k, bits_per_sample);
                 },
                 .ycck => blk: {
                     const yy = samplePlaneValue(planes[0], components[0], max_h, max_v, bits_per_sample, x, y);
@@ -5263,7 +5265,7 @@ test "decode rgba matches manifest-backed adobe cmyk jpeg fixture" {
     try std.testing.expectEqualSlices(u8, &expected_rgba, decoded.rgba);
 }
 
-test "decode options preserve PDF DeviceCMYK sample semantics" {
+test "PDF DeviceCMYK honors Adobe inverted CMYK encoding" {
     const alloc = std.testing.allocator;
     const manifest = try test_support.loadManifest(alloc, std.testing.io);
     defer test_support.freeManifest(alloc, manifest);
@@ -5275,7 +5277,12 @@ test "decode options preserve PDF DeviceCMYK sample semantics" {
     defer alloc.free(decoded.rgba);
     try std.testing.expectEqual(@as(u32, 3), decoded.width);
     try std.testing.expectEqual(@as(u32, 1), decoded.height);
-    try std.testing.expectEqualSlices(u8, &([_]u8{ 0, 0, 0, 0xff } ** 3), decoded.rgba);
+    const expected_rgba = [_]u8{
+        0xff, 0x00, 0x00, 0xff,
+        0x00, 0xff, 0x00, 0xff,
+        0x00, 0x00, 0xff, 0xff,
+    };
+    try std.testing.expectEqualSlices(u8, &expected_rgba, decoded.rgba);
 }
 
 test "baseline decode options use bounded native DCT scaling" {
