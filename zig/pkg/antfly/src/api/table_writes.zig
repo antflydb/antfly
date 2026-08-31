@@ -792,6 +792,10 @@ fn startupCatchUpMonotonicMs() u64 {
     return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
 }
 const replicated_apply_writer_open_timeout_ns: u64 = 30 * std.time.ns_per_s;
+/// Public write admission must not wait forever behind catalog publication.
+/// Callers with a shorter transport deadline are canceled by the request
+/// context; this bound protects detached/internal callers as well.
+const write_routing_snapshot_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const replicated_apply_writer_open_retry_ns: u64 = 10 * std.time.ns_per_ms;
 const stateless_batch_max_attempts: u8 = 3;
 const stateless_batch_retry_base_ns: u64 = std.time.ns_per_ms;
@@ -9522,7 +9526,13 @@ pub const ProvisionedTableWriteSource = struct {
             };
             if (maybe_cached) |cached| {
                 self.local_db_mutex.unlock();
-                return cached;
+                var validated = cached;
+                errdefer validated.deinit(alloc);
+                try validateProvisionedDbIdentityNamespaceExpected(
+                    managed_open_options.identity_namespace_override,
+                    validated.db,
+                );
+                return validated;
             }
             self.local_db_mutex.unlock();
             return self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, null, managed_open_options) catch |err| {
@@ -15843,7 +15853,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn coalesceCompatibleEntry(first: *const WriteCoalesceEntry, candidate: *const WriteCoalesceEntry) bool {
-        return first.sync_level == candidate.sync_level and first.timestamp_ns == candidate.timestamp_ns;
+        return first.sync_level == candidate.sync_level and
+            first.timestamp_ns == candidate.timestamp_ns and
+            first.group.topology_epoch == candidate.group.topology_epoch and
+            std.meta.eql(first.group.identity_namespace, candidate.group.identity_namespace);
     }
 
     fn coalescedEntryBatchRequest(entry: *const WriteCoalesceEntry) db_mod.types.BatchRequest {
@@ -16036,7 +16049,11 @@ pub const ProvisionedTableWriteSource = struct {
             return;
         }
 
-        var merged = GroupBatch{ .group_id = group_id };
+        var merged = GroupBatch{
+            .group_id = group_id,
+            .identity_namespace = entries[0].group.identity_namespace,
+            .topology_epoch = entries[0].group.topology_epoch,
+        };
         merged.writes.ensureTotalCapacity(arena_alloc, totalCoalescedWrites(entries)) catch |err| {
             self.finishCoalescedEntries(entries, err);
             return;
@@ -16148,7 +16165,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer alloc.free(path);
         if (self.write_cache) |cache| {
             const target_generation = self.visibleRootGeneration(group.group_id);
-            var cached = try self.getOrOpenCachedDbForLocalMutation(
+            var cached = try self.getOrOpenCachedDbForLocalMutationWithOptions(
                 alloc,
                 cache,
                 path,
@@ -16156,14 +16173,16 @@ pub const ProvisionedTableWriteSource = struct {
                 target_generation,
                 table_name,
                 true,
+                .{ .identity_namespace_override = group.identity_namespace },
             );
             defer cached.deinit(alloc);
+            try validateProvisionedDbIdentityNamespaceExpected(group.identity_namespace, cached.db);
             try applyGroupBatchWithSchemaJson(alloc, cached.db, cached.schema_json, group, req, cancellation);
             cache.publishCachedLeaseGeneration(&cached, target_generation);
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group.group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGateAndIdentity(alloc, path, self.catalog, table_name, group.group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror, group.identity_namespace);
             defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group.group_id, &db);
+            try validateProvisionedDbIdentityNamespaceExpected(group.identity_namespace, &db);
             try applyGroupBatch(alloc, self.catalog, &db, table_name, group, req, cancellation);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group.group_id, &db);
         }
@@ -16208,26 +16227,27 @@ pub const ProvisionedTableWriteSource = struct {
             grouped.deinit(alloc);
         }
 
-        var snapshot = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&snapshot);
-        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
-        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
-        defer metadata_admin.freeRangeRefs(alloc, ranges);
-        if (ranges.len == 0) return null;
+        var routing = (try table_catalog.authoritativeTableRoutingSnapshot(
+            alloc,
+            self.catalog,
+            table_name,
+            platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+        )) orelse return null;
+        defer routing.deinit(alloc);
 
         for (req.writes) |write| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, write.key) orelse return null;
-            const group = try ensureGroupBatch(alloc, &grouped, group_id);
+            const route = routing.resolveRouteForKey(write.key) orelse return null;
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, route, routing.topology_epoch);
             try group.writes.append(alloc, write);
         }
         for (req.deletes) |key| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, key) orelse return null;
-            const group = try ensureGroupBatch(alloc, &grouped, group_id);
+            const route = routing.resolveRouteForKey(key) orelse return null;
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, route, routing.topology_epoch);
             try group.deletes.append(alloc, key);
         }
         for (req.transforms) |transform| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, transform.key) orelse return null;
-            const group = try ensureGroupBatch(alloc, &grouped, group_id);
+            const route = routing.resolveRouteForKey(transform.key) orelse return null;
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, route, routing.topology_epoch);
             try group.transforms.append(alloc, transform);
         }
 
@@ -20565,6 +20585,10 @@ test "prepared raft apply reclassifies every transient pre-mutation writer confl
 
 const GroupBatch = struct {
     group_id: u64,
+    /// Authority captured with the key-to-group decision. Local writer
+    /// acquisition consumes this capability instead of re-reading metadata.
+    identity_namespace: ?doc_identity.Namespace = null,
+    topology_epoch: u64 = 0,
     writes: std.ArrayListUnmanaged(db_mod.types.BatchWrite) = .empty,
     deletes: std.ArrayListUnmanaged([]const u8) = .empty,
     transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
@@ -20581,7 +20605,11 @@ fn cloneWriteCoalesceGroupBatch(
     alloc: std.mem.Allocator,
     group: GroupBatch,
 ) !GroupBatch {
-    var cloned = GroupBatch{ .group_id = group.group_id };
+    var cloned = GroupBatch{
+        .group_id = group.group_id,
+        .identity_namespace = group.identity_namespace,
+        .topology_epoch = group.topology_epoch,
+    };
     errdefer freeWriteCoalesceGroupBatch(alloc, &cloned);
 
     try cloned.writes.ensureTotalCapacity(alloc, group.writes.items.len);
@@ -20621,6 +20649,30 @@ fn ensureGroupBatch(
         if (group.group_id == group_id) return group;
     }
     try grouped.append(alloc, .{ .group_id = group_id });
+    return &grouped.items[grouped.items.len - 1];
+}
+
+fn ensureRoutedGroupBatch(
+    alloc: std.mem.Allocator,
+    grouped: *std.ArrayListUnmanaged(GroupBatch),
+    route: table_catalog.CatalogGroupRoute,
+    topology_epoch: u64,
+) !*GroupBatch {
+    const identity_namespace = docIdentityNamespaceFromCatalog(route.identity_namespace);
+    for (grouped.items) |*group| {
+        if (group.group_id != route.group_id) continue;
+        if (group.topology_epoch != topology_epoch or
+            !std.meta.eql(group.identity_namespace, @as(?doc_identity.Namespace, identity_namespace)))
+        {
+            return error.TopologyChanged;
+        }
+        return group;
+    }
+    try grouped.append(alloc, .{
+        .group_id = route.group_id,
+        .identity_namespace = identity_namespace,
+        .topology_epoch = topology_epoch,
+    });
     return &grouped.items[grouped.items.len - 1];
 }
 
@@ -21552,7 +21604,31 @@ fn openManagedDbForTableGroupWithRuntimeAndHAWriteGate(
     ha_write_gate: ?db_mod.HAWriteGate,
     ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
 ) !db_mod.DB {
-    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime, ha_write_gate, ha_async_mirror);
+    return try openManagedDbForTableGroupWithRuntimeAndHAWriteGateAndIdentity(
+        alloc,
+        path,
+        catalog,
+        table_name,
+        group_id,
+        backend_runtime,
+        ha_write_gate,
+        ha_async_mirror,
+        null,
+    );
+}
+
+fn openManagedDbForTableGroupWithRuntimeAndHAWriteGateAndIdentity(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    ha_write_gate: ?db_mod.HAWriteGate,
+    ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
+    identity_namespace: ?doc_identity.Namespace,
+) !db_mod.DB {
+    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGateAndIdentity(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime, ha_write_gate, ha_async_mirror, identity_namespace);
 }
 
 fn openManagedDbForTableWithCache(
@@ -21620,8 +21696,41 @@ fn openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(
     ha_write_gate: ?db_mod.HAWriteGate,
     ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
 ) !db_mod.DB {
+    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGateAndIdentity(
+        alloc,
+        path,
+        catalog,
+        table_name,
+        group_id,
+        lsm_cache,
+        hbc_cache,
+        lsm_root_generation,
+        resource_manager,
+        backend_runtime,
+        ha_write_gate,
+        ha_async_mirror,
+        null,
+    );
+}
+
+fn openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGateAndIdentity(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    lsm_cache: ?*lsm_backend.Cache,
+    hbc_cache: ?*hbc_mod.Cache,
+    lsm_root_generation: u64,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    ha_write_gate: ?db_mod.HAWriteGate,
+    ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
+    identity_namespace_override: ?doc_identity.Namespace,
+) !db_mod.DB {
     const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default, ha_async_mirror);
-    const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
+    const identity_namespace = identity_namespace_override orelse
+        try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
     const indexes_json = (try loadTableIndexesJson(alloc, catalog, table_name)) orelse {
         var db = try db_mod.DB.open(alloc, path, .{
             .lsm_cache = lsm_cache,
@@ -26460,7 +26569,9 @@ fn loadTableIdentityNamespaceForGroup(
     // it behind the compact linearizable barrier; eventual positives are only
     // safe for tentative reads because a removed/reassigned group may still
     // be present in a follower or TTL cache.
-    var snapshot = try (try catalog.routingSource()).linearizableSnapshot(null);
+    var snapshot = try (try catalog.routingSource()).linearizableSnapshot(
+        platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+    );
     defer snapshot.deinit();
     var table_id: ?u64 = null;
     for (snapshot.value.tables) |table| {
@@ -34726,8 +34837,8 @@ test "provisioned create index updates cached writer in place" {
     const Fence = struct {
         cache: *runtime_status.TableRuntimeSnapshotCache,
         calls: usize = 0,
-        structural_calls: usize = 0,
-        publication_attempted_before_structural: bool = false,
+        reconciled_calls: usize = 0,
+        publication_attempted_before_reconciled: bool = false,
 
         fn run(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -34736,10 +34847,10 @@ test "provisioned create index updates cached writer in place" {
         }
 
         fn onChange(ptr: *anyopaque, _: []const u8, kind: ProvisionedTableWriteSource.LocalChangeKind) void {
-            if (kind != .structural) return;
+            if (kind != .runtime_reconciled) return;
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.structural_calls += 1;
-            self.publication_attempted_before_structural = self.calls != 0;
+            self.reconciled_calls += 1;
+            self.publication_attempted_before_reconciled = self.calls != 0;
         }
     };
     var fence = Fence{ .cache = &status_cache };
@@ -34756,8 +34867,8 @@ test "provisioned create index updates cached writer in place" {
     // concurrent invalidation can fence that observation without retrying or
     // rolling back the already-committed index admission.
     try std.testing.expectEqual(@as(usize, 1), fence.calls);
-    try std.testing.expectEqual(@as(usize, 1), fence.structural_calls);
-    try std.testing.expect(fence.publication_attempted_before_structural);
+    try std.testing.expectEqual(@as(usize, 1), fence.reconciled_calls);
+    try std.testing.expect(fence.publication_attempted_before_reconciled);
     source.publishWriteCacheRuntimeStatusesForTableBestEffort(alloc, "docs");
     var published_status = (try status_cache.snapshotGroupStatus(alloc, "docs", 7001)) orelse
         return error.TestUnexpectedResult;

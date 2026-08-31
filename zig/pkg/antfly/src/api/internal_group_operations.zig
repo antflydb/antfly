@@ -119,6 +119,24 @@ pub const Operations = struct {
         return reads;
     }
 
+    fn mapCommonReadError(err: anyerror) ?Error {
+        return switch (err) {
+            error.Timeout,
+            error.DeadlineExceeded,
+            error.CatalogRoutingSnapshotTimeout,
+            => error.DeadlineExceeded,
+            error.Cancelled, error.Canceled => error.Canceled,
+            error.TopologyChanged => error.TopologyChanged,
+            error.IdentityReadGenerationChanged => error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
+            error.StorageReadTemporarilyUnavailable => error.StorageReadTemporarilyUnavailable,
+            error.CatalogRoutingUnavailable,
+            error.CatalogProjectionRefreshRequired,
+            => error.Unavailable,
+            else => null,
+        };
+    }
+
     pub fn corruptEmbeddingArtifact(
         self: Operations,
         alloc: std.mem.Allocator,
@@ -596,15 +614,7 @@ pub const Operations = struct {
             input.key,
             options,
             input.consistency,
-        ) catch |err| switch (err) {
-            error.Timeout => return error.DeadlineExceeded,
-            error.Cancelled, error.Canceled => return error.Canceled,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            else => return error.Internal,
-        };
+        ) catch |err| return mapCommonReadError(err) orelse error.Internal;
         return result orelse error.NotFound;
     }
 
@@ -621,13 +631,12 @@ pub const Operations = struct {
     ) Error!db_mod.types.DocumentArtifactManifest {
         try request.ensureActive();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .read_index) catch |err| switch (err) {
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
-            else => return error.Internal,
+        return (reads.documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .read_index) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.UnknownGroup, error.TableNotFound, error.NotFound => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
@@ -643,13 +652,12 @@ pub const Operations = struct {
     ) Error!db_mod.types.DocumentArtifactManifestList {
         try request.ensureActive();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, .read_index) catch |err| switch (err) {
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
-            else => return error.Internal,
+        return (reads.documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, .read_index) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.UnknownGroup, error.TableNotFound, error.NotFound => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
@@ -666,13 +674,8 @@ pub const Operations = struct {
     ) Error!table_reads.ScanResponse {
         try request.ensureActive();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.scanGroupLocal(alloc, group_id, table_name, from, to, options, .read_index) catch |err| switch (err) {
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            else => return error.Internal,
-        }) orelse error.NotFound;
+        return (reads.scanGroupLocal(alloc, group_id, table_name, from, to, options, .read_index) catch |err|
+            return mapCommonReadError(err) orelse error.Internal) orelse error.NotFound;
     }
 
     /// Execute a schema-routed group-local query. The returned response owns
@@ -687,15 +690,14 @@ pub const Operations = struct {
     ) Error!query_api.QueryResponse {
         try request.ensureActive();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.queryGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
-            error.HierarchyCursorStale => return error.HierarchyCursorStale,
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return error.InvalidArgument,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            error.UnknownGroup, error.TableNotFound => return error.NotFound,
-            else => return error.Internal,
+        return (reads.queryGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.HierarchyCursorStale => error.HierarchyCursorStale,
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => error.InvalidArgument,
+                error.UnknownGroup, error.TableNotFound => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
@@ -713,83 +715,77 @@ pub const Operations = struct {
     ) Error!runtime_preflight.RuntimePreflightSummary {
         try request.ensureActive();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.preflightQueryGroupLocal(alloc, group_id, table_name, input, .read_index, max_work) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return error.InvalidArgument,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            error.UnknownGroup, error.TableNotFound => return error.NotFound,
-            else => return error.Internal,
+        return (reads.preflightQueryGroupLocal(alloc, group_id, table_name, input, .read_index, max_work) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => error.InvalidArgument,
+                error.UnknownGroup, error.TableNotFound => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
     pub fn graphExpand(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphExpandRequest) Error!distributed_graph.GraphExpandResponse {
         try request.ensureActive();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.graphExpandGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => return error.InvalidArgument,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            error.UnknownGroup, error.TableNotFound => return error.NotFound,
-            else => return error.Internal,
+        return (reads.graphExpandGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => error.InvalidArgument,
+                error.UnknownGroup, error.TableNotFound => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
     pub fn graphHydrate(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphHydrateRequest) Error!distributed_graph.GraphHydrateResponse {
         try request.ensureActive();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.graphHydrateGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            error.UnknownGroup, error.TableNotFound => return error.NotFound,
-            else => return error.Internal,
+        return (reads.graphHydrateGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.UnknownGroup, error.TableNotFound => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
     pub fn graphEdges(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphEdgesRequest) Error!distributed_graph.GraphEdgesResponse {
         try request.ensureActive();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.graphEdgesGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.IndexNotFound => return error.InvalidArgument,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            error.UnknownGroup, error.TableNotFound => return error.NotFound,
-            else => return error.Internal,
+        return (reads.graphEdgesGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.InvalidQueryRequest, error.IndexNotFound => error.InvalidArgument,
+                error.UnknownGroup, error.TableNotFound => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
     pub fn textStats(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, body: []const u8) Error!query_api.QueryResponse {
         try request.ensureActive();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.textStatsGroupLocal(alloc, group_id, table_name, body) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidArgument,
-            error.TableNotFound, error.UnknownGroup => return error.NotFound,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            else => return error.Internal,
+        return (reads.textStatsGroupLocal(alloc, group_id, table_name, body) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest => error.InvalidArgument,
+                error.TableNotFound, error.UnknownGroup => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
     pub fn algebraicPartials(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, body: []const u8) Error!query_api.QueryResponse {
         try request.ensureActive();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.algebraicPartialsGroupLocal(alloc, group_id, table_name, body) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidArgument,
-            error.TableNotFound, error.UnknownGroup => return error.NotFound,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            else => return error.Internal,
+        return (reads.algebraicPartialsGroupLocal(alloc, group_id, table_name, body) catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return switch (err) {
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest => error.InvalidArgument,
+                error.TableNotFound, error.UnknownGroup => error.NotFound,
+                else => error.Internal,
+            };
         }) orelse error.NotFound;
     }
 
@@ -1337,6 +1333,14 @@ test "typed internal query workers preserve identity generation validation" {
 
 test "typed internal group reads preserve retryable resident storage failures" {
     const alloc = std.testing.allocator;
+    try std.testing.expectEqual(
+        error.DeadlineExceeded,
+        Operations.mapCommonReadError(error.CatalogRoutingSnapshotTimeout).?,
+    );
+    try std.testing.expectEqual(
+        error.Unavailable,
+        Operations.mapCommonReadError(error.CatalogRoutingUnavailable).?,
+    );
     const FakeReads = struct {
         fn source() table_reads.TableReadSource {
             return .{ .ptr = undefined, .vtable = &.{

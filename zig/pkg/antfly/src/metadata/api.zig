@@ -317,6 +317,8 @@ pub const CatalogGroupRoute = struct {
 
 pub const catalog_route_fence_protocol_current: u16 = 1;
 pub const catalog_route_fence_header = "X-Antfly-Catalog-Route-Fence";
+pub const catalog_route_fence_ack_header = "X-Antfly-Catalog-Route-Fence-Ack";
+pub const catalog_route_fence_ack_value = "1";
 
 /// Immutable authority and identity carried with every first-party
 /// group-local read. The receiver validates this against its compact routing

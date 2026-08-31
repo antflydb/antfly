@@ -955,6 +955,19 @@ pub const AntflyApiHandler = struct {
     }
 
     fn operationContext(ctx: *httpx.Context, identity: ?AuthenticatedIdentity) operation_contract.RequestContext {
+        const catalog_route_fence_json = ctx.header(metadata_api.catalog_route_fence_header) orelse "";
+        if (catalog_route_fence_json.len != 0) {
+            // The operation layer validates the encoded fence before storage
+            // admission. Echoing the protocol only proves that this binary
+            // participates in that contract; callers still require a 2xx
+            // response before accepting the acknowledgement. If response
+            // header allocation fails, omitting the ack makes the coordinator
+            // fail closed with a retryable availability error.
+            ctx.setHeader(
+                metadata_api.catalog_route_fence_ack_header,
+                metadata_api.catalog_route_fence_ack_value,
+            ) catch {};
+        }
         return .{
             .cancellation = if (ctx.cancellation != null or ctx.cancellation_probe != null) .{
                 .ptr = ctx,
@@ -972,7 +985,7 @@ pub const AntflyApiHandler = struct {
                 .subject = authenticated.username,
             } else null,
             .destination_authorization_principal = http_server_mod.storedDestinationPrincipal(identity),
-            .catalog_route_fence_json = ctx.header(metadata_api.catalog_route_fence_header) orelse "",
+            .catalog_route_fence_json = catalog_route_fence_json,
         };
     }
 
@@ -1813,6 +1826,7 @@ pub const AntflyApiHandler = struct {
     fn internalCapabilities(_: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return ctx.json(.{
             .data_raft_batch_protocol_version = internal_batch_forwarding.raft_batch_protocol_version,
+            .catalog_route_fence_protocol_version = metadata_api.catalog_route_fence_protocol_current,
         });
     }
 

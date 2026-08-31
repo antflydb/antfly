@@ -375,7 +375,7 @@ pub const RoutingSession = struct {
         .route_identity = routeIdentity,
         .route_fence = routeFence,
         .resolve_route = resolvePinnedRoute,
-        .validate_route = resolveCurrentRoute,
+        .validate_route = resolveObservedRoute,
         .wait_for_routing_change = waitForRoutingChange,
         .requires_linearizable_publication_fence = true,
         .validate_publication = validatePublication,
@@ -483,7 +483,7 @@ pub const RoutingSession = struct {
         return error.CatalogProjectionRefreshRequired;
     }
 
-    fn resolveCurrentRoute(
+    fn resolveObservedRoute(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -491,14 +491,13 @@ pub const RoutingSession = struct {
         deadline_ns: ?u64,
     ) !RouteResult {
         const self = cast(ptr);
-        var snapshot = (try self.base.routingSource()).linearizableSnapshot(deadline_ns) catch |err| switch (err) {
-            error.CatalogRoutingSnapshotTimeout => return .timed_out,
-            else => return err,
-        };
-        defer snapshot.deinit();
-        if (try routePlanFromSnapshot(alloc, snapshot.value, table_name, query)) |plan|
-            return .{ .found = plan };
-        return .not_found;
+        // Route consumption is deliberately eventually consistent. Recheck
+        // against the latest compact projection so a receiver that has
+        // observed a cutover rejects an older capability, without placing a
+        // linearizable metadata barrier on every query. Miss confirmation and
+        // publication/structural validation retain their separate authority
+        // paths through resolveCatalogRoute and publication contracts.
+        return try resolveCatalogRoute(alloc, self.base, table_name, query, deadline_ns);
     }
 
     fn waitForRoutingChange(
@@ -920,6 +919,67 @@ pub fn resolveGroupForKeyFromRanges(
     return null;
 }
 
+/// One authoritative, compact table projection suitable for write admission.
+/// It pins key routing, storage identity, and topology epoch to the same
+/// linearizable catalog revision without capturing operational admin state.
+pub const AuthoritativeTableRoutingSnapshot = struct {
+    snapshot: OwnedRoutingSnapshot,
+    table_id: u64,
+    ranges: []const *const metadata_table_manager.RangeRecord,
+    topology_epoch: u64,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.ranges);
+        self.snapshot.deinit();
+        self.* = undefined;
+    }
+
+    pub fn resolveRouteForKey(self: *const @This(), key: []const u8) ?CatalogGroupRoute {
+        for (self.ranges) |range| {
+            if (!rangeContainsKey(range.*, key)) continue;
+            const range_id = metadata_table_manager.rangeDocIdentityRangeId(range.*);
+            return .{
+                .group_id = range.group_id,
+                .range_id = range_id,
+                .identity_namespace = .{
+                    .table_id = self.table_id,
+                    .shard_id = metadata_table_manager.rangeDocIdentityShardId(range.*),
+                    .range_id = range_id,
+                },
+            };
+        }
+        return null;
+    }
+};
+
+pub fn authoritativeTableRoutingSnapshot(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    deadline_ns: ?u64,
+) !?AuthoritativeTableRoutingSnapshot {
+    var snapshot = try (try catalog.routingSource()).linearizableSnapshot(deadline_ns);
+    errdefer snapshot.deinit();
+    const table = findTableByName(snapshot.value.tables, table_name) orelse {
+        snapshot.deinit();
+        return null;
+    };
+    const ranges = try listTableRanges(alloc, snapshot.value.ranges, table.table_id);
+    errdefer alloc.free(ranges);
+    if (ranges.len == 0) {
+        alloc.free(ranges);
+        snapshot.deinit();
+        return null;
+    }
+    sortRangeRefs(ranges);
+    return .{
+        .snapshot = snapshot,
+        .table_id = table.table_id,
+        .ranges = ranges,
+        .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
+    };
+}
+
 /// Owns one catalog snapshot and its sorted table-range projection for the
 /// lifetime of transaction routing. This keeps every key in a table pinned to
 /// the same topology without taking a catalog snapshot for each operation.
@@ -1084,6 +1144,74 @@ test "routing topology epoch fences identity-only changes" {
     const after_ranges = [_]*const metadata_table_manager.RangeRecord{&after};
     try std.testing.expect(topologyEpochFromSortedRanges(table, &before_ranges) !=
         topologyEpochFromSortedRanges(table, &after_ranges));
+}
+
+test "authoritative write routing pins keys and identity in one compact snapshot" {
+    const State = struct {
+        linearizable_calls: usize = 0,
+        free_calls: usize = 0,
+
+        const tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .table_id = 7, .group_id = 7001, .range_id = 71, .start_key = "", .end_key = "m" },
+            .{ .table_id = 7, .group_id = 7002, .range_id = 72, .start_key = "m" },
+        };
+
+        fn source(self: *@This()) CatalogSource {
+            return .{ .ptr = self, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = eventualSnapshot,
+                .linearizable_routing_snapshot = linearizableSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
+            } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.AdminSnapshotUsedForWriteRouting;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn eventualSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return error.EventualSnapshotUsedForWriteRouting;
+        }
+
+        fn linearizableSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.linearizable_calls += 1;
+            return .{
+                .catalog_revision = 19,
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(ptr: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.free_calls += 1;
+        }
+    };
+
+    var state = State{};
+    {
+        var routing = (try authoritativeTableRoutingSnapshot(
+            std.testing.allocator,
+            state.source(),
+            "docs",
+            null,
+        )).?;
+        defer routing.deinit(std.testing.allocator);
+
+        const left = routing.resolveRouteForKey("a").?;
+        const right = routing.resolveRouteForKey("z").?;
+        try std.testing.expectEqual(@as(u64, 7001), left.group_id);
+        try std.testing.expectEqual(@as(u64, 71), left.identity_namespace.range_id);
+        try std.testing.expectEqual(@as(u64, 7002), right.group_id);
+        try std.testing.expectEqual(@as(u64, 72), right.identity_namespace.range_id);
+    }
+    try std.testing.expectEqual(@as(usize, 1), state.linearizable_calls);
+    try std.testing.expectEqual(@as(usize, 1), state.free_calls);
 }
 
 pub fn transactionTopologyEpoch(
@@ -2372,6 +2500,7 @@ test "routing session validates a pinned selection against current topology" {
     const TestState = struct {
         eventual_calls: usize = 0,
         linearizable_calls: usize = 0,
+        publish_current: bool = false,
     };
     const FakeCatalog = struct {
         const tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
@@ -2399,9 +2528,12 @@ test "routing session validates a pinned selection against current topology" {
             state.eventual_calls += 1;
             return .{
                 .metadata_group_id = 1,
-                .catalog_revision = 9,
+                .catalog_revision = if (state.publish_current) 10 else 9,
                 .tables = @constCast(tables[0..]),
-                .ranges = @constCast(eventual_ranges[0..]),
+                .ranges = if (state.publish_current)
+                    @constCast(current_ranges[0..])
+                else
+                    @constCast(eventual_ranges[0..]),
             };
         }
 
@@ -2439,12 +2571,13 @@ test "routing session validates a pinned selection against current topology" {
         resolveCatalogRoute(std.testing.allocator, source, "docs", .{ .group = 7002 }, null),
     );
     try std.testing.expectEqual(@as(usize, 0), state.linearizable_calls);
+    state.publish_current = true;
     try std.testing.expectError(
         error.TopologyChanged,
         validatePinnedTopologyEpoch(std.testing.allocator, source, "docs", pinned.topology_epoch),
     );
-    try std.testing.expectEqual(@as(usize, 1), state.eventual_calls);
-    try std.testing.expectEqual(@as(usize, 1), state.linearizable_calls);
+    try std.testing.expectEqual(@as(usize, 2), state.eventual_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.linearizable_calls);
 }
 
 test "span routing confirms eventual misses with a linearizable compact snapshot" {

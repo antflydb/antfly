@@ -3362,10 +3362,10 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         try checkQueryDeadline(req);
-        // Queries may discover graph/join target tables after source-table
-        // admission. Capture one authoritative projection up front so every
-        // phase is planned from the same catalog generation.
-        var routing_session = try table_catalog.RoutingSession.init(alloc, self.catalog, req.execution_deadline_ns);
+        var routing_session = if (requiresAuthoritativeRoutingSession(req))
+            try table_catalog.RoutingSession.init(alloc, self.catalog, req.execution_deadline_ns)
+        else
+            try table_catalog.RoutingSession.initForRoute(alloc, self.catalog, table_name, .all_ranges, req.execution_deadline_ns);
         defer routing_session.deinit();
         var routed_source = self.*;
         routed_source.catalog = routing_session.catalog();
@@ -3496,7 +3496,10 @@ pub const ProvisionedTableReadSource = struct {
         try self.ensureHAReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
-            var routing_session = try table_catalog.RoutingSession.init(alloc, self.catalog, req.execution_deadline_ns);
+            var routing_session = if (requiresAuthoritativeRoutingSession(req))
+                try table_catalog.RoutingSession.init(alloc, self.catalog, req.execution_deadline_ns)
+            else
+                try table_catalog.RoutingSession.initForRoute(alloc, self.catalog, table_name, .all_ranges, req.execution_deadline_ns);
             defer routing_session.deinit();
             var routed_source = self.*;
             routed_source.catalog = routing_session.catalog();
@@ -4318,7 +4321,19 @@ pub const HostedProvisionedTableReadSource = struct {
                 return error.CatalogRouteFenceRequired;
             }
         }
-        return client.executeRequest(routed_request);
+        var response = try client.executeRequest(routed_request);
+        errdefer response.deinit(alloc);
+        if (encoded_fence != null) {
+            const ack = response.header(metadata_api.catalog_route_fence_ack_header) orelse {
+                std.log.warn("routed read peer did not acknowledge catalog fence uri={s}", .{request.uri});
+                return error.StorageReadTemporarilyUnavailable;
+            };
+            if (!std.mem.eql(u8, ack, metadata_api.catalog_route_fence_ack_value)) {
+                std.log.warn("routed read peer returned unsupported catalog fence acknowledgement uri={s} ack={s}", .{ request.uri, ack });
+                return error.StorageReadTemporarilyUnavailable;
+            }
+        }
+        return response;
     }
 
     fn internalGroupIdFromUri(uri: []const u8) ?u64 {
@@ -4808,7 +4823,10 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try checkQueryDeadline(req);
-        var routing_session = try table_catalog.RoutingSession.init(alloc, hosted.catalog, req.execution_deadline_ns);
+        var routing_session = if (requiresAuthoritativeRoutingSession(req))
+            try table_catalog.RoutingSession.init(alloc, hosted.catalog, req.execution_deadline_ns)
+        else
+            try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .all_ranges, req.execution_deadline_ns);
         defer routing_session.deinit();
         var routed_source = hosted.*;
         routed_source.catalog = routing_session.catalog();
@@ -4899,7 +4917,10 @@ pub const HostedProvisionedTableReadSource = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var routing_session = try table_catalog.RoutingSession.init(alloc, hosted.catalog, req.execution_deadline_ns);
+        var routing_session = if (requiresAuthoritativeRoutingSession(req))
+            try table_catalog.RoutingSession.init(alloc, hosted.catalog, req.execution_deadline_ns)
+        else
+            try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .all_ranges, req.execution_deadline_ns);
         defer routing_session.deinit();
         var routed_source = hosted.*;
         routed_source.catalog = routing_session.catalog();
@@ -7195,6 +7216,17 @@ fn requiresDistributedGraphCoordinator(
 ) bool {
     return distributed_graph.supportsCrossRange(req) and
         (group_count > 1 or req.graph_table_read_authorizer != null);
+}
+
+/// Only requests that can discover another table need an authoritative
+/// catalog-wide projection. Ordinary one-table reads use the cached compact
+/// projection and let each storage owner validate the carried route fence.
+/// Looking for the exact JSON key is deliberately conservative: a false
+/// positive costs one authoritative capture, while a false negative could mix
+/// table generations across a distributed join.
+fn requiresAuthoritativeRoutingSession(req: db_mod.types.SearchRequest) bool {
+    if (req.graph_queries.len != 0) return true;
+    return std.mem.indexOf(u8, req.aggregations_json, "\"algebraic_join\"") != null;
 }
 
 fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrateRequest, db: *db_mod.DB) !void {
@@ -22172,14 +22204,22 @@ test "hosted hierarchy navigation routes projection-safe hydration and advances 
         }
 
         fn ownedHeader(inner_alloc: std.mem.Allocator, name: []const u8, value: []const u8) ![]http_common.Header {
-            const headers = try inner_alloc.alloc(http_common.Header, 1);
+            const headers = try inner_alloc.alloc(http_common.Header, 2);
             errdefer inner_alloc.free(headers);
             const owned_name = try inner_alloc.dupe(u8, name);
             errdefer inner_alloc.free(owned_name);
             const owned_value = try inner_alloc.dupe(u8, value);
+            errdefer inner_alloc.free(owned_value);
+            const ack_name = try inner_alloc.dupe(u8, metadata_api.catalog_route_fence_ack_header);
+            errdefer inner_alloc.free(ack_name);
+            const ack_value = try inner_alloc.dupe(u8, metadata_api.catalog_route_fence_ack_value);
             headers[0] = .{
                 .name = owned_name,
                 .value = owned_value,
+            };
+            headers[1] = .{
+                .name = ack_name,
+                .value = ack_value,
             };
             return headers;
         }
@@ -26617,8 +26657,15 @@ test "hosted table read source preflights mixed local and remote groups" {
             self.call_count += 1;
             try std.testing.expect(std.mem.endsWith(u8, req.uri, "/internal/v1/groups/8/tables/docs/query-preflight"));
             try std.testing.expectEqual(http_common.Method.POST, req.method);
+            const headers = try alloc_inner.alloc(http_common.Header, 1);
+            errdefer alloc_inner.free(headers);
+            const ack_name = try alloc_inner.dupe(u8, metadata_api.catalog_route_fence_ack_header);
+            errdefer alloc_inner.free(ack_name);
+            const ack_value = try alloc_inner.dupe(u8, metadata_api.catalog_route_fence_ack_value);
+            headers[0] = .{ .name = ack_name, .value = ack_value };
             return .{
                 .status = 400,
+                .headers = headers,
                 .body = try alloc_inner.dupe(u8, "IndexNotFound"),
             };
         }
@@ -26672,6 +26719,100 @@ test "authenticated single-group graph queries require distributed coordination"
     req.graph_table_read_authorizer = null;
     try std.testing.expect(!requiresDistributedGraphCoordinator(1, req));
     try std.testing.expect(requiresDistributedGraphCoordinator(2, req));
+}
+
+test "routing sessions reserve authoritative snapshots for cross-table plans" {
+    try std.testing.expect(!requiresAuthoritativeRoutingSession(.{}));
+    try std.testing.expect(!requiresAuthoritativeRoutingSession(.{
+        .aggregations_json = "{\"terms\":{\"field\":\"kind\"}}",
+    }));
+    try std.testing.expect(requiresAuthoritativeRoutingSession(.{
+        .aggregations_json = "{\"joined\":{\"algebraic_join\":{\"right_table\":\"users\"}}}",
+    }));
+}
+
+test "routed internal reads require an explicit peer fence acknowledgement" {
+    const FakeCatalog = struct {
+        fn routeFence(_: *anyopaque, group_id: u64) !?metadata_api.CatalogRouteFence {
+            return .{
+                .metadata_group_id = 1,
+                .catalog_revision = 2,
+                .table_id = 7,
+                .topology_epoch = 3,
+                .route = .{
+                    .group_id = group_id,
+                    .range_id = 71,
+                    .identity_namespace = .{ .table_id = 7, .shard_id = group_id, .range_id = 71 },
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminSnapshot;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn source() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .route_fence = routeFence,
+            } };
+        }
+    };
+
+    const Executor = struct {
+        acknowledge: bool,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var carried_fence = false;
+            for (req.headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, metadata_api.catalog_route_fence_header)) carried_fence = true;
+            }
+            try std.testing.expect(carried_fence);
+            const headers = try alloc.alloc(http_common.Header, if (self.acknowledge) 1 else 0);
+            errdefer alloc.free(headers);
+            if (self.acknowledge) {
+                const name = try alloc.dupe(u8, metadata_api.catalog_route_fence_ack_header);
+                errdefer alloc.free(name);
+                const value = try alloc.dupe(u8, metadata_api.catalog_route_fence_ack_value);
+                headers[0] = .{ .name = name, .value = value };
+            }
+            return .{
+                .status = 200,
+                .headers = headers,
+                .body = try alloc.dupe(u8, "{}"),
+            };
+        }
+    };
+
+    const request = http_common.HttpRequest{
+        .method = .GET,
+        .uri = "http://peer.test/internal/v1/groups/7001/tables/docs/documents/doc:a",
+    };
+    var executor = Executor{ .acknowledge = false };
+    var hosted = HostedProvisionedTableReadSource{
+        .replica_root_dir = "",
+        .catalog = FakeCatalog.source(),
+        .requester = undefined,
+        .router = undefined,
+        .executor = executor.iface(),
+    };
+    try std.testing.expectError(
+        error.StorageReadTemporarilyUnavailable,
+        HostedProvisionedTableReadSource.executeInternalRequest(&hosted, std.testing.allocator, request),
+    );
+
+    executor.acknowledge = true;
+    var response = try HostedProvisionedTableReadSource.executeInternalRequest(&hosted, std.testing.allocator, request);
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
 }
 
 test "hosted cross-range graph query expands explicit local start keys" {
