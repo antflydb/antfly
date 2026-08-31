@@ -73,6 +73,11 @@ const table_mutation_campaign_response_reserve_ms: u32 = 50;
 const reallocation_protocol_probe_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const table_topology_protocol_probe_concurrency: usize = 8;
 const table_topology_protocol_probe_wait_ns: u64 = 25 * std.time.ns_per_ms;
+/// Bound repeated peer fanout when a rolling upgrade, configuration error, or
+/// unavailable member makes topology-format admission impossible. This is
+/// deliberately short: callers in the same burst share one result, while an
+/// operator repair becomes observable without a long stale-failure window.
+const table_topology_protocol_probe_failure_cache_ns: u64 = std.time.ns_per_s;
 const runtime_status_protocol_probe_min_backoff_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_max_backoff_ns: u64 = 60 * std.time.ns_per_s;
 const table_catalog_mutation_lane_count: usize = 64;
@@ -839,9 +844,16 @@ const TableTopologyProtocolProbeCoordinator = struct {
     wake_epoch: std.atomic.Value(u32) = .init(0),
     cached: ?CompletedProbe = null,
 
+    const Outcome = enum {
+        ready,
+        upgrade_required,
+    };
+
     const CompletedProbe = struct {
         completion_epoch: u32,
         readiness: TableTopologyProtocolReadiness,
+        outcome: Outcome = .ready,
+        retry_after_ns: u64 = 0,
     };
 
     const Lease = struct {
@@ -861,9 +873,11 @@ const TableTopologyProtocolProbeCoordinator = struct {
         }
 
         fn deinit(self: *Lease) void {
-            self.coordinator.lane.unlock();
             if (self.publishes_completion) {
                 _ = self.coordinator.wake_epoch.fetchAdd(1, .release);
+            }
+            self.coordinator.lane.unlock();
+            if (self.publishes_completion) {
                 std.Io.futexWake(
                     std.Options.debug_io,
                     u32,
@@ -874,6 +888,29 @@ const TableTopologyProtocolProbeCoordinator = struct {
             self.* = undefined;
         }
     };
+
+    fn reusableOutcome(
+        self: *const @This(),
+        expected: TableTopologyProtocolReadiness,
+        now_ns: u64,
+        joined_completion_epoch: ?u32,
+    ) ?Outcome {
+        const completed = self.cached orelse return null;
+        if (!tableTopologyReadinessEqual(completed.readiness, expected)) return null;
+        return switch (completed.outcome) {
+            .ready => .ready,
+            // A bounded negative cache protects later request bursts. A
+            // caller already queued behind this exact completion consumes it
+            // regardless of scheduler delay, so one cohort can never fan out
+            // the same failed probe repeatedly after the deadline expires.
+            .upgrade_required => if (now_ns < completed.retry_after_ns or
+                (joined_completion_epoch != null and
+                    joined_completion_epoch.? == completed.completion_epoch))
+                .upgrade_required
+            else
+                null,
+        };
+    }
 
     fn tryAcquire(self: *@This()) ?Lease {
         if (!self.lane.tryLock()) return null;
@@ -911,7 +948,7 @@ test "metadata proposal receipt progress uses a single transferable driver" {
     next.deinit();
 }
 
-test "table topology protocol probes cache only matching readiness" {
+test "table topology protocol probes share matching success and bounded failure" {
     var coordinator = TableTopologyProtocolProbeCoordinator{};
     var first = coordinator.tryAcquire() orelse return error.TestExpectedEqual;
     try std.testing.expect(coordinator.tryAcquire() == null);
@@ -922,17 +959,20 @@ test "table topology protocol probes cache only matching readiness" {
         .protected_member_count = 2,
         .protected_membership_fingerprint = [_]u8{7} ** std.crypto.hash.sha2.Sha256.digest_length,
     };
+    const first_completion_epoch = first.completionEpoch();
     coordinator.cached = .{
-        .completion_epoch = first.completionEpoch(),
+        .completion_epoch = first_completion_epoch,
         .readiness = readiness,
     };
     first.publishCompletion();
-    const observed = coordinator.currentEpoch();
     first.deinit();
-    try std.testing.expect(coordinator.currentEpoch() != observed);
+    try std.testing.expectEqual(first_completion_epoch, coordinator.currentEpoch());
 
     var second = coordinator.tryAcquire() orelse return error.TestExpectedEqual;
-    try std.testing.expect(tableTopologyReadinessEqual(coordinator.cached.?.readiness, readiness));
+    try std.testing.expectEqual(
+        TableTopologyProtocolProbeCoordinator.Outcome.ready,
+        coordinator.reusableOutcome(readiness, 1, null).?,
+    );
     // Consuming a completed proof is not itself a probe completion. It remains
     // reusable until term, membership, incarnation, or required version moves.
     const after_probe = coordinator.currentEpoch();
@@ -940,7 +980,34 @@ test "table topology protocol probes cache only matching readiness" {
     try std.testing.expectEqual(after_probe, coordinator.currentEpoch());
     var changed = readiness;
     changed.term += 1;
-    try std.testing.expect(!tableTopologyReadinessEqual(coordinator.cached.?.readiness, changed));
+    try std.testing.expect(coordinator.reusableOutcome(changed, 1, null) == null);
+
+    var failed = coordinator.tryAcquire() orelse return error.TestExpectedEqual;
+    const failure_completion_epoch = failed.completionEpoch();
+    coordinator.cached = .{
+        .completion_epoch = failure_completion_epoch,
+        .readiness = readiness,
+        .outcome = .upgrade_required,
+        .retry_after_ns = 101,
+    };
+    failed.publishCompletion();
+    failed.deinit();
+    try std.testing.expectEqual(failure_completion_epoch, coordinator.currentEpoch());
+
+    var cohort_consumer = coordinator.tryAcquire() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(
+        TableTopologyProtocolProbeCoordinator.Outcome.upgrade_required,
+        coordinator.reusableOutcome(readiness, 100, null).?,
+    );
+    const after_failure = coordinator.currentEpoch();
+    cohort_consumer.deinit();
+    try std.testing.expectEqual(after_failure, coordinator.currentEpoch());
+    try std.testing.expectEqual(
+        TableTopologyProtocolProbeCoordinator.Outcome.upgrade_required,
+        coordinator.reusableOutcome(readiness, 101, failure_completion_epoch).?,
+    );
+    try std.testing.expect(coordinator.reusableOutcome(readiness, 101, null) == null);
+    try std.testing.expect(coordinator.reusableOutcome(changed, 100, failure_completion_epoch) == null);
 }
 
 const LifecycleSignal = struct {
@@ -6535,26 +6602,45 @@ pub const MetadataHttpService = struct {
             required_node_ids,
         );
 
+        // Preserve the completion epoch from the first contention. Consumers
+        // do not advance it, so every caller queued behind the actual network
+        // probe can share its outcome even after scheduler delays.
+        var joined_completion_epoch: ?u32 = null;
         var probe_lease = while (true) {
             try request.ensureActive();
             const observed_epoch = self.table_topology_protocol_probe.currentEpoch();
             if (self.table_topology_protocol_probe.tryAcquire()) |lease| break lease;
+            if (joined_completion_epoch == null) joined_completion_epoch = observed_epoch +% 1;
             self.table_topology_protocol_probe.waitForHandoff(
                 observed_epoch,
                 table_topology_protocol_probe_wait_ns,
             );
         };
         defer probe_lease.deinit();
-        if (self.table_topology_protocol_probe.cached) |cached| {
-            if (tableTopologyReadinessEqual(cached.readiness, expected_readiness))
-                return expected_readiness;
-        }
+        if (self.table_topology_protocol_probe.reusableOutcome(
+            expected_readiness,
+            platform_time.monotonicNs(),
+            joined_completion_epoch,
+        )) |outcome| switch (outcome) {
+            .ready => return expected_readiness,
+            .upgrade_required => return error.TableTopologyProtocolUpgradeRequired,
+        };
         // Every path below performs a real network observation (including a
         // failed one), so its lease publishes exactly one new cohort epoch.
         probe_lease.publishCompletion();
         // Clear a stale identity before the fresh fanout so failures cannot be
         // consumed by concurrent waiters as success.
         self.table_topology_protocol_probe.cached = null;
+        const completion_epoch = probe_lease.completionEpoch();
+        errdefer |err| if (err == error.TableTopologyProtocolUpgradeRequired) {
+            const failed_at_ns = platform_time.monotonicNs();
+            self.table_topology_protocol_probe.cached = .{
+                .completion_epoch = completion_epoch,
+                .readiness = expected_readiness,
+                .outcome = .upgrade_required,
+                .retry_after_ns = failed_at_ns +| table_topology_protocol_probe_failure_cache_ns,
+            };
+        };
 
         const now_ns = platform_time.monotonicNs();
         const request_deadline = request.deadline_ns orelse std.math.maxInt(u64);
@@ -6655,7 +6741,7 @@ pub const MetadataHttpService = struct {
             }
         }
         self.table_topology_protocol_probe.cached = .{
-            .completion_epoch = probe_lease.completionEpoch(),
+            .completion_epoch = completion_epoch,
             .readiness = expected_readiness,
         };
         return expected_readiness;
