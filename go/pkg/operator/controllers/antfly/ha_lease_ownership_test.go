@@ -36,6 +36,16 @@ func TestLeaseRenewalClockIgnoresStatusOnlyEvents(t *testing.T) {
 	}
 }
 
+func TestLeaseRenewalControllerDoesNotWaitForManagerLeadership(t *testing.T) {
+	options := haLeaseRenewalControllerOptions()
+	if options.NeedLeaderElection == nil || *options.NeedLeaderElection {
+		t.Fatal("data-plane Lease renewal must remain live during operator leader election")
+	}
+	if options.MaxConcurrentReconciles != 16 {
+		t.Fatalf("MaxConcurrentReconciles = %d, want 16", options.MaxConcurrentReconciles)
+	}
+}
+
 func TestFullReconcileIgnoresStatusFeedbackButObservesDesiredState(t *testing.T) {
 	predicate := antflyClusterDesiredStateEventPredicate()
 	oldCluster := haClusterWithAutomaticKubernetesLeaseFailover()

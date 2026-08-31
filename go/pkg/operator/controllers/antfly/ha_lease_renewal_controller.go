@@ -15,6 +15,7 @@ import (
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
@@ -29,6 +30,24 @@ const (
 // capture and every topology transition stay on the main reconciler.
 type haLeaseRenewalReconciler struct {
 	parent *AntflyClusterReconciler
+}
+
+func haLeaseRenewalControllerOptions() controller.Options {
+	// Runtime authority expires on the data-plane watchdog clock, which is
+	// intentionally shorter than a conventional controller-manager leader
+	// election. Waiting for manager leadership here would therefore turn an
+	// ordinary operator rollout or restart into a healthy primary self-fence.
+	//
+	// This is safe to run on every operator replica: the reconciler can only
+	// renew the unchanged, proof-authenticated holder (or an exact committed
+	// time-only handoff), uses current API-server Lease boundaries, and treats
+	// optimistic-lock conflicts as another replica having made progress. Every
+	// topology mutation remains on the leader-elected main reconciler.
+	needLeaderElection := false
+	return controller.Options{
+		MaxConcurrentReconciles: 16,
+		NeedLeaderElection:      &needLeaderElection,
+	}
 }
 
 func haLeaseRenewalEventPredicate() predicate.Predicate {

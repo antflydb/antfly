@@ -14394,7 +14394,7 @@ func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	if err := ctrl.NewControllerManagedBy(mgr).
 		Named("antflycluster-ha-lease-renewal").
-		WithOptions(controller.Options{MaxConcurrentReconciles: 16}).
+		WithOptions(haLeaseRenewalControllerOptions()).
 		For(&antflyv1.AntflyCluster{}, ctrlbuilder.WithPredicates(haLeaseRenewalEventPredicate())).
 		Complete(&haLeaseRenewalReconciler{parent: r}); err != nil {
 		return err
