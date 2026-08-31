@@ -1,4 +1,4 @@
-import type { IndexStatus, QueryRequest, TableStatus } from "@antfly/sdk";
+import type { IndexStatus, TableQueryRequest, TableStatus } from "@antfly/sdk";
 
 export interface TableQueryBuilderState {
   query: string;
@@ -33,7 +33,7 @@ export function tableQueryMetadataBlocker(
 export function tableQueryJsonSafetyBlocker(
   metadataBlocker: string | null,
   artifactProjectionRequired: boolean,
-  request: QueryRequest | null
+  request: TableQueryRequest | null
 ): string | null {
   if ((!metadataBlocker && !artifactProjectionRequired) || !request) return null;
   const fields = (request as { fields?: unknown }).fields;
@@ -45,8 +45,8 @@ export function tableQueryJsonSafetyBlocker(
 }
 
 export function tableQueryBuilderConversionBlocker(
-  source: QueryRequest,
-  rebuilt: QueryRequest
+  source: TableQueryRequest,
+  rebuilt: TableQueryRequest
 ): string | null {
   if (JSON.stringify(canonicalJsonValue(source)) === JSON.stringify(canonicalJsonValue(rebuilt))) {
     return null;
@@ -135,7 +135,7 @@ export function builderArtifactRetrievalDefaults(
 
 export function requestArtifactRetrievalDefaults(
   indexes: IndexStatus[],
-  request: QueryRequest | null,
+  request: TableQueryRequest | null,
   tableStatus?: TableStatus | null
 ): ArtifactRetrievalDefaults | null {
   if (!request) return null;
@@ -373,11 +373,14 @@ function parseJsonObject(source: string): Record<string, unknown> | null {
   }
 }
 
-export function parseTableQueryRequest(source: string): QueryRequest | null {
-  return parseJsonObject(source) as QueryRequest | null;
+export function parseTableQueryRequest(source: string): TableQueryRequest | null {
+  return parseJsonObject(source) as TableQueryRequest | null;
 }
 
-export function tableQueryInput(request: QueryRequest, artifactSearchFields?: string[]): string {
+export function tableQueryInput(
+  request: TableQueryRequest,
+  artifactSearchFields?: string[]
+): string {
   if (typeof request.semantic_search === "string") {
     return request.semantic_search;
   }
@@ -476,7 +479,10 @@ export function tableQueryErrorMessage(error: unknown, fallback: string): string
   return fallback;
 }
 
-function artifactFullTextQuery(fields: string[], query: string): QueryRequest["full_text_search"] {
+function artifactFullTextQuery(
+  fields: string[],
+  query: string
+): TableQueryRequest["full_text_search"] {
   if (fields.length > 1) {
     return {
       disjuncts: fields.map((field) => ({ match: query, field })),
@@ -512,8 +518,8 @@ export function buildTableQueryRequest({
   artifactProjectionFields,
   returnArtifactMatches = false,
   requireSafeProjection = false,
-}: TableQueryBuilderState): QueryRequest {
-  const request: QueryRequest = {};
+}: TableQueryBuilderState): TableQueryRequest {
+  const request: TableQueryRequest = {};
   const trimmedQuery = query.trim();
   const hasSemanticQuery = trimmedQuery.length > 0 && queryIndexes.length > 0;
   const normalizedSearchFields = artifactSearchFields
@@ -545,7 +551,7 @@ export function buildTableQueryRequest({
 
   const options = parseJsonObject(semanticQuery);
   if (options?.aggregations !== undefined) {
-    request.aggregations = options.aggregations as QueryRequest["aggregations"];
+    request.aggregations = options.aggregations as TableQueryRequest["aggregations"];
   }
   request.limit =
     typeof options?.limit === "number"
@@ -559,7 +565,7 @@ export function buildTableQueryRequest({
 
   const filter = parseJsonObject(filterQuery);
   if (filter && Object.keys(filter).length > 0) {
-    request.filter_query = filter as QueryRequest["filter_query"];
+    request.filter_query = filter as TableQueryRequest["filter_query"];
   }
 
   if (includeProfile) {

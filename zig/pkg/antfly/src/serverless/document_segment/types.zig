@@ -28,6 +28,27 @@ pub const Entry = struct {
     }
 };
 
+/// Lightweight document identity and body location decoded from the v2
+/// segment directory. Query paths can enumerate exact document identities
+/// without retaining stored document bodies.
+pub const IndexEntry = struct {
+    doc_id: []u8,
+    body_offset: u64,
+    body_len: u32,
+    last_lsn: u64,
+    last_timestamp_ns: u64,
+
+    pub fn deinit(self: *IndexEntry, alloc: Allocator) void {
+        alloc.free(self.doc_id);
+        self.* = undefined;
+    }
+};
+
+pub fn freeIndexEntries(alloc: Allocator, entries: []IndexEntry) void {
+    for (entries) |*entry| entry.deinit(alloc);
+    alloc.free(entries);
+}
+
 pub fn freeEntries(alloc: Allocator, entries: []Entry) void {
     for (entries) |*entry| entry.deinit(alloc);
     alloc.free(entries);
@@ -43,4 +64,17 @@ test "freeEntries releases owned published document entries" {
         .last_timestamp_ns = 10,
     };
     freeEntries(alloc, entries);
+}
+
+test "freeIndexEntries releases owned document identities" {
+    const alloc = std.testing.allocator;
+    const entries = try alloc.alloc(IndexEntry, 1);
+    entries[0] = .{
+        .doc_id = try alloc.dupe(u8, "doc-a"),
+        .body_offset = 128,
+        .body_len = 5,
+        .last_lsn = 1,
+        .last_timestamp_ns = 10,
+    };
+    freeIndexEntries(alloc, entries);
 }
