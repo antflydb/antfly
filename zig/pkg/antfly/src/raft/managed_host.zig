@@ -261,6 +261,21 @@ pub const ManagedHost = struct {
         return try self.reconciler_loop.reconcileMembershipOnly(intents);
     }
 
+    pub fn reconcileMembershipInto(
+        self: *ManagedHost,
+        intents: []const reconciler.PlacementIntent,
+        result: *reconciler.ReconcileResult,
+    ) !void {
+        try self.reconciler_loop.reconcileMembershipInto(intents, result);
+    }
+
+    pub fn finishLiveConvergence(
+        self: *ManagedHost,
+        result: reconciler.ReconcileResult,
+    ) void {
+        self.reconciler_loop.finishLiveConvergence(result);
+    }
+
     pub fn membershipStatus(self: *const ManagedHost, group_id: u64) ?reconciler.MembershipConvergence {
         return self.reconciler_loop.membershipStatus(group_id);
     }
@@ -582,6 +597,21 @@ pub const ManagedHttpHost = struct {
         intents: []const reconciler.PlacementIntent,
     ) !reconciler.ReconcileResult {
         return try self.reconciler_loop.reconcileMembershipOnly(intents);
+    }
+
+    pub fn reconcileMembershipInto(
+        self: *ManagedHttpHost,
+        intents: []const reconciler.PlacementIntent,
+        result: *reconciler.ReconcileResult,
+    ) !void {
+        try self.reconciler_loop.reconcileMembershipInto(intents, result);
+    }
+
+    pub fn finishLiveConvergence(
+        self: *ManagedHttpHost,
+        result: reconciler.ReconcileResult,
+    ) void {
+        self.reconciler_loop.finishLiveConvergence(result);
     }
 
     pub fn membershipStatus(self: *const ManagedHttpHost, group_id: u64) ?reconciler.MembershipConvergence {

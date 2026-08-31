@@ -11901,7 +11901,10 @@ pub const DataServer = struct {
 
         const metadata_epoch = snapshot.status.metadata_epoch;
 
-        if (metadata_epoch != 0 and self.last_data_raft_reconciled_metadata_epoch == metadata_epoch) {
+        const stable_cached_epoch = metadata_epoch != 0 and
+            self.last_data_raft_reconciled_metadata_epoch == metadata_epoch;
+        stable_round: {
+            if (!stable_cached_epoch) break :stable_round;
             // The epoch-owned plan is immutable. Stable rounds borrow it
             // directly, avoiding topology-index construction and per-group
             // voter/learner duplication while still advancing Raft state.
@@ -11916,13 +11919,20 @@ pub const DataServer = struct {
             // owner lock. The immutable plan is published below only after
             // re-entering the serialized runtime phase.
             try live.prepare();
+            var result: antfly.raft.ReconcileResult = .{};
             {
                 lockAtomic(&self.data_raft_mutex);
                 defer self.data_raft_mutex.unlock();
-                var result: antfly.raft.ReconcileResult = .{};
                 try live.commit(&result);
-                _ = try raft.host.reconcileMembershipOnly(local_intents);
+                try raft.host.reconcileMembershipInto(local_intents, &result);
+                if (result.membership_waiting_for_replica == 0)
+                    raft.host.finishLiveConvergence(result);
             }
+            // Missing desired ownership is durable reconciliation debt, not a
+            // normal membership wait. Fall through in this same metadata round
+            // so recovery does not wait for another poll or rebuild healthy
+            // topology on every stable iteration.
+            if (result.membership_waiting_for_replica != 0) break :stable_round;
             const status_fingerprint = self.maintainDataRaftLeadership(snapshot, local_intents, registration.node_id);
             self.observeDataRaftStatusFingerprint(status_fingerprint);
             if (self.data_raft_protocol_activation_cleanup_needed.load(.acquire)) {
@@ -20659,6 +20669,25 @@ test "data raft ticker advances consensus independently of control rounds" {
     try server.syncDataRaftFromSnapshot(&snapshot);
     try std.testing.expect(server.localDataRaftLeaderReady(77));
     try std.testing.expectEqual(cached_intents_ptr, server.last_data_raft_local_intents.ptr);
+
+    // Local runtime ownership can be lost independently of metadata
+    // publication. An unchanged epoch must leave the lightweight path and
+    // restore its durable desired plan immediately.
+    {
+        lockAtomic(&server.data_raft_mutex);
+        defer server.data_raft_mutex.unlock();
+        try data_raft.host.http_host.host.removePreparedReplica(77);
+    }
+    try std.testing.expectEqual(
+        antfly.raft.host.HostedReplicaStatus.absent,
+        data_raft.host.status(77),
+    );
+    try server.syncDataRaftFromSnapshot(&snapshot);
+    try std.testing.expectEqual(
+        antfly.raft.host.HostedReplicaStatus.active,
+        data_raft.host.status(77),
+    );
+    try std.testing.expectEqual(@as(?u64, 17), server.last_data_raft_reconciled_metadata_epoch);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();

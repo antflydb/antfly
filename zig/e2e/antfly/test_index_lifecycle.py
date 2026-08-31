@@ -24,7 +24,7 @@ from urllib.parse import quote
 import pytest
 import requests
 
-from conftest import ready_index_status
+from conftest import IndexReadinessProtocolError, ready_index_status
 from helpers import assert_created_index, json_doc, upsert, wait_until
 
 pytestmark = pytest.mark.reuse_antfly_process
@@ -245,6 +245,26 @@ def test_ready_index_status_requires_current_coverage_observation():
     stale_receipt = json.loads(json.dumps(canonical_ready))
     stale_receipt["status"]["readiness"]["published_revision"] = 11
     assert ready_index_status(stale_receipt) is None
+
+    for malformed in (None, "ready", [], True):
+        invalid = json.loads(json.dumps(ready_status))
+        invalid["status"]["backfill_state"] = "ready"
+        invalid["status"]["readiness"] = malformed
+        with pytest.raises(IndexReadinessProtocolError, match="status.readiness"):
+            ready_index_status(invalid)
+
+    for field, value in (
+        ("state", "future_state"),
+        ("queryable", 1),
+        ("complete", None),
+        ("pending_reasons", "none"),
+        ("published_revision", True),
+        ("target_revision", "12"),
+    ):
+        invalid = json.loads(json.dumps(canonical_ready))
+        invalid["status"]["readiness"][field] = value
+        with pytest.raises(IndexReadinessProtocolError, match=field):
+            ready_index_status(invalid)
 
     stale_incarnation = json.loads(json.dumps(ready_status))
     stale_incarnation["status"]["coverage"]["observation_complete"] = False

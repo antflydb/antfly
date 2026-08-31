@@ -483,6 +483,10 @@ fn failureDomainPriority(domain: FailureDomain) u8 {
     };
 }
 
+fn failureDomainBit(domain: FailureDomain) u8 {
+    return @as(u8, 1) << @intCast(@intFromEnum(domain));
+}
+
 fn failureFromRetryState(group_id: u64, state: FailureRetryState) ReconcileFailure {
     return .{
         .group_id = group_id,
@@ -1041,6 +1045,7 @@ pub const Reconciler = struct {
     route_retries: std.AutoHashMapUnmanaged(u64, RouteRetryState) = .empty,
     policy_retries: std.AutoHashMapUnmanaged(u64, RouteRetryState) = .empty,
     failure_retries: std.AutoHashMapUnmanaged(FailureKey, FailureRetryState) = .empty,
+    failure_group_domains: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     live_retry_cursor: usize = 0,
 
     pub fn deinit(self: *Reconciler) void {
@@ -1056,6 +1061,8 @@ pub const Reconciler = struct {
         self.policy_retries = .empty;
         self.failure_retries.deinit(self.alloc);
         self.failure_retries = .empty;
+        self.failure_group_domains.deinit(self.alloc);
+        self.failure_group_domains = .empty;
     }
 
     pub fn membershipStatus(self: *const Reconciler, group_id: u64) ?MembershipConvergence {
@@ -1131,6 +1138,11 @@ pub const Reconciler = struct {
                 return error.TooManyPlacementIntents,
         ) orelse return error.TooManyPlacementIntents;
         try self.failure_retries.ensureTotalCapacity(self.alloc, failure_retry_capacity);
+        const failed_group_capacity = std.math.cast(
+            u32,
+            @as(usize, self.failure_group_domains.count()) +| intent_count,
+        ) orelse return error.TooManyPlacementIntents;
+        try self.failure_group_domains.ensureTotalCapacity(self.alloc, failed_group_capacity);
     }
 
     fn appendRouteGroup(
@@ -1235,7 +1247,7 @@ pub const Reconciler = struct {
         const key = FailureKey{ .group_id = group_id, .domain = .admission };
         const state = self.failure_retries.get(key) orelse return false;
         if (state.intent_hash == null or state.intent_hash.? != intent_hash) {
-            _ = self.failure_retries.remove(key);
+            _ = self.removeFailure(key);
             return false;
         }
         return switch (state.classification) {
@@ -1253,7 +1265,7 @@ pub const Reconciler = struct {
     }
 
     fn clearObsoleteRetirementFailure(self: *Reconciler, group_id: u64) void {
-        _ = self.failure_retries.remove(.{ .group_id = group_id, .domain = .retirement });
+        _ = self.removeFailure(.{ .group_id = group_id, .domain = .retirement });
     }
 
     /// Desired-scoped convergence state is mark/swept every authoritative
@@ -1301,7 +1313,7 @@ pub const Reconciler = struct {
             if (removals.contains(key.group_id) and key.domain == .retirement) continue;
             try stale_failures.append(self.alloc, key);
         }
-        for (stale_failures.items) |key| _ = self.failure_retries.remove(key);
+        for (stale_failures.items) |key| _ = self.removeFailure(key);
     }
 
     pub fn prepare(self: *Reconciler) !PreparedReconcile {
@@ -1526,6 +1538,9 @@ pub const Reconciler = struct {
             .attempts = attempts,
             .next_retry_ns = next_retry_ns,
         });
+        const domain_entry = self.failure_group_domains.getOrPutAssumeCapacity(group_id);
+        if (!domain_entry.found_existing) domain_entry.value_ptr.* = 0;
+        domain_entry.value_ptr.* |= failureDomainBit(key.domain);
         result.recordFailure(failures, .{
             .group_id = group_id,
             .phase = phase,
@@ -1545,20 +1560,28 @@ pub const Reconciler = struct {
     fn clearGroupFailure(self: *Reconciler, group_id: u64, phase: ReconcileFailurePhase) void {
         const key = FailureKey{ .group_id = group_id, .domain = failureDomainForPhase(phase) };
         const state = self.failure_retries.get(key) orelse return;
-        if (state.phase == phase) _ = self.failure_retries.remove(key);
+        if (state.phase == phase) _ = self.removeFailure(key);
     }
 
     fn clearAdmissionFailure(self: *Reconciler, group_id: u64) void {
-        _ = self.failure_retries.remove(.{ .group_id = group_id, .domain = .admission });
+        _ = self.removeFailure(.{ .group_id = group_id, .domain = .admission });
     }
 
     fn clearAllGroupFailures(self: *Reconciler, group_id: u64) void {
         inline for (@typeInfo(FailureDomain).@"enum".fields) |field| {
-            _ = self.failure_retries.remove(.{
+            _ = self.removeFailure(.{
                 .group_id = group_id,
                 .domain = @enumFromInt(field.value),
             });
         }
+    }
+
+    fn removeFailure(self: *Reconciler, key: FailureKey) bool {
+        if (!self.failure_retries.remove(key)) return false;
+        const domains = self.failure_group_domains.getPtr(key.group_id) orelse unreachable;
+        domains.* &= ~failureDomainBit(key.domain);
+        if (domains.* == 0) _ = self.failure_group_domains.remove(key.group_id);
+        return true;
     }
 
     /// Advances only mutable Raft membership. It performs no descriptor
@@ -1569,8 +1592,22 @@ pub const Reconciler = struct {
         self: *Reconciler,
         intents: []const PlacementIntent,
     ) !ReconcileResult {
-        try self.ensureConvergenceCapacity(intents.len);
         var result: ReconcileResult = .{};
+        try self.reconcileMembershipInto(intents, &result);
+        self.finishLiveConvergence(result);
+        return result;
+    }
+
+    /// Adds membership observations to an existing live-convergence result.
+    /// This deliberately does not publish metrics: a runtime round can combine
+    /// route, admission-policy, and membership work and expose one coherent
+    /// observation after every phase has completed.
+    pub fn reconcileMembershipInto(
+        self: *Reconciler,
+        intents: []const PlacementIntent,
+        result: *ReconcileResult,
+    ) !void {
+        try self.ensureConvergenceCapacity(intents.len);
         for (intents) |intent| {
             try intent.desiredMembership().validate();
             const outcome = try self.reconcileRaftMembership(intent);
@@ -1579,8 +1616,17 @@ pub const Reconciler = struct {
         }
         result.admission_blocked = self.countAdmissionBlocked(intents);
         result.route_retrying_groups = self.countRouteRetrying(intents);
+    }
+
+    /// Publishes one completed topology-stable round. Persistent retry state,
+    /// rather than only work attempted in this round, owns failure gauges so a
+    /// backoff interval cannot make outstanding convergence debt look healthy.
+    pub fn finishLiveConvergence(
+        self: *Reconciler,
+        result: ReconcileResult,
+    ) void {
+        self.host.metrics.reconcile_rounds += 1;
         self.publishConvergenceMetrics(result);
-        return result;
     }
 
     fn recordRouteRefreshResult(self: *Reconciler, group_id: u64, last_error: ?anyerror) void {
@@ -1673,7 +1719,11 @@ pub const Reconciler = struct {
         self.host.metrics.membership_waiting_for_pending_change = result.membership_waiting_for_pending_change;
         self.host.metrics.membership_waiting_for_policy = result.membership_waiting_for_policy;
         self.host.metrics.route_retrying_groups = result.route_retrying_groups;
-        self.host.metrics.reconcile_failed_groups = result.failed_groups;
+        self.host.metrics.reconcile_failed_groups = self.countFailedGroups();
+    }
+
+    fn countFailedGroups(self: *const Reconciler) usize {
+        return self.failure_group_domains.count();
     }
 
     fn reconcileRaftMembership(self: *Reconciler, intent: PlacementIntent) !MembershipConvergence {
@@ -1859,6 +1909,13 @@ test "reconcile retry domains preserve admission backoff and primary diagnostics
     owner.recordGroupFailure(&result, &accumulator, 71, .routes, error.NoPeerEndpoints);
     owner.recordGroupFailure(&result, &accumulator, 71, .membership, error.NotLeader);
 
+    owner.finishLiveConvergence(result);
+    try std.testing.expectEqual(@as(usize, 1), host.metrics.reconcile_failed_groups);
+    // Backoff-only rounds attempt no failing operation, but the state gauge
+    // must retain the outstanding unique group.
+    owner.finishLiveConvergence(.{});
+    try std.testing.expectEqual(@as(usize, 1), host.metrics.reconcile_failed_groups);
+
     try std.testing.expectEqual(
         ReconcileFailurePhase.admission_prepare,
         owner.failureDiagnostics(71).?.phase,
@@ -1880,6 +1937,11 @@ test "reconcile retry domains preserve admission backoff and primary diagnostics
     owner.clearGroupFailure(71, .routes);
     try std.testing.expect(owner.failureDiagnosticsForDomain(71, .routes) == null);
     try std.testing.expect(owner.failureDiagnosticsForDomain(71, .admission) != null);
+
+    owner.clearAdmissionFailure(71);
+    owner.clearGroupFailure(71, .membership);
+    owner.finishLiveConvergence(.{});
+    try std.testing.expectEqual(@as(usize, 0), host.metrics.reconcile_failed_groups);
 }
 
 fn retirementLeaderTransferTarget(
