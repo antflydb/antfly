@@ -29,7 +29,9 @@ class GraphArtifactSourceConfig:
                 names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`.
             format_ (GraphArtifactSourceConfigFormat | Unset):  Default:
                 GraphArtifactSourceConfigFormat.EXTRACTION_RELATION.
-            mention_edge_type (str | Unset):
+            mention_edge_type (str | Unset): Durable graph edge type. Values must be valid UTF-8 and encode to at most 64
+                KiB; `maxLength` is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-
+                byte limit.
             nodes (GraphArtifactNodeMappingConfig | Unset): Maps each artifact item to graph node identifiers.
             edge (GraphArtifactEdgeMappingConfig | Unset): Maps each artifact item to an edge type, weight, and public
                 metadata.

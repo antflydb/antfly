@@ -465,18 +465,17 @@ def _wait_for_mention_hydration(
 ) -> dict:
     payload = {
         "query": {"match_all": {}},
-        "graph_searches": {
+        "graph_queries": {
             "mentions": {
-                "type": "neighbors",
-                "index_name": "relations_graph",
-                "start_nodes": {"keys": [start_node]},
-                "params": {
+                "index": "relations_graph",
+                "traverse": {
+                    "start": {"keys": [start_node]},
                     "edge_types": ["mentions"],
-                    "direction": "out",
-                    "max_results": 10,
+                    "max_depth": 1,
+                    "limit": 10,
+                    "include_documents": True,
+                    "fields": ["entity_type", "canonical_name", "aliases"],
                 },
-                "include_documents": True,
-                "fields": ["entity_type", "canonical_name", "aliases"],
             }
         },
         "limit": 10,
@@ -579,7 +578,6 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_
         },
         deadline=_new_e2e_deadline(),
     )
-    assert mentions["type"] == "neighbors"
     node_keys = {node["key"] for node in mentions["nodes"]}
     assert {"person/ada_lovelace", "org/antfly"} <= node_keys
 

@@ -234,6 +234,8 @@ from .evaluator_score_metadata import EvaluatorScoreMetadata
 from .exa_search_config import ExaSearchConfig
 from .exa_search_config_search_type import ExaSearchConfigSearchType
 from .exact_sort_error import ExactSortError
+from .exact_sort_error_error import ExactSortErrorError
+from .exact_sort_error_status import ExactSortErrorStatus
 from .execute_graph_metric_action_action import ExecuteGraphMetricActionAction
 from .execution_policy import ExecutionPolicy
 from .extension_error import ExtensionError
@@ -309,7 +311,18 @@ from .get_current_user_response_200_metadata_type_0 import GetCurrentUserRespons
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
+from .graph_aggregate_value import GraphAggregateValue
+from .graph_aggregates_result import GraphAggregatesResult
+from .graph_aggregates_result_aggregates import GraphAggregatesResultAggregates
+from .graph_aggregates_result_kind import GraphAggregatesResultKind
+from .graph_aggregates_return import GraphAggregatesReturn
+from .graph_aggregates_return_aggregates import GraphAggregatesReturnAggregates
 from .graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
+from .graph_alias_count_aggregate import GraphAliasCountAggregate
+from .graph_alias_operand import GraphAliasOperand
+from .graph_anchor_filter_requires_index_error import GraphAnchorFilterRequiresIndexError
+from .graph_anchor_filter_requires_index_error_error import GraphAnchorFilterRequiresIndexErrorError
+from .graph_anchor_filter_requires_index_error_status import GraphAnchorFilterRequiresIndexErrorStatus
 from .graph_artifact_context_config import GraphArtifactContextConfig
 from .graph_artifact_edge_mapping_config import GraphArtifactEdgeMappingConfig
 from .graph_artifact_edge_mapping_config_metadata import GraphArtifactEdgeMappingConfigMetadata
@@ -322,8 +335,41 @@ from .graph_artifact_producer_source_config import GraphArtifactProducerSourceCo
 from .graph_artifact_producer_source_config_type import GraphArtifactProducerSourceConfigType
 from .graph_artifact_source_config import GraphArtifactSourceConfig
 from .graph_artifact_source_config_format import GraphArtifactSourceConfigFormat
+from .graph_binding_node import GraphBindingNode
+from .graph_binding_node_document import GraphBindingNodeDocument
+from .graph_bindings_result import GraphBindingsResult
+from .graph_bindings_result_kind import GraphBindingsResultKind
+from .graph_bindings_return import GraphBindingsReturn
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
 from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
+from .graph_distinct_budget_exceeded_error import GraphDistinctBudgetExceededError
+from .graph_distinct_budget_exceeded_error_dimension import GraphDistinctBudgetExceededErrorDimension
+from .graph_distinct_budget_exceeded_error_error import GraphDistinctBudgetExceededErrorError
+from .graph_distinct_budget_exceeded_error_status import GraphDistinctBudgetExceededErrorStatus
+from .graph_document_bool_field_body import GraphDocumentBoolFieldBody
+from .graph_document_bool_field_filter import GraphDocumentBoolFieldFilter
+from .graph_document_date_range_body import GraphDocumentDateRangeBody
+from .graph_document_date_range_filter import GraphDocumentDateRangeFilter
+from .graph_document_filter_boolean import GraphDocumentFilterBoolean
+from .graph_document_filter_conjunction import GraphDocumentFilterConjunction
+from .graph_document_filter_disjunction import GraphDocumentFilterDisjunction
+from .graph_document_fuzzy_filter import GraphDocumentFuzzyFilter
+from .graph_document_ids_filter import GraphDocumentIdsFilter
+from .graph_document_match_all_filter import GraphDocumentMatchAllFilter
+from .graph_document_match_all_filter_match_all import GraphDocumentMatchAllFilterMatchAll
+from .graph_document_match_none_filter import GraphDocumentMatchNoneFilter
+from .graph_document_match_none_filter_match_none import GraphDocumentMatchNoneFilterMatchNone
+from .graph_document_numeric_range_body import GraphDocumentNumericRangeBody
+from .graph_document_numeric_range_filter import GraphDocumentNumericRangeFilter
+from .graph_document_prefix_filter import GraphDocumentPrefixFilter
+from .graph_document_regexp_filter import GraphDocumentRegexpFilter
+from .graph_document_term_filter import GraphDocumentTermFilter
+from .graph_document_term_range_body import GraphDocumentTermRangeBody
+from .graph_document_term_range_filter import GraphDocumentTermRangeFilter
+from .graph_document_wildcard_filter import GraphDocumentWildcardFilter
+from .graph_edge_weight_range import GraphEdgeWeightRange
+from .graph_exact_result_stats import GraphExactResultStats
+from .graph_identity_node_selector import GraphIdentityNodeSelector
 from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
@@ -335,6 +381,17 @@ from .graph_index_stats_promotion import GraphIndexStatsPromotion
 from .graph_index_stats_resolution import GraphIndexStatsResolution
 from .graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
 from .graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
+from .graph_k_shortest_paths import GraphKShortestPaths
+from .graph_k_shortest_paths_query import GraphKShortestPathsQuery
+from .graph_key_node_selector import GraphKeyNodeSelector
+from .graph_match import GraphMatch
+from .graph_match_edge import GraphMatchEdge
+from .graph_match_node import GraphMatchNode
+from .graph_match_nodes import GraphMatchNodes
+from .graph_match_operation_limit_exceeded_error import GraphMatchOperationLimitExceededError
+from .graph_match_operation_limit_exceeded_error_error import GraphMatchOperationLimitExceededErrorError
+from .graph_match_operation_limit_exceeded_error_status import GraphMatchOperationLimitExceededErrorStatus
+from .graph_match_query import GraphMatchQuery
 from .graph_metric_action_response import GraphMetricActionResponse
 from .graph_metric_build_page_status import GraphMetricBuildPageStatus
 from .graph_metric_build_page_status_range_kind import GraphMetricBuildPageStatusRangeKind
@@ -360,14 +417,36 @@ from .graph_metric_runtime_stats_role import GraphMetricRuntimeStatsRole
 from .graph_metric_score import GraphMetricScore
 from .graph_metric_status import GraphMetricStatus
 from .graph_metric_status_phase import GraphMetricStatusPhase
-from .graph_node_selector import GraphNodeSelector
-from .graph_query import GraphQuery
-from .graph_query_metric_freshness import GraphQueryMetricFreshness
+from .graph_nodes_result import GraphNodesResult
+from .graph_nodes_result_kind import GraphNodesResultKind
+from .graph_nodes_result_metric_status import GraphNodesResultMetricStatus
+from .graph_not_equal_predicate import GraphNotEqualPredicate
+from .graph_not_exists_pattern import GraphNotExistsPattern
+from .graph_optional_match import GraphOptionalMatch
+from .graph_optional_match_nodes import GraphOptionalMatchNodes
+from .graph_path import GraphPath
+from .graph_path_edge import GraphPathEdge
+from .graph_path_edge_direction import GraphPathEdgeDirection
+from .graph_path_edge_metadata import GraphPathEdgeMetadata
+from .graph_path_endpoint import GraphPathEndpoint
+from .graph_path_objective import GraphPathObjective
+from .graph_path_result import GraphPathResult
+from .graph_path_result_document import GraphPathResultDocument
+from .graph_path_weight_domain_error import GraphPathWeightDomainError
+from .graph_path_weight_domain_error_error import GraphPathWeightDomainErrorError
+from .graph_path_weight_domain_error_status import GraphPathWeightDomainErrorStatus
+from .graph_path_weight_domain_error_violation import GraphPathWeightDomainErrorViolation
+from .graph_paths_result import GraphPathsResult
+from .graph_paths_result_kind import GraphPathsResultKind
+from .graph_queries import GraphQueries
 from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
-from .graph_query_result import GraphQueryResult
-from .graph_query_result_metric_status import GraphQueryResultMetricStatus
+from .graph_query_results import GraphQueryResults
 from .graph_query_type import GraphQueryType
+from .graph_query_unsupported_error import GraphQueryUnsupportedError
+from .graph_query_unsupported_error_error import GraphQueryUnsupportedErrorError
+from .graph_query_unsupported_error_reason import GraphQueryUnsupportedErrorReason
+from .graph_query_unsupported_error_status import GraphQueryUnsupportedErrorStatus
 from .graph_resolver_config import GraphResolverConfig
 from .graph_resolver_config_candidate_search import GraphResolverConfigCandidateSearch
 from .graph_resolver_config_fusion_combine import GraphResolverConfigFusionCombine
@@ -376,6 +455,23 @@ from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
 from .graph_result_node_metrics import GraphResultNodeMetrics
+from .graph_result_ref_node_selector import GraphResultRefNodeSelector
+from .graph_result_row import GraphResultRow
+from .graph_result_stats import GraphResultStats
+from .graph_row_count_aggregate import GraphRowCountAggregate
+from .graph_row_count_target import GraphRowCountTarget
+from .graph_shortest_path import GraphShortestPath
+from .graph_shortest_path_query import GraphShortestPathQuery
+from .graph_traversal import GraphTraversal
+from .graph_traversal_metric_freshness import GraphTraversalMetricFreshness
+from .graph_traverse_query import GraphTraverseQuery
+from .graph_where_and import GraphWhereAnd
+from .graph_where_not_equal import GraphWhereNotEqual
+from .graph_where_not_exists import GraphWhereNotExists
+from .graph_work_budget_exceeded_error import GraphWorkBudgetExceededError
+from .graph_work_budget_exceeded_error_dimension import GraphWorkBudgetExceededErrorDimension
+from .graph_work_budget_exceeded_error_error import GraphWorkBudgetExceededErrorError
+from .graph_work_budget_exceeded_error_status import GraphWorkBudgetExceededErrorStatus
 from .ground_truth import GroundTruth
 from .hierarchy_ancestor import HierarchyAncestor
 from .hierarchy_ancestor_document import HierarchyAncestorDocument
@@ -593,9 +689,20 @@ from .join_profile import JoinProfile
 from .join_strategy import JoinStrategy
 from .join_type import JoinType
 from .key_range import KeyRange
+from .legacy_graph_document_query import LegacyGraphDocumentQuery
+from .legacy_graph_node_selector import LegacyGraphNodeSelector
+from .legacy_graph_query import LegacyGraphQuery
+from .legacy_graph_query_metric_freshness import LegacyGraphQueryMetricFreshness
+from .legacy_graph_result_node import LegacyGraphResultNode
+from .legacy_graph_result_node_document import LegacyGraphResultNodeDocument
+from .legacy_graph_result_node_evidence import LegacyGraphResultNodeEvidence
+from .legacy_graph_search_result import LegacyGraphSearchResult
+from .legacy_graph_search_result_kind import LegacyGraphSearchResultKind
+from .legacy_graph_search_result_metric_status import LegacyGraphSearchResultMetricStatus
 from .linear_merge_page_status import LinearMergePageStatus
 from .linear_merge_request import LinearMergeRequest
 from .linear_merge_request_records import LinearMergeRequestRecords
+from .linear_merge_request_records_additional_property import LinearMergeRequestRecordsAdditionalProperty
 from .linear_merge_result import LinearMergeResult
 from .linkup_search_config import LinkupSearchConfig
 from .linkup_search_config_depth import LinkupSearchConfigDepth
@@ -638,7 +745,6 @@ from .multi_match_body_type import MultiMatchBodyType
 from .multi_match_query import MultiMatchQuery
 from .multi_phrase_query import MultiPhraseQuery
 from .node_filter import NodeFilter
-from .node_filter_filter_query import NodeFilterFilterQuery
 from .numeric_range_query import NumericRangeQuery
 from .ollama_embedder_config import OllamaEmbedderConfig
 from .ollama_generator_config import OllamaGeneratorConfig
@@ -677,6 +783,9 @@ from .query_builder_request_example_documents_item import QueryBuilderRequestExa
 from .query_builder_result import QueryBuilderResult
 from .query_builder_result_plan import QueryBuilderResultPlan
 from .query_builder_result_query import QueryBuilderResultQuery
+from .query_candidate_budget_exceeded_error import QueryCandidateBudgetExceededError
+from .query_candidate_budget_exceeded_error_error import QueryCandidateBudgetExceededErrorError
+from .query_candidate_budget_exceeded_error_status import QueryCandidateBudgetExceededErrorStatus
 from .query_filter_error import QueryFilterError
 from .query_filter_error_error import QueryFilterErrorError
 from .query_filter_error_field import QueryFilterErrorField
@@ -695,16 +804,14 @@ from .query_profile import QueryProfile
 from .query_request import QueryRequest
 from .query_request_aggregations import QueryRequestAggregations
 from .query_request_embeddings import QueryRequestEmbeddings
-from .query_request_expand_strategy import QueryRequestExpandStrategy
 from .query_request_foreign_sources import QueryRequestForeignSources
-from .query_request_graph_searches import QueryRequestGraphSearches
 from .query_request_query import QueryRequestQuery
 from .query_responses import QueryResponses
 from .query_result import QueryResult
-from .query_result_aggregations import QueryResultAggregations
-from .query_result_analyses import QueryResultAnalyses
-from .query_result_graph_metric_results import QueryResultGraphMetricResults
-from .query_result_graph_results import QueryResultGraphResults
+from .query_result_base import QueryResultBase
+from .query_result_base_aggregations import QueryResultBaseAggregations
+from .query_result_base_analyses import QueryResultBaseAnalyses
+from .query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
 from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
@@ -779,6 +886,12 @@ from .sse_step_progress import SSEStepProgress
 from .sse_step_started import SSEStepStarted
 from .sse_tool_mode import SSEToolMode
 from .sse_tool_mode_mode import SSEToolModeMode
+from .stateful_graph_query_results import StatefulGraphQueryResults
+from .stateful_query_request import StatefulQueryRequest
+from .stateful_query_request_expand_strategy import StatefulQueryRequestExpandStrategy
+from .stateful_query_request_graph_searches import StatefulQueryRequestGraphSearches
+from .stateful_query_responses import StatefulQueryResponses
+from .stateful_query_result import StatefulQueryResult
 from .storage_maintenance_capabilities import StorageMaintenanceCapabilities
 from .storage_resource_exhausted_error import StorageResourceExhaustedError
 from .storage_resource_exhausted_error_code import StorageResourceExhaustedErrorCode
@@ -828,6 +941,10 @@ from .text_content_part_type import TextContentPartType
 from .tool_call import ToolCall
 from .tool_call_function import ToolCallFunction
 from .tool_call_type import ToolCallType
+from .topology_changed_error import TopologyChangedError
+from .topology_changed_error_action import TopologyChangedErrorAction
+from .topology_changed_error_error import TopologyChangedErrorError
+from .topology_changed_error_status import TopologyChangedErrorStatus
 from .transaction_begin_request import TransactionBeginRequest
 from .transaction_begin_response import TransactionBeginResponse
 from .transaction_commit_request import TransactionCommitRequest
@@ -1124,6 +1241,8 @@ __all__ = (
     "EvaluatorScore",
     "EvaluatorScoreMetadata",
     "ExactSortError",
+    "ExactSortErrorError",
+    "ExactSortErrorStatus",
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
     "ExecuteGraphMetricActionAction",
@@ -1201,7 +1320,18 @@ __all__ = (
     "GetDocumentArtifactManifestDetail",
     "GoogleEmbedderConfig",
     "GoogleGeneratorConfig",
+    "GraphAggregatesResult",
+    "GraphAggregatesResultAggregates",
+    "GraphAggregatesResultKind",
+    "GraphAggregatesReturn",
+    "GraphAggregatesReturnAggregates",
+    "GraphAggregateValue",
     "GraphAlgebraicPlanningConfig",
+    "GraphAliasCountAggregate",
+    "GraphAliasOperand",
+    "GraphAnchorFilterRequiresIndexError",
+    "GraphAnchorFilterRequiresIndexErrorError",
+    "GraphAnchorFilterRequiresIndexErrorStatus",
     "GraphArtifactContextConfig",
     "GraphArtifactEdgeMappingConfig",
     "GraphArtifactEdgeMappingConfigMetadata",
@@ -1214,8 +1344,41 @@ __all__ = (
     "GraphArtifactProducerSourceConfigType",
     "GraphArtifactSourceConfig",
     "GraphArtifactSourceConfigFormat",
+    "GraphBindingNode",
+    "GraphBindingNodeDocument",
+    "GraphBindingsResult",
+    "GraphBindingsResultKind",
+    "GraphBindingsReturn",
     "GraphBoundedTraversalConfig",
     "GraphBoundedTraversalConfigLaw",
+    "GraphDistinctBudgetExceededError",
+    "GraphDistinctBudgetExceededErrorDimension",
+    "GraphDistinctBudgetExceededErrorError",
+    "GraphDistinctBudgetExceededErrorStatus",
+    "GraphDocumentBoolFieldBody",
+    "GraphDocumentBoolFieldFilter",
+    "GraphDocumentDateRangeBody",
+    "GraphDocumentDateRangeFilter",
+    "GraphDocumentFilterBoolean",
+    "GraphDocumentFilterConjunction",
+    "GraphDocumentFilterDisjunction",
+    "GraphDocumentFuzzyFilter",
+    "GraphDocumentIdsFilter",
+    "GraphDocumentMatchAllFilter",
+    "GraphDocumentMatchAllFilterMatchAll",
+    "GraphDocumentMatchNoneFilter",
+    "GraphDocumentMatchNoneFilterMatchNone",
+    "GraphDocumentNumericRangeBody",
+    "GraphDocumentNumericRangeFilter",
+    "GraphDocumentPrefixFilter",
+    "GraphDocumentRegexpFilter",
+    "GraphDocumentTermFilter",
+    "GraphDocumentTermRangeBody",
+    "GraphDocumentTermRangeFilter",
+    "GraphDocumentWildcardFilter",
+    "GraphEdgeWeightRange",
+    "GraphExactResultStats",
+    "GraphIdentityNodeSelector",
     "GraphIndexConfig",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
@@ -1227,6 +1390,17 @@ __all__ = (
     "GraphIndexStatsResolution",
     "GraphIndexStatsResolverReplay",
     "GraphIndexStatsSourceArtifact",
+    "GraphKeyNodeSelector",
+    "GraphKShortestPaths",
+    "GraphKShortestPathsQuery",
+    "GraphMatch",
+    "GraphMatchEdge",
+    "GraphMatchNode",
+    "GraphMatchNodes",
+    "GraphMatchOperationLimitExceededError",
+    "GraphMatchOperationLimitExceededErrorError",
+    "GraphMatchOperationLimitExceededErrorStatus",
+    "GraphMatchQuery",
     "GraphMetricActionResponse",
     "GraphMetricBuildPageStatus",
     "GraphMetricBuildPageStatusRangeKind",
@@ -1252,14 +1426,36 @@ __all__ = (
     "GraphMetricScore",
     "GraphMetricStatus",
     "GraphMetricStatusPhase",
-    "GraphNodeSelector",
-    "GraphQuery",
-    "GraphQueryMetricFreshness",
+    "GraphNodesResult",
+    "GraphNodesResultKind",
+    "GraphNodesResultMetricStatus",
+    "GraphNotEqualPredicate",
+    "GraphNotExistsPattern",
+    "GraphOptionalMatch",
+    "GraphOptionalMatchNodes",
+    "GraphPath",
+    "GraphPathEdge",
+    "GraphPathEdgeDirection",
+    "GraphPathEdgeMetadata",
+    "GraphPathEndpoint",
+    "GraphPathObjective",
+    "GraphPathResult",
+    "GraphPathResultDocument",
+    "GraphPathsResult",
+    "GraphPathsResultKind",
+    "GraphPathWeightDomainError",
+    "GraphPathWeightDomainErrorError",
+    "GraphPathWeightDomainErrorStatus",
+    "GraphPathWeightDomainErrorViolation",
+    "GraphQueries",
     "GraphQueryParams",
     "GraphQueryParamsAlgorithmParams",
-    "GraphQueryResult",
-    "GraphQueryResultMetricStatus",
+    "GraphQueryResults",
     "GraphQueryType",
+    "GraphQueryUnsupportedError",
+    "GraphQueryUnsupportedErrorError",
+    "GraphQueryUnsupportedErrorReason",
+    "GraphQueryUnsupportedErrorStatus",
     "GraphResolverConfig",
     "GraphResolverConfigCandidateSearch",
     "GraphResolverConfigFusionCombine",
@@ -1268,6 +1464,23 @@ __all__ = (
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
     "GraphResultNodeMetrics",
+    "GraphResultRefNodeSelector",
+    "GraphResultRow",
+    "GraphResultStats",
+    "GraphRowCountAggregate",
+    "GraphRowCountTarget",
+    "GraphShortestPath",
+    "GraphShortestPathQuery",
+    "GraphTraversal",
+    "GraphTraversalMetricFreshness",
+    "GraphTraverseQuery",
+    "GraphWhereAnd",
+    "GraphWhereNotEqual",
+    "GraphWhereNotExists",
+    "GraphWorkBudgetExceededError",
+    "GraphWorkBudgetExceededErrorDimension",
+    "GraphWorkBudgetExceededErrorError",
+    "GraphWorkBudgetExceededErrorStatus",
     "GroundTruth",
     "HierarchyAncestor",
     "HierarchyAncestorDocument",
@@ -1483,9 +1696,20 @@ __all__ = (
     "JoinStrategy",
     "JoinType",
     "KeyRange",
+    "LegacyGraphDocumentQuery",
+    "LegacyGraphNodeSelector",
+    "LegacyGraphQuery",
+    "LegacyGraphQueryMetricFreshness",
+    "LegacyGraphResultNode",
+    "LegacyGraphResultNodeDocument",
+    "LegacyGraphResultNodeEvidence",
+    "LegacyGraphSearchResult",
+    "LegacyGraphSearchResultKind",
+    "LegacyGraphSearchResultMetricStatus",
     "LinearMergePageStatus",
     "LinearMergeRequest",
     "LinearMergeRequestRecords",
+    "LinearMergeRequestRecordsAdditionalProperty",
     "LinearMergeResult",
     "LinkupSearchConfig",
     "LinkupSearchConfigDepth",
@@ -1526,7 +1750,6 @@ __all__ = (
     "MultiMatchQuery",
     "MultiPhraseQuery",
     "NodeFilter",
-    "NodeFilterFilterQuery",
     "NumericRangeQuery",
     "OllamaEmbedderConfig",
     "OllamaGeneratorConfig",
@@ -1565,6 +1788,9 @@ __all__ = (
     "QueryBuilderResult",
     "QueryBuilderResultPlan",
     "QueryBuilderResultQuery",
+    "QueryCandidateBudgetExceededError",
+    "QueryCandidateBudgetExceededErrorError",
+    "QueryCandidateBudgetExceededErrorStatus",
     "QueryFilterError",
     "QueryFilterErrorError",
     "QueryFilterErrorField",
@@ -1583,16 +1809,14 @@ __all__ = (
     "QueryRequest",
     "QueryRequestAggregations",
     "QueryRequestEmbeddings",
-    "QueryRequestExpandStrategy",
     "QueryRequestForeignSources",
-    "QueryRequestGraphSearches",
     "QueryRequestQuery",
     "QueryResponses",
     "QueryResult",
-    "QueryResultAggregations",
-    "QueryResultAnalyses",
-    "QueryResultGraphMetricResults",
-    "QueryResultGraphResults",
+    "QueryResultBase",
+    "QueryResultBaseAggregations",
+    "QueryResultBaseAnalyses",
+    "QueryResultBaseGraphMetricResults",
     "QueryScoreDetails",
     "QueryStrategy",
     "QueryStringQuery",
@@ -1667,6 +1891,12 @@ __all__ = (
     "SSEStepStarted",
     "SSEToolMode",
     "SSEToolModeMode",
+    "StatefulGraphQueryResults",
+    "StatefulQueryRequest",
+    "StatefulQueryRequestExpandStrategy",
+    "StatefulQueryRequestGraphSearches",
+    "StatefulQueryResponses",
+    "StatefulQueryResult",
     "StorageMaintenanceCapabilities",
     "StorageResourceExhaustedError",
     "StorageResourceExhaustedErrorCode",
@@ -1716,6 +1946,10 @@ __all__ = (
     "ToolCall",
     "ToolCallFunction",
     "ToolCallType",
+    "TopologyChangedError",
+    "TopologyChangedErrorAction",
+    "TopologyChangedErrorError",
+    "TopologyChangedErrorStatus",
     "TransactionBeginRequest",
     "TransactionBeginResponse",
     "TransactionCommitRequest",

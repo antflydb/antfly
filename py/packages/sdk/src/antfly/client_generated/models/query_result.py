@@ -9,12 +9,12 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.graph_query_results import GraphQueryResults
     from ..models.query_hits import QueryHits
     from ..models.query_profile import QueryProfile
-    from ..models.query_result_aggregations import QueryResultAggregations
-    from ..models.query_result_analyses import QueryResultAnalyses
-    from ..models.query_result_graph_metric_results import QueryResultGraphMetricResults
-    from ..models.query_result_graph_results import QueryResultGraphResults
+    from ..models.query_result_base_aggregations import QueryResultBaseAggregations
+    from ..models.query_result_base_analyses import QueryResultBaseAnalyses
+    from ..models.query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
 
 
 T = TypeVar("T", bound="QueryResult")
@@ -22,34 +22,35 @@ T = TypeVar("T", bound="QueryResult")
 
 @_attrs_define
 class QueryResult:
-    """Result of a query operation as an array of results and a count.
+    """Result of a canonical query operation.
 
     Attributes:
         took (int): Duration of the query in milliseconds.
         status (int): HTTP status code of the query operation.
         hits (QueryHits | Unset): A list of query hits.
-        aggregations (QueryResultAggregations | Unset): Aggregation results keyed by the user-defined aggregation names
-            from the request.
+        aggregations (QueryResultBaseAggregations | Unset): Aggregation results keyed by the user-defined aggregation
+            names from the request.
             Contains computed metrics or buckets depending on the aggregation type.
-        analyses (QueryResultAnalyses | Unset): Analysis results like PCA and t-SNE per index embeddings.
-        graph_results (QueryResultGraphResults | Unset): Results from declarative graph queries.
-        graph_metric_results (QueryResultGraphMetricResults | Unset): Results from direct graph metric reads.
+        analyses (QueryResultBaseAnalyses | Unset): Analysis results like PCA and t-SNE per index embeddings.
+        graph_metric_results (QueryResultBaseGraphMetricResults | Unset): Results from direct graph metric reads.
         profile (QueryProfile | Unset): Detailed execution profiling for a query. Present in the response
             when the request sets `profile: true`.
         error (str | Unset): Error message if the query failed.
         table (str | Unset): Which table this result came from
+        graph_results (GraphQueryResults | Unset): Non-empty canonical graph results keyed exactly by graph_queries
+            operation name. Keys use the versioned GraphIdentifier policy.
     """
 
     took: int
     status: int
     hits: QueryHits | Unset = UNSET
-    aggregations: QueryResultAggregations | Unset = UNSET
-    analyses: QueryResultAnalyses | Unset = UNSET
-    graph_results: QueryResultGraphResults | Unset = UNSET
-    graph_metric_results: QueryResultGraphMetricResults | Unset = UNSET
+    aggregations: QueryResultBaseAggregations | Unset = UNSET
+    analyses: QueryResultBaseAnalyses | Unset = UNSET
+    graph_metric_results: QueryResultBaseGraphMetricResults | Unset = UNSET
     profile: QueryProfile | Unset = UNSET
     error: str | Unset = UNSET
     table: str | Unset = UNSET
+    graph_results: GraphQueryResults | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -69,10 +70,6 @@ class QueryResult:
         if not isinstance(self.analyses, Unset):
             analyses = self.analyses.to_dict()
 
-        graph_results: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.graph_results, Unset):
-            graph_results = self.graph_results.to_dict()
-
         graph_metric_results: dict[str, Any] | Unset = UNSET
         if not isinstance(self.graph_metric_results, Unset):
             graph_metric_results = self.graph_metric_results.to_dict()
@@ -84,6 +81,10 @@ class QueryResult:
         error = self.error
 
         table = self.table
+
+        graph_results: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.graph_results, Unset):
+            graph_results = self.graph_results.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -99,8 +100,6 @@ class QueryResult:
             field_dict["aggregations"] = aggregations
         if analyses is not UNSET:
             field_dict["analyses"] = analyses
-        if graph_results is not UNSET:
-            field_dict["graph_results"] = graph_results
         if graph_metric_results is not UNSET:
             field_dict["graph_metric_results"] = graph_metric_results
         if profile is not UNSET:
@@ -109,17 +108,19 @@ class QueryResult:
             field_dict["error"] = error
         if table is not UNSET:
             field_dict["table"] = table
+        if graph_results is not UNSET:
+            field_dict["graph_results"] = graph_results
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_query_results import GraphQueryResults
         from ..models.query_hits import QueryHits
         from ..models.query_profile import QueryProfile
-        from ..models.query_result_aggregations import QueryResultAggregations
-        from ..models.query_result_analyses import QueryResultAnalyses
-        from ..models.query_result_graph_metric_results import QueryResultGraphMetricResults
-        from ..models.query_result_graph_results import QueryResultGraphResults
+        from ..models.query_result_base_aggregations import QueryResultBaseAggregations
+        from ..models.query_result_base_analyses import QueryResultBaseAnalyses
+        from ..models.query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
 
         d = dict(src_dict)
         took = d.pop("took")
@@ -134,32 +135,25 @@ class QueryResult:
             hits = QueryHits.from_dict(_hits)
 
         _aggregations = d.pop("aggregations", UNSET)
-        aggregations: QueryResultAggregations | Unset
+        aggregations: QueryResultBaseAggregations | Unset
         if isinstance(_aggregations, Unset):
             aggregations = UNSET
         else:
-            aggregations = QueryResultAggregations.from_dict(_aggregations)
+            aggregations = QueryResultBaseAggregations.from_dict(_aggregations)
 
         _analyses = d.pop("analyses", UNSET)
-        analyses: QueryResultAnalyses | Unset
+        analyses: QueryResultBaseAnalyses | Unset
         if isinstance(_analyses, Unset):
             analyses = UNSET
         else:
-            analyses = QueryResultAnalyses.from_dict(_analyses)
-
-        _graph_results = d.pop("graph_results", UNSET)
-        graph_results: QueryResultGraphResults | Unset
-        if isinstance(_graph_results, Unset):
-            graph_results = UNSET
-        else:
-            graph_results = QueryResultGraphResults.from_dict(_graph_results)
+            analyses = QueryResultBaseAnalyses.from_dict(_analyses)
 
         _graph_metric_results = d.pop("graph_metric_results", UNSET)
-        graph_metric_results: QueryResultGraphMetricResults | Unset
+        graph_metric_results: QueryResultBaseGraphMetricResults | Unset
         if isinstance(_graph_metric_results, Unset):
             graph_metric_results = UNSET
         else:
-            graph_metric_results = QueryResultGraphMetricResults.from_dict(_graph_metric_results)
+            graph_metric_results = QueryResultBaseGraphMetricResults.from_dict(_graph_metric_results)
 
         _profile = d.pop("profile", UNSET)
         profile: QueryProfile | Unset
@@ -172,17 +166,24 @@ class QueryResult:
 
         table = d.pop("table", UNSET)
 
+        _graph_results = d.pop("graph_results", UNSET)
+        graph_results: GraphQueryResults | Unset
+        if isinstance(_graph_results, Unset):
+            graph_results = UNSET
+        else:
+            graph_results = GraphQueryResults.from_dict(_graph_results)
+
         query_result = cls(
             took=took,
             status=status,
             hits=hits,
             aggregations=aggregations,
             analyses=analyses,
-            graph_results=graph_results,
             graph_metric_results=graph_metric_results,
             profile=profile,
             error=error,
             table=table,
+            graph_results=graph_results,
         )
 
         query_result.additional_properties = d

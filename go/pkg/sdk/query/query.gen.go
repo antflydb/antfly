@@ -103,13 +103,13 @@ type ConjunctionQuery struct {
 // DateRangeStringQuery defines model for DateRangeStringQuery.
 type DateRangeStringQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
-	Boost          Boost     `json:"boost,omitempty,omitzero"`
-	DatetimeParser string    `json:"datetime_parser,omitempty,omitzero"`
-	End            time.Time `json:"end,omitempty,omitzero"`
-	Field          string    `json:"field,omitempty,omitzero"`
-	InclusiveEnd   bool      `json:"inclusive_end,omitempty,omitzero"`
-	InclusiveStart bool      `json:"inclusive_start,omitempty,omitzero"`
-	Start          time.Time `json:"start,omitempty,omitzero"`
+	Boost          Boost      `json:"boost,omitempty,omitzero"`
+	DatetimeParser string     `json:"datetime_parser,omitempty,omitzero"`
+	End            *time.Time `json:"end,omitempty"`
+	Field          string     `json:"field,omitempty,omitzero"`
+	InclusiveEnd   *bool      `json:"inclusive_end,omitempty"`
+	InclusiveStart *bool      `json:"inclusive_start,omitempty"`
+	Start          *time.Time `json:"start,omitempty"`
 }
 
 // DisjunctionQuery defines model for DisjunctionQuery.
@@ -117,7 +117,9 @@ type DisjunctionQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
 	Boost     Boost   `json:"boost,omitempty,omitzero"`
 	Disjuncts []Query `json:"disjuncts"`
-	Min       float64 `json:"min,omitempty,omitzero"`
+
+	// Min Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
+	Min *uint32 `json:"min,omitempty"`
 }
 
 // DocIdQuery defines model for DocIdQuery.
@@ -299,12 +301,12 @@ type MultiPhraseQuery struct {
 // NumericRangeQuery defines model for NumericRangeQuery.
 type NumericRangeQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
-	Boost        Boost   `json:"boost,omitempty,omitzero"`
-	Field        string  `json:"field,omitempty,omitzero"`
-	InclusiveMax bool    `json:"inclusive_max,omitempty,omitzero"`
-	InclusiveMin bool    `json:"inclusive_min,omitempty,omitzero"`
-	Max          float64 `json:"max,omitempty,omitzero"`
-	Min          float64 `json:"min,omitempty,omitzero"`
+	Boost        Boost    `json:"boost,omitempty,omitzero"`
+	Field        string   `json:"field,omitempty,omitzero"`
+	InclusiveMax *bool    `json:"inclusive_max,omitempty"`
+	InclusiveMin *bool    `json:"inclusive_min,omitempty"`
+	Max          *float64 `json:"max,omitempty"`
+	Min          *float64 `json:"min,omitempty"`
 }
 
 // PhraseQuery defines model for PhraseQuery.
@@ -357,12 +359,12 @@ type TermQuery struct {
 // TermRangeQuery defines model for TermRangeQuery.
 type TermRangeQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
-	Boost        Boost  `json:"boost,omitempty,omitzero"`
-	Field        string `json:"field,omitempty,omitzero"`
-	InclusiveMax bool   `json:"inclusive_max,omitempty,omitzero"`
-	InclusiveMin bool   `json:"inclusive_min,omitempty,omitzero"`
-	Max          string `json:"max,omitempty,omitzero"`
-	Min          string `json:"min,omitempty,omitzero"`
+	Boost        Boost   `json:"boost,omitempty,omitzero"`
+	Field        string  `json:"field,omitempty,omitzero"`
+	InclusiveMax *bool   `json:"inclusive_max,omitempty"`
+	InclusiveMin *bool   `json:"inclusive_min,omitempty"`
+	Max          *string `json:"max,omitempty"`
+	Min          *string `json:"min,omitempty"`
 }
 
 // WildcardQuery defines model for WildcardQuery.
@@ -1246,36 +1248,38 @@ type ClientWithResponsesInterface interface {
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
+	"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",
+	"5DJDARmjM/omnIZvaEAzMCt3Prv9bwAAAP//",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

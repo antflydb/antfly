@@ -378,6 +378,7 @@ pub const Builder = struct {
         const graph_refs = try buildGraphArtifactRefsForMaterializedDocsAlloc(
             self.alloc,
             self.artifacts,
+            namespace,
             current_manifest,
             materialized.base_documents,
             materialized.documents,
@@ -633,6 +634,7 @@ pub const Builder = struct {
         const graph_refs = try buildGraphArtifactRefsForRepublishAlloc(
             self.alloc,
             self.artifacts,
+            namespace,
             current,
             graph_docs,
             graph_index_names,
@@ -2003,6 +2005,7 @@ fn graphProjectionChangedAlloc(
     for (before_edges, after_edges) |lhs, rhs| {
         if (!std.mem.eql(u8, lhs.target, rhs.target)) return true;
         if (!std.mem.eql(u8, lhs.edge_type, rhs.edge_type)) return true;
+        if (!optionalStringsEqual(lhs.target_table, rhs.target_table)) return true;
         if (lhs.weight != rhs.weight) return true;
     }
     return false;
@@ -3263,6 +3266,7 @@ fn buildVectorArtifactRefsForRepublishAlloc(
 pub fn buildGraphArtifactRefsForMaterializedDocsAlloc(
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
+    source_table: []const u8,
     current: ?manifest_mod.Manifest,
     before_docs: []const query_mod.QueryMaterializedDocument,
     docs: []const query_mod.QueryMaterializedDocument,
@@ -3284,7 +3288,7 @@ pub fn buildGraphArtifactRefsForMaterializedDocsAlloc(
                 }
             }
         }
-        const built = try buildGraphSegmentAlloc(alloc, docs, true);
+        const built = try buildGraphSegmentAlloc(alloc, source_table, docs, true);
         defer if (built.payload) |payload| alloc.free(payload);
         if (built.payload) |payload| {
             var artifact = try artifacts.put(payload);
@@ -3310,7 +3314,7 @@ pub fn buildGraphArtifactRefsForMaterializedDocsAlloc(
         }
     }
 
-    const built = try buildGraphSegmentAlloc(alloc, docs, true);
+    const built = try buildGraphSegmentAlloc(alloc, source_table, docs, true);
     defer if (built.payload) |payload| alloc.free(payload);
     if (built.payload) |payload| {
         var artifact = try artifacts.put(payload);
@@ -3333,6 +3337,7 @@ pub fn buildGraphArtifactRefsForMaterializedDocsAlloc(
 fn buildGraphArtifactRefsForRepublishAlloc(
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
+    source_table: []const u8,
     current: manifest_mod.Manifest,
     docs: []const query_mod.QueryMaterializedDocument,
     graph_index_names: []const []u8,
@@ -3350,7 +3355,7 @@ fn buildGraphArtifactRefsForRepublishAlloc(
                 return refs;
             }
         }
-        const built = try buildGraphSegmentAlloc(alloc, docs, true);
+        const built = try buildGraphSegmentAlloc(alloc, source_table, docs, true);
         defer if (built.payload) |payload| alloc.free(payload);
         if (built.payload) |payload| {
             var artifact = try artifacts.put(payload);
@@ -3374,7 +3379,7 @@ fn buildGraphArtifactRefsForRepublishAlloc(
         freeArtifactRefs(alloc, refs.items);
     }
 
-    const built = try buildGraphSegmentAlloc(alloc, docs, true);
+    const built = try buildGraphSegmentAlloc(alloc, source_table, docs, true);
     defer if (built.payload) |payload| alloc.free(payload);
     if (built.payload) |payload| {
         var artifact = try artifacts.put(payload);
@@ -3999,6 +4004,7 @@ fn predictDerivedOutputAction(
 
 pub fn buildGraphSegmentAlloc(
     alloc: Allocator,
+    source_table: []const u8,
     docs: []const query_mod.QueryMaterializedDocument,
     include_graph: bool,
 ) !struct {
@@ -4008,6 +4014,8 @@ pub fn buildGraphSegmentAlloc(
     if (!include_graph) return .{ .payload = null, .edge_count = 0 };
     var node_map = std.StringArrayHashMapUnmanaged(NodeEdges).empty;
     defer deinitNodeMap(alloc, &node_map);
+    var neighbor_tables = std.StringArrayHashMapUnmanaged(void).empty;
+    defer deinitNeighborTableMap(alloc, &neighbor_tables);
     var total_edges: usize = 0;
 
     for (docs) |doc| {
@@ -4016,24 +4024,38 @@ pub fn buildGraphSegmentAlloc(
         defer freeParsedGraphEdges(alloc, parsed_edges);
         for (parsed_edges) |edge| {
             const src = try ensureNode(alloc, &node_map, doc.doc_id);
-            const dst = try ensureNode(alloc, &node_map, edge.target);
+            const target_table = if (edge.target_table) |table|
+                if (std.mem.eql(u8, table, source_table)) null else table
+            else
+                null;
+            const neighbor_table_id = if (target_table) |table|
+                try internNeighborTable(alloc, &neighbor_tables, table)
+            else
+                null;
             try src.out_edges.append(alloc, .{
                 .neighbor_id = try alloc.dupe(u8, edge.target),
                 .edge_type = try alloc.dupe(u8, edge.edge_type),
                 .weight = edge.weight,
+                .neighbor_table_id = neighbor_table_id,
             });
-            try dst.in_edges.append(alloc, .{
-                .neighbor_id = try alloc.dupe(u8, doc.doc_id),
-                .edge_type = try alloc.dupe(u8, edge.edge_type),
-                .weight = edge.weight,
-            });
+            // A qualified endpoint belongs to another table's segment. Do not
+            // synthesize it into this table's key space or invent a reverse
+            // edge in the source-table artifact.
+            if (target_table == null) {
+                const dst = try ensureNode(alloc, &node_map, edge.target);
+                try dst.in_edges.append(alloc, .{
+                    .neighbor_id = try alloc.dupe(u8, doc.doc_id),
+                    .edge_type = try alloc.dupe(u8, edge.edge_type),
+                    .weight = edge.weight,
+                });
+            }
             total_edges += 1;
         }
     }
 
     if (total_edges == 0) return .{ .payload = null, .edge_count = 0 };
 
-    var segment = try nodeMapToSegmentAlloc(alloc, &node_map);
+    var segment = try nodeMapToSegmentAlloc(alloc, &node_map, &neighbor_tables);
     defer graph_segment_mod.freeSegment(alloc, &segment);
     return .{
         .payload = try graph_segment_mod.encodeAlloc(alloc, segment),
@@ -4045,6 +4067,7 @@ const ParsedGraphEdge = struct {
     target: []u8,
     edge_type: []u8,
     weight: f32,
+    target_table: ?[]u8,
 };
 
 const NodeEdges = struct {
@@ -4073,6 +4096,7 @@ fn parseGraphEdgesAlloc(alloc: Allocator, body: []const u8) ![]ParsedGraphEdge {
         for (out.items) |edge| {
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.target_table) |table| alloc.free(table);
         }
         out.deinit(alloc);
     }
@@ -4083,6 +4107,7 @@ fn parseGraphEdgesAlloc(alloc: Allocator, body: []const u8) ![]ParsedGraphEdge {
         if (target_value != .string or target_value.string.len == 0) continue;
         const edge_type_value = item.object.get("edge_type");
         const weight_value = item.object.get("weight");
+        const target_table_value = item.object.get("target_table");
         try out.append(alloc, .{
             .target = try alloc.dupe(u8, target_value.string),
             .edge_type = if (edge_type_value != null and edge_type_value.? == .string) try alloc.dupe(u8, edge_type_value.?.string) else try alloc.dupe(u8, ""),
@@ -4092,6 +4117,12 @@ fn parseGraphEdgesAlloc(alloc: Allocator, body: []const u8) ![]ParsedGraphEdge {
                 .number_string => std.fmt.parseFloat(f32, weight.number_string) catch 1.0,
                 else => 1.0,
             } else 1.0,
+            .target_table = if (target_table_value != null and
+                target_table_value.? == .string and
+                target_table_value.?.string.len > 0)
+                try alloc.dupe(u8, target_table_value.?.string)
+            else
+                null,
         });
     }
     return try out.toOwnedSlice(alloc);
@@ -4101,6 +4132,7 @@ fn freeParsedGraphEdges(alloc: Allocator, edges: []ParsedGraphEdge) void {
     for (edges) |edge| {
         alloc.free(edge.target);
         alloc.free(edge.edge_type);
+        if (edge.target_table) |table| alloc.free(table);
     }
     alloc.free(edges);
 }
@@ -4110,6 +4142,8 @@ fn sortParsedGraphEdges(edges: []ParsedGraphEdge) void {
 }
 
 fn lessParsedGraphEdge(_: void, lhs: ParsedGraphEdge, rhs: ParsedGraphEdge) bool {
+    const table_order = optionalStringOrder(lhs.target_table, rhs.target_table);
+    if (table_order != .eq) return table_order == .lt;
     const edge_type_order = std.mem.order(u8, lhs.edge_type, rhs.edge_type);
     if (edge_type_order != .eq) return edge_type_order == .lt;
     const target_order = std.mem.order(u8, lhs.target, rhs.target);
@@ -4117,7 +4151,19 @@ fn lessParsedGraphEdge(_: void, lhs: ParsedGraphEdge, rhs: ParsedGraphEdge) bool
     return lhs.weight < rhs.weight;
 }
 
-fn nodeMapToSegmentAlloc(alloc: Allocator, node_map: *std.StringArrayHashMapUnmanaged(NodeEdges)) !graph_segment_mod.Segment {
+fn nodeMapToSegmentAlloc(
+    alloc: Allocator,
+    node_map: *std.StringArrayHashMapUnmanaged(NodeEdges),
+    neighbor_table_map: *const std.StringArrayHashMapUnmanaged(void),
+) !graph_segment_mod.Segment {
+    const neighbor_tables = try alloc.alloc([]u8, neighbor_table_map.count());
+    errdefer if (neighbor_tables.len > 0) alloc.free(neighbor_tables);
+    var initialized_tables: usize = 0;
+    errdefer for (neighbor_tables[0..initialized_tables]) |table| alloc.free(table);
+    for (neighbor_table_map.keys(), 0..) |table, idx| {
+        neighbor_tables[idx] = try alloc.dupe(u8, table);
+        initialized_tables += 1;
+    }
     const adjacencies = try alloc.alloc(graph_segment_mod.Adjacency, node_map.count());
     errdefer alloc.free(adjacencies);
     var initialized: usize = 0;
@@ -4136,7 +4182,39 @@ fn nodeMapToSegmentAlloc(alloc: Allocator, node_map: *std.StringArrayHashMapUnma
         initialized += 1;
     }
     std.mem.sort(graph_segment_mod.Adjacency, adjacencies, {}, lessGraphAdjacency);
-    return .{ .adjacencies = adjacencies };
+    return .{ .neighbor_tables = neighbor_tables, .adjacencies = adjacencies };
+}
+
+fn internNeighborTable(
+    alloc: Allocator,
+    tables: *std.StringArrayHashMapUnmanaged(void),
+    table: []const u8,
+) !u32 {
+    if (tables.getIndex(table)) |index| return std.math.cast(u32, index) orelse error.GraphSegmentTooLarge;
+    const next_id = std.math.cast(u32, tables.count()) orelse return error.GraphSegmentTooLarge;
+    const owned = try alloc.dupe(u8, table);
+    errdefer alloc.free(owned);
+    const gop = try tables.getOrPut(alloc, owned);
+    std.debug.assert(!gop.found_existing);
+    std.debug.assert(gop.index == @as(usize, next_id));
+    return next_id;
+}
+
+fn deinitNeighborTableMap(alloc: Allocator, tables: *std.StringArrayHashMapUnmanaged(void)) void {
+    for (tables.keys()) |table| alloc.free(table);
+    tables.deinit(alloc);
+}
+
+fn optionalStringOrder(lhs: ?[]const u8, rhs: ?[]const u8) std.math.Order {
+    if (lhs == null and rhs == null) return .eq;
+    if (lhs == null) return .lt;
+    if (rhs == null) return .gt;
+    return std.mem.order(u8, lhs.?, rhs.?);
+}
+
+fn optionalStringsEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    return std.mem.eql(u8, lhs.?, rhs.?);
 }
 
 fn deinitNodeMap(alloc: Allocator, node_map: *std.StringArrayHashMapUnmanaged(NodeEdges)) void {
@@ -5565,6 +5643,31 @@ test "builder publishes graph segment when document body carries graph edges" {
     defer manifest.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 1), manifest.stats.graph_segment_count);
     try std.testing.expect(findArtifactIndex(manifest, .graph_segment) != null);
+}
+
+test "serverless graph segment preserves qualified endpoints without local key aliasing" {
+    const alloc = std.testing.allocator;
+    const docs = [_]query_mod.QueryMaterializedDocument{.{
+        .doc_id = @constCast("doc-g"),
+        .body = @constCast("{\"graph_edges\":[{\"target\":\"shared\",\"target_table\":\"entities\",\"edge_type\":\"mentions\"},{\"target\":\"doc-h\",\"target_table\":\"docs\",\"edge_type\":\"related\"}]}"),
+        .last_lsn = 1,
+        .last_timestamp_ns = 1,
+    }};
+    const built = try buildGraphSegmentAlloc(alloc, "docs", &docs, true);
+    defer if (built.payload) |payload| alloc.free(payload);
+
+    var segment = try graph_segment_mod.decodeAlloc(alloc, built.payload.?);
+    defer graph_segment_mod.freeSegment(alloc, &segment);
+    try std.testing.expectEqual(@as(usize, 1), segment.neighbor_tables.len);
+    try std.testing.expectEqualStrings("entities", segment.neighbor_tables[0]);
+    try std.testing.expectEqual(@as(usize, 2), segment.adjacencies.len);
+    var adjacency_index = try graph_segment_mod.AdjacencyIndex.init(alloc, segment);
+    defer adjacency_index.deinit(alloc);
+    const source = adjacency_index.find(segment, "doc-g").?;
+    try std.testing.expectEqual(@as(usize, 2), source.out_edges.len);
+    try std.testing.expectEqualStrings("entities", segment.neighborTable(source.out_edges[0]).?);
+    try std.testing.expect(adjacency_index.find(segment, "shared") == null);
+    try std.testing.expectEqual(@as(usize, 1), adjacency_index.find(segment, "doc-h").?.in_edges.len);
 }
 
 test "builder publishes named graph segments for graph indexes" {

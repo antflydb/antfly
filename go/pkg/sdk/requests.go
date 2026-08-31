@@ -41,7 +41,7 @@ type BatchRequest struct {
 	// Transform operations allow you to modify documents without read-modify-write races:
 	// - Operations are applied atomically on the server
 	// - Multiple operations per document are applied in sequence
-	// - Supports $set, $setOnInsert, $unset, $inc, $addToSet, $min, and $max
+	// - Supports $set, $setOnInsert, $unset, $inc, $push, $pull, $addToSet, $min, and $max
 	Transforms []Transform `json:"transforms,omitempty"`
 
 	// SyncLevel Synchronization level for the batch operation:
@@ -188,9 +188,8 @@ type QueryRequest struct {
 	// DocumentRenderer optional Go template string for rendering document content to the prompt
 	DocumentRenderer string `json:"document_renderer,omitempty"`
 
-	// GraphSearches declarative graph queries to execute after full-text/vector searches.
-	// Results can reference search results using node selectors like $full_text_results.
-	GraphSearches map[string]GraphQuery `json:"graph_searches,omitempty"`
+	// GraphQueries contains declarative graph matching, traversal, and path queries.
+	GraphQueries map[string]GraphQuery `json:"graph_queries,omitempty"`
 
 	// GraphMetric reads one globally ranked, published graph metric generation.
 	GraphMetric *GraphMetricQuery `json:"graph_metric,omitempty"`
@@ -217,6 +216,11 @@ type QueryRequest struct {
 // It converts the strongly-typed *query.Query fields to json.RawMessage
 // for compatibility with the OAPI layer.
 func (q QueryRequest) MarshalJSON() ([]byte, error) {
+	if q.GraphQueries != nil {
+		if err := validateNamedGraphQueries(q.GraphQueries); err != nil {
+			return nil, err
+		}
+	}
 	// Convert SDK QueryRequest to oapi.QueryRequest
 	oapiReq := oapi.QueryRequest{
 		Table:            q.Table,
@@ -240,7 +244,7 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		Pruner:           q.Pruner,
 		SemanticSearch:   q.SemanticSearch,
 		DocumentRenderer: q.DocumentRenderer,
-		GraphSearches:    q.GraphSearches,
+		GraphQueries:     q.GraphQueries,
 		Hierarchy:        q.Hierarchy,
 		ForeignSources:   q.ForeignSources,
 	}
@@ -330,7 +334,6 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 	q.Pruner = oapiReq.Pruner
 	q.SemanticSearch = oapiReq.SemanticSearch
 	q.DocumentRenderer = oapiReq.DocumentRenderer
-	q.GraphSearches = oapiReq.GraphSearches
 	q.GraphMetric = nil
 	if !reflect.ValueOf(oapiReq.GraphMetric).IsZero() {
 		q.GraphMetric = &oapiReq.GraphMetric
@@ -338,6 +341,12 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 	q.GraphMetricRerank = nil
 	if !reflect.ValueOf(oapiReq.GraphMetricRerank).IsZero() {
 		q.GraphMetricRerank = &oapiReq.GraphMetricRerank
+	}
+	q.GraphQueries = oapiReq.GraphQueries
+	if q.GraphQueries != nil {
+		if err := validateNamedGraphQueries(q.GraphQueries); err != nil {
+			return err
+		}
 	}
 	q.Hierarchy = oapiReq.Hierarchy
 	q.Join = oapiReq.Join

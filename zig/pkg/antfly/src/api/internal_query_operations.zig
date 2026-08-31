@@ -93,6 +93,7 @@ pub const Context = struct {
     catalog: CatalogSource,
     query_router: QueryRouter,
     query_planning: ?QueryPlanningContext = null,
+    graph_execution_limits: @import("../graph/work_budget.zig").Limits = .{},
 
     fn queryPlanning(self: Context) ?QueryPlanningContext {
         if (self.query_planning) |planning| return planning;
@@ -113,7 +114,9 @@ pub const Context = struct {
         body: []const u8,
     ) !query_api.OwnedQueryRequest {
         var semantic_resolver = SemanticStatusResolver{ .planning = self.queryPlanning() };
-        return query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, body);
+        var request = try query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, body);
+        request.req.graph_execution_limits = self.graph_execution_limits;
+        return request;
     }
 
     /// Route a planned request to the schema generation that owns the read.
