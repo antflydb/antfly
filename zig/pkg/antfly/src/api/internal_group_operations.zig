@@ -55,12 +55,17 @@ pub const RepairCancellationLookup = struct {
     }
 };
 
+pub const RoutedBatchAuthority = union(enum) {
+    catalog: metadata_api.CatalogRouteFence,
+    split_replication,
+};
+
 pub const RoutedRaftBatchWriter = struct {
     ptr: *anyopaque,
     write_fn: *const fn (
         *anyopaque,
         std.mem.Allocator,
-        metadata_api.CatalogRouteFence,
+        RoutedBatchAuthority,
         u64,
         []const u8,
         db_mod.types.BatchRequest,
@@ -68,8 +73,8 @@ pub const RoutedRaftBatchWriter = struct {
         CancellationToken,
     ) anyerror!?void,
 
-    fn write(self: @This(), alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, cancellation: CancellationToken) !?void {
-        return self.write_fn(self.ptr, alloc, fence, group_id, table_name, input, forwarding, cancellation);
+    fn write(self: @This(), alloc: std.mem.Allocator, authority: RoutedBatchAuthority, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, cancellation: CancellationToken) !?void {
+        return self.write_fn(self.ptr, alloc, authority, group_id, table_name, input, forwarding, cancellation);
     }
 };
 
@@ -293,19 +298,38 @@ pub const Operations = struct {
             else => return error.Internal,
         };
         const writer = self.routed_raft_batch_writer orelse return error.Unavailable;
-        if (request.catalog_route_fence_json.len == 0) return error.Unavailable;
-        var parsed_fence = std.json.parseFromSlice(
-            metadata_api.CatalogRouteFence,
-            alloc,
-            request.catalog_route_fence_json,
-            .{ .ignore_unknown_fields = false },
-        ) catch return error.InvalidArgument;
-        defer parsed_fence.deinit();
-        parsed_fence.value.validate() catch return error.InvalidArgument;
-        if (parsed_fence.value.route.group_id != group_id) return error.InvalidArgument;
-        parsed_fence.value.admission_deadline_ns = request.deadline_ns;
-        parsed_fence.value.admission_cancellation = request.cancellation;
-        _ = (writer.write(alloc, parsed_fence.value, group_id, table_name, input, forwarding, request.cancellation) catch |err| switch (err) {
+        var parsed_fence: ?std.json.Parsed(metadata_api.CatalogRouteFence) = null;
+        defer if (parsed_fence) |*fence| fence.deinit();
+        const authority: RoutedBatchAuthority = if (request.catalog_route_fence_json.len != 0) fence: {
+            parsed_fence = std.json.parseFromSlice(
+                metadata_api.CatalogRouteFence,
+                alloc,
+                request.catalog_route_fence_json,
+                .{ .ignore_unknown_fields = false },
+            ) catch return error.InvalidArgument;
+            parsed_fence.?.value.validate() catch return error.InvalidArgument;
+            if (parsed_fence.?.value.route.group_id != group_id) return error.InvalidArgument;
+            parsed_fence.?.value.admission_deadline_ns = request.deadline_ns;
+            parsed_fence.?.value.admission_cancellation = request.cancellation;
+            break :fence .{ .catalog = parsed_fence.?.value };
+        } else split: {
+            // Publicly routed writes always carry a catalog fence. Split
+            // replication is different: its destination is intentionally not
+            // catalog-visible yet, and the replicated transition identity is
+            // the authority checked by every destination replica. Admit only
+            // that self-identifying internal batch shape without a fence.
+            const split_replication = input.split_replication orelse return error.Unavailable;
+            if (split_replication.transition_id == 0 or
+                split_replication.attempt_epoch == 0 or
+                split_replication.source_group_id == 0 or
+                split_replication.destination_group_id != group_id or
+                split_replication.source_group_id == group_id)
+            {
+                return error.InvalidArgument;
+            }
+            break :split .split_replication;
+        };
+        _ = (writer.write(alloc, authority, group_id, table_name, input, forwarding, request.cancellation) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
             error.TopologyChanged => return error.TopologyChanged,
             error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
@@ -1176,6 +1200,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
         calls: usize = 0,
         fail_identity: bool = false,
         visibility_error: ?anyerror = null,
+        saw_unfenced_split: bool = false,
 
         fn validate(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1187,7 +1212,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
         fn write(
             ptr: *anyopaque,
             _: std.mem.Allocator,
-            fence: metadata_api.CatalogRouteFence,
+            authority: RoutedBatchAuthority,
             group_id: u64,
             table_name: []const u8,
             _: db_mod.types.BatchRequest,
@@ -1197,7 +1222,10 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             try std.testing.expectEqual(@as(u64, 17), group_id);
-            try std.testing.expectEqual(group_id, fence.route.group_id);
+            switch (authority) {
+                .catalog => |catalog_fence| try std.testing.expectEqual(group_id, catalog_fence.route.group_id),
+                .split_replication => self.saw_unfenced_split = true,
+            }
             try std.testing.expectEqualStrings("documents", table_name);
             try std.testing.expectEqual(@as(u32, 425), forwarding.remaining_ms);
             try std.testing.expectEqual(@as(u8, 1), forwarding.forwards_remaining);
@@ -1270,6 +1298,49 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
         forwarding,
     ));
     try std.testing.expectEqual(@as(usize, 4), state.calls);
+
+    const unfenced_request: operation.RequestContext = .{
+        .cancellation = CancellationToken.fromAtomic(&cancelled),
+    };
+    try std.testing.expectError(error.Unavailable, operations.routedBatch(
+        std.testing.allocator,
+        unfenced_request,
+        17,
+        "documents",
+        .{},
+        forwarding,
+    ));
+    try std.testing.expectEqual(@as(usize, 4), state.calls);
+
+    const split_replication: db_mod.types.SplitReplicationContext = .{
+        .transition_id = 91,
+        .attempt_epoch = 2,
+        .source_group_id = 16,
+        .destination_group_id = 17,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 17 },
+    };
+    _ = try operations.routedBatch(
+        std.testing.allocator,
+        unfenced_request,
+        17,
+        "documents",
+        .{ .split_replication = split_replication },
+        forwarding,
+    );
+    try std.testing.expectEqual(@as(usize, 5), state.calls);
+    try std.testing.expect(state.saw_unfenced_split);
+
+    var mismatched_split = split_replication;
+    mismatched_split.destination_group_id = 18;
+    try std.testing.expectError(error.InvalidArgument, operations.routedBatch(
+        std.testing.allocator,
+        unfenced_request,
+        17,
+        "documents",
+        .{ .split_replication = mismatched_split },
+        forwarding,
+    ));
+    try std.testing.expectEqual(@as(usize, 5), state.calls);
 }
 
 test "typed internal query workers preserve identity generation validation" {

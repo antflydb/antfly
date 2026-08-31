@@ -7598,7 +7598,7 @@ pub const DataServer = struct {
     fn localRaftBatchGroupForwarded(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
-        fence: antfly.metadata_api.CatalogRouteFence,
+        authority: antfly.public_api.internal_group_operations.RoutedBatchAuthority,
         group_id: u64,
         table_name: []const u8,
         req: antfly.db.types.BatchRequest,
@@ -7606,6 +7606,10 @@ pub const DataServer = struct {
         cancellation_token: antfly.public_api.operation.CancellationToken,
     ) !?void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const write_route_fence: ?antfly.metadata_api.CatalogRouteFence = switch (authority) {
+            .catalog => |fence| fence,
+            .split_replication => null,
+        };
         var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(cancellation_token);
         const leader_wait_ns = dataRaftForwardedLeaderWaitNs(forwarding);
         if (leader_wait_ns == 0) return error.LeaderUnavailable;
@@ -7620,7 +7624,7 @@ pub const DataServer = struct {
                 .forwards_remaining = forwarding.forwards_remaining,
                 .cancellation = if (cancellation_token.ptr != null) &cancellation else null,
                 .visibility_cancellation = cancellation_token,
-                .write_route_fence = fence,
+                .write_route_fence = write_route_fence,
             },
             leader_wait_ns,
         );
