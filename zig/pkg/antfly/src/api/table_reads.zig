@@ -3362,7 +3362,10 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         try checkQueryDeadline(req);
-        var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, self.catalog, table_name, .all_ranges, req.execution_deadline_ns);
+        // Queries may discover graph/join target tables after source-table
+        // admission. Capture one authoritative projection up front so every
+        // phase is planned from the same catalog generation.
+        var routing_session = try table_catalog.RoutingSession.init(alloc, self.catalog, req.execution_deadline_ns);
         defer routing_session.deinit();
         var routed_source = self.*;
         routed_source.catalog = routing_session.catalog();
@@ -3493,7 +3496,7 @@ pub const ProvisionedTableReadSource = struct {
         try self.ensureHAReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
-            var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, self.catalog, table_name, .all_ranges, req.execution_deadline_ns);
+            var routing_session = try table_catalog.RoutingSession.init(alloc, self.catalog, req.execution_deadline_ns);
             defer routing_session.deinit();
             var routed_source = self.*;
             routed_source.catalog = routing_session.catalog();
@@ -4433,6 +4436,42 @@ pub const HostedProvisionedTableReadSource = struct {
         return try algebraicPartialsGroupLocal(&routed, alloc, group_id, table_name, body);
     }
 
+    fn joinPartitionGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: ?u32) !?query_api.QueryResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try joinPartitionGroupLocal(&routed, alloc, group_id, table_name, body, timeout_ms);
+    }
+
+    fn joinRowsGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: ?u32) !?query_api.QueryResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try joinRowsGroupLocal(&routed, alloc, group_id, table_name, body, timeout_ms);
+    }
+
+    fn joinUnmatchedGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: ?u32) !?query_api.QueryResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try joinUnmatchedGroupLocal(&routed, alloc, group_id, table_name, body, timeout_ms);
+    }
+
+    fn joinFinalizeGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: ?u32) !?query_api.QueryResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try joinFinalizeGroupLocal(&routed, alloc, group_id, table_name, body, timeout_ms);
+    }
+
     fn graphExpandGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: distributed_graph.GraphExpandRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphExpandResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
@@ -4486,6 +4525,10 @@ pub const HostedProvisionedTableReadSource = struct {
                 .join_rows_group_local_with_timeout = joinRowsGroupLocal,
                 .join_unmatched_group_local_with_timeout = joinUnmatchedGroupLocal,
                 .join_finalize_group_local_with_timeout = joinFinalizeGroupLocal,
+                .join_partition_group_local_routed_with_timeout = joinPartitionGroupLocalRouted,
+                .join_rows_group_local_routed_with_timeout = joinRowsGroupLocalRouted,
+                .join_unmatched_group_local_routed_with_timeout = joinUnmatchedGroupLocalRouted,
+                .join_finalize_group_local_routed_with_timeout = joinFinalizeGroupLocalRouted,
                 .join_job_state_group_local = joinJobStateGroupLocal,
                 .graph_expand_group_local = graphExpandGroupLocal,
                 .graph_expand_group_local_routed = graphExpandGroupLocalRouted,
@@ -4765,7 +4808,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try checkQueryDeadline(req);
-        var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .all_ranges, req.execution_deadline_ns);
+        var routing_session = try table_catalog.RoutingSession.init(alloc, hosted.catalog, req.execution_deadline_ns);
         defer routing_session.deinit();
         var routed_source = hosted.*;
         routed_source.catalog = routing_session.catalog();
@@ -4856,7 +4899,7 @@ pub const HostedProvisionedTableReadSource = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .all_ranges, req.execution_deadline_ns);
+        var routing_session = try table_catalog.RoutingSession.init(alloc, hosted.catalog, req.execution_deadline_ns);
         defer routing_session.deinit();
         var routed_source = hosted.*;
         routed_source.catalog = routing_session.catalog();

@@ -232,7 +232,6 @@ pub const RoutingSession = struct {
     base: CatalogSource,
     snapshot: OwnedRoutingSnapshot,
     authoritative: bool,
-    deadline_ns: ?u64,
     table_indexes: std.StringHashMapUnmanaged(usize) = .empty,
     table_id_indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     group_indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty,
@@ -244,7 +243,7 @@ pub const RoutingSession = struct {
         deadline_ns: ?u64,
     ) !RoutingSession {
         const routing = try base.routingSource();
-        return try initOwned(alloc, base, try routing.linearizableSnapshot(deadline_ns), true, deadline_ns);
+        return try initOwned(alloc, base, try routing.linearizableSnapshot(deadline_ns), true);
     }
 
     /// Use the cached/eventual projection for positive routes. Misses are
@@ -265,7 +264,7 @@ pub const RoutingSession = struct {
         if (candidate) |plan_value| {
             var plan = plan_value;
             plan.deinit(alloc);
-            return try initOwned(alloc, base, snapshot, false, deadline_ns);
+            return try initOwned(alloc, base, snapshot, false);
         }
         snapshot.deinit();
         return try initOwned(
@@ -273,7 +272,6 @@ pub const RoutingSession = struct {
             base,
             try routing.linearizableSnapshot(deadline_ns),
             true,
-            deadline_ns,
         );
     }
 
@@ -282,7 +280,6 @@ pub const RoutingSession = struct {
         base: CatalogSource,
         snapshot_value: OwnedRoutingSnapshot,
         authoritative: bool,
-        deadline_ns: ?u64,
     ) !RoutingSession {
         var snapshot = snapshot_value;
         errdefer snapshot.deinit();
@@ -291,7 +288,6 @@ pub const RoutingSession = struct {
             .base = base,
             .snapshot = snapshot,
             .authoritative = authoritative,
-            .deadline_ns = deadline_ns,
         };
         errdefer {
             self.table_indexes.deinit(alloc);
@@ -413,9 +409,11 @@ pub const RoutingSession = struct {
     fn linearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
         const self = cast(ptr);
         if (self.authoritative) return try routingSnapshot(ptr, deadline_ns);
-        var authoritative = try (try self.base.routingSource()).linearizableSnapshot(deadline_ns);
-        defer authoritative.deinit();
-        return try cloneRoutingSnapshot(self.alloc, authoritative.value, deadline_ns);
+        // A request-scoped catalog is an immutable projection, not a portal
+        // back into mutable metadata. Callers that need an authoritative miss
+        // must restart planning with `RoutingSession.init`; silently upgrading
+        // here could combine a route from revision N with a fence from N+1.
+        return error.CatalogProjectionRefreshRequired;
     }
 
     fn routeIdentity(
@@ -437,24 +435,7 @@ pub const RoutingSession = struct {
                 }
             }
         }
-        if (self.authoritative) return null;
-        var authoritative = try (try self.base.routingSource()).linearizableSnapshot(self.deadline_ns);
-        defer authoritative.deinit();
-        return identityFromSnapshot(authoritative.value, table_name, group_id);
-    }
-
-    fn identityFromSnapshot(
-        snapshot: metadata_api.CatalogRoutingSnapshot,
-        table_name: []const u8,
-        group_id: u64,
-    ) ?metadata_api.CatalogIdentityNamespace {
-        const table = findTableByName(snapshot.tables, table_name) orelse return null;
-        const range = findRangeForTableGroup(snapshot.ranges, table.table_id, group_id) orelse return null;
-        return .{
-            .table_id = table.table_id,
-            .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
-            .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
-        };
+        return null;
     }
 
     fn routeFence(ptr: *anyopaque, group_id: u64) !?metadata_api.CatalogRouteFence {
@@ -482,38 +463,7 @@ pub const RoutingSession = struct {
                 },
             };
         }
-        if (self.authoritative) return null;
-        var authoritative = try (try self.base.routingSource()).linearizableSnapshot(self.deadline_ns);
-        defer authoritative.deinit();
-        return try self.routeFenceFromSnapshot(authoritative.value, group_id);
-    }
-
-    fn routeFenceFromSnapshot(
-        self: *RoutingSession,
-        snapshot: metadata_api.CatalogRoutingSnapshot,
-        group_id: u64,
-    ) !?metadata_api.CatalogRouteFence {
-        var selected_table_id: ?u64 = null;
-        for (snapshot.ranges) |range| {
-            if (range.group_id != group_id) continue;
-            if (selected_table_id != null and selected_table_id.? != range.table_id)
-                return error.TopologyChanged;
-            selected_table_id = range.table_id;
-        }
-        const table_id = selected_table_id orelse return null;
-        const table = findTableById(snapshot.tables, table_id) orelse return error.TopologyChanged;
-        var plan = (try routePlanFromSnapshot(self.alloc, snapshot, table.name, .{ .group = group_id })) orelse
-            return error.TopologyChanged;
-        defer plan.deinit(self.alloc);
-        if (plan.groups.len != 1) return error.TopologyChanged;
-        return .{
-            .metadata_group_id = plan.metadata_group_id,
-            .metadata_incarnation = plan.metadata_incarnation,
-            .catalog_revision = plan.catalog_revision,
-            .table_id = plan.table_id,
-            .topology_epoch = plan.topology_epoch,
-            .route = plan.groups[0],
-        };
+        return null;
     }
 
     fn resolvePinnedRoute(
@@ -530,7 +480,7 @@ pub const RoutingSession = struct {
         if (try routePlanFromSnapshot(alloc, self.snapshot.value, table_name, query)) |plan|
             return .{ .found = plan };
         if (self.authoritative) return .not_found;
-        return try resolveRoute(alloc, try self.base.routingSource(), table_name, query, deadline_ns);
+        return error.CatalogProjectionRefreshRequired;
     }
 
     fn resolveCurrentRoute(
@@ -552,14 +502,13 @@ pub const RoutingSession = struct {
     }
 
     fn waitForRoutingChange(
-        _: *anyopaque,
+        ptr: *anyopaque,
         _: metadata_api.CatalogRoutingChangeToken,
         _: u64,
         _: u64,
     ) !CatalogChangeWaitResult {
-        // Resolution performs a linearizable fallback before reaching this
-        // point, so an unchanged miss is authoritative for this request.
-        return .authoritative_absence;
+        if (cast(ptr).authoritative) return .authoritative_absence;
+        return error.CatalogProjectionRefreshRequired;
     }
 
     fn validatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -2483,6 +2432,13 @@ test "routing session validates a pinned selection against current topology" {
     var pinned = try routedSpanSnapshot(std.testing.allocator, source, "docs", "", "");
     defer pinned.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u64, &.{7001}, pinned.group_ids);
+    try std.testing.expect((try source.vtable.route_identity.?(source.ptr, "docs", 7002)) == null);
+    try std.testing.expect((try source.vtable.route_fence.?(source.ptr, 7002)) == null);
+    try std.testing.expectError(
+        error.CatalogProjectionRefreshRequired,
+        resolveCatalogRoute(std.testing.allocator, source, "docs", .{ .group = 7002 }, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.linearizable_calls);
     try std.testing.expectError(
         error.TopologyChanged,
         validatePinnedTopologyEpoch(std.testing.allocator, source, "docs", pinned.topology_epoch),

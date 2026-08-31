@@ -9822,6 +9822,22 @@ pub const ProvisionedTableWriteSource = struct {
                 self.transactionRecoveryConfig();
             var retry_prepared_open = false;
             var opened: ?db_mod.DB = while (true) {
+                // The initial identity lookup happens before cold-open
+                // serialization. Revalidate after admission and immediately
+                // before the first storage side effect so a removed or
+                // reassigned group cannot seed a writer from a stale route.
+                if (preloaded_metadata == null and
+                    managed_open_options.identity_namespace_override == null)
+                {
+                    const admitted_identity = try loadTableIdentityNamespaceForGroup(
+                        cache.alloc,
+                        self.catalog,
+                        table_name,
+                        group_id,
+                    );
+                    if (!std.meta.eql(identity_namespace, admitted_identity))
+                        return error.TopologyChanged;
+                }
                 const open_result: anyerror!db_mod.DB = if (consumeTestWriterOpenPersistentDescriptorFailure())
                     error.PersistentDescriptorAdmissionExhausted
                 else if (prepared_open.?.indexes_json) |value|
@@ -26439,23 +26455,83 @@ fn loadTableIdentityNamespaceForGroup(
     table_name: []const u8,
     group_id: u64,
 ) !?doc_identity.Namespace {
-    // Identity is part of the range-routing contract. Reading it from an
-    // independent admin snapshot can race a newly visible route and create a
-    // DB with the default namespace, permanently fencing later opens. Keep
-    // group selection and namespace selection on the compact projection.
-    var result = try table_catalog.resolveRoute(
-        alloc,
-        try catalog.routingSource(),
-        table_name,
-        .{ .group = group_id },
-        null,
-    );
-    defer result.deinit(alloc);
-    return switch (result) {
-        .found => |plan| docIdentityNamespaceFromCatalog(plan.groups[0].identity_namespace),
-        .not_found => error.TopologyChanged,
-        .timed_out => error.CatalogRoutingSnapshotTimeout,
+    _ = alloc;
+    // Writer identity is a correctness decision, never a cache hint. Capture
+    // it behind the compact linearizable barrier; eventual positives are only
+    // safe for tentative reads because a removed/reassigned group may still
+    // be present in a follower or TTL cache.
+    var snapshot = try (try catalog.routingSource()).linearizableSnapshot(null);
+    defer snapshot.deinit();
+    var table_id: ?u64 = null;
+    for (snapshot.value.tables) |table| {
+        if (std.mem.eql(u8, table.name, table_name)) {
+            table_id = table.table_id;
+            break;
+        }
+    }
+    const expected_table_id = table_id orelse return error.TopologyChanged;
+    for (snapshot.value.ranges) |range| {
+        if (range.table_id != expected_table_id or range.group_id != group_id) continue;
+        return tableIdentityNamespaceForRangeId(expected_table_id, range);
+    }
+    return error.TopologyChanged;
+}
+
+test "writer identity resolution rejects stale eventual routes" {
+    const State = struct {
+        eventual_calls: usize = 0,
+        linearizable_calls: usize = 0,
+
+        const tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
+        const stale_ranges = [_]metadata_table_manager.RangeRecord{.{ .table_id = 7, .group_id = 7001, .range_id = 71, .start_key = "" }};
+        const current_ranges = [_]metadata_table_manager.RangeRecord{.{ .table_id = 7, .group_id = 7002, .range_id = 72, .start_key = "" }};
+
+        fn source(self: *@This()) table_catalog.CatalogSource {
+            return .{ .ptr = self, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = eventualSnapshot,
+                .linearizable_routing_snapshot = linearizableSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
+            } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.AdminSnapshotUsedForRouting;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn eventualSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.eventual_calls += 1;
+            return .{ .tables = @constCast(tables[0..]), .ranges = @constCast(stale_ranges[0..]) };
+        }
+
+        fn linearizableSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.linearizable_calls += 1;
+            return .{ .tables = @constCast(tables[0..]), .ranges = @constCast(current_ranges[0..]) };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
     };
+
+    var state = State{};
+    try std.testing.expectError(
+        error.TopologyChanged,
+        loadTableIdentityNamespaceForGroup(std.testing.allocator, state.source(), "docs", 7001),
+    );
+    const current = (try loadTableIdentityNamespaceForGroup(
+        std.testing.allocator,
+        state.source(),
+        "docs",
+        7002,
+    )).?;
+    try std.testing.expectEqual(@as(u64, 7), current.table_id);
+    try std.testing.expectEqual(@as(u64, 72), current.range_id);
+    try std.testing.expectEqual(@as(usize, 0), state.eventual_calls);
+    try std.testing.expectEqual(@as(usize, 2), state.linearizable_calls);
 }
 
 fn docIdentityNamespaceFromCatalog(namespace: table_catalog.CatalogIdentityNamespace) doc_identity.Namespace {

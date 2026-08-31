@@ -1017,7 +1017,7 @@ const LocalStandaloneMetadata = struct {
         }
         self.mutex.unlock();
 
-        const now_ns = platform_time.monotonicNs();
+        var now_ns = platform_time.monotonicNs();
         if (now_ns < deadline_ns) {
             // Finish the passive watch before the outer deadline and reserve
             // bounded time for the authoritative mutex confirmation. Waiting
@@ -1029,12 +1029,18 @@ const LocalStandaloneMetadata = struct {
                 @max(std.time.ns_per_ms, remaining_ns / 4),
             );
             const watch_deadline_ns = deadline_ns -| confirmation_budget_ns;
-            const wait_ns = if (now_ns < watch_deadline_ns)
-                @min(watch_deadline_ns - now_ns, @max(probe_interval_ns, std.time.ns_per_ms))
-            else
-                0;
-            if (wait_ns > 0)
+            while (now_ns < watch_deadline_ns) {
+                const wait_ns = @min(
+                    watch_deadline_ns - now_ns,
+                    @max(probe_interval_ns, std.time.ns_per_ms),
+                );
                 platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
+                if (!lockAtomicUntil(&self.mutex, deadline_ns)) return .retry;
+                const changed = standaloneCatalogTokenChanged(self, observed_token);
+                self.mutex.unlock();
+                if (changed) return .changed;
+                now_ns = platform_time.monotonicNs();
+            }
         }
         if (!lockAtomicUntil(&self.mutex, deadline_ns)) return .retry;
         defer self.mutex.unlock();
@@ -7666,6 +7672,40 @@ test "standalone metadata advertises a linearizable owned snapshot" {
     defer source.freeAdminSnapshot(&rebound_snapshot);
     try std.testing.expectEqual(@as(usize, 1), rebound_snapshot.stores.len);
     try std.testing.expectEqualStrings("http://127.0.0.1:49152", rebound_snapshot.stores[0].api_url);
+}
+
+test "standalone routing watch does not report absence after one probe" {
+    const alloc = std.testing.allocator;
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, ".zig-cache/unused-routing-watch-catalog"),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+    metadata.epoch = 9;
+
+    const start_ns = platform_time.monotonicNs();
+    const result = try (try metadata.catalogSource().routingSource()).waitForChange(
+        .{ .metadata_group_id = group_ids.main_metadata_group_id, .revision = 9 },
+        start_ns + 60 * std.time.ns_per_ms,
+        2 * std.time.ns_per_ms,
+    );
+    try std.testing.expectEqual(
+        antfly.public_api.table_catalog.CatalogChangeWaitResult.authoritative_absence,
+        result,
+    );
+    // The old one-probe implementation returned in roughly 2 ms. Keep a
+    // generous lower bound so scheduler jitter can only make the test safer.
+    try std.testing.expect(platform_time.monotonicNs() -| start_ns >= 30 * std.time.ns_per_ms);
 }
 
 test "standalone metadata rejects corrupt catalog without double-freeing owned paths" {
