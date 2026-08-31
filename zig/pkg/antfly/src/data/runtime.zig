@@ -15499,9 +15499,17 @@ const RemoteMetadataSource = struct {
             alloc: std.mem.Allocator,
             source: antfly.metadata_api.CatalogRoutingSnapshot,
         ) !*@This() {
+            return try createUntil(alloc, source, null);
+        }
+
+        fn createUntil(
+            alloc: std.mem.Allocator,
+            source: antfly.metadata_api.CatalogRoutingSnapshot,
+            deadline_ns: ?u64,
+        ) !*@This() {
             const entry = try alloc.create(@This());
             errdefer alloc.destroy(entry);
-            entry.* = .{ .snapshot = try cloneRoutingSnapshotOwned(alloc, source) };
+            entry.* = .{ .snapshot = try cloneRoutingSnapshotOwnedUntil(alloc, source, deadline_ns) };
             return entry;
         }
 
@@ -16349,7 +16357,8 @@ const RemoteMetadataSource = struct {
             // Singleflight followers recheck after the active refresh. This
             // keeps a burst of routed reads to one metadata request.
             if (try self.cachedRoutingSnapshotFresh(deadline_ns)) |snapshot| return snapshot;
-            lockAtomic(&self.cache_mutex);
+            if (!lockAtomicBefore(&self.cache_mutex, deadline_ns))
+                return error.CatalogRoutingSnapshotTimeout;
             routing_invalidation_generation = self.snapshot_invalidation_generation;
             self.cache_mutex.unlock();
         }
@@ -16407,12 +16416,13 @@ const RemoteMetadataSource = struct {
                         continue;
                     };
                     defer parsed.deinit();
-                    break :compact self.ownedRoutingSnapshot(
+                    break :compact self.ownedRoutingSnapshotUntil(
                         parsed.value.metadata_group_id,
                         parsed.value.metadata_incarnation,
                         parsed.value.catalog_revision,
                         parsed.value.tables,
                         parsed.value.ranges,
+                        if (attempt_budget) |budget| budget.deadline_ns else null,
                     ) catch |err| {
                         last_err = err;
                         continue;
@@ -16436,7 +16446,7 @@ const RemoteMetadataSource = struct {
                 .unknown, .incompatible => unreachable,
             };
             self.noteMetadataReadSuccess(index);
-            if (!linearizable) self.publishRoutingSnapshot(snapshot, routing_invalidation_generation) catch |err| {
+            if (!linearizable) self.publishRoutingSnapshot(snapshot, routing_invalidation_generation, deadline_ns) catch |err| {
                 var owned = snapshot;
                 freeRoutingSnapshotOwned(self.alloc, &owned);
                 if (err == error.MetadataSnapshotHeadMismatch) {
@@ -16448,6 +16458,13 @@ const RemoteMetadataSource = struct {
                 }
                 return err;
             };
+            if (deadline_ns) |deadline| {
+                if (platform_time.monotonicNs() >= deadline) {
+                    var owned = snapshot;
+                    freeRoutingSnapshotOwned(self.alloc, &owned);
+                    return error.CatalogRoutingSnapshotTimeout;
+                }
+            }
             return snapshot;
         }
         if (deadline_ns) |deadline| {
@@ -16461,7 +16478,8 @@ const RemoteMetadataSource = struct {
         deadline_ns: ?u64,
     ) !?antfly.metadata_api.CatalogRoutingSnapshot {
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-        lockAtomic(&self.cache_mutex);
+        if (!lockAtomicBefore(&self.cache_mutex, deadline_ns))
+            return error.CatalogRoutingSnapshotTimeout;
         const entry = self.cached_routing_snapshot orelse {
             self.cache_mutex.unlock();
             return null;
@@ -16480,16 +16498,29 @@ const RemoteMetadataSource = struct {
         self: *RemoteMetadataSource,
         snapshot: antfly.metadata_api.CatalogRoutingSnapshot,
         invalidation_generation: u64,
+        deadline_ns: ?u64,
     ) !void {
-        const entry = try RoutingSnapshotCacheEntry.create(self.alloc, snapshot);
+        const entry = try RoutingSnapshotCacheEntry.createUntil(self.alloc, snapshot, deadline_ns);
         var published = false;
         defer if (!published) entry.release(self.alloc);
         var retired: ?*RoutingSnapshotCacheEntry = null;
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-        lockAtomic(&self.cache_mutex);
+        if (!lockAtomicBefore(&self.cache_mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) {
+                self.cache_mutex.unlock();
+                return error.CatalogRoutingSnapshotTimeout;
+            }
+        }
         if (self.snapshot_invalidation_generation != invalidation_generation) {
             self.cache_mutex.unlock();
             return error.MetadataSnapshotHeadMismatch;
+        }
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) {
+                self.cache_mutex.unlock();
+                return error.CatalogRoutingSnapshotTimeout;
+            }
         }
         retired = self.cached_routing_snapshot;
         self.cached_routing_snapshot = entry;
@@ -16511,26 +16542,36 @@ const RemoteMetadataSource = struct {
         else
             try metadata_client.fetchSnapshotWithBudget(self.base_uris[index], budget);
         defer parsed.deinit();
-        return try self.ownedRoutingSnapshot(
+        return try self.ownedRoutingSnapshotUntil(
             parsed.value.status.metadata_group_id,
             parsed.value.status.metadata_incarnation,
             0,
             parsed.value.tables,
             parsed.value.ranges,
+            if (budget) |value| value.deadline_ns else null,
         );
     }
 
-    fn ownedRoutingSnapshot(
+    fn ownedRoutingSnapshotUntil(
         self: *RemoteMetadataSource,
         metadata_group_id: u64,
         metadata_incarnation: ?antfly.metadata_api.MetadataClusterIncarnation,
         catalog_revision: u64,
         source_tables: []const antfly.metadata.table_manager.TableRecord,
         source_ranges: []const antfly.metadata.table_manager.RangeRecord,
+        deadline_ns: ?u64,
     ) !antfly.metadata_api.CatalogRoutingSnapshot {
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
         try self.acceptMetadataIdentity(metadata_group_id, metadata_incarnation);
-        const tables = try cloneRoutingTablesOwned(self.alloc, source_tables);
+        const tables = try cloneRoutingTablesOwnedUntil(self.alloc, source_tables, deadline_ns);
         errdefer freeTablesOwned(self.alloc, tables);
+        const ranges = try cloneRoutingRangesOwnedUntil(self.alloc, source_ranges, deadline_ns);
+        errdefer freeRangesOwned(self.alloc, ranges);
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
         return .{
             .metadata_group_id = metadata_group_id,
             .metadata_incarnation = metadata_incarnation,
@@ -16541,7 +16582,7 @@ const RemoteMetadataSource = struct {
                 .revision = catalog_revision,
             },
             .tables = tables,
-            .ranges = try cloneRoutingRangesOwned(self.alloc, source_ranges),
+            .ranges = ranges,
         };
     }
 
@@ -18924,7 +18965,14 @@ fn cloneTablesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.t
     return out;
 }
 
-fn cloneRoutingTablesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.TableRecord) ![]antfly.metadata.table_manager.TableRecord {
+fn cloneRoutingTablesOwnedUntil(
+    alloc: std.mem.Allocator,
+    records: []const antfly.metadata.table_manager.TableRecord,
+    deadline_ns: ?u64,
+) ![]antfly.metadata.table_manager.TableRecord {
+    if (deadline_ns) |deadline| {
+        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+    }
     const out = try alloc.alloc(antfly.metadata.table_manager.TableRecord, records.len);
     var initialized: usize = 0;
     errdefer {
@@ -18932,6 +18980,9 @@ fn cloneRoutingTablesOwned(alloc: std.mem.Allocator, records: []const antfly.met
         alloc.free(out);
     }
     for (records, 0..) |record, i| {
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
         out[i] = try antfly.metadata.table_manager.cloneRoutingTable(alloc, record);
         initialized += 1;
     }
@@ -18952,7 +19003,14 @@ fn cloneRangesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.t
     return out;
 }
 
-fn cloneRoutingRangesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.RangeRecord) ![]antfly.metadata.table_manager.RangeRecord {
+fn cloneRoutingRangesOwnedUntil(
+    alloc: std.mem.Allocator,
+    records: []const antfly.metadata.table_manager.RangeRecord,
+    deadline_ns: ?u64,
+) ![]antfly.metadata.table_manager.RangeRecord {
+    if (deadline_ns) |deadline| {
+        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+    }
     const out = try alloc.alloc(antfly.metadata.table_manager.RangeRecord, records.len);
     var initialized: usize = 0;
     errdefer {
@@ -18960,17 +19018,13 @@ fn cloneRoutingRangesOwned(alloc: std.mem.Allocator, records: []const antfly.met
         alloc.free(out);
     }
     for (records, 0..) |record, i| {
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
         out[i] = try antfly.metadata.table_manager.cloneRoutingRange(alloc, record);
         initialized += 1;
     }
     return out;
-}
-
-fn cloneRoutingSnapshotOwned(
-    alloc: std.mem.Allocator,
-    snapshot: antfly.metadata_api.CatalogRoutingSnapshot,
-) !antfly.metadata_api.CatalogRoutingSnapshot {
-    return try cloneRoutingSnapshotOwnedUntil(alloc, snapshot, null);
 }
 
 fn cloneRoutingSnapshotOwnedUntil(
@@ -18981,39 +19035,13 @@ fn cloneRoutingSnapshotOwnedUntil(
     if (deadline_ns) |deadline| {
         if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
     }
-    const tables = tables: {
-        const out = try alloc.alloc(antfly.metadata.table_manager.TableRecord, snapshot.tables.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (out[0..initialized]) |record| antfly.metadata.table_manager.freeTable(alloc, record);
-            alloc.free(out);
-        }
-        for (snapshot.tables, 0..) |record, index| {
-            if (deadline_ns) |deadline| {
-                if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
-            }
-            out[index] = try antfly.metadata.table_manager.cloneRoutingTable(alloc, record);
-            initialized = index + 1;
-        }
-        break :tables out;
-    };
+    const tables = try cloneRoutingTablesOwnedUntil(alloc, snapshot.tables, deadline_ns);
     errdefer freeTablesOwned(alloc, tables);
-    const ranges = ranges: {
-        const out = try alloc.alloc(antfly.metadata.table_manager.RangeRecord, snapshot.ranges.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (out[0..initialized]) |record| antfly.metadata.table_manager.freeRange(alloc, record);
-            alloc.free(out);
-        }
-        for (snapshot.ranges, 0..) |record, index| {
-            if (deadline_ns) |deadline| {
-                if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
-            }
-            out[index] = try antfly.metadata.table_manager.cloneRoutingRange(alloc, record);
-            initialized = index + 1;
-        }
-        break :ranges out;
-    };
+    const ranges = try cloneRoutingRangesOwnedUntil(alloc, snapshot.ranges, deadline_ns);
+    errdefer freeRangesOwned(alloc, ranges);
+    if (deadline_ns) |deadline| {
+        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+    }
     return .{
         .metadata_group_id = snapshot.metadata_group_id,
         .metadata_incarnation = snapshot.metadata_incarnation,
@@ -32283,6 +32311,54 @@ test "remote routing cache entries retain immutable snapshots outside the cache 
             platform_time.monotonicNs(),
         ),
     );
+}
+
+test "remote routing never publishes a cache entry after its deadline" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    var tables = [_]antfly.metadata.table_manager.TableRecord{
+        .{ .table_id = 7, .name = "docs" },
+    };
+    var ranges = [_]antfly.metadata.table_manager.RangeRecord{
+        .{ .table_id = 7, .group_id = 7001, .range_id = 71, .start_key = "" },
+    };
+    const first = antfly.metadata_api.CatalogRoutingSnapshot{
+        .catalog_revision = 9,
+        .tables = tables[0..],
+        .ranges = ranges[0..],
+    };
+    try source.publishRoutingSnapshot(
+        first,
+        source.snapshot_invalidation_generation,
+        platform_time.monotonicNs() + std.time.ns_per_s,
+    );
+
+    lockAtomic(&source.cache_mutex);
+    const published = source.cached_routing_snapshot.?;
+    source.cache_mutex.unlock();
+
+    var replacement = first;
+    replacement.catalog_revision = 10;
+    try std.testing.expectError(
+        error.CatalogRoutingSnapshotTimeout,
+        source.publishRoutingSnapshot(
+            replacement,
+            source.snapshot_invalidation_generation,
+            platform_time.monotonicNs(),
+        ),
+    );
+
+    lockAtomic(&source.cache_mutex);
+    defer source.cache_mutex.unlock();
+    try std.testing.expect(source.cached_routing_snapshot == published);
+    try std.testing.expectEqual(@as(u64, 9), source.cached_routing_snapshot.?.snapshot.catalog_revision);
 }
 
 test "remote metadata catalog source provides compact routing" {

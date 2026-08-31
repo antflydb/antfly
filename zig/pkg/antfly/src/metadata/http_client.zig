@@ -53,13 +53,20 @@ pub const RequestBudget = struct {
     cancellation: ?*const http_common.RequestCancellation = null,
 };
 
-fn ensureRoutingBudget(budget: ?RequestBudget) !void {
+fn ensureRequestBudget(budget: ?RequestBudget) !void {
     if (budget) |value| {
         if (value.cancellation) |signal| {
             if (signal.isCancelled()) return error.Cancelled;
         }
-        if (platform_time.monotonicNs() >= value.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+        if (platform_time.monotonicNs() >= value.deadline_ns) return error.Timeout;
     }
+}
+
+fn ensureRoutingBudget(budget: ?RequestBudget) !void {
+    ensureRequestBudget(budget) catch |err| switch (err) {
+        error.Timeout => return error.CatalogRoutingSnapshotTimeout,
+        else => return err,
+    };
 }
 
 fn isUriUnreserved(ch: u8) bool {
@@ -147,7 +154,9 @@ pub const MetadataHttpClient = struct {
         defer resp.deinit(self.alloc);
         if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
-        return try std.json.parseFromSliceLeaky(metadata_api.MetadataCapabilities, self.alloc, resp.body, .{ .ignore_unknown_fields = true });
+        const capabilities = try std.json.parseFromSliceLeaky(metadata_api.MetadataCapabilities, self.alloc, resp.body, .{ .ignore_unknown_fields = true });
+        try ensureRequestBudget(budget);
+        return capabilities;
     }
 
     pub fn fetchHeadWithBudget(
@@ -193,7 +202,10 @@ pub const MetadataHttpClient = struct {
         // upgrade. Treat both common server spellings as unsupported.
         if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
         try mapStatus(resp.status, null, null, null);
-        return try parseJson(metadata_api.AdminSnapshot, self.alloc, resp.body);
+        var parsed = try parseJson(metadata_api.AdminSnapshot, self.alloc, resp.body);
+        errdefer parsed.deinit();
+        try ensureRequestBudget(budget);
+        return parsed;
     }
 
     pub fn fetchSnapshot(self: *MetadataHttpClient, base_uri: []const u8) !std.json.Parsed(metadata_api.AdminSnapshot) {
@@ -802,7 +814,10 @@ pub const MetadataHttpClient = struct {
         }, budget);
         defer resp.deinit(self.alloc);
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
-        return try parseJson(T, self.alloc, resp.body);
+        var parsed = try parseJson(T, self.alloc, resp.body);
+        errdefer parsed.deinit();
+        try ensureRequestBudget(budget);
+        return parsed;
     }
 
     fn getJsonValue(self: *MetadataHttpClient, comptime T: type, base_uri: []const u8, path: []const u8) !T {
@@ -826,7 +841,9 @@ pub const MetadataHttpClient = struct {
         }, budget);
         defer resp.deinit(self.alloc);
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
-        return try std.json.parseFromSliceLeaky(T, self.alloc, resp.body, .{ .ignore_unknown_fields = true });
+        const value = try std.json.parseFromSliceLeaky(T, self.alloc, resp.body, .{ .ignore_unknown_fields = true });
+        try ensureRequestBudget(budget);
+        return value;
     }
 
     fn requestWithBody(
@@ -1135,6 +1152,123 @@ test "metadata routing client forwards relative deadline and preserves timeout" 
         }),
     );
     try std.testing.expect(executor.saw_budget);
+}
+
+test "budgeted admin snapshots reject cancellation after transport completion" {
+    const Executor = struct {
+        cancellation: *http_common.RequestCancellation,
+        expected_method: http_common.Method,
+        expected_path: []const u8,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.expected_method, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, self.expected_path));
+            // Simulate cancellation racing a successful response. The client
+            // must reject the parsed value instead of returning work that
+            // completed outside the caller's request lifetime.
+            self.cancellation.cancel();
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"status":{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":3,"metrics":{}},"tables":[],"ranges":[],"stores":[],"placement_intents":[],"split_transitions":[],"merge_transitions":[]}
+                ),
+            };
+        }
+    };
+
+    var eventual_cancellation: http_common.RequestCancellation = .{};
+    var eventual_executor = Executor{
+        .cancellation = &eventual_cancellation,
+        .expected_method = .GET,
+        .expected_path = routes.Routes.admin_snapshot,
+    };
+    var eventual_client = MetadataHttpClient.init(std.testing.allocator, eventual_executor.executor());
+    try std.testing.expectError(
+        error.Cancelled,
+        eventual_client.fetchSnapshotWithBudget("http://127.0.0.1:9000", .{
+            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+            .cancellation = &eventual_cancellation,
+        }),
+    );
+
+    var linearizable_cancellation: http_common.RequestCancellation = .{};
+    var linearizable_executor = Executor{
+        .cancellation = &linearizable_cancellation,
+        .expected_method = .POST,
+        .expected_path = routes.Routes.internal_linearizable_snapshot,
+    };
+    var linearizable_client = MetadataHttpClient.init(std.testing.allocator, linearizable_executor.executor());
+    try std.testing.expectError(
+        error.Cancelled,
+        linearizable_client.fetchLinearizableSnapshot("http://127.0.0.1:9000", .{
+            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+            .cancellation = &linearizable_cancellation,
+        }),
+    );
+}
+
+test "budgeted metadata values reject cancellation after transport completion" {
+    const Executor = struct {
+        cancellation: *http_common.RequestCancellation,
+        expected_path: []const u8,
+        response_body: []const u8,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, self.expected_path));
+            self.cancellation.cancel();
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, self.response_body),
+            };
+        }
+    };
+
+    var head_cancellation: http_common.RequestCancellation = .{};
+    var head_executor = Executor{
+        .cancellation = &head_cancellation,
+        .expected_path = routes.Routes.head,
+        .response_body =
+        \\{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":4}
+        ,
+    };
+    var head_client = MetadataHttpClient.init(std.testing.allocator, head_executor.executor());
+    try std.testing.expectError(
+        error.Cancelled,
+        head_client.fetchHeadWithBudget("http://127.0.0.1:9000", .{
+            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+            .cancellation = &head_cancellation,
+        }),
+    );
+
+    var capabilities_cancellation: http_common.RequestCancellation = .{};
+    var capabilities_executor = Executor{
+        .cancellation = &capabilities_cancellation,
+        .expected_path = routes.Routes.capabilities,
+        .response_body =
+        \\{"catalog_routing_protocol_min":2,"catalog_routing_protocol_max":2}
+        ,
+    };
+    var capabilities_client = MetadataHttpClient.init(std.testing.allocator, capabilities_executor.executor());
+    try std.testing.expectError(
+        error.Cancelled,
+        capabilities_client.fetchCapabilities("http://127.0.0.1:9000", .{
+            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+            .cancellation = &capabilities_cancellation,
+        }),
+    );
 }
 
 test "metadata capability client distinguishes advertised routing from N-1 absence" {

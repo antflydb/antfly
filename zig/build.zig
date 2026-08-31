@@ -4614,6 +4614,7 @@ pub fn build(b: *std.Build) void {
         "remote metadata source bounds unsupported linearizable snapshot probes",
         "remote metadata source shares backend runtime io across a bounded executor pool",
         "remote routing cache entries retain immutable snapshots outside the cache lock",
+        "remote routing never publishes a cache entry after its deadline",
         "remote metadata catalog source provides compact routing",
         "remote metadata routing negotiation upgrades the N-1 adapter",
         "data runtime treats metadata leadership churn as retryable bootstrap failure",
