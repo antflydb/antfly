@@ -220,6 +220,11 @@ pub const Fixture = struct {
     const graph_authorization_username = "vopr-graph-reader";
     const graph_authorization_password = "vopr-graph-secret";
     const graph_authorization_header = "Basic dm9wci1ncmFwaC1yZWFkZXI6dm9wci1ncmFwaC1zZWNyZXQ=";
+    const docs_tenant_username = "alice";
+    const tenant_b_username = "bob";
+    const tenant_password = "secret";
+    const docs_tenant_authorization_header = "Basic YWxpY2U6c2VjcmV0";
+    const tenant_b_authorization_header = "Basic Ym9iOnNlY3JldA==";
     const left_batch_body =
         \\{"inserts":{"doc:c":{"title":"production-left","_edges":{"graph_idx":{"links":[{"target":"doc:x"}]}}},"doc:k":{"title":"production-split"}},"sync_level":"full_index"}
     ;
@@ -250,6 +255,10 @@ pub const Fixture = struct {
         "{\"query\":{\"match_all\":{}},\"fields\":[\"title\"],\"limit\":64,\"profile\":true,\"join\":{\"right_table\":\"docs\",\"join_type\":\"inner\",\"on\":{\"left_field\":\"customer_id\",\"right_field\":\"_id\",\"operator\":\"eq\"},\"strategy_hint\":\"shuffle\",\"right_fields\":[\"title\"]}}";
     const resource_probe_body =
         "{\"inserts\":{\"pressure:probe\":{\"title\":\"pressure\",\"body\":\"production-owner-resource-recovery\"}},\"sync_level\":\"write\"}";
+    const docs_to_tenant_forbidden_body =
+        "{\"inserts\":{\"tenant:forbidden\":{\"title\":\"docs-identity-must-not-write-tenant\"}},\"sync_level\":\"write\"}";
+    const tenant_to_docs_forbidden_body =
+        "{\"inserts\":{\"doc:forbidden\":{\"title\":\"tenant-identity-must-not-write-docs\"}},\"sync_level\":\"write\"}";
     const DataServer = data_runtime.DataServer;
 
     pub const WorkCostPorts = struct {
@@ -286,6 +295,7 @@ pub const Fixture = struct {
     public_executor: io_http_executor.IoHttpExecutor = undefined,
     public_executor_live: bool = false,
     public_authorization_executor: PublicAuthorizationExecutor = undefined,
+    tenant_authorization_executor: PublicAuthorizationExecutor = undefined,
     http_disconnect_probe: http_disconnect.Probe = undefined,
     transition_executor: io_http_executor.IoHttpExecutor = undefined,
     transition_executor_live: bool = false,
@@ -327,6 +337,7 @@ pub const Fixture = struct {
     transition_registrations: [node_count]?shard_ops.OwnedShardOperationAdapter.Registration = .{null} ** node_count,
     transition_registration_count: usize = 0,
     client: api_http_client.ApiHttpClient = undefined,
+    tenant_client: api_http_client.ApiHttpClient = undefined,
     driver_future: ?std.Io.Future(void) = null,
     raft_driver_futures: [node_count]?std.Io.Future(void) = .{null} ** node_count,
     workload_future: ?std.Io.Future(void) = null,
@@ -382,6 +393,14 @@ pub const Fixture = struct {
     write_sound: bool = false,
     read_sound: bool = false,
     tenant_sound: bool = false,
+    authenticated_tenant_isolation_enabled: bool = false,
+    authenticated_tenant_isolation_sound: bool = false,
+    docs_identity_tenant_read_status: u16 = 0,
+    docs_identity_tenant_write_status: u16 = 0,
+    docs_identity_tenant_absence_status: u16 = 0,
+    tenant_identity_docs_read_status: u16 = 0,
+    tenant_identity_docs_write_status: u16 = 0,
+    tenant_identity_docs_absence_status: u16 = 0,
     global_query_sound: bool = false,
     global_query_status: u16 = 0,
     global_query_response_count: usize = 0,
@@ -770,9 +789,15 @@ pub const Fixture = struct {
         self.global_query_owner_restart_enabled = enabled;
     }
 
+    pub fn setAuthenticatedTenantIsolationEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.authenticated_tenant_isolation_enabled = enabled;
+    }
+
     fn liveAuthorizationEnabled(self: *const Fixture) bool {
         return self.graph_inflight_authorization_revocation_enabled or
-            self.global_query_authorization_revocation_enabled;
+            self.global_query_authorization_revocation_enabled or
+            self.authenticated_tenant_isolation_enabled;
     }
 
     pub fn setJoinCancellationEnabled(self: *Fixture, enabled: bool) void {
@@ -1396,22 +1421,45 @@ pub const Fixture = struct {
             defer tenant_read.deinit(alloc);
             var tenant_write = try usermgr.Permission.initOwned(alloc, .table, "tenant_b_docs", .write);
             defer tenant_write.deinit(alloc);
-            const permissions = [_]usermgr.Permission{
-                docs_read,
-                docs_write,
-                tenant_read,
-                tenant_write,
-            };
-            var user = try self.auth_manager.createUser(
-                graph_authorization_username,
-                graph_authorization_password,
-                &permissions,
-            );
-            user.deinit(alloc);
-            self.public_authorization_executor = .{
-                .inner = self.public_executor.executor(),
-                .authorization = graph_authorization_header,
-            };
+            if (self.authenticated_tenant_isolation_enabled) {
+                var docs_user = try self.auth_manager.createUser(
+                    docs_tenant_username,
+                    tenant_password,
+                    &.{ docs_read, docs_write },
+                );
+                docs_user.deinit(alloc);
+                var tenant_user = try self.auth_manager.createUser(
+                    tenant_b_username,
+                    tenant_password,
+                    &.{ tenant_read, tenant_write },
+                );
+                tenant_user.deinit(alloc);
+                self.public_authorization_executor = .{
+                    .inner = self.public_executor.executor(),
+                    .authorization = docs_tenant_authorization_header,
+                };
+                self.tenant_authorization_executor = .{
+                    .inner = self.public_executor.executor(),
+                    .authorization = tenant_b_authorization_header,
+                };
+            } else {
+                const permissions = [_]usermgr.Permission{
+                    docs_read,
+                    docs_write,
+                    tenant_read,
+                    tenant_write,
+                };
+                var user = try self.auth_manager.createUser(
+                    graph_authorization_username,
+                    graph_authorization_password,
+                    &permissions,
+                );
+                user.deinit(alloc);
+                self.public_authorization_executor = .{
+                    .inner = self.public_executor.executor(),
+                    .authorization = graph_authorization_header,
+                };
+            }
         }
         // Hosted structural-operation polling is a control-plane protocol,
         // not the keep-alive subject of this deployment history. Give it a
@@ -1494,6 +1542,12 @@ pub const Fixture = struct {
             else
                 self.public_executor.executor(),
         );
+        if (self.authenticated_tenant_isolation_enabled) {
+            self.tenant_client = api_http_client.ApiHttpClient.init(
+                alloc,
+                self.tenant_authorization_executor.iface(),
+            );
+        }
     }
 
     fn initializeDataServer(self: *Fixture, index: usize) !void {
@@ -3008,6 +3062,12 @@ pub const Fixture = struct {
         self.phase = .reads_complete;
         if (!self.write_sound or !self.read_sound or !self.tenant_sound)
             return error.ProductionDataPublicRoundTripFailed;
+        if (self.authenticated_tenant_isolation_enabled) {
+            self.authenticated_tenant_isolation_sound =
+                try self.runAuthenticatedTenantIsolationProbes();
+            if (!self.authenticated_tenant_isolation_sound)
+                return error.ProductionDataAuthenticatedTenantIsolationFailed;
+        }
 
         if (self.global_query_enabled) {
             if (!try self.waitForDocIdentityReady("docs", 64) or
@@ -4988,6 +5048,84 @@ pub const Fixture = struct {
         return false;
     }
 
+    fn publicClientForTable(self: *Fixture, table_name: []const u8) *api_http_client.ApiHttpClient {
+        if (self.authenticated_tenant_isolation_enabled and
+            std.mem.eql(u8, table_name, "tenant_b_docs"))
+        {
+            return &self.tenant_client;
+        }
+        return &self.client;
+    }
+
+    fn runAuthenticatedTenantIsolationProbes(self: *Fixture) !bool {
+        // Each direction crosses a different public ingress. The credential is
+        // valid, but it owns only the other table, so middleware must reject
+        // both reads and writes before routing or proposal. A subsequent read
+        // with the owning identity proves the denied mutation stayed absent.
+        var docs_read_tenant = try self.client.fetchLookupResponse(
+            self.data_api_uris[0],
+            "tenant_b_docs",
+            "tenant:q",
+            null,
+        );
+        defer docs_read_tenant.deinit(self.alloc);
+        self.docs_identity_tenant_read_status = docs_read_tenant.status;
+
+        var docs_write_tenant = try self.client.fetchBatchResponse(
+            self.data_api_uris[2],
+            "tenant_b_docs",
+            docs_to_tenant_forbidden_body,
+        );
+        defer docs_write_tenant.deinit(self.alloc);
+        self.docs_identity_tenant_write_status = docs_write_tenant.status;
+
+        var tenant_absence = try self.tenant_client.fetchLookupResponse(
+            self.data_api_uris[1],
+            "tenant_b_docs",
+            "tenant:forbidden",
+            null,
+        );
+        defer tenant_absence.deinit(self.alloc);
+        self.docs_identity_tenant_absence_status = tenant_absence.status;
+
+        var tenant_read_docs = try self.tenant_client.fetchLookupResponse(
+            self.data_api_uris[2],
+            "docs",
+            "doc:c",
+            null,
+        );
+        defer tenant_read_docs.deinit(self.alloc);
+        self.tenant_identity_docs_read_status = tenant_read_docs.status;
+
+        var tenant_write_docs = try self.tenant_client.fetchBatchResponse(
+            self.data_api_uris[1],
+            "docs",
+            tenant_to_docs_forbidden_body,
+        );
+        defer tenant_write_docs.deinit(self.alloc);
+        self.tenant_identity_docs_write_status = tenant_write_docs.status;
+
+        var docs_absence = try self.client.fetchLookupResponse(
+            self.data_api_uris[0],
+            "docs",
+            "doc:forbidden",
+            null,
+        );
+        defer docs_absence.deinit(self.alloc);
+        self.tenant_identity_docs_absence_status = docs_absence.status;
+
+        return docs_read_tenant.status == 403 and
+            docs_write_tenant.status == 403 and
+            tenant_absence.status == 404 and
+            std.mem.indexOf(u8, docs_read_tenant.body, "production-tenant") == null and
+            std.mem.indexOf(u8, tenant_absence.body, "docs-identity-must-not-write-tenant") == null and
+            tenant_read_docs.status == 403 and
+            tenant_write_docs.status == 403 and
+            docs_absence.status == 404 and
+            std.mem.indexOf(u8, tenant_read_docs.body, "production-left") == null and
+            std.mem.indexOf(u8, docs_absence.body, "tenant-identity-must-not-write-docs") == null;
+    }
+
     fn runWrite(
         self: *Fixture,
         operation_index: usize,
@@ -4996,7 +5134,7 @@ pub const Fixture = struct {
         body: []const u8,
     ) OperationResult {
         self.write_attempts[operation_index] +|= 1;
-        var response = self.client.fetchBatchResponse(uri, table_name, body) catch |err|
+        var response = self.publicClientForTable(table_name).fetchBatchResponse(uri, table_name, body) catch |err|
             return .{ .failure = err };
         defer response.deinit(self.alloc);
         self.write_statuses[operation_index] = response.status;
@@ -5033,7 +5171,7 @@ pub const Fixture = struct {
         for (0..node_count * 4) |attempt| {
             self.read_attempts[operation_index] +|= 1;
             const uri = self.data_api_uris[(starting_uri_index + attempt) % node_count];
-            var response = self.client.fetchLookupResponse(uri, table_name, key, null) catch |err|
+            var response = self.publicClientForTable(table_name).fetchLookupResponse(uri, table_name, key, null) catch |err|
                 return .{ .failure = err };
             const status = response.status;
             const visible = status == 200 and std.mem.indexOf(u8, response.body, expected) != null;
@@ -5597,6 +5735,8 @@ pub const Fixture = struct {
             .requests_ok = self.write_sound and
                 self.read_sound and
                 self.tenant_sound and
+                (!self.authenticated_tenant_isolation_enabled or
+                    self.authenticated_tenant_isolation_sound) and
                 (!self.global_query_enabled or self.global_query_sound) and
                 (!self.join_enabled or self.join_sound) and
                 (!self.join_cancellation_enabled or self.join_cancellation_sound) and

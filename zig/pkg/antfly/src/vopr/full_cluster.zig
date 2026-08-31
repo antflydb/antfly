@@ -21,7 +21,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 50;
+    pub const version: u32 = 51;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -46,6 +46,7 @@ pub const Scenario = struct {
     const production_service_rate_id = vopr.id.stable(name, "production-service-rates-compose-and-heal");
     const production_query_cache_service_rate_id = vopr.id.stable(name, "production-query-embedding-cache-deadline-owner-restart");
     const production_serverless_fencing_id = vopr.id.stable(name, "production-serverless-generation-progress-conflict-fenced");
+    const production_authenticated_tenant_isolation_id = vopr.id.stable(name, "production-authenticated-tenants-fail-closed-across-tables");
     const production_replication_backfill_id = vopr.id.stable(name, "production-replication-backfill-crosses-public-data-raft");
     const production_replication_schema_change_id = vopr.id.stable(name, "production-replication-schema-change-resumes-from-durable-status");
     const production_replication_owner_restart_id = vopr.id.stable(name, "production-replication-target-owner-restarts-and-resumes");
@@ -100,6 +101,7 @@ pub const Scenario = struct {
         .{ .id = production_service_rate_id, .name = name ++ ".production-service-rates-compose-and-heal", .kind = .always },
         .{ .id = production_query_cache_service_rate_id, .name = name ++ ".production-query-embedding-cache-deadline-owner-restart", .kind = .always },
         .{ .id = production_serverless_fencing_id, .name = name ++ ".production-serverless-generation-progress-conflict-fenced", .kind = .always },
+        .{ .id = production_authenticated_tenant_isolation_id, .name = name ++ ".production-authenticated-tenants-fail-closed-across-tables", .kind = .always },
         .{ .id = production_replication_backfill_id, .name = name ++ ".production-replication-backfill-crosses-public-data-raft", .kind = .always },
         .{ .id = production_replication_schema_change_id, .name = name ++ ".production-replication-schema-change-resumes-from-durable-status", .kind = .always },
         .{ .id = production_replication_owner_restart_id, .name = name ++ ".production-replication-target-owner-restarts-and-resumes", .kind = .always },
@@ -179,6 +181,7 @@ pub const Scenario = struct {
         production_data_plane_replication_cancellation_service_rate,
         production_data_plane_replication_stale_owner_service_rate,
         production_data_plane_replication_topology_change_service_rate,
+        production_data_plane_authenticated_tenant_isolation,
 
         fn isReplicationBackfill(self: Mode) bool {
             return self == .production_data_plane_replication_backfill_service_rate or
@@ -222,12 +225,13 @@ pub const Scenario = struct {
                 self == .production_data_plane_global_query_owner_restart or
                 self == .production_data_plane_query_embedding_cache_service_rate or
                 self == .production_data_plane_serverless_generation_progress_conflict or
+                self == .production_data_plane_authenticated_tenant_isolation or
                 self.isReplicationBackfill();
         }
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_durable_join_owner_restart, .production_data_plane_durable_join_retry_exhaustion, .production_data_plane_durable_join_cancellation_overlapping_faults, .production_data_plane_durable_join_cancellation_owner_restart, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation, .production_data_plane_global_query_inflight_authorization_revocation, .production_data_plane_global_query_transport_failure, .production_data_plane_global_query_owner_restart, .production_data_plane_query_embedding_cache_service_rate, .production_data_plane_serverless_generation_progress_conflict, .production_data_plane_replication_backfill_service_rate, .production_data_plane_replication_schema_change_service_rate, .production_data_plane_replication_owner_restart_service_rate, .production_data_plane_replication_source_crash_service_rate, .production_data_plane_replication_cancellation_service_rate, .production_data_plane_replication_stale_owner_service_rate, .production_data_plane_replication_topology_change_service_rate => .clean,
+                .clean, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_durable_join_owner_restart, .production_data_plane_durable_join_retry_exhaustion, .production_data_plane_durable_join_cancellation_overlapping_faults, .production_data_plane_durable_join_cancellation_owner_restart, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation, .production_data_plane_global_query_inflight_authorization_revocation, .production_data_plane_global_query_transport_failure, .production_data_plane_global_query_owner_restart, .production_data_plane_query_embedding_cache_service_rate, .production_data_plane_serverless_generation_progress_conflict, .production_data_plane_replication_backfill_service_rate, .production_data_plane_replication_schema_change_service_rate, .production_data_plane_replication_owner_restart_service_rate, .production_data_plane_replication_source_crash_service_rate, .production_data_plane_replication_cancellation_service_rate, .production_data_plane_replication_stale_owner_service_rate, .production_data_plane_replication_topology_change_service_rate, .production_data_plane_authenticated_tenant_isolation => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -294,6 +298,7 @@ pub const Scenario = struct {
             vopr.id.stable(name, "production-data-plane-replication-cancellation-service-rate"),
             vopr.id.stable(name, "production-data-plane-replication-stale-owner-service-rate"),
             vopr.id.stable(name, "production-data-plane-replication-topology-change-service-rate"),
+            vopr.id.stable(name, "production-data-plane-authenticated-tenant-isolation"),
         };
     };
     const mode_names = [_][]const u8{
@@ -343,6 +348,7 @@ pub const Scenario = struct {
         name ++ ".production-data-plane-replication-cancellation-service-rate",
         name ++ ".production-data-plane-replication-stale-owner-service-rate",
         name ++ ".production-data-plane-replication-topology-change-service-rate",
+        name ++ ".production-data-plane-authenticated-tenant-isolation",
     };
 
     const production_baseline_ordinal: usize = @intFromEnum(Mode.production_data_plane_baseline);
@@ -383,6 +389,7 @@ pub const Scenario = struct {
     const production_replication_cancellation_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_cancellation_service_rate);
     const production_replication_stale_owner_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_stale_owner_service_rate);
     const production_replication_topology_change_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_topology_change_service_rate);
+    const production_authenticated_tenant_isolation_ordinal: usize = @intFromEnum(Mode.production_data_plane_authenticated_tenant_isolation);
 
     const metadata_role = vopr.id.stable(name, "role.metadata");
     const public_data_role = vopr.id.stable(name, "role.public-data");
@@ -1195,6 +1202,24 @@ pub const Scenario = struct {
                 cluster_health.raft_wire_requests > 0;
         }
 
+        fn authenticatedTenantIsolationSound(self: *State) bool {
+            if (self.mode != .production_data_plane_authenticated_tenant_isolation)
+                return true;
+            const cluster = self.production_cluster orelse return false;
+            const cluster_health = cluster.healthSnapshot();
+            return cluster.complete and cluster.workload_done and
+                cluster.write_sound and cluster.read_sound and cluster.tenant_sound and
+                cluster.authenticated_tenant_isolation_enabled and
+                cluster.authenticated_tenant_isolation_sound and
+                cluster.docs_identity_tenant_read_status == 403 and
+                cluster.docs_identity_tenant_write_status == 403 and
+                cluster.docs_identity_tenant_absence_status == 404 and
+                cluster.tenant_identity_docs_read_status == 403 and
+                cluster.tenant_identity_docs_write_status == 403 and
+                cluster.tenant_identity_docs_absence_status == 404 and
+                cluster_health.raft_wire_requests > 0;
+        }
+
         fn nowNs(self: *State) u64 {
             return @intCast(@max(std.Io.Timestamp.now(self.sim.io(), .awake).toNanoseconds(), 0));
         }
@@ -1723,6 +1748,9 @@ pub const Scenario = struct {
                         mode == .production_data_plane_join_split or
                         mode == .production_data_plane_graph_stale_snapshot_retry_exhaustion,
                 );
+                self.production_cluster.?.setAuthenticatedTenantIsolationEnabled(
+                    mode == .production_data_plane_authenticated_tenant_isolation,
+                );
                 self.production_cluster.?.setGraphEnabled(
                     mode == .production_data_plane_graph or
                         mode == .production_data_plane_service_rate or
@@ -1980,7 +2008,7 @@ pub const Scenario = struct {
             for (deployment_instances[3..6]) |instance| try deployment.publishReady(instance.id);
             try deployment.publishReady(deployment_instances[6].id);
             switch (mode) {
-                .clean => {},
+                .clean, .production_data_plane_authenticated_tenant_isolation => {},
                 .metadata_partition => {
                     const leader = fixture.?.metadata_leader_index;
                     for (deployment_links, 0..) |link, index| {
@@ -2272,7 +2300,11 @@ pub const Scenario = struct {
             inline for (std.meta.tags(Mode), mode_ids, mode_names) |mode, id, mode_name| try list.append(allocator, .{
                 .id = id,
                 .name = mode_name,
-                .kind = if (mode == .clean or mode == .graph_topology_churn) .workload else .fault,
+                .kind = if (mode == .clean or mode == .graph_topology_churn or
+                    mode == .production_data_plane_authenticated_tenant_isolation)
+                    .workload
+                else
+                    .fault,
             });
             return;
         }
@@ -2333,6 +2365,13 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".production-left-write-unknowns", if (production) |production_fixture| @intCast(production_fixture.write_outcome_unknowns[0]) else 0);
         try builder.addNamed(allocator, name ++ ".production-right-write-unknowns", if (production) |production_fixture| @intCast(production_fixture.write_outcome_unknowns[1]) else 0);
         try builder.addNamed(allocator, name ++ ".production-tenant-write-unknowns", if (production) |production_fixture| @intCast(production_fixture.write_outcome_unknowns[2]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-authenticated-tenant-isolation", @intFromBool(if (production) |production_fixture| production_fixture.authenticated_tenant_isolation_sound else false));
+        try builder.addNamed(allocator, name ++ ".production-docs-identity-tenant-read-status", if (production) |production_fixture| production_fixture.docs_identity_tenant_read_status else 0);
+        try builder.addNamed(allocator, name ++ ".production-docs-identity-tenant-write-status", if (production) |production_fixture| production_fixture.docs_identity_tenant_write_status else 0);
+        try builder.addNamed(allocator, name ++ ".production-docs-identity-tenant-absence-status", if (production) |production_fixture| production_fixture.docs_identity_tenant_absence_status else 0);
+        try builder.addNamed(allocator, name ++ ".production-tenant-identity-docs-read-status", if (production) |production_fixture| production_fixture.tenant_identity_docs_read_status else 0);
+        try builder.addNamed(allocator, name ++ ".production-tenant-identity-docs-write-status", if (production) |production_fixture| production_fixture.tenant_identity_docs_write_status else 0);
+        try builder.addNamed(allocator, name ++ ".production-tenant-identity-docs-absence-status", if (production) |production_fixture| production_fixture.tenant_identity_docs_absence_status else 0);
         try builder.addNamed(allocator, name ++ ".production-request-routing-started", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.routing_started)]) else 0);
         try builder.addNamed(allocator, name ++ ".production-request-forward-started", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.remote_forward_started)]) else 0);
         try builder.addNamed(allocator, name ++ ".production-request-forward-completed", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.remote_forward_completed)]) else 0);
@@ -2932,6 +2971,9 @@ pub const Scenario = struct {
         try sink.check(allocator, production_serverless_fencing_id, !state.complete or
             state.mode.? != .production_data_plane_serverless_generation_progress_conflict or
             state.serverlessFencingSound());
+        try sink.check(allocator, production_authenticated_tenant_isolation_id, !state.complete or
+            state.mode.? != .production_data_plane_authenticated_tenant_isolation or
+            state.authenticatedTenantIsolationSound());
         try sink.check(allocator, production_replication_backfill_id, !state.complete or
             !state.mode.?.isReplicationBackfill() or
             state.replicationSound());
@@ -3117,6 +3159,7 @@ fn runExactMode(
     const production_replication_cancellation_mode = mode_id == Scenario.mode_ids[Scenario.production_replication_cancellation_ordinal];
     const production_replication_stale_owner_mode = mode_id == Scenario.mode_ids[Scenario.production_replication_stale_owner_ordinal];
     const production_replication_topology_change_mode = mode_id == Scenario.mode_ids[Scenario.production_replication_topology_change_ordinal];
+    const production_authenticated_tenant_isolation_mode = mode_id == Scenario.mode_ids[Scenario.production_authenticated_tenant_isolation_ordinal];
     const production_replication_mode = production_replication_backfill_mode or
         production_replication_schema_change_mode or
         production_replication_owner_restart_mode or
@@ -3141,6 +3184,7 @@ fn runExactMode(
         production_global_query_cancellation_mode or production_global_query_authorization_mode or
         production_global_query_transport_mode or production_global_query_owner_restart_mode or
         production_query_cache_service_rate_mode or production_serverless_fencing_mode or
+        production_authenticated_tenant_isolation_mode or
         production_replication_mode;
     // Fault extensions of the promoted graph/split history keep its
     // cooperative scheduling seed. The prefixed mode remains distinct replay
@@ -3161,6 +3205,7 @@ fn runExactMode(
         Scenario.production_graph_split_transport_ordinal
     else if (production_service_rate_mode or production_query_cache_service_rate_mode or
         production_serverless_fencing_mode or
+        production_authenticated_tenant_isolation_mode or
         production_replication_mode)
         Scenario.production_graph_ordinal
     else if (production_graph_hydration_mode)
@@ -3207,6 +3252,8 @@ fn runExactMode(
                 "full-cluster-vopr-v49-query-embedding-cache-deadline-owner-restart"
             else if (production_serverless_fencing_mode)
                 "full-cluster-vopr-v50-serverless-generation-progress-conflict"
+            else if (production_authenticated_tenant_isolation_mode)
+                "full-cluster-vopr-v51-authenticated-tenant-isolation"
             else if (production_global_query_owner_restart_mode)
                 "full-cluster-vopr-v40-public-global-query-owner-restart"
             else if (production_global_query_transport_mode)
@@ -3611,6 +3658,19 @@ test "full cluster production serverless generation progress conflict exact repl
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
     const ordinal = Scenario.production_serverless_fencing_ordinal;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        120_000,
+        .complete,
+    );
+}
+
+test "full cluster production authenticated tenant isolation exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.production_authenticated_tenant_isolation_ordinal;
     try runExactMode(
         history_allocator.allocator(),
         Scenario.mode_ids[ordinal],
