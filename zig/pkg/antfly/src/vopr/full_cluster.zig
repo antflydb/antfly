@@ -21,7 +21,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 49;
+    pub const version: u32 = 50;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -45,6 +45,7 @@ pub const Scenario = struct {
     const production_socket_pressure_id = vopr.id.stable(name, "production-listener-socket-pressure-recovers-during-split");
     const production_service_rate_id = vopr.id.stable(name, "production-service-rates-compose-and-heal");
     const production_query_cache_service_rate_id = vopr.id.stable(name, "production-query-embedding-cache-deadline-owner-restart");
+    const production_serverless_fencing_id = vopr.id.stable(name, "production-serverless-generation-progress-conflict-fenced");
     const production_replication_backfill_id = vopr.id.stable(name, "production-replication-backfill-crosses-public-data-raft");
     const production_replication_schema_change_id = vopr.id.stable(name, "production-replication-schema-change-resumes-from-durable-status");
     const production_replication_owner_restart_id = vopr.id.stable(name, "production-replication-target-owner-restarts-and-resumes");
@@ -98,6 +99,7 @@ pub const Scenario = struct {
         .{ .id = production_socket_pressure_id, .name = name ++ ".production-listener-socket-pressure-recovers-during-split", .kind = .always },
         .{ .id = production_service_rate_id, .name = name ++ ".production-service-rates-compose-and-heal", .kind = .always },
         .{ .id = production_query_cache_service_rate_id, .name = name ++ ".production-query-embedding-cache-deadline-owner-restart", .kind = .always },
+        .{ .id = production_serverless_fencing_id, .name = name ++ ".production-serverless-generation-progress-conflict-fenced", .kind = .always },
         .{ .id = production_replication_backfill_id, .name = name ++ ".production-replication-backfill-crosses-public-data-raft", .kind = .always },
         .{ .id = production_replication_schema_change_id, .name = name ++ ".production-replication-schema-change-resumes-from-durable-status", .kind = .always },
         .{ .id = production_replication_owner_restart_id, .name = name ++ ".production-replication-target-owner-restarts-and-resumes", .kind = .always },
@@ -138,7 +140,7 @@ pub const Scenario = struct {
         graph_topology_churn,
         graph_transport_failure,
         partial_http_write,
-        serverless_stale_generation,
+        production_data_plane_serverless_generation_progress_conflict,
         resource_pressure,
         production_data_plane_baseline,
         production_data_plane_graph,
@@ -219,12 +221,13 @@ pub const Scenario = struct {
                 self == .production_data_plane_global_query_transport_failure or
                 self == .production_data_plane_global_query_owner_restart or
                 self == .production_data_plane_query_embedding_cache_service_rate or
+                self == .production_data_plane_serverless_generation_progress_conflict or
                 self.isReplicationBackfill();
         }
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_durable_join_owner_restart, .production_data_plane_durable_join_retry_exhaustion, .production_data_plane_durable_join_cancellation_overlapping_faults, .production_data_plane_durable_join_cancellation_owner_restart, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation, .production_data_plane_global_query_inflight_authorization_revocation, .production_data_plane_global_query_transport_failure, .production_data_plane_global_query_owner_restart, .production_data_plane_query_embedding_cache_service_rate, .production_data_plane_replication_backfill_service_rate, .production_data_plane_replication_schema_change_service_rate, .production_data_plane_replication_owner_restart_service_rate, .production_data_plane_replication_source_crash_service_rate, .production_data_plane_replication_cancellation_service_rate, .production_data_plane_replication_stale_owner_service_rate, .production_data_plane_replication_topology_change_service_rate => .clean,
+                .clean, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_durable_join_owner_restart, .production_data_plane_durable_join_retry_exhaustion, .production_data_plane_durable_join_cancellation_overlapping_faults, .production_data_plane_durable_join_cancellation_owner_restart, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation, .production_data_plane_global_query_inflight_authorization_revocation, .production_data_plane_global_query_transport_failure, .production_data_plane_global_query_owner_restart, .production_data_plane_query_embedding_cache_service_rate, .production_data_plane_serverless_generation_progress_conflict, .production_data_plane_replication_backfill_service_rate, .production_data_plane_replication_schema_change_service_rate, .production_data_plane_replication_owner_restart_service_rate, .production_data_plane_replication_source_crash_service_rate, .production_data_plane_replication_cancellation_service_rate, .production_data_plane_replication_stale_owner_service_rate, .production_data_plane_replication_topology_change_service_rate => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -236,8 +239,8 @@ pub const Scenario = struct {
         }
 
         fn serverlessMode(self: Mode) serverless_workflow.Scenario.Mode {
-            return if (self == .serverless_stale_generation)
-                .stale_enrichment_generation
+            return if (self == .production_data_plane_serverless_generation_progress_conflict)
+                .stale_enrichment_progress_conflict
             else
                 .clean;
         }
@@ -252,7 +255,7 @@ pub const Scenario = struct {
             vopr.id.stable(name, "graph-topology-churn"),
             vopr.id.stable(name, "graph-transport-failure"),
             vopr.id.stable(name, "partial-http-write"),
-            vopr.id.stable(name, "serverless-stale-generation"),
+            vopr.id.stable(name, "production-data-plane-serverless-generation-progress-conflict"),
             vopr.id.stable(name, "resource-pressure"),
             vopr.id.stable(name, "production-data-plane-baseline"),
             vopr.id.stable(name, "production-data-plane-graph"),
@@ -301,7 +304,7 @@ pub const Scenario = struct {
         name ++ ".graph-topology-churn",
         name ++ ".graph-transport-failure",
         name ++ ".partial-http-write",
-        name ++ ".serverless-stale-generation",
+        name ++ ".production-data-plane-serverless-generation-progress-conflict",
         name ++ ".resource-pressure",
         name ++ ".production-data-plane-baseline",
         name ++ ".production-data-plane-graph",
@@ -372,6 +375,7 @@ pub const Scenario = struct {
     const production_global_query_transport_ordinal: usize = @intFromEnum(Mode.production_data_plane_global_query_transport_failure);
     const production_global_query_owner_restart_ordinal: usize = @intFromEnum(Mode.production_data_plane_global_query_owner_restart);
     const production_query_cache_service_rate_ordinal: usize = @intFromEnum(Mode.production_data_plane_query_embedding_cache_service_rate);
+    const production_serverless_fencing_ordinal: usize = @intFromEnum(Mode.production_data_plane_serverless_generation_progress_conflict);
     const production_replication_backfill_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_backfill_service_rate);
     const production_replication_schema_change_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_schema_change_service_rate);
     const production_replication_owner_restart_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_owner_restart_service_rate);
@@ -1172,6 +1176,25 @@ pub const Scenario = struct {
                 self.query_cache_post_restart_budget_used == entry_charge;
         }
 
+        fn serverlessFencingSound(self: *State) bool {
+            if (self.mode != .production_data_plane_serverless_generation_progress_conflict)
+                return true;
+            const cluster = self.production_cluster orelse return false;
+            const cluster_health = cluster.healthSnapshot();
+            return self.serverless_done and self.serverless_sound and
+                self.serverless_public_sound and self.serverless.generation_fenced and
+                self.serverless.progress_conflict_fenced and
+                self.serverless.first_attempt_interrupted and
+                self.serverless.publication_hook_calls == 1 and
+                self.serverless.conflicting_candidate_version == 2 and
+                self.serverless.generation_cutover_version == 3 and
+                self.serverless.final_head == 4 and
+                self.serverless.visible_document_mask == 1 and
+                cluster.complete and cluster.workload_done and
+                cluster.write_sound and cluster.read_sound and
+                cluster_health.raft_wire_requests > 0;
+        }
+
         fn nowNs(self: *State) u64 {
             return @intCast(@max(std.Io.Timestamp.now(self.sim.io(), .awake).toNanoseconds(), 0));
         }
@@ -1882,6 +1905,9 @@ pub const Scenario = struct {
         }
 
         fn runServerless(self: *State) void {
+            const production_serverless_fencing =
+                self.mode == .production_data_plane_serverless_generation_progress_conflict;
+            if (production_serverless_fencing) self.production_cluster.?.start();
             defer {
                 const replication_mode = self.mode.?.isReplicationBackfill();
                 if (replication_mode) {
@@ -1910,7 +1936,7 @@ pub const Scenario = struct {
                 self.serverless_done = true;
                 self.healServiceRates();
                 if (self.production_cluster) |fixture| {
-                    if (!replication_mode) fixture.start();
+                    if (!replication_mode and !production_serverless_fencing) fixture.start();
                 } else if (self.public_cluster) |fixture|
                     fixture.allowGraphFaultWorkload();
             }
@@ -1991,8 +2017,8 @@ pub const Scenario = struct {
                     .network,
                     deployment_links[0].id,
                 ),
-                .serverless_stale_generation => try deployment.activateFault(
-                    vopr.id.stable(name, "fault.serverless-stale-generation"),
+                .production_data_plane_serverless_generation_progress_conflict => try deployment.activateFault(
+                    vopr.id.stable(name, "fault.serverless-generation-progress-conflict"),
                     .storage,
                     storage_domains[3],
                 ),
@@ -2578,6 +2604,11 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".serverless-visible", @intFromBool(state.serverless_sound));
         try builder.addNamed(allocator, name ++ ".serverless-public-http-visible", @intFromBool(state.serverless_public_sound));
         try builder.addNamed(allocator, name ++ ".serverless-public-http-error", @intCast(state.serverless_public_error_code));
+        try builder.addNamed(allocator, name ++ ".serverless-fencing-sound", @intFromBool(state.serverlessFencingSound()));
+        try builder.addNamed(allocator, name ++ ".serverless-publication-hook-calls", @intCast(state.serverless.publication_hook_calls));
+        try builder.addNamed(allocator, name ++ ".serverless-conflicting-candidate-version", @intCast(state.serverless.conflicting_candidate_version));
+        try builder.addNamed(allocator, name ++ ".serverless-generation-cutover-version", @intCast(state.serverless.generation_cutover_version));
+        try builder.addNamed(allocator, name ++ ".serverless-final-head", @intCast(state.serverless.final_head));
         try builder.addNamed(allocator, name ++ ".raft-wire-requests", if (cluster) |snapshot| @intCast(snapshot.raft_wire_requests) else 0);
         try builder.addNamed(allocator, name ++ ".node-resource-managers", if (cluster) |snapshot| @intCast(snapshot.node_resource_managers) else 0);
         try builder.addNamed(allocator, name ++ ".resource-denial-ok", @intFromBool(if (cluster) |snapshot| snapshot.resource_denial_ok else false));
@@ -2898,6 +2929,9 @@ pub const Scenario = struct {
         try sink.check(allocator, production_query_cache_service_rate_id, !state.complete or
             state.mode.? != .production_data_plane_query_embedding_cache_service_rate or
             state.queryCacheSound());
+        try sink.check(allocator, production_serverless_fencing_id, !state.complete or
+            state.mode.? != .production_data_plane_serverless_generation_progress_conflict or
+            state.serverlessFencingSound());
         try sink.check(allocator, production_replication_backfill_id, !state.complete or
             !state.mode.?.isReplicationBackfill() or
             state.replicationSound());
@@ -3012,6 +3046,8 @@ pub const Scenario = struct {
             .consistency_valid = !state.initialization_failed and
                 (cluster == null or cluster.?.requests_ok) and
                 (!state.serverless_done or state.serverless_sound) and
+                (state.mode != .production_data_plane_serverless_generation_progress_conflict or
+                    !state.serverless_done or state.serverlessFencingSound()) and
                 (state.mode != .production_data_plane_query_embedding_cache_service_rate or
                     !state.query_cache_done or state.queryCacheSound()) and
                 (state.mode == null or !state.mode.?.isReplicationBackfill() or
@@ -3073,6 +3109,7 @@ fn runExactMode(
     const production_global_query_transport_mode = mode_id == Scenario.mode_ids[Scenario.production_global_query_transport_ordinal];
     const production_global_query_owner_restart_mode = mode_id == Scenario.mode_ids[Scenario.production_global_query_owner_restart_ordinal];
     const production_query_cache_service_rate_mode = mode_id == Scenario.mode_ids[Scenario.production_query_cache_service_rate_ordinal];
+    const production_serverless_fencing_mode = mode_id == Scenario.mode_ids[Scenario.production_serverless_fencing_ordinal];
     const production_replication_backfill_mode = mode_id == Scenario.mode_ids[Scenario.production_replication_backfill_ordinal];
     const production_replication_schema_change_mode = mode_id == Scenario.mode_ids[Scenario.production_replication_schema_change_ordinal];
     const production_replication_owner_restart_mode = mode_id == Scenario.mode_ids[Scenario.production_replication_owner_restart_ordinal];
@@ -3103,7 +3140,8 @@ fn runExactMode(
         production_graph_stale_snapshot_mode or production_global_query_mode or
         production_global_query_cancellation_mode or production_global_query_authorization_mode or
         production_global_query_transport_mode or production_global_query_owner_restart_mode or
-        production_query_cache_service_rate_mode or production_replication_mode;
+        production_query_cache_service_rate_mode or production_serverless_fencing_mode or
+        production_replication_mode;
     // Fault extensions of the promoted graph/split history keep its
     // cooperative scheduling seed. The prefixed mode remains distinct replay
     // truth, while comparable scheduling ensures the experiment changes the
@@ -3122,6 +3160,7 @@ fn runExactMode(
     else if (production_graph_split_overlapping_faults_mode or production_graph_split_socket_pressure_mode)
         Scenario.production_graph_split_transport_ordinal
     else if (production_service_rate_mode or production_query_cache_service_rate_mode or
+        production_serverless_fencing_mode or
         production_replication_mode)
         Scenario.production_graph_ordinal
     else if (production_graph_hydration_mode)
@@ -3166,6 +3205,8 @@ fn runExactMode(
                 "full-cluster-vopr-v42-replication-backfill-service-rate"
             else if (production_query_cache_service_rate_mode)
                 "full-cluster-vopr-v49-query-embedding-cache-deadline-owner-restart"
+            else if (production_serverless_fencing_mode)
+                "full-cluster-vopr-v50-serverless-generation-progress-conflict"
             else if (production_global_query_owner_restart_mode)
                 "full-cluster-vopr-v40-public-global-query-owner-restart"
             else if (production_global_query_transport_mode)
@@ -3303,8 +3344,18 @@ test "full cluster VOPR exact replays the composed deployment and recovery" {
     // Keep the promoted aggregate on its last green contract. Experimental
     // modes receive a distinct focused gate and join this slice only after
     // their recorded history and exact replay pass within the tier budget.
-    const promoted_mode_count = Scenario.production_baseline_ordinal;
-    for (Scenario.mode_ids[0..promoted_mode_count], 0..) |mode_id, mode_ordinal| {
+    const promoted_mode_ordinals = [_]usize{
+        @intFromEnum(Scenario.Mode.clean),
+        @intFromEnum(Scenario.Mode.metadata_partition),
+        @intFromEnum(Scenario.Mode.node_restart),
+        @intFromEnum(Scenario.Mode.graph_inflight_restart),
+        @intFromEnum(Scenario.Mode.graph_topology_churn),
+        @intFromEnum(Scenario.Mode.graph_transport_failure),
+        @intFromEnum(Scenario.Mode.partial_http_write),
+        @intFromEnum(Scenario.Mode.resource_pressure),
+    };
+    for (promoted_mode_ordinals) |mode_ordinal| {
+        const mode_id = Scenario.mode_ids[mode_ordinal];
         try runExactMode(history_alloc, mode_id, mode_ordinal, 50_000, .complete);
     }
 }
@@ -3547,6 +3598,19 @@ test "full cluster production query embedding cache deadline owner restart and e
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
     const ordinal = Scenario.production_query_cache_service_rate_ordinal;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        120_000,
+        .complete,
+    );
+}
+
+test "full cluster production serverless generation progress conflict exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.production_serverless_fencing_ordinal;
     try runExactMode(
         history_allocator.allocator(),
         Scenario.mode_ids[ordinal],

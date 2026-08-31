@@ -34,7 +34,7 @@ const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "serverless-workflow-production-recovery";
-    pub const version: u32 = 4;
+    pub const version: u32 = 5;
 
     const no_lost_documents_id = vopr.id.stable(name, "no-lost-documents");
     const catalog_visible_id = vopr.id.stable(name, "catalog-visible-after-cutover");
@@ -44,6 +44,7 @@ pub const Scenario = struct {
     const recovery_id = vopr.id.stable(name, "interrupted-workflow-recovers");
     const compacted_id = vopr.id.stable(name, "compaction-publishes-complete-head");
     const generation_fenced_id = vopr.id.stable(name, "stale-enrichment-generation-preserves-documents");
+    const progress_conflict_id = vopr.id.stable(name, "publication-progress-conflict-fences-stale-candidate");
 
     pub const properties = &[_]vopr.property.Declaration{
         .{ .id = no_lost_documents_id, .name = name ++ ".no-lost-documents", .kind = .always },
@@ -54,6 +55,7 @@ pub const Scenario = struct {
         .{ .id = recovery_id, .name = name ++ ".interrupted-workflow-recovers", .kind = .reachable },
         .{ .id = compacted_id, .name = name ++ ".compaction-publishes-complete-head", .kind = .reachable },
         .{ .id = generation_fenced_id, .name = name ++ ".stale-enrichment-generation-preserves-documents", .kind = .always },
+        .{ .id = progress_conflict_id, .name = name ++ ".publication-progress-conflict-fences-stale-candidate", .kind = .always },
     };
 
     pub const Mode = enum {
@@ -66,7 +68,7 @@ pub const Scenario = struct {
         retry,
         crash_recovery,
         compaction_crash,
-        stale_enrichment_generation,
+        stale_enrichment_progress_conflict,
     };
 
     const mode_ids = [_]vopr.id.StableId{
@@ -79,7 +81,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "retry"),
         vopr.id.stable(name, "crash-recovery"),
         vopr.id.stable(name, "compaction-crash"),
-        vopr.id.stable(name, "stale-enrichment-generation"),
+        vopr.id.stable(name, "stale-enrichment-progress-conflict"),
     };
     const mode_names = [_][]const u8{
         name ++ ".clean",
@@ -91,7 +93,7 @@ pub const Scenario = struct {
         name ++ ".retry",
         name ++ ".crash_recovery",
         name ++ ".compaction_crash",
-        name ++ ".stale_enrichment_generation",
+        name ++ ".stale_enrichment_progress_conflict",
     };
 
     /// Reusable production serverless owner graph. Full-cluster campaigns may
@@ -144,6 +146,10 @@ pub const Scenario = struct {
         visible_document_mask: u8 = 0,
         compacted: bool = false,
         generation_fenced: bool = true,
+        progress_conflict_fenced: bool = false,
+        publication_hook_calls: u64 = 0,
+        conflicting_candidate_version: u64 = 0,
+        generation_cutover_version: u64 = 0,
 
         fn init(alloc: std.mem.Allocator) !*Fixture {
             const self = try alloc.create(Fixture);
@@ -272,6 +278,10 @@ pub const Scenario = struct {
             self.visible_document_mask = 0;
             self.compacted = false;
             self.generation_fenced = true;
+            self.progress_conflict_fenced = false;
+            self.publication_hook_calls = 0;
+            self.conflicting_candidate_version = 0;
+            self.generation_cutover_version = 0;
 
             try self.initRuntime("worker-primary");
             errdefer self.runtime.deinit();
@@ -387,13 +397,14 @@ pub const Scenario = struct {
                 "docs",
             );
             defer query_result.deinit();
-            if (query_result.value.version != 3 or query_result.value.view != .published) return false;
+            const expected_version: u64 = if (mode == .stale_enrichment_progress_conflict) 4 else 3;
+            if (query_result.value.version != expected_version or query_result.value.view != .published) return false;
             var mask: u8 = 0;
             for (query_result.value.documents) |document| {
                 if (std.mem.eql(u8, document.doc_id, "doc-a")) mask |= 1;
                 if (std.mem.eql(u8, document.doc_id, "doc-b")) mask |= 2;
             }
-            const expected_mask: u8 = if (mode == .stale_enrichment_generation) 1 else 3;
+            const expected_mask: u8 = if (mode == .stale_enrichment_progress_conflict) 1 else 3;
             self.public_catalog_visible = mask == expected_mask;
             return self.public_catalog_visible;
         }
@@ -463,7 +474,7 @@ pub const Scenario = struct {
 
         fn runFirstPublication(self: *Fixture) !void {
             switch (self.mode) {
-                .clean, .compaction_crash, .stale_enrichment_generation => {
+                .clean, .compaction_crash, .stale_enrichment_progress_conflict => {
                     _ = try self.runtime.runOnce();
                 },
                 .duplicate_workers => {
@@ -683,21 +694,52 @@ pub const Scenario = struct {
             self.visible_document_mask = mask;
         }
 
-        fn runStaleEnrichmentGeneration(self: *Fixture) !void {
+        fn publicationLifecycleHook(self: *Fixture) build_mod.PublicationLifecycleHook {
+            return .{ .ptr = self, .reach_fn = reachPublicationLifecycle };
+        }
+
+        fn reachPublicationLifecycle(
+            ptr: *anyopaque,
+            event: build_mod.PublicationLifecycleEvent,
+        ) !void {
+            const self: *Fixture = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, event.namespace, "docs") or
+                event.expected_head != @as(?u64, 1) or event.candidate_version != 2)
+            {
+                return error.UnexpectedPublicationLifecycleBoundary;
+            }
+            self.publication_hook_calls += 1;
+            self.conflicting_candidate_version = event.candidate_version;
+            try self.advanceGenerationDuringPublication();
+        }
+
+        fn advanceGenerationDuringPublication(self: *Fixture) !void {
+            var generation = try self.manifests.getAlloc("docs", 1);
+            defer generation.deinit(self.alloc);
+            generation.version = self.conflicting_candidate_version;
+            self.generation_cutover_version = try build_mod.builder.putManifestForPublication(
+                &self.manifests,
+                &generation,
+                1,
+            );
+            if (self.generation_cutover_version != 3)
+                return error.GenerationCutoverVersionMismatch;
+            if (!try self.progress.compareAndSwapHead(
+                "docs",
+                1,
+                self.generation_cutover_version,
+            )) return error.GenerationCutoverConflict;
+        }
+
+        fn runStaleEnrichmentProgressConflict(self: *Fixture) !void {
             try self.ingest("doc-a", "{\"text\":\"authoritative\"}", 100);
             _ = try self.runtime.runOnce();
             try std.testing.expectEqual(@as(u64, 1), try self.progress.getHead("docs"));
 
-            // Model a WAL-free external/metadata generation cutover after an
-            // enricher captured head 1 but before it appended its full-body
-            // derived mutation.
-            var generation_two = try self.manifests.getAlloc("docs", 1);
-            defer generation_two.deinit(self.alloc);
-            generation_two.version = 2;
-            try self.manifests.put(generation_two);
-            if (!try self.progress.compareAndSwapHead("docs", 1, 2))
-                return error.GenerationCutoverConflict;
-
+            // The enricher captured generation 1 before producing this
+            // full-body derived mutation. A concurrent metadata publisher will
+            // advance the authoritative generation while the ordinary builder
+            // is parked after persisting its candidate but before HEAD CAS.
             const stale_mutation = try api_codec.encodeMutationAlloc(self.alloc, .{
                 .kind = .upsert,
                 .doc_id = "doc-a",
@@ -712,13 +754,46 @@ pub const Scenario = struct {
                 1,
             ) != 2) return error.StaleEnrichmentAppendNotRecorded;
 
+            self.builder.setPublicationLifecycleHook(self.publicationLifecycleHook());
+            const first_publish_error: ?anyerror = blk: {
+                var candidate = self.builder.publishNamespace("docs") catch |err| break :blk err;
+                candidate.deinit(self.alloc);
+                break :blk null;
+            };
+            self.builder.setPublicationLifecycleHook(null);
+
+            const head_after_conflict = try self.progress.getHead("docs");
+            var orphan = try self.manifests.getAlloc("docs", self.conflicting_candidate_version);
+            defer orphan.deinit(self.alloc);
+            if (first_publish_error) |err| {
+                if (err != error.HeadChanged) return err;
+            } else return error.ConflictingPublicationUnexpectedlyWon;
+            if (self.publication_hook_calls != 1)
+                return error.PublicationLifecycleHookCountMismatch;
+            if (self.conflicting_candidate_version != 2)
+                return error.ConflictingCandidateVersionMismatch;
+            if (self.generation_cutover_version != 3)
+                return error.GenerationCutoverVersionMismatch;
+            if (head_after_conflict != self.generation_cutover_version)
+                return error.ConflictingPublicationChangedVisibleHead;
+            if (!orphan.publication_lineage_tracked or
+                orphan.publication_parent_version != @as(?u64, 1))
+            {
+                return error.ConflictingCandidateLineageMismatch;
+            }
+            self.progress_conflict_fenced = true;
+            self.first_attempt_interrupted = true;
+
+            // Retry from the winning generation. The stale mutation is now
+            // inapplicable to HEAD 3, so the builder consumes its WAL position
+            // while cloning only the authoritative document artifacts.
             var consumed = try self.builder.publishNamespace("docs");
             defer consumed.deinit(self.alloc);
             self.final_head = consumed.version;
-            if (!consumed.published or consumed.version != 3 or consumed.wal_end_lsn != 2)
+            if (!consumed.published or consumed.version != 4 or consumed.wal_end_lsn != 2)
                 return error.StaleEnrichmentNotConsumed;
 
-            var visible = try self.manifests.getAlloc("docs", 3);
+            var visible = try self.manifests.getAlloc("docs", 4);
             defer visible.deinit(self.alloc);
             const document_ref = for (visible.artifacts) |artifact| {
                 if (artifact.kind == .document_segment) break artifact;
@@ -736,8 +811,8 @@ pub const Scenario = struct {
         }
 
         fn run(self: *Fixture) !void {
-            if (self.mode == .stale_enrichment_generation) {
-                try self.runStaleEnrichmentGeneration();
+            if (self.mode == .stale_enrichment_progress_conflict) {
+                try self.runStaleEnrichmentProgressConflict();
                 try self.sim.ensureNoCapabilityViolation();
                 return;
             }
@@ -768,11 +843,13 @@ pub const Scenario = struct {
         }
 
         pub fn workflowVisibleForMode(self: *const Fixture, mode: Mode) bool {
-            const expected_document_mask: u8 = if (mode == .stale_enrichment_generation) 1 else 3;
-            return self.complete and self.recovered and self.final_head == 3 and
+            const fencing_mode = mode == .stale_enrichment_progress_conflict;
+            const expected_document_mask: u8 = if (fencing_mode) 1 else 3;
+            const expected_head: u64 = if (fencing_mode) 4 else 3;
+            return self.complete and self.recovered and self.final_head == expected_head and
                 self.visible_document_mask == expected_document_mask and
-                (mode == .stale_enrichment_generation or self.compacted) and
-                self.generation_fenced;
+                (fencing_mode or self.compacted) and
+                self.generation_fenced and (!fencing_mode or self.progress_conflict_fenced);
         }
     };
 
@@ -832,6 +909,10 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".interrupted", @intFromBool(world.state.first_attempt_interrupted));
         try builder.addNamed(allocator, name ++ ".compacted", @intFromBool(world.state.compacted));
         try builder.addNamed(allocator, name ++ ".legacy-epoch-preserved", @intFromBool(world.state.legacy_epoch_preserved));
+        try builder.addNamed(allocator, name ++ ".publication-hook-calls", @intCast(world.state.publication_hook_calls));
+        try builder.addNamed(allocator, name ++ ".conflicting-candidate-version", @intCast(world.state.conflicting_candidate_version));
+        try builder.addNamed(allocator, name ++ ".generation-cutover-version", @intCast(world.state.generation_cutover_version));
+        try builder.addNamed(allocator, name ++ ".progress-conflict-fenced", @intFromBool(world.state.progress_conflict_fenced));
     }
 
     pub fn evaluate(
@@ -840,7 +921,9 @@ pub const Scenario = struct {
         allocator: std.mem.Allocator,
     ) !void {
         const state = world.state;
-        const expected_document_mask: u8 = if (state.mode == .stale_enrichment_generation) 1 else 3;
+        const fencing_mode = state.mode == .stale_enrichment_progress_conflict;
+        const expected_document_mask: u8 = if (fencing_mode) 1 else 3;
+        const expected_head: u64 = if (fencing_mode) 4 else 3;
         try sink.check(
             allocator,
             no_lost_documents_id,
@@ -849,7 +932,7 @@ pub const Scenario = struct {
         try sink.check(
             allocator,
             catalog_visible_id,
-            !state.complete or state.final_head == 3,
+            !state.complete or state.final_head == expected_head,
         );
         try sink.check(
             allocator,
@@ -868,25 +951,33 @@ pub const Scenario = struct {
         );
         try sink.check(allocator, recovery_id, state.complete and state.recovered);
         try sink.check(allocator, compacted_id, state.complete and
-            (state.mode == .stale_enrichment_generation or state.compacted));
+            (fencing_mode or state.compacted));
         try sink.check(
             allocator,
             generation_fenced_id,
-            state.mode != .stale_enrichment_generation or state.generation_fenced,
+            !fencing_mode or state.generation_fenced,
+        );
+        try sink.check(
+            allocator,
+            progress_conflict_id,
+            !fencing_mode or state.progress_conflict_fenced,
         );
     }
 
     pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
         const state = world.state;
-        const expected_document_mask: u8 = if (state.mode == .stale_enrichment_generation) 1 else 3;
+        const fencing_mode = state.mode == .stale_enrichment_progress_conflict;
+        const expected_document_mask: u8 = if (fencing_mode) 1 else 3;
+        const expected_head: u64 = if (fencing_mode) 4 else 3;
         return state.sim.healthSnapshot(.{
             .progress_expected = true,
             .progress_units = state.final_head + @popCount(state.visible_document_mask),
             .recovery_expected = state.mode != .clean,
             .recovery_complete = state.complete and state.recovered,
             .consistency_valid = !state.complete or
-                (state.visible_document_mask == expected_document_mask and state.final_head == 3 and
-                    (state.mode == .stale_enrichment_generation or state.compacted) and state.generation_fenced),
+                (state.visible_document_mask == expected_document_mask and state.final_head == expected_head and
+                    (fencing_mode or state.compacted) and state.generation_fenced and
+                    (!fencing_mode or state.progress_conflict_fenced)),
             .cleanup_complete = state.complete and !state.runtime_live,
         });
     }
@@ -1036,7 +1127,7 @@ test "complete serverless workflow VOPR exact replays claim build compact publis
                 .system = "antfly",
                 .transition_budget = 1,
                 .backend_ids = &backend_ids,
-                .source_revision = "serverless-workflow-vopr-v4",
+                .source_revision = "serverless-workflow-vopr-v5-generation-progress-conflict",
                 .target = "native",
                 .optimize = @tagName(@import("builtin").mode),
             },

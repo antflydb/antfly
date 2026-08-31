@@ -91,12 +91,33 @@ pub const NamedVectorBuildPolicy = struct {
     policy: ?vector_index.BuildPolicy = null,
 };
 
+/// Production-neutral suspension and observation seam for an immutable
+/// manifest publication. The hook runs after the candidate manifest is
+/// durable and before the progress-store compare-and-swap makes it visible.
+/// It is unset in production; deterministic runtimes may park here to expose
+/// a concurrent generation change without replacing either storage owner.
+pub const PublicationLifecycleEvent = struct {
+    namespace: []const u8,
+    expected_head: ?u64,
+    candidate_version: u64,
+};
+
+pub const PublicationLifecycleHook = struct {
+    ptr: *anyopaque,
+    reach_fn: *const fn (ptr: *anyopaque, event: PublicationLifecycleEvent) anyerror!void,
+
+    pub fn reach(self: PublicationLifecycleHook, event: PublicationLifecycleEvent) !void {
+        try self.reach_fn(self.ptr, event);
+    }
+};
+
 pub const Builder = struct {
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
     manifests: *manifest_mod.ManifestStore,
     progress: *catalog_mod.ProgressStore,
     wal: *wal_mod.WalStore,
+    publication_lifecycle_hook: ?PublicationLifecycleHook = null,
 
     const CurrentHeadManifest = struct {
         progress_version: u64 = 0,
@@ -123,6 +144,34 @@ pub const Builder = struct {
             .progress = progress,
             .wal = wal,
         };
+    }
+
+    pub fn setPublicationLifecycleHook(
+        self: *Builder,
+        hook: ?PublicationLifecycleHook,
+    ) void {
+        self.publication_lifecycle_hook = hook;
+    }
+
+    fn compareAndSwapPublishedHead(
+        self: *Builder,
+        namespace: []const u8,
+        expected: ?u64,
+        candidate_version: u64,
+        publication_guard: ?work_lease.PublicationGuard,
+    ) !bool {
+        if (self.publication_lifecycle_hook) |hook| try hook.reach(.{
+            .namespace = namespace,
+            .expected_head = expected,
+            .candidate_version = candidate_version,
+        });
+        return try compareAndSwapHeadGuarded(
+            self.progress,
+            namespace,
+            expected,
+            candidate_version,
+            publication_guard,
+        );
     }
 
     fn loadCurrentHeadManifestAlloc(self: *Builder, namespace: []const u8) !CurrentHeadManifest {
@@ -550,8 +599,7 @@ pub const Builder = struct {
             &manifest,
             if (current_head == 0) null else current_head,
         );
-        const published = try compareAndSwapHeadGuarded(
-            self.progress,
+        const published = try self.compareAndSwapPublishedHead(
             namespace,
             if (current_head == 0) null else current_head,
             published_version,
@@ -591,8 +639,7 @@ pub const Builder = struct {
         manifest.wal_end_lsn = last_record.lsn;
 
         const published_version = try putManifestForPublication(self.manifests, &manifest, current_head);
-        const published = try compareAndSwapHeadGuarded(
-            self.progress,
+        const published = try self.compareAndSwapPublishedHead(
             namespace,
             current_head,
             published_version,
@@ -636,8 +683,7 @@ pub const Builder = struct {
             &manifest,
             if (current_head == 0) null else current_head,
         );
-        const published = try compareAndSwapHeadGuarded(
-            self.progress,
+        const published = try self.compareAndSwapPublishedHead(
             namespace,
             if (current_head == 0) null else current_head,
             published_version,
@@ -854,8 +900,7 @@ pub const Builder = struct {
             &manifest,
             current_head,
         );
-        const published = try compareAndSwapHeadGuarded(
-            self.progress,
+        const published = try self.compareAndSwapPublishedHead(
             namespace,
             current_head,
             published_version,

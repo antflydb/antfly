@@ -42,6 +42,8 @@ pub const vector_index = @import("vector_index.zig");
 
 pub const BuildResult = builder.BuildResult;
 pub const Builder = builder.Builder;
+pub const PublicationLifecycleEvent = builder.PublicationLifecycleEvent;
+pub const PublicationLifecycleHook = builder.PublicationLifecycleHook;
 pub const AlgebraicManifestPlan = algebraic_manifest.Plan;
 pub const AlgebraicPublishedArtifact = algebraic_manifest.PublishedArtifact;
 pub const planAlgebraicManifestAlloc = algebraic_manifest.planAlloc;
