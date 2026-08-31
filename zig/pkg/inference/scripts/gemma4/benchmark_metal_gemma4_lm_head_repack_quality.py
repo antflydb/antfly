@@ -666,7 +666,7 @@ def main() -> int:
         raise ContractError("model-label must be a lowercase identifier")
     validate_campaign_dimensions(args.repetitions, args.vocab_size, args.timeout_seconds)
 
-    repo = SCRIPT_DIR.parents[3]
+    repo = SCRIPT_DIR.parents[4]
     args.out_dir = validate_output_directory(args.out_dir, repo)
     suite = load_suite(args.suite, args.suite_sha256)
     binary = args.binary.resolve(strict=True)

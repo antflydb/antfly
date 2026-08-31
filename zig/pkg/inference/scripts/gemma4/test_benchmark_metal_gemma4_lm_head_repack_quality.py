@@ -171,7 +171,7 @@ class ThresholdContractTests(unittest.TestCase):
 
 class EvidenceContractTests(unittest.TestCase):
     def test_output_directory_must_be_new_and_outside_the_repository(self) -> None:
-        repo = SCRIPT_DIR.parents[3]
+        repo = SCRIPT_DIR.parents[4]
         with self.assertRaisesRegex(quality.ContractError, "outside the source repository"):
             quality.validate_output_directory(repo / "new-evidence", repo)
         with tempfile.TemporaryDirectory() as directory:

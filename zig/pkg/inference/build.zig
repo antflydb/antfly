@@ -950,7 +950,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_lm_head_repack_quality_contract_test = b.addSystemCommand(&.{
         "python3",
-        "scripts/test_benchmark_metal_gemma4_lm_head_repack_quality.py",
+        "scripts/gemma4/test_benchmark_metal_gemma4_lm_head_repack_quality.py",
     });
     const metal_gemma4_lm_head_repack_quality_contract_test_step = b.step(
         "test-metal-gemma4-lm-head-repack-quality",

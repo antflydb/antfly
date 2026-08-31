@@ -1,7 +1,7 @@
 # Gemma 4 E2B/E4B Metal Performance Plan — Closing the Gap with llama.cpp and vLLM-Metal
 
 Date: 2026-08-26 · Baseline: v0.2.1-rc0 circus benchmark (`https://circus.antfly.io/v0.2.1-rc0/#inference-generation`)
-Scope: single-stream Gemma 4 E4B/E2B QAT Q4_0 generation on Apple Silicon (Metal). No commits from this analysis; plan only.
+Scope: single-stream Gemma 4 E4B/E2B QAT Q4_0 generation on Apple Silicon (Metal). The initial analysis was plan-only; §§9–16 record the subsequent implementation and qualification ledgers.
 
 ---
 
@@ -43,7 +43,7 @@ Circus, E4B Q4_0, single prompt, 64 tokens, temp 0, serial:
 
 Run before any optimization; each experiment decisively splits a gap bucket.
 
-1. **Stage timing**: `TERMITE_METAL_STAGE_TIMING=1` on E4B Q4_0 64- and 512-token runs; compare each decode bucket (attention/ffn/ple/tail/embedding) against its byte floor from §1. This alone confirms or kills the Q6_K-tail hypothesis. (Parsed by `scripts/benchmark_metal_gemma4_ab.py`.)
+1. **Stage timing**: `TERMITE_METAL_STAGE_TIMING=1` on E4B Q4_0 64- and 512-token runs; compare each decode bucket (attention/ffn/ple/tail/embedding) against its byte floor from §1. This alone confirms or kills the Q6_K-tail hypothesis. (Parsed by `scripts/gemma4/benchmark_metal_gemma4_ab.py`.)
 2. **GPU-busy vs wall**: `whole_frame_gpu_nanos` vs per-step wall time → sizes bucket (c) exactly.
 3. **Resolve the pipelined-frame discrepancy**: read `generation.zig:1633-1642` + `metal_kernels.m:48468` and A/B `TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME=1` (negative control: `TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME=1`).
 4. **Q6_K vocab-matvec microbench** at [2560×262144] via the quant-kernel bench harness → achievable tail GB/s before writing any kernel.
@@ -146,6 +146,23 @@ Success criteria on the M4 Pro reference box, E4B QAT Q4_0, streaming server, 64
 
 Updated expectations for the M4 Pro box: items 1-2 stack with round 1 (pipelined default-on). The long-context win (item 2) should be the headline in the next circus run if it includes any multi-hundred-token prompts; the 64-token single-prompt circus scenario mostly reflects round-1 + item-1 gains.
 
+## 11. Pre-handoff review + fix round (2026-08-26, originally uncommitted on top of b064b22de)
+
+A high-effort multi-agent review (8 finder angles, 21 adversarially verified candidates) produced 10 findings; all were fixed and re-validated (perf wins intact: E2B 53.9→56.5 with repack, tokens identical, long-ctx split ~1.9x, split-routes oracle green, both -Dmetal variants build, targeted tests pass):
+
+1. `-Dmetal=false` macOS link failure → `build_options.enable_metal` comptime guard on the new extern (empirically re-verified).
+2. Double free on the repack OOM path → explicit ownership handoff, no errdefer armed across the transfer. (Same latent pattern pre-exists in the Q8 helpers — untouched, note for a follow-up.)
+3-4/7. Auto-draft discovery restructured: runs BEFORE qualified-profile validation, admission, and the prompt estimate (speculation_requested now set at config build → estimate/limit/pre-encode-reuse consistent); reserves speculation slot units (degrading, not rejecting, when capacity is short — same at the native-generate lease); name-qualified like the registry companion rule (gemma-4 + -qat only) with manifest/config pre-validation; ALL draft-setup failures for a discovered drafter degrade to single-model generation (labeled draft_setup block) instead of failing the request. Verified live: flag + sibling present → request succeeds.
+5. LM-head repack now gated on a real `lm_head` identity bit plumbed contract→rms-runtime→gated-runtime (tagged prepare) and across the metal_compute bridge (which had silently dropped the field — caught because the repack stopped firing), not on out_dim alone.
+6. Repack env parse: `no`/`off`/`false`/`0` disable, unknown values warn+disable, `q4_0` warns loudly (kept for A/B evidence only).
+8. Companion pull: never inherits --tasks/--capabilities (manifest inferred from its own plan) and skips when already installed.
+9. One shared `pipelinedDecodeFrameEnabled()` policy in metal_runtime (cached env reads) used by both the pipeline and executor.
+10. Q6_K/Q4_K variant env parsing case-insensitive with invalid-value warnings; forced nsg4/nsg8 gated on maxTotalThreadsPerThreadgroup; Q4_K v2 AUTO scoped to the TAIL workload via the descriptor's existing workload field (M4 + vocab-sized).
+
+Review also REFUTED with evidence: JSON duplicate-key differential (Value parser errors on duplicates too), early-free of the parsed Value tree (typed request ALIASES it — the defer is required), prompt-cache/speculation pairing (blocked downstream by `!use_speculative`), executor-gate weakness (arm path re-checks the full gemma+PLE contract), suppression-mode barrier race (concurrent mode forces the scan on), split-scratch memory doubling (~2 MiB, trivial).
+
+Known accepted residue for the M4 Pro follow-up: single-threaded repack at load (~seconds; parallelize with the cold-load worker pool), Q8 helpers' pre-existing errdefer pattern, batch endpoint double-parse, per-hazard attribution only visible in concurrent mode.
+
 ## 12. Roofline-efficiency round (2026-08-27, M4 Air, uncommitted on top of the review-fix diff)
 
 Executed the approved roofline plan's Air-valid slice; M4 Pro items remain queued.
@@ -225,8 +242,8 @@ This round starts from the user's committed `a3c645c6f130601a039341a7bb5b9db9f5c
 
 The official BF16 assistants are installed as matching sibling models:
 
-- E2B: `/Users/tim/.antfly/inference/models/google/gemma-4-E2B-it-qat-q4_0-unquantized-assistant/mtp-gemma-4-E2B-it-BF16.gguf`, 162 MiB, SHA-256 `72d948683dbd8b4da9c9a1714406a2dc6db3bd7c94afd59b65389605015d5db6`.
-- E4B: `/Users/tim/.antfly/inference/models/google/gemma-4-E4B-it-qat-q4_0-unquantized-assistant/mtp-gemma-4-E4B-it-BF16.gguf`, 164 MiB, SHA-256 `cb70f7a55c900e01911deb881c742d752cd63e047002da95750a99bf13c41516`.
+- E2B: `~/.antfly/inference/models/google/gemma-4-E2B-it-qat-q4_0-unquantized-assistant/mtp-gemma-4-E2B-it-BF16.gguf`, 162 MiB, SHA-256 `72d948683dbd8b4da9c9a1714406a2dc6db3bd7c94afd59b65389605015d5db6`.
+- E4B: `~/.antfly/inference/models/google/gemma-4-E4B-it-qat-q4_0-unquantized-assistant/mtp-gemma-4-E4B-it-BF16.gguf`, 164 MiB, SHA-256 `cb70f7a55c900e01911deb881c742d752cd63e047002da95750a99bf13c41516`.
 - Source repositories: `https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/tree/main/MTP` and `https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF/tree/main/MTP`; sibling repository identities match Google's `gemma-4-E2B-it-qat-q4_0-unquantized-assistant` / `gemma-4-E4B-it-qat-q4_0-unquantized-assistant` naming contract.
 
 Both inspect as `gemma4-assistant` with four layers, hidden size 256, the expected backbone identity, and a full-vocabulary projection. The E4B projector-metadata server failure reported on the smaller laptop did not reproduce.
@@ -403,7 +420,7 @@ Composed medians (each stage assumes the prior lands at its central estimate; ll
 1. **Stage-timing correction:** `MTLCounterSamplingPointAtDispatchBoundary` is unsupported on the M4 Pro reference box too (`supported=0`), not just the Air — §12/§13.4/§14.5's "M4 Pro dispatch census" plan must use Instruments or route-algebra A/Bs (this round's method: forced-route cells on a flat KV testbed).
 2. **Cross-session GPU mutex:** two independent agents ran GPU campaigns 24 s apart this round (no contamination, verified by timeline) — the one-GPU-job rule needs an enforced lock file, not convention.
 3. **E4B GGUF durability:** the reference E4B lives only at `/private/tmp/antfly-gemma4-e4b-qat-b064/` (sha `676c3507…`); it must be re-staged under `~/.antfly` before P0's E4B lanes (a reboot orphans the pinned comparison).
-4. **Doc drift:** `GEMMA4_METAL_PERFORMANCE.md` is referenced by METAL.md/GEMMA4.md/TODO.md but does not exist; METAL.md's trace-flag names `ANTFLY_INFERENCE_METAL_TRACE_FRAME`/`ANTFLY_INFERENCE_DEBUG_METAL_TIMING` are stale (source: `TERMITE_METAL_TRACE_FRAME`, `TERMITE_DEBUG_METAL_TIMING`); §11 of this file is a numbering skip, no lost round.
+4. **Documentation cleanup:** the missing §11 fragment was consolidated into this canonical plan; stale `GEMMA4_METAL_PERFORMANCE.md` links and obsolete Metal trace-flag names were corrected.
 5. **Ledger value corrections:** pair-activation fusion = +2.77% on the M4 Pro (not the Air's 0.5–1%); PLE Q8 staging = +1.10% E2B here; the §1(e) "3-pass kv_1x" description is one dispatch with three barrier-separated internal phases.
 6. **Telemetry gaps to close while touching these paths:** counter on the pair-activation rc −2..−6 fallback; counter on the split-GQA below-floor early-out; `TERMITE_METAL_TRACE_DISPATCH_PROFILE` appears inert on the planned-frame route.
 7. **Binary archival:** none of the four pinned ledger binaries is archived anywhere on disk; archive release-candidate binaries (or record source→binary reproducibility) alongside the evidence dir.
