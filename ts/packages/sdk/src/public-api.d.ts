@@ -10768,7 +10768,7 @@ export interface components {
             /** @description Dense-only exact publication status; absent for sparse indexes and when the target proof is unavailable. */
             publication?: components["schemas"]["DenseVectorPublicationStatus"];
             /** @description Fresh owner-reported activity, or null when no heartbeat for this index incarnation is available. */
-            activity?: components["schemas"]["EmbeddingIndexActivity"];
+            activity?: components["schemas"]["EmbeddingIndexActivity"] | null;
             /** @description Error message if stats could not be retrieved */
             error?: string;
             /**
