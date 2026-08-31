@@ -15115,6 +15115,18 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
 
+fn lockAtomicBefore(mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
+    if (deadline_ns == null) {
+        lockAtomic(mutex);
+        return true;
+    }
+    while (platform_time.monotonicNs() < deadline_ns.?) {
+        if (mutex.tryLock()) return true;
+        platform_clock.Clock.real().sleepMs(1);
+    }
+    return false;
+}
+
 fn catalogRoutingProbeDeadline(now_ns: u64, deadline_ns: u64, probe_interval_ns: u64) u64 {
     return @min(
         deadline_ns,
@@ -15437,6 +15449,9 @@ const RemoteMetadataSource = struct {
     cached_head_at_ms: u64 = 0,
     cached_snapshot: ?antfly.metadata_api.AdminSnapshot = null,
     cached_snapshot_at_ms: u64 = 0,
+    cached_routing_snapshot: ?antfly.metadata_api.CatalogRoutingSnapshot = null,
+    cached_routing_snapshot_at_ms: u64 = 0,
+    routing_refresh_mutex: std.atomic.Mutex = .unlocked,
     // Incremented only by authoritative replacement or invalidation. An
     // ordinary snapshot request captures this before I/O and may not publish
     // across a generation change.
@@ -15504,6 +15519,7 @@ const RemoteMetadataSource = struct {
         self.alloc.free(self.http_executors);
         lockAtomic(&self.cache_mutex);
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
+        if (self.cached_routing_snapshot) |*snapshot| freeRoutingSnapshotOwned(self.alloc, snapshot);
         self.alloc.free(self.linearizable_snapshot_unsupported_until_ns);
         self.alloc.free(self.routing_protocol_states);
         for (self.base_uris) |uri| self.alloc.free(uri);
@@ -15786,16 +15802,21 @@ const RemoteMetadataSource = struct {
 
     fn invalidateCache(self: *RemoteMetadataSource) void {
         var retired_snapshot: ?antfly.metadata_api.AdminSnapshot = null;
+        var retired_routing_snapshot: ?antfly.metadata_api.CatalogRoutingSnapshot = null;
         lockAtomic(&self.cache_mutex);
         retired_snapshot = self.cached_snapshot;
+        retired_routing_snapshot = self.cached_routing_snapshot;
         self.cached_snapshot = null;
+        self.cached_routing_snapshot = null;
         self.cached_head = null;
         self.cached_head_at_ms = 0;
         self.cached_snapshot_at_ms = 0;
+        self.cached_routing_snapshot_at_ms = 0;
         self.snapshot_fence_generation +%= 1;
         self.snapshot_invalidation_generation +%= 1;
         self.cache_mutex.unlock();
         if (retired_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
+        if (retired_routing_snapshot) |*snapshot| freeRoutingSnapshotOwned(self.alloc, snapshot);
     }
 
     fn acceptLinearizableSnapshot(
@@ -16227,6 +16248,21 @@ const RemoteMetadataSource = struct {
         deadline_ns: ?u64,
         linearizable: bool,
     ) !antfly.metadata_api.CatalogRoutingSnapshot {
+        var refresh_locked = false;
+        defer if (refresh_locked) self.routing_refresh_mutex.unlock();
+        var routing_invalidation_generation: u64 = 0;
+        if (!linearizable) {
+            if (try self.cachedRoutingSnapshotFresh()) |snapshot| return snapshot;
+            if (!lockAtomicBefore(&self.routing_refresh_mutex, deadline_ns))
+                return error.CatalogRoutingSnapshotTimeout;
+            refresh_locked = true;
+            // Singleflight followers recheck after the active refresh. This
+            // keeps a burst of routed reads to one metadata request.
+            if (try self.cachedRoutingSnapshotFresh()) |snapshot| return snapshot;
+            lockAtomic(&self.cache_mutex);
+            routing_invalidation_generation = self.snapshot_invalidation_generation;
+            self.cache_mutex.unlock();
+        }
         const outer_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline|
             .{ .deadline_ns = deadline }
         else
@@ -16310,12 +16346,56 @@ const RemoteMetadataSource = struct {
                 .unknown, .incompatible => unreachable,
             };
             self.noteMetadataReadSuccess(index);
+            if (!linearizable) self.publishRoutingSnapshot(snapshot, routing_invalidation_generation) catch |err| {
+                var owned = snapshot;
+                freeRoutingSnapshotOwned(self.alloc, &owned);
+                if (err == error.MetadataSnapshotHeadMismatch) {
+                    // A mutation raced the eventual fetch. Do not expose the
+                    // stale result or leak an internal cache-generation error
+                    // to the request: refresh through the authoritative path
+                    // while retaining the caller's original deadline.
+                    return try self.remoteRoutingSnapshotWithMode(deadline_ns, true);
+                }
+                return err;
+            };
             return snapshot;
         }
         if (deadline_ns) |deadline| {
             if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
         return last_err;
+    }
+
+    fn cachedRoutingSnapshotFresh(self: *RemoteMetadataSource) !?antfly.metadata_api.CatalogRoutingSnapshot {
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        lockAtomic(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        const snapshot = self.cached_routing_snapshot orelse return null;
+        if (now_ms -| self.cached_routing_snapshot_at_ms > metadata_snapshot_cache_ttl_ms) return null;
+        return try cloneRoutingSnapshotOwned(self.alloc, snapshot);
+    }
+
+    fn publishRoutingSnapshot(
+        self: *RemoteMetadataSource,
+        snapshot: antfly.metadata_api.CatalogRoutingSnapshot,
+        invalidation_generation: u64,
+    ) !void {
+        var owned = try cloneRoutingSnapshotOwned(self.alloc, snapshot);
+        var retain_owned = false;
+        defer if (!retain_owned) freeRoutingSnapshotOwned(self.alloc, &owned);
+        var retired: ?antfly.metadata_api.CatalogRoutingSnapshot = null;
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        lockAtomic(&self.cache_mutex);
+        if (self.snapshot_invalidation_generation != invalidation_generation) {
+            self.cache_mutex.unlock();
+            return error.MetadataSnapshotHeadMismatch;
+        }
+        retired = self.cached_routing_snapshot;
+        self.cached_routing_snapshot = owned;
+        self.cached_routing_snapshot_at_ms = now_ms;
+        retain_owned = true;
+        self.cache_mutex.unlock();
+        if (retired) |*value| freeRoutingSnapshotOwned(self.alloc, value);
     }
 
     fn fetchLegacyRoutingSnapshotAtEndpoint(
@@ -16348,7 +16428,7 @@ const RemoteMetadataSource = struct {
         source_ranges: []const antfly.metadata.table_manager.RangeRecord,
     ) !antfly.metadata_api.CatalogRoutingSnapshot {
         try self.acceptMetadataIdentity(metadata_group_id, metadata_incarnation);
-        const tables = try cloneTablesOwned(self.alloc, source_tables);
+        const tables = try cloneRoutingTablesOwned(self.alloc, source_tables);
         errdefer freeTablesOwned(self.alloc, tables);
         return .{
             .metadata_group_id = metadata_group_id,
@@ -16360,15 +16440,13 @@ const RemoteMetadataSource = struct {
                 .revision = catalog_revision,
             },
             .tables = tables,
-            .ranges = try cloneRangesOwned(self.alloc, source_ranges),
+            .ranges = try cloneRoutingRangesOwned(self.alloc, source_ranges),
         };
     }
 
     fn remoteFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *antfly.metadata_api.CatalogRoutingSnapshot) void {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
-        freeTablesOwned(self.alloc, snapshot.tables);
-        freeRangesOwned(self.alloc, snapshot.ranges);
-        snapshot.* = undefined;
+        freeRoutingSnapshotOwned(self.alloc, snapshot);
     }
 
     fn remoteWaitForRoutingChange(ptr: *anyopaque, observed_token: antfly.metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, probe_interval_ns: u64) !antfly.public_api.table_catalog.CatalogChangeWaitResult {
@@ -18725,6 +18803,20 @@ fn cloneTablesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.t
     return out;
 }
 
+fn cloneRoutingTablesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.TableRecord) ![]antfly.metadata.table_manager.TableRecord {
+    const out = try alloc.alloc(antfly.metadata.table_manager.TableRecord, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeTable(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneRoutingTable(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
 fn cloneRangesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.RangeRecord) ![]antfly.metadata.table_manager.RangeRecord {
     const out = try alloc.alloc(antfly.metadata.table_manager.RangeRecord, records.len);
     var initialized: usize = 0;
@@ -18737,6 +18829,45 @@ fn cloneRangesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.t
         initialized += 1;
     }
     return out;
+}
+
+fn cloneRoutingRangesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.RangeRecord) ![]antfly.metadata.table_manager.RangeRecord {
+    const out = try alloc.alloc(antfly.metadata.table_manager.RangeRecord, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeRange(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneRoutingRange(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneRoutingSnapshotOwned(
+    alloc: std.mem.Allocator,
+    snapshot: antfly.metadata_api.CatalogRoutingSnapshot,
+) !antfly.metadata_api.CatalogRoutingSnapshot {
+    const tables = try cloneRoutingTablesOwned(alloc, snapshot.tables);
+    errdefer freeTablesOwned(alloc, tables);
+    return .{
+        .metadata_group_id = snapshot.metadata_group_id,
+        .metadata_incarnation = snapshot.metadata_incarnation,
+        .catalog_revision = snapshot.catalog_revision,
+        .change_token = snapshot.change_token,
+        .tables = tables,
+        .ranges = try cloneRoutingRangesOwned(alloc, snapshot.ranges),
+    };
+}
+
+fn freeRoutingSnapshotOwned(
+    alloc: std.mem.Allocator,
+    snapshot: *antfly.metadata_api.CatalogRoutingSnapshot,
+) void {
+    freeTablesOwned(alloc, snapshot.tables);
+    freeRangesOwned(alloc, snapshot.ranges);
+    snapshot.* = undefined;
 }
 
 fn freeTablesOwned(alloc: std.mem.Allocator, records: []antfly.metadata.table_manager.TableRecord) void {

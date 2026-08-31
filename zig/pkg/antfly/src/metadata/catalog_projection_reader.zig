@@ -215,7 +215,7 @@ fn cloneTables(
     }
     for (records, 0..) |record, i| {
         try ensureBeforeDeadline(deadline_ns);
-        out[i] = try metadata_table_manager.cloneTable(alloc, record);
+        out[i] = try metadata_table_manager.cloneRoutingTable(alloc, record);
         cloned = i + 1;
     }
     try ensureBeforeDeadline(deadline_ns);
@@ -236,7 +236,7 @@ fn cloneRanges(
     }
     for (records, 0..) |record, i| {
         try ensureBeforeDeadline(deadline_ns);
-        out[i] = try metadata_table_manager.cloneRange(alloc, record);
+        out[i] = try metadata_table_manager.cloneRoutingRange(alloc, record);
         cloned = i + 1;
     }
     try ensureBeforeDeadline(deadline_ns);

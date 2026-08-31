@@ -1019,13 +1019,27 @@ const LocalStandaloneMetadata = struct {
 
         const now_ns = platform_time.monotonicNs();
         if (now_ns < deadline_ns) {
-            const wait_ns = @min(deadline_ns - now_ns, @max(probe_interval_ns, std.time.ns_per_ms));
-            platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
+            // Finish the passive watch before the outer deadline and reserve
+            // bounded time for the authoritative mutex confirmation. Waiting
+            // all the way to the deadline makes lockAtomicUntil reject the
+            // final read and turns a stable absence into a false timeout.
+            const remaining_ns = deadline_ns - now_ns;
+            const confirmation_budget_ns = @min(
+                10 * std.time.ns_per_ms,
+                @max(std.time.ns_per_ms, remaining_ns / 4),
+            );
+            const watch_deadline_ns = deadline_ns -| confirmation_budget_ns;
+            const wait_ns = if (now_ns < watch_deadline_ns)
+                @min(watch_deadline_ns - now_ns, @max(probe_interval_ns, std.time.ns_per_ms))
+            else
+                0;
+            if (wait_ns > 0)
+                platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
         }
         if (!lockAtomicUntil(&self.mutex, deadline_ns)) return .retry;
         defer self.mutex.unlock();
         if (standaloneCatalogTokenChanged(self, observed_token)) return .changed;
-        return if (platform_time.monotonicNs() >= deadline_ns) .authoritative_absence else .retry;
+        return .authoritative_absence;
     }
 
     fn standaloneCatalogTokenChanged(

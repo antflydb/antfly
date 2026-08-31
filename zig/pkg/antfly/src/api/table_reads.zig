@@ -3362,14 +3362,15 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         try checkQueryDeadline(req);
-        var prepared = try self.prepareRoutedSpanRead(alloc, table_name, "", "", .{ .search = req }, consistency, readPreparationKindForQuery(req));
+        var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, self.catalog, table_name, .all_ranges, req.execution_deadline_ns);
+        defer routing_session.deinit();
+        var routed_source = self.*;
+        routed_source.catalog = routing_session.catalog();
+        const routed = &routed_source;
+        var prepared = try routed.prepareRoutedSpanRead(alloc, table_name, "", "", .{ .search = req }, consistency, readPreparationKindForQuery(req));
         defer prepared.deinit();
         const group_ids = prepared.group_ids;
         if (group_ids.len == 0) return null;
-        var pinned_catalog = RoutePinnedCatalog{ .base = self.catalog, .table_name = table_name, .routes = prepared.routes, .metadata_group_id = prepared.metadata_group_id, .metadata_incarnation = prepared.metadata_incarnation, .catalog_revision = prepared.catalog_revision, .table_id = prepared.table_id, .topology_epoch = prepared.topology_epoch };
-        var routed_source = self.*;
-        routed_source.catalog = pinned_catalog.source();
-        const routed = &routed_source;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, routed.catalog, table_name, group_ids.len);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
@@ -3492,14 +3493,15 @@ pub const ProvisionedTableReadSource = struct {
         try self.ensureHAReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
-            var prepared = try self.prepareRoutedSpanRead(alloc, table_name, "", "", .{ .search = req }, consistency, readPreparationKindForQuery(req));
+            var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, self.catalog, table_name, .all_ranges, req.execution_deadline_ns);
+            defer routing_session.deinit();
+            var routed_source = self.*;
+            routed_source.catalog = routing_session.catalog();
+            const routed = &routed_source;
+            var prepared = try routed.prepareRoutedSpanRead(alloc, table_name, "", "", .{ .search = req }, consistency, readPreparationKindForQuery(req));
             defer prepared.deinit();
             const group_ids = prepared.group_ids;
             if (group_ids.len == 0) return null;
-            var pinned_catalog = RoutePinnedCatalog{ .base = self.catalog, .table_name = table_name, .routes = prepared.routes, .metadata_group_id = prepared.metadata_group_id, .metadata_incarnation = prepared.metadata_incarnation, .catalog_revision = prepared.catalog_revision, .table_id = prepared.table_id, .topology_epoch = prepared.topology_epoch };
-            var routed_source = self.*;
-            routed_source.catalog = pinned_catalog.source();
-            const routed = &routed_source;
             try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, routed.catalog, table_name, group_ids.len);
             try validateResolvedDocFilterForGroups(alloc, routed.catalog, table_name, group_ids, req);
             const plan = planFanout(.preflight, routed.io_impl, group_ids.len);
@@ -4717,12 +4719,13 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, hosted.catalog, table_name, from_key, to_key, null);
-        defer route_snapshot.deinit(alloc);
-        var pinned = RoutePinnedCatalog{ .base = hosted.catalog, .table_name = table_name, .routes = route_snapshot.routes, .metadata_group_id = route_snapshot.metadata_group_id, .metadata_incarnation = route_snapshot.metadata_incarnation, .catalog_revision = route_snapshot.catalog_revision, .table_id = route_snapshot.table_id, .topology_epoch = route_snapshot.topology_epoch };
+        var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .{ .span = .{ .from_key = from_key, .to_key = to_key } }, null);
+        defer routing_session.deinit();
         var routed_source = hosted.*;
-        routed_source.catalog = pinned.source();
+        routed_source.catalog = routing_session.catalog();
         const self = &routed_source;
+        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, from_key, to_key, null);
+        defer route_snapshot.deinit(alloc);
         const group_ids = route_snapshot.group_ids;
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
@@ -4762,19 +4765,20 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try checkQueryDeadline(req);
+        var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .all_ranges, req.execution_deadline_ns);
+        defer routing_session.deinit();
+        var routed_source = hosted.*;
+        routed_source.catalog = routing_session.catalog();
+        const self = &routed_source;
         var route_snapshot = try table_catalog.routedSpanSnapshotUntil(
             alloc,
-            hosted.catalog,
+            self.catalog,
             table_name,
             "",
             "",
             req.execution_deadline_ns,
         );
         defer route_snapshot.deinit(alloc);
-        var pinned = RoutePinnedCatalog{ .base = hosted.catalog, .table_name = table_name, .routes = route_snapshot.routes, .metadata_group_id = route_snapshot.metadata_group_id, .metadata_incarnation = route_snapshot.metadata_incarnation, .catalog_revision = route_snapshot.catalog_revision, .table_id = route_snapshot.table_id, .topology_epoch = route_snapshot.topology_epoch };
-        var routed_source = hosted.*;
-        routed_source.catalog = pinned.source();
-        const self = &routed_source;
         const group_ids = route_snapshot.group_ids;
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
@@ -4852,12 +4856,13 @@ pub const HostedProvisionedTableReadSource = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, hosted.catalog, table_name, "", "", req.execution_deadline_ns);
-        defer route_snapshot.deinit(alloc);
-        var pinned = RoutePinnedCatalog{ .base = hosted.catalog, .table_name = table_name, .routes = route_snapshot.routes, .metadata_group_id = route_snapshot.metadata_group_id, .metadata_incarnation = route_snapshot.metadata_incarnation, .catalog_revision = route_snapshot.catalog_revision, .table_id = route_snapshot.table_id, .topology_epoch = route_snapshot.topology_epoch };
+        var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .all_ranges, req.execution_deadline_ns);
+        defer routing_session.deinit();
         var routed_source = hosted.*;
-        routed_source.catalog = pinned.source();
+        routed_source.catalog = routing_session.catalog();
         const self = &routed_source;
+        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, "", "", req.execution_deadline_ns);
+        defer route_snapshot.deinit(alloc);
         const group_ids = route_snapshot.group_ids;
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
@@ -10157,14 +10162,12 @@ fn loadTableIdentityNamespaceForGroup(
     table_name: []const u8,
     group_id: u64,
 ) !?db_mod.DocIdentityNamespace {
-    _ = alloc;
     if (catalog.vtable.route_identity) |resolve| {
-        var declined = false;
         const resolved = resolve(catalog.ptr, table_name, group_id) catch |err| switch (err) {
-            error.RouteIdentityNotPinned => blk: {
-                declined = true;
-                break :blk null;
-            },
+            // Legacy single-route wrappers may deliberately decline another
+            // table. Resolve it from the compact routing capability below;
+            // never recover identity from an operational admin snapshot.
+            error.RouteIdentityNotPinned => null,
             else => return err,
         };
         if (resolved) |identity| {
@@ -10174,22 +10177,13 @@ fn loadTableIdentityNamespaceForGroup(
                 .range_id = identity.range_id,
             };
         }
-        if (!declined) return null;
-        // The callback deliberately declined this table; continue through the
-        // ordinary admin path for cross-table graph work.
+        // Resolve a declined or missing identity through the compact routing
+        // capability. For a RoutingSession this reuses the same immutable
+        // projection; for compatibility wrappers it remains fail-closed.
     }
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
-    const table = @import("tables.zig").findTableByName(&snapshot, table_name) orelse return null;
-    for (snapshot.ranges) |range| {
-        if (range.table_id != table.table_id or range.group_id != group_id) continue;
-        return .{
-            .table_id = table.table_id,
-            .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
-            .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
-        };
-    }
-    return null;
+    const routed = try table_catalog.routedGroupIdSnapshotUntil(alloc, catalog, table_name, group_id, null);
+    const route = routed.route orelse return null;
+    return docIdentityNamespaceForRoute(route);
 }
 
 fn docIdentityNamespaceForRoute(route: table_catalog.CatalogGroupRoute) db_mod.DocIdentityNamespace {
