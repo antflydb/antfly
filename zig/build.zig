@@ -1841,7 +1841,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const pdf_standard_fonts_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/antfarm/fonts/standard_fonts.zig"),
+        .root_source_file = b.path("pdf_standard_fonts.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1869,7 +1869,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const wasm_pdf_standard_fonts_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/antfarm/fonts/standard_fonts.zig"),
+        .root_source_file = b.path("pdf_standard_fonts.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
@@ -3203,7 +3203,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     const pdf_bench_standard_fonts_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/antfarm/fonts/standard_fonts.zig"),
+        .root_source_file = b.path("pdf_standard_fonts.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
