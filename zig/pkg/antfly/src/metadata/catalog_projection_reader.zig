@@ -27,7 +27,12 @@ pub const CatalogProjectionReader = struct {
         pub const VTable = struct {
             ensure_listener_registered: *const fn (ptr: *anyopaque) anyerror!void,
             catalog_epoch: *const fn (ptr: *anyopaque) u64,
-            projected_store: *const fn (ptr: *anyopaque) ?*metadata_storage.RaftApplyStore,
+            capture_projection: *const fn (
+                ptr: *anyopaque,
+                alloc: std.mem.Allocator,
+                metadata_group_id: u64,
+                deadline_ns: ?u64,
+            ) anyerror!metadata_storage.CatalogProjectionSnapshot,
         };
 
         fn ensureListenerRegistered(self: Source) !void {
@@ -38,8 +43,13 @@ pub const CatalogProjectionReader = struct {
             return self.vtable.catalog_epoch(self.ptr);
         }
 
-        fn projectedStore(self: Source) ?*metadata_storage.RaftApplyStore {
-            return self.vtable.projected_store(self.ptr);
+        fn captureProjection(
+            self: Source,
+            alloc: std.mem.Allocator,
+            metadata_group_id: u64,
+            deadline_ns: ?u64,
+        ) !metadata_storage.CatalogProjectionSnapshot {
+            return try self.vtable.capture_projection(self.ptr, alloc, metadata_group_id, deadline_ns);
         }
     };
 
@@ -66,6 +76,7 @@ pub const CatalogProjectionReader = struct {
 
     const Cache = struct {
         catalog_epoch: u64 = 0,
+        reusable: bool = false,
         snapshot: ?Snapshot = null,
 
         fn deinit(self: *Cache, alloc: std.mem.Allocator) void {
@@ -111,29 +122,36 @@ pub const CatalogProjectionReader = struct {
         try ensureBeforeDeadline(deadline_ns);
 
         const current_epoch = source.catalogEpoch();
-        if (self.cache.snapshot != null and self.cache.catalog_epoch == current_epoch) {
+        if (self.cache.reusable and self.cache.snapshot != null and self.cache.catalog_epoch == current_epoch) {
             return &(self.cache.snapshot orelse unreachable);
         }
 
         // The apply store captures both namespaces from one point-in-time read
-        // transaction. Epoch checks stabilize publication while allowing apply
-        // and Raft runtime work to proceed independently.
-        for (0..4) |_| {
-            try ensureBeforeDeadline(deadline_ns);
-            const before = source.catalogEpoch();
-            var fresh = try capture(alloc, metadata_group_id, source, deadline_ns);
-            errdefer fresh.deinit(alloc);
-            const after = source.catalogEpoch();
-            try ensureBeforeDeadline(deadline_ns);
-            if (before != after) {
-                fresh.deinit(alloc);
-                continue;
+        // transaction, so concurrent publication does not make the captured
+        // value internally inconsistent. If the listener epoch changes while
+        // cloning, return this coherent point-in-time value to the current
+        // caller but mark it non-reusable; the next caller refreshes instead
+        // of turning ordinary catalog churn into an internal error.
+        try ensureBeforeDeadline(deadline_ns);
+        const before = source.catalogEpoch();
+        var fresh = try capture(alloc, metadata_group_id, source, deadline_ns);
+        errdefer fresh.deinit(alloc);
+        const after = source.catalogEpoch();
+        try ensureBeforeDeadline(deadline_ns);
+        if (self.cache.snapshot) |cached| {
+            if (std.meta.eql(cached.metadata_incarnation, fresh.metadata_incarnation) and
+                fresh.catalog_revision < cached.catalog_revision)
+            {
+                return error.CatalogProjectionRevisionRegressed;
             }
-            if (self.cache.snapshot) |*snapshot| snapshot.deinit(alloc);
-            self.cache = .{ .catalog_epoch = after, .snapshot = fresh };
-            return &(self.cache.snapshot orelse unreachable);
         }
-        return error.CatalogProjectionUnstable;
+        if (self.cache.snapshot) |*snapshot| snapshot.deinit(alloc);
+        self.cache = .{
+            .catalog_epoch = after,
+            .reusable = before == after,
+            .snapshot = fresh,
+        };
+        return &(self.cache.snapshot orelse unreachable);
     }
 
     pub fn routingSnapshot(
@@ -249,10 +267,9 @@ pub const CatalogProjectionReader = struct {
         source: Source,
         deadline_ns: ?u64,
     ) !Snapshot {
-        const store = source.projectedStore() orelse return error.MissingMetadataStore;
         var snapshot: Snapshot = .{};
         errdefer snapshot.deinit(alloc);
-        const projected = try store.captureCatalogProjection(alloc, metadata_group_id, deadline_ns);
+        const projected = try source.captureProjection(alloc, metadata_group_id, deadline_ns);
         snapshot.metadata_incarnation = projected.metadata_incarnation;
         snapshot.catalog_revision = projected.catalog_revision;
         snapshot.tables = projected.tables;
@@ -343,4 +360,128 @@ fn freeTables(alloc: std.mem.Allocator, records: []metadata_table_manager.TableR
 fn freeRanges(alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
     for (records) |record| metadata_table_manager.freeRange(alloc, record);
     if (records.len > 0) alloc.free(records);
+}
+
+test "catalog projection churn returns coherent snapshots and only caches stable captures" {
+    const FakeSource = struct {
+        epoch: u64 = 0,
+        revision: u64 = 0,
+        captures: usize = 0,
+        advance_epoch_during_capture: bool = true,
+
+        fn source(self: *@This()) CatalogProjectionReader.Source {
+            return .{ .ptr = self, .vtable = &.{
+                .ensure_listener_registered = ensureListenerRegistered,
+                .catalog_epoch = catalogEpoch,
+                .capture_projection = captureProjection,
+            } };
+        }
+
+        fn ensureListenerRegistered(_: *anyopaque) !void {}
+
+        fn catalogEpoch(ptr: *anyopaque) u64 {
+            return cast(ptr).epoch;
+        }
+
+        fn captureProjection(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            deadline_ns: ?u64,
+        ) !metadata_storage.CatalogProjectionSnapshot {
+            try ensureBeforeDeadline(deadline_ns);
+            const self = cast(ptr);
+            self.captures += 1;
+            self.revision += 1;
+            if (self.advance_epoch_during_capture) self.epoch += 1;
+            return .{
+                .metadata_incarnation = null,
+                .catalog_revision = self.revision,
+                .tables = &.{},
+                .ranges = &.{},
+            };
+        }
+
+        fn cast(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+    };
+
+    var fake = FakeSource{};
+    var reader: CatalogProjectionReader = .{};
+    defer reader.deinit(std.testing.allocator);
+
+    var first = try reader.routingSnapshot(std.testing.allocator, 91, fake.source(), null);
+    reader.freeRoutingSnapshot(std.testing.allocator, &first);
+    try std.testing.expectEqual(@as(usize, 1), fake.captures);
+    try std.testing.expect(!reader.cache.reusable);
+
+    var second = try reader.routingSnapshot(std.testing.allocator, 91, fake.source(), null);
+    reader.freeRoutingSnapshot(std.testing.allocator, &second);
+    try std.testing.expectEqual(@as(usize, 2), fake.captures);
+    try std.testing.expect(!reader.cache.reusable);
+
+    fake.advance_epoch_during_capture = false;
+    var stable = try reader.routingSnapshot(std.testing.allocator, 91, fake.source(), null);
+    reader.freeRoutingSnapshot(std.testing.allocator, &stable);
+    try std.testing.expectEqual(@as(usize, 3), fake.captures);
+    try std.testing.expect(reader.cache.reusable);
+
+    var cached = try reader.routingSnapshot(std.testing.allocator, 91, fake.source(), null);
+    reader.freeRoutingSnapshot(std.testing.allocator, &cached);
+    try std.testing.expectEqual(@as(usize, 3), fake.captures);
+}
+
+test "catalog projection cache rejects revision regression within one authority" {
+    const FakeSource = struct {
+        epoch: u64 = 1,
+        revision: u64 = 7,
+
+        fn source(self: *@This()) CatalogProjectionReader.Source {
+            return .{ .ptr = self, .vtable = &.{
+                .ensure_listener_registered = ensureListenerRegistered,
+                .catalog_epoch = catalogEpoch,
+                .capture_projection = captureProjection,
+            } };
+        }
+
+        fn ensureListenerRegistered(_: *anyopaque) !void {}
+
+        fn catalogEpoch(ptr: *anyopaque) u64 {
+            return cast(ptr).epoch;
+        }
+
+        fn captureProjection(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: ?u64,
+        ) !metadata_storage.CatalogProjectionSnapshot {
+            const self = cast(ptr);
+            return .{
+                .metadata_incarnation = null,
+                .catalog_revision = self.revision,
+                .tables = &.{},
+                .ranges = &.{},
+            };
+        }
+
+        fn cast(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+    };
+
+    var fake = FakeSource{};
+    var reader: CatalogProjectionReader = .{};
+    defer reader.deinit(std.testing.allocator);
+
+    var initial = try reader.routingSnapshot(std.testing.allocator, 91, fake.source(), null);
+    reader.freeRoutingSnapshot(std.testing.allocator, &initial);
+    fake.epoch += 1;
+    fake.revision -= 1;
+    try std.testing.expectError(
+        error.CatalogProjectionRevisionRegressed,
+        reader.routingSnapshot(std.testing.allocator, 91, fake.source(), null),
+    );
+    try std.testing.expectEqual(@as(u64, 7), reader.cache.snapshot.?.catalog_revision);
 }

@@ -2349,7 +2349,7 @@ pub const MetadataService = struct {
         return .{ .ptr = self, .vtable = &.{
             .ensure_listener_registered = catalogProjectionEnsureListener,
             .catalog_epoch = catalogProjectionEpoch,
-            .projected_store = catalogProjectionStore,
+            .capture_projection = catalogProjectionCapture,
         } };
     }
 
@@ -2363,9 +2363,15 @@ pub const MetadataService = struct {
         return self.catalog_epoch.load(.acquire);
     }
 
-    fn catalogProjectionStore(ptr: *anyopaque) ?*metadata_storage.RaftApplyStore {
+    fn catalogProjectionCapture(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64,
+        deadline_ns: ?u64,
+    ) !metadata_storage.raft_apply_store.CatalogProjectionSnapshot {
         const self: *MetadataService = @ptrCast(@alignCast(ptr));
-        return self.projectedStore();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.captureCatalogProjection(alloc, metadata_group_id, deadline_ns);
     }
 
     fn metadataServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
@@ -4173,7 +4179,7 @@ pub const MetadataHttpService = struct {
         return .{ .ptr = self, .vtable = &.{
             .ensure_listener_registered = catalogProjectionEnsureListener,
             .catalog_epoch = catalogProjectionEpoch,
-            .projected_store = catalogProjectionStore,
+            .capture_projection = catalogProjectionCapture,
         } };
     }
 
@@ -4187,9 +4193,15 @@ pub const MetadataHttpService = struct {
         return self.catalog_epoch.load(.acquire);
     }
 
-    fn catalogProjectionStore(ptr: *anyopaque) ?*metadata_storage.RaftApplyStore {
+    fn catalogProjectionCapture(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64,
+        deadline_ns: ?u64,
+    ) !metadata_storage.raft_apply_store.CatalogProjectionSnapshot {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
-        return self.projectedStore();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.captureCatalogProjection(alloc, metadata_group_id, deadline_ns);
     }
 
     fn metadataHttpServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {

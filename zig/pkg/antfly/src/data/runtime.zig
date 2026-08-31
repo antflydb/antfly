@@ -16679,13 +16679,23 @@ const RemoteMetadataSource = struct {
             deadline_ns,
             probe_interval_ns,
         );
-        while (platform_time.monotonicNs() < optimistic_deadline_ns) {
+        optimistic_loop: while (platform_time.monotonicNs() < optimistic_deadline_ns) {
             var snapshot = self.remoteRoutingSnapshotWithMode(optimistic_deadline_ns, false) catch |err| switch (err) {
                 error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => break,
                 else => return err,
             };
             defer remoteFreeRoutingSnapshot(self, &snapshot);
-            if (try antfly.public_api.table_catalog.routePlanFromSnapshot(alloc, snapshot, table_name, query)) |plan| {
+            const optimistic_plan = antfly.public_api.table_catalog.routePlanFromSnapshotUntil(
+                alloc,
+                snapshot,
+                table_name,
+                query,
+                optimistic_deadline_ns,
+            ) catch |err| switch (err) {
+                error.CatalogRoutingSnapshotTimeout => break :optimistic_loop,
+                else => return err,
+            };
+            if (optimistic_plan) |plan| {
                 return .{ .found = plan };
             }
             const now_ns = platform_time.monotonicNs();
@@ -16699,7 +16709,17 @@ const RemoteMetadataSource = struct {
             else => return err,
         };
         defer remoteFreeRoutingSnapshot(self, &authoritative);
-        if (try antfly.public_api.table_catalog.routePlanFromSnapshot(alloc, authoritative, table_name, query)) |plan| {
+        const authoritative_plan = antfly.public_api.table_catalog.routePlanFromSnapshotUntil(
+            alloc,
+            authoritative,
+            table_name,
+            query,
+            deadline_ns,
+        ) catch |err| switch (err) {
+            error.CatalogRoutingSnapshotTimeout => return .timed_out,
+            else => return err,
+        };
+        if (authoritative_plan) |plan| {
             return .{ .found = plan };
         }
         return .publication_not_observed;

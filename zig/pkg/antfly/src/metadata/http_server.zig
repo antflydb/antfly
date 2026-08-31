@@ -1542,14 +1542,21 @@ pub const MetadataHttpServer = struct {
                 else => return metadataReadError(ctx, err),
             };
             const token = snapshot.change_token;
-            var local_plan = api_table_catalog.routePlanFromSnapshot(
+            var local_plan = api_table_catalog.routePlanFromSnapshotUntil(
                 ctx.allocator,
                 snapshot,
                 parsed.value.query.table_name,
                 query,
-            ) catch |err| {
-                self.source.freeRoutingSnapshot(&snapshot);
-                return metadataReadError(ctx, err);
+                deadline_ns,
+            ) catch |err| switch (err) {
+                error.CatalogRoutingSnapshotTimeout => {
+                    self.source.freeRoutingSnapshot(&snapshot);
+                    return self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{ .disposition = .timed_out });
+                },
+                else => {
+                    self.source.freeRoutingSnapshot(&snapshot);
+                    return metadataReadError(ctx, err);
+                },
             };
             self.source.freeRoutingSnapshot(&snapshot);
             if (local_plan) |*plan| {

@@ -26,6 +26,29 @@ const platform_time = @import("antfly_platform").time;
 const raft_reconciler = @import("../raft/reconciler.zig");
 const tables_api = @import("tables.zig");
 
+/// One absolute monotonic budget shared by snapshot capture and all CPU-side
+/// routing work that follows it. The periodic checkpoint keeps large catalog
+/// scans interruptible without putting a clock read on every range.
+pub const RoutingBudget = struct {
+    deadline_ns: ?u64 = null,
+
+    const checkpoint_stride: usize = 64;
+
+    pub fn init(deadline_ns: ?u64) RoutingBudget {
+        return .{ .deadline_ns = deadline_ns };
+    }
+
+    pub fn checkpoint(self: RoutingBudget) !void {
+        if (self.deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
+    }
+
+    pub fn checkpointIndex(self: RoutingBudget, index: usize) !void {
+        if (index % checkpoint_stride == 0) try self.checkpoint();
+    }
+};
+
 pub const CatalogSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -253,7 +276,7 @@ pub const RoutingSession = struct {
         deadline_ns: ?u64,
     ) !RoutingSession {
         const routing = try base.routingSource();
-        return try initOwned(alloc, base, try routing.linearizableSnapshot(deadline_ns), true);
+        return try initOwned(alloc, base, try routing.linearizableSnapshot(deadline_ns), true, RoutingBudget.init(deadline_ns));
     }
 
     /// Use the cached/eventual projection for positive routes. Misses are
@@ -265,16 +288,18 @@ pub const RoutingSession = struct {
         query: RouteQuery,
         deadline_ns: ?u64,
     ) !RoutingSession {
+        const budget = RoutingBudget.init(deadline_ns);
+        try budget.checkpoint();
         const routing = try base.routingSource();
         var snapshot = try routing.eventualSnapshot(deadline_ns);
-        const candidate = routePlanFromSnapshot(alloc, snapshot.value, table_name, query) catch |err| {
+        const candidate = routePlanFromSnapshotWithBudget(alloc, snapshot.value, table_name, query, budget) catch |err| {
             snapshot.deinit();
             return err;
         };
         if (candidate) |plan_value| {
             var plan = plan_value;
             plan.deinit(alloc);
-            return try initOwned(alloc, base, snapshot, false);
+            return try initOwned(alloc, base, snapshot, false, budget);
         }
         snapshot.deinit();
         return try initOwned(
@@ -282,6 +307,7 @@ pub const RoutingSession = struct {
             base,
             try routing.linearizableSnapshot(deadline_ns),
             true,
+            budget,
         );
     }
 
@@ -290,7 +316,9 @@ pub const RoutingSession = struct {
         base: CatalogSource,
         snapshot_value: OwnedRoutingSnapshot,
         authoritative: bool,
+        budget: RoutingBudget,
     ) !RoutingSession {
+        try budget.checkpoint();
         var snapshot = snapshot_value;
         errdefer snapshot.deinit();
         var self: RoutingSession = .{
@@ -310,12 +338,14 @@ pub const RoutingSession = struct {
         try self.group_indexes.ensureTotalCapacity(alloc, @intCast(snapshot.value.ranges.len));
         try self.topology_epochs.ensureTotalCapacity(alloc, @intCast(snapshot.value.tables.len));
         for (snapshot.value.tables, 0..) |table, index| {
+            try budget.checkpointIndex(index);
             if (self.table_indexes.contains(table.name)) return error.InvalidCatalogProjection;
             if (self.table_id_indexes.contains(table.table_id)) return error.InvalidCatalogProjection;
             self.table_indexes.putAssumeCapacity(table.name, index);
             self.table_id_indexes.putAssumeCapacity(table.table_id, index);
         }
         for (snapshot.value.ranges, 0..) |range, index| {
+            try budget.checkpointIndex(index);
             if (!self.table_id_indexes.contains(range.table_id)) return error.InvalidCatalogProjection;
             if (self.group_indexes.contains(range.group_id)) return error.InvalidCatalogProjection;
             self.group_indexes.putAssumeCapacity(range.group_id, index);
@@ -325,7 +355,10 @@ pub const RoutingSession = struct {
         // multi-tenant catalogs.
         const range_refs = try alloc.alloc(*const metadata_table_manager.RangeRecord, snapshot.value.ranges.len);
         defer alloc.free(range_refs);
-        for (snapshot.value.ranges, range_refs) |*range, *ref| ref.* = range;
+        for (snapshot.value.ranges, range_refs, 0..) |*range, *ref, index| {
+            try budget.checkpointIndex(index);
+            ref.* = range;
+        }
         std.sort.pdq(*const metadata_table_manager.RangeRecord, range_refs, {}, struct {
             fn lessThan(_: void, a: *const metadata_table_manager.RangeRecord, b: *const metadata_table_manager.RangeRecord) bool {
                 if (a.table_id != b.table_id) return a.table_id < b.table_id;
@@ -339,25 +372,31 @@ pub const RoutingSession = struct {
                 };
             }
         }.lessThan);
+        // The standard sort is not fallible, so check immediately afterward
+        // and never expose a successfully routed request past its deadline.
+        try budget.checkpoint();
         var first: usize = 0;
         while (first < range_refs.len) {
+            try budget.checkpointIndex(first);
             var end = first + 1;
             while (end < range_refs.len and range_refs[end].table_id == range_refs[first].table_id) : (end += 1) {}
             const table_id = range_refs[first].table_id;
             const table_index = self.table_id_indexes.get(table_id) orelse return error.InvalidCatalogProjection;
             self.topology_epochs.putAssumeCapacity(
                 table_id,
-                topologyEpochFromSortedRanges(snapshot.value.tables[table_index], range_refs[first..end]),
+                try topologyEpochFromSortedRangesWithBudget(snapshot.value.tables[table_index], range_refs[first..end], budget),
             );
             first = end;
         }
-        for (snapshot.value.tables) |table| {
+        for (snapshot.value.tables, 0..) |table, index| {
+            try budget.checkpointIndex(index);
             if (self.topology_epochs.contains(table.table_id)) continue;
             self.topology_epochs.putAssumeCapacity(
                 table.table_id,
                 topologyEpochFromSortedRanges(table, &.{}),
             );
         }
+        try budget.checkpoint();
         // Ownership moved into self; keep the errdefer from releasing it.
         snapshot = undefined;
         return self;
@@ -487,7 +526,12 @@ pub const RoutingSession = struct {
         if (deadline_ns) |deadline| {
             if (platform_time.monotonicNs() >= deadline) return .timed_out;
         }
-        if (try routePlanFromSnapshot(alloc, self.snapshot.value, table_name, query)) |plan|
+        const budget = RoutingBudget.init(deadline_ns);
+        const resolved = routePlanFromSnapshotWithBudget(alloc, self.snapshot.value, table_name, query, budget) catch |err| switch (err) {
+            error.CatalogRoutingSnapshotTimeout => return .timed_out,
+            else => return err,
+        };
+        if (resolved) |plan|
             return .{ .found = plan };
         if (self.authoritative) return .not_found;
         return error.CatalogProjectionRefreshRequired;
@@ -1216,11 +1260,21 @@ fn topologyEpochFromSortedRanges(
     table: metadata_table_manager.TableRecord,
     ranges: []const *const metadata_table_manager.RangeRecord,
 ) u64 {
+    return topologyEpochFromSortedRangesWithBudget(table, ranges, .{}) catch unreachable;
+}
+
+fn topologyEpochFromSortedRangesWithBudget(
+    table: metadata_table_manager.TableRecord,
+    ranges: []const *const metadata_table_manager.RangeRecord,
+    budget: RoutingBudget,
+) !u64 {
+    try budget.checkpoint();
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(table.name);
     hasher.update(std.mem.asBytes(&table.table_id));
     hasher.update(std.mem.asBytes(&@as(u64, @intCast(ranges.len))));
-    for (ranges) |range| {
+    for (ranges, 0..) |range, index| {
+        try budget.checkpointIndex(index);
         hasher.update(std.mem.asBytes(&range.group_id));
         hasher.update(std.mem.asBytes(&range.range_id));
         const identity_shard_id = metadata_table_manager.rangeDocIdentityShardId(range.*);
@@ -1235,6 +1289,7 @@ fn topologyEpochFromSortedRanges(
             hasher.update(&[_]u8{0});
         }
     }
+    try budget.checkpoint();
     return hasher.final();
 }
 
@@ -1655,6 +1710,23 @@ fn findTableByName(
     return null;
 }
 
+fn findTableByNameWithBudget(
+    tables: []const metadata_table_manager.TableRecord,
+    table_name: []const u8,
+    budget: RoutingBudget,
+) !?*const metadata_table_manager.TableRecord {
+    try budget.checkpoint();
+    for (tables, 0..) |*table, index| {
+        try budget.checkpointIndex(index);
+        if (std.mem.eql(u8, table.name, table_name)) {
+            try budget.checkpoint();
+            return table;
+        }
+    }
+    try budget.checkpoint();
+    return null;
+}
+
 fn findTableById(
     tables: []const metadata_table_manager.TableRecord,
     table_id: u64,
@@ -1670,17 +1742,32 @@ fn listTableRanges(
     catalog_ranges: []const metadata_table_manager.RangeRecord,
     table_id: u64,
 ) ![]const *const metadata_table_manager.RangeRecord {
+    return try listTableRangesWithBudget(alloc, catalog_ranges, table_id, .{});
+}
+
+fn listTableRangesWithBudget(
+    alloc: std.mem.Allocator,
+    catalog_ranges: []const metadata_table_manager.RangeRecord,
+    table_id: u64,
+    budget: RoutingBudget,
+) ![]const *const metadata_table_manager.RangeRecord {
+    try budget.checkpoint();
     var count: usize = 0;
-    for (catalog_ranges) |range| {
+    for (catalog_ranges, 0..) |range, range_index| {
+        try budget.checkpointIndex(range_index);
         if (range.table_id == table_id) count += 1;
     }
+    try budget.checkpoint();
     const ranges = try alloc.alloc(*const metadata_table_manager.RangeRecord, count);
+    errdefer alloc.free(ranges);
     var index: usize = 0;
-    for (catalog_ranges) |*range| {
+    for (catalog_ranges, 0..) |*range, range_index| {
+        try budget.checkpointIndex(range_index);
         if (range.table_id != table_id) continue;
         ranges[index] = range;
         index += 1;
     }
+    try budget.checkpoint();
     return ranges;
 }
 
@@ -1873,7 +1960,12 @@ fn resolveRouteObserved(
         else => return err,
     };
     defer eventual.deinit();
-    if (try routePlanFromSnapshot(alloc, eventual.value, table_name, query)) |plan| {
+    const budget = RoutingBudget.init(deadline_ns);
+    const eventual_plan = routePlanFromSnapshotWithBudget(alloc, eventual.value, table_name, query, budget) catch |err| switch (err) {
+        error.CatalogRoutingSnapshotTimeout => return .timed_out,
+        else => return err,
+    };
+    if (eventual_plan) |plan| {
         return .{ .found = plan };
     }
 
@@ -1882,7 +1974,11 @@ fn resolveRouteObserved(
         else => return err,
     };
     defer authoritative.deinit();
-    if (try routePlanFromSnapshot(alloc, authoritative.value, table_name, query)) |plan| {
+    const authoritative_plan = routePlanFromSnapshotWithBudget(alloc, authoritative.value, table_name, query, budget) catch |err| switch (err) {
+        error.CatalogRoutingSnapshotTimeout => return .timed_out,
+        else => return err,
+    };
+    if (authoritative_plan) |plan| {
         return .{ .found = plan };
     }
     return .{ .not_found = authoritative.value.change_token };
@@ -1949,14 +2045,43 @@ pub fn routePlanFromSnapshot(
     table_name: []const u8,
     query: RouteQuery,
 ) !?CatalogRoutePlan {
-    const table = findTableByName(snapshot.tables, table_name) orelse return null;
-    const ranges = try listTableRanges(alloc, snapshot.ranges, table.table_id);
+    return try routePlanFromSnapshotWithBudget(alloc, snapshot, table_name, query, .{});
+}
+
+pub fn routePlanFromSnapshotUntil(
+    alloc: std.mem.Allocator,
+    snapshot: metadata_api.CatalogRoutingSnapshot,
+    table_name: []const u8,
+    query: RouteQuery,
+    deadline_ns: ?u64,
+) !?CatalogRoutePlan {
+    return try routePlanFromSnapshotWithBudget(
+        alloc,
+        snapshot,
+        table_name,
+        query,
+        RoutingBudget.init(deadline_ns),
+    );
+}
+
+fn routePlanFromSnapshotWithBudget(
+    alloc: std.mem.Allocator,
+    snapshot: metadata_api.CatalogRoutingSnapshot,
+    table_name: []const u8,
+    query: RouteQuery,
+    budget: RoutingBudget,
+) !?CatalogRoutePlan {
+    try budget.checkpoint();
+    const table = (try findTableByNameWithBudget(snapshot.tables, table_name, budget)) orelse return null;
+    const ranges = try listTableRangesWithBudget(alloc, snapshot.ranges, table.table_id, budget);
     defer metadata_admin.freeRangeRefs(alloc, ranges);
 
     sortRangeRefs(ranges);
+    try budget.checkpoint();
     var groups = std.ArrayListUnmanaged(CatalogGroupRoute).empty;
     defer groups.deinit(alloc);
-    for (ranges) |range| {
+    for (ranges, 0..) |range, index| {
+        try budget.checkpointIndex(index);
         const selected = switch (query) {
             .table => false,
             .all_ranges => true,
@@ -1980,15 +2105,48 @@ pub fn routePlanFromSnapshot(
         .table => false,
         else => true,
     };
-    if (groups.items.len == 0 and requires_route) return null;
+    if (groups.items.len == 0 and requires_route) {
+        try budget.checkpoint();
+        return null;
+    }
+    const topology_epoch = try topologyEpochFromSortedRangesWithBudget(table.*, ranges, budget);
+    const owned_groups = try groups.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_groups);
+    try budget.checkpoint();
     return .{
         .metadata_group_id = snapshot.metadata_group_id,
         .metadata_incarnation = snapshot.metadata_incarnation,
         .catalog_revision = snapshot.catalog_revision,
         .table_id = table.table_id,
-        .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
-        .groups = try groups.toOwnedSlice(alloc),
+        .topology_epoch = topology_epoch,
+        .groups = owned_groups,
     };
+}
+
+test "route planning never succeeds after its absolute deadline" {
+    var tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
+    var ranges = [_]metadata_table_manager.RangeRecord{.{
+        .table_id = 7,
+        .group_id = 7001,
+        .range_id = 71,
+        .start_key = "",
+    }};
+    const snapshot = metadata_api.CatalogRoutingSnapshot{
+        .metadata_group_id = 3,
+        .catalog_revision = 18,
+        .tables = tables[0..],
+        .ranges = ranges[0..],
+    };
+    try std.testing.expectError(
+        error.CatalogRoutingSnapshotTimeout,
+        routePlanFromSnapshotUntil(
+            std.testing.allocator,
+            snapshot,
+            "docs",
+            .all_ranges,
+            1,
+        ),
+    );
 }
 
 pub const RoutedSpanSnapshot = struct {
