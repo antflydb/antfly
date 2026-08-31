@@ -196,7 +196,7 @@ pub const CatalogProjectionReader = struct {
         errdefer alloc.free(tables);
         tables[0] = try metadata_table_manager.cloneRoutingTable(alloc, table);
         errdefer metadata_table_manager.freeTable(alloc, tables[0]);
-        const span = snapshot.table_range_spans.get(table.table_id) orelse .{ .start = 0, .len = 0 };
+        const span = snapshot.table_range_spans.get(table.table_id) orelse Snapshot.RangeSpan{ .start = 0, .len = 0 };
         const table_ranges = snapshot.ranges[span.start..][0..span.len];
         const ranges = try alloc.alloc(metadata_table_manager.RangeRecord, table_ranges.len);
         var cloned: usize = 0;
