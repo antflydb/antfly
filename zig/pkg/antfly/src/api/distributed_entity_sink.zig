@@ -76,7 +76,7 @@ pub const DistributedEntitySink = struct {
         const a = arena.allocator();
 
         // Group merge transforms by table (one TableCommitRequest per table;
-        // commitTransaction routes each key to its group and commits atomically).
+        // commitBatch routes each key and chooses one-shard or 2PC atomically).
         var tables = std.ArrayListUnmanaged([]const u8).empty;
         var table_ops = std.ArrayListUnmanaged(std.ArrayListUnmanaged(db_mod.types.DocumentTransform)).empty;
         for (entries) |e| {
@@ -459,7 +459,7 @@ test "DistributedEntitySink transactional mode falls back to batch when unsuppor
         \\{"entity_type":"person","canonical_name":"Ada Lovelace","aliases":["Ada Lovelace"]}
     );
 
-    // commitTransaction returned null (unwired) -> fell back to batch, still wrote.
+    // No atomic commit callback was wired, so the plain table batch still ran.
     try testing.expectEqual(@as(usize, 0), fake.commit_calls);
     try testing.expectEqual(@as(usize, 1), fake.keys.items.len);
 }
