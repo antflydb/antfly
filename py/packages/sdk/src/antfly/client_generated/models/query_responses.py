@@ -17,7 +17,7 @@ T = TypeVar("T", bound="QueryResponses")
 
 @_attrs_define
 class QueryResponses:
-    """Responses from multiple query operations.
+    """Canonical responses from multiple query operations.
 
     Attributes:
         responses (list[QueryResult] | Unset):

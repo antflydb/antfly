@@ -24,8 +24,10 @@ class Edge:
     Attributes:
         source (str): Base64-encoded source document key
         target (str): Base64-encoded target document key
-        type_ (str): Edge type (e.g., "cites", "similar_to", "authored_by")
-        weight (float): Edge weight/confidence (0.0 to 1.0)
+        type_ (str): Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is
+            the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit.
+        weight (float): Finite non-negative edge cost or confidence. The max_weight_product path objective additionally
+            requires values in [0,1].
         created_at (datetime.datetime | Unset): When the edge was created
         updated_at (datetime.datetime | Unset): When the edge was last updated
         metadata (EdgeMetadata | Unset): Optional edge metadata

@@ -63,7 +63,8 @@ export function ConnectionStatusBanner() {
     </>
   ) : (
     <>
-      Checking <code>{inferenceTarget}</code>. Run <code>./antfly standalone</code> or update Settings.
+      Checking <code>{inferenceTarget}</code>. Run <code>./antfly standalone</code> or update
+      Settings.
     </>
   );
 

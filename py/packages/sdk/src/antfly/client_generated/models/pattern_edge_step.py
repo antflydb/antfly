@@ -14,18 +14,19 @@ T = TypeVar("T", bound="PatternEdgeStep")
 
 @_attrs_define
 class PatternEdgeStep:
-    """Edge constraints in a pattern step
+    """Deprecated linear graph_searches pattern edge.
 
     Attributes:
-        types (list[str] | Unset): Edge types to traverse (empty = any)
+        types (list[str] | Unset): Empty or omitted matches every edge type; otherwise at most 64 unique types totaling
+            at most 64 KiB.
         direction (EdgeDirection | Unset): Direction of edges to query:
             - out: Outgoing edges from the node
             - in: Incoming edges to the node
             - both: Both outgoing and incoming edges
-        min_hops (int | Unset): Minimum number of hops (1 = direct edge) Default: 1.
-        max_hops (int | Unset): Maximum number of hops (>1 = variable-length path) Default: 1.
-        min_weight (float | Unset): Minimum edge weight filter
-        max_weight (float | Unset): Maximum edge weight filter
+        min_hops (int | Unset):  Default: 1.
+        max_hops (int | Unset):  Default: 1.
+        min_weight (float | Unset):
+        max_weight (float | Unset):
     """
 
     types: list[str] | Unset = UNSET

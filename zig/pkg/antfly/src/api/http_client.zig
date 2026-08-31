@@ -98,13 +98,15 @@ pub const TxnPreDecisionOutcome = enum {
 };
 
 pub const QueryResponse = struct {
+    owner_allocator: ?std.mem.Allocator = null,
     content_type: ?[]u8 = null,
     identity_read_generation: ?u64 = null,
     body: []u8,
 
     pub fn deinit(self: *QueryResponse, alloc: std.mem.Allocator) void {
-        if (self.content_type) |content_type| alloc.free(content_type);
-        alloc.free(self.body);
+        const owner = self.owner_allocator orelse alloc;
+        if (self.content_type) |content_type| owner.free(content_type);
+        if (self.body.len > 0) owner.free(self.body);
         self.* = undefined;
     }
 };
@@ -796,10 +798,14 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         if (resp.status != 200) return error.UnexpectedHttpStatus;
-        return .{
-            .content_type = if (resp.content_type) |content_type| try self.alloc.dupe(u8, content_type) else null,
-            .body = try self.alloc.dupe(u8, resp.body),
+        const response = QueryResponse{
+            .owner_allocator = resp.owner_allocator orelse self.alloc,
+            .content_type = resp.content_type,
+            .body = resp.body,
         };
+        resp.content_type = null;
+        resp.body = &.{};
+        return response;
     }
 
     pub fn fetchRetrievalAgent(
@@ -869,10 +875,13 @@ pub const ApiHttpClient = struct {
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
-        return .{
+        const response = QueryResponse{
+            .owner_allocator = resp.owner_allocator orelse self.alloc,
             .identity_read_generation = try parseIdentityReadGenerationHeader(resp),
-            .body = try self.alloc.dupe(u8, resp.body),
+            .body = resp.body,
         };
+        resp.body = &.{};
+        return response;
     }
 
     pub fn fetchGroupQueryPreflight(
@@ -1473,6 +1482,7 @@ pub const ApiHttpClient = struct {
             408 => return error.Timeout,
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
+            422 => return remoteGraphEdgesError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
@@ -3244,6 +3254,15 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
     return error.UnexpectedHttpStatus;
 }
 
+fn remoteGraphEdgesError(body: []const u8) anyerror {
+    const message = std.mem.trim(u8, body, " \t\r\n");
+    if (std.mem.eql(u8, message, "graph explored edges budget exceeded"))
+        return error.GraphExploredEdgesBudgetExceeded;
+    if (std.mem.eql(u8, message, "graph explored edge bytes budget exceeded"))
+        return error.GraphExploredEdgeBytesBudgetExceeded;
+    return error.UnexpectedHttpStatus;
+}
+
 fn remotePublicBatchError(status: u16, body: []const u8) anyerror {
     const message = std.mem.trim(u8, body, " \t\r\n");
     switch (status) {
@@ -3319,6 +3338,21 @@ test "api http client preserves remote storage read contention" {
     );
 }
 
+test "api http client preserves remote graph edge budget exhaustion" {
+    try std.testing.expectEqual(
+        error.GraphExploredEdgesBudgetExceeded,
+        remoteGraphEdgesError("graph explored edges budget exceeded\n"),
+    );
+    try std.testing.expectEqual(
+        error.GraphExploredEdgeBytesBudgetExceeded,
+        remoteGraphEdgesError("graph explored edge bytes budget exceeded\n"),
+    );
+    try std.testing.expectEqual(
+        error.UnexpectedHttpStatus,
+        remoteGraphEdgesError("invalid graph edge request"),
+    );
+}
+
 test "api http client preserves storage read contention across group read endpoints" {
     const UnavailableExecutor = struct {
         fn executor(self: *@This()) http_common.RequestExecutor {
@@ -3349,6 +3383,41 @@ test "api http client preserves storage read contention across group read endpoi
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupGraphHydrate(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupGraphEdges(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
+}
+
+test "api http client transfers query response buffers without copying" {
+    const TransferExecutor = struct {
+        body_address: usize = 0,
+        content_type_address: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const body = try alloc.dupe(u8, "{\"responses\":[]}");
+            const content_type = try alloc.dupe(u8, "application/json");
+            self.body_address = @intFromPtr(body.ptr);
+            self.content_type_address = @intFromPtr(content_type.ptr);
+            return .{
+                .status = 200,
+                .content_type = content_type,
+                .body = body,
+            };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var executor = TransferExecutor{};
+    var client = ApiHttpClient.init(alloc, executor.executor());
+    var response = try client.fetchQuery("http://127.0.0.1:1", "docs", "{}");
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(executor.body_address, @intFromPtr(response.body.ptr));
+    try std.testing.expectEqual(
+        executor.content_type_address,
+        @intFromPtr(response.content_type.?.ptr),
+    );
 }
 
 test "api http client accepts durable pending batch responses" {

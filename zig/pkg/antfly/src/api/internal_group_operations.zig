@@ -29,6 +29,9 @@ pub const Error = operation.ApiError || error{
     HierarchyCursorStale,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
+    QueryCandidateBudgetExceeded,
+    GraphExploredEdgesBudgetExceeded,
+    GraphExploredEdgeBytesBudgetExceeded,
     GroupLeaderUnavailable,
     PreDecisionDeadlineExceeded,
     TransactionPreDecisionOutcomeUnknown,
@@ -775,6 +778,8 @@ pub const Operations = struct {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
                 error.InvalidQueryRequest, error.IndexNotFound => error.InvalidArgument,
+                error.GraphExploredEdgesBudgetExceeded => error.GraphExploredEdgesBudgetExceeded,
+                error.GraphExploredEdgeBytesBudgetExceeded => error.GraphExploredEdgeBytesBudgetExceeded,
                 error.UnknownGroup, error.TableNotFound => error.NotFound,
                 else => error.Internal,
             };

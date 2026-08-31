@@ -175,8 +175,31 @@ func WithToken(token string) oapi.RequestEditorFn {
 type APIError struct {
 	// StatusCode is the HTTP status code returned by the server.
 	StatusCode int
-	// Message is the error message from the server.
+	// Code is the stable machine-readable error discriminator, when present.
+	Code string
+	// Message is the human-readable error message from the server.
 	Message string
+	// RawBody retains the bounded structured response for forward-compatible
+	// inspection when no more specific convenience error is available.
+	RawBody json.RawMessage
+}
+
+// GraphQueryError preserves one graph-specific 422 response as its selected
+// generated OpenAPI model. Callers can switch on Detail.Kind and inspect the
+// corresponding non-nil generated value without reparsing wire JSON.
+type GraphQueryError struct {
+	StatusCode int
+	Code       string
+	Message    string
+	Retryable  bool
+	Detail     oapi.DecodedGraphQueryError
+}
+
+func (e *GraphQueryError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return e.Code
 }
 
 // IndexMutationTemporarilyUnavailableError reports a retryable index creation
@@ -214,6 +237,24 @@ type HierarchyCursorStaleError struct {
 }
 
 func (e *HierarchyCursorStaleError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return e.Code
+}
+
+// TopologyChangedError reports that Antfly exhausted its bounded internal
+// topology retry. Retrying the complete query against fresh topology may
+// succeed; callers must not retry only a graph sub-operation.
+type TopologyChangedError struct {
+	StatusCode int
+	Code       string
+	Message    string
+	Action     string
+	Retryable  bool
+}
+
+func (e *TopologyChangedError) Error() string {
 	if e.Message != "" {
 		return e.Message
 	}
@@ -392,6 +433,19 @@ func readErrorResponse(resp *http.Response) error {
 				Retryable:      false,
 			}
 		}
+		if resp.StatusCode == http.StatusConflict &&
+			errResp.Status == http.StatusConflict &&
+			errResp.Error == "topology_changed" &&
+			errResp.Action == "retry_query" &&
+			errResp.Retryable != nil && *errResp.Retryable {
+			return &TopologyChangedError{
+				StatusCode: resp.StatusCode,
+				Code:       errResp.Error,
+				Message:    errResp.Message,
+				Action:     errResp.Action,
+				Retryable:  true,
+			}
+		}
 		if resp.StatusCode == http.StatusServiceUnavailable &&
 			errResp.Retryable != nil && *errResp.Retryable &&
 			isQueryTemporarilyUnavailableCode(errResp.Code) {
@@ -414,11 +468,38 @@ func readErrorResponse(resp *http.Response) error {
 				RetryAfterSeconds: queryRetryAfterSeconds(resp.Header),
 			}
 		}
+		if resp.StatusCode == http.StatusUnprocessableEntity && errResp.Error != "" {
+			var union oapi.QueryUnprocessableError
+			if err := json.Unmarshal(respBody, &union); err == nil {
+				if detail, err := union.DecodeStrictGraphError(); err == nil {
+					return &GraphQueryError{
+						StatusCode: resp.StatusCode,
+						Code:       errResp.Error,
+						Message:    errResp.Message,
+						Retryable:  errResp.Retryable != nil && *errResp.Retryable,
+						Detail:     detail,
+					}
+				}
+			}
+		}
 	}
-	if parsedStructuredError && errResp.Error != "" {
+	stableCode := errResp.Error
+	if stableCode == "" {
+		// Stateful Antfly historically used code for some error families. Keep
+		// that transport compatibility at the SDK boundary while exposing one
+		// canonical APIError.Code to callers.
+		stableCode = errResp.Code
+	}
+	if parsedStructuredError && stableCode != "" {
+		message := errResp.Message
+		if message == "" {
+			message = stableCode
+		}
 		return &APIError{
 			StatusCode: resp.StatusCode,
-			Message:    errResp.Error,
+			Code:       stableCode,
+			Message:    message,
+			RawBody:    respBody,
 		}
 	}
 

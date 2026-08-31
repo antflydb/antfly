@@ -2,7 +2,13 @@
  * Unit tests for the Antfly SDK client using Vitest
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ClusterStatus, CreateTableRequest, QueryRequest, TableStatus } from "../src/types.js";
+import type {
+  ClusterStatus,
+  CreateTableRequest,
+  QueryRequest,
+  TableQueryRequest,
+  TableStatus,
+} from "../src/types.js";
 
 // Mock openapi-fetch at the top level
 const mockGet = vi.fn();
@@ -206,7 +212,7 @@ describe("AntflyClient", () => {
         error: undefined,
       });
 
-      const request: QueryRequest = {
+      const request: TableQueryRequest = {
         table: "products",
         full_text_index: "product_text",
         full_text_search: {
@@ -351,7 +357,7 @@ describe("AntflyClient", () => {
         error: undefined,
       });
       const controller = new AbortController();
-      const request: QueryRequest = { limit: 3 };
+      const request: TableQueryRequest = { limit: 3 };
 
       await client.tables.query("products", request, { signal: controller.signal });
 
@@ -360,6 +366,22 @@ describe("AntflyClient", () => {
         body: request,
         signal: controller.signal,
       });
+    });
+
+    it("rejects a competing body table on table-scoped queries before transport", async () => {
+      const ambiguous = { table: "other", limit: 3 } as QueryRequest;
+
+      await expect(
+        client.tables.query("products", ambiguous as unknown as TableQueryRequest)
+      ).rejects.toThrow(
+        'request.table must be omitted; the route already selects table "products"'
+      );
+      await expect(
+        client.tables.multiquery("products", [ambiguous as unknown as TableQueryRequest])
+      ).rejects.toThrow(
+        'requests[0].table must be omitted; the route already selects table "products"'
+      );
+      expect(mockPost).not.toHaveBeenCalled();
     });
 
     it("formats table query Problem Details errors", async () => {
