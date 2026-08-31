@@ -1371,6 +1371,9 @@ pub const ShadingRun = struct {
     color_samples: [shading_color_sample_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_capacity,
     color_sample_positions: [shading_color_sample_capacity]f64 = [_]f64{0} ** shading_color_sample_capacity,
     color_sample_count: u8 = 0,
+    exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_discontinuity_capacity,
+    exact_boundary_positions: [shading_discontinuity_capacity]f64 = [_]f64{0} ** shading_discontinuity_capacity,
+    exact_boundary_count: u8 = 0,
     extend_start: bool = false,
     extend_end: bool = false,
 
@@ -2651,6 +2654,9 @@ const PageShading = struct {
     color_samples: [shading_color_sample_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_capacity,
     color_sample_positions: [shading_color_sample_capacity]f64 = [_]f64{0} ** shading_color_sample_capacity,
     color_sample_count: u8 = 0,
+    exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_discontinuity_capacity,
+    exact_boundary_positions: [shading_discontinuity_capacity]f64 = [_]f64{0} ** shading_discontinuity_capacity,
+    exact_boundary_count: u8 = 0,
     extend_start: bool = false,
     extend_end: bool = false,
 
@@ -7964,6 +7970,9 @@ pub const Reader = struct {
         }
         var discontinuities: [shading_discontinuity_capacity]f64 = undefined;
         var discontinuity_count: usize = 0;
+        var exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_discontinuity_capacity;
+        var exact_boundary_positions: [shading_discontinuity_capacity]f64 = [_]f64{0} ** shading_discontinuity_capacity;
+        var exact_boundary_count: usize = 0;
         try function.appendDiscontinuities(
             &discontinuities,
             &discontinuity_count,
@@ -7989,6 +7998,11 @@ pub const Reader = struct {
             const left_delta = @min(base_delta, (bound - previous) / 4.0);
             const right_delta = @min(base_delta, (next - bound) / 4.0);
             const position = (bound - shading_domain[0]) / (shading_domain[1] - shading_domain[0]);
+            var exact_values = [4]f64{ 0, 0, 0, 0 };
+            function.evaluate(std.math.clamp(bound, function_domain[0], function_domain[1]), exact_values[0..components]);
+            exact_boundary_colors[exact_boundary_count] = renderBaseColorSpaceComponents(.{ .kind = color_space_kind }, exact_values);
+            exact_boundary_positions[exact_boundary_count] = position;
+            exact_boundary_count += 1;
             sample_points[sample_count] = .{ .position = position, .input = bound - left_delta, .side = 0 };
             sample_count += 1;
             sample_points[sample_count] = .{ .position = position, .input = bound + right_delta, .side = 2 };
@@ -8033,6 +8047,9 @@ pub const Reader = struct {
             .color_samples = color_samples,
             .color_sample_positions = color_sample_positions,
             .color_sample_count = @intCast(sample_count),
+            .exact_boundary_colors = exact_boundary_colors,
+            .exact_boundary_positions = exact_boundary_positions,
+            .exact_boundary_count = @intCast(exact_boundary_count),
             .extend_start = if (extend) |arr| if (arr.len >= 1) switch (arr[0]) {
                 .boolean => |b| b,
                 else => false,
@@ -15992,6 +16009,9 @@ fn applyShadingOperator(
                 .color_samples = shadingColorSamplesWithAlpha(shading, state.fill_alpha),
                 .color_sample_positions = shading.color_sample_positions,
                 .color_sample_count = shading.color_sample_count,
+                .exact_boundary_colors = shadingExactBoundaryColorsWithAlpha(shading, state.fill_alpha),
+                .exact_boundary_positions = shading.exact_boundary_positions,
+                .exact_boundary_count = shading.exact_boundary_count,
                 .extend_start = shading.extend_start,
                 .extend_end = shading.extend_end,
             });
@@ -16409,6 +16429,9 @@ fn emitPatternShadingRun(
         .color_samples = shadingColorSamplesWithAlpha(shading, state.fill_alpha),
         .color_sample_positions = shading.color_sample_positions,
         .color_sample_count = shading.color_sample_count,
+        .exact_boundary_colors = shadingExactBoundaryColorsWithAlpha(shading, state.fill_alpha),
+        .exact_boundary_positions = shading.exact_boundary_positions,
+        .exact_boundary_count = shading.exact_boundary_count,
         .extend_start = shading.extend_start,
         .extend_end = shading.extend_end,
     });
@@ -17312,6 +17335,13 @@ fn shadingColorSamplesWithAlpha(shading: PageShading, alpha: u8) [shading_color_
     return samples;
 }
 
+fn shadingExactBoundaryColorsWithAlpha(shading: PageShading, alpha: u8) [shading_discontinuity_capacity][4]u8 {
+    var samples = shading.exact_boundary_colors;
+    for (samples[0..shading.exact_boundary_count]) |*color|
+        color.* = colorWithAlpha(color.*, alpha);
+    return samples;
+}
+
 fn findExtGState(gstates: []const PageExtGState, name: []const u8) ?PageExtGState {
     for (gstates) |gstate| {
         if (std.mem.eql(u8, gstate.name, name)) return gstate;
@@ -17806,6 +17836,9 @@ fn buildShadingPatternRunAlloc(
             .color_samples = shadingColorSamplesWithAlpha(shading, paint_alpha),
             .color_sample_positions = shading.color_sample_positions,
             .color_sample_count = shading.color_sample_count,
+            .exact_boundary_colors = shadingExactBoundaryColorsWithAlpha(shading, paint_alpha),
+            .exact_boundary_positions = shading.exact_boundary_positions,
+            .exact_boundary_count = shading.exact_boundary_count,
             .extend_start = shading.extend_start,
             .extend_end = shading.extend_end,
         },
@@ -24354,7 +24387,7 @@ test "nested stitching discontinuities remain reachable and unused shadings stay
         "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /Shading << /S 5 0 R /Unused 10 0 R >> >> /Contents 4 0 R >>\nendobj\n",
         "4 0 obj\n<< /Length 6 >>\nstream\n/S sh\nendstream\nendobj\n",
         "5 0 obj\n<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 10 0] /Function 6 0 R >>\nendobj\n",
-        "6 0 obj\n<< /FunctionType 3 /Domain [0 1] /Functions [7 0 R] /Bounds [] /Encode [0 1] >>\nendobj\n",
+        "6 0 obj\n<< /FunctionType 3 /Domain [0 1] /Functions [7 0 R] /Bounds [] /Encode [1 0] >>\nendobj\n",
         "7 0 obj\n<< /FunctionType 3 /Domain [0 1] /Functions [8 0 R 9 0 R] /Bounds [0.5] /Encode [0 1 0 1] >>\nendobj\n",
         "8 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 0 0] /N 1 >>\nendobj\n",
         "9 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 [0 0 1] /C1 [1 1 1] /N 1 >>\nendobj\n",
@@ -24382,9 +24415,15 @@ test "nested stitching discontinuities remain reachable and unused shadings stay
         }
     }
     const index = boundary_index orelse return error.TestExpectedEqual;
-    try std.testing.expect(runs[0].color_samples[index][0] > 0xf0);
-    try std.testing.expect(runs[0].color_samples[index][2] == 0);
-    try std.testing.expectEqual([4]u8{ 0, 0, 0xff, 0xff }, runs[0].color_samples[index + 1]);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0xff, 0xff }, runs[0].color_samples[index]);
+    try std.testing.expect(runs[0].color_samples[index + 1][0] > 0xf0);
+    try std.testing.expect(runs[0].color_samples[index + 1][2] == 0);
+    try std.testing.expectEqual(@as(u8, 1), runs[0].exact_boundary_count);
+    try std.testing.expectEqual(@as(f64, 0.5), runs[0].exact_boundary_positions[0]);
+    // The nested function chooses its right-hand child at equality. A reversed
+    // parent Encode maps that exact value to the root-left color, not the
+    // root-right interpolation sample.
+    try std.testing.expectEqual([4]u8{ 0, 0, 0xff, 0xff }, runs[0].exact_boundary_colors[0]);
 }
 
 test "default device color spaces remap abbreviated explicit and initial selections" {

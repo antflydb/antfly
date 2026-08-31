@@ -546,22 +546,36 @@ fn renderChildGroupAlloc(
     } else {
         @memcpy(child, target);
     }
-    try renderGroupChildrenAlloc(alloc, child, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout, cancellation, bilevel_sample_budget);
     if (nonisolated_boundary) {
+        // The backdrop and coverage passes must make identical source-sampling
+        // decisions or coverage can no longer be used to recover the group's
+        // premultiplied source. Give each pass the same half of the remaining
+        // allowance, then debit their actual combined consumption. This keeps
+        // nested groups bounded, deterministic, and correct under exhaustion.
+        const paired_budget_start = bilevel_sample_budget.remaining_samples;
+        const pass_allowance = paired_budget_start / 2;
+        var color_budget = BilevelSampleBudget{ .remaining_samples = pass_allowance };
+        var coverage_budget = BilevelSampleBudget{ .remaining_samples = pass_allowance };
+        defer {
+            const color_consumed = pass_allowance - color_budget.remaining_samples;
+            const coverage_consumed = pass_allowance - coverage_budget.remaining_samples;
+            bilevel_sample_budget.remaining_samples = paired_budget_start - color_consumed - coverage_consumed;
+        }
+        try renderGroupChildrenAlloc(alloc, child, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout, cancellation, &color_budget);
         // A non-isolated group must see the real backdrop while its children
         // blend. Render its coverage independently, then remove the backdrop
         // contribution from the result before applying boundary alpha/blend.
         const coverage = try alloc.alloc(u8, width * height * 4);
         defer alloc.free(coverage);
         @memset(coverage, 0);
-        // Coverage is real render work. Keep it on the shared page budget so a
-        // group boundary cannot reset the bounded source-sampling allowance;
-        // nested groups therefore remain bounded as well.
-        try renderGroupChildrenAlloc(alloc, coverage, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout, cancellation, bilevel_sample_budget);
+        try renderGroupChildrenAlloc(alloc, coverage, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout, cancellation, &coverage_budget);
         try compositeNonisolatedGroupCanvasModeCancelable(target, child, coverage, meta.alpha, meta.blend_mode, cancellation);
-    } else if (meta.isolated) {
-        try compositeGroupCanvasModeCancelable(target, child, meta.alpha, meta.blend_mode, cancellation);
     } else {
+        try renderGroupChildrenAlloc(alloc, child, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout, cancellation, bilevel_sample_budget);
+    }
+    if (meta.isolated) {
+        try compositeGroupCanvasModeCancelable(target, child, meta.alpha, meta.blend_mode, cancellation);
+    } else if (!nonisolated_boundary) {
         try copyCanvasCancelable(target, child, width, height, cancellation);
     }
 }
@@ -1563,13 +1577,26 @@ fn drawShadingRunCancelable(canvas: []u8, canvas_w: usize, canvas_h: usize, min_
 }
 
 fn shadingColorAt(run: reader.ShadingRun, t: f64) [4]u8 {
-    if (run.color_sample_count < 2) return lerpColor(run.c0, run.c1, t);
-    const count: usize = run.color_sample_count;
     const position = std.math.clamp(t, 0.0, 1.0);
+    const exact_boundary_count: usize = run.exact_boundary_count;
+    var boundary_lower: usize = 0;
+    var boundary_upper: usize = exact_boundary_count;
+    while (boundary_lower < boundary_upper) {
+        const middle = boundary_lower + (boundary_upper - boundary_lower) / 2;
+        if (run.exact_boundary_positions[middle] < position)
+            boundary_lower = middle + 1
+        else
+            boundary_upper = middle;
+    }
+    if (boundary_lower < exact_boundary_count and
+        run.exact_boundary_positions[boundary_lower] == position)
+        return run.exact_boundary_colors[boundary_lower];
+    if (run.color_sample_count < 2) return lerpColor(run.c0, run.c1, position);
+    const count: usize = run.color_sample_count;
     var lower: usize = 0;
-    // Advance across equal-position samples so an exact stitching boundary
-    // selects its right-hand function, while interpolation approaching it
-    // terminates at the left-hand sample.
+    // Advance across equal-position samples so interpolation on the right of
+    // a stitching boundary starts at its right-hand limit. Exact boundary
+    // values were handled by the dedicated table above.
     while (lower + 1 < count and run.color_sample_positions[lower + 1] <= position) : (lower += 1) {}
     if (lower + 1 >= count) return run.color_samples[count - 1];
     const upper = lower + 1;
@@ -2858,7 +2885,11 @@ test "non-isolated group boundary removes backdrop before applying alpha" {
 
 test "non-isolated coverage rendering consumes the shared bilevel budget" {
     const alloc = std.testing.allocator;
-    var pixels = [_]u8{ 0, 0, 0, 0xff } ** 8;
+    var pixels = [_]u8{0} ** (8 * 4);
+    for (0..8) |index| {
+        pixels[index * 4] = 0xff;
+        pixels[index * 4 + 3] = if (index == 0 or index == 2 or index == 5 or index == 7) 0xff else 0;
+    }
     const images = [_]reader.ImageRun{.{
         .rgba = &pixels,
         .width = 8,
@@ -2879,7 +2910,24 @@ test "non-isolated coverage rendering consumes the shared bilevel budget" {
         .draw_width = 1,
         .draw_height = 1,
     }};
-    var budget = BilevelSampleBudget{ .remaining_samples = 16 };
+    var reference = [_]u8{0} ** 4;
+    var reference_budget = BilevelSampleBudget{ .remaining_samples = 4 };
+    try drawImageRunCancelable(&reference, 1, 1, 0, 0, 1, images[0], .{}, &reference_budget);
+    var expected = [_]u8{ 0, 0, 0xff, 0xff };
+    var source = reference;
+    source[3] = @intCast((@as(u16, source[3]) * 0x80 + 127) / 255);
+    blendPixelMode(&expected, 0, source, .normal);
+
+    var shape_points = [_][2]f64{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
+    const shapes = [_]reader.ShapeRun{.{
+        .kind = .fill,
+        .paint_order = 0,
+        .color = .{ 0, 0, 0xff, 0xff },
+        .stroke_width = 0,
+        .closed = true,
+        .points = &shape_points,
+    }};
+    var budget = BilevelSampleBudget{ .remaining_samples = 8 };
     const raw = try renderPageContentRgbaInBoxAllocWithBudget(
         alloc,
         .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
@@ -2887,13 +2935,14 @@ test "non-isolated coverage rendering consumes the shared bilevel budget" {
         &images,
         &.{},
         &.{},
-        &.{},
+        &shapes,
         .{},
         &budget,
         .opaque_white,
     );
     defer alloc.free(raw.rgba);
     try std.testing.expectEqual(@as(u64, 0), budget.remaining_samples);
+    try std.testing.expectEqualSlices(u8, &expected, raw.rgba);
 }
 
 test "shading samples select the right side of a stitching discontinuity" {
@@ -2917,6 +2966,32 @@ test "shading samples select the right side of a stitching discontinuity" {
     try std.testing.expectEqual([4]u8{ 0, 0, 0xff, 0xff }, shadingColorAt(run, 0.5));
     const left = shadingColorAt(run, 0.499);
     try std.testing.expect(left[0] > 0xf0 and left[2] == 0);
+}
+
+test "shading samples preserve exact nested boundary color under reversed encode" {
+    var run = reader.ShadingRun{
+        .kind = .axial,
+        .x0 = 0,
+        .y0 = 0,
+        .x1 = 1,
+        .y1 = 0,
+        .c0 = .{ 0, 0, 0, 0xff },
+        .c1 = .{ 0xff, 0xff, 0xff, 0xff },
+        .color_sample_count = 4,
+        .exact_boundary_count = 1,
+    };
+    run.color_sample_positions[0..4].* = .{ 0, 0.5, 0.5, 1 };
+    run.color_samples[0..4].* = .{
+        .{ 0, 0, 0xff, 0xff },
+        .{ 0, 0, 0xff, 0xff },
+        .{ 0xff, 0, 0, 0xff },
+        .{ 0xff, 0, 0, 0xff },
+    };
+    run.exact_boundary_positions[0] = 0.5;
+    run.exact_boundary_colors[0] = .{ 0, 0, 0xff, 0xff };
+    try std.testing.expectEqual([4]u8{ 0, 0, 0xff, 0xff }, shadingColorAt(run, 0.5));
+    const right = shadingColorAt(run, 0.500001);
+    try std.testing.expect(right[0] > 0xf0 and right[2] == 0);
 }
 
 test "knockout groups remove prior sibling contribution before compositing" {
