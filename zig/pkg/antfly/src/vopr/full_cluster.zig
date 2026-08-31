@@ -8,7 +8,6 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const cache_budget = @import("../common/cache_budget.zig");
 const data_runtime = @import("../data/runtime.zig");
 const distributed_graph = @import("../api/distributed_graph.zig");
 const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
@@ -22,7 +21,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 48;
+    pub const version: u32 = 49;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -45,7 +44,7 @@ pub const Scenario = struct {
     const production_overlapping_faults_id = vopr.id.stable(name, "production-graph-overlapping-link-resource-faults-recover");
     const production_socket_pressure_id = vopr.id.stable(name, "production-listener-socket-pressure-recovers-during-split");
     const production_service_rate_id = vopr.id.stable(name, "production-service-rates-compose-and-heal");
-    const production_query_cache_service_rate_id = vopr.id.stable(name, "production-query-embedding-cache-service-rates-compose-and-heal");
+    const production_query_cache_service_rate_id = vopr.id.stable(name, "production-query-embedding-cache-deadline-owner-restart");
     const production_replication_backfill_id = vopr.id.stable(name, "production-replication-backfill-crosses-public-data-raft");
     const production_replication_schema_change_id = vopr.id.stable(name, "production-replication-schema-change-resumes-from-durable-status");
     const production_replication_owner_restart_id = vopr.id.stable(name, "production-replication-target-owner-restarts-and-resumes");
@@ -98,7 +97,7 @@ pub const Scenario = struct {
         .{ .id = production_overlapping_faults_id, .name = name ++ ".production-graph-overlapping-link-resource-faults-recover", .kind = .always },
         .{ .id = production_socket_pressure_id, .name = name ++ ".production-listener-socket-pressure-recovers-during-split", .kind = .always },
         .{ .id = production_service_rate_id, .name = name ++ ".production-service-rates-compose-and-heal", .kind = .always },
-        .{ .id = production_query_cache_service_rate_id, .name = name ++ ".production-query-embedding-cache-service-rates-compose-and-heal", .kind = .always },
+        .{ .id = production_query_cache_service_rate_id, .name = name ++ ".production-query-embedding-cache-deadline-owner-restart", .kind = .always },
         .{ .id = production_replication_backfill_id, .name = name ++ ".production-replication-backfill-crosses-public-data-raft", .kind = .always },
         .{ .id = production_replication_schema_change_id, .name = name ++ ".production-replication-schema-change-resumes-from-durable-status", .kind = .always },
         .{ .id = production_replication_owner_restart_id, .name = name ++ ".production-replication-target-owner-restarts-and-resumes", .kind = .always },
@@ -284,7 +283,7 @@ pub const Scenario = struct {
             vopr.id.stable(name, "production-data-plane-global-query-inflight-authorization-revocation"),
             vopr.id.stable(name, "production-data-plane-global-query-transport-failure"),
             vopr.id.stable(name, "production-data-plane-global-query-owner-restart"),
-            vopr.id.stable(name, "production-data-plane-query-embedding-cache-service-rate"),
+            vopr.id.stable(name, "production-data-plane-query-embedding-cache-deadline-owner-restart"),
             vopr.id.stable(name, "production-data-plane-replication-backfill-service-rate"),
             vopr.id.stable(name, "production-data-plane-replication-schema-change-service-rate"),
             vopr.id.stable(name, "production-data-plane-replication-owner-restart-service-rate"),
@@ -333,7 +332,7 @@ pub const Scenario = struct {
         name ++ ".production-data-plane-global-query-inflight-authorization-revocation",
         name ++ ".production-data-plane-global-query-transport-failure",
         name ++ ".production-data-plane-global-query-owner-restart",
-        name ++ ".production-data-plane-query-embedding-cache-service-rate",
+        name ++ ".production-data-plane-query-embedding-cache-deadline-owner-restart",
         name ++ ".production-data-plane-replication-backfill-service-rate",
         name ++ ".production-data-plane-replication-schema-change-service-rate",
         name ++ ".production-data-plane-replication-owner-restart-service-rate",
@@ -818,8 +817,6 @@ pub const Scenario = struct {
         serverless_service_rate_adapter: ServerlessServiceRateAdapter,
         query_cache_service_rate_adapter: QueryCacheServiceRateAdapter,
         replication_service_rate_adapter: ReplicationServiceRateAdapter,
-        query_cache_budget: cache_budget.CacheBudget,
-        query_cache: query_embedding_cache.QueryEmbeddingCache,
         replication: *replication_backfill_vopr.Scenario.Fixture,
         service_rates_enabled: bool = false,
         service_rates_healed: bool = false,
@@ -848,6 +845,17 @@ pub const Scenario = struct {
         query_cache_error_code: u64 = 0,
         query_cache_compute_calls: u64 = 0,
         query_cache_successful_results: u64 = 0,
+        query_cache_waiter_timed_out: bool = false,
+        query_cache_owner_restarted: bool = false,
+        query_cache_restart_empty: bool = false,
+        query_cache_durable_read: bool = false,
+        query_cache_restart_read_attempts: u64 = 0,
+        query_cache_restart_read_failures: u64 = 0,
+        query_cache_restart_read_error_code: u64 = 0,
+        query_cache_pre_restart_stats: query_embedding_cache.Stats = .{},
+        query_cache_post_restart_stats: query_embedding_cache.Stats = .{},
+        query_cache_pre_restart_budget_used: usize = 0,
+        query_cache_post_restart_budget_used: usize = 0,
         replication_pre_heal_done: bool = false,
         replication_done: bool = false,
         replication_sound: bool = false,
@@ -915,18 +923,6 @@ pub const Scenario = struct {
                 .port = try self.service_rate_model.port(self.sim.io(), service_nodes[0].id),
                 .healed = &self.service_rates_healed,
             };
-            const query_cache_charge = query_embedding_cache.QueryEmbeddingCache.entryChargeBytes(3);
-            self.query_cache_budget = cache_budget.CacheBudget.init(query_cache_charge * 2);
-            self.query_cache = query_embedding_cache.QueryEmbeddingCache.init(
-                fixture_alloc,
-                self.sim.io(),
-                .{
-                    .max_bytes = query_cache_charge * 2,
-                    .ttl_ns = std.math.maxInt(u64),
-                    .max_inflight = 1,
-                },
-            );
-            errdefer self.query_cache.deinit(&self.query_cache_budget);
             self.replication = try replication_backfill_vopr.Scenario.Fixture.initWithVoprIo(
                 fixture_alloc,
                 &self.sim,
@@ -957,6 +953,17 @@ pub const Scenario = struct {
             self.query_cache_error_code = 0;
             self.query_cache_compute_calls = 0;
             self.query_cache_successful_results = 0;
+            self.query_cache_waiter_timed_out = false;
+            self.query_cache_owner_restarted = false;
+            self.query_cache_restart_empty = false;
+            self.query_cache_durable_read = false;
+            self.query_cache_restart_read_attempts = 0;
+            self.query_cache_restart_read_failures = 0;
+            self.query_cache_restart_read_error_code = 0;
+            self.query_cache_pre_restart_stats = .{};
+            self.query_cache_post_restart_stats = .{};
+            self.query_cache_pre_restart_budget_used = 0;
+            self.query_cache_post_restart_budget_used = 0;
             self.replication_pre_heal_done = false;
             self.replication_done = false;
             self.replication_sound = false;
@@ -1011,7 +1018,6 @@ pub const Scenario = struct {
             self.replication.deinit();
             if (self.public_cluster) |fixture| fixture.deinit();
             if (self.production_cluster) |fixture| fixture.deinit();
-            self.query_cache.deinit(&self.query_cache_budget);
             self.service_rate_model.deinit();
             self.sim.deinit();
             std.debug.assert(self.fixture_allocator.deinit() == .ok);
@@ -1039,10 +1045,13 @@ pub const Scenario = struct {
             self.production_cluster.?.setWorkCostPorts(.{
                 .data = data_ports,
                 .graph = graph_ports,
+                .query_cache = .{
+                    self.query_cache_service_rate_adapter.iface(),
+                    null,
+                    null,
+                },
             });
             self.serverless.setWorkCostPort(self.serverless_service_rate_adapter.iface());
-            if (self.mode == .production_data_plane_query_embedding_cache_service_rate)
-                self.query_cache.setWorkCostPort(self.query_cache_service_rate_adapter.iface());
             if (self.mode.?.isReplicationBackfill())
                 self.replication.setWorkPermit(self.replication_service_rate_adapter.permit());
         }
@@ -1080,7 +1089,7 @@ pub const Scenario = struct {
                 self.serverless_service_rate_adapter.accounting.pre_heal_units > 0 and
                 (!query_cache_required or
                     (self.query_cache_service_rate_adapter.accounting.pre_heal_units == 4 and
-                        self.query_cache_service_rate_adapter.accounting.post_heal_units == 4 and
+                        self.query_cache_service_rate_adapter.accounting.post_heal_units == 10 and
                         self.queryCacheSound())) and
                 (!replication_required or
                     (self.replication_pre_heal_done and
@@ -1137,16 +1146,34 @@ pub const Scenario = struct {
 
         fn queryCacheSound(self: *State) bool {
             if (self.mode != .production_data_plane_query_embedding_cache_service_rate) return true;
-            const stats = self.query_cache.stats(&self.query_cache_budget);
-            const budget_stats = self.query_cache_budget.stats();
+            const pre = self.query_cache_pre_restart_stats;
+            const post = self.query_cache_post_restart_stats;
+            const entry_charge = query_embedding_cache.QueryEmbeddingCache.entryChargeBytes(3);
             return self.query_cache_done and self.query_cache_sound and
                 self.query_cache_error_code == 0 and
-                self.query_cache_compute_calls == 1 and
-                self.query_cache_successful_results == 3 and
-                stats.hits == 1 and stats.misses == 1 and
-                stats.coalesced_waiters == 1 and stats.producer_computations == 1 and
-                stats.inflight == 0 and stats.entries == 1 and
-                budget_stats.used_bytes == query_embedding_cache.QueryEmbeddingCache.entryChargeBytes(3);
+                self.query_cache_compute_calls == 2 and
+                self.query_cache_successful_results == 4 and
+                self.query_cache_waiter_timed_out and
+                self.query_cache_owner_restarted and
+                self.query_cache_restart_empty and
+                self.query_cache_durable_read and
+                self.query_cache_restart_read_attempts == 2 and
+                self.query_cache_restart_read_failures == 1 and
+                queryCacheReconnectErrorCodeSound(self.query_cache_restart_read_error_code) and
+                pre.hits == 1 and pre.misses == 1 and
+                pre.coalesced_waiters == 1 and pre.waiter_timeouts == 1 and
+                pre.producer_computations == 1 and pre.inflight == 0 and
+                pre.entries == 1 and pre.live_bytes == entry_charge and
+                self.query_cache_pre_restart_budget_used == entry_charge and
+                post.hits == 1 and post.misses == 1 and
+                post.coalesced_waiters == 0 and post.waiter_timeouts == 0 and
+                post.producer_computations == 1 and post.inflight == 0 and
+                post.entries == 1 and post.live_bytes == entry_charge and
+                self.query_cache_post_restart_budget_used == entry_charge;
+        }
+
+        fn nowNs(self: *State) u64 {
+            return @intCast(@max(std.Io.Timestamp.now(self.sim.io(), .awake).toNanoseconds(), 0));
         }
 
         fn computeQueryEmbedding(ptr: *anyopaque, allocator: std.mem.Allocator) ![]f32 {
@@ -1157,12 +1184,12 @@ pub const Scenario = struct {
             return try allocator.dupe(f32, &.{ 1, 2, 3 });
         }
 
-        fn fetchQueryEmbedding(self: *State) !void {
-            const result = try self.query_cache.getOrCompute(
-                &self.query_cache_budget,
+        fn fetchQueryEmbedding(self: *State, deadline_ns: ?u64) !void {
+            const result = try self.production_cluster.?.getOrComputeQueryEmbeddingAtNode(
+                0,
                 self.fixture_allocator.allocator(),
                 query_cache_key,
-                null,
+                deadline_ns,
                 self,
                 computeQueryEmbedding,
             );
@@ -1173,16 +1200,19 @@ pub const Scenario = struct {
         }
 
         fn runQueryCacheProducer(self: *State) void {
-            self.fetchQueryEmbedding() catch |err| {
+            self.fetchQueryEmbedding(null) catch |err| {
                 self.query_cache_sound = false;
                 self.query_cache_error_code = @intFromError(err);
             };
         }
 
         fn runQueryCacheWaiter(self: *State) void {
-            self.fetchQueryEmbedding() catch |err| {
-                self.query_cache_sound = false;
-                self.query_cache_error_code = @intFromError(err);
+            self.fetchQueryEmbedding(self.nowNs() +| 5) catch |err| switch (err) {
+                error.Timeout => self.query_cache_waiter_timed_out = true,
+                else => {
+                    self.query_cache_sound = false;
+                    self.query_cache_error_code = @intFromError(err);
+                },
             };
         }
 
@@ -1206,29 +1236,109 @@ pub const Scenario = struct {
                 try self.sim.io().sleep(.fromMilliseconds(1), .awake);
 
             var waiter = self.sim.io().async(runQueryCacheWaiter, .{self});
-            // `waiter started` is not a sufficient boundary when its request
-            // charge itself yields. Observe the production cache's flight
-            // ledger so healing cannot race ahead of actual coalescing.
-            while (self.query_cache.stats(&self.query_cache_budget).coalesced_waiters == 0)
-                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+            // The waiter must cross the real node-owned cache's coalesced path
+            // and expire under the active slowdown before either the producer
+            // or the slowdown is released.
+            waiter.await(self.sim.io());
+            if (!self.query_cache_waiter_timed_out)
+                return error.QueryEmbeddingWaiterDidNotTimeOut;
             self.query_cache_pre_heal_done = true;
             self.query_cache_compute_release.set(self.sim.io());
             producer.await(self.sim.io());
-            waiter.await(self.sim.io());
 
             while (!self.service_rates_healed)
                 try self.sim.io().sleep(.fromMilliseconds(1), .awake);
-            try self.fetchQueryEmbedding();
+            try self.fetchQueryEmbedding(null);
+
+            const cluster = self.production_cluster.?;
+            const pre_restart = try cluster.queryEmbeddingCacheRequestStats(0);
+            self.query_cache_pre_restart_stats = pre_restart.query_embedding_cache;
+            self.query_cache_pre_restart_budget_used = pre_restart.inference_cache_budget.used_bytes;
+
+            // Keep the production Raft drivers and public listeners alive at
+            // their external completion fence until ordinary writes and reads
+            // have established durable state. Then destroy the exact process
+            // that owns this cache and rebuild it from the stable data roots.
+            while (!cluster.workload_body_done) {
+                if (cluster.failure) |err| return err;
+                if (self.tearing_down) return error.Canceled;
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+            }
+            const restart_fault_id = vopr.id.stable(name, "fault.production-query-cache-owner-restart");
+            try self.deployment.?.activateFault(
+                restart_fault_id,
+                .node_pause,
+                process_domains[0],
+            );
+            try self.deployment.?.restartNode(deployment_node_ids[0]);
+            try cluster.restartDataServerProcess(0);
+            self.query_cache_owner_restarted = true;
+            try self.deployment.?.healFault(restart_fault_id);
+            try self.deployment.?.publishReady(deployment_instances[0].id);
+            try self.deployment.?.publishReady(deployment_instances[3].id);
+
+            const empty = try cluster.queryEmbeddingCacheRequestStats(0);
+            self.query_cache_restart_empty = empty.query_embedding_cache.entries == 0 and
+                empty.query_embedding_cache.hits == 0 and
+                empty.query_embedding_cache.misses == 0 and
+                empty.query_embedding_cache.inflight == 0 and
+                empty.inference_cache_budget.used_bytes == 0;
+            try self.fetchQueryEmbedding(null);
+            try self.fetchQueryEmbedding(null);
+            const post_restart = try cluster.queryEmbeddingCacheRequestStats(0);
+            self.query_cache_post_restart_stats = post_restart.query_embedding_cache;
+            self.query_cache_post_restart_budget_used = post_restart.inference_cache_budget.used_bytes;
+            for (0..64) |_| {
+                self.query_cache_restart_read_attempts +|= 1;
+                self.query_cache_durable_read = cluster.documentVisibleAtNode(
+                    0,
+                    "docs",
+                    "doc:c",
+                    "production-left",
+                ) catch |err| blk: {
+                    switch (err) {
+                        error.ConnectionRefused,
+                        error.ConnectionResetByPeer,
+                        error.EndOfStream,
+                        error.SendFailed,
+                        => {
+                            self.query_cache_restart_read_failures +|= 1;
+                            self.query_cache_restart_read_error_code = @intFromError(err);
+                            break :blk false;
+                        },
+                        else => return err,
+                    }
+                };
+                if (self.query_cache_durable_read) break;
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+            }
+            if (!self.query_cache_durable_read)
+                return error.QueryEmbeddingCacheOwnerDurableReadFailed;
             self.query_cache_sound = self.query_cache_sound and self.queryCacheSoundBeforeDone();
         }
 
         fn queryCacheSoundBeforeDone(self: *State) bool {
-            const stats = self.query_cache.stats(&self.query_cache_budget);
-            return self.query_cache_compute_calls == 1 and
-                self.query_cache_successful_results == 3 and
-                stats.hits == 1 and stats.misses == 1 and
-                stats.coalesced_waiters == 1 and stats.producer_computations == 1 and
-                stats.inflight == 0 and stats.entries == 1;
+            return self.query_cache_compute_calls == 2 and
+                self.query_cache_successful_results == 4 and
+                self.query_cache_waiter_timed_out and
+                self.query_cache_owner_restarted and
+                self.query_cache_restart_empty and
+                self.query_cache_durable_read and
+                self.query_cache_restart_read_attempts == 2 and
+                self.query_cache_restart_read_failures == 1 and
+                queryCacheReconnectErrorCodeSound(self.query_cache_restart_read_error_code);
+        }
+
+        fn queryCacheReconnectErrorCodeSound(code: u64) bool {
+            return code == @intFromError(error.ConnectionRefused) or
+                code == @intFromError(error.ConnectionResetByPeer) or
+                code == @intFromError(error.EndOfStream) or
+                code == @intFromError(error.SendFailed);
+        }
+
+        fn queryCacheCompletionReady(ptr: *anyopaque) bool {
+            const self: *State = @ptrCast(@alignCast(ptr));
+            return self.query_cache_done or self.tearing_down;
         }
 
         fn replicationCompletionReady(ptr: *anyopaque) bool {
@@ -1570,6 +1680,12 @@ pub const Scenario = struct {
                     self.production_cluster.?.setCompletionFence(.{
                         .ptr = self,
                         .ready_fn = replicationCompletionReady,
+                    });
+                }
+                if (mode == .production_data_plane_query_embedding_cache_service_rate) {
+                    self.production_cluster.?.setCompletionFence(.{
+                        .ptr = self,
+                        .ready_fn = queryCacheCompletionReady,
                     });
                 }
                 self.production_cluster.?.setActiveSplitEnabled(
@@ -2227,17 +2343,29 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".service-rates-healed", @intFromBool(state.service_rates_healed));
         try builder.addNamed(allocator, name ++ ".service-rates-sound", @intFromBool(state.serviceRatesSound()));
         try builder.addNamed(allocator, name ++ ".service-rate-active-effects", @intCast(state.service_rate_model.activeEffectCount()));
-        const query_cache_stats = state.query_cache.stats(&state.query_cache_budget);
         try builder.addNamed(allocator, name ++ ".query-cache-pre-heal-done", @intFromBool(state.query_cache_pre_heal_done));
         try builder.addNamed(allocator, name ++ ".query-cache-done", @intFromBool(state.query_cache_done));
         try builder.addNamed(allocator, name ++ ".query-cache-sound", @intFromBool(state.queryCacheSound()));
         try builder.addNamed(allocator, name ++ ".query-cache-error", @intCast(state.query_cache_error_code));
         try builder.addNamed(allocator, name ++ ".query-cache-compute-calls", @intCast(state.query_cache_compute_calls));
         try builder.addNamed(allocator, name ++ ".query-cache-results", @intCast(state.query_cache_successful_results));
-        try builder.addNamed(allocator, name ++ ".query-cache-hits", @intCast(query_cache_stats.hits));
-        try builder.addNamed(allocator, name ++ ".query-cache-misses", @intCast(query_cache_stats.misses));
-        try builder.addNamed(allocator, name ++ ".query-cache-coalesced-waiters", @intCast(query_cache_stats.coalesced_waiters));
-        try builder.addNamed(allocator, name ++ ".query-cache-inflight", @intCast(query_cache_stats.inflight));
+        try builder.addNamed(allocator, name ++ ".query-cache-waiter-timeout", @intFromBool(state.query_cache_waiter_timed_out));
+        try builder.addNamed(allocator, name ++ ".query-cache-owner-restarted", @intFromBool(state.query_cache_owner_restarted));
+        try builder.addNamed(allocator, name ++ ".query-cache-restart-empty", @intFromBool(state.query_cache_restart_empty));
+        try builder.addNamed(allocator, name ++ ".query-cache-durable-read", @intFromBool(state.query_cache_durable_read));
+        try builder.addNamed(allocator, name ++ ".query-cache-restart-read-attempts", @intCast(state.query_cache_restart_read_attempts));
+        try builder.addNamed(allocator, name ++ ".query-cache-restart-read-failures", @intCast(state.query_cache_restart_read_failures));
+        try builder.addNamed(allocator, name ++ ".query-cache-restart-read-error", @intCast(state.query_cache_restart_read_error_code));
+        try builder.addNamed(allocator, name ++ ".query-cache-pre-restart-hits", @intCast(state.query_cache_pre_restart_stats.hits));
+        try builder.addNamed(allocator, name ++ ".query-cache-pre-restart-misses", @intCast(state.query_cache_pre_restart_stats.misses));
+        try builder.addNamed(allocator, name ++ ".query-cache-pre-restart-coalesced-waiters", @intCast(state.query_cache_pre_restart_stats.coalesced_waiters));
+        try builder.addNamed(allocator, name ++ ".query-cache-pre-restart-waiter-timeouts", @intCast(state.query_cache_pre_restart_stats.waiter_timeouts));
+        try builder.addNamed(allocator, name ++ ".query-cache-pre-restart-budget", @intCast(state.query_cache_pre_restart_budget_used));
+        try builder.addNamed(allocator, name ++ ".query-cache-post-restart-hits", @intCast(state.query_cache_post_restart_stats.hits));
+        try builder.addNamed(allocator, name ++ ".query-cache-post-restart-misses", @intCast(state.query_cache_post_restart_stats.misses));
+        try builder.addNamed(allocator, name ++ ".query-cache-post-restart-coalesced-waiters", @intCast(state.query_cache_post_restart_stats.coalesced_waiters));
+        try builder.addNamed(allocator, name ++ ".query-cache-post-restart-inflight", @intCast(state.query_cache_post_restart_stats.inflight));
+        try builder.addNamed(allocator, name ++ ".query-cache-post-restart-budget", @intCast(state.query_cache_post_restart_budget_used));
         try builder.addNamed(allocator, name ++ ".replication-pre-heal-done", @intFromBool(state.replication_pre_heal_done));
         try builder.addNamed(allocator, name ++ ".replication-done", @intFromBool(state.replication_done));
         try builder.addNamed(allocator, name ++ ".replication-sound", @intFromBool(state.replication_sound));
@@ -3037,7 +3165,7 @@ fn runExactMode(
             else if (production_replication_backfill_mode)
                 "full-cluster-vopr-v42-replication-backfill-service-rate"
             else if (production_query_cache_service_rate_mode)
-                "full-cluster-vopr-v41-query-embedding-cache-service-rate"
+                "full-cluster-vopr-v49-query-embedding-cache-deadline-owner-restart"
             else if (production_global_query_owner_restart_mode)
                 "full-cluster-vopr-v40-public-global-query-owner-restart"
             else if (production_global_query_transport_mode)
@@ -3415,7 +3543,7 @@ test "full cluster production service rates compose heal and exact replay" {
     );
 }
 
-test "full cluster production query embedding cache service rates compose heal and exact replay" {
+test "full cluster production query embedding cache deadline owner restart and exact replay" {
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
     const ordinal = Scenario.production_query_cache_service_rate_ordinal;

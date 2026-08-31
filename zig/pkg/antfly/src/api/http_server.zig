@@ -2770,6 +2770,40 @@ pub const ApiHttpServer = struct {
         return self.query_embedding_cache.stats(self.inferenceCacheBudget());
     }
 
+    /// Install an owner-scoped cost model for query-embedding cache work.
+    /// The owning runtime may change this only while no cache request is in
+    /// flight. Keeping the seam on the ApiHttpServer preserves the cache's
+    /// real process lifetime instead of requiring callers to construct a
+    /// second cache beside the production owner.
+    pub fn setQueryEmbeddingCacheWorkCostPort(
+        self: *ApiHttpServer,
+        port: ?query_embedding_cache.WorkCostPort,
+    ) void {
+        self.query_embedding_cache.setWorkCostPort(port);
+    }
+
+    /// Resolve one already security-scoped cache key through this server's
+    /// production-owned cache and ResourceManager budget. Higher-level query
+    /// planning remains responsible for deriving keys that include provider,
+    /// model, template, and authorization scope.
+    pub fn getOrComputeQueryEmbeddingByKey(
+        self: *ApiHttpServer,
+        caller_alloc: std.mem.Allocator,
+        key: query_embedding_cache.Key,
+        deadline_ns: ?u64,
+        context: *anyopaque,
+        compute: query_embedding_cache.ComputeFn,
+    ) ![]f32 {
+        return self.query_embedding_cache.getOrCompute(
+            self.inferenceCacheBudget(),
+            caller_alloc,
+            key,
+            deadline_ns,
+            context,
+            compute,
+        );
+    }
+
     fn inferenceCacheBudget(self: *ApiHttpServer) *cache_budget.CacheBudget {
         const manager = self.shared_resource_manager orelse &self.local_resource_manager;
         return manager.queryEmbeddingCacheBudget();

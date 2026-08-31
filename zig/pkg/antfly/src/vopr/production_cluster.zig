@@ -21,6 +21,7 @@ const api_http_server = @import("../api/http_server.zig");
 const api_batch = @import("../api/batch.zig");
 const api_distributed_graph = @import("../api/distributed_graph.zig");
 const api_distributed_join = @import("../api/distributed_join.zig");
+const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
 const api_table_write_source = @import("../api/table_write_source.zig");
 const test_contract_helpers = @import("../api/test_contract_helpers.zig");
 const common_http = @import("../common/http/http_common.zig");
@@ -254,6 +255,7 @@ pub const Fixture = struct {
     pub const WorkCostPorts = struct {
         data: [node_count]data_runtime.DataServerWorkCostPort,
         graph: [node_count]api_distributed_graph.WorkCostPort,
+        query_cache: [node_count]?query_embedding_cache.WorkCostPort = .{null} ** node_count,
     };
 
     /// Keeps production listeners, Raft drivers, and storage owners live until
@@ -372,6 +374,10 @@ pub const Fixture = struct {
     read_statuses: [4]u16 = .{ 0, 0, 0, 0 },
     read_body_digests: [4]u64 = .{ 0, 0, 0, 0 },
     read_attempts: [4]u16 = .{ 0, 0, 0, 0 },
+    /// The production workload has completed its public operations but may be
+    /// held at an external completion fence while another composed owner is
+    /// inspected or restarted.
+    workload_body_done: bool = false,
     workload_done: bool = false,
     write_sound: bool = false,
     read_sound: bool = false,
@@ -1577,6 +1583,9 @@ pub const Fixture = struct {
             self.data_raft_uri_live[index] = false;
         }
         try self.data_servers[index].startPublicHttp();
+        self.data_servers[index].http_server.?.setQueryEmbeddingCacheWorkCostPort(
+            if (self.work_cost_ports) |ports| ports.query_cache[index] else null,
+        );
         if (!self.data_servers[index].http_server.?.join_job_store.hasDurableStore())
             return error.DurableJoinStoreUnavailable;
         self.data_api_uris[index] = try self.data_servers[index].baseUri(self.alloc);
@@ -2599,6 +2608,67 @@ pub const Fixture = struct {
         try self.waitForDataRoutingReady();
     }
 
+    /// Execute one cacheable embedding computation on the cache owned by the
+    /// selected live production ApiHttpServer. The cache and its resource
+    /// budget are destroyed and recreated with that DataServer process.
+    pub fn getOrComputeQueryEmbeddingAtNode(
+        self: *Fixture,
+        index: usize,
+        caller_alloc: std.mem.Allocator,
+        key: query_embedding_cache.Key,
+        deadline_ns: ?u64,
+        context: *anyopaque,
+        compute: query_embedding_cache.ComputeFn,
+    ) ![]f32 {
+        if (index >= self.data_server_count or !self.data_server_live[index])
+            return error.ProductionDataCacheOwnerUnavailable;
+        return self.data_servers[index].http_server.?.getOrComputeQueryEmbeddingByKey(
+            caller_alloc,
+            key,
+            deadline_ns,
+            context,
+            compute,
+        );
+    }
+
+    pub fn queryEmbeddingCacheRequestStats(
+        self: *Fixture,
+        index: usize,
+    ) !api_http_server.ApiHttpServer.RequestStats {
+        if (index >= self.data_server_count or !self.data_server_live[index])
+            return error.ProductionDataCacheOwnerUnavailable;
+        return self.data_servers[index].http_server.?.requestStats();
+    }
+
+    /// Reconstruct one exact production DataServer process while preserving
+    /// its stable node/store identity and durable roots. Callers must ensure
+    /// their own process-local work has drained before requesting restart.
+    pub fn restartDataServerProcess(self: *Fixture, index: usize) !void {
+        try self.stopDataServerForRestart(index);
+        errdefer self.data_server_paused[index] = false;
+        try self.restartDataServer(index);
+    }
+
+    pub fn documentVisibleAtNode(
+        self: *Fixture,
+        index: usize,
+        table_name: []const u8,
+        document_id: []const u8,
+        expected_fragment: []const u8,
+    ) !bool {
+        if (index >= self.data_api_uri_count or !self.data_api_uri_live[index])
+            return error.ProductionDataReadTargetUnavailable;
+        var response = try self.client.fetchLookupResponse(
+            self.data_api_uris[index],
+            table_name,
+            document_id,
+            null,
+        );
+        defer response.deinit(self.alloc);
+        return response.status == 200 and
+            std.mem.indexOf(u8, response.body, expected_fragment) != null;
+    }
+
     fn waitForDataRoutingReady(self: *Fixture) !void {
         for (0..4_096) |round| {
             if (round % 8 == 0) {
@@ -2724,6 +2794,7 @@ pub const Fixture = struct {
         self.runWorkloadInner() catch |err| {
             self.failure = err;
         };
+        self.workload_body_done = self.failure == null;
         if (self.failure == null) self.awaitCompletionFence() catch |err| {
             self.failure = err;
         };

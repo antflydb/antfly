@@ -7446,13 +7446,13 @@ pub fn build(b: *std.Build) void {
 
     const production_cluster_query_cache_service_rate_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"full cluster production query embedding cache service rates compose heal and exact replay"},
+        .filters = &.{"full cluster production query embedding cache deadline owner restart and exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_query_cache_service_rate_vopr_tests = b.addRunArtifact(production_cluster_query_cache_service_rate_vopr_tests);
     const production_cluster_query_cache_service_rate_vopr_test_step = b.step(
-        "production-cluster-query-cache-service-rate-vopr-test",
-        "Run query-cache coalescing and hit costs with DataServer, graph, and serverless node slowdown",
+        "production-cluster-query-cache-deadline-restart-vopr-test",
+        "Run the production ApiHttpServer cache through slowdown, deadline, DataServer restart, recomputation, and durable recovery",
     );
     production_cluster_query_cache_service_rate_vopr_test_step.dependOn(&run_production_cluster_query_cache_service_rate_vopr_tests.step);
 
