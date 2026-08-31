@@ -55,10 +55,10 @@ pub const DistributedEntitySink = struct {
 
     const vtable = EntitySink.VTable{ .upsert = upsertFn, .upsert_batch = upsertBatchFn };
 
-    /// Promote all of a document's entities in one transaction. With
-    /// `transactional` set, this is a single multi-participant 2PC commit across
-    /// the entity table's shards, so a document never lands a partial set of its
-    /// entities; otherwise it falls back to independent per-entity upserts.
+    /// Promote all of a document's entities atomically. With `transactional`
+    /// set, a single entity shard uses one fenced Raft batch and multiple shards
+    /// use 2PC, so a document never lands a partial set of its entities;
+    /// otherwise it falls back to independent per-entity upserts.
     fn upsertBatchFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
