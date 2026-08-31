@@ -290,6 +290,107 @@ def _is_metadata_not_leader_response(response: requests.Response) -> bool:
     return response.headers.get("X-Antfly-Metadata-Not-Leader", "").lower() == "true"
 
 
+def _metadata_quorum_leader_index(
+    statuses: list[dict | None], *, cluster_size: int
+) -> int | None:
+    """Return a self-confirmed leader backed by a same-term voter quorum.
+
+    Followers can legitimately lag an election by a heartbeat, so requiring
+    every reachable node to report one leader turns normal Raft convergence
+    into a false outage. A quorum in one term is the safety boundary; requiring
+    the candidate to report itself as leader avoids routing to a stale hint.
+    """
+    if cluster_size < 1:
+        return None
+
+    quorum = cluster_size // 2 + 1
+    observations: dict[tuple[int, int], int] = {}
+    by_node: dict[int, dict] = {}
+    for status in statuses:
+        if not status:
+            continue
+        try:
+            node_id = int(status["metadata_raft_local_node_id"])
+            term = int(status["metadata_raft_term"])
+            leader_id = int(status["metadata_raft_leader_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (1 <= node_id <= cluster_size and 1 <= leader_id <= cluster_size):
+            continue
+        if node_id in by_node:
+            continue
+        by_node[node_id] = status
+        if status.get("metadata_raft_local_voter", True):
+            key = (term, leader_id)
+            observations[key] = observations.get(key, 0) + 1
+
+    # A majority cannot support two different observations in one term. Sort
+    # by term so a quorum-confirmed newer election wins over stale hints.
+    for (term, leader_id), count in sorted(observations.items(), reverse=True):
+        if count < quorum:
+            continue
+        leader_status = by_node.get(leader_id)
+        if not leader_status:
+            continue
+        try:
+            leader_term = int(leader_status["metadata_raft_term"])
+            self_leader_id = int(leader_status["metadata_raft_leader_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            leader_term == term
+            and self_leader_id == leader_id
+            and leader_status.get("metadata_raft_role") == "leader"
+        ):
+            return leader_id - 1
+    return None
+
+
+def _metadata_status(
+    node_id: int,
+    *,
+    term: int,
+    leader_id: int | None,
+    role: str = "follower",
+    voter: bool = True,
+) -> dict:
+    """Build a focused status fixture for leader-discovery contract tests."""
+    return {
+        "metadata_raft_local_node_id": node_id,
+        "metadata_raft_term": term,
+        "metadata_raft_leader_id": leader_id,
+        "metadata_raft_role": role,
+        "metadata_raft_local_voter": voter,
+    }
+
+
+def test_metadata_quorum_leader_discovery_tolerates_one_stale_follower() -> None:
+    statuses = [
+        _metadata_status(1, term=8, leader_id=2),
+        _metadata_status(2, term=8, leader_id=2, role="leader"),
+        _metadata_status(3, term=7, leader_id=1),
+    ]
+    assert _metadata_quorum_leader_index(statuses, cluster_size=3) == 1
+
+
+def test_metadata_quorum_leader_discovery_requires_a_quorum() -> None:
+    statuses = [
+        _metadata_status(1, term=8, leader_id=2),
+        _metadata_status(2, term=8, leader_id=2, role="leader", voter=False),
+        None,
+    ]
+    assert _metadata_quorum_leader_index(statuses, cluster_size=3) is None
+
+
+def test_metadata_quorum_leader_discovery_requires_self_confirmation() -> None:
+    statuses = [
+        _metadata_status(1, term=8, leader_id=2),
+        _metadata_status(2, term=8, leader_id=2),
+        _metadata_status(3, term=7, leader_id=1),
+    ]
+    assert _metadata_quorum_leader_index(statuses, cluster_size=3) is None
+
+
 class MultiMetadataBackupCluster:
     def __init__(self, binary: str):
         self.binary = binary
@@ -330,6 +431,7 @@ class MultiMetadataBackupCluster:
 
             self.metadata_procs: list[subprocess.Popen[str]] = []
             self.data_proc: subprocess.Popen[str] | None = None
+            self.last_metadata_statuses: list[dict | None] = []
             setup.pop_all()
 
         try:
@@ -463,7 +565,8 @@ class MultiMetadataBackupCluster:
 
         if self.metadata_stable_leader_index(timeout_s=30.0) is None:
             raise RuntimeError(
-                f"metadata cluster did not elect a leader\n{self.debug_logs()}"
+                "metadata cluster did not elect a leader; "
+                f"last_statuses={self.last_metadata_statuses!r}\n{self.debug_logs()}"
             )
 
         data_command = self._data_command()
@@ -506,28 +609,15 @@ class MultiMetadataBackupCluster:
         # election-observation window before healthy peers are considered.
         # Keep one bounded request per node and preserve configured ordering.
         with ThreadPoolExecutor(max_workers=len(self.metadata_admin_urls)) as executor:
-            return list(executor.map(fetch, self.metadata_admin_urls))
+            statuses = list(executor.map(fetch, self.metadata_admin_urls))
+        self.last_metadata_statuses = statuses
+        return statuses
 
     def metadata_leader_index_once(self, *, request_timeout_s: float) -> int | None:
         statuses = self.metadata_statuses(request_timeout_s=request_timeout_s)
-        leader_ids = {
-            int(status["metadata_raft_leader_id"])
-            for status in statuses
-            if status and status.get("metadata_raft_leader_id") is not None
-        }
-        if len(leader_ids) != 1:
-            return None
-        leader_id = leader_ids.pop()
-        if leader_id < 1 or leader_id > len(self.metadata_admin_urls):
-            return None
-        leader_status = statuses[leader_id - 1]
-        if not leader_status:
-            return None
-        if leader_status.get("metadata_raft_role") != "leader":
-            return None
-        if int(leader_status.get("metadata_raft_local_node_id", 0)) != leader_id:
-            return None
-        return leader_id - 1
+        return _metadata_quorum_leader_index(
+            statuses, cluster_size=len(self.metadata_admin_urls)
+        )
 
     def metadata_leader_index(self, *, timeout_s: float) -> int | None:
         def current_leader() -> int | None:
@@ -550,7 +640,10 @@ class MultiMetadataBackupCluster:
         def current_stable_leader() -> int | None:
             nonlocal last_leader, observed
             leader_index = self.metadata_leader_index_once(
-                request_timeout_s=min(1.0, max(0.05, interval_s))
+                # Poll cadence and per-request latency are independent. A
+                # 250ms status deadline was too aggressive under loaded CI and
+                # amplified transient scheduler delay into a false outage.
+                request_timeout_s=1.0
             )
             if leader_index is None:
                 last_leader = None
@@ -570,7 +663,10 @@ class MultiMetadataBackupCluster:
     def metadata_leader_public_url(self, *, timeout_s: float = 30.0) -> str:
         leader_index = self.metadata_stable_leader_index(timeout_s=timeout_s)
         if leader_index is None:
-            raise AssertionError(f"metadata leader unavailable\n{self.debug_logs()}")
+            raise AssertionError(
+                "metadata leader unavailable; "
+                f"last_statuses={self.last_metadata_statuses!r}\n{self.debug_logs()}"
+            )
         return self.metadata_public_urls[leader_index]
 
     def stop(self) -> None:
