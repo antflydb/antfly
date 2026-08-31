@@ -3879,6 +3879,11 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         // control-plane backoff preserves that exclusion without terminating
         // the data process and permanently removing a destination voter.
         error.TransitionDestinationProvisioningBusy,
+        // Placement and split-transition projections are multi-row. A data
+        // node can briefly observe its destination placement before the
+        // provisioning range becomes visible in the same snapshot. Fail
+        // closed for that round, then retry from a fresh metadata snapshot.
+        error.MissingProvisioningRange,
         // Placement projection is multi-row. A store can observe its local
         // row before every row needed to prove the incumbent voter set is
         // visible. Refusing to bootstrap from that partial set is required,
@@ -3931,6 +3936,10 @@ test "data runtime treats metadata leadership churn as retryable bootstrap failu
     try std.testing.expect(isRetryableMetadataBootstrapError(error.TransitionDestinationProvisioningBusy));
     try std.testing.expect(!isRetryableMetadataBootstrapError(error.InvalidArguments));
     try std.testing.expect(!isRetryableMetadataBootstrapError(error.MetadataIncarnationMismatch));
+}
+
+test "data runtime retries incomplete split provisioning projections" {
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.MissingProvisioningRange));
 }
 
 test "replicated transition action lanes fail fast without serializing unrelated groups" {
