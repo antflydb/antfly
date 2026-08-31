@@ -16944,6 +16944,7 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .replay_applied_sequence = index.replay_applied_sequence,
         .replay_target_sequence = index.replay_target_sequence,
         .replay_catch_up_required = index.replay_catch_up_required,
+        .embedding_activity_observed = index.embedding_activity_observed,
         .embedding_activity = .{
             .epoch = index.embedding_activity.epoch,
             .phase = switch (index.embedding_activity.effectivePhase()) {
@@ -16972,6 +16973,7 @@ test "data runtime report preserves compact managed repair admission state" {
         .kind = .dense_vector,
         .publication_target_count = 2500,
         .publication_target_ready = true,
+        .embedding_activity_observed = true,
         .embedding_activity = .{
             .epoch = 7,
             .chunks_created = 9,
@@ -16995,7 +16997,7 @@ test "data runtime report preserves compact managed repair admission state" {
     defer alloc.free(encoded);
     try ant_json.testing.expectSubsetJsonText(
         alloc,
-        "{\"publication_target_count\":2500,\"publication_target_ready\":true,\"embedding_activity\":{\"epoch\":7,\"phase\":\"waiting_retry\",\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
+        "{\"publication_target_count\":2500,\"publication_target_ready\":true,\"embedding_activity_observed\":true,\"embedding_activity\":{\"epoch\":7,\"phase\":\"waiting_retry\",\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
         encoded,
     );
 }

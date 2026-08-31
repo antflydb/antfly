@@ -25634,6 +25634,7 @@ pub const DB = struct {
                 for (runtime_stats.indexes) |*item| {
                     item.enrichment_failed = item.enrichment_failed or runtime.indexHasIsolatedFailure(item.name);
                     if (item.kind == .dense_vector or item.kind == .sparse_vector) {
+                        item.embedding_activity_observed = true;
                         item.embedding_activity = runtime.indexEmbeddingActivity(item.name);
                     }
                     for (item.source_replay) |*source| {
@@ -42805,6 +42806,7 @@ fn accountDenseCoverage(
     writes: []const mapper.DenseEmbeddingWrite,
 ) !void {
     const external = ctx.index_manager.denseIndexUsesExternalCoverage(index_name);
+    const direct = ctx.index_manager.denseIndexUsesManagedDirectField(index_name);
     var produced = std.StringHashMapUnmanaged(void).empty;
     defer produced.deinit(ctx.alloc);
     for (writes) |write| {
@@ -42812,37 +42814,23 @@ fn accountDenseCoverage(
     }
     var outcomes = std.ArrayListUnmanaged(DerivedCoverageDocOutcome).empty;
     defer outcomes.deinit(ctx.alloc);
-    if (!external) {
-        var deferred = std.StringHashMapUnmanaged(void).empty;
-        defer deferred.deinit(ctx.alloc);
-        if (ctx.index_manager.denseEmbeddingName(index_name)) |embedding_name| {
-            for (batch.generated_enrichment_refs) |ref| {
-                if (ref.kind != .dense_embedding or
-                    !std.mem.eql(u8, enrichment_types.refEmbeddingName(ref), embedding_name)) continue;
-                try deferred.put(ctx.alloc, ref.doc_key, {});
-            }
-        }
+    if (!external and direct) {
         for (batch.documents) |doc| {
             if (doc.action == .delete or internal_keys.isInternalUserKey(doc.key) or !ctx.index_manager.byte_range.contains(doc.key)) continue;
-            // A source write and its generated embedding are intentionally
-            // separated when the caller waits only through full-text
-            // visibility. Absence of an embedding in that source replay batch
-            // is pending enrichment, not an intentional skip. The enrichment
-            // worker owns the terminal produced/skipped/failed transition for
-            // every deferred request. Overwrites have already removed the
-            // previous terminal marker above, so omitting an outcome here is
-            // the durable pending representation and keeps status O(1).
             const was_produced = produced.contains(doc.key);
-            if (!was_produced and deferred.contains(doc.key)) continue;
             try outcomes.append(ctx.alloc, .{
                 .doc_key = doc.key,
-                .outcome = if (was_produced)
-                    .produced
-                else
-                    try denseMissingArtifactCoverageOutcome(ctx, index_name, doc.key),
+                .outcome = if (was_produced) .produced else .skipped,
             });
         }
     } else {
+        // Generated indexes have a distinct producer lifecycle. A replay
+        // window can contain source documents before, or independently from,
+        // their generated artifacts; absence from that window is therefore
+        // pending work, never terminal skip evidence. The enrichment producer
+        // owns all generated produced/skipped/failed transitions. Replay may
+        // repeat positive produced evidence, which is idempotent and also
+        // covers external indexes that have no managed producer.
         var iter = produced.keyIterator();
         while (iter.next()) |doc_key| {
             if (internal_keys.isInternalUserKey(doc_key.*) or !ctx.index_manager.byte_range.contains(doc_key.*)) continue;
@@ -42852,43 +42840,6 @@ fn accountDenseCoverage(
     try setDerivedCoverageOutcomes(ctx.alloc, ctx.store, ctx.index_manager, index_name, outcomes.items);
 }
 
-fn denseMissingArtifactCoverageOutcome(
-    ctx: *const AsyncContext,
-    index_name: []const u8,
-    doc_key: []const u8,
-) !DerivedCoverageOutcome {
-    const dense = ctx.index_manager.denseIndex(index_name) orelse return .skipped;
-    const chunk_name = dense.chunk_name orelse return .skipped;
-    const chunk_cfg = ctx.index_manager.getEnrichment(.chunk, chunk_name) orelse return .skipped;
-    if (chunk_cfg.source_artifact_name.len == 0) return .skipped;
-
-    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(ctx.alloc, doc_key, "asset", chunk_cfg.source_artifact_name);
-    defer ctx.alloc.free(manifest_key);
-    const manifest = ctx.store.get(ctx.alloc, manifest_key) catch |err| switch (err) {
-        error.NotFound => return .skipped,
-        else => return err,
-    };
-    defer ctx.alloc.free(manifest);
-    var parsed = try std.json.parseFromSlice(std.json.Value, ctx.alloc, manifest, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
-    const object = parsed.value.object;
-    if (object.get("last_error") != null) return .terminal_failed;
-    if (object.get("merge_status")) |value| {
-        if (value == .string and std.mem.eql(u8, value.string, "failed")) return .terminal_failed;
-    }
-    if (object.get("route_type")) |value| {
-        if (value == .string and std.mem.eql(u8, value.string, "error")) return .terminal_failed;
-    }
-    const chunk_count = try jsonObjectU64(object, "chunk_count");
-    const ocr_failed_count = try jsonObjectU64(object, "ocr_failed_count");
-    const failed_pages = if (object.get("ocr_failed_page_numbers")) |value|
-        if (value == .array) value.array.items.len else 0
-    else
-        0;
-    return if (chunk_count == 0 and (ocr_failed_count > 0 or failed_pages > 0)) .terminal_failed else .skipped;
-}
-
 fn accountSparseCoverage(
     ctx: *const AsyncContext,
     index_name: []const u8,
@@ -42896,6 +42847,7 @@ fn accountSparseCoverage(
     writes: []const mapper.SparseEmbeddingWrite,
 ) !void {
     const external = ctx.index_manager.sparseIndexUsesExternalCoverage(index_name);
+    const direct = ctx.index_manager.sparseIndexUsesManagedDirectField(index_name);
     var produced = std.StringHashMapUnmanaged(void).empty;
     defer produced.deinit(ctx.alloc);
     for (writes) |write| {
@@ -42903,20 +42855,10 @@ fn accountSparseCoverage(
     }
     var outcomes = std.ArrayListUnmanaged(DerivedCoverageDocOutcome).empty;
     defer outcomes.deinit(ctx.alloc);
-    if (!external) {
-        var deferred = std.StringHashMapUnmanaged(void).empty;
-        defer deferred.deinit(ctx.alloc);
-        if (ctx.index_manager.sparseEmbeddingName(index_name)) |embedding_name| {
-            for (batch.generated_enrichment_refs) |ref| {
-                if (ref.kind != .sparse_embedding or
-                    !std.mem.eql(u8, enrichment_types.refEmbeddingName(ref), embedding_name)) continue;
-                try deferred.put(ctx.alloc, ref.doc_key, {});
-            }
-        }
+    if (!external and direct) {
         for (batch.documents) |doc| {
             if (doc.action == .delete or internal_keys.isInternalUserKey(doc.key) or !ctx.index_manager.byte_range.contains(doc.key)) continue;
             const was_produced = produced.contains(doc.key);
-            if (!was_produced and deferred.contains(doc.key)) continue;
             try outcomes.append(ctx.alloc, .{
                 .doc_key = doc.key,
                 .outcome = if (was_produced) .produced else .skipped,
@@ -53425,14 +53367,37 @@ test "db runtime-only status overlay preserves a resident enrichment worker" {
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     });
     defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic"}}
+        ,
+    });
 
     // Model a durable/query-only recovery snapshot. A resident writer overlay
     // must replace its absent producer diagnostics immediately rather than
     // waiting for the periodic full status refresh.
-    var recovered: types.DBStats = .{};
+    var indexes = [_]types.DBIndexStats{.{
+        .name = "semantic",
+        .kind = .dense_vector,
+    }};
+    var recovered: types.DBStats = .{ .indexes = indexes[0..] };
     db.overlayRuntimeStatusRuntimeBestEffort(&recovered);
     try std.testing.expect(recovered.enrichment.enabled);
     try std.testing.expect(recovered.enrichment.worker_started);
+    try std.testing.expect(indexes[0].embedding_activity_observed);
+    try std.testing.expect(indexes[0].embedding_activity.epoch != 0);
+
+    // Lifecycle contention is explicitly unavailable, not an idle activity
+    // sample that may erase the metadata cache's last exact-owner heartbeat.
+    indexes[0].embedding_activity_observed = false;
+    indexes[0].embedding_activity = .{};
+    lockAtomicWithBackoff(&db.async_context.enrichment_lifecycle_mutex);
+    db.overlayRuntimeStatusRuntimeBestEffort(&recovered);
+    db.async_context.enrichment_lifecycle_mutex.unlock();
+    try std.testing.expect(!indexes[0].embedding_activity_observed);
+    try std.testing.expectEqual(@as(u64, 0), indexes[0].embedding_activity.epoch);
 }
 
 test "runtime status best effort overlay cannot clear readiness under apply contention" {
@@ -70237,6 +70202,54 @@ test "db deferred generated coverage remains pending until the enrichment worker
             break;
         } else return error.IndexNotFound;
     }
+}
+
+test "db generated enrichment replay cannot infer terminal skip from an omitted partial artifact" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic"}}
+        ,
+    });
+    try db.addIndex(.{
+        .name = "semantic_sparse",
+        .kind = .sparse_vector,
+        .config_json =
+        \\{"field":"sparse_embedding","generator":{"kind":"sparse_embedding","source_field":"body","embedding_name":"semantic_sparse"}}
+        ,
+    });
+
+    // Progressive generated batches may publish source documents separately
+    // from their embeddings and without carrying the original request refs.
+    // Only the enrichment producer can classify that absence as terminal.
+    const documents = [_]derived_types.DerivedDocument{.{
+        .key = "doc:pending",
+        .cleaned_value = "{\"body\":\"still embedding\"}",
+    }};
+    try accountDenseCoverage(db.async_context, "semantic", .{ .documents = &documents }, &.{});
+    try accountSparseCoverage(db.async_context, "semantic_sparse", .{ .documents = &documents }, &.{});
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var verified: usize = 0;
+    for (stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "semantic") and
+            !std.mem.eql(u8, index_stats.name, "semantic_sparse")) continue;
+        try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_produced_count);
+        try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_skipped_count);
+        try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+        verified += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), verified);
 }
 
 test "db managed conditional embeddings persist exact mixed corpus coverage across reopen" {

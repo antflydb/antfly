@@ -929,6 +929,9 @@ pub const RuntimeIndexStatusReport = struct {
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
+    /// True when the owner observed `embedding_activity` at a stable lifecycle
+    /// boundary. False means unavailable for this heartbeat, not idle.
+    embedding_activity_observed: bool = false,
     embedding_activity: RuntimeEmbeddingActivityStatusReport = .{},
     source_replay: []RuntimeIndexSourceReplayStatusReport = &.{},
     repair_status: ?IndexRepairStatus = null,
@@ -2291,6 +2294,7 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .replay_applied_sequence = record.replay_applied_sequence,
         .replay_target_sequence = record.replay_target_sequence,
         .replay_catch_up_required = record.replay_catch_up_required,
+        .embedding_activity_observed = record.embedding_activity_observed,
         .embedding_activity = record.embedding_activity,
         .source_replay = source_replay,
         .repair_status = record.repair_status,

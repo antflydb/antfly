@@ -2971,6 +2971,10 @@ pub const DBIndexStats = struct {
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
+    // True only when this status pass observed the enrichment owner while its
+    // lifecycle was stable. False is an observation gap, not idle.
+    // This is volatile status-plane metadata, not part of the public API.
+    embedding_activity_observed: bool = false,
     embedding_activity: EmbeddingActivityStats = .{},
     // Stable across shard-local marker generations for the same stored config.
     coverage_config_hash: u64 = 0,

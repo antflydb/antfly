@@ -113,8 +113,8 @@ const EmbeddingActivityCache = struct {
         self.* = .{};
     }
 
-    fn activityPresent(activity: metadata_table_manager.RuntimeEmbeddingActivityStatusReport) bool {
-        return activity.epoch != 0;
+    fn activityAvailable(index_status: metadata_table_manager.RuntimeIndexStatusReport) bool {
+        return index_status.embedding_activity_observed and index_status.embedding_activity.epoch != 0;
     }
 
     fn removeStoreAssumeLocked(self: *@This(), alloc: std.mem.Allocator, store_id: u64) void {
@@ -134,9 +134,135 @@ const EmbeddingActivityCache = struct {
         return null;
     }
 
-    fn refreshStoreAssumeLocked(self: *@This(), store_id: u64, now_ns: u64) void {
-        for (self.entries.items) |*entry| {
-            if (entry.store_id == store_id) entry.observed_at_ns = now_ns;
+    fn entryMatchesIndex(
+        entry: Entry,
+        reporter_incarnation: u64,
+        group_id: u64,
+        index_status: metadata_table_manager.RuntimeIndexStatusReport,
+    ) bool {
+        return entry.reporter_incarnation == reporter_incarnation and
+            entry.group_id == group_id and
+            entry.coverage_generation == index_status.coverage_generation and
+            entry.coverage_config_hash == index_status.coverage_config_hash and
+            std.mem.eql(u8, entry.index_name, index_status.name) and
+            std.mem.eql(u8, entry.index_kind, index_status.kind);
+    }
+
+    fn entryIndexAssumeLocked(
+        self: *const @This(),
+        store_id: u64,
+        reporter_incarnation: u64,
+        group_id: u64,
+        index_status: metadata_table_manager.RuntimeIndexStatusReport,
+    ) ?usize {
+        for (self.entries.items, 0..) |entry, i| {
+            if (entry.store_id == store_id and
+                entryMatchesIndex(entry, reporter_incarnation, group_id, index_status)) return i;
+        }
+        return null;
+    }
+
+    fn mergeObservedActivitiesAssumeLocked(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        report: metadata_table_manager.StoreStatusReport,
+        now_ns: u64,
+    ) !void {
+        for (report.runtime_statuses) |runtime_status| {
+            for (runtime_status.indexes) |index_status| {
+                if (!index_status.embedding_activity_observed) continue;
+                if (self.entryIndexAssumeLocked(
+                    report.store_id,
+                    report.reporter_incarnation,
+                    runtime_status.group_id,
+                    index_status,
+                )) |entry_index| {
+                    if (!activityAvailable(index_status)) {
+                        const removed = self.entries.swapRemove(entry_index);
+                        removed.deinit(alloc);
+                        continue;
+                    }
+                    self.entries.items[entry_index].activity = index_status.embedding_activity;
+                    self.entries.items[entry_index].observed_at_ns = now_ns;
+                    continue;
+                }
+                if (!activityAvailable(index_status)) continue;
+                const index_name = try alloc.dupe(u8, index_status.name);
+                errdefer alloc.free(index_name);
+                const index_kind = try alloc.dupe(u8, index_status.kind);
+                errdefer alloc.free(index_kind);
+                try self.entries.append(alloc, .{
+                    .store_id = report.store_id,
+                    .reporter_incarnation = report.reporter_incarnation,
+                    .group_id = runtime_status.group_id,
+                    .coverage_generation = index_status.coverage_generation,
+                    .coverage_config_hash = index_status.coverage_config_hash,
+                    .index_name = index_name,
+                    .index_kind = index_kind,
+                    .activity = index_status.embedding_activity,
+                    .observed_at_ns = now_ns,
+                });
+            }
+        }
+    }
+
+    fn reconcileNewStoreSnapshotAssumeLocked(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        report: metadata_table_manager.StoreStatusReport,
+        now_ns: u64,
+    ) !void {
+        // Reports are best-effort observations, not complete activity
+        // snapshots. Merge only fields the owner explicitly observed. Entries
+        // for omitted, dropped, or recreated indexes remain TTL-bounded and
+        // cannot project because overlay rechecks the exact durable identity.
+        try self.mergeObservedActivitiesAssumeLocked(alloc, report, now_ns);
+    }
+
+    fn refreshSameGenerationActivitiesAssumeLocked(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        report: metadata_table_manager.StoreStatusReport,
+        now_ns: u64,
+    ) !void {
+        for (report.runtime_statuses) |runtime_status| {
+            for (runtime_status.indexes) |index_status| {
+                if (!index_status.embedding_activity_observed) continue;
+                if (self.entryIndexAssumeLocked(
+                    report.store_id,
+                    report.reporter_incarnation,
+                    runtime_status.group_id,
+                    index_status,
+                )) |entry_index| {
+                    if (index_status.embedding_activity.epoch == 0) {
+                        const removed = self.entries.swapRemove(entry_index);
+                        removed.deinit(alloc);
+                        continue;
+                    }
+                    // Same-generation reports are replayable. Refresh liveness
+                    // but do not let a reordered payload regress monotonic
+                    // counters.
+                    if (self.entries.items[entry_index].activity.epoch == index_status.embedding_activity.epoch)
+                        self.entries.items[entry_index].observed_at_ns = now_ns;
+                    continue;
+                }
+                if (index_status.embedding_activity.epoch == 0) continue;
+                const index_name = try alloc.dupe(u8, index_status.name);
+                errdefer alloc.free(index_name);
+                const index_kind = try alloc.dupe(u8, index_status.kind);
+                errdefer alloc.free(index_kind);
+                try self.entries.append(alloc, .{
+                    .store_id = report.store_id,
+                    .reporter_incarnation = report.reporter_incarnation,
+                    .group_id = runtime_status.group_id,
+                    .coverage_generation = index_status.coverage_generation,
+                    .coverage_config_hash = index_status.coverage_config_hash,
+                    .index_name = index_name,
+                    .index_kind = index_kind,
+                    .activity = index_status.embedding_activity,
+                    .observed_at_ns = now_ns,
+                });
+            }
         }
     }
 
@@ -162,11 +288,11 @@ const EmbeddingActivityCache = struct {
                 if (fence.reporter_incarnation == report.reporter_incarnation) {
                     if (report.status_generation < fence.status_generation) continue;
                     if (report.status_generation == fence.status_generation) {
-                        // Periodic heartbeat of the same immutable owner
-                        // snapshot refreshes liveness without reapplying data.
-                        self.refreshStoreAssumeLocked(report.store_id, now_ns);
+                        try self.refreshSameGenerationActivitiesAssumeLocked(alloc, report, now_ns);
                         continue;
                     }
+                } else {
+                    self.removeStoreAssumeLocked(alloc, report.store_id);
                 }
                 fence.* = .{
                     .store_id = report.store_id,
@@ -181,30 +307,7 @@ const EmbeddingActivityCache = struct {
                 });
             }
 
-            // A report is a full owner snapshot. Replace this store's prior
-            // entries atomically so removed indexes and restarted epochs never
-            // linger until TTL expiry.
-            self.removeStoreAssumeLocked(alloc, report.store_id);
-            for (report.runtime_statuses) |runtime_status| {
-                for (runtime_status.indexes) |index_status| {
-                    if (!activityPresent(index_status.embedding_activity)) continue;
-                    const index_name = try alloc.dupe(u8, index_status.name);
-                    errdefer alloc.free(index_name);
-                    const index_kind = try alloc.dupe(u8, index_status.kind);
-                    errdefer alloc.free(index_kind);
-                    try self.entries.append(alloc, .{
-                        .store_id = report.store_id,
-                        .reporter_incarnation = report.reporter_incarnation,
-                        .group_id = runtime_status.group_id,
-                        .coverage_generation = index_status.coverage_generation,
-                        .coverage_config_hash = index_status.coverage_config_hash,
-                        .index_name = index_name,
-                        .index_kind = index_kind,
-                        .activity = index_status.embedding_activity,
-                        .observed_at_ns = now_ns,
-                    });
-                }
-            }
+            try self.reconcileNewStoreSnapshotAssumeLocked(alloc, report, now_ns);
         }
     }
 
@@ -1037,7 +1140,8 @@ fn runtimeEmbeddingActivityPresent(activity: metadata_table_manager.RuntimeEmbed
 fn storeHasRuntimeEmbeddingActivity(record: metadata_table_manager.StoreRecord) bool {
     for (record.runtime_statuses) |runtime_status| {
         for (runtime_status.indexes) |index_status| {
-            if (runtimeEmbeddingActivityPresent(index_status.embedding_activity)) return true;
+            if (index_status.embedding_activity_observed or
+                runtimeEmbeddingActivityPresent(index_status.embedding_activity)) return true;
         }
     }
     return false;
@@ -1075,7 +1179,10 @@ fn stripRuntimeRepairStatus(record: *metadata_table_manager.StoreRecord) void {
 
 fn stripRuntimeEmbeddingActivity(record: *metadata_table_manager.StoreRecord) void {
     for (record.runtime_statuses) |*runtime_status| {
-        for (runtime_status.indexes) |*index_status| index_status.embedding_activity = .{};
+        for (runtime_status.indexes) |*index_status| {
+            index_status.embedding_activity_observed = false;
+            index_status.embedding_activity = .{};
+        }
     }
 }
 
@@ -7451,6 +7558,7 @@ test "metadata service transition commands negotiate runtime status payload vers
         .kind = "dense_vector",
         .repair_status = .rebuilding,
         .repair_active_generation_serviceable = true,
+        .embedding_activity_observed = true,
         .embedding_activity = .{ .epoch = 9, .embeddings_computed = 17 },
         .source_replay = source_replay[0..],
     }};
@@ -7648,7 +7756,7 @@ test "metadata service projects optional activity without freezing older status"
     try std.testing.expect(!storeHasRuntimeEmbeddingActivity(projected[0]));
 }
 
-test "metadata activity cache is versioned TTL-bound and incarnation scoped" {
+test "metadata service activity cache is versioned TTL-bound and incarnation scoped" {
     const alloc = std.testing.allocator;
     var committed_indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
         .name = "semantic",
@@ -7668,6 +7776,7 @@ test "metadata activity cache is versioned TTL-bound and incarnation scoped" {
         .runtime_statuses = committed_runtime[0..],
     };
     var observed_indexes = committed_indexes;
+    observed_indexes[0].embedding_activity_observed = true;
     observed_indexes[0].embedding_activity = .{
         .epoch = 77,
         .phase = .embedding,
@@ -7744,6 +7853,86 @@ test "metadata activity cache is versioned TTL-bound and incarnation scoped" {
     try cache.update(alloc, &.{committed}, &.{legacy_report}, 200);
     cache.overlay(alloc, &current, 201);
     try std.testing.expectEqual(@as(u64, 0), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+}
+
+test "metadata service activity cache distinguishes observation gaps from observed idle" {
+    const alloc = std.testing.allocator;
+    var committed_indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
+        .name = "semantic",
+        .kind = "dense_vector",
+        .coverage_generation = 7,
+        .coverage_config_hash = 9,
+    }};
+    var committed_runtime = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .group_id = 11,
+        .indexes = committed_indexes[0..],
+    }};
+    const committed = metadata_table_manager.StoreRecord{
+        .store_id = 3,
+        .node_id = 4,
+        .reporter_incarnation = 0x1234,
+        .status_generation = 5,
+        .runtime_statuses = committed_runtime[0..],
+    };
+
+    var active_indexes = committed_indexes;
+    active_indexes[0].embedding_activity_observed = true;
+    active_indexes[0].embedding_activity = .{
+        .epoch = 77,
+        .phase = .embedding,
+        .embeddings_computed = 12,
+    };
+    var active_runtime = committed_runtime;
+    active_runtime[0].indexes = active_indexes[0..];
+    const active_report = metadata_table_manager.StoreStatusReport{
+        .store_id = 3,
+        .embedding_activity_protocol_version = embedding_activity_protocol_version,
+        .reporter_incarnation = 0x1234,
+        .status_generation = 6,
+        .runtime_statuses = active_runtime[0..],
+    };
+
+    var cache: EmbeddingActivityCache = .{};
+    defer cache.deinit(alloc);
+    try cache.update(alloc, &.{committed}, &.{active_report}, 100);
+
+    // A newer durable snapshot can miss the lifecycle lock. Preserve the last
+    // explicit owner sample, but do not turn the miss into a heartbeat.
+    var unavailable_runtime = committed_runtime;
+    unavailable_runtime[0].indexes = committed_indexes[0..];
+    var unavailable_report = active_report;
+    unavailable_report.status_generation = 7;
+    unavailable_report.runtime_statuses = unavailable_runtime[0..];
+    try cache.update(alloc, &.{committed}, &.{unavailable_report}, 120);
+
+    var current = [_]metadata_table_manager.StoreRecord{try metadata_table_manager.cloneStore(alloc, committed)};
+    defer metadata_table_manager.freeStore(alloc, current[0]);
+    cache.overlay(alloc, &current, 121);
+    try std.testing.expectEqual(@as(u64, 77), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+    current[0].runtime_statuses[0].indexes[0].embedding_activity = .{};
+    cache.overlay(alloc, &current, 100 + embedding_activity_ttl_ns);
+    try std.testing.expectEqual(@as(u64, 0), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+
+    // Idle is an observed owner state, not an absence. It replaces active
+    // telemetry immediately and remains distinguishable from unavailable.
+    var resumed_report = active_report;
+    resumed_report.status_generation = 8;
+    try cache.update(alloc, &.{committed}, &.{resumed_report}, 200 + embedding_activity_ttl_ns);
+    var idle_indexes = active_indexes;
+    idle_indexes[0].embedding_activity.phase = .idle;
+    idle_indexes[0].embedding_activity.active_batch_size = 0;
+    var idle_runtime = committed_runtime;
+    idle_runtime[0].indexes = idle_indexes[0..];
+    var idle_report = active_report;
+    idle_report.status_generation = 9;
+    idle_report.runtime_statuses = idle_runtime[0..];
+    try cache.update(alloc, &.{committed}, &.{idle_report}, 201 + embedding_activity_ttl_ns);
+    cache.overlay(alloc, &current, 202 + embedding_activity_ttl_ns);
+    try std.testing.expectEqual(@as(u64, 77), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
+    try std.testing.expectEqual(
+        metadata_table_manager.RuntimeEmbeddingActivityStatusReport.Phase.idle,
+        current[0].runtime_statuses[0].indexes[0].embedding_activity.phase,
+    );
 }
 
 test "metadata service gates mandatory native restore identity until protocol activation" {
