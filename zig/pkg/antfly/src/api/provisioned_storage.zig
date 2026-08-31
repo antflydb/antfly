@@ -415,6 +415,7 @@ pub const ProvisionedGroupStorage = struct {
         self.read_cache.backend_runtime = runtime;
         self.write_cache.backend_runtime = runtime;
         self.startup_write_cache.backend_runtime = runtime;
+        self.runtime_status_cache.setModeledRuntimeTelemetry(runtime.usesBorrowedIo());
         read_source.backend_runtime = runtime;
         write_source.backend_runtime = runtime;
     }

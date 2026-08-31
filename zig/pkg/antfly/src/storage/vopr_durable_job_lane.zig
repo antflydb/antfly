@@ -1,14 +1,13 @@
 // Copyright 2026 Antfly, Inc.
 // Licensed under the Elastic License 2.0 (ELv2).
 
-//! Antfly adapter from the production durable-job contract to VOPR's narrow
-//! deterministic executor. The reusable scheduler remains in `lib/vopr`; the
-//! knowledge of Antfly job classes and owner lifetimes stays here.
+//! Antfly adapter from the production durable-job contract to a deterministic
+//! `std.Io`. The reusable scheduler remains in `lib/vopr`; this file owns only
+//! Antfly job classes and owner lifetimes.
 //!
-//! A submission becomes one atomic VOPR scheduler transition. `closeOwner`
-//! cancels queued work because a deterministic runtime cannot synchronously
-//! wait for its own scheduler. `drainOwner` therefore requires the caller to
-//! have driven the runtime to quiescence and fails loudly if work is pending.
+//! Jobs are ordinary `std.Io` group tasks rather than atomic VOPR callbacks.
+//! Production work may therefore sleep, wait on futexes, perform I/O, and
+//! observe cancellation without escaping the simulated runtime.
 
 const std = @import("std");
 const vopr = @import("vopr");
@@ -17,8 +16,7 @@ const lsm_background = @import("lsm_backend/background.zig");
 
 pub const Lane = struct {
     allocator: std.mem.Allocator,
-    executor: vopr.runtime.Executor,
-    next_sequence: u64 = 1,
+    io: std.Io,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     closed_owners: std.AutoHashMapUnmanaged(u64, void) = .empty,
     paused_owners: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -28,25 +26,23 @@ pub const Lane = struct {
 
     const Entry = struct {
         lane: *Lane,
-        task_id: vopr.runtime.TaskId,
+        group: std.Io.Group = .init,
         job: background_runtime.Job,
+        finished: bool = false,
 
-        fn run(ptr: *anyopaque) !void {
-            const self: *Entry = @ptrCast(@alignCast(ptr));
+        fn run(self: *Entry) std.Io.Cancelable!void {
+            defer {
+                self.job.deinit(self.job.ptr);
+                self.finished = true;
+            }
             self.job.run(self.job.ptr) catch |err| {
+                if (err == error.Canceled or err == error.Cancelled)
+                    return error.Canceled;
                 self.lane.failed_jobs +|= 1;
                 self.lane.last_error_name = @errorName(err);
                 return;
             };
             self.lane.completed_jobs +|= 1;
-        }
-
-        fn deinit(ptr: *anyopaque) void {
-            const self: *Entry = @ptrCast(@alignCast(ptr));
-            const owner = self.lane;
-            owner.removeEntry(self);
-            self.job.deinit(self.job.ptr);
-            owner.allocator.destroy(self);
         }
     };
 
@@ -57,17 +53,15 @@ pub const Lane = struct {
         last_error_name: ?[]const u8,
     };
 
-    pub fn init(allocator: std.mem.Allocator, executor: vopr.runtime.Executor) Lane {
-        return .{ .allocator = allocator, .executor = executor };
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Lane {
+        return .{ .allocator = allocator, .io = io };
     }
 
     pub fn deinit(self: *Lane) void {
         while (self.entries.items.len != 0) {
-            const task_id = self.entries.items[self.entries.items.len - 1].task_id;
-            const canceled = self.executor.cancel(task_id) catch |err| {
-                std.debug.panic("failed to cancel VOPR durable job during teardown: {s}", .{@errorName(err)});
-            };
-            if (!canceled) @panic("VOPR durable job disappeared during serialized teardown");
+            const entry = self.entries.items[self.entries.items.len - 1];
+            entry.group.cancel(self.io);
+            self.removeAndDestroyEntry(entry);
         }
         self.entries.deinit(self.allocator);
         self.closed_owners.deinit(self.allocator);
@@ -96,21 +90,6 @@ pub const Lane = struct {
         };
     }
 
-    fn className(class: background_runtime.Job.Class) []const u8 {
-        return switch (class) {
-            .commit_durable => "antfly.commit_durable",
-            .maintenance => "antfly.maintenance",
-            .cleanup => "antfly.cleanup",
-        };
-    }
-
-    fn allocateTaskId(self: *Lane, owner_id: u64) !vopr.runtime.TaskId {
-        if (self.next_sequence == std.math.maxInt(u64)) return error.VoprDurableJobSequenceExhausted;
-        const sequence = self.next_sequence;
-        self.next_sequence += 1;
-        return vopr.id.derive("antfly.durable-job", owner_id, sequence);
-    }
-
     fn submit(ptr: *anyopaque, job: background_runtime.Job) !void {
         const self: *Lane = @ptrCast(@alignCast(ptr));
         if (job.owner_id == 0) return error.InvalidBackgroundOwner;
@@ -121,26 +100,20 @@ pub const Lane = struct {
         errdefer self.allocator.destroy(entry);
         entry.* = .{
             .lane = self,
-            .task_id = try self.allocateTaskId(job.owner_id),
             .job = job,
         };
         try self.entries.append(self.allocator, entry);
         errdefer _ = self.entries.pop();
-        try self.executor.submit(.{
-            .id = entry.task_id,
-            .name = className(job.class),
-            .context = entry,
-            .run_fn = Entry.run,
-            .deinit_fn = Entry.deinit,
-        });
+        entry.group.async(self.io, Entry.run, .{entry});
     }
 
     fn drainOwner(ptr: *anyopaque, owner_id: u64) void {
         const self: *Lane = @ptrCast(@alignCast(ptr));
-        for (self.entries.items) |entry| {
-            if (entry.job.owner_id == owner_id) {
-                @panic("drive the VOPR scheduler to quiescence before draining a durable-job owner");
-            }
+        while (self.findOwnerEntry(owner_id)) |entry| {
+            entry.group.await(self.io) catch |err| switch (err) {
+                error.Canceled => {},
+            };
+            self.removeAndDestroyEntry(entry);
         }
     }
 
@@ -150,14 +123,9 @@ pub const Lane = struct {
         self.closed_owners.put(self.allocator, owner_id, {}) catch |err| {
             std.debug.panic("failed to close VOPR durable-job owner: {s}", .{@errorName(err)});
         };
-        while (true) {
-            const task_id = for (self.entries.items) |entry| {
-                if (entry.job.owner_id == owner_id) break entry.task_id;
-            } else break;
-            const canceled = self.executor.cancel(task_id) catch |err| {
-                std.debug.panic("failed to cancel VOPR durable job: {s}", .{@errorName(err)});
-            };
-            if (!canceled) @panic("VOPR durable job disappeared during serialized owner close");
+        while (self.findOwnerEntry(owner_id)) |entry| {
+            entry.group.cancel(self.io);
+            self.removeAndDestroyEntry(entry);
         }
     }
 
@@ -185,10 +153,23 @@ pub const Lane = struct {
         return 0;
     }
 
-    fn removeEntry(self: *Lane, target: *Entry) void {
+    fn findOwnerEntry(self: *Lane, owner_id: u64) ?*Entry {
+        for (self.entries.items) |entry|
+            if (entry.job.owner_id == owner_id) return entry;
+        return null;
+    }
+
+    fn removeAndDestroyEntry(self: *Lane, target: *Entry) void {
         for (self.entries.items, 0..) |entry, index| {
             if (entry == target) {
                 _ = self.entries.swapRemove(index);
+                // A group canceled before its function starts never enters
+                // Entry.run, so the production job still owns its deinit hook.
+                if (!target.finished) {
+                    target.job.deinit(target.job.ptr);
+                    target.finished = true;
+                }
+                self.allocator.destroy(target);
                 return;
             }
         }
@@ -223,9 +204,9 @@ test "VOPR durable job lane runs the production LSM background executor as a sch
         }
     };
 
-    var runtime = vopr.sim_runtime.SimRuntime.init(std.testing.allocator, 0);
+    var runtime = try vopr.vopr_io.VoprIo.init(.{ .task_allocator = std.testing.allocator });
     defer runtime.deinit();
-    var adapter = Lane.init(std.testing.allocator, runtime.runtime().executor);
+    var adapter = Lane.init(std.testing.allocator, runtime.io());
     defer adapter.deinit();
     var context = Context{};
     const production_executor = lsm_background.Executor.initLane(adapter.lane(), 41);
@@ -244,9 +225,9 @@ test "VOPR durable job lane runs the production LSM background executor as a sch
 
     try std.testing.expectEqual(@as(usize, 1), context.runs);
     try std.testing.expectEqual(@as(usize, 1), context.deinits);
-    try std.testing.expectEqual(@as(usize, 0), adapter.stats().pending_jobs);
     try std.testing.expectEqual(@as(u64, 1), adapter.stats().completed_jobs);
     adapter.lane().drainOwner(41);
+    try std.testing.expectEqual(@as(usize, 0), adapter.stats().pending_jobs);
 }
 
 test "VOPR durable job owner close cancels queued work exactly once" {
@@ -265,9 +246,9 @@ test "VOPR durable job owner close cancels queued work exactly once" {
         }
     };
 
-    var runtime = vopr.sim_runtime.SimRuntime.init(std.testing.allocator, 0);
+    var runtime = try vopr.vopr_io.VoprIo.init(.{ .task_allocator = std.testing.allocator });
     defer runtime.deinit();
-    var adapter = Lane.init(std.testing.allocator, runtime.runtime().executor);
+    var adapter = Lane.init(std.testing.allocator, runtime.io());
     defer adapter.deinit();
     var context = Context{};
     try adapter.lane().submit(.{
@@ -309,9 +290,9 @@ test "VOPR durable job owner uses production pause close and reopen protocol" {
         }
     };
 
-    var runtime = vopr.sim_runtime.SimRuntime.init(std.testing.allocator, 0);
+    var runtime = try vopr.vopr_io.VoprIo.init(.{ .task_allocator = std.testing.allocator });
     defer runtime.deinit();
-    var adapter = Lane.init(std.testing.allocator, runtime.runtime().executor);
+    var adapter = Lane.init(std.testing.allocator, runtime.io());
     defer adapter.deinit();
     const lane = adapter.lane();
     var context = Context{};

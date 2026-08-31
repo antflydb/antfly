@@ -67,7 +67,7 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
         },
     });
     defer backend_runtime.deinit();
-    var background_jobs = durable_job_lane.Lane.init(alloc, vopr_io.executor());
+    var background_jobs = durable_job_lane.Lane.init(alloc, io);
     defer background_jobs.deinit();
     backend_runtime.durable_jobs = background_jobs.lane();
 

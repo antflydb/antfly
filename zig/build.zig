@@ -6620,6 +6620,7 @@ pub fn build(b: *std.Build) void {
             "committed generation reconciliation preserves the validated candidate",
             "generation publication marker parsing preserves allocator exhaustion",
             "manual generation runtime uses an explicit filesystem io authority",
+            "provisioned table write source borrows runtime IO without native fallback",
         },
     });
     const run_api_table_writes_production_regression_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
@@ -7492,6 +7493,18 @@ pub fn build(b: *std.Build) void {
     );
     production_cluster_disk_capacity_vopr_test_step.dependOn(&run_production_cluster_disk_capacity_vopr_tests.step);
 
+    const production_cluster_managed_index_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production managed index publication recovery exact replay"},
+        .max_rss = full_cluster_vopr_max_rss,
+    });
+    const run_production_cluster_managed_index_vopr_tests = b.addRunArtifact(production_cluster_managed_index_vopr_tests);
+    const production_cluster_managed_index_vopr_test_step = b.step(
+        "production-cluster-managed-index-vopr-test",
+        "Run public managed-index pending readiness through DataServer reconstruction, durable repair, and all-node semantic recovery",
+    );
+    production_cluster_managed_index_vopr_test_step.dependOn(&run_production_cluster_managed_index_vopr_tests.step);
+
     const production_cluster_replication_backfill_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production replication backfill crosses public data raft and exact replays"},
@@ -7961,7 +7974,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_graph_split_socket_pressure_vopr_test_step.dependOn(&run_production_cluster_graph_split_socket_pressure_vopr_tests.step);
     const production_cluster_vopr_test_step = b.step(
         "production-cluster-vopr-test",
-        "Run every focused production DataServer cluster history through v52",
+        "Run every focused production DataServer cluster history through v53",
     );
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_deep_test_step);
@@ -7972,6 +7985,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_partial_write_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_resource_pressure_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_disk_capacity_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_managed_index_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_join_split_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_durable_join_takeover_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_durable_join_cancellation_vopr_test_step);

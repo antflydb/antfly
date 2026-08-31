@@ -51,6 +51,22 @@ pub fn addIndexToTableIndexesJson(
     index_name: []const u8,
     index_json: []const u8,
 ) ![]u8 {
+    return try addIndexToTableIndexesJsonWithIo(
+        alloc,
+        std.Io.Threaded.global_single_threaded.io(),
+        current_indexes_json,
+        index_name,
+        index_json,
+    );
+}
+
+pub fn addIndexToTableIndexesJsonWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    current_indexes_json: []const u8,
+    index_name: []const u8,
+    index_json: []const u8,
+) ![]u8 {
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
     var config = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
@@ -63,6 +79,7 @@ pub fn addIndexToTableIndexesJson(
     if (config.value != .object) return error.InvalidCreateIndexRequest;
     const stored_config = storedIndexConfigForMutationAlloc(
         alloc,
+        io,
         index_name,
         root.get(index_name),
         config.value,
@@ -96,6 +113,7 @@ pub fn addIndexToTableIndexesJson(
 
 fn storedIndexConfigForMutationAlloc(
     alloc: std.mem.Allocator,
+    io: std.Io,
     index_name: []const u8,
     existing: ?std.json.Value,
     requested: std.json.Value,
@@ -116,7 +134,7 @@ fn storedIndexConfigForMutationAlloc(
             }
         }
     }
-    return try coverage_policy_mod.withFreshIncarnationAlloc(alloc, requested);
+    return try coverage_policy_mod.withFreshIncarnationAllocWithIo(alloc, io, requested);
 }
 
 fn equivalentDerivedOutputConfig(

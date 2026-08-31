@@ -78,14 +78,15 @@ fn newIncarnation(io: std.Io) !i64 {
     return @intCast(try coverage_identity.generate(io));
 }
 
-pub fn withFreshIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+pub fn withFreshIncarnationAllocWithIo(alloc: std.mem.Allocator, io: std.Io, value: std.json.Value) ![]u8 {
     if (value != .object) return error.InvalidIndexConfig;
     try validateIndexConfig(value);
     _ = value.object.get("type") orelse return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    return try withIncarnationAlloc(alloc, value, @intCast(try newIncarnation(io)));
+}
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    return try withIncarnationAlloc(alloc, value, @intCast(try newIncarnation(io_impl.io())));
+pub fn withFreshIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return try withFreshIncarnationAllocWithIo(alloc, std.Io.Threaded.global_single_threaded.io(), value);
 }
 
 pub fn withIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value, coverage_incarnation: u64) ![]u8 {

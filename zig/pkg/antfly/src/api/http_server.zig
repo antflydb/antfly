@@ -10733,7 +10733,7 @@ pub const ApiHttpServer = struct {
         // Materialize catalog-owned fields once. The same exact config is sent
         // through consensus and used as the projection expectation, making the
         // operation idempotent across retries and leadership changes.
-        const expected_indexes_json = indexes_api.addIndexToTableIndexesJson(alloc, table_before.indexes_json, index_name, authorized_index_json) catch |err| switch (err) {
+        const expected_indexes_json = indexes_api.addIndexToTableIndexesJsonWithIo(alloc, self.inferenceIo(), table_before.indexes_json, index_name, authorized_index_json) catch |err| switch (err) {
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };

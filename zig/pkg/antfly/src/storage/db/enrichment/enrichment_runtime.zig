@@ -85,7 +85,9 @@ pub const Config = struct {
     /// Borrowed executor for request-scoped remote template and artifact I/O.
     io: ?std.Io = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
-    clock: platform_clock.Clock = platform_clock.Clock.real(),
+    /// Optional explicit clock for focused tests. Production composition
+    /// defaults to the clock paired with BackendRuntime's std.Io executor.
+    clock: ?platform_clock.Clock = null,
     inline_retry_max_attempts: u32 = transient_embed_retry_max_attempts,
     worker_retry_max_attempts: u32 = transient_worker_retry_max_attempts,
     /// Hard liveness guard for callers waiting on post-commit enrichment
@@ -243,8 +245,9 @@ const borrowed_cancellation_poll_max_ns: i64 = 250 * std.time.ns_per_ms;
 const ForegroundCatchUpGuard = struct {
     cancellation: CancellationToken = .none,
     deadline_ns: ?u64 = null,
+    clock: platform_clock.Clock = platform_clock.Clock.real(),
 
-    fn bounded(config: Config, cancellation: CancellationToken) @This() {
+    fn bounded(clock: platform_clock.Clock, config: Config, cancellation: CancellationToken) @This() {
         const timeout_ns = std.math.mul(
             u64,
             @max(config.sync_wait_timeout_ms, 1),
@@ -252,23 +255,25 @@ const ForegroundCatchUpGuard = struct {
         ) catch std.math.maxInt(u64);
         return .{
             .cancellation = cancellation,
-            .deadline_ns = platform_time.monotonicNs() +| timeout_ns,
+            .deadline_ns = clock.nowRealtimeNs() +| timeout_ns,
+            .clock = clock,
         };
     }
 
-    fn boundedBy(config: Config, cancellation: CancellationToken, deadline_ns: ?u64) @This() {
+    fn boundedBy(clock: platform_clock.Clock, config: Config, cancellation: CancellationToken, deadline_ns: ?u64) @This() {
         if (deadline_ns) |deadline| return .{
             .cancellation = cancellation,
             .deadline_ns = deadline,
+            .clock = clock,
         };
-        return bounded(config, cancellation);
+        return bounded(clock, config, cancellation);
     }
 
     fn check(self: @This()) !void {
         if (self.cancellation.isCancelled())
             return RuntimeError.EnrichmentWaitCanceled;
         if (self.deadline_ns) |deadline_ns| {
-            if (platform_time.monotonicNs() >= deadline_ns)
+            if (self.clock.nowRealtimeNs() >= deadline_ns)
                 return RuntimeError.EnrichmentWaitTimeout;
         }
     }
@@ -478,7 +483,7 @@ const query_yield_max_ns: u64 = 5 * std.time.ns_per_s;
 fn yieldToInteractiveEmbeds(runtime: *EnrichmentRuntime) void {
     if (comptime builtin.os.tag == .freestanding) return;
     if (enrichment_types.interactive_embed_inflight.load(.monotonic) == 0) return;
-    const start_ns = runtime.config.clock.nowRealtimeNs();
+    const start_ns = runtime.clock.nowRealtimeNs();
     while (enrichment_types.interactive_embed_inflight.load(.monotonic) > 0) {
         if (elapsedNsSince(runtime, start_ns) >= query_yield_max_ns) return;
         if (runtimeShuttingDown(runtime)) return;
@@ -505,13 +510,13 @@ fn runtimeShuttingDown(runtime: *EnrichmentRuntime) bool {
 }
 
 fn elapsedNsSince(runtime: *EnrichmentRuntime, start_ns: u64) u64 {
-    const end_ns = runtime.config.clock.nowRealtimeNs();
+    const end_ns = runtime.clock.nowRealtimeNs();
     if (end_ns <= start_ns) return 0;
     return end_ns - start_ns;
 }
 
 fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, items: usize, bytes: usize, max_bytes: usize) void {
-    const now_ms = runtime.config.clock.nowRealtimeMs();
+    const now_ms = runtime.clock.nowRealtimeMs();
     if (comptime builtin.os.tag == .freestanding) {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
@@ -550,7 +555,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
             runtime.last_embed_batch_items = @intCast(items);
             runtime.last_embed_batch_bytes = @intCast(bytes);
             runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
-            runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+            runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.clock.nowRealtimeMs());
             runtime.last_embed_batch_ns = elapsed_ns;
             runtime.total_embed_ns += elapsed_ns;
         }
@@ -571,7 +576,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
             runtime.last_embed_batch_items = @intCast(items);
             runtime.last_embed_batch_bytes = @intCast(bytes);
             runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
-            runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+            runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.clock.nowRealtimeMs());
             runtime.last_embed_batch_ns = elapsed_ns;
             runtime.total_embed_ns += elapsed_ns;
         }
@@ -586,7 +591,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
             runtime.last_embed_batch_items = @intCast(items);
             runtime.last_embed_batch_bytes = @intCast(bytes);
             runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
-            runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+            runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.clock.nowRealtimeMs());
             runtime.last_embed_batch_ns = elapsed_ns;
             runtime.total_embed_ns += elapsed_ns;
         }
@@ -637,7 +642,7 @@ fn noteTrackedRequestEmbedBatchFinished(
         runtime.last_embed_batch_items = @intCast(items);
         runtime.last_embed_batch_bytes = @intCast(bytes);
         runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
-        runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+        runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.clock.nowRealtimeMs());
         runtime.last_embed_batch_ns = elapsed_ns;
         runtime.total_embed_ns += elapsed_ns;
         return;
@@ -652,7 +657,7 @@ fn noteTrackedRequestEmbedBatchFinished(
         runtime.last_embed_batch_items = @intCast(items);
         runtime.last_embed_batch_bytes = @intCast(bytes);
         runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
-        runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+        runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.clock.nowRealtimeMs());
         runtime.last_embed_batch_ns = elapsed_ns;
         runtime.total_embed_ns += elapsed_ns;
     } else {
@@ -661,7 +666,7 @@ fn noteTrackedRequestEmbedBatchFinished(
         runtime.last_embed_batch_items = @intCast(items);
         runtime.last_embed_batch_bytes = @intCast(bytes);
         runtime.last_embed_batch_max_bytes = @intCast(max_bytes);
-        runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
+        runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.clock.nowRealtimeMs());
         runtime.last_embed_batch_ns = elapsed_ns;
         runtime.total_embed_ns += elapsed_ns;
     }
@@ -694,7 +699,7 @@ pub fn embedDenseTracked(
     dims: u32,
 ) ![]f32 {
     noteTrackedRequestEmbedBatchStarted(runtime, 1);
-    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const started_ns = runtime.clock.nowRealtimeNs();
     const vector = dense_embedder.embedDense(alloc, embedding_name, text, dims) catch |err| {
         noteTrackedRequestEmbedBatchFinished(runtime, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), false);
         return err;
@@ -713,7 +718,7 @@ pub fn embedDenseBatchTracked(
 ) ![]const []const f32 {
     const stats = textBatchByteStats(texts);
     noteTrackedRequestEmbedBatchStarted(runtime, texts.len);
-    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const started_ns = runtime.clock.nowRealtimeNs();
     const vectors = dense_embedder.embedDenseBatch(alloc, embedding_name, texts, dims) catch |err| {
         noteTrackedRequestEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
         return err;
@@ -747,7 +752,7 @@ pub fn embedDensePartsTracked(
         max_bytes = @max(max_bytes, bytes);
     }
     noteTrackedRequestEmbedBatchStarted(runtime, 1);
-    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const started_ns = runtime.clock.nowRealtimeNs();
     const vector = dense_embedder.embedDenseParts(alloc, embedding_name, parts, dims) catch |err| {
         noteTrackedRequestEmbedBatchFinished(runtime, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), false);
         return err;
@@ -2188,6 +2193,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     notify_ctx: *anyopaque,
     notify_fn: NotifyFn,
     config: Config,
+    clock: platform_clock.Clock = platform_clock.Clock.real(),
+    deadline_clock: platform_clock.Clock = platform_clock.Clock.real(),
     applied_sequence: u64 = 0,
     target_sequence: u64 = 0,
     processed_requests: u64 = 0,
@@ -2266,6 +2273,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .failure_pending_fence = failure_pending_fence,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
+            .clock = config.clock orelse platform_clock.Clock.real(),
+            .deadline_clock = config.clock orelse platform_clock.Clock.real(),
             .config = .{
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
@@ -2402,7 +2411,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 return RuntimeError.EnrichmentWorkerFailed;
             return;
         }
-        const guard = ForegroundCatchUpGuard.boundedBy(self.config, cancellation, deadline_ns);
+        const guard = ForegroundCatchUpGuard.boundedBy(self.deadline_clock, self.config, cancellation, deadline_ns);
         self.catchUpUntilGuarded(sequence, guard) catch |err| {
             const failure_envelope = terminalFailureEnvelopeSnapshot(self);
             if ((err == RuntimeError.EnrichmentWaitCanceled or err == RuntimeError.EnrichmentWaitTimeout) and
@@ -2595,6 +2604,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     notify_ctx: *anyopaque,
     notify_fn: NotifyFn,
     config: Config,
+    clock: platform_clock.Clock = platform_clock.Clock.real(),
+    deadline_clock: platform_clock.Clock = platform_clock.Clock.real(),
     ownership: ownership_mod.State,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
@@ -2687,6 +2698,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .failure_pending_fence = failure_pending_fence,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
+            .clock = config.clock orelse backend_runtime.clock(),
+            .deadline_clock = config.clock orelse backend_runtime.monotonicClock(),
             .config = .{
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
@@ -2740,16 +2753,26 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn stop(self: *EnrichmentRuntime) void {
         if (self.io_impl) |io_impl| {
             const io = io_impl.io();
-            self.mutex.lockUncancelable(io);
-            self.shutdown = true;
-            broadcastRuntimeStateChanged(self, io);
-            self.mutex.unlock(io);
+            self.beginTeardown();
 
             if (self.future) |*future| _ = future.await(io);
         }
         self.future = null;
         self.shutdown = false;
         self.ownership.release();
+    }
+
+    /// Publish shutdown without joining the worker. Deterministic owners call
+    /// this before draining their shared scheduler: the worker waits on an
+    /// intentionally un-cancelable condition, so task cancellation alone
+    /// cannot wake it to run defers and release DB ownership.
+    pub fn beginTeardown(self: *EnrichmentRuntime) void {
+        const io_impl = self.io_impl orelse return;
+        const io = io_impl.io();
+        self.mutex.lockUncancelable(io);
+        self.shutdown = true;
+        broadcastRuntimeStateChanged(self, io);
+        self.mutex.unlock(io);
     }
 
     pub fn isStarted(self: *const EnrichmentRuntime) bool {
@@ -2867,8 +2890,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             @max(self.config.sync_wait_timeout_ms, 1),
             std.time.ns_per_ms,
         ) catch std.math.maxInt(u64);
-        const effective_deadline_ns = deadline_ns orelse platform_time.monotonicNs() +| timeout_ns;
-        const now_ns = platform_time.monotonicNs();
+        const effective_deadline_ns = deadline_ns orelse self.deadline_clock.nowRealtimeNs() +| timeout_ns;
+        const now_ns = self.deadline_clock.nowRealtimeNs();
         const remaining_ns = effective_deadline_ns -| now_ns;
         const deadline = Io.Clock.Timestamp.fromNow(io, .{
             .clock = .awake,
@@ -2904,7 +2927,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 self.mutex.unlock(io);
                 return RuntimeError.EnrichmentWaitCanceled;
             }
-            if (platform_time.monotonicNs() >= effective_deadline_ns) {
+            if (self.deadline_clock.nowRealtimeNs() >= effective_deadline_ns) {
                 const applied = self.applied_sequence;
                 const target = self.target_sequence;
                 const worker_started = self.future != null;
@@ -2996,7 +3019,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.mutex.lockUncancelable(io);
         const wait_after_sequence = self.applied_sequence;
         self.mutex.unlock(io);
-        const guard = ForegroundCatchUpGuard.boundedBy(self.config, cancellation, deadline_ns);
+        const guard = ForegroundCatchUpGuard.boundedBy(self.deadline_clock, self.config, cancellation, deadline_ns);
         self.catchUpUntilGuarded(sequence, guard) catch |err| {
             self.mutex.lockUncancelable(io);
             const failure_envelope = terminalFailureEnvelopeSnapshot(self);
@@ -3028,7 +3051,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             const next_retry_at_ms = self.next_retry_at_ms;
             self.mutex.unlock(io);
 
-            const retry_due = retrying and self.config.clock.nowRealtimeMs() >= next_retry_at_ms;
+            const retry_due = retrying and self.clock.nowRealtimeMs() >= next_retry_at_ms;
             switch (foregroundCatchUpDecision(applied, sequence, runtime_target, failed, retrying, retry_due)) {
                 .complete => return,
                 .worker_failed => return RuntimeError.EnrichmentWorkerFailed,
@@ -3200,7 +3223,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.retry_failure_count = 0;
         }
         self.retry_failure_count +|= 1;
-        self.next_retry_at_ms = self.config.clock.nowRealtimeMs() +| workerRetryDelayMs(self.consecutive_retry_count);
+        self.next_retry_at_ms = self.clock.nowRealtimeMs() +| workerRetryDelayMs(self.consecutive_retry_count);
         self.retrying = true;
         self.retry_error_has_request_identity = false;
         status = runtimeStatusSnapshot(self);
@@ -3468,7 +3491,7 @@ fn waitForWorkerRetry(runtime: *EnrichmentRuntime, io: Io) bool {
         runtime.mutex.unlock(io);
         if (shutdown) return false;
 
-        const now_ms = runtime.config.clock.nowRealtimeMs();
+        const now_ms = runtime.clock.nowRealtimeMs();
         if (now_ms >= retry_at_ms) return true;
         const remaining_ms = retry_at_ms - now_ms;
         io.sleep(Io.Duration.fromMilliseconds(@intCast(@min(remaining_ms, 100))), .awake) catch {};
@@ -4197,7 +4220,7 @@ fn beginReplayPass(
         runtime.mutex.unlock(io);
         return false;
     }
-    if (runtime.retrying and runtime.config.clock.nowRealtimeMs() < runtime.next_retry_at_ms) {
+    if (runtime.retrying and runtime.clock.nowRealtimeMs() < runtime.next_retry_at_ms) {
         runtime.mutex.unlock(io);
         return RuntimeError.EnrichmentRetryInProgress;
     }
@@ -4312,7 +4335,7 @@ fn runForegroundCatchUpPassOwned(
 ) !void {
     try guard.check();
     setActiveFailureFingerprint(runtime, 0);
-    const now_ms = runtime.config.clock.nowRealtimeMs();
+    const now_ms = runtime.clock.nowRealtimeMs();
     runtime.mutex.lockUncancelable(io);
     const acquired = runtime.ownership.ensureLease(now_ms) catch |err| {
         runtime.ownership.noteAcquireFailure();
@@ -5736,7 +5759,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                 // the next native render inherit an already-expired deadline.
                 pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
                 pdf_session.?.setCancellationProbe(pdf_render_deadline.?.probe());
-                const render_started_ns = runtime.config.clock.nowRealtimeNs();
+                const render_started_ns = runtime.clock.nowRealtimeNs();
                 const rendered_page = pdf_session.?.renderPagePngAdaptiveAlloc(working_alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
                     logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, null, null, null, null, render_started_ns, @errorName(err));
                     if (!shouldIsolateOcrPageRenderFailure(err)) return err;
@@ -5841,7 +5864,7 @@ fn flushRuntimeGeneratedTextBatch(
         return try flushRuntimeGeneratedTextBatchSequential(runtime, alloc, working_alloc, producer, requests, unit_indices, parts_values, units, method, kind, quality_config, ocr_prompt, source_fingerprint, "native_batch_unsupported");
     }
 
-    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const started_ns = runtime.clock.nowRealtimeNs();
     const request_bytes = runtimeGeneratedTextBatchBytes(requests);
     var produced = assetProducerProduceBatchGuarded(runtime, producer, alloc, requests) catch |err| {
         logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, unit_indices, requests.len, request_bytes, "serial_fallback", @errorName(err), started_ns);
@@ -5902,7 +5925,7 @@ fn flushRuntimeGeneratedTextBatchSequential(
 ) !void {
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
     for (requests, unit_indices) |request, unit_idx| {
-        const started_ns = runtime.config.clock.nowRealtimeNs();
+        const started_ns = runtime.clock.nowRealtimeNs();
         const produced = assetProducerProduceGuarded(runtime, producer, alloc, request) catch |err| {
             logRuntimeOcrBatchProfile(runtime, source_fingerprint, units, &.{unit_idx}, 1, runtimeGeneratedTextRequestBytes(request), "serial", @errorName(err), started_ns);
             if (isUnavailableOcrModelError(kind, err)) {
@@ -5936,7 +5959,7 @@ fn runtimeReadProfileEnabled() bool {
 }
 
 fn profileElapsedMs(runtime: *EnrichmentRuntime, started_ns: u64) f64 {
-    const finished_ns = runtime.config.clock.nowRealtimeNs();
+    const finished_ns = runtime.clock.nowRealtimeNs();
     const elapsed_ns = if (finished_ns >= started_ns) finished_ns - started_ns else 0;
     return @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, std.time.ns_per_ms);
 }
@@ -8730,7 +8753,7 @@ fn flushChunkedDenseItems(
     const batch_stats = textBatchByteStats(batch_texts);
     yieldToInteractiveEmbeds(runtime);
     noteEmbedBatchStarted(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
-    const embed_started_ns = runtime.config.clock.nowRealtimeNs();
+    const embed_started_ns = runtime.clock.nowRealtimeNs();
     const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, batch_texts, expected_dims) catch |err| {
         noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         if (shouldYieldRequestError(runtime, err)) return err;
@@ -9291,7 +9314,7 @@ fn flushPlainDenseItems(
 
     yieldToInteractiveEmbeds(runtime);
     noteEmbedBatchStarted(runtime, items.len, total_source_bytes, max_source_bytes);
-    const embed_started_ns = runtime.config.clock.nowRealtimeNs();
+    const embed_started_ns = runtime.clock.nowRealtimeNs();
     const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, texts, expected_dims) catch |err| {
         noteEmbedBatchFinished(runtime, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         return err;
@@ -10191,7 +10214,7 @@ fn buildChunkDenseEmbeddingsFromSources(
         const batch_keys = chunk_keys.items[start..end];
         const batch_stats = textBatchByteStats(batch_texts);
         noteEmbedBatchStarted(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
-        const embed_started_ns = runtime.config.clock.nowRealtimeNs();
+        const embed_started_ns = runtime.clock.nowRealtimeNs();
         const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, requestEmbeddingName(request), batch_texts, request.expected_dims) catch |err| {
             noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return err;
@@ -10319,7 +10342,7 @@ fn buildChunkSparseEmbeddingsFromSources(
         const batch_hashes = chunk_hashes.items[start..end];
         const batch_stats = textBatchByteStats(batch_texts);
         noteEmbedBatchStarted(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
-        const embed_started_ns = runtime.config.clock.nowRealtimeNs();
+        const embed_started_ns = runtime.clock.nowRealtimeNs();
         const sparse_batch = embedSparseBatchWithRetry(sparse_embedder, runtime, requestEmbeddingName(request), batch_texts) catch |err| {
             noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return err;

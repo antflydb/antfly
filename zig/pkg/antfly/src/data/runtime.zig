@@ -1296,8 +1296,11 @@ const RaftTableApplyStateMachine = struct {
         catalog: antfly.public_api.table_catalog.CatalogSource,
         backend_runtime: ?*backend_runtime_mod.BackendRuntime,
     ) RaftTableApplyStateMachine {
-        var write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, catalog);
-        write_source.backend_runtime = backend_runtime;
+        const write_source = antfly.public_api.ProvisionedTableWriteSource.initWithBackendRuntime(
+            replica_root_dir,
+            catalog,
+            backend_runtime,
+        );
         return .{
             .alloc = alloc,
             .write_source = write_source,
@@ -15432,16 +15435,31 @@ pub const DataServer = struct {
         const runtime = try self.ensureBackendRuntime();
         if (self.provisioned_index_repair_active.load(.acquire)) return;
         lockAtomic(&self.provisioned_index_repair_mutex);
-        defer self.provisioned_index_repair_mutex.unlock();
-        if (self.provisioned_index_repair_shutdown.load(.acquire)) return error.BackgroundOwnerClosing;
-        if (self.provisioned_index_repair_active.load(.acquire)) return;
-        if (self.provisioned_index_repair_owner_id == 0) {
-            self.provisioned_index_repair_owner_id = try runtime.allocOwnerId();
+        if (self.provisioned_index_repair_shutdown.load(.acquire)) {
+            self.provisioned_index_repair_mutex.unlock();
+            return error.BackgroundOwnerClosing;
         }
+        if (self.provisioned_index_repair_active.load(.acquire)) {
+            self.provisioned_index_repair_mutex.unlock();
+            return;
+        }
+        if (self.provisioned_index_repair_owner_id == 0) {
+            self.provisioned_index_repair_owner_id = runtime.allocOwnerId() catch |err| {
+                self.provisioned_index_repair_mutex.unlock();
+                return err;
+            };
+        }
+        const owner_id = self.provisioned_index_repair_owner_id;
         self.provisioned_index_repair_active.store(true, .release);
+        self.provisioned_index_repair_mutex.unlock();
+
+        // A deterministic durable-job lane can suspend while admitting the
+        // job. Never retain a native atomic mutex across that scheduler
+        // boundary: cancellation and teardown run on peer fibers and must be
+        // able to close the owner that wakes the submitter.
         errdefer self.provisioned_index_repair_active.store(false, .release);
         try runtime.durable_jobs.submit(.{
-            .owner_id = self.provisioned_index_repair_owner_id,
+            .owner_id = owner_id,
             .class = .maintenance,
             .ptr = self,
             .run = runProvisionedIndexRepairJob,
@@ -16638,9 +16656,10 @@ pub const DataServer = struct {
                 remote_metadata.catalogSource(),
                 antfly.raft.read_gate.unavailableReadSafetyBarrier(),
             ),
-            .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            .write_source = antfly.public_api.ProvisionedTableWriteSource.initWithBackendRuntime(
                 cfg.replica_root_dir,
                 remote_metadata.catalogSource(),
+                backend_runtime,
             ),
             .status_source = remote_metadata.statusSource(),
             .api_server_cfg = cfg.api_server_cfg,
@@ -21143,7 +21162,7 @@ test "DataServer VOPR background owner executes and cancels maintenance on VoprI
         },
     });
     defer backend_runtime.deinit();
-    var background_jobs = durable_job_lane.Lane.init(alloc, sim.executor());
+    var background_jobs = durable_job_lane.Lane.init(alloc, io);
     defer background_jobs.deinit();
     backend_runtime.ptr().durable_jobs = background_jobs.lane();
 

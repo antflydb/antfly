@@ -925,6 +925,48 @@ pub const BackendRuntime = struct {
         return if (self.io_impl) |io_impl| io_impl.io() else null;
     }
 
+    /// Clock authority paired with this runtime's executor. Simulated callers
+    /// therefore observe VoprIo time while native callers retain wall-clock
+    /// behavior, without either path constructing a hidden executor.
+    pub fn clock(self: *BackendRuntime) platform.clock.Clock {
+        return .{
+            .ctx = self,
+            .now_realtime_ns_fn = runtimeNowRealtimeNs,
+            .sleep_ms_fn = runtimeSleepMs,
+        };
+    }
+
+    /// Monotonic deadline authority paired with this runtime's executor.
+    /// Keep timeout math independent from reversible realtime-clock faults.
+    pub fn monotonicClock(self: *BackendRuntime) platform.clock.Clock {
+        return .{
+            .ctx = self,
+            .now_realtime_ns_fn = runtimeNowMonotonicNs,
+            .sleep_ms_fn = runtimeSleepMs,
+        };
+    }
+
+    fn runtimeNowRealtimeNs(ctx: ?*anyopaque) u64 {
+        const self: *BackendRuntime = @ptrCast(@alignCast(ctx.?));
+        const runtime_io = self.io() orelse return platform.clock.Clock.real().nowRealtimeNs();
+        return @intCast(@max(0, std.Io.Clock.now(.real, runtime_io).nanoseconds));
+    }
+
+    fn runtimeNowMonotonicNs(ctx: ?*anyopaque) u64 {
+        const self: *BackendRuntime = @ptrCast(@alignCast(ctx.?));
+        const runtime_io = self.io() orelse return platform.time.monotonicNs();
+        return @intCast(@max(0, std.Io.Clock.now(.awake, runtime_io).nanoseconds));
+    }
+
+    fn runtimeSleepMs(ctx: ?*anyopaque, ms: u64) void {
+        const self: *BackendRuntime = @ptrCast(@alignCast(ctx.?));
+        const runtime_io = self.io() orelse {
+            platform.clock.Clock.real().sleepMs(ms);
+            return;
+        };
+        runtime_io.sleep(.fromMilliseconds(@intCast(@max(ms, 1))), .awake) catch {};
+    }
+
     pub fn usesBorrowedIo(self: *const BackendRuntime) bool {
         return self.borrowed_io != null;
     }

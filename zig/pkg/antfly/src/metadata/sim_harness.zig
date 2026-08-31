@@ -4034,18 +4034,37 @@ pub const MetadataHttpNodeSimulation = struct {
         self.cluster.metadata_proposal_in_flight += 1;
         defer self.cluster.metadata_proposal_in_flight -= 1;
 
+        // A composed deployment can report several data-server status changes
+        // at once. Concurrent proposals are valid, but concurrent attempts to
+        // recover an absent leader are not useful: each forced campaign raises
+        // a different term and the otherwise healthy quorum can livelock. One
+        // caller owns forced campaigns while every caller continues stepping
+        // the quorum and retrying its own proposal.
+        const owns_leader_recovery = self.cluster.metadata_leader_recovery_in_flight.cmpxchgStrong(
+            false,
+            true,
+            .acq_rel,
+            .acquire,
+        ) == null;
+        defer if (owns_leader_recovery)
+            self.cluster.metadata_leader_recovery_in_flight.store(false, .release);
+
         for (commands) |command| {
             const encoded = try metadata_storage.encodeTransitionCommand(self.cluster.alloc, command);
             defer self.cluster.alloc.free(encoded);
 
-            const recovery_candidate_index = bestMetadataElectionCandidateIndex(self.cluster) orelse self.index;
             var attempts: usize = 0;
             command_retry: while (attempts < 8) : (attempts += 1) {
                 const target_index = self.cluster.currentMetadataLeaderIndex() orelse {
+                    // Nested/concurrent callers must not advance every
+                    // election clock while the recovery owner is trying to
+                    // establish one candidate. Their mutation is retryable;
+                    // returning preserves the single-owner election schedule.
+                    if (!owns_leader_recovery) return error.NotLeader;
                     // A single, up-to-date candidate breaks synchronized
                     // election ties without continuously advancing terms on
                     // different replicas.
-                    self.cluster.node(recovery_candidate_index).campaignMetadataGroup() catch |err| switch (err) {
+                    self.cluster.campaignBestMetadataCandidate() catch |err| switch (err) {
                         error.UnknownGroup => {},
                         else => return err,
                     };
@@ -4224,6 +4243,7 @@ pub const MetadataHttpClusterSimulation = struct {
     manual_clock: *platform_clock.ManualClock,
     reconcile_lease_update_in_flight: bool = false,
     metadata_proposal_in_flight: usize = 0,
+    metadata_leader_recovery_in_flight: std.atomic.Value(bool) = .init(false),
     next_reallocation_request_id: u128 = 1,
     data_plane_ownership: DataPlaneOwnership = .co_located,
 
@@ -4370,6 +4390,7 @@ pub const MetadataHttpClusterSimulation = struct {
             .manual_clock = manual_clock,
             .reconcile_lease_update_in_flight = false,
             .metadata_proposal_in_flight = 0,
+            .metadata_leader_recovery_in_flight = .init(false),
         };
         try cluster.registerVirtualNodes();
         return cluster;
@@ -4417,6 +4438,28 @@ pub const MetadataHttpClusterSimulation = struct {
 
     pub fn node(self: *MetadataHttpClusterSimulation, index: usize) MetadataHttpNodeSimulation {
         return .{ .cluster = self, .index = index };
+    }
+
+    /// Break deterministic election lockstep without inventing authority. The
+    /// replica with the freshest log must campaign in a term strictly newer
+    /// than every observed candidate; otherwise a lagging replica that ticks
+    /// first can repeatedly consume the shared next term without ever being
+    /// eligible for an up-to-date quorum's votes.
+    pub fn campaignBestMetadataCandidate(self: *MetadataHttpClusterSimulation) !void {
+        const candidate_index = bestMetadataElectionCandidateIndex(self) orelse
+            return error.UnknownGroup;
+        var max_observed_term: u64 = 0;
+        for (self.cluster.nodes) |*replica| {
+            const status = replica.raftStatus(self.metadata_group_id) orelse continue;
+            max_observed_term = @max(max_observed_term, status.hard.current_term);
+        }
+        for (0..self.cluster.nodes.len + 2) |_| {
+            const status = self.cluster.node(candidate_index).raftStatus(self.metadata_group_id) orelse
+                return error.UnknownGroup;
+            if (status.hard.current_term > max_observed_term) return;
+            try self.cluster.node(candidate_index).campaignGroup(self.metadata_group_id);
+        }
+        return error.MetadataElectionTermDidNotAdvance;
     }
 
     pub fn backendRuntime(self: *MetadataHttpClusterSimulation, index: usize) *db_mod.background_runtime.BackendRuntime {
@@ -5344,6 +5387,12 @@ fn bestMetadataLeaderIndex(cluster: *MetadataHttpClusterSimulation) ?usize {
             const peer_status = peer.raftStatus(cluster.metadata_group_id) orelse continue;
             if (peer_status.hard.current_term == status.hard.current_term and peer_status.soft.leader_id == status.id) support += 1;
         }
+        // A local leader role is not sufficient authority for mutations. A
+        // former leader can retain that soft state while a quorum has moved to
+        // a higher term; routing proposals to it suppresses the recovery path
+        // and guarantees that the proposed index cannot commit.
+        const quorum = cluster.cluster.nodes.len / 2 + 1;
+        if (support < quorum) continue;
         if (best_index == null or
             support > best_support or
             (support == best_support and status.hard.current_term > best_term) or
@@ -5950,7 +5999,14 @@ pub const MetadataAdminSimSource = struct {
                 .linearizable_snapshot = linearizableSnapshot,
                 .status = status,
                 .admin_snapshot = adminSnapshot,
+                .validate_publication = validatePublication,
+                .validate_table_publication = validateTablePublication,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .create_table = createTable,
+                .drop_table = dropTable,
+                .update_schema = updateSchema,
+                .create_index = createIndex,
+                .drop_index = dropIndex,
                 .upsert_node = upsertNode,
                 .request_node_shutdown = requestNodeShutdown,
                 .cancel_node_shutdown = cancelNodeShutdown,
@@ -6001,9 +6057,83 @@ pub const MetadataAdminSimSource = struct {
         return try self.node.adminSnapshot();
     }
 
+    fn validatePublication(
+        ptr: *anyopaque,
+        contract: metadata_api.CatalogPublicationContract,
+    ) !bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = currentMetadataMutationNode(self.node);
+        if (target.index != self.node.index) return error.NotLeader;
+        var snapshot = try target.adminSnapshot();
+        defer target.freeAdminSnapshot(&snapshot);
+        return contract.matches(&snapshot);
+    }
+
+    fn validateTablePublication(
+        ptr: *anyopaque,
+        contract: metadata_api.CatalogTablePublicationContract,
+    ) !bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = currentMetadataMutationNode(self.node);
+        if (target.index != self.node.index) return error.NotLeader;
+        var snapshot = try target.adminSnapshot();
+        defer target.freeAdminSnapshot(&snapshot);
+        return contract.matches(&snapshot);
+    }
+
     fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.node.freeAdminSnapshot(snapshot);
+    }
+
+    fn createTable(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        table_name: []const u8,
+        req: api_tables.CreateTableRequest,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try applyCreateTableMutation(self.node, table_name, req);
+    }
+
+    fn dropTable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try applyDropTableMutation(self.node, alloc, table_name);
+    }
+
+    fn updateSchema(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema_json: []const u8,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try applyUpdateSchemaMutation(self.node, alloc, table_name, schema_json);
+    }
+
+    fn createIndex(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        index_json: []const u8,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try applyCreateIndexMutation(self.node, alloc, table_name, index_name, index_json);
+    }
+
+    fn dropIndex(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try applyDropIndexMutation(self.node, alloc, table_name, index_name);
     }
 
     fn upsertNode(ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.NodeRecord) !void {
@@ -6620,7 +6750,7 @@ pub const VoprPublicClusterFixture = struct {
         self.* = .{
             .alloc = alloc,
             .sim = sim,
-            .tmp = std.testing.tmpDir(.{}), // vopr-audit: allow(host_filesystem) production DB differential roots remain node-local
+            .tmp = std.testing.tmpDir(.{}), // vopr-audit: allow(host_filesystem) unique process-local namespace; all modeled I/O still uses VoprIo
         };
         return self;
     }

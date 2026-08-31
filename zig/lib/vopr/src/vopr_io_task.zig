@@ -223,6 +223,7 @@ pub const Kernel = struct {
     next_wait_sequence: u64 = 1,
     main_context: std.Io.fiber.Context = undefined,
     current: ?*Task = null,
+    execution_thread_id: std.atomic.Value(u64) = .init(0),
     tasks: std.ArrayListUnmanaged(*Task) = .empty,
     groups: std.ArrayListUnmanaged(*GroupState) = .empty,
     futex_wakes: std.ArrayListUnmanaged(FutexWake) = .empty,
@@ -877,9 +878,11 @@ pub const Kernel = struct {
     }
 
     noinline fn switchToTask(self: *Kernel, task: *Task) void {
+        self.execution_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
         const message: std.Io.fiber.Switch = .{ .old = &self.main_context, .new = &task.context };
         _ = std.Io.fiber.contextSwitch(&message);
         self.setCurrent(null);
+        self.execution_thread_id.store(0, .seq_cst);
     }
 
     noinline fn yieldCurrent(self: *Kernel, task: *Task) void {
@@ -895,7 +898,16 @@ pub const Kernel = struct {
     /// switch boundaries prevent either side from moving that state across the
     /// transfer.
     fn currentTask(self: *Kernel) ?*Task {
-        return @atomicLoad(?*Task, &self.current, .seq_cst);
+        const task = @atomicLoad(?*Task, &self.current, .seq_cst);
+        if (task != null) {
+            const expected = self.execution_thread_id.load(.seq_cst);
+            const actual: u64 = @intCast(std.Thread.getCurrentId());
+            if (expected != 0 and expected != actual) std.debug.panic(
+                "VoprIo accessed from foreign native thread expected_thread={} actual_thread={} task=0x{x} status={s}",
+                .{ expected, actual, @intFromPtr(task.?), @tagName(task.?.status) },
+            );
+        }
+        return task;
     }
 
     fn setCurrent(self: *Kernel, task: ?*Task) void {

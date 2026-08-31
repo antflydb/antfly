@@ -582,7 +582,7 @@ pub const Scenario = struct {
             .inference_admission = request_admission.RequestAdmission.init(1),
         };
         errdefer state.resources.deinit(fixture_alloc);
-        state.durable_jobs = vopr_durable_job_lane.Lane.init(fixture_alloc, state.sim.executor());
+        state.durable_jobs = vopr_durable_job_lane.Lane.init(fixture_alloc, state.sim.io());
         errdefer state.durable_jobs.deinit();
         try state.durable_jobs.registerOwner(background_owner);
         state.managed = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(fixture_alloc,

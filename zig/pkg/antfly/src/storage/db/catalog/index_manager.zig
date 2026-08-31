@@ -5806,11 +5806,11 @@ pub const IndexManager = struct {
         if (config_count <= 1 or builtin.single_threaded or allow_backfill or !read_only) return 1;
         if (self.load_parallelism) |value| return @min(@max(value, 1), config_count);
 
-        var parallelism = std.Thread.getCpuCount() catch 1;
-        parallelism /= 2;
-        if (parallelism == 0) parallelism = 1;
-        parallelism = @min(parallelism, 4);
-        return @min(parallelism, config_count);
+        // Executor capacity is runtime policy; host CPU discovery is neither
+        // stable replay input nor a reason to change index-open ordering.
+        // std.Io applies its own concurrency ceiling underneath this fixed,
+        // bounded task fanout.
+        return @min(@as(usize, 4), config_count);
     }
 
     fn loadConfiguredIndexesParallel(
@@ -5839,7 +5839,7 @@ pub const IndexManager = struct {
             results: []OpenResult,
             next_index: std.atomic.Value(usize) = .init(0),
 
-            fn run(state: *@This()) void {
+            fn run(state: *@This()) std.Io.Cancelable!void {
                 while (true) {
                     const index = state.next_index.fetchAdd(1, .monotonic);
                     if (index >= state.configs.len) return;
@@ -5871,26 +5871,18 @@ pub const IndexManager = struct {
             .results = results,
         };
 
-        const spawned_count = parallelism - 1;
-        var threads = try self.alloc.alloc(std.Thread, spawned_count);
-        defer self.alloc.free(threads);
-
-        var spawned: usize = 0;
-        var threads_joined = false;
-        errdefer {
-            if (!threads_joined) {
-                for (threads[0..spawned]) |*thread| thread.join();
-            }
+        if (self.io) |io| {
+            var group: std.Io.Group = .init;
+            defer group.cancel(io);
+            for (1..parallelism) |_| group.async(io, WorkerState.run, .{&state});
+            try WorkerState.run(&state);
+            try group.await(io);
+        } else {
+            // IndexManager instances without an executor are focused/native
+            // callers. Preserve correctness by opening serially instead of
+            // manufacturing an unowned native thread pool.
+            try WorkerState.run(&state);
         }
-        for (threads) |*thread| {
-            thread.* = try std.Thread.spawn(.{}, WorkerState.run, .{&state});
-            spawned += 1;
-        }
-
-        WorkerState.run(&state);
-
-        for (threads[0..spawned]) |*thread| thread.join();
-        threads_joined = true;
 
         // A failed index load quarantines that index instead of failing the
         // whole table open; the other indexes stay usable and the failure is
@@ -27892,7 +27884,7 @@ test "index load recovery classification only auto rebuilds incomplete publicati
     );
 }
 
-test "loadConfiguredIndexesParallel quarantines worker errors without double-joining threads" {
+test "loadConfiguredIndexesParallel quarantines worker errors on borrowed std Io tasks" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -27930,6 +27922,7 @@ test "loadConfiguredIndexesParallel quarantines worker errors without double-joi
 
     var manager = try IndexManager.init(alloc, path);
     defer manager.deinit();
+    manager.setIo(std.testing.io);
     manager.updateRange(.{ .start = "", .end = "" });
 
     for (configs) |cfg| {
@@ -27938,7 +27931,7 @@ test "loadConfiguredIndexesParallel quarantines worker errors without double-joi
 
     // A worker error no longer fails the load: the failing index is
     // quarantined (config retained, error recorded) while the healthy one
-    // loads normally — and the worker threads still join exactly once.
+    // loads normally — and the borrowed std.Io group drains exactly once.
     try manager.loadConfiguredIndexesParallel(&store, &configs, 2);
     try std.testing.expect(manager.textIndexEntry("ft_v1") != null);
     try std.testing.expect(manager.denseIndex("dv_bad") == null);

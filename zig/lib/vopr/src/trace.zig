@@ -119,6 +119,9 @@ pub const Trace = struct {
     faults: std.ArrayListUnmanaged(FaultRecord) = .empty,
     events: std.ArrayListUnmanaged(EventRecord) = .empty,
     observations: std.ArrayListUnmanaged(ObservationRecord) = .empty,
+    /// Record schemas repeat at every transition. Own each name/identity string
+    /// once per trace while records retain their ordinary wire representation.
+    record_strings: std.StringHashMapUnmanaged(void) = .empty,
     properties: std.ArrayListUnmanaged(PropertyRecord) = .empty,
     failures: std.ArrayListUnmanaged(FailureRecord) = .empty,
     summary: ?Summary = null,
@@ -190,22 +193,12 @@ pub const Trace = struct {
         self.allocator.free(self.config.backend_ids);
         for (self.config.scenario_parameters) |parameter| self.allocator.free(parameter.name);
         self.allocator.free(self.config.scenario_parameters);
-        for (self.choices.items) |record| {
-            self.allocator.free(record.site_name);
-            self.allocator.free(record.enabled_ids);
-        }
-        for (self.transitions.items) |record| self.allocator.free(record.name);
-        for (self.faults.items) |record| self.allocator.free(record.name);
-        for (self.events.items) |record| self.allocator.free(record.name);
-        for (self.observations.items) |record| {
-            for (record.features) |feature| self.allocator.free(feature.name);
-            self.allocator.free(record.features);
-        }
-        for (self.properties.items) |record| {
-            self.allocator.free(record.name);
-            self.allocator.free(record.details);
-        }
-        for (self.failures.items) |record| self.allocator.free(record.identity);
+        for (self.choices.items) |record| self.allocator.free(record.enabled_ids);
+        for (self.observations.items) |record| self.allocator.free(record.features);
+        for (self.properties.items) |record| if (record.details.len != 0) self.allocator.free(record.details);
+        var string_iterator = self.record_strings.keyIterator();
+        while (string_iterator.next()) |value| self.allocator.free(value.*);
+        self.record_strings.deinit(self.allocator);
         self.choices.deinit(self.allocator);
         self.transitions.deinit(self.allocator);
         self.faults.deinit(self.allocator);
@@ -217,8 +210,7 @@ pub const Trace = struct {
     }
 
     pub fn addChoice(self: *Trace, record: ChoiceRecord) !void {
-        const site_name = try self.allocator.dupe(u8, record.site_name);
-        errdefer self.allocator.free(site_name);
+        const site_name = try self.internRecordString(record.site_name);
         const enabled_ids = try self.allocator.dupe(ids.StableId, record.enabled_ids);
         errdefer self.allocator.free(enabled_ids);
         try self.choices.append(self.allocator, .{
@@ -231,8 +223,7 @@ pub const Trace = struct {
     }
 
     pub fn addTransition(self: *Trace, record: TransitionRecord) !void {
-        const name = try self.allocator.dupe(u8, record.name);
-        errdefer self.allocator.free(name);
+        const name = try self.internRecordString(record.name);
         try self.transitions.append(self.allocator, .{
             .index = record.index,
             .id = record.id,
@@ -246,14 +237,12 @@ pub const Trace = struct {
     }
 
     pub fn addFault(self: *Trace, record: FaultRecord) !void {
-        const name = try self.allocator.dupe(u8, record.name);
-        errdefer self.allocator.free(name);
+        const name = try self.internRecordString(record.name);
         try self.faults.append(self.allocator, .{ .index = record.index, .id = record.id, .name = name, .phase = record.phase });
     }
 
     pub fn addEvent(self: *Trace, record: EventRecord) !void {
-        const name = try self.allocator.dupe(u8, record.name);
-        errdefer self.allocator.free(name);
+        const name = try self.internRecordString(record.name);
         try self.events.append(self.allocator, .{
             .index = record.index,
             .ordinal = record.ordinal,
@@ -269,20 +258,32 @@ pub const Trace = struct {
     pub fn addObservation(self: *Trace, record: ObservationRecord) !void {
         const features = try self.allocator.alloc(observation.Feature, record.features.len);
         errdefer self.allocator.free(features);
-        var initialized: usize = 0;
-        errdefer for (features[0..initialized]) |feature| self.allocator.free(feature.name);
         for (record.features, 0..) |feature, index| {
-            features[index] = .{ .id = feature.id, .name = try self.allocator.dupe(u8, feature.name), .value = feature.value };
-            initialized += 1;
+            features[index] = .{
+                .id = feature.id,
+                .name = try self.internRecordString(feature.name),
+                .value = feature.value,
+            };
         }
         try self.observations.append(self.allocator, .{ .index = record.index, .digest = record.digest, .features = features });
     }
 
+    fn internRecordString(self: *Trace, value: []const u8) ![]const u8 {
+        if (value.len == 0) return "";
+        if (self.record_strings.getKey(value)) |existing| return existing;
+        const owned = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned);
+        try self.record_strings.put(self.allocator, owned, {});
+        return owned;
+    }
+
     pub fn addProperty(self: *Trace, record: PropertyRecord) !void {
-        const name = try self.allocator.dupe(u8, record.name);
-        errdefer self.allocator.free(name);
-        const details = try self.allocator.dupe(u8, record.details);
-        errdefer self.allocator.free(details);
+        const name = try self.internRecordString(record.name);
+        const details = if (record.details.len == 0)
+            ""
+        else
+            try self.allocator.dupe(u8, record.details);
+        errdefer if (details.len != 0) self.allocator.free(details);
         try self.properties.append(self.allocator, .{
             .index = record.index,
             .property_id = record.property_id,
@@ -294,8 +295,7 @@ pub const Trace = struct {
     }
 
     pub fn addFailure(self: *Trace, record: FailureRecord) !void {
-        const identity = try self.allocator.dupe(u8, record.identity);
-        errdefer self.allocator.free(identity);
+        const identity = try self.internRecordString(record.identity);
         try self.failures.append(self.allocator, .{
             .index = record.index,
             .class = record.class,
@@ -863,4 +863,38 @@ test "canonical value equality follows nested slice contents" {
     try std.testing.expect(canonicalValueEqual(expected_ids, actual_ids));
     try std.testing.expect(!canonicalValueEqual(expected_ids, different_ids));
     try std.testing.expect(canonicalValueEqual(expected_parameter_slice, actual_parameter_slice));
+}
+
+test "trace interns repeated record strings without changing records" {
+    var artifact = try Trace.init(std.testing.allocator, .{
+        .system = "test",
+        .scenario = "observation-name-interning",
+        .scenario_version = 1,
+        .source_revision = "v1",
+        .target = "native",
+        .optimize = "Debug",
+    }, .{ .transition_budget = 2 });
+    defer artifact.deinit();
+
+    const first_name = try std.testing.allocator.dupe(u8, "repeated.feature");
+    defer std.testing.allocator.free(first_name);
+    const second_name = try std.testing.allocator.dupe(u8, "repeated.feature");
+    defer std.testing.allocator.free(second_name);
+    try artifact.addObservation(.{
+        .index = 0,
+        .digest = 11,
+        .features = &.{.{ .id = 7, .name = first_name, .value = 1 }},
+    });
+    try artifact.addObservation(.{
+        .index = 1,
+        .digest = 12,
+        .features = &.{.{ .id = 7, .name = second_name, .value = 2 }},
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), artifact.record_strings.count());
+    try std.testing.expectEqual(
+        @intFromPtr(artifact.observations.items[0].features[0].name.ptr),
+        @intFromPtr(artifact.observations.items[1].features[0].name.ptr),
+    );
+    try std.testing.expectEqualStrings("repeated.feature", artifact.observations.items[1].features[0].name);
 }

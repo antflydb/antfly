@@ -16,12 +16,14 @@ const metadata_sim = @import("../metadata/sim_harness.zig");
 const raft_runtime_loop = @import("../raft/runtime_loop.zig");
 const raft_transport = @import("../raft/transport/mod.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
+const vopr_durable_job_lane = @import("../storage/vopr_durable_job_lane.zig");
 const api_http_client = @import("../api/http_client.zig");
 const api_http_server = @import("../api/http_server.zig");
 const api_batch = @import("../api/batch.zig");
 const api_distributed_graph = @import("../api/distributed_graph.zig");
 const api_distributed_join = @import("../api/distributed_join.zig");
 const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
+const managed_embedder = @import("../inference/managed_embedder.zig");
 const api_table_write_source = @import("../api/table_write_source.zig");
 const test_contract_helpers = @import("../api/test_contract_helpers.zig");
 const common_http = @import("../common/http/http_common.zig");
@@ -39,6 +41,7 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const http_disconnect = @import("http_disconnect.zig");
 const usermgr = @import("../usermgr/user_manager.zig");
 const db_types = @import("../storage/db/types.zig");
+const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 
 // The composed deployment uses the same service identity as the metadata
 // quorum fixture. Leaving this unset does not model an unauthenticated legacy
@@ -69,9 +72,14 @@ const ModeledCapacitySource = struct {
         const root_bytes = try self.sim.storageBytesUnderPrefix(self.root);
         const catalog_bytes = try self.sim.storageBytesUnderPrefix(self.catalog);
         const used_bytes = root_bytes +| catalog_bytes;
+        // Real capacity probes report allocated filesystem blocks, not the
+        // byte length of every logical record. Model that granularity so a
+        // process-local namespace encoded into a checksum cannot manufacture
+        // one-byte free-space drift between otherwise identical fresh worlds.
+        const allocated_bytes = std.mem.alignForward(u64, used_bytes, 4096);
         return .{
             .capacity_bytes = self.capacity_bytes,
-            .available_bytes = self.capacity_bytes -| used_bytes,
+            .available_bytes = self.capacity_bytes -| allocated_bytes,
         };
     }
 };
@@ -258,6 +266,10 @@ pub const Fixture = struct {
         "{\"query\":{\"match_all\":{}},\"fields\":[\"title\"],\"limit\":64,\"profile\":true,\"join\":{\"right_table\":\"docs\",\"join_type\":\"inner\",\"on\":{\"left_field\":\"customer_id\",\"right_field\":\"_id\",\"operator\":\"eq\"},\"strategy_hint\":\"shuffle\",\"right_fields\":[\"title\"]}}";
     const resource_probe_body =
         "{\"inserts\":{\"pressure:probe\":{\"title\":\"pressure\",\"body\":\"production-owner-resource-recovery\"}},\"sync_level\":\"write\"}";
+    const managed_index_name = "managed_semantic_idx";
+    const managed_index_body =
+        \\{"name":"managed_semantic_idx","type":"embeddings","publication_policy":"progressive","coverage_policy":"strict","field":"title","dimension":3,"embedder":{"provider":"antfly","model":"vopr-managed-index"},"execution":{"embedding":{"batch_items":1}}}
+    ;
     const docs_to_tenant_forbidden_body =
         "{\"inserts\":{\"tenant:forbidden\":{\"title\":\"docs-identity-must-not-write-tenant\"}},\"sync_level\":\"write\"}";
     const tenant_to_docs_forbidden_body =
@@ -304,6 +316,8 @@ pub const Fixture = struct {
     transition_executor_live: bool = false,
     backend_runtimes: [node_count]background_runtime.BackendRuntimeHandle = undefined,
     backend_runtime_count: usize = 0,
+    durable_job_lanes: [node_count]vopr_durable_job_lane.Lane = undefined,
+    durable_job_lane_count: usize = 0,
     backend_runtime_owners_started: usize = 0,
     join_job_backends: [node_count]mem_backend.Backend = undefined,
     join_job_backend_count: usize = 0,
@@ -398,6 +412,20 @@ pub const Fixture = struct {
     tenant_sound: bool = false,
     authenticated_tenant_isolation_enabled: bool = false,
     authenticated_tenant_isolation_sound: bool = false,
+    managed_index_publication_enabled: bool = false,
+    managed_index_provider_blocked: std.atomic.Value(bool) = .init(true),
+    managed_index_provider_calls: std.atomic.Value(u64) = .init(0),
+    managed_index_document_attempts: std.atomic.Value(u64) = .init(0),
+    managed_index_created: bool = false,
+    managed_index_initial_pending: bool = false,
+    managed_index_restart_target_index: usize = 1,
+    managed_index_owner_reconstructed: bool = false,
+    managed_index_provider_released: bool = false,
+    managed_index_all_nodes_ready: bool = false,
+    managed_index_replay_converged: bool = false,
+    managed_index_query_nodes: usize = 0,
+    managed_index_query_recovered: bool = false,
+    managed_index_sound: bool = false,
     docs_identity_tenant_read_status: u16 = 0,
     docs_identity_tenant_write_status: u16 = 0,
     docs_identity_tenant_absence_status: u16 = 0,
@@ -812,10 +840,73 @@ pub const Fixture = struct {
         self.authenticated_tenant_isolation_enabled = enabled;
     }
 
+    pub fn setManagedIndexPublicationEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.managed_index_publication_enabled = enabled;
+        self.managed_index_provider_blocked.store(enabled, .release);
+    }
+
     fn liveAuthorizationEnabled(self: *const Fixture) bool {
         return self.graph_inflight_authorization_revocation_enabled or
             self.global_query_authorization_revocation_enabled or
             self.authenticated_tenant_isolation_enabled;
+    }
+
+    fn managedIndexProvider(self: *Fixture) managed_embedder.AntflyProvider {
+        return .{
+            .ptr = self,
+            .embed_dense_texts = managedIndexDenseTexts,
+            .embed_sparse_texts = managedIndexSparseTexts,
+        };
+    }
+
+    fn managedIndexDenseTexts(
+        raw: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: []const u8,
+        texts: []const []const u8,
+    ) ![][]f32 {
+        const self: *Fixture = @ptrCast(@alignCast(raw));
+        _ = self.managed_index_provider_calls.fetchAdd(1, .monotonic);
+        var contains_document = false;
+        for (texts) |text| {
+            if (!std.mem.eql(u8, text, "antfly embedding dimension probe")) {
+                contains_document = true;
+                break;
+            }
+        }
+        if (contains_document) {
+            _ = self.managed_index_document_attempts.fetchAdd(texts.len, .monotonic);
+            const blocked = self.managed_index_provider_blocked.load(.acquire);
+            if (blocked) return error.Timeout;
+        }
+
+        const vectors = try allocator.alloc([]f32, texts.len);
+        errdefer allocator.free(vectors);
+        var initialized: usize = 0;
+        errdefer for (vectors[0..initialized]) |vector| allocator.free(vector);
+        for (texts, vectors) |text, *vector| {
+            const value: []const f32 = if (std.mem.indexOf(u8, text, "production-left") != null)
+                &.{ 1.0, 0.0, 0.0 }
+            else if (std.mem.indexOf(u8, text, "production-right") != null)
+                &.{ 0.0, 1.0, 0.0 }
+            else if (std.mem.indexOf(u8, text, "production-split") != null)
+                &.{ 0.0, 0.0, 1.0 }
+            else
+                &.{ 0.5, 0.5, 0.5 };
+            vector.* = try allocator.dupe(f32, value);
+            initialized += 1;
+        }
+        return vectors;
+    }
+
+    fn managedIndexSparseTexts(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: []const u8,
+        _: []const []const u8,
+    ) ![]db_embedder.SparseEmbedding {
+        return try allocator.alloc(db_embedder.SparseEmbedding, 0);
     }
 
     pub fn setJoinCancellationEnabled(self: *Fixture, enabled: bool) void {
@@ -1513,6 +1604,12 @@ pub const Fixture = struct {
                 .borrowed_io = .{ .general = self.sim.io() },
             });
             self.backend_runtime_count += 1;
+            self.durable_job_lanes[index] = vopr_durable_job_lane.Lane.init(
+                alloc,
+                self.sim.io(),
+            );
+            self.durable_job_lane_count += 1;
+            self.backend_runtimes[index].ptr().durable_jobs = self.durable_job_lanes[index].lane();
             self.backend_runtime_owners_started += 1;
             self.data_roots[index] = try std.fmt.allocPrint(
                 alloc,
@@ -1638,8 +1735,10 @@ pub const Fixture = struct {
         }, &self.metadata_base_uris);
         self.data_server_live[index] = true;
         errdefer {
-            self.data_servers[index].deinit();
             self.data_server_live[index] = false;
+            self.data_servers[index].beginTeardown();
+            self.data_servers[index].quiesceBackgroundWork();
+            self.data_servers[index].deinit();
         }
         _ = self.data_servers[index].read_source.withDistributedGraphLifecycleHook(.{
             .ptr = self,
@@ -1658,8 +1757,9 @@ pub const Fixture = struct {
         );
         self.data_raft_listener_live[index] = true;
         errdefer {
-            self.data_raft_listeners[index].deinit();
             self.data_raft_listener_live[index] = false;
+            self.data_raft_listeners[index].requestStop();
+            self.data_raft_listeners[index].deinit();
         }
         self.data_raft_uris[index] = try self.alloc.dupe(u8, self.data_raft_listeners[index].base_uri);
         self.data_raft_uri_live[index] = true;
@@ -1669,6 +1769,8 @@ pub const Fixture = struct {
             self.data_raft_uri_live[index] = false;
         }
         try self.data_servers[index].startPublicHttp();
+        if (self.managed_index_publication_enabled)
+            self.data_servers[index].setAntflyProvider(self.managedIndexProvider());
         self.data_servers[index].http_server.?.setQueryEmbeddingCacheWorkCostPort(
             if (self.work_cost_ports) |ports| ports.query_cache[index] else null,
         );
@@ -2665,12 +2767,15 @@ pub const Fixture = struct {
         try self.initializeDataServer(index);
         errdefer {
             if (self.data_raft_listener_live[index]) {
-                self.data_raft_listeners[index].deinit();
                 self.data_raft_listener_live[index] = false;
+                self.data_raft_listeners[index].requestStop();
+                self.data_raft_listeners[index].deinit();
             }
             if (self.data_server_live[index]) {
-                self.data_servers[index].deinit();
                 self.data_server_live[index] = false;
+                self.data_servers[index].beginTeardown();
+                self.data_servers[index].quiesceBackgroundWork();
+                self.data_servers[index].deinit();
             }
             if (self.data_api_uri_live[index]) {
                 self.alloc.free(self.data_api_uris[index]);
@@ -2685,7 +2790,30 @@ pub const Fixture = struct {
         // the reporter incarnation and rebinding its advertised endpoints.
         // Register through the production metadata path so delayed reports
         // from the destroyed process are fenced and leader routing can move.
-        try self.data_servers[index].registerNodeIfConfigured();
+        var registered = false;
+        for (0..256) |_| {
+            self.data_servers[index].registerNodeIfConfigured() catch |err| switch (err) {
+                error.NotLeader,
+                error.StoreRegistrationNotVisible,
+                => {
+                    if (self.metadata.?.cluster.currentMetadataLeaderIndex() == null) {
+                        try self.metadata.?.cluster.campaignBestMetadataCandidate();
+                        self.metadata_recovery_campaigns +|= 1;
+                    }
+                    // Keep the restart fencing handshake metadata-only. A
+                    // full data-control round publishes more competing status
+                    // mutations before the replacement incarnation is
+                    // registered and can starve leader recovery.
+                    try self.metadata.?.cluster.stepAll();
+                    try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                },
+                else => return err,
+            };
+            registered = true;
+            break;
+        }
+        if (!registered) return error.ProductionDataRestartRegistrationTimeout;
         for (self.data_servers[0..self.data_server_count], 0..) |*server, server_index| {
             if (!self.data_server_live[server_index]) continue;
             try server.refreshRemoteMetadataSnapshot();
@@ -3101,6 +3229,9 @@ pub const Fixture = struct {
             if (!self.authenticated_tenant_isolation_sound)
                 return error.ProductionDataAuthenticatedTenantIsolationFailed;
         }
+
+        if (self.managed_index_publication_enabled)
+            try self.runManagedIndexPublication();
 
         if (self.fault_mode == .disk_capacity_pressure) {
             try self.runDiskCapacityPressure();
@@ -4660,6 +4791,239 @@ pub const Fixture = struct {
             return error.ProductionDataResourceRecoveryFailed;
     }
 
+    const ManagedIndexObservation = struct {
+        pending: bool,
+        ready: bool,
+        replay_converged: bool,
+        total_indexed: i64,
+    };
+
+    fn managedIndexObservationAt(self: *Fixture, node_index: usize) !ManagedIndexObservation {
+        if (node_index >= self.data_server_count or !self.data_server_live[node_index])
+            return error.ProductionManagedIndexNodeUnavailable;
+        var response = try self.client.fetchTableIndex(
+            self.data_api_uris[node_index],
+            "docs",
+            managed_index_name,
+        );
+        defer response.deinit(self.alloc);
+        var parsed = try std.json.parseFromSlice(
+            metadata_openapi.IndexStatus,
+            self.alloc,
+            response.body,
+            .{},
+        );
+        defer parsed.deinit();
+        const stats = switch (parsed.value.status) {
+            .embeddings_index_stats => |value| value,
+            else => return error.ProductionManagedIndexStatusKindInvalid,
+        };
+        const readiness = stats.readiness orelse
+            return error.ProductionManagedIndexReadinessMissing;
+        const replay_converged = stats.replay_applied_sequence != null and
+            stats.replay_target_sequence != null and
+            stats.replay_applied_sequence.? == stats.replay_target_sequence.?;
+        const coverage_complete = stats.coverage != null and
+            stats.coverage.?.observation_complete and
+            stats.coverage.?.summary_ready and
+            stats.coverage.?.complete and
+            stats.coverage.?.healthy;
+        const total_indexed = stats.total_indexed orelse -1;
+        const ready = readiness.state == .ready and readiness.queryable and
+            readiness.complete and coverage_complete and replay_converged and
+            !(stats.rebuilding orelse true) and
+            !(stats.backfill_active orelse true) and
+            total_indexed == 3;
+        return .{
+            .pending = readiness.state == .pending or
+                readiness.state == .queryable_partial or
+                !readiness.complete,
+            .ready = ready,
+            .replay_converged = replay_converged,
+            .total_indexed = total_indexed,
+        };
+    }
+
+    fn managedIndexQuerySoundAt(self: *Fixture, node_index: usize) !bool {
+        const query_body = try test_contract_helpers.encodeSemanticQueryRequest(
+            self.alloc,
+            "production-left",
+            &.{managed_index_name},
+            3,
+        );
+        defer self.alloc.free(query_body);
+        var response = try self.client.fetchQuery(
+            self.data_api_uris[node_index],
+            "docs",
+            query_body,
+        );
+        defer response.deinit(self.alloc);
+        var parsed = try std.json.parseFromSlice(
+            metadata_openapi.QueryResponses,
+            self.alloc,
+            response.body,
+            .{},
+        );
+        defer parsed.deinit();
+        const responses = parsed.value.responses orelse return false;
+        if (responses.len != 1) return false;
+        const hits = responses[0].hits orelse return false;
+        const items = hits.hits orelse return false;
+        return hits.total != null and hits.total.?.value == 3 and
+            items.len == 3 and std.mem.eql(u8, items[0]._id, "doc:c");
+    }
+
+    /// Promote managed-index repair through public metadata mutation, every
+    /// production DataServer owner, public readiness aggregation, semantic
+    /// query planning, and stable-identity process reconstruction. The local
+    /// provider admits the dimension probe but rejects document enrichment
+    /// until pending readiness is observed. The history then publishes the
+    /// index and rebuilds one owner, making repair and reconstruction evidence
+    /// deterministic rather than timing-dependent.
+    fn createManagedIndex(self: *Fixture) !api_http_client.TablesResponse {
+        return self.client.createTableIndex(
+            self.data_api_uris[0],
+            "docs",
+            managed_index_name,
+            managed_index_body,
+        );
+    }
+
+    fn runManagedIndexPublication(self: *Fixture) !void {
+        if (!self.managed_index_publication_enabled)
+            return error.ProductionManagedIndexPublicationNotEnabled;
+        // A bounded history may cancel this actor while the provider is
+        // deliberately rejecting document work. Always open the gate before
+        // owner teardown so repair jobs can observe cancellation and drain.
+        defer self.managed_index_provider_blocked.store(false, .release);
+
+        // A managed index can remain inside the production create handler
+        // while its initial local installation waits for enrichment. Keep the
+        // request in flight while the history observes durable pending state
+        // and stops one peer owner. The surviving owners can then finish the
+        // request before the stopped process is reconstructed.
+        var create_request = self.sim.io().async(createManagedIndex, .{self});
+        defer if (create_request.any_future != null) {
+            const canceled_response: ?api_http_client.TablesResponse = create_request.cancel(self.sim.io()) catch null;
+            if (canceled_response) |response_value| {
+                var response = response_value;
+                response.deinit(self.alloc);
+            }
+        };
+
+        for (0..512) |_| {
+            const observation = self.managedIndexObservationAt(0) catch |err| switch (err) {
+                error.UnexpectedHttpStatus,
+                error.ProductionManagedIndexReadinessMissing,
+                => {
+                    try self.sim.io().sleep(.fromMilliseconds(50), .awake);
+                    continue;
+                },
+                else => return err,
+            };
+            if (observation.pending and
+                self.managed_index_document_attempts.load(.acquire) > 0)
+            {
+                self.managed_index_initial_pending = true;
+                break;
+            }
+            try self.sim.io().sleep(.fromMilliseconds(50), .awake);
+        }
+        if (!self.managed_index_initial_pending)
+            return error.ProductionManagedIndexPendingReadinessNotObserved;
+        self.managed_index_provider_blocked.store(false, .release);
+        self.managed_index_provider_released = true;
+        // Continuously runnable Raft/service actors mean a sleeping repair
+        // timer is not necessarily the scheduler's next transition. Cross the
+        // production worker's capped 30-second retry deadline explicitly when
+        // healing the provider fault, then deliver every due modeled timer.
+        try self.sim.advance(31 * std.time.ns_per_s);
+
+        // The mutation response is itself the production publication edge.
+        // Await it before issuing readiness traffic: repeatedly polling the
+        // public status endpoint while creation is still in flight can keep
+        // adding HTTP/Raft work faster than the derived repair lane drains,
+        // exhausting a bounded history without learning a new state.
+        var created = try create_request.await(self.sim.io());
+        created.deinit(self.alloc);
+        self.managed_index_created = true;
+
+        var publication_ready = false;
+        for (0..512) |_| {
+            // This fixture deliberately runs production control/status work
+            // only when requested. Drive one real DataServer control round
+            // before each public observation so a transient metadata
+            // leadership failure is retried and the runtime status cache is
+            // published through the same path used in production.
+            try self.runOneControlRound();
+            const observation = self.managedIndexObservationAt(0) catch |err| switch (err) {
+                error.UnexpectedHttpStatus,
+                error.ProductionManagedIndexReadinessMissing,
+                => {
+                    try self.sim.io().sleep(.fromMilliseconds(50), .awake);
+                    continue;
+                },
+                else => return err,
+            };
+            if (observation.ready) {
+                publication_ready = true;
+                break;
+            }
+            try self.sim.io().sleep(.fromMilliseconds(50), .awake);
+        }
+        if (!publication_ready)
+            return error.ProductionManagedIndexPublicationDidNotBecomeReady;
+
+        try self.restartDataServerProcess(self.managed_index_restart_target_index);
+        self.managed_index_owner_reconstructed = true;
+
+        for (0..2_048) |_| {
+            try self.runOneControlRound();
+            var ready_nodes: usize = 0;
+            var replay_converged = true;
+            for (0..node_count) |node_index| {
+                const observation = self.managedIndexObservationAt(node_index) catch |err| switch (err) {
+                    error.UnexpectedHttpStatus,
+                    error.ProductionManagedIndexReadinessMissing,
+                    => {
+                        replay_converged = false;
+                        break;
+                    },
+                    else => return err,
+                };
+                replay_converged = replay_converged and observation.replay_converged;
+                if (observation.ready) ready_nodes += 1;
+            }
+            if (ready_nodes == node_count and replay_converged) {
+                self.managed_index_all_nodes_ready = true;
+                self.managed_index_replay_converged = true;
+                break;
+            }
+            try self.sim.io().sleep(.fromMilliseconds(50), .awake);
+        }
+        if (!self.managed_index_all_nodes_ready or !self.managed_index_replay_converged)
+            return error.ProductionManagedIndexReadinessDidNotConverge;
+
+        for (0..node_count) |node_index| {
+            if (!try self.managedIndexQuerySoundAt(node_index))
+                return error.ProductionManagedIndexSemanticQueryInvalid;
+            self.managed_index_query_nodes += 1;
+        }
+        self.managed_index_query_recovered =
+            self.managed_index_query_nodes == node_count;
+        self.managed_index_sound = self.managed_index_created and
+            self.managed_index_initial_pending and
+            self.managed_index_owner_reconstructed and
+            self.managed_index_provider_released and
+            self.managed_index_all_nodes_ready and
+            self.managed_index_replay_converged and
+            self.managed_index_query_recovered and
+            self.managed_index_provider_calls.load(.acquire) > 0 and
+            self.managed_index_document_attempts.load(.acquire) > 0;
+        if (!self.managed_index_sound)
+            return error.ProductionManagedIndexPublicationContractFailed;
+    }
+
     /// Drive disk admission through the production persistent object-range
     /// cache attached to one live DataServer's node-wide ResourceManager.
     /// The zero-capacity interval must reject before file creation while
@@ -5534,6 +5898,12 @@ pub const Fixture = struct {
             "production data-plane VOPR after DataServer deinit active_http_requests metadata={} raft={} public={}",
             .{ self.executor.activeRequestCount(), self.raft_executor.activeRequestCount(), self.public_executor.activeRequestCount() },
         );
+        var durable_job_lane_index = self.durable_job_lane_count;
+        while (durable_job_lane_index > 0) {
+            durable_job_lane_index -= 1;
+            self.durable_job_lanes[durable_job_lane_index].deinit();
+        }
+        self.durable_job_lane_count = 0;
         var backend_runtime_index = self.backend_runtime_count;
         while (backend_runtime_index > 0) {
             backend_runtime_index -= 1;
@@ -5900,6 +6270,18 @@ pub const Fixture = struct {
         disk_capacity_cache_recovered: bool,
         disk_capacity_public_recovered: bool,
         disk_capacity_ok: bool,
+        managed_index_created: bool,
+        managed_index_initial_pending: bool,
+        managed_index_restart_target_index: usize,
+        managed_index_owner_reconstructed: bool,
+        managed_index_provider_released: bool,
+        managed_index_provider_calls: u64,
+        managed_index_document_attempts: u64,
+        managed_index_all_nodes_ready: bool,
+        managed_index_replay_converged: bool,
+        managed_index_query_nodes: usize,
+        managed_index_query_recovered: bool,
+        managed_index_ok: bool,
         graph_partial_rejected_sound: bool,
         cleanup_ok: bool,
         node_resource_managers: usize,
@@ -5923,6 +6305,7 @@ pub const Fixture = struct {
                 (!self.graph_cancellation_enabled or self.graph_cancellation_sound) and
                 (!self.graph_inflight_authorization_revocation_enabled or self.graph_authorization_sound) and
                 (!self.graph_stale_snapshot_retry_exhaustion_enabled or self.graph_stale_snapshot_sound) and
+                (!self.managed_index_publication_enabled or self.managed_index_sound) and
                 (self.fault_mode != .disk_capacity_pressure or self.disk_capacity_sound) and
                 (!self.active_split_enabled or self.split_sound) and
                 self.failure == null,
@@ -6103,6 +6486,18 @@ pub const Fixture = struct {
             .disk_capacity_cache_recovered = self.disk_capacity_cache_recovered,
             .disk_capacity_public_recovered = self.disk_capacity_public_recovered,
             .disk_capacity_ok = self.disk_capacity_sound,
+            .managed_index_created = self.managed_index_created,
+            .managed_index_initial_pending = self.managed_index_initial_pending,
+            .managed_index_restart_target_index = self.managed_index_restart_target_index,
+            .managed_index_owner_reconstructed = self.managed_index_owner_reconstructed,
+            .managed_index_provider_released = self.managed_index_provider_released,
+            .managed_index_provider_calls = self.managed_index_provider_calls.load(.acquire),
+            .managed_index_document_attempts = self.managed_index_document_attempts.load(.acquire),
+            .managed_index_all_nodes_ready = self.managed_index_all_nodes_ready,
+            .managed_index_replay_converged = self.managed_index_replay_converged,
+            .managed_index_query_nodes = self.managed_index_query_nodes,
+            .managed_index_query_recovered = self.managed_index_query_recovered,
+            .managed_index_ok = self.managed_index_sound,
             .graph_partial_rejected_sound = self.graph_partial_rejected_sound,
             .cleanup_ok = self.cleanup_sound,
             // `backend_runtime_count` is live ownership and intentionally

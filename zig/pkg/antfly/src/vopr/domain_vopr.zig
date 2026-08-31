@@ -565,7 +565,7 @@ pub const DerivedWorkflowScenario = struct {
         fn deinit(_: *anyopaque) void {}
     };
     const State = struct {
-        runtime: vopr.sim_runtime.SimRuntime,
+        sim: vopr.vopr_io.VoprIo,
         lane: durable_job_lane.Lane,
         contexts: [5]JobContext,
         stage: Stage = .provider,
@@ -584,9 +584,9 @@ pub const DerivedWorkflowScenario = struct {
     pub fn init(allocator: Allocator) !World {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        state.runtime = .init(allocator, 0);
-        errdefer state.runtime.deinit();
-        state.lane = .init(allocator, state.runtime.runtime().executor);
+        state.sim = try .init(.{ .required = .of(&.{.task_scheduling}) });
+        errdefer state.sim.deinit();
+        state.lane = .init(allocator, state.sim.io());
         errdefer state.lane.deinit();
         state.stage = .provider;
         state.owner_id = 1;
@@ -603,13 +603,13 @@ pub const DerivedWorkflowScenario = struct {
     }
     pub fn deinit(world: *World, allocator: Allocator) void {
         world.state.lane.deinit();
-        world.state.runtime.deinit();
+        world.state.sim.deinit();
         allocator.destroy(world.state);
         world.* = undefined;
     }
     pub fn enumerate(world: *World, list: *vopr.transition.List, allocator: Allocator) !void {
         const state = world.state;
-        try state.runtime.scheduler().enumerateReady(list, allocator);
+        try state.sim.scheduler().enumerateReady(list, allocator);
         switch (state.stage) {
             .provider => try add(list, allocator, provider_id, name ++ ".provider_result", .workload),
             .checkpoint_ready => try add(list, allocator, checkpoint_id, name ++ ".checkpoint_submit", .maintenance),
@@ -643,7 +643,7 @@ pub const DerivedWorkflowScenario = struct {
             try state.lane.registerOwner(state.owner_id);
             state.canceled = true;
             state.stage = .cleanup_ready;
-        } else try state.runtime.scheduler().executeReady(selected.id, events, allocator);
+        } else try state.sim.scheduler().executeReady(selected.id, events, allocator);
         try events.emitNamed(allocator, .domain, selected.name, @intFromEnum(state.stage));
         return .applied();
     }

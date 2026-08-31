@@ -738,6 +738,11 @@ const auto_bulk_ingest_finish_options: backend_types.BulkIngestFinishOptions = .
 fn startupCatchUpMonotonicMs() u64 {
     return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
 }
+
+fn monotonicMsWithIo(io: Io) u64 {
+    const now_ns = @max(0, std.Io.Clock.now(.awake, io).nanoseconds);
+    return @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
+}
 const replicated_apply_writer_open_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const replicated_apply_writer_open_retry_ns: u64 = 10 * std.time.ns_per_ms;
 const stateless_batch_max_attempts: u8 = 3;
@@ -6432,7 +6437,7 @@ pub const ProvisionedTableWriteSource = struct {
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     local_db_mutex: SourceStateMutex = .{},
-    table_activity_threaded: Io.Threaded,
+    table_activity_threaded: ?Io.Threaded,
     table_activity_mutex: Io.Mutex = .init,
     table_activity_ready: Io.Condition = .init,
     write_coalesce_mutex: Io.Mutex = .init,
@@ -6765,11 +6770,42 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn init(replica_root_dir: []const u8, catalog: table_catalog.CatalogSource) ProvisionedTableWriteSource {
+        return initWithBackendRuntime(replica_root_dir, catalog, null);
+    }
+
+    /// Construct a source inside an existing runtime authority. Native-only
+    /// callers retain the bounded Threaded fallback through `init`, while a
+    /// composed DataServer does not create an unused hidden executor.
+    pub fn initWithBackendRuntime(
+        replica_root_dir: []const u8,
+        catalog: table_catalog.CatalogSource,
+        backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    ) ProvisionedTableWriteSource {
         return .{
             .replica_root_dir = replica_root_dir,
             .catalog = catalog,
-            .table_activity_threaded = threaded_io_limits.initService(std.heap.page_allocator),
+            .table_activity_threaded = if (backend_runtime == null)
+                threaded_io_limits.initService(std.heap.page_allocator)
+            else
+                null,
+            .backend_runtime = backend_runtime,
         };
+    }
+
+    /// Every source-owned background task must execute on the same std.Io
+    /// authority as the production runtime it can call back into. In
+    /// particular, a structural reconcile validates metadata through the
+    /// catalog's HTTP executor; launching that work on this source's native
+    /// fallback while the catalog borrows another executor crosses runtime
+    /// and cancellation domains. Standalone sources retain the bounded native
+    /// fallback, while composed and deterministic deployments borrow their
+    /// BackendRuntime control lane end-to-end.
+    fn tableActivityIo(self: *ProvisionedTableWriteSource) Io {
+        if (self.backend_runtime) |runtime| {
+            if (runtime.controlIo() orelse runtime.io()) |runtime_io| return runtime_io;
+        }
+        if (self.table_activity_threaded) |*threaded| return threaded.io();
+        @panic("ProvisionedTableWriteSource requires BackendRuntime std.Io");
     }
 
     pub fn bindWriteCaches(
@@ -7178,7 +7214,7 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn quiesce(self: *ProvisionedTableWriteSource) void {
         if (self.quiesced) return;
         self.closeDroppedTableDeletes();
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.restore_repair_shutdown.store(true, .release);
         self.restore_repair_work_group.cancel(io);
         self.restore_repair_completion_group.await(io) catch {};
@@ -7215,7 +7251,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.dirty_write_tables.deinit(std.heap.page_allocator);
         self.dirty_write_tables = .empty;
         self.dirty_write_tables_mutex.unlock();
-        self.table_activity_threaded.deinit();
+        if (self.table_activity_threaded) |*threaded| threaded.deinit();
         self.* = undefined;
     }
 
@@ -7224,7 +7260,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn freeWriteCoalesceQueues(self: *ProvisionedTableWriteSource) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const alloc = std.heap.page_allocator;
         self.write_coalesce_mutex.lockUncancelable(io);
         defer self.write_coalesce_mutex.unlock(io);
@@ -7437,7 +7473,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn waitForNoStructuralActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
@@ -7451,7 +7487,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginTableRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
@@ -7477,7 +7513,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endTableRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, null) orelse {
             self.table_activity_ready.broadcast(io);
             return;
@@ -7492,7 +7528,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginStructuralReconcileActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.activityEntryLocked(table_name, null).structural_reconcile_waiters += 1;
@@ -7517,14 +7553,14 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn reserveStructuralReconcileActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.activityEntryLocked(table_name, null).structural_reconcile_queued += 1;
     }
 
     fn reserveStructuralReconcileStatus(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.activityEntryLocked(table_name, null).structural_reconcile_status_pending += 1;
@@ -7535,7 +7571,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         index_name: []const u8,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.reserveTargetedStructuralReconcileStatusLocked(table_name, index_name);
@@ -7564,7 +7600,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn releaseStructuralReconcileStatus(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, null) orelse return;
@@ -7580,7 +7616,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         index_name: []const u8,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.releaseTargetedStructuralReconcileStatusLocked(table_name, index_name);
@@ -7629,7 +7665,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const table_index = self.findTableActivityLocked(table_name, null) orelse return;
@@ -7651,7 +7687,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         target: PublicationHandoffTarget,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const table_index = self.findTableActivityLocked(table_name, null) orelse return;
@@ -7697,7 +7733,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_ids: []const u64,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
 
@@ -7746,7 +7782,7 @@ pub const ProvisionedTableWriteSource = struct {
         // This runs after ordinary status publications too. Preserve the hot
         // path's allocation profile by cloning a cached status only when an
         // actual create handoff is waiting for that observation.
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         const pending = if (self.findTableActivityLocked(table_name, group_id)) |index|
             self.active_table_activities.items[index].publication_handoffs.items.len != 0
@@ -7818,7 +7854,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         require_clear: bool,
     ) ?RepairHandoffPublicationToken {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return null;
@@ -7835,7 +7871,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         token: RepairHandoffPublicationToken,
     ) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return false;
@@ -7862,7 +7898,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         token: RepairHandoffPublicationToken,
     ) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return false;
@@ -7892,7 +7928,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         result: *StartupCatchUpResult,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
@@ -7914,7 +7950,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         result: *StartupCatchUpResult,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
@@ -7937,7 +7973,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
@@ -7957,7 +7993,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
@@ -7976,7 +8012,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         if (self.findTableActivityLocked(table_name, group_id)) |index| {
@@ -8000,7 +8036,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn cancelStructuralReconcileReservation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, null) orelse return;
@@ -8012,7 +8048,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginReservedStructuralReconcileActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         while (true) {
@@ -8031,7 +8067,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endStructuralReconcileActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, null) orelse unreachable;
@@ -8042,7 +8078,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginReadRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
@@ -8067,7 +8103,7 @@ pub const ProvisionedTableWriteSource = struct {
         admission: StatusRequestAdmission,
     ) void {
         if (admission == .snapshot_only) return;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, null) orelse {
             self.table_activity_ready.broadcast(io);
             return;
@@ -8151,14 +8187,14 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         statuses: *runtime_status.LocalTableRuntimeStatuses,
     ) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.retainOnlyTargetedStatusSnapshotFreshnessLocked(table_name, statuses);
     }
 
     fn beginStatusRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) StatusRequestAdmission {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
@@ -8181,7 +8217,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endReadRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, null) orelse {
             self.table_activity_ready.broadcast(io);
             return;
@@ -8196,7 +8232,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.activityEntryLocked(table_name, group_id).operation_waiters += 1;
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
@@ -8223,7 +8259,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn cancelGroupOperationWaiterLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, group_id) orelse unreachable;
         std.debug.assert(self.active_table_activities.items[index].operation_waiters > 0);
         self.active_table_activities.items[index].operation_waiters -= 1;
@@ -8232,7 +8268,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn tryBeginGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
             if (entry.structural_active or entry.restore_preparations > 0 or entry.read_request_active > 0) return false;
@@ -8284,14 +8320,14 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginReplicatedApplyOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (!self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id)) {
             self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
         }
     }
 
     fn beginGroupTransitionOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.activityEntryLocked(table_name, group_id).transition_waiters += 1;
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
@@ -8318,7 +8354,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, group_id) orelse unreachable;
         std.debug.assert(self.active_table_activities.items[index].operation_active);
         self.active_table_activities.items[index].operation_active = false;
@@ -8328,7 +8364,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginGroupGenerationPreparation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         while (true) {
@@ -8352,7 +8388,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endGroupGenerationPreparation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse unreachable;
@@ -8363,7 +8399,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn tryBeginStructuralTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
             if (entry.structural_active or entry.structural_waiters > 0 or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0 or entry.table_request_active > 0 or entry.read_request_active > 0) return false;
@@ -8389,7 +8425,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         target_index_name: ?[]const u8,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         // Reserve before draining foreground activity. This closes admission
         // to new reads/writes and routes new status calls to the immutable
         // snapshot, while already-admitted table requests may finish their
@@ -8436,7 +8472,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endStructuralTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, null) orelse unreachable;
         std.debug.assert(!self.active_table_activities.items[index].targeted_structural_mutation_active);
         self.active_table_activities.items[index].structural_active = false;
@@ -8449,7 +8485,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         index_name: []const u8,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, null) orelse unreachable;
         const entry = &self.active_table_activities.items[index];
         std.debug.assert(entry.structural_active);
@@ -8462,7 +8498,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginRestoreLifecycleActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (true) {
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
@@ -8482,7 +8518,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endRestoreLifecycleActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, null) orelse {
             self.table_activity_ready.broadcast(io);
             return;
@@ -8495,56 +8531,56 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginRestoreLifecycleActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginRestoreLifecycleActivityLocked(table_name);
     }
 
     fn endRestoreLifecycleActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endRestoreLifecycleActivityLocked(table_name);
     }
 
     fn waitForNoStructuralActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.waitForNoStructuralActivityLocked(table_name);
     }
 
     fn beginTableRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginTableRequestLocked(table_name);
     }
 
     fn tryBeginTableRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.tryBeginTableRequestLocked(table_name);
     }
 
     fn endTableRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endTableRequestLocked(table_name);
     }
 
     fn beginReadRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginReadRequestLocked(table_name);
     }
 
     fn beginStatusRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) StatusRequestAdmission {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.beginStatusRequestLocked(table_name);
@@ -8555,21 +8591,21 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         admission: StatusRequestAdmission,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endStatusRequestLocked(table_name, admission);
     }
 
     fn endReadRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endReadRequestLocked(table_name);
     }
 
     fn beginGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginGroupOperationLocked(table_name, group_id);
@@ -8577,7 +8613,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn testingMarkTableRequestActive(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         if (!builtin.is_test) @compileError("testingMarkTableRequestActive is test-only");
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const entry = self.activityEntryLocked(table_name, null);
@@ -8586,7 +8622,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn testingMarkGroupOperationActive(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         if (!builtin.is_test) @compileError("testingMarkGroupOperationActive is test-only");
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const entry = self.activityEntryLocked(table_name, group_id);
@@ -8596,7 +8632,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn testingGroupTransitionWaiterCount(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) usize {
         if (!builtin.is_test) @compileError("testingGroupTransitionWaiterCount is test-only");
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return 0;
@@ -8605,7 +8641,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn testingGroupOperationWaiterCount(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) usize {
         if (!builtin.is_test) @compileError("testingGroupOperationWaiterCount is test-only");
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return 0;
@@ -8613,14 +8649,14 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn tryBeginGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.tryBeginGroupOperationLocked(table_name, group_id);
     }
 
     fn tryBeginReadCompatibleGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id);
@@ -8644,21 +8680,21 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginReplicatedApplyOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginReplicatedApplyOperationLocked(table_name, group_id);
     }
 
     fn beginGroupTransitionOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginGroupTransitionOperationLocked(table_name, group_id);
     }
 
     fn allowGroupOperationReads(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse unreachable;
@@ -8669,7 +8705,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn endGroupOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endGroupOperationLocked(table_name, group_id);
@@ -8693,7 +8729,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
     ) ?GroupRefreshActivity {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
@@ -8816,14 +8852,14 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn tryBeginStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.tryBeginStructuralTableActivityLocked(table_name);
     }
 
     fn beginStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginStructuralTableActivityLocked(table_name);
@@ -8834,14 +8870,14 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         index_name: []const u8,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginStructuralTableActivityLockedForTarget(table_name, index_name);
     }
 
     fn endStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endStructuralTableActivityLocked(table_name);
@@ -8852,7 +8888,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         index_name: []const u8,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endTargetedStructuralTableActivityLocked(table_name, index_name);
@@ -9145,7 +9181,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginStructuralTableActivityFromRestorePreparation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = &self.active_table_activities.items[index];
@@ -11131,7 +11167,7 @@ pub const ProvisionedTableWriteSource = struct {
         // An opening attempt does not own runtime truth until it has leased the
         // generation. Publishing before the open lets a normal WriterLocked
         // return overwrite a healthy writer observation indefinitely.
-        const source_io = self.table_activity_threaded.io();
+        const source_io = self.tableActivityIo();
         if (!use_live_repair_cache) {
             _ = db_mod.DB.recoverIncompleteRestoreImportIfNeededWithIo(alloc, source_io, path, .{}) catch |err| {
                 if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
@@ -12013,13 +12049,13 @@ pub const ProvisionedTableWriteSource = struct {
 
         pub fn release(self: *@This()) void {
             if (!self.active) return;
-            self.source.table_activity_mutex.unlock(self.source.table_activity_threaded.io());
+            self.source.table_activity_mutex.unlock(self.source.tableActivityIo());
             self.active = false;
         }
     };
 
     pub fn acquireHASeedCaptureActivityLease(self: *ProvisionedTableWriteSource) !HASeedCaptureActivityLease {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         errdefer self.table_activity_mutex.unlock(io);
 
@@ -12267,7 +12303,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn hasGroupActivityBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
@@ -12282,7 +12318,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn hasReadBlockingActivityBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
@@ -12297,14 +12333,14 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn structuralStatusSnapshotOnlyBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         return self.statusUsesPublishedSnapshotLocked(table_name);
     }
 
     fn readCompatibleMaintenanceActiveBestEffort(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         if (self.findTableActivityLocked(table_name, null)) |index| {
@@ -12330,7 +12366,7 @@ pub const ProvisionedTableWriteSource = struct {
         request_busy: bool,
         groups: []u64,
     } {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
 
@@ -13540,7 +13576,7 @@ pub const ProvisionedTableWriteSource = struct {
             return;
         };
 
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.restore_repair_completion_mutex.lockUncancelable(io);
         self.restore_repair_completions.append(alloc, owned_table_name) catch |err| {
             self.restore_repair_completion_mutex.unlock(io);
@@ -13554,7 +13590,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn scheduleRestoreRepairCompletionDrain(self: *ProvisionedTableWriteSource) void {
         if (self.restore_repair_completion_scheduled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.restore_repair_completion_group.concurrent(io, drainRestoreRepairCompletionsTask, .{self}) catch |err| {
             self.restore_repair_completion_scheduled.store(false, .release);
             std.log.warn("restore repair completion drain schedule failed err={}", .{err});
@@ -13567,7 +13603,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn drainRestoreRepairCompletionsScheduled(self: *ProvisionedTableWriteSource) void {
         const alloc = std.heap.page_allocator;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (true) {
             self.restore_repair_completion_mutex.lockUncancelable(io);
             if (self.restore_repair_completions.items.len == 0) {
@@ -13589,7 +13625,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn freeRestoreRepairCompletions(self: *ProvisionedTableWriteSource) void {
         const alloc = std.heap.page_allocator;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.restore_repair_completion_mutex.lockUncancelable(io);
         defer self.restore_repair_completion_mutex.unlock(io);
         for (self.restore_repair_completions.items) |table_name| alloc.free(table_name);
@@ -13680,7 +13716,7 @@ pub const ProvisionedTableWriteSource = struct {
             try cancellation.check();
             const runtime_repair_needed = try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(
                 alloc,
-                self.table_activity_threaded.io(),
+                self.tableActivityIo(),
                 path,
             );
             if (!runtime_repair_needed and raft_apply_marker_reset) return;
@@ -13709,8 +13745,8 @@ pub const ProvisionedTableWriteSource = struct {
                             @errorName(err),
                         });
                     }
-                    self.table_activity_threaded.io().sleep(Io.Duration.fromNanoseconds(replicated_apply_writer_open_retry_ns), .awake) catch |sleep_err| switch (sleep_err) {
-                        error.Canceled => return Io.recancel(self.table_activity_threaded.io()),
+                    self.tableActivityIo().sleep(Io.Duration.fromNanoseconds(replicated_apply_writer_open_retry_ns), .awake) catch |sleep_err| switch (sleep_err) {
+                        error.Canceled => return Io.recancel(self.tableActivityIo()),
                     };
                     continue;
                 }
@@ -13747,7 +13783,7 @@ pub const ProvisionedTableWriteSource = struct {
         return try repairRestoredDbRuntimeStateUntilCompleteWithIo(
             alloc,
             db,
-            self.table_activity_threaded.io(),
+            self.tableActivityIo(),
             group_id,
             open_attempts,
             cancellation,
@@ -13766,7 +13802,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         cancellation: db_mod.types.CancellationToken,
     ) !void {
-        if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, self.table_activity_threaded.io(), path)) return;
+        if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, self.tableActivityIo(), path)) return;
 
         self.beginLocalStructuralCachedDbMutationFromPreparation(table_name);
         errdefer self.abortLocalStructuralCachedDbMutation(table_name);
@@ -13853,8 +13889,8 @@ pub const ProvisionedTableWriteSource = struct {
 
         fn sleepRetry(self: *@This()) void {
             runTestBeforeRestoreRepairRetrySleepHook();
-            self.source.table_activity_threaded.io().sleep(Io.Duration.fromMilliseconds(100), .awake) catch |err| switch (err) {
-                error.Canceled => Io.recancel(self.source.table_activity_threaded.io()),
+            self.source.tableActivityIo().sleep(Io.Duration.fromMilliseconds(100), .awake) catch |err| switch (err) {
+                error.Canceled => Io.recancel(self.source.tableActivityIo()),
             };
         }
 
@@ -13908,7 +13944,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
             if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(
                 self.alloc,
-                self.source.table_activity_threaded.io(),
+                self.source.tableActivityIo(),
                 path,
             )) return false;
 
@@ -13974,7 +14010,7 @@ pub const ProvisionedTableWriteSource = struct {
             .group_id = group_id,
             .table_name = owned_table_name,
         };
-        self.restore_repair_work_group.concurrent(self.table_activity_threaded.io(), RestoreRepairCatchUpWork.runAndDeinit, .{work}) catch |err| {
+        self.restore_repair_work_group.concurrent(self.tableActivityIo(), RestoreRepairCatchUpWork.runAndDeinit, .{work}) catch |err| {
             RestoreRepairCatchUpWork.deinit(work);
             std.log.warn("restore background catch-up failed phase=submit group_id={d} class={s}", .{ group_id, @errorName(err) });
             return;
@@ -13982,7 +14018,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn freeStructuralReconcileTables(self: *ProvisionedTableWriteSource) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         const alloc = std.heap.page_allocator;
         self.structural_reconcile_mutex.lockUncancelable(io);
         defer self.structural_reconcile_mutex.unlock(io);
@@ -14018,7 +14054,7 @@ pub const ProvisionedTableWriteSource = struct {
             snapshot_cache.fenceTablePublications(table_name);
         }
         const alloc = std.heap.page_allocator;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
 
         self.structural_reconcile_mutex.lockUncancelable(io);
         defer self.structural_reconcile_mutex.unlock(io);
@@ -14072,7 +14108,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn drainStructuralReconcileTask(self: *ProvisionedTableWriteSource) Io.Cancelable!void {
         const alloc = std.heap.page_allocator;
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         while (true) {
             self.structural_reconcile_mutex.lockUncancelable(io);
             if (self.structural_reconcile_tables.items.len == 0) {
@@ -14080,7 +14116,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.structural_reconcile_mutex.unlock(io);
                 return;
             }
-            const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+            const now_ms = monotonicMsWithIo(io);
             var ready_index: ?usize = null;
             var earliest_ms: u64 = std.math.maxInt(u64);
             for (self.structural_reconcile_tables.items, 0..) |request, index| {
@@ -14115,7 +14151,7 @@ pub const ProvisionedTableWriteSource = struct {
             };
             if (reconcile_error) |err| {
                 request.failure_count +|= 1;
-                const retry_now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+                const retry_now_ms = monotonicMsWithIo(io);
                 request.not_before_ms = retry_now_ms +| structuralReconcileRetryDelayMs(request.failure_count);
                 if (request.index_name) |index_name| {
                     std.log.warn("structural reconcile deferred table={s} index={s} failures={d} retry_at_monotonic_ms={d} err={s}", .{ request.table_name, index_name, request.failure_count, request.not_before_ms, @errorName(err) });
@@ -14127,7 +14163,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
             if (reconcile_outcome == .yielded) {
                 request.failure_count = 0;
-                const retry_now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+                const retry_now_ms = monotonicMsWithIo(io);
                 request.not_before_ms = structuralReconcileRequeueAtMs(.yielded, retry_now_ms);
                 self.requeueActiveStructuralReconcile(&request, alloc);
                 continue;
@@ -14135,7 +14171,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (reconcile_outcome == .blocked) {
                 request.pending_count +|= 1;
                 request.failure_count = 0;
-                const retry_now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+                const retry_now_ms = monotonicMsWithIo(io);
                 // Pending is expected bounded maintenance, and each pass can
                 // advance durable cleanup. A fixed delay preserves queue
                 // fairness without exponentially throttling forward progress.
@@ -14173,7 +14209,7 @@ pub const ProvisionedTableWriteSource = struct {
         request: *StructuralReconcileRequest,
         alloc: std.mem.Allocator,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         // Whole-table reconciliation keeps its reservation continuous across
         // retries. Index-targeted work has already installed write capability
         // and can retry without holding foreground admission.
@@ -15741,7 +15777,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn writeCoalescerActive(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.write_coalesce_mutex.lockUncancelable(io);
         defer self.write_coalesce_mutex.unlock(io);
         const queue_index = self.findWriteCoalesceQueueLocked(table_name, group_id) orelse return false;
@@ -15771,7 +15807,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
     ) usize {
         if (!builtin.is_test) @compileError("testingWriteCoalesceQueueEntryCount is test-only");
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.write_coalesce_mutex.lockUncancelable(io);
         defer self.write_coalesce_mutex.unlock(io);
         const queue_index = self.findWriteCoalesceQueueLocked(table_name, group_id) orelse return 0;
@@ -15803,7 +15839,7 @@ pub const ProvisionedTableWriteSource = struct {
         };
         defer freeWriteCoalesceGroupBatch(alloc, &entry.group);
 
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         var should_drain = false;
         self.write_coalesce_mutex.lockUncancelable(io);
         {
@@ -15853,7 +15889,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         owner_entry: *WriteCoalesceEntry,
     ) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
 
@@ -15918,7 +15954,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         owner_entry: *const WriteCoalesceEntry,
     ) bool {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.write_coalesce_mutex.lockUncancelable(io);
         defer self.write_coalesce_mutex.unlock(io);
         if (!owner_entry.done) return false;
@@ -16053,7 +16089,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn finishCoalescedEntries(self: *ProvisionedTableWriteSource, entries: []const *WriteCoalesceEntry, err: ?anyerror) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.write_coalesce_mutex.lockUncancelable(io);
         defer self.write_coalesce_mutex.unlock(io);
         for (entries) |entry| {
@@ -16064,7 +16100,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn finishCoalescedEntry(self: *ProvisionedTableWriteSource, entry: *WriteCoalesceEntry, err: ?anyerror) void {
-        const io = self.table_activity_threaded.io();
+        const io = self.tableActivityIo();
         self.write_coalesce_mutex.lockUncancelable(io);
         defer self.write_coalesce_mutex.unlock(io);
         entry.err = err;
@@ -16449,7 +16485,7 @@ pub const ProvisionedTableWriteSource = struct {
         try backups_api.validateRestorableManifestLayout(plan.manifest);
         try backups_api.validateRestoreManifest(alloc, plan.manifest, plan.manifest.backup_id);
         if (plan.reconcile_only and plan.replace_existing) return error.InvalidBackupRequest;
-        const restore_io = plan.io orelse self.table_activity_threaded.io();
+        const restore_io = plan.io orelse self.tableActivityIo();
         const source_identity = try backups_api.canonicalRestoreSourceIdentityAlloc(alloc, plan.source_location);
         defer alloc.free(source_identity);
 
@@ -16709,7 +16745,7 @@ pub const ProvisionedTableWriteSource = struct {
             .{
                 .retain_terminal = retain_terminal,
                 .report_post_commit_failure = false,
-                .fanout_io = self.table_activity_threaded.io(),
+                .fanout_io = self.tableActivityIo(),
                 .post_commit_cancellation = cancellation,
             },
         );
@@ -18697,8 +18733,25 @@ test "provisioned table write source has a finite worker ceiling" {
 
     try std.testing.expectEqual(
         std.Io.Limit.limited(threaded_io_limits.service),
-        source.table_activity_threaded.concurrent_limit,
+        source.table_activity_threaded.?.concurrent_limit,
     );
+}
+
+test "provisioned table write source borrows runtime IO without native fallback" {
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(std.testing.allocator, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = std.testing.io },
+    });
+    defer runtime.deinit();
+    var source = ProvisionedTableWriteSource.initWithBackendRuntime(
+        "unused",
+        table_catalog.emptyCatalogSource(),
+        &runtime,
+    );
+    defer source.deinit();
+
+    try std.testing.expect(source.table_activity_threaded == null);
+    try std.testing.expectEqual(std.testing.io.userdata, source.tableActivityIo().userdata);
 }
 
 test "provisioned owner clone snapshot preserves retired runtime counters" {
@@ -28476,7 +28529,7 @@ test "provisioned table restore retry repairs exact incomplete restore state thr
         .artifact_backup_id = manifest.backup_id,
         .source_location = location,
     });
-    source.restore_repair_work_group.await(source.table_activity_threaded.io()) catch {};
+    source.restore_repair_work_group.await(source.tableActivityIo()) catch {};
     source.drainRestoreRepairCompletionsScheduled();
 
     try db_mod.DB.markRestorePrimaryRestoredForPathWithIdentityWithIo(
@@ -28744,8 +28797,8 @@ test "provisioned restore repair worker retries transient step failures to compl
     defer test_before_restore_repair_step_hook = null;
 
     source.requestRestoreRepairCatchUp("docs", 7001);
-    source.restore_repair_work_group.await(source.table_activity_threaded.io()) catch {};
-    source.restore_repair_completion_group.await(source.table_activity_threaded.io()) catch {};
+    source.restore_repair_work_group.await(source.tableActivityIo()) catch {};
+    source.restore_repair_completion_group.await(source.tableActivityIo()) catch {};
 
     try std.testing.expect(hook_ctx.calls.load(.acquire) >= 2);
     try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
@@ -36484,7 +36537,7 @@ test "managed maintenance admission distinguishes status from data reads" {
     source.beginGroupOperation("docs", 7001);
     var synthetic_waiter_active = false;
     defer {
-        const activity_io = source.table_activity_threaded.io();
+        const activity_io = source.tableActivityIo();
         source.table_activity_mutex.lockUncancelable(activity_io);
         if (synthetic_waiter_active) {
             const index = source.findTableActivityLocked("docs", 7001) orelse unreachable;
@@ -36494,7 +36547,7 @@ test "managed maintenance admission distinguishes status from data reads" {
         source.table_activity_mutex.unlock(activity_io);
     }
     {
-        const activity_io = source.table_activity_threaded.io();
+        const activity_io = source.tableActivityIo();
         source.table_activity_mutex.lockUncancelable(activity_io);
         defer source.table_activity_mutex.unlock(activity_io);
         source.activityEntryLocked("docs", 7001).operation_waiters += 1;
@@ -36503,7 +36556,7 @@ test "managed maintenance admission distinguishes status from data reads" {
     }
     source.endGroupOperation("docs", 7001);
     {
-        const activity_io = source.table_activity_threaded.io();
+        const activity_io = source.tableActivityIo();
         source.table_activity_mutex.lockUncancelable(activity_io);
         defer source.table_activity_mutex.unlock(activity_io);
         try std.testing.expect(!source.structuralDrainPendingLocked("docs"));
@@ -37083,7 +37136,7 @@ test "unrelated repair visibility edge invalidates during targeted reconciliatio
     );
 
     try std.testing.expect((try cache.snapshot(alloc, "docs")) == null);
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     source.table_activity_mutex.lockUncancelable(io);
     const group_index = source.findTableActivityLocked("docs", 7001) orelse {
         source.table_activity_mutex.unlock(io);
@@ -37488,7 +37541,7 @@ test "live repair final audit excludes concurrent group mutation through publica
 
         fn run(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const io = self.source.table_activity_threaded.io();
+            const io = self.source.tableActivityIo();
             self.source.table_activity_mutex.lockUncancelable(io);
             const clear_observed = if (self.source.findTableActivityLocked("docs", 7001)) |index|
                 self.source.active_table_activities.items[index].repair_handoff_clear_observed
@@ -37827,7 +37880,7 @@ test "index reconciliation request enqueues a catalog-deleted target without cre
     );
     try std.testing.expect(requested != null);
 
-    const io = source.table_activity_threaded.io();
+    const io = source.tableActivityIo();
     source.structural_reconcile_mutex.lockUncancelable(io);
     defer source.structural_reconcile_mutex.unlock(io);
     try std.testing.expectEqual(@as(usize, 1), source.structural_reconcile_tables.items.len);
@@ -38045,7 +38098,7 @@ test "structural reconcile publishes durable index repair debt once per group" {
 
             fn run(ptr: *anyopaque) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
-                const io = self.source.table_activity_threaded.io();
+                const io = self.source.tableActivityIo();
                 self.source.table_activity_mutex.lockUncancelable(io);
                 const clear_observed = if (self.source.findTableActivityLocked("docs", 7001)) |index|
                     self.source.active_table_activities.items[index].repair_handoff_clear_observed
@@ -39240,7 +39293,7 @@ test "provisioned table write source restore repair completion retires cached ve
     }
 
     source.enqueueRestoreRepairComplete("docs");
-    source.restore_repair_completion_group.await(source.table_activity_threaded.io()) catch {};
+    source.restore_repair_completion_group.await(source.tableActivityIo()) catch {};
 
     try std.testing.expectEqual(@as(u64, 0), hbc_cache.global_stats.total_bytes);
     var cached_after_completion = try snapshot_cache.snapshot(alloc, "docs");
@@ -46055,7 +46108,7 @@ test "provisioned table write source deinit drains restore repair work group" {
     var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-restore-repair-drain", NoCatalog.iface());
 
     var ctx = DrainCtx{};
-    try source.restore_repair_work_group.concurrent(source.table_activity_threaded.io(), DrainCtx.run, .{&ctx});
+    try source.restore_repair_work_group.concurrent(source.tableActivityIo(), DrainCtx.run, .{&ctx});
 
     while (ctx.started.load(.acquire) == 0) std.Thread.yield() catch {};
     source.deinit();

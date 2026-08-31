@@ -5288,6 +5288,7 @@ pub const DB = struct {
     /// deterministic scheduler drains them. Destruction still happens through
     /// the ordinary close path after the drain completes.
     pub fn beginTeardown(self: *DB) void {
+        if (self.enrichment_runtime) |runtime| runtime.beginTeardown();
         if (self.transaction_runtime) |runtime| runtime.beginTeardown();
     }
 
@@ -22630,6 +22631,7 @@ pub const DB = struct {
         const wait = derived_executor_mod.VisibilityWait{
             .cancellation = cancellation,
             .deadline_ns = deadline_ns,
+            .clock = self.backend_runtime.monotonicClock(),
         };
         var stable_target = sequence;
         while (true) {
@@ -25031,10 +25033,12 @@ pub const DB = struct {
         else
             default_visibility_wait_timeout_ms;
         const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
-        const deadline_ns = platform_time.monotonicNs() +| timeout_ns;
+        const visibility_clock = self.backend_runtime.monotonicClock();
+        const deadline_ns = visibility_clock.nowRealtimeNs() +| timeout_ns;
         const wait = derived_executor_mod.VisibilityWait{
             .cancellation = cancellation,
             .deadline_ns = deadline_ns,
+            .clock = visibility_clock,
         };
         switch (sync_level) {
             .propose, .write => try self.executor.failIfUnhealthy(),

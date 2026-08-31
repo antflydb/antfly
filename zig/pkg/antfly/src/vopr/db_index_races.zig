@@ -703,7 +703,7 @@ const ManagedReadinessFixture = struct {
         // vopr-audit: allow(host_filesystem) HBC's mmap/native storage remains
         // the reviewed differential boundary; all protocol scheduling above
         // it borrows VoprIo.
-        db.core.index_manager.setIo(std.testing.io);
+        db.core.index_manager.setIo(std.testing.io); // vopr-audit: allow(host_filesystem) HBC physical bytes are an explicit differential boundary
         return db;
     }
 
