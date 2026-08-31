@@ -114,9 +114,6 @@ func (r *AntflyClusterReconciler) reconcileHAFormerPrimaryIsolation(ctx context.
 		if !ready {
 			return fmt.Errorf("isolate former primary: fencing Lease is not current: %s", reason)
 		}
-		if !haLeaseFenceScopeMatches(lease, scope) {
-			return fmt.Errorf("isolate former primary: fencing Lease scope does not match the planned topology")
-		}
 
 		statefulSet := &appsv1.StatefulSet{}
 		key := types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}

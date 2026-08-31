@@ -111,7 +111,7 @@ func TestCompletedPhysicalIsolationAcceptsExactFrozenLeaseBoundary(t *testing.T)
 	action.TargetLSN = 17
 	action.ObservedLSN = 17
 
-	_, lease := currentPhysicalIsolationObjects(cluster, now)
+	sts, lease := currentPhysicalIsolationObjects(cluster, now)
 	scope, ok := haPhysicalIsolationReceiptScope(receipt)
 	if !ok {
 		t.Fatal("fixture receipt has no exact Lease scope")
@@ -127,6 +127,23 @@ func TestCompletedPhysicalIsolationAcceptsExactFrozenLeaseBoundary(t *testing.T)
 	}
 	if err := validateCurrentPhysicalIsolationLease(lease, &action, scope); err != nil {
 		t.Fatalf("exact one-way Lease boundary strengthening was rejected: %v", err)
+	}
+
+	// Exercise the whole controller path as well as the validator. The
+	// reconciler must not repeat a stricter election-scope comparison after the
+	// validator has accepted the exact frozen-boundary strengthening.
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{action}
+	reconciler := testHAReconciler(t, cluster, sts, lease)
+	reconciler.BoundaryReader = haTestResourceVersionReader{Reader: reconciler.Client, listResourceVersion: "pods-absence-current"}
+	reconciler.Now = func() time.Time { return now.Add(20 * time.Second) }
+	monotonicNow := now
+	reconciler.MonotonicNow = func() time.Time { return monotonicNow }
+	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); !errors.Is(err, errHAPhysicalIsolationGracePending) {
+		t.Fatalf("exact frozen Lease boundary did not reach the local watchdog barrier: %v", err)
+	}
+	monotonicNow = monotonicNow.Add(10 * time.Second)
+	if err := reconciler.reconcileHAFormerPrimaryIsolation(context.Background(), cluster); err != nil {
+		t.Fatalf("exact frozen Lease boundary remained blocked after the watchdog barrier: %v", err)
 	}
 }
 
