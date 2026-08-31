@@ -21,7 +21,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 51;
+    pub const version: u32 = 52;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -47,6 +47,7 @@ pub const Scenario = struct {
     const production_query_cache_service_rate_id = vopr.id.stable(name, "production-query-embedding-cache-deadline-owner-restart");
     const production_serverless_fencing_id = vopr.id.stable(name, "production-serverless-generation-progress-conflict-fenced");
     const production_authenticated_tenant_isolation_id = vopr.id.stable(name, "production-authenticated-tenants-fail-closed-across-tables");
+    const production_disk_capacity_pressure_id = vopr.id.stable(name, "production-disk-capacity-denial-recovers-through-cache");
     const production_replication_backfill_id = vopr.id.stable(name, "production-replication-backfill-crosses-public-data-raft");
     const production_replication_schema_change_id = vopr.id.stable(name, "production-replication-schema-change-resumes-from-durable-status");
     const production_replication_owner_restart_id = vopr.id.stable(name, "production-replication-target-owner-restarts-and-resumes");
@@ -102,6 +103,7 @@ pub const Scenario = struct {
         .{ .id = production_query_cache_service_rate_id, .name = name ++ ".production-query-embedding-cache-deadline-owner-restart", .kind = .always },
         .{ .id = production_serverless_fencing_id, .name = name ++ ".production-serverless-generation-progress-conflict-fenced", .kind = .always },
         .{ .id = production_authenticated_tenant_isolation_id, .name = name ++ ".production-authenticated-tenants-fail-closed-across-tables", .kind = .always },
+        .{ .id = production_disk_capacity_pressure_id, .name = name ++ ".production-disk-capacity-denial-recovers-through-cache", .kind = .always },
         .{ .id = production_replication_backfill_id, .name = name ++ ".production-replication-backfill-crosses-public-data-raft", .kind = .always },
         .{ .id = production_replication_schema_change_id, .name = name ++ ".production-replication-schema-change-resumes-from-durable-status", .kind = .always },
         .{ .id = production_replication_owner_restart_id, .name = name ++ ".production-replication-target-owner-restarts-and-resumes", .kind = .always },
@@ -182,6 +184,7 @@ pub const Scenario = struct {
         production_data_plane_replication_stale_owner_service_rate,
         production_data_plane_replication_topology_change_service_rate,
         production_data_plane_authenticated_tenant_isolation,
+        production_data_plane_disk_capacity_pressure,
 
         fn isReplicationBackfill(self: Mode) bool {
             return self == .production_data_plane_replication_backfill_service_rate or
@@ -226,12 +229,13 @@ pub const Scenario = struct {
                 self == .production_data_plane_query_embedding_cache_service_rate or
                 self == .production_data_plane_serverless_generation_progress_conflict or
                 self == .production_data_plane_authenticated_tenant_isolation or
+                self == .production_data_plane_disk_capacity_pressure or
                 self.isReplicationBackfill();
         }
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_durable_join_owner_restart, .production_data_plane_durable_join_retry_exhaustion, .production_data_plane_durable_join_cancellation_overlapping_faults, .production_data_plane_durable_join_cancellation_owner_restart, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation, .production_data_plane_global_query_inflight_authorization_revocation, .production_data_plane_global_query_transport_failure, .production_data_plane_global_query_owner_restart, .production_data_plane_query_embedding_cache_service_rate, .production_data_plane_serverless_generation_progress_conflict, .production_data_plane_replication_backfill_service_rate, .production_data_plane_replication_schema_change_service_rate, .production_data_plane_replication_owner_restart_service_rate, .production_data_plane_replication_source_crash_service_rate, .production_data_plane_replication_cancellation_service_rate, .production_data_plane_replication_stale_owner_service_rate, .production_data_plane_replication_topology_change_service_rate, .production_data_plane_authenticated_tenant_isolation => .clean,
+                .clean, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_durable_join_cancellation, .production_data_plane_durable_join_worker_retry, .production_data_plane_durable_join_owner_restart, .production_data_plane_durable_join_retry_exhaustion, .production_data_plane_durable_join_cancellation_overlapping_faults, .production_data_plane_durable_join_cancellation_owner_restart, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion, .production_data_plane_global_query, .production_data_plane_global_query_cancellation, .production_data_plane_global_query_inflight_authorization_revocation, .production_data_plane_global_query_transport_failure, .production_data_plane_global_query_owner_restart, .production_data_plane_query_embedding_cache_service_rate, .production_data_plane_serverless_generation_progress_conflict, .production_data_plane_replication_backfill_service_rate, .production_data_plane_replication_schema_change_service_rate, .production_data_plane_replication_owner_restart_service_rate, .production_data_plane_replication_source_crash_service_rate, .production_data_plane_replication_cancellation_service_rate, .production_data_plane_replication_stale_owner_service_rate, .production_data_plane_replication_topology_change_service_rate, .production_data_plane_authenticated_tenant_isolation, .production_data_plane_disk_capacity_pressure => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -299,6 +303,7 @@ pub const Scenario = struct {
             vopr.id.stable(name, "production-data-plane-replication-stale-owner-service-rate"),
             vopr.id.stable(name, "production-data-plane-replication-topology-change-service-rate"),
             vopr.id.stable(name, "production-data-plane-authenticated-tenant-isolation"),
+            vopr.id.stable(name, "production-data-plane-disk-capacity-pressure"),
         };
     };
     const mode_names = [_][]const u8{
@@ -349,6 +354,7 @@ pub const Scenario = struct {
         name ++ ".production-data-plane-replication-stale-owner-service-rate",
         name ++ ".production-data-plane-replication-topology-change-service-rate",
         name ++ ".production-data-plane-authenticated-tenant-isolation",
+        name ++ ".production-data-plane-disk-capacity-pressure",
     };
 
     const production_baseline_ordinal: usize = @intFromEnum(Mode.production_data_plane_baseline);
@@ -390,6 +396,7 @@ pub const Scenario = struct {
     const production_replication_stale_owner_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_stale_owner_service_rate);
     const production_replication_topology_change_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_topology_change_service_rate);
     const production_authenticated_tenant_isolation_ordinal: usize = @intFromEnum(Mode.production_data_plane_authenticated_tenant_isolation);
+    const production_disk_capacity_pressure_ordinal: usize = @intFromEnum(Mode.production_data_plane_disk_capacity_pressure);
 
     const metadata_role = vopr.id.stable(name, "role.metadata");
     const public_data_role = vopr.id.stable(name, "role.public-data");
@@ -424,9 +431,9 @@ pub const Scenario = struct {
         .{ .id = serverless_role, .name = "serverless", .depends_on = &.{metadata_role} },
     };
     const deployment_nodes = [_]vopr.deployment.Node{
-        .{ .id = deployment_node_ids[0], .name = "node-1", .process_domain = process_domains[0], .storage_domain = storage_domains[0], .resource_domain = resource_domains[0], .resources = .{ .memory_limit_bytes = 512 * 1024 * 1024, .disk_limit_bytes = 64 * 1024 * 1024 } },
-        .{ .id = deployment_node_ids[1], .name = "node-2", .process_domain = process_domains[1], .storage_domain = storage_domains[1], .resource_domain = resource_domains[1], .resources = .{ .memory_limit_bytes = 512 * 1024 * 1024, .disk_limit_bytes = 64 * 1024 * 1024 } },
-        .{ .id = deployment_node_ids[2], .name = "node-3", .process_domain = process_domains[2], .storage_domain = storage_domains[2], .resource_domain = resource_domains[2], .resources = .{ .memory_limit_bytes = 512 * 1024 * 1024, .disk_limit_bytes = 64 * 1024 * 1024 } },
+        .{ .id = deployment_node_ids[0], .name = "node-1", .process_domain = process_domains[0], .storage_domain = storage_domains[0], .resource_domain = resource_domains[0], .resources = .{ .memory_limit_bytes = 512 * 1024 * 1024, .disk_limit_bytes = 2 * 1024 * 1024 * 1024 } },
+        .{ .id = deployment_node_ids[1], .name = "node-2", .process_domain = process_domains[1], .storage_domain = storage_domains[1], .resource_domain = resource_domains[1], .resources = .{ .memory_limit_bytes = 512 * 1024 * 1024, .disk_limit_bytes = 2 * 1024 * 1024 * 1024 } },
+        .{ .id = deployment_node_ids[2], .name = "node-3", .process_domain = process_domains[2], .storage_domain = storage_domains[2], .resource_domain = resource_domains[2], .resources = .{ .memory_limit_bytes = 512 * 1024 * 1024, .disk_limit_bytes = 2 * 1024 * 1024 * 1024 } },
         .{ .id = deployment_node_ids[3], .name = "serverless-worker", .process_domain = process_domains[3], .storage_domain = storage_domains[3], .resource_domain = resource_domains[3], .resources = .{ .memory_limit_bytes = 512 * 1024 * 1024, .disk_limit_bytes = 64 * 1024 * 1024 } },
     };
     const deployment_instances = [_]vopr.deployment.Instance{
@@ -510,6 +517,20 @@ pub const Scenario = struct {
         resource_proposals_after: u64 = 0,
         resource_absent_before_retry: bool = false,
         resource_post_split_ok: bool = false,
+        disk_capacity_target_index: usize = 0,
+        disk_capacity_fault_injected: bool = false,
+        disk_capacity_denial_observed: bool = false,
+        disk_capacity_denials_before: u64 = 0,
+        disk_capacity_denials_after: u64 = 0,
+        disk_capacity_reservations_before: u64 = 0,
+        disk_capacity_reservations_after: u64 = 0,
+        disk_capacity_reserved_bytes_after: u64 = 0,
+        disk_capacity_denied_cache_absent: bool = false,
+        disk_capacity_public_read_during_pressure: bool = false,
+        disk_capacity_healed: bool = false,
+        disk_capacity_cache_recovered: bool = false,
+        disk_capacity_public_recovered: bool = false,
+        disk_capacity_ok: bool = false,
         join_query_ok: bool = false,
         split_join_query_ok: bool = false,
         post_split_join_query_ok: bool = false,
@@ -1647,6 +1668,20 @@ pub const Scenario = struct {
                     .resource_absent_before_retry = snapshot.resource_absent_before_retry,
                     .resource_recovery_ok = snapshot.resource_recovery_ok,
                     .resource_post_split_ok = snapshot.resource_post_split_ok,
+                    .disk_capacity_target_index = snapshot.disk_capacity_target_index,
+                    .disk_capacity_fault_injected = snapshot.disk_capacity_fault_injected,
+                    .disk_capacity_denial_observed = snapshot.disk_capacity_denial_observed,
+                    .disk_capacity_denials_before = snapshot.disk_capacity_denials_before,
+                    .disk_capacity_denials_after = snapshot.disk_capacity_denials_after,
+                    .disk_capacity_reservations_before = snapshot.disk_capacity_reservations_before,
+                    .disk_capacity_reservations_after = snapshot.disk_capacity_reservations_after,
+                    .disk_capacity_reserved_bytes_after = snapshot.disk_capacity_reserved_bytes_after,
+                    .disk_capacity_denied_cache_absent = snapshot.disk_capacity_denied_cache_absent,
+                    .disk_capacity_public_read_during_pressure = snapshot.disk_capacity_public_read_during_pressure,
+                    .disk_capacity_healed = snapshot.disk_capacity_healed,
+                    .disk_capacity_cache_recovered = snapshot.disk_capacity_cache_recovered,
+                    .disk_capacity_public_recovered = snapshot.disk_capacity_public_recovered,
+                    .disk_capacity_ok = snapshot.disk_capacity_ok,
                     .cleanup_ok = snapshot.cleanup_ok,
                     .raft_wire_requests = snapshot.raft_wire_requests,
                     .node_resource_managers = snapshot.node_resource_managers,
@@ -1751,6 +1786,14 @@ pub const Scenario = struct {
                 self.production_cluster.?.setAuthenticatedTenantIsolationEnabled(
                     mode == .production_data_plane_authenticated_tenant_isolation,
                 );
+                if (mode == .production_data_plane_disk_capacity_pressure)
+                    self.production_cluster.?.setDiskCapacityPressureTarget(1) catch |err| {
+                        self.initialization_failed = true;
+                        self.initialization_error_code = @intFromError(err);
+                        self.initialization_done = true;
+                        self.complete = true;
+                        return;
+                    };
                 self.production_cluster.?.setGraphEnabled(
                     mode == .production_data_plane_graph or
                         mode == .production_data_plane_service_rate or
@@ -1841,6 +1884,7 @@ pub const Scenario = struct {
                     .production_data_plane_graph_split_socket_pressure => .socket_pressure,
                     .production_data_plane_graph_cancellation_transport_failure => .graph_hydration_transport_failure,
                     .production_data_plane_durable_join_takeover => .join_finalizer_ack_failure,
+                    .production_data_plane_disk_capacity_pressure => .disk_capacity_pressure,
                     else => .clean,
                 });
                 self.production_cluster.?.bootstrap() catch |err| {
@@ -2092,6 +2136,11 @@ pub const Scenario = struct {
                     vopr.id.derive("full-cluster.production-resource-pressure", domain_id, index),
                     .resource,
                     domain_id,
+                ),
+                .production_data_plane_disk_capacity_pressure => try deployment.activateFault(
+                    vopr.id.stable(name, "fault.production-disk-capacity-pressure"),
+                    .resource,
+                    resource_domains[1],
                 ),
                 .production_data_plane_graph_split_overlapping_faults => {
                     const production = self.production_cluster orelse
@@ -2663,6 +2712,20 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".production-resource-proposals-after", if (cluster) |snapshot| @intCast(snapshot.resource_proposals_after) else 0);
         try builder.addNamed(allocator, name ++ ".production-resource-absent-before-retry", @intFromBool(if (cluster) |snapshot| snapshot.resource_absent_before_retry else false));
         try builder.addNamed(allocator, name ++ ".production-resource-post-split-ok", @intFromBool(if (cluster) |snapshot| snapshot.resource_post_split_ok else false));
+        try builder.addNamed(allocator, name ++ ".production-disk-capacity-target", if (cluster) |snapshot| @intCast(snapshot.disk_capacity_target_index) else 0);
+        try builder.addNamed(allocator, name ++ ".production-disk-capacity-fault-injected", @intFromBool(if (cluster) |snapshot| snapshot.disk_capacity_fault_injected else false));
+        try builder.addNamed(allocator, name ++ ".production-disk-capacity-denial-observed", @intFromBool(if (cluster) |snapshot| snapshot.disk_capacity_denial_observed else false));
+        try builder.addNamed(allocator, name ++ ".production-disk-capacity-denials-before", if (cluster) |snapshot| @intCast(snapshot.disk_capacity_denials_before) else 0);
+        try builder.addNamed(allocator, name ++ ".production-disk-capacity-denials-after", if (cluster) |snapshot| @intCast(snapshot.disk_capacity_denials_after) else 0);
+        try builder.addNamed(allocator, name ++ ".production-disk-capacity-reservations-before", if (cluster) |snapshot| @intCast(snapshot.disk_capacity_reservations_before) else 0);
+        try builder.addNamed(allocator, name ++ ".production-disk-capacity-reservations-after", if (cluster) |snapshot| @intCast(snapshot.disk_capacity_reservations_after) else 0);
+        try builder.addNamed(allocator, name ++ ".production-disk-capacity-reserved-after", if (cluster) |snapshot| @intCast(snapshot.disk_capacity_reserved_bytes_after) else 0);
+        try builder.addNamed(allocator, name ++ ".production-disk-capacity-denied-cache-absent", @intFromBool(if (cluster) |snapshot| snapshot.disk_capacity_denied_cache_absent else false));
+        try builder.addNamed(allocator, name ++ ".production-disk-capacity-public-read-during-pressure", @intFromBool(if (cluster) |snapshot| snapshot.disk_capacity_public_read_during_pressure else false));
+        try builder.addNamed(allocator, name ++ ".production-disk-capacity-healed", @intFromBool(if (cluster) |snapshot| snapshot.disk_capacity_healed else false));
+        try builder.addNamed(allocator, name ++ ".production-disk-capacity-cache-recovered", @intFromBool(if (cluster) |snapshot| snapshot.disk_capacity_cache_recovered else false));
+        try builder.addNamed(allocator, name ++ ".production-disk-capacity-public-recovered", @intFromBool(if (cluster) |snapshot| snapshot.disk_capacity_public_recovered else false));
+        try builder.addNamed(allocator, name ++ ".production-disk-capacity-ok", @intFromBool(if (cluster) |snapshot| snapshot.disk_capacity_ok else false));
         try builder.addNamed(allocator, name ++ ".deployment-quiet", @intFromBool(state.deployment_sound));
         try builder.addNamed(allocator, name ++ ".initialization-failed", @intFromBool(state.initialization_failed));
         try builder.addNamed(allocator, name ++ ".initialization-error", @intCast(state.initialization_error_code));
@@ -2974,6 +3037,22 @@ pub const Scenario = struct {
         try sink.check(allocator, production_authenticated_tenant_isolation_id, !state.complete or
             state.mode.? != .production_data_plane_authenticated_tenant_isolation or
             state.authenticatedTenantIsolationSound());
+        try sink.check(allocator, production_disk_capacity_pressure_id, !state.complete or
+            state.mode.? != .production_data_plane_disk_capacity_pressure or
+            (cluster != null and cluster.?.requests_ok and
+                cluster.?.disk_capacity_target_index == 1 and
+                cluster.?.disk_capacity_fault_injected and
+                cluster.?.disk_capacity_denial_observed and
+                cluster.?.disk_capacity_denials_after > cluster.?.disk_capacity_denials_before and
+                cluster.?.disk_capacity_reservations_after ==
+                    cluster.?.disk_capacity_reservations_before + 1 and
+                cluster.?.disk_capacity_reserved_bytes_after == 0 and
+                cluster.?.disk_capacity_denied_cache_absent and
+                cluster.?.disk_capacity_public_read_during_pressure and
+                cluster.?.disk_capacity_healed and
+                cluster.?.disk_capacity_cache_recovered and
+                cluster.?.disk_capacity_public_recovered and
+                cluster.?.disk_capacity_ok));
         try sink.check(allocator, production_replication_backfill_id, !state.complete or
             !state.mode.?.isReplicationBackfill() or
             state.replicationSound());
@@ -3160,6 +3239,7 @@ fn runExactMode(
     const production_replication_stale_owner_mode = mode_id == Scenario.mode_ids[Scenario.production_replication_stale_owner_ordinal];
     const production_replication_topology_change_mode = mode_id == Scenario.mode_ids[Scenario.production_replication_topology_change_ordinal];
     const production_authenticated_tenant_isolation_mode = mode_id == Scenario.mode_ids[Scenario.production_authenticated_tenant_isolation_ordinal];
+    const production_disk_capacity_pressure_mode = mode_id == Scenario.mode_ids[Scenario.production_disk_capacity_pressure_ordinal];
     const production_replication_mode = production_replication_backfill_mode or
         production_replication_schema_change_mode or
         production_replication_owner_restart_mode or
@@ -3185,6 +3265,7 @@ fn runExactMode(
         production_global_query_transport_mode or production_global_query_owner_restart_mode or
         production_query_cache_service_rate_mode or production_serverless_fencing_mode or
         production_authenticated_tenant_isolation_mode or
+        production_disk_capacity_pressure_mode or
         production_replication_mode;
     // Fault extensions of the promoted graph/split history keep its
     // cooperative scheduling seed. The prefixed mode remains distinct replay
@@ -3206,6 +3287,7 @@ fn runExactMode(
     else if (production_service_rate_mode or production_query_cache_service_rate_mode or
         production_serverless_fencing_mode or
         production_authenticated_tenant_isolation_mode or
+        production_disk_capacity_pressure_mode or
         production_replication_mode)
         Scenario.production_graph_ordinal
     else if (production_graph_hydration_mode)
@@ -3254,6 +3336,8 @@ fn runExactMode(
                 "full-cluster-vopr-v50-serverless-generation-progress-conflict"
             else if (production_authenticated_tenant_isolation_mode)
                 "full-cluster-vopr-v51-authenticated-tenant-isolation"
+            else if (production_disk_capacity_pressure_mode)
+                "full-cluster-vopr-v52-disk-capacity-pressure"
             else if (production_global_query_owner_restart_mode)
                 "full-cluster-vopr-v40-public-global-query-owner-restart"
             else if (production_global_query_transport_mode)
@@ -3671,6 +3755,19 @@ test "full cluster production authenticated tenant isolation exact replay" {
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
     const ordinal = Scenario.production_authenticated_tenant_isolation_ordinal;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        120_000,
+        .complete,
+    );
+}
+
+test "full cluster production disk capacity pressure exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.production_disk_capacity_pressure_ordinal;
     try runExactMode(
         history_allocator.allocator(),
         Scenario.mode_ids[ordinal],

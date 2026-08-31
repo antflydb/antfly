@@ -7480,6 +7480,18 @@ pub fn build(b: *std.Build) void {
     );
     production_cluster_authenticated_tenant_vopr_test_step.dependOn(&run_production_cluster_authenticated_tenant_vopr_tests.step);
 
+    const production_cluster_disk_capacity_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production disk capacity pressure exact replay"},
+        .max_rss = full_cluster_vopr_max_rss,
+    });
+    const run_production_cluster_disk_capacity_vopr_tests = b.addRunArtifact(production_cluster_disk_capacity_vopr_tests);
+    const production_cluster_disk_capacity_vopr_test_step = b.step(
+        "production-cluster-disk-capacity-vopr-test",
+        "Run a live DataServer capacity source through persistent-cache denial, healing, retry, and public-read continuity",
+    );
+    production_cluster_disk_capacity_vopr_test_step.dependOn(&run_production_cluster_disk_capacity_vopr_tests.step);
+
     const production_cluster_replication_backfill_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production replication backfill crosses public data raft and exact replays"},
@@ -7949,7 +7961,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_graph_split_socket_pressure_vopr_test_step.dependOn(&run_production_cluster_graph_split_socket_pressure_vopr_tests.step);
     const production_cluster_vopr_test_step = b.step(
         "production-cluster-vopr-test",
-        "Run every focused production DataServer cluster history through v51",
+        "Run every focused production DataServer cluster history through v52",
     );
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_deep_test_step);
@@ -7959,6 +7971,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_owner_restart_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_partial_write_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_resource_pressure_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_disk_capacity_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_join_split_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_durable_join_takeover_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_durable_join_cancellation_vopr_test_step);

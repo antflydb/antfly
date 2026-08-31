@@ -32,6 +32,7 @@ const shard_ops = @import("../raft/shard_ops.zig");
 const transition_state = @import("../metadata/transition_state.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const resource_manager = @import("../storage/resource_manager.zig");
+const lake_parquet_rowgroup = @import("../serverless/query/lake_parquet_rowgroup.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
@@ -46,6 +47,7 @@ const db_types = @import("../storage/db/types.zig");
 // that a mutation was not proposed.
 const internal_service_secret = "metadata-simulation-internal-service-secret";
 const internal_service_issuer = "metadata-sim";
+const modeled_healthy_capacity_bytes: u64 = 2 * 1024 * 1024 * 1024;
 
 const ModeledCapacitySource = struct {
     sim: *vopr.vopr_io.VoprIo,
@@ -129,6 +131,7 @@ pub const Fixture = struct {
         graph_owner_restart,
         graph_partial_write,
         resource_pressure,
+        disk_capacity_pressure,
         socket_pressure,
         join_finalizer_ack_failure,
 
@@ -611,6 +614,21 @@ pub const Fixture = struct {
     resource_absent_before_retry: bool = false,
     resource_recovery_sound: bool = false,
     resource_post_split_sound: bool = false,
+    disk_capacity_target_index: usize = 0,
+    disk_capacity_target_configured: bool = false,
+    disk_capacity_fault_injected: bool = false,
+    disk_capacity_denial_observed: bool = false,
+    disk_capacity_denials_before: u64 = 0,
+    disk_capacity_denials_after: u64 = 0,
+    disk_capacity_reservations_before: u64 = 0,
+    disk_capacity_reservations_after: u64 = 0,
+    disk_capacity_reserved_bytes_after: u64 = 0,
+    disk_capacity_denied_cache_absent: bool = false,
+    disk_capacity_public_read_during_pressure: bool = false,
+    disk_capacity_healed: bool = false,
+    disk_capacity_cache_recovered: bool = false,
+    disk_capacity_public_recovered: bool = false,
+    disk_capacity_sound: bool = false,
     graph_restart_requested: std.Io.Semaphore = .{},
     graph_restart_down: std.Io.Semaphore = .{},
     graph_restart_recover: std.Io.Semaphore = .{},
@@ -861,6 +879,13 @@ pub const Fixture = struct {
     pub fn setFaultMode(self: *Fixture, mode: FaultMode) void {
         std.debug.assert(self.phase == .created);
         self.fault_mode = mode;
+    }
+
+    pub fn setDiskCapacityPressureTarget(self: *Fixture, target_index: usize) !void {
+        std.debug.assert(self.phase == .created);
+        if (target_index >= node_count) return error.InvalidProductionDiskCapacityTarget;
+        self.disk_capacity_target_index = target_index;
+        self.disk_capacity_target_configured = true;
     }
 
     pub fn setWorkCostPorts(self: *Fixture, ports: WorkCostPorts) void {
@@ -1340,6 +1365,9 @@ pub const Fixture = struct {
             return error.InvalidProductionClusterJoinRetryExhaustionMode;
         switch (self.fault_mode) {
             .clean => {},
+            .disk_capacity_pressure => if (self.active_split_enabled or self.graph_enabled or
+                !self.disk_capacity_target_configured)
+                return error.InvalidProductionClusterFaultMode,
             .graph_hydration_transport_failure => if (!self.graph_enabled or
                 !self.graph_cancellation_enabled or self.active_split_enabled)
                 return error.InvalidProductionClusterFaultMode,
@@ -1502,7 +1530,11 @@ pub const Fixture = struct {
                 .sim = self.sim,
                 .root = self.data_roots[index],
                 .catalog = self.data_catalogs[index],
-                .capacity_bytes = 64 * 1024 * 1024,
+                // Production admission retains a 1 GiB absolute safety floor.
+                // Keep the healthy modeled volume above that floor so a
+                // reservation-consuming cache/repair seam can both admit and
+                // recover; pressure modes lower this source explicitly.
+                .capacity_bytes = modeled_healthy_capacity_bytes,
                 .domain_id = @as(u128, vopr.id.derive(
                     "full-cluster.production-capacity-domain",
                     vopr.id.stable("full-cluster", "production-data"),
@@ -1856,6 +1888,7 @@ pub const Fixture = struct {
         }
         if (self.fault_mode == .clean or self.fault_mode == .graph_hydration_transport_failure or
             self.fault_mode == .resource_pressure or
+            self.fault_mode == .disk_capacity_pressure or
             self.fault_mode == .socket_pressure or
             self.fault_mode == .join_finalizer_ack_failure) return;
         switch (event.phase) {
@@ -1899,7 +1932,7 @@ pub const Fixture = struct {
                         self.sim.setOutboundEndpointPayloadPartialWrite(endpoint, "/graph-expand", 1) catch unreachable;
                         self.graph_partial_write_injected = true;
                     },
-                    .graph_hydration_transport_failure, .resource_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
+                    .graph_hydration_transport_failure, .resource_pressure, .disk_capacity_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
                 }
             },
             .attempt_failed => {
@@ -1929,7 +1962,7 @@ pub const Fixture = struct {
                         self.graph_restart_recovered.wait(self.sim.io()) catch return;
                     },
                     .graph_partial_write => {},
-                    .graph_hydration_transport_failure, .resource_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
+                    .graph_hydration_transport_failure, .resource_pressure, .disk_capacity_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
                 }
             },
             else => {},
@@ -3069,6 +3102,10 @@ pub const Fixture = struct {
                 return error.ProductionDataAuthenticatedTenantIsolationFailed;
         }
 
+        if (self.fault_mode == .disk_capacity_pressure) {
+            try self.runDiskCapacityPressure();
+        }
+
         if (self.global_query_enabled) {
             if (!try self.waitForDocIdentityReady("docs", 64) or
                 !try self.waitForDocIdentityReady("tenant_b_docs", 64))
@@ -3210,7 +3247,7 @@ pub const Fixture = struct {
                                     return error.ProductionGraphPartialWriteTargetLeadershipChanged;
                                 break :blk try parseHttpBaseUriAddress(self.data_api_uris[target_index]);
                             },
-                        .graph_hydration_transport_failure, .resource_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
+                        .graph_hydration_transport_failure, .resource_pressure, .disk_capacity_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
                     }
                     self.graph_transport_fault_armed = true;
                 }
@@ -4623,6 +4660,128 @@ pub const Fixture = struct {
             return error.ProductionDataResourceRecoveryFailed;
     }
 
+    /// Drive disk admission through the production persistent object-range
+    /// cache attached to one live DataServer's node-wide ResourceManager.
+    /// The zero-capacity interval must reject before file creation while
+    /// ordinary public reads remain available. Healing the same modeled
+    /// volume must admit exactly one retry, persist it, and leave no capacity
+    /// reservation behind. This is deliberately not a fixture-side capacity
+    /// precheck: both denial and recovery cross the cache worker's real
+    /// `reserveCapacity` call and the DataServer-owned CapacitySource.
+    fn runDiskCapacityPressure(self: *Fixture) !void {
+        if (!self.disk_capacity_target_configured)
+            return error.ProductionDiskCapacityTargetMissing;
+        const target_index = self.disk_capacity_target_index;
+        if (target_index >= self.data_server_count or !self.data_server_live[target_index])
+            return error.ProductionDiskCapacityTargetUnavailable;
+
+        const cache_root = try std.fmt.allocPrint(
+            self.alloc,
+            "{s}/vopr-lake-range-cache",
+            .{self.data_roots[target_index]},
+        );
+        defer self.alloc.free(cache_root);
+        const manager = &self.data_servers[target_index].provisioned_storage.resource_manager;
+        var cache = try lake_parquet_rowgroup.PersistentObjectRangeCache.initWithPolicyAndResources(
+            self.sim.io(),
+            cache_root,
+            .{
+                .max_total_bytes = 1024 * 1024,
+                .max_entries = 8,
+                .max_write_queue_bytes = 64 * 1024,
+                .max_write_queue_entries = 4,
+                .durability = .durable,
+            },
+            .{ .resource_manager = manager },
+        );
+        defer cache.deinit();
+
+        const healthy_capacity = self.capacity_sources[target_index].capacity_bytes;
+        if (healthy_capacity != modeled_healthy_capacity_bytes)
+            return error.ProductionDiskCapacityHealthyBaselineInvalid;
+        defer self.capacity_sources[target_index].capacity_bytes = healthy_capacity;
+
+        const denied_key = "vopr:production-capacity:denied";
+        const recovered_key = "vopr:production-capacity:recovered";
+        const payload = "production-cache-capacity-recovery";
+        const cache_before = cache.statsSnapshot();
+        const capacity_before = manager.capacityStats();
+        self.disk_capacity_denials_before = capacity_before.denials;
+        self.disk_capacity_reservations_before = capacity_before.reservations;
+
+        self.capacity_sources[target_index].capacity_bytes = 0;
+        self.disk_capacity_fault_injected = true;
+        if (cache.enqueueWrite(denied_key, payload) != .enqueued)
+            return error.ProductionDiskCapacityProbeNotQueued;
+        cache.flush();
+
+        const cache_denied = cache.statsSnapshot();
+        const capacity_denied = manager.capacityStats();
+        self.disk_capacity_denials_after = capacity_denied.denials;
+        self.disk_capacity_denial_observed =
+            cache_denied.writes_completed == cache_before.writes_completed and
+            cache_denied.writes_dropped == cache_before.writes_dropped + 1 and
+            cache_denied.write_errors == cache_before.write_errors and
+            capacity_denied.denials > capacity_before.denials and
+            capacity_denied.reservations == capacity_before.reservations and
+            capacity_denied.reserved_bytes == 0;
+        if (!self.disk_capacity_denial_observed)
+            return error.ProductionDiskCapacityDidNotDenyBeforeWrite;
+
+        if (try cache.readAlloc(self.alloc, denied_key, payload.len)) |unexpected| {
+            self.alloc.free(unexpected);
+            return error.ProductionDiskCapacityDeniedEntryMaterialized;
+        }
+        self.disk_capacity_denied_cache_absent = true;
+        self.disk_capacity_public_read_during_pressure = try self.documentVisibleAtNode(
+            target_index,
+            "docs",
+            "doc:c",
+            "production-left",
+        );
+        if (!self.disk_capacity_public_read_during_pressure)
+            return error.ProductionDiskCapacityPressureBrokePublicRead;
+
+        self.capacity_sources[target_index].capacity_bytes = healthy_capacity;
+        self.disk_capacity_healed = true;
+        if (cache.enqueueWrite(recovered_key, payload) != .enqueued)
+            return error.ProductionDiskCapacityRecoveryNotQueued;
+        cache.flush();
+
+        const cache_recovered = cache.statsSnapshot();
+        const capacity_recovered = manager.capacityStats();
+        self.disk_capacity_reservations_after = capacity_recovered.reservations;
+        self.disk_capacity_reserved_bytes_after = capacity_recovered.reserved_bytes;
+        const recovered = (try cache.readAlloc(self.alloc, recovered_key, payload.len)) orelse
+            return error.ProductionDiskCapacityRecoveredEntryMissing;
+        defer self.alloc.free(recovered);
+        self.disk_capacity_cache_recovered =
+            std.mem.eql(u8, recovered, payload) and
+            cache_recovered.writes_completed == cache_before.writes_completed + 1 and
+            cache_recovered.writes_dropped == cache_before.writes_dropped + 1 and
+            capacity_recovered.denials == capacity_denied.denials and
+            capacity_recovered.reservations == capacity_before.reservations + 1 and
+            capacity_recovered.reserved_bytes == 0;
+        if (!self.disk_capacity_cache_recovered)
+            return error.ProductionDiskCapacityCacheDidNotRecover;
+
+        self.disk_capacity_public_recovered = try self.documentVisibleAtNode(
+            (target_index + 1) % self.data_api_uri_count,
+            "docs",
+            "doc:x",
+            "production-right",
+        );
+        self.disk_capacity_sound = self.disk_capacity_fault_injected and
+            self.disk_capacity_denial_observed and
+            self.disk_capacity_denied_cache_absent and
+            self.disk_capacity_public_read_during_pressure and
+            self.disk_capacity_healed and
+            self.disk_capacity_cache_recovered and
+            self.disk_capacity_public_recovered;
+        if (!self.disk_capacity_sound)
+            return error.ProductionDiskCapacityRecoveryFailed;
+    }
+
     /// Deny every new connection to one registered production listener while
     /// leaving existing connections and all other node endpoints untouched.
     /// A fresh non-pooled client makes the denial non-vacuous; a second fresh
@@ -5277,6 +5436,8 @@ pub const Fixture = struct {
         if (self.cleanup_sound) return;
         self.cleanup_started = true;
         self.releaseNodeMemory();
+        for (self.capacity_sources[0..self.data_root_count]) |*source|
+            source.capacity_bytes = modeled_healthy_capacity_bytes;
         self.graph_transport_fault_armed = false;
         self.graph_transport_fault_endpoint = null;
         self.global_query_transport_failure_armed = false;
@@ -5725,6 +5886,20 @@ pub const Fixture = struct {
         resource_absent_before_retry: bool,
         resource_recovery_ok: bool,
         resource_post_split_ok: bool,
+        disk_capacity_target_index: usize,
+        disk_capacity_fault_injected: bool,
+        disk_capacity_denial_observed: bool,
+        disk_capacity_denials_before: u64,
+        disk_capacity_denials_after: u64,
+        disk_capacity_reservations_before: u64,
+        disk_capacity_reservations_after: u64,
+        disk_capacity_reserved_bytes_after: u64,
+        disk_capacity_denied_cache_absent: bool,
+        disk_capacity_public_read_during_pressure: bool,
+        disk_capacity_healed: bool,
+        disk_capacity_cache_recovered: bool,
+        disk_capacity_public_recovered: bool,
+        disk_capacity_ok: bool,
         graph_partial_rejected_sound: bool,
         cleanup_ok: bool,
         node_resource_managers: usize,
@@ -5748,6 +5923,7 @@ pub const Fixture = struct {
                 (!self.graph_cancellation_enabled or self.graph_cancellation_sound) and
                 (!self.graph_inflight_authorization_revocation_enabled or self.graph_authorization_sound) and
                 (!self.graph_stale_snapshot_retry_exhaustion_enabled or self.graph_stale_snapshot_sound) and
+                (self.fault_mode != .disk_capacity_pressure or self.disk_capacity_sound) and
                 (!self.active_split_enabled or self.split_sound) and
                 self.failure == null,
             .topology_ok = self.topology_sound,
@@ -5913,6 +6089,20 @@ pub const Fixture = struct {
             .resource_absent_before_retry = self.resource_absent_before_retry,
             .resource_recovery_ok = self.resource_recovery_sound,
             .resource_post_split_ok = self.resource_post_split_sound,
+            .disk_capacity_target_index = self.disk_capacity_target_index,
+            .disk_capacity_fault_injected = self.disk_capacity_fault_injected,
+            .disk_capacity_denial_observed = self.disk_capacity_denial_observed,
+            .disk_capacity_denials_before = self.disk_capacity_denials_before,
+            .disk_capacity_denials_after = self.disk_capacity_denials_after,
+            .disk_capacity_reservations_before = self.disk_capacity_reservations_before,
+            .disk_capacity_reservations_after = self.disk_capacity_reservations_after,
+            .disk_capacity_reserved_bytes_after = self.disk_capacity_reserved_bytes_after,
+            .disk_capacity_denied_cache_absent = self.disk_capacity_denied_cache_absent,
+            .disk_capacity_public_read_during_pressure = self.disk_capacity_public_read_during_pressure,
+            .disk_capacity_healed = self.disk_capacity_healed,
+            .disk_capacity_cache_recovered = self.disk_capacity_cache_recovered,
+            .disk_capacity_public_recovered = self.disk_capacity_public_recovered,
+            .disk_capacity_ok = self.disk_capacity_sound,
             .graph_partial_rejected_sound = self.graph_partial_rejected_sound,
             .cleanup_ok = self.cleanup_sound,
             // `backend_runtime_count` is live ownership and intentionally
