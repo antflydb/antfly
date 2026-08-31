@@ -2132,7 +2132,10 @@ fn optionalTagAlloc(alloc: Allocator, xml: []const u8, tag: []const u8) !?[]u8 {
 
 fn optionalDecodedXmlAlloc(alloc: Allocator, xml: []const u8, tag: []const u8) !?[]u8 {
     if (findBlock(xml, tag, 0) == null) return null;
-    return try decodeXmlAlloc(alloc, xml, tag);
+    const value = try decodeXmlAlloc(alloc, xml, tag);
+    if (value.len != 0) return value;
+    alloc.free(value);
+    return null;
 }
 
 fn completeMultipartXmlAlloc(alloc: Allocator, etags: []const []u8) ![]u8 {
@@ -2398,6 +2401,19 @@ test "s3 version-list parser fails closed on unusable pagination" {
         error.InvalidListVersionsResponse,
         parseListObjectVersionsResponse(alloc, "<ListVersionsResult><IsTruncated>false</IsTruncated><NextKeyMarker>unexpected</NextKeyMarker></ListVersionsResult>"),
     );
+}
+
+test "s3 version-list parser normalizes empty terminal markers" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseListObjectVersionsResponse(
+        alloc,
+        "<ListVersionsResult><NextVersionIdMarker></NextVersionIdMarker><IsTruncated>false</IsTruncated></ListVersionsResult>",
+    );
+    defer parsed.deinit(alloc);
+    try std.testing.expect(!parsed.is_truncated);
+    try std.testing.expectEqual(@as(usize, 0), parsed.entries.len);
+    try std.testing.expectEqual(@as(?[]u8, null), parsed.next_key_marker);
+    try std.testing.expectEqual(@as(?[]u8, null), parsed.next_version_id_marker);
 }
 
 test "s3 object query includes version and part selectors" {
