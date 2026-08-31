@@ -546,7 +546,6 @@ fn renderChildGroupAlloc(
     } else {
         @memcpy(child, target);
     }
-    const coverage_budget_start = bilevel_sample_budget.*;
     try renderGroupChildrenAlloc(alloc, child, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout, cancellation, bilevel_sample_budget);
     if (nonisolated_boundary) {
         // A non-isolated group must see the real backdrop while its children
@@ -555,8 +554,10 @@ fn renderChildGroupAlloc(
         const coverage = try alloc.alloc(u8, width * height * 4);
         defer alloc.free(coverage);
         @memset(coverage, 0);
-        var coverage_bilevel_budget = coverage_budget_start;
-        try renderGroupChildrenAlloc(alloc, coverage, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout, cancellation, &coverage_bilevel_budget);
+        // Coverage is real render work. Keep it on the shared page budget so a
+        // group boundary cannot reset the bounded source-sampling allowance;
+        // nested groups therefore remain bounded as well.
+        try renderGroupChildrenAlloc(alloc, coverage, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout, cancellation, bilevel_sample_budget);
         try compositeNonisolatedGroupCanvasModeCancelable(target, child, coverage, meta.alpha, meta.blend_mode, cancellation);
     } else if (meta.isolated) {
         try compositeGroupCanvasModeCancelable(target, child, meta.alpha, meta.blend_mode, cancellation);
@@ -2853,6 +2854,46 @@ test "non-isolated group boundary removes backdrop before applying alpha" {
     try std.testing.expectEqual(@as(u8, 0), canvas[1]);
     try std.testing.expect(@abs(@as(i16, canvas[2]) - 0xbf) <= 1);
     try std.testing.expectEqual(@as(u8, 0xff), canvas[3]);
+}
+
+test "non-isolated coverage rendering consumes the shared bilevel budget" {
+    const alloc = std.testing.allocator;
+    var pixels = [_]u8{ 0, 0, 0, 0xff } ** 8;
+    const images = [_]reader.ImageRun{.{
+        .rgba = &pixels,
+        .width = 8,
+        .height = 1,
+        .bilevel = true,
+        .ocr_coverage_minify = true,
+        .group_id = 1,
+        .group_isolated = false,
+        .group_alpha = 0x80,
+        .a = 1,
+        .b = 0,
+        .c = 0,
+        .d = 1,
+        .e = 0,
+        .f = 0,
+        .x = 0,
+        .y = 0,
+        .draw_width = 1,
+        .draw_height = 1,
+    }};
+    var budget = BilevelSampleBudget{ .remaining_samples = 16 };
+    const raw = try renderPageContentRgbaInBoxAllocWithBudget(
+        alloc,
+        .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
+        &.{},
+        &images,
+        &.{},
+        &.{},
+        &.{},
+        .{},
+        &budget,
+        .opaque_white,
+    );
+    defer alloc.free(raw.rgba);
+    try std.testing.expectEqual(@as(u64, 0), budget.remaining_samples);
 }
 
 test "shading samples select the right side of a stitching discontinuity" {

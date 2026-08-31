@@ -1343,6 +1343,8 @@ pub const ImageRun = struct {
 const shading_uniform_color_sample_count: usize = 64;
 const shading_color_sample_capacity: usize = 128;
 const shading_color_sample_count = shading_uniform_color_sample_count;
+const shading_discontinuity_capacity: usize = (shading_color_sample_capacity - shading_uniform_color_sample_count) / 2;
+const shading_function_node_capacity: u16 = 128;
 
 pub const ShadingRun = struct {
     kind: enum { axial, radial },
@@ -2819,7 +2821,75 @@ const ShadingColorFunction = union(enum) {
             .stitching => |function| .{ function.domain_min, function.domain_max },
         };
     }
+
+    /// Append every reachable stitching boundary in the root function's input
+    /// coordinates. The affine mapping is inverted at each stitching child so
+    /// nested and reversed /Encode ranges retain their discontinuities without
+    /// growing an unbounded recursive breakpoint table.
+    fn appendDiscontinuities(
+        self: *const ShadingColorFunction,
+        out: *[shading_discontinuity_capacity]f64,
+        count: *usize,
+        root_scale: f64,
+        root_offset: f64,
+        reachable_min: f64,
+        reachable_max: f64,
+    ) !void {
+        const domain_value = self.domain();
+        const active_min = @max(reachable_min, domain_value[0]);
+        const active_max = @min(reachable_max, domain_value[1]);
+        if (!(active_min < active_max)) return;
+
+        const stitching = switch (self.*) {
+            .stitching => |function| function,
+            else => return,
+        };
+        for (stitching.bounds) |bound| {
+            if (bound <= active_min or bound >= active_max) continue;
+            try appendUniqueShadingDiscontinuity(out, count, root_scale * bound + root_offset);
+        }
+        for (stitching.functions, 0..) |*child, index| {
+            const segment_min = if (index == 0) stitching.domain_min else stitching.bounds[index - 1];
+            const segment_max = if (index == stitching.functions.len - 1) stitching.domain_max else stitching.bounds[index];
+            const child_parent_min = @max(active_min, segment_min);
+            const child_parent_max = @min(active_max, segment_max);
+            if (!(child_parent_min < child_parent_max)) continue;
+
+            const encode_min = stitching.encode[index * 2];
+            const encode_max = stitching.encode[index * 2 + 1];
+            const encode_delta = encode_max - encode_min;
+            if (encode_delta == 0) continue;
+            const segment_delta = segment_max - segment_min;
+            const encoded_active_min = encode_min +
+                ((child_parent_min - segment_min) / segment_delta) * encode_delta;
+            const encoded_active_max = encode_min +
+                ((child_parent_max - segment_min) / segment_delta) * encode_delta;
+            const child_root_scale = root_scale * segment_delta / encode_delta;
+            const child_root_offset = root_offset + root_scale *
+                (segment_min - encode_min * segment_delta / encode_delta);
+            try child.appendDiscontinuities(
+                out,
+                count,
+                child_root_scale,
+                child_root_offset,
+                @min(encoded_active_min, encoded_active_max),
+                @max(encoded_active_min, encoded_active_max),
+            );
+        }
+    }
 };
+
+fn appendUniqueShadingDiscontinuity(
+    out: *[shading_discontinuity_capacity]f64,
+    count: *usize,
+    value: f64,
+) !void {
+    if (!std.math.isFinite(value)) return error.UnsupportedPdfRendering;
+    for (out[0..count.*]) |existing| if (existing == value) return;
+    if (count.* >= out.len) return error.UnsupportedPdfRendering;
+    out[count.*] = value;
+    count.* += 1;
+}
 
 const ShadingStitchingFunction = struct {
     functions: []ShadingColorFunction,
@@ -4230,7 +4300,7 @@ pub const Reader = struct {
         const decoded_content = try self.readCombinedContentStreamsAlloc(contents);
         defer self.alloc.free(decoded_content);
 
-        const shadings = try self.collectPageShadingsAlloc(&page);
+        const shadings = try self.collectPageShadingsForContentAlloc(&page, decoded_content);
         defer {
             for (shadings) |*shading| shading.deinit(self.alloc);
             self.alloc.free(shadings);
@@ -4319,7 +4389,7 @@ pub const Reader = struct {
             self.alloc.free(images);
         }
         try self.checkCancellation();
-        const shadings = try self.collectPageShadingsAlloc(&page);
+        const shadings = try self.collectPageShadingsForContentAlloc(&page, decoded_content);
         defer {
             for (shadings) |*shading| shading.deinit(self.alloc);
             self.alloc.free(shadings);
@@ -6759,11 +6829,11 @@ pub const Reader = struct {
         return try self.collectImagesFromResourcesAlloc(&resources.?, content);
     }
 
-    fn collectPageShadingsAlloc(self: *const Reader, page: *const syntax.Object) ![]PageShading {
+    fn collectPageShadingsForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageShading {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PageShading, 0);
         defer if (resources) |*obj| obj.deinit(self.alloc);
-        return try self.collectShadingsFromResourcesAlloc(&resources.?);
+        return try self.collectShadingsFromResourcesAlloc(&resources.?, content);
     }
 
     fn collectPagePatternsAlloc(self: *const Reader, page: *const syntax.Object) ![]PagePattern {
@@ -7154,23 +7224,23 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn collectShadingsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object) ![]PageShading {
+    fn collectShadingsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageShading {
         const shadings_obj = resources.get("Shading") orelse return try self.alloc.alloc(PageShading, 0);
         var resolved_shadings = try self.resolveValue(shadings_obj);
         defer resolved_shadings.deinit(self.alloc);
         if (resolved_shadings != .dict) return try self.alloc.alloc(PageShading, 0);
+        var references = try collectReferencedResourceNamesAlloc(self.alloc, content, &.{"sh"});
+        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageShading).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*shading| shading.deinit(self.alloc);
         for (resolved_shadings.dict) |entry| {
             try self.checkCancellation();
+            if (!references.contains(entry.key)) continue;
             var shading_obj = try self.resolveValue(&entry.value);
             defer shading_obj.deinit(self.alloc);
-            var shading = self.buildPageShading(entry.key, &shading_obj) catch |err| switch (err) {
-                error.UnsupportedPdfRendering => continue,
-                else => return err,
-            };
+            var shading = try self.buildPageShading(entry.key, &shading_obj);
             errdefer shading.deinit(self.alloc);
             try out.append(self.alloc, shading);
         }
@@ -7268,9 +7338,11 @@ pub const Reader = struct {
             if (!std.mem.eql(u8, name, "DeviceGray") and !std.mem.eql(u8, name, "DeviceRGB"))
                 return error.UnsupportedPdfRendering;
         };
-        const bbox = parsePageBox(group.get("BBox") orelse return error.UnsupportedPdfRendering) catch
-            return error.UnsupportedPdfRendering;
-        const group_matrix = parseFormMatrix(&group);
+        const bbox = try self.resolveSoftMaskPageBox(group.get("BBox") orelse return error.UnsupportedPdfRendering);
+        const group_matrix = if (group.get("Matrix")) |matrix_obj|
+            try self.resolveSoftMaskMatrix(matrix_obj)
+        else
+            GraphicsMatrix{};
         const resources_obj = group.get("Resources") orelse return error.UnsupportedPdfRendering;
         var resources = try self.resolveValue(resources_obj);
         defer resources.deinit(self.alloc);
@@ -7333,6 +7405,42 @@ pub const Reader = struct {
         };
     }
 
+    fn resolveSoftMaskPageBox(self: *const Reader, obj: *const syntax.Object) !PageBox {
+        var resolved = try self.resolveValue(obj);
+        defer resolved.deinit(self.alloc);
+        if (resolved != .array or resolved.array.len != 4) return error.UnsupportedPdfRendering;
+        var values: [4]f64 = undefined;
+        for (resolved.array, 0..) |*component, index| {
+            values[index] = (try self.resolvedNumericObjectValue(component)) orelse return error.UnsupportedPdfRendering;
+            if (!std.math.isFinite(values[index])) return error.UnsupportedPdfRendering;
+        }
+        return .{
+            .min_x = @min(values[0], values[2]),
+            .min_y = @min(values[1], values[3]),
+            .max_x = @max(values[0], values[2]),
+            .max_y = @max(values[1], values[3]),
+        };
+    }
+
+    fn resolveSoftMaskMatrix(self: *const Reader, obj: *const syntax.Object) !GraphicsMatrix {
+        var resolved = try self.resolveValue(obj);
+        defer resolved.deinit(self.alloc);
+        if (resolved != .array or resolved.array.len != 6) return error.UnsupportedPdfRendering;
+        var values: [6]f64 = undefined;
+        for (resolved.array, 0..) |*component, index| {
+            values[index] = (try self.resolvedNumericObjectValue(component)) orelse return error.UnsupportedPdfRendering;
+            if (!std.math.isFinite(values[index])) return error.UnsupportedPdfRendering;
+        }
+        return .{
+            .a = values[0],
+            .b = values[1],
+            .c = values[2],
+            .d = values[3],
+            .e = values[4],
+            .f = values[5],
+        };
+    }
+
     fn collectPatternsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, fallback_resources: ?*const syntax.Object, depth: u8, parent_content: []const u8, exclude_type3_fonts: bool) anyerror![]PagePattern {
         if (depth > 1) return try self.alloc.alloc(PagePattern, 0);
         const pattern_obj = resources.get("Pattern") orelse return try self.alloc.alloc(PagePattern, 0);
@@ -7371,10 +7479,7 @@ pub const Reader = struct {
                 const shading_obj = pat.get("Shading") orelse continue;
                 var resolved_shading = try self.resolveValue(shading_obj);
                 defer resolved_shading.deinit(self.alloc);
-                var shading: ?PageShading = self.buildPageShading(entry.key, &resolved_shading) catch |err| switch (err) {
-                    error.UnsupportedPdfRendering => continue,
-                    else => return err,
-                };
+                var shading: ?PageShading = try self.buildPageShading(entry.key, &resolved_shading);
                 errdefer if (shading) |*owned| owned.deinit(self.alloc);
                 var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
                 errdefer if (name) |owned| self.alloc.free(owned);
@@ -7426,7 +7531,7 @@ pub const Reader = struct {
                 for (images) |*image| image.deinit(self.alloc);
                 if (images.len > 0) self.alloc.free(images);
             }
-            const shadings = if (resolved_pattern_resources) |*pattern_resources| try self.collectShadingsFromResourcesAlloc(pattern_resources) else try self.alloc.alloc(PageShading, 0);
+            const shadings = if (resolved_pattern_resources) |*pattern_resources| try self.collectShadingsFromResourcesAlloc(pattern_resources, content) else try self.alloc.alloc(PageShading, 0);
             errdefer {
                 for (shadings) |*shading| shading.deinit(self.alloc);
                 if (shadings.len > 0) self.alloc.free(shadings);
@@ -7517,7 +7622,7 @@ pub const Reader = struct {
                 for (images) |*image| image.deinit(self.alloc);
                 if (images.len > 0) self.alloc.free(images);
             }
-            const shadings = if (resolved_form_resources) |*form_resources| try self.collectShadingsFromResourcesAlloc(form_resources) else try self.alloc.alloc(PageShading, 0);
+            const shadings = if (resolved_form_resources) |*form_resources| try self.collectShadingsFromResourcesAlloc(form_resources, content) else try self.alloc.alloc(PageShading, 0);
             errdefer {
                 for (shadings) |*shading| shading.deinit(self.alloc);
                 if (shadings.len > 0) self.alloc.free(shadings);
@@ -7728,16 +7833,14 @@ pub const Reader = struct {
         obj: *const syntax.Object,
         output_components: usize,
         depth: u8,
+        remaining_nodes: *u16,
     ) !ShadingColorFunction {
-        if (depth >= 8) return error.UnsupportedPdfRendering;
+        if (depth >= 8 or remaining_nodes.* == 0) return error.UnsupportedPdfRendering;
+        remaining_nodes.* -= 1;
         return switch (try self.colorFunctionType(obj)) {
             0 => .{ .sampled = try self.parseSampledTintTransform(obj, output_components) },
             2 => .{ .exponential = try self.parseExponentialTintTransform(obj, output_components) },
             3 => blk: {
-                // Sampling preserves every discontinuity of the outer
-                // stitching function. Nested stitching needs a recursive
-                // breakpoint table and remains explicitly unsupported.
-                if (depth != 0) return error.UnsupportedPdfRendering;
                 var resolved = try self.resolveValue(obj);
                 defer resolved.deinit(self.alloc);
                 const dict: []const syntax.DictEntry = switch (resolved) {
@@ -7765,7 +7868,7 @@ pub const Reader = struct {
                     self.alloc.free(functions);
                 }
                 for (function_objects.array) |*child| {
-                    functions[initialized] = try self.parseShadingColorFunction(child, output_components, depth + 1);
+                    functions[initialized] = try self.parseShadingColorFunction(child, output_components, depth + 1, remaining_nodes);
                     initialized += 1;
                 }
 
@@ -7824,7 +7927,13 @@ pub const Reader = struct {
         const coords = dictGetArray(dict, "Coords") orelse return error.UnsupportedPdfRendering;
         if ((shading_type == 2 and coords.len < 4) or (shading_type == 3 and coords.len < 6)) return error.UnsupportedPdfRendering;
 
-        var function = try self.parseShadingColorFunction(dictGetObject(dict, "Function") orelse return error.UnsupportedPdfRendering, components, 0);
+        var remaining_function_nodes = shading_function_node_capacity;
+        var function = try self.parseShadingColorFunction(
+            dictGetObject(dict, "Function") orelse return error.UnsupportedPdfRendering,
+            components,
+            0,
+            &remaining_function_nodes,
+        );
         defer function.deinit(self.alloc);
         const function_domain = function.domain();
         var shading_domain = [2]f64{ 0, 1 };
@@ -7853,18 +7962,37 @@ pub const Reader = struct {
             };
             sample_count += 1;
         }
-        if (function == .stitching) {
-            const stitching = function.stitching;
-            for (stitching.bounds) |bound| {
-                if (bound <= shading_domain[0] or bound >= shading_domain[1]) continue;
-                if (sample_count + 2 > shading_color_sample_capacity) return error.UnsupportedPdfRendering;
-                const position = (bound - shading_domain[0]) / (shading_domain[1] - shading_domain[0]);
-                const left_input = @max(shading_domain[0], bound - @max(1.0, @abs(bound)) * 0.000000000001);
-                sample_points[sample_count] = .{ .position = position, .input = left_input, .side = 0 };
-                sample_count += 1;
-                sample_points[sample_count] = .{ .position = position, .input = bound, .side = 2 };
-                sample_count += 1;
-            }
+        var discontinuities: [shading_discontinuity_capacity]f64 = undefined;
+        var discontinuity_count: usize = 0;
+        try function.appendDiscontinuities(
+            &discontinuities,
+            &discontinuity_count,
+            1,
+            0,
+            shading_domain[0],
+            shading_domain[1],
+        );
+        var discontinuity_sort_index: usize = 1;
+        while (discontinuity_sort_index < discontinuity_count) : (discontinuity_sort_index += 1) {
+            const value = discontinuities[discontinuity_sort_index];
+            var insert = discontinuity_sort_index;
+            while (insert > 0 and discontinuities[insert - 1] > value) : (insert -= 1)
+                discontinuities[insert] = discontinuities[insert - 1];
+            discontinuities[insert] = value;
+        }
+        for (discontinuities[0..discontinuity_count], 0..) |bound, index| {
+            if (bound <= shading_domain[0] or bound >= shading_domain[1]) continue;
+            if (sample_count + 2 > shading_color_sample_capacity) return error.UnsupportedPdfRendering;
+            const previous = if (index == 0) shading_domain[0] else discontinuities[index - 1];
+            const next = if (index + 1 == discontinuity_count) shading_domain[1] else discontinuities[index + 1];
+            const base_delta = @max(1.0, @abs(bound)) * 0.000000000001;
+            const left_delta = @min(base_delta, (bound - previous) / 4.0);
+            const right_delta = @min(base_delta, (next - bound) / 4.0);
+            const position = (bound - shading_domain[0]) / (shading_domain[1] - shading_domain[0]);
+            sample_points[sample_count] = .{ .position = position, .input = bound - left_delta, .side = 0 };
+            sample_count += 1;
+            sample_points[sample_count] = .{ .position = position, .input = bound + right_delta, .side = 2 };
+            sample_count += 1;
         }
         // The fixed table is tiny; insertion sort is deterministic and keeps
         // left/right samples at identical breakpoint positions in side order.
@@ -10796,7 +10924,7 @@ pub const Reader = struct {
                     try resource_content.append(self.alloc, '\n');
                 }
                 font.images = try self.collectImagesFromResourcesAlloc(&resources, resource_content.items);
-                font.shadings = try self.collectShadingsFromResourcesAlloc(&resources);
+                font.shadings = try self.collectShadingsFromResourcesAlloc(&resources, resource_content.items);
                 font.gstates = try self.collectExtGStatesFromResourcesAlloc(&resources, resource_content.items);
                 font.color_spaces = try self.collectColorSpacesFromResourcesAlloc(&resources, resource_content.items);
                 font.fonts = try self.collectNonType3FontsFromResourcesAlloc(&resources, resource_content.items);
@@ -17965,19 +18093,6 @@ fn pageBoxesApproxEqual(lhs: PageBox, rhs: PageBox) bool {
         approximatelyEqualPdfCoordinate(lhs.max_y, rhs.max_y);
 }
 
-fn parseFormMatrix(obj: *const syntax.Object) GraphicsMatrix {
-    const matrix_obj = obj.get("Matrix") orelse return .{};
-    if (matrix_obj.* != .array or matrix_obj.array.len < 6) return .{};
-    return .{
-        .a = numericObjectValue(&matrix_obj.array[0]) orelse 1,
-        .b = numericObjectValue(&matrix_obj.array[1]) orelse 0,
-        .c = numericObjectValue(&matrix_obj.array[2]) orelse 0,
-        .d = numericObjectValue(&matrix_obj.array[3]) orelse 1,
-        .e = numericObjectValue(&matrix_obj.array[4]) orelse 0,
-        .f = numericObjectValue(&matrix_obj.array[5]) orelse 0,
-    };
-}
-
 fn transformPageBox(box: PageBox, matrix: GraphicsMatrix) PageBox {
     const p0 = applyMatrixToPoint(matrix, box.min_x, box.min_y);
     const p1 = applyMatrixToPoint(matrix, box.max_x, box.min_y);
@@ -19806,6 +19921,40 @@ test "resource reachability recognizes Tf operands and soft mask paint profiles"
     try std.testing.expect(try contentIsSingleImageSoftMaskAlloc(alloc, "q 2 0 0 2 0 0 cm /Mask Do Q"));
     try std.testing.expect(!try contentIsSingleImageSoftMaskAlloc(alloc, "/Mask Do 0 0 1 1 re f"));
     try std.testing.expect(!try contentIsSingleImageSoftMaskAlloc(alloc, "/One Do /Two Do"));
+}
+
+test "graphics-state soft masks resolve indirect BBox and Matrix arrays" {
+    const alloc = std.testing.allocator;
+    const page_content = "q /GS gs /Img Do Q\n";
+    const mask_content = "/Mask Do\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Resources << /XObject << /Img 5 0 R >> /ExtGState << /GS 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3 >>\nstream\n\x20\x40\x60\nendstream\nendobj\n",
+        "6 0 obj\n<< /Type /ExtGState /SMask << /S /Luminosity /G 7 0 R >> >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox 8 0 R /Matrix 9 0 R /Resources << /XObject << /Mask 10 0 R >> >> /Group << /S /Transparency /CS /DeviceGray >> /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ mask_content.len, mask_content }),
+        "8 0 obj\n[0 0 1 1]\nendobj\n",
+        "9 0 obj\n[1 0 0 1 0 0]\nendobj\n",
+        "10 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n\x80\nendstream\nendobj\n",
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[6]);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var pdf_reader = try Reader.init(alloc, sample);
+    defer pdf_reader.deinit();
+    var runs = try pdf_reader.extractPageRenderRunsAlloc(1);
+    defer runs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), runs.image_runs.len);
+    const run = runs.image_runs[0];
+    try std.testing.expect(run.opacity_mask_rgba != null);
+    try std.testing.expectEqual(@as(u32, 1), run.opacity_mask_width);
+    try std.testing.expectEqual(@as(u32, 1), run.opacity_mask_height);
+    try std.testing.expect(run.opacity_mask_luminosity);
+    try std.testing.expectEqual(@as(u8, 0x80), run.opacity_mask_rgba.?[0]);
 }
 
 test "reader ignores an invalid xref sentinel and repairs a stale zero page count" {
@@ -24169,6 +24318,47 @@ test "shading domain and stitching discontinuity survive bounded sampling" {
         "6 0 obj\n<< /FunctionType 3 /Domain [2 4] /Functions [7 0 R 8 0 R] /Bounds [3] /Encode [0 1 0 1] >>\nendobj\n",
         "7 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 0 0] /N 1 >>\nendobj\n",
         "8 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 [0 0 1] /C1 [1 1 1] /N 1 >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var pdf_reader = try Reader.init(alloc, sample);
+    defer pdf_reader.deinit();
+    const runs = try pdf_reader.extractPageShadingRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(u8, shading_uniform_color_sample_count + 2), runs[0].color_sample_count);
+    var boundary_index: ?usize = null;
+    for (runs[0].color_sample_positions[0..runs[0].color_sample_count], 0..) |position, index| {
+        if (position == 0.5 and index + 1 < runs[0].color_sample_count and
+            runs[0].color_sample_positions[index + 1] == 0.5)
+        {
+            boundary_index = index;
+            break;
+        }
+    }
+    const index = boundary_index orelse return error.TestExpectedEqual;
+    try std.testing.expect(runs[0].color_samples[index][0] > 0xf0);
+    try std.testing.expect(runs[0].color_samples[index][2] == 0);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0xff, 0xff }, runs[0].color_samples[index + 1]);
+}
+
+test "nested stitching discontinuities remain reachable and unused shadings stay lazy" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /Shading << /S 5 0 R /Unused 10 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "4 0 obj\n<< /Length 6 >>\nstream\n/S sh\nendstream\nendobj\n",
+        "5 0 obj\n<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 10 0] /Function 6 0 R >>\nendobj\n",
+        "6 0 obj\n<< /FunctionType 3 /Domain [0 1] /Functions [7 0 R] /Bounds [] /Encode [0 1] >>\nendobj\n",
+        "7 0 obj\n<< /FunctionType 3 /Domain [0 1] /Functions [8 0 R 9 0 R] /Bounds [0.5] /Encode [0 1 0 1] >>\nendobj\n",
+        "8 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 0 0] /N 1 >>\nendobj\n",
+        "9 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 [0 0 1] /C1 [1 1 1] /N 1 >>\nendobj\n",
+        "10 0 obj\n<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 10 0] /Function << /FunctionType 4 >> >>\nendobj\n",
     };
     const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
     defer alloc.free(sample);
