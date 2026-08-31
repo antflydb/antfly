@@ -41,13 +41,11 @@ pub const DistributedEntitySink = struct {
     /// Sync level for entity upserts. `write` (durable, not full-index) keeps
     /// promotion latency low; the entity shard indexes asynchronously.
     sync_level: db_mod.types.SyncLevel = .write,
-    /// When set, commit the entity upsert through the source's atomic batch
-    /// contract. First-party sources collapse a single participant to one
-    /// fenced shard batch and use 2PC only when operations span groups. This is
-    /// the reachable foundation for deferred multi-participant entity+edge
-    /// coupling (RESOLUTION.md option 1). Falls back to a plain table batch when
-    /// the write source does not implement an atomic commit path.
-    transactional: bool = false,
+    /// Require the source's atomic batch contract. First-party sources collapse
+    /// a single participant to one fenced shard batch and use 2PC only when
+    /// operations span groups. Unsupported sources fail closed instead of
+    /// silently weakening document-level promotion atomicity.
+    atomic_batch_required: bool = false,
 
     pub fn entitySink(self: *DistributedEntitySink) EntitySink {
         return .{ .ptr = self, .vtable = &vtable };
@@ -55,7 +53,8 @@ pub const DistributedEntitySink = struct {
 
     const vtable = EntitySink.VTable{ .upsert = upsertFn, .upsert_batch = upsertBatchFn };
 
-    /// Promote all of a document's entities atomically. With `transactional`
+    /// Promote all of a document's entities atomically. With
+    /// `atomic_batch_required`
     /// set, a single entity shard uses one fenced Raft batch and multiple shards
     /// use 2PC, so a document never lands a partial set of its entities;
     /// otherwise it falls back to independent per-entity upserts.
@@ -66,7 +65,7 @@ pub const DistributedEntitySink = struct {
     ) anyerror!void {
         const self: *DistributedEntitySink = @ptrCast(@alignCast(ptr));
         if (entries.len == 0) return;
-        if (!self.transactional) {
+        if (!self.atomic_batch_required) {
             for (entries) |e| try upsertFn(ptr, allocator, e.table, e.key, e.doc_json);
             return;
         }
@@ -112,9 +111,10 @@ pub const DistributedEntitySink = struct {
                 .conflict => return error.EntityPromotionConflict,
             }
         }
-        // Transaction path unsupported by this write source; fall back to
-        // independent per-entity upserts (non-atomic).
-        for (entries) |e| try upsertFn(ptr, allocator, e.table, e.key, e.doc_json);
+        // Atomic mode is an explicit correctness contract. A custom or rolling
+        // source that cannot honor it must leave promotion unapplied so the
+        // catch-up worker can retry after capability convergence.
+        return error.EntityPromotionAtomicCommitUnavailable;
     }
 
     fn upsertFn(
@@ -134,10 +134,10 @@ pub const DistributedEntitySink = struct {
         if (ops.len == 0) return;
         const transform = db_mod.types.DocumentTransform{ .key = key, .operations = ops, .upsert = true };
 
-        if (self.transactional) {
+        if (self.atomic_batch_required) {
             // Commit the merge through the atomic batch path. A null outcome
-            // means the write source has no atomic commit callback, so fall
-            // back to a plain table batch.
+            // means the write source has no atomic commit callback, so fail
+            // closed without publishing a weaker independent write.
             const outcome = try self.writes.commitBatch(allocator, &.{.{ .table_name = table, .transforms = &.{transform} }}, self.sync_level);
             if (outcome) |result| {
                 switch (result) {
@@ -148,6 +148,7 @@ pub const DistributedEntitySink = struct {
                     .conflict => return error.EntityPromotionConflict,
                 }
             }
+            return error.EntityPromotionAtomicCommitUnavailable;
         }
 
         return self.batchUpsert(allocator, table, transform);
@@ -392,7 +393,7 @@ test "DistributedEntitySink skips a malformed document" {
     try testing.expectEqual(@as(usize, 0), fake.keys.items.len);
 }
 
-test "DistributedEntitySink transactional promotion batch prefers stateless batch commit" {
+test "DistributedEntitySink atomic promotion batch prefers stateless batch commit" {
     const alloc = testing.allocator;
     var fake = FakeTableWriteSource{
         .alloc = alloc,
@@ -402,7 +403,7 @@ test "DistributedEntitySink transactional promotion batch prefers stateless batc
     };
     defer fake.deinit();
 
-    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .transactional = true };
+    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .atomic_batch_required = true };
     const sink = sink_impl.entitySink();
 
     try sink.upsertBatch(alloc, &.{
@@ -432,7 +433,7 @@ test "DistributedEntitySink batch commit remains compatible with transaction-onl
     var fake = FakeTableWriteSource{ .alloc = alloc, .table = "entities", .support_transactions = true };
     defer fake.deinit();
 
-    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .transactional = true };
+    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .atomic_batch_required = true };
     const sink = sink_impl.entitySink();
 
     try sink.upsert(alloc, "entities", "person/ada_lovelace",
@@ -446,20 +447,25 @@ test "DistributedEntitySink batch commit remains compatible with transaction-onl
     try testing.expectEqual(@as(usize, 1), fake.keys.items.len);
 }
 
-test "DistributedEntitySink transactional mode falls back to batch when unsupported" {
+test "DistributedEntitySink atomic mode fails closed when unsupported" {
     const alloc = testing.allocator;
     // support_transactions = false -> the source has no commit_transaction vtable.
     var fake = FakeTableWriteSource{ .alloc = alloc, .table = "entities" };
     defer fake.deinit();
 
-    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .transactional = true };
+    var sink_impl = DistributedEntitySink{ .writes = fake.source(), .atomic_batch_required = true };
     const sink = sink_impl.entitySink();
 
-    try sink.upsert(alloc, "entities", "person/ada_lovelace",
+    try testing.expectError(error.EntityPromotionAtomicCommitUnavailable, sink.upsert(alloc, "entities", "person/ada_lovelace",
         \\{"entity_type":"person","canonical_name":"Ada Lovelace","aliases":["Ada Lovelace"]}
-    );
+    ));
+    try testing.expectError(error.EntityPromotionAtomicCommitUnavailable, sink.upsertBatch(alloc, &.{.{
+        .table = "entities",
+        .key = "org/antfly",
+        .doc_json = "{\"entity_type\":\"org\",\"canonical_name\":\"Antfly\",\"aliases\":[\"Antfly\"]}",
+    }}));
 
-    // No atomic commit callback was wired, so the plain table batch still ran.
+    // No callback means no partial write; catch-up can retry after convergence.
     try testing.expectEqual(@as(usize, 0), fake.commit_calls);
-    try testing.expectEqual(@as(usize, 1), fake.keys.items.len);
+    try testing.expectEqual(@as(usize, 0), fake.keys.items.len);
 }

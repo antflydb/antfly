@@ -1470,6 +1470,7 @@ const ProjectedCoreSnapshotDiagnostics = struct {
     split_transitions: usize = 0,
     merge_transitions: usize = 0,
     estimated_bytes: usize = 0,
+    catalog_projection_reader: catalog_projection_reader.CatalogProjectionReader.Diagnostics = .{},
 };
 
 fn addCatalogProjectionDiagnostics(
@@ -3172,20 +3173,26 @@ pub const MetadataService = struct {
 
     pub fn validatePublication(self: *MetadataService, contract: metadata_api.CatalogPublicationContract) !bool {
         try self.ensureLinearizableRead();
-        self.catalog_projection_reader.lock();
-        defer self.catalog_projection_reader.unlock();
         const incarnation = try self.metadataIncarnation();
-        const snapshot = try self.catalogValidationSnapshotLocked();
-        return snapshot.index.matchesPublication(contract, self.metadata_group_id, incarnation, snapshot.tables, snapshot.ranges);
+        return try self.catalog_projection_reader.matchesPublication(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            incarnation,
+            contract,
+        );
     }
 
     pub fn validateTablePublication(self: *MetadataService, contract: metadata_api.CatalogTablePublicationContract) !bool {
         try self.ensureLinearizableRead();
-        self.catalog_projection_reader.lock();
-        defer self.catalog_projection_reader.unlock();
         const incarnation = try self.metadataIncarnation();
-        const snapshot = try self.catalogValidationSnapshotLocked();
-        return snapshot.index.matchesTablePublication(contract, self.metadata_group_id, incarnation, snapshot.tables);
+        return try self.catalog_projection_reader.matchesTablePublication(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            incarnation,
+            contract,
+        );
     }
 
     fn catalogValidationSnapshotLocked(self: *MetadataService) !*const catalog_projection_reader.CatalogProjectionReader.Snapshot {
@@ -6095,26 +6102,36 @@ pub const MetadataHttpService = struct {
 
     pub fn validatePublication(self: *MetadataHttpService, contract: metadata_api.CatalogPublicationContract) !bool {
         try self.ensureLinearizableRead();
-        self.lockRuntime();
-        defer self.unlockRuntime();
-        self.catalog_projection_reader.lock();
-        defer self.catalog_projection_reader.unlock();
-        const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        const incarnation = try store.getMetadataIncarnation(self.metadata_group_id);
-        const snapshot = try self.catalogValidationSnapshotLocked();
-        return snapshot.index.matchesPublication(contract, self.metadata_group_id, incarnation, snapshot.tables, snapshot.ranges);
+        const incarnation = blk: {
+            self.lockRuntime();
+            defer self.unlockRuntime();
+            const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk try store.getMetadataIncarnation(self.metadata_group_id);
+        };
+        return try self.catalog_projection_reader.matchesPublication(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            incarnation,
+            contract,
+        );
     }
 
     pub fn validateTablePublication(self: *MetadataHttpService, contract: metadata_api.CatalogTablePublicationContract) !bool {
         try self.ensureLinearizableRead();
-        self.lockRuntime();
-        defer self.unlockRuntime();
-        self.catalog_projection_reader.lock();
-        defer self.catalog_projection_reader.unlock();
-        const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        const incarnation = try store.getMetadataIncarnation(self.metadata_group_id);
-        const snapshot = try self.catalogValidationSnapshotLocked();
-        return snapshot.index.matchesTablePublication(contract, self.metadata_group_id, incarnation, snapshot.tables);
+        const incarnation = blk: {
+            self.lockRuntime();
+            defer self.unlockRuntime();
+            const store = self.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk try store.getMetadataIncarnation(self.metadata_group_id);
+        };
+        return try self.catalog_projection_reader.matchesTablePublication(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            incarnation,
+            contract,
+        );
     }
 
     fn catalogValidationSnapshotLocked(self: *MetadataHttpService) !*const catalog_projection_reader.CatalogProjectionReader.Snapshot {
@@ -6262,6 +6279,7 @@ pub const MetadataHttpService = struct {
         if (self.catalog_projection_reader.cachedSnapshotLocked()) |snapshot| {
             addCatalogProjectionDiagnostics(snapshot, &out.projected_core_snapshot);
         }
+        out.projected_core_snapshot.catalog_projection_reader = self.catalog_projection_reader.diagnostics();
         if (self.projectedStore()) |store| {
             out.projected_store_lsm = lsmRetentionDiagnostics(store.snapshotMaintenanceStats());
         }

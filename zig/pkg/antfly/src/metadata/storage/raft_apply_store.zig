@@ -50,6 +50,12 @@ pub const CatalogCursor = struct {
     revision: u64,
 };
 
+fn catalogProjectionDeadline(deadline_ns: ?u64) !void {
+    if (deadline_ns) |deadline| {
+        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+    }
+}
+
 pub const ExtensionMemberKey = struct {
     extension_name: []const u8,
     object_kind: extension_domain.ExtensionObjectKind,
@@ -1615,15 +1621,27 @@ pub const RaftApplyStore = struct {
     }
 
     fn listTablesTxn(
-        _: *RaftApplyStore,
+        self: *RaftApplyStore,
         alloc: std.mem.Allocator,
         txn: *docstore.DocStore.Txn,
         group_id: u64,
     ) ![]metadata.TableRecord {
+        return try self.listTablesTxnUntil(alloc, txn, group_id, null);
+    }
+
+    fn listTablesTxnUntil(
+        _: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        deadline_ns: ?u64,
+    ) ![]metadata.TableRecord {
+        try catalogProjectionDeadline(deadline_ns);
         var prefix_buf: [128]u8 = undefined;
         const prefix = try tablePrefixForGroup(&prefix_buf, group_id);
         const kvs = try docstore.DocStore.scanPrefixTxn(alloc, txn, prefix);
         defer freeKvs(alloc, kvs);
+        try catalogProjectionDeadline(deadline_ns);
         const out = try alloc.alloc(metadata.TableRecord, kvs.len);
         var filled: usize = 0;
         errdefer {
@@ -1633,9 +1651,11 @@ pub const RaftApplyStore = struct {
             alloc.free(out);
         }
         for (kvs, 0..) |kv, i| {
+            if (i % 64 == 0) try catalogProjectionDeadline(deadline_ns);
             out[i] = try decodeTableRecord(alloc, kv.value);
             filled = i + 1;
         }
+        try catalogProjectionDeadline(deadline_ns);
         return out;
     }
 
@@ -1675,12 +1695,12 @@ pub const RaftApplyStore = struct {
         else
             null;
 
-        const tables = try self.listTablesTxn(alloc, &txn, group_id);
+        const tables = try self.listTablesTxnUntil(alloc, &txn, group_id, deadline_ns);
         errdefer self.freeTables(alloc, tables);
         if (deadline_ns) |deadline| {
             if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
-        const ranges = try self.listRangesTxn(alloc, &txn, group_id);
+        const ranges = try self.listRangesTxnUntil(alloc, &txn, group_id, deadline_ns);
         errdefer self.freeRanges(alloc, ranges);
         if (deadline_ns) |deadline| {
             if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
@@ -1996,15 +2016,27 @@ pub const RaftApplyStore = struct {
     }
 
     fn listRangesTxn(
-        _: *RaftApplyStore,
+        self: *RaftApplyStore,
         alloc: std.mem.Allocator,
         txn: *docstore.DocStore.Txn,
         group_id: u64,
     ) ![]metadata.RangeRecord {
+        return try self.listRangesTxnUntil(alloc, txn, group_id, null);
+    }
+
+    fn listRangesTxnUntil(
+        _: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        deadline_ns: ?u64,
+    ) ![]metadata.RangeRecord {
+        try catalogProjectionDeadline(deadline_ns);
         var prefix_buf: [128]u8 = undefined;
         const prefix = try rangePrefixForGroup(&prefix_buf, group_id);
         const kvs = try docstore.DocStore.scanPrefixTxn(alloc, txn, prefix);
         defer freeKvs(alloc, kvs);
+        try catalogProjectionDeadline(deadline_ns);
         const out = try alloc.alloc(metadata.RangeRecord, kvs.len);
         var filled: usize = 0;
         errdefer {
@@ -2012,9 +2044,11 @@ pub const RaftApplyStore = struct {
             alloc.free(out);
         }
         for (kvs, 0..) |kv, i| {
+            if (i % 64 == 0) try catalogProjectionDeadline(deadline_ns);
             out[i] = try decodeRangeRecord(alloc, kv.value);
             filled = i + 1;
         }
+        try catalogProjectionDeadline(deadline_ns);
         return out;
     }
 

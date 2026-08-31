@@ -400,6 +400,18 @@ def test_metadata_quorum_leader_discovery_keeps_node_ids_truthy() -> None:
     assert _metadata_quorum_leader_id(statuses, cluster_size=3) == 1
 
 
+def test_wait_until_explicit_readiness_accepts_zero() -> None:
+    assert (
+        wait_until(
+            lambda: 0,
+            timeout_s=0.1,
+            interval_s=0.01,
+            ready_when=lambda value: value is not None,
+        )
+        == 0
+    )
+
+
 def test_metadata_quorum_leader_discovery_requires_a_quorum() -> None:
     statuses = [
         _metadata_status(1, term=8, leader_id=2),
@@ -654,7 +666,12 @@ class MultiMetadataBackupCluster:
                 request_timeout_s=min(1.0, max(0.05, timeout_s))
             )
 
-        return wait_until(current_leader, timeout_s=timeout_s, interval_s=0.25)
+        return wait_until(
+            current_leader,
+            timeout_s=timeout_s,
+            interval_s=0.25,
+            ready_when=lambda value: value is not None,
+        )
 
     def metadata_stable_leader_id(
         self,
@@ -686,7 +703,10 @@ class MultiMetadataBackupCluster:
             return leader_id if observed >= stable_observations else None
 
         return wait_until(
-            current_stable_leader, timeout_s=timeout_s, interval_s=interval_s
+            current_stable_leader,
+            timeout_s=timeout_s,
+            interval_s=interval_s,
+            ready_when=lambda value: value is not None,
         )
 
     def metadata_leader_public_url(self, *, timeout_s: float = 30.0) -> str:

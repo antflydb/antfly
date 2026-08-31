@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const metadata_state = @import("state.zig");
 const metadata_reconciler = @import("reconciler.zig");
@@ -484,6 +485,16 @@ pub const CatalogProjectionIndex = struct {
         tables: []const table_manager.TableRecord,
         ranges: []const table_manager.RangeRecord,
     ) !CatalogProjectionIndex {
+        return try initUntil(alloc, tables, ranges, null);
+    }
+
+    pub fn initUntil(
+        alloc: std.mem.Allocator,
+        tables: []const table_manager.TableRecord,
+        ranges: []const table_manager.RangeRecord,
+        deadline_ns: ?u64,
+    ) !CatalogProjectionIndex {
+        try catalogProjectionCheckpoint(deadline_ns, 0);
         var self: CatalogProjectionIndex = .{};
         errdefer self.deinit(alloc);
         try self.table_indexes.ensureTotalCapacity(alloc, @intCast(tables.len));
@@ -491,6 +502,8 @@ pub const CatalogProjectionIndex = struct {
         try self.table_topologies.ensureTotalCapacity(alloc, @intCast(tables.len));
 
         for (tables, 0..) |table, index| {
+            try catalogProjectionCheckpoint(deadline_ns, index);
+            if (self.table_indexes.contains(table.table_id)) return error.InvalidCatalogProjection;
             self.table_indexes.putAssumeCapacity(table.table_id, index);
             self.table_topologies.putAssumeCapacity(table.table_id, .{
                 .range_count = 0,
@@ -498,19 +511,27 @@ pub const CatalogProjectionIndex = struct {
             });
         }
         for (ranges, 0..) |range, index| {
+            try catalogProjectionCheckpoint(deadline_ns, index);
+            if (self.range_indexes.contains(range.group_id)) return error.InvalidCatalogProjection;
             self.range_indexes.putAssumeCapacity(range.group_id, index);
+            // Partial indexes intentionally ignore ranges for tables outside
+            // the supplied projection; the full reader validates ownership.
             const topology = self.table_topologies.getPtr(range.table_id) orelse continue;
             topology.range_count += 1;
             addCatalogTopologyDigest(&topology.digest, catalogRangeTopologyDigest(range));
         }
         var iterator = self.table_topologies.iterator();
+        var topology_index: usize = 0;
         while (iterator.next()) |entry| {
+            try catalogProjectionCheckpoint(deadline_ns, topology_index);
             entry.value_ptr.digest = finalizeCatalogTableTopology(
                 entry.key_ptr.*,
                 entry.value_ptr.range_count,
                 entry.value_ptr.digest,
             );
+            topology_index += 1;
         }
+        try catalogProjectionDeadline(deadline_ns);
         return self;
     }
 
@@ -553,6 +574,16 @@ pub const CatalogProjectionIndex = struct {
             std.crypto.timing_safe.eql(@TypeOf(topology.digest), topology.digest, contract.topology.digest);
     }
 };
+
+fn catalogProjectionCheckpoint(deadline_ns: ?u64, index: usize) !void {
+    if (index % 64 == 0) try catalogProjectionDeadline(deadline_ns);
+}
+
+fn catalogProjectionDeadline(deadline_ns: ?u64) !void {
+    if (deadline_ns) |deadline| {
+        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+    }
+}
 
 fn catalogIdentityMatches(
     expected_group_id: u64,

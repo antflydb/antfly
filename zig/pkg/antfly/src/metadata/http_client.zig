@@ -53,6 +53,15 @@ pub const RequestBudget = struct {
     cancellation: ?*const http_common.RequestCancellation = null,
 };
 
+fn ensureRoutingBudget(budget: ?RequestBudget) !void {
+    if (budget) |value| {
+        if (value.cancellation) |signal| {
+            if (signal.isCancelled()) return error.Cancelled;
+        }
+        if (platform_time.monotonicNs() >= value.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+    }
+}
+
 fn isUriUnreserved(ch: u8) bool {
     return (ch >= 'A' and ch <= 'Z') or
         (ch >= 'a' and ch <= 'z') or
@@ -267,7 +276,10 @@ pub const MetadataHttpClient = struct {
         if (resp.status == 504) return error.CatalogRoutingSnapshotTimeout;
         if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
-        return try parseJson(metadata_api.CatalogRoutingSnapshot, self.alloc, resp.body);
+        var parsed = try parseJson(metadata_api.CatalogRoutingSnapshot, self.alloc, resp.body);
+        errdefer parsed.deinit();
+        try ensureRoutingBudget(budget);
+        return parsed;
     }
 
     pub fn waitForRoutingChange(
@@ -312,7 +324,10 @@ pub const MetadataHttpClient = struct {
         if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
         if (resp.status == 504) return error.CatalogRoutingSnapshotTimeout;
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
-        return try parseJson(metadata_api.CatalogRoutingChangeResult, self.alloc, resp.body);
+        var parsed = try parseJson(metadata_api.CatalogRoutingChangeResult, self.alloc, resp.body);
+        errdefer parsed.deinit();
+        try ensureRoutingBudget(budget);
+        return parsed;
     }
 
     pub fn awaitCatalogRoute(
@@ -351,7 +366,10 @@ pub const MetadataHttpClient = struct {
         if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
         if (resp.status == 504) return error.CatalogRoutingSnapshotTimeout;
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
-        return try parseJson(metadata_api.CatalogRouteResolveResult, self.alloc, resp.body);
+        var parsed = try parseJson(metadata_api.CatalogRouteResolveResult, self.alloc, resp.body);
+        errdefer parsed.deinit();
+        try ensureRoutingBudget(budget);
+        return parsed;
     }
 
     pub fn validateCatalogPublication(
