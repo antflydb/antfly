@@ -19,8 +19,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import signal
 import shutil
+import signal
 import struct
 import subprocess
 import tempfile
@@ -32,7 +32,6 @@ from typing import Any
 
 import pytest
 import requests
-
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     _read_log_tail,
@@ -43,7 +42,6 @@ from conftest import (
     wait_for_server,
 )
 from port_reservations import LoopbackPortReservations
-
 
 HA_ADMIN_ROOT = "/admin/v1/ha"
 DB_API_ROOT = "/db/v1"
@@ -270,8 +268,17 @@ class HAStandaloneNode:
         )
 
     def admin_get(self, path: str, **params: Any) -> dict[str, Any]:
-        response = self.admin_get_response(path, **params)
-        return self._check(response)
+        deadline = time.monotonic() + 20.0
+        while True:
+            response = self.admin_get_response(path, **params)
+            if response.status_code != 503 or response.text != "HAStateTransitionBusy":
+                return self._check(response)
+            if time.monotonic() >= deadline:
+                return self._check(response)
+            # HA GETs are observations. The runtime deliberately sheds them
+            # while a role transition owns the state mutex, so retry the exact
+            # transient response without weakening any other failure signal.
+            time.sleep(0.1)
 
     def admin_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         response = self.admin_post_response(path, payload)
