@@ -164,6 +164,9 @@ pub const AlgebraicIndexStats = struct {
     pub const openApiFieldMetadata = .{
         .{ "index_type", "index_type", false },
         .{ "readiness", "readiness", true },
+        .{ "target_revision", "target_revision", true },
+        .{ "published_revision", "published_revision", true },
+        .{ "milestones", "milestones", true },
         .{ "error", "error", true },
         .{ "total_indexed", "total_indexed", true },
         .{ "disk_usage", "disk_usage", true },
@@ -247,6 +250,18 @@ pub const AlgebraicIndexStats = struct {
         try jw.write(self.index_type);
         if (self.readiness) |value| {
             try jw.objectField("readiness");
+            try jw.write(value);
+        }
+        if (self.target_revision) |value| {
+            try jw.objectField("target_revision");
+            try jw.write(value);
+        }
+        if (self.published_revision) |value| {
+            try jw.objectField("published_revision");
+            try jw.write(value);
+        }
+        if (self.milestones) |value| {
+            try jw.objectField("milestones");
             try jw.write(value);
         }
         if (self.@"error") |value| {
@@ -2667,6 +2682,44 @@ pub const EmbeddingIndexActivity = struct {
     active_batch_size: i64,
     /// Completion time of the latest successful embedding batch, or null before the first batch.
     last_progress_at: ?[]const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "epoch", "epoch", false },
+        .{ "phase", "phase", false },
+        .{ "chunks_created", "chunks_created", false },
+        .{ "embedding_batches_completed", "embedding_batches_completed", false },
+        .{ "embeddings_computed", "embeddings_computed", false },
+        .{ "active_batch_size", "active_batch_size", false },
+        .{ "last_progress_at", "last_progress_at", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("epoch");
+        try jw.write(self.epoch);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("chunks_created");
+        try jw.write(self.chunks_created);
+        try jw.objectField("embedding_batches_completed");
+        try jw.write(self.embedding_batches_completed);
+        try jw.objectField("embeddings_computed");
+        try jw.write(self.embeddings_computed);
+        try jw.objectField("active_batch_size");
+        try jw.write(self.active_batch_size);
+        try jw.objectField("last_progress_at");
+        try jw.write(self.last_progress_at);
+        try jw.endObject();
+    }
 };
 
 pub const EmbeddingIndexActivityPhase = enum {
@@ -2724,6 +2777,59 @@ pub const EmbeddingSourceCoverageStatus = struct {
     complete: bool,
     healthy: bool,
     degraded: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "policy", "policy", false },
+        .{ "observation_complete", "observation_complete", false },
+        .{ "observation_incomplete_reasons", "observation_incomplete_reasons", false },
+        .{ "config_fingerprint", "config_fingerprint", false },
+        .{ "total", "total", false },
+        .{ "pending", "pending", false },
+        .{ "covered", "covered", false },
+        .{ "skipped", "skipped", false },
+        .{ "failed", "failed", false },
+        .{ "complete", "complete", false },
+        .{ "healthy", "healthy", false },
+        .{ "degraded", "degraded", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("policy");
+        try jw.write(self.policy);
+        try jw.objectField("observation_complete");
+        try jw.write(self.observation_complete);
+        try jw.objectField("observation_incomplete_reasons");
+        try jw.write(self.observation_incomplete_reasons);
+        try jw.objectField("config_fingerprint");
+        try jw.write(self.config_fingerprint);
+        try jw.objectField("total");
+        try jw.write(self.total);
+        try jw.objectField("pending");
+        try jw.write(self.pending);
+        try jw.objectField("covered");
+        try jw.write(self.covered);
+        try jw.objectField("skipped");
+        try jw.write(self.skipped);
+        try jw.objectField("failed");
+        try jw.write(self.failed);
+        try jw.objectField("complete");
+        try jw.write(self.complete);
+        try jw.objectField("healthy");
+        try jw.write(self.healthy);
+        try jw.objectField("degraded");
+        try jw.write(self.degraded);
+        try jw.endObject();
+    }
 };
 
 /// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
@@ -3014,6 +3120,14 @@ pub const EmbeddingsIndexStats = struct {
     pub const openApiFieldMetadata = .{
         .{ "index_type", "index_type", false },
         .{ "readiness", "readiness", true },
+        .{ "incarnation", "incarnation", true },
+        .{ "target_revision", "target_revision", true },
+        .{ "published_revision", "published_revision", true },
+        .{ "milestones", "milestones", true },
+        .{ "source_coverage", "source_coverage", true },
+        .{ "searchable_vectors", "searchable_vectors", true },
+        .{ "publication", "publication", true },
+        .{ "activity", "activity", true },
         .{ "error", "error", true },
         .{ "total_indexed", "total_indexed", true },
         .{ "disk_usage", "disk_usage", true },
@@ -3088,6 +3202,38 @@ pub const EmbeddingsIndexStats = struct {
         try jw.write(self.index_type);
         if (self.readiness) |value| {
             try jw.objectField("readiness");
+            try jw.write(value);
+        }
+        if (self.incarnation) |value| {
+            try jw.objectField("incarnation");
+            try jw.write(value);
+        }
+        if (self.target_revision) |value| {
+            try jw.objectField("target_revision");
+            try jw.write(value);
+        }
+        if (self.published_revision) |value| {
+            try jw.objectField("published_revision");
+            try jw.write(value);
+        }
+        if (self.milestones) |value| {
+            try jw.objectField("milestones");
+            try jw.write(value);
+        }
+        if (self.source_coverage) |value| {
+            try jw.objectField("source_coverage");
+            try jw.write(value);
+        }
+        if (self.searchable_vectors) |value| {
+            try jw.objectField("searchable_vectors");
+            try jw.write(value);
+        }
+        if (self.publication) |value| {
+            try jw.objectField("publication");
+            try jw.write(value);
+        }
+        if (self.activity) |value| {
+            try jw.objectField("activity");
             try jw.write(value);
         }
         if (self.@"error") |value| {
@@ -3736,6 +3882,9 @@ pub const FullTextIndexStats = struct {
     pub const openApiFieldMetadata = .{
         .{ "index_type", "index_type", false },
         .{ "readiness", "readiness", true },
+        .{ "target_revision", "target_revision", true },
+        .{ "published_revision", "published_revision", true },
+        .{ "milestones", "milestones", true },
         .{ "error", "error", true },
         .{ "total_indexed", "total_indexed", true },
         .{ "disk_usage", "disk_usage", true },
@@ -3796,6 +3945,18 @@ pub const FullTextIndexStats = struct {
         try jw.write(self.index_type);
         if (self.readiness) |value| {
             try jw.objectField("readiness");
+            try jw.write(value);
+        }
+        if (self.target_revision) |value| {
+            try jw.objectField("target_revision");
+            try jw.write(value);
+        }
+        if (self.published_revision) |value| {
+            try jw.objectField("published_revision");
+            try jw.write(value);
+        }
+        if (self.milestones) |value| {
+            try jw.objectField("milestones");
             try jw.write(value);
         }
         if (self.@"error") |value| {
@@ -5174,6 +5335,9 @@ pub const GraphIndexStats = struct {
     pub const openApiFieldMetadata = .{
         .{ "index_type", "index_type", false },
         .{ "readiness", "readiness", true },
+        .{ "target_revision", "target_revision", true },
+        .{ "published_revision", "published_revision", true },
+        .{ "milestones", "milestones", true },
         .{ "error", "error", true },
         .{ "total_edges", "total_edges", true },
         .{ "edge_types", "edge_types", true },
@@ -5236,6 +5400,18 @@ pub const GraphIndexStats = struct {
         try jw.write(self.index_type);
         if (self.readiness) |value| {
             try jw.objectField("readiness");
+            try jw.write(value);
+        }
+        if (self.target_revision) |value| {
+            try jw.objectField("target_revision");
+            try jw.write(value);
+        }
+        if (self.published_revision) |value| {
+            try jw.objectField("published_revision");
+            try jw.write(value);
+        }
+        if (self.milestones) |value| {
+            try jw.objectField("milestones");
             try jw.write(value);
         }
         if (self.@"error") |value| {
