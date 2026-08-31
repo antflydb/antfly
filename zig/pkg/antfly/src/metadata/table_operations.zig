@@ -53,6 +53,7 @@ pub const Source = struct {
         create_table_with_context: ?*const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, []const u8, tables_api.CreateTableRequest) anyerror!void = null,
         replace_definition: *const fn (*anyopaque, table_manager.TableRecord, table_manager.TableRecord) anyerror!void,
         restore_table: *const fn (*anyopaque, std.mem.Allocator, []const u8, RestoreRequest) anyerror!void,
+        restore_table_with_context: ?*const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, []const u8, RestoreRequest) anyerror!void = null,
         drop_table: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!void,
         drop_table_with_context: ?*const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, []const u8) anyerror!void = null,
         update_schema: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!void,
@@ -93,6 +94,8 @@ pub const Operations = struct {
         if (request.connection.len == 0 or request.connection.len > 256) return error.InvalidBackupRequest;
         if (!std.mem.eql(u8, request.backup_id, request.manifest.backup_id)) return error.InvalidBackupRequest;
         try backups_api.validateTableManifest(alloc, &request.manifest, request.backup_id);
+        if (self.source.vtable.restore_table_with_context) |restore_fn|
+            return try restore_fn(self.source.ptr, alloc, ctx, table_name, request);
         try self.source.vtable.restore_table(self.source.ptr, alloc, table_name, request);
     }
 

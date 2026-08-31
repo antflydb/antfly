@@ -17,6 +17,7 @@
 const std = @import("std");
 const operation = @import("../api/operation.zig");
 const tables_api = @import("../api/tables.zig");
+const group_ids = @import("../common/group_ids.zig");
 const metadata_authority = @import("authority.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const topology_protocol = @import("topology_protocol.zig");
@@ -123,6 +124,69 @@ pub fn create(
         else => return afterAdmission(err),
     };
     unlockTableCatalogMutation(svc, table_name);
+    catalog_locked = false;
+}
+
+/// Atomically publishes a backup manifest's exact table/range topology. The
+/// admission snapshot accepts an exact retry or a compatible prefix from the
+/// former multi-entry restore workflow, but rejects every conflicting row
+/// before the tag-50 command is proposed.
+pub fn restore(
+    svc: anytype,
+    alloc: std.mem.Allocator,
+    request: operation.RequestContext,
+    table: metadata_table_manager.TableRecord,
+    ranges: []const metadata_table_manager.RangeRecord,
+) !void {
+    try request.ensureActive();
+    if (table.table_id == 0 or table.name.len == 0 or
+        ranges.len == 0 or ranges.len > topology_protocol.max_initial_ranges or
+        ranges.len != @as(usize, table.min_ranges))
+        return error.InvalidTableTopologyMutation;
+    var unique_groups = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer unique_groups.deinit(alloc);
+    try unique_groups.ensureTotalCapacity(alloc, @intCast(ranges.len));
+    for (ranges) |range| {
+        group_ids.requireDataGroupId(range.group_id) catch
+            return error.InvalidTableTopologyMutation;
+        if (range.table_id != table.table_id or unique_groups.contains(range.group_id))
+            return error.InvalidTableTopologyMutation;
+        unique_groups.putAssumeCapacity(range.group_id, {});
+    }
+    const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(
+        request,
+        topology_protocol.atomic_table_topology_version,
+    );
+    lockTableCatalogMutation(svc, table.name);
+    var catalog_locked = true;
+    defer if (catalog_locked) unlockTableCatalogMutation(svc, table.name);
+    try request.ensureActive();
+    try svc.ensureLinearizableReadWithContext(request);
+    try svc.validateTableTopologyProtocolReadinessWithContext(request, protocol_readiness);
+    const transition_generation = try svc.captureTableRestoreGeneration(
+        alloc,
+        table,
+        ranges,
+    );
+
+    try request.ensureActive();
+    const receipt = svc.proposeTransitionCommandWithReceipt(.{
+        .apply_table_topology = .{ .create = .{
+            .expected_transition_generation = transition_generation,
+            .table = table,
+            .ranges = ranges,
+        } },
+    }) catch |err| {
+        if (metadata_authority.isMutationNotAdmittedError(err)) return error.NotLeader;
+        return err;
+    };
+    svc.waitForTransitionAppliedWithContext(receipt, request) catch |err|
+        return afterAdmission(err);
+    svc.verifyTableCreateProjection(alloc, table, ranges) catch |err| switch (err) {
+        error.TableAlreadyExists => return err,
+        else => return afterAdmission(err),
+    };
+    unlockTableCatalogMutation(svc, table.name);
     catalog_locked = false;
 }
 

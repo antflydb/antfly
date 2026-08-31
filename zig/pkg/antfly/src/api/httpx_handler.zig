@@ -4486,7 +4486,7 @@ pub const AntflyApiHandler = struct {
             },
             error.MetadataTopologyCommandTooLarge => {
                 _ = ctx.status(413);
-                return ctx.text("table topology is too large for the current rolling-upgrade protocol");
+                return ctx.text("table topology exceeds the 3 MiB metadata command limit; reduce the initial shard count or table definition size");
             },
             error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => {
                 _ = ctx.status(409);

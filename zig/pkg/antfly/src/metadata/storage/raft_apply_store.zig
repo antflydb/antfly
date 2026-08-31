@@ -882,6 +882,22 @@ test "table topology create rejects ranges orphaned by an interrupted legacy dro
     });
 
     const legacy_fence = try store.getTableTransitionFence(metadata_group_id, table.table_id);
+    const missing_range = metadata.RangeRecord{
+        .group_id = 302,
+        .range_id = 302,
+        .table_id = table.table_id,
+        .start_key = "doc:m",
+    };
+    try store.ensureDerivedCatalogIndexes(metadata_group_id);
+    try std.testing.expectEqual(
+        legacy_fence.generation,
+        try store.captureTableRestoreGeneration(
+            std.testing.allocator,
+            metadata_group_id,
+            table,
+            &.{ range, missing_range },
+        ),
+    );
     const legacy_remove = try encodeTransitionCommand(std.testing.allocator, .{ .remove_table = .{
         .table_id = table.table_id,
         .expected_transition_generation = legacy_fence.generation,
@@ -982,6 +998,30 @@ test "table topology mutation atomically creates and drops catalog ranges" {
     const create_fence = try store.getTableTransitionFence(metadata_group_id, table.table_id);
     try std.testing.expectEqual(@as(u64, 1), create_fence.generation);
     try store.ensureDerivedCatalogIndexes(metadata_group_id);
+    try std.testing.expectEqual(
+        create_fence.generation,
+        try store.captureTableRestoreGeneration(
+            std.testing.allocator,
+            metadata_group_id,
+            table,
+            &ranges,
+        ),
+    );
+    try store.verifyTableCreateProjectionExact(
+        std.testing.allocator,
+        metadata_group_id,
+        table,
+        &ranges,
+    );
+    try std.testing.expectError(
+        error.TableAlreadyExists,
+        store.verifyTableCreateProjectionExact(
+            std.testing.allocator,
+            metadata_group_id,
+            table,
+            ranges[0..1],
+        ),
+    );
     var create_projection = (try store.captureTableDropProjection(
         std.testing.allocator,
         metadata_group_id,
@@ -2468,6 +2508,179 @@ pub const RaftApplyStore = struct {
         if (indexed_range_group_ids.len != 0 or fence.range_membership.count != 0)
             return error.TableTransitionActive;
         return fence.generation;
+    }
+
+    /// Captures a restore admission from one catalog revision. Unlike an
+    /// ordinary create, restore retries may encounter an exact table or a
+    /// prefix published by the former multi-entry workflow. Only an exact
+    /// prefix is admissible; unrelated rows or reused data-group IDs fail
+    /// before Raft admission.
+    pub fn captureTableRestoreGeneration(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        expected_table: metadata.TableRecord,
+        expected_ranges: []const metadata.RangeRecord,
+    ) !u64 {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+
+        var version_key_buf: [160]u8 = undefined;
+        const version = txn.get(try derivedCatalogIndexVersionKey(&version_key_buf, group_id)) catch |err| switch (err) {
+            error.NotFound => return error.InvalidDerivedCatalogIndex,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, version, derived_catalog_index_version))
+            return error.InvalidDerivedCatalogIndex;
+
+        const fence = try self.loadTableTransitionFenceTxn(&txn, group_id, expected_table.table_id);
+        if (fence.active()) return error.TableTransitionActive;
+        const indexed_range_group_ids = try self.indexedTableRangeIdsTxn(
+            alloc,
+            &txn,
+            group_id,
+            expected_table.table_id,
+        );
+        defer alloc.free(indexed_range_group_ids);
+        if (!try self.indexedRangeMembershipMatchesTxn(
+            &txn,
+            group_id,
+            expected_table.table_id,
+            indexed_range_group_ids,
+            fence.membership(expected_table.table_id),
+        )) return error.InvalidDerivedCatalogIndex;
+
+        var expected_by_group = std.AutoHashMapUnmanaged(u64, metadata.RangeRecord).empty;
+        defer expected_by_group.deinit(alloc);
+        try expected_by_group.ensureTotalCapacity(alloc, @intCast(expected_ranges.len));
+        for (expected_ranges) |record| {
+            if (record.table_id != expected_table.table_id or expected_by_group.contains(record.group_id))
+                return error.InvalidTableTopologyMutation;
+            expected_by_group.putAssumeCapacity(record.group_id, record);
+        }
+
+        var table_key_buf: [160]u8 = undefined;
+        const table_key = try tableKeyForGroup(&table_key_buf, group_id, expected_table.table_id);
+        const encoded_table = txn.get(table_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (encoded_table) |encoded| {
+            const existing = try decodeTableRecord(alloc, encoded);
+            defer metadata_table_manager.freeTable(alloc, existing);
+            if (!metadata_table_manager.tableDefinitionsEqual(existing, expected_table))
+                return error.TableAlreadyExists;
+        } else if (indexed_range_group_ids.len != 0 or fence.range_membership.count != 0) {
+            return error.TableTransitionActive;
+        }
+
+        // Existing table-scoped rows must be an exact subset of the manifest.
+        for (indexed_range_group_ids) |range_group_id| {
+            const expected = expected_by_group.get(range_group_id) orelse
+                return error.TableAlreadyExists;
+            var range_key_buf: [160]u8 = undefined;
+            const encoded = txn.get(try rangeKeyForGroup(&range_key_buf, group_id, range_group_id)) catch |err| switch (err) {
+                error.NotFound => return error.InvalidDerivedCatalogIndex,
+                else => return err,
+            };
+            const existing = try decodeRangeRecord(alloc, encoded);
+            defer metadata_table_manager.freeRange(alloc, existing);
+            if (!metadata_table_manager.rangeRecordsEqual(existing, expected))
+                return error.TableAlreadyExists;
+            _ = expected_by_group.remove(range_group_id);
+        }
+
+        // Only manifest rows absent from the table-keyed index need another
+        // primary lookup. This keeps exact restore retries to one range read
+        // per shard while still rejecting IDs owned by another table.
+        for (expected_ranges) |expected| {
+            if (!expected_by_group.contains(expected.group_id)) continue;
+            var range_key_buf: [160]u8 = undefined;
+            const encoded = txn.get(try rangeKeyForGroup(&range_key_buf, group_id, expected.group_id)) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            if (encoded_table == null) return error.TableAlreadyExists;
+            const existing = try decodeRangeRecord(alloc, encoded);
+            defer metadata_table_manager.freeRange(alloc, existing);
+            if (!metadata_table_manager.rangeRecordsEqual(existing, expected))
+                return error.TableAlreadyExists;
+        }
+        return fence.generation;
+    }
+
+    /// Verifies the complete table-scoped projection from one revision. A
+    /// subset check can incorrectly declare restore success while stale or
+    /// concurrently-added ranges remain attached to the table.
+    pub fn verifyTableCreateProjectionExact(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        expected_table: metadata.TableRecord,
+        expected_ranges: []const metadata.RangeRecord,
+    ) !void {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+
+        var version_key_buf: [160]u8 = undefined;
+        const version = txn.get(try derivedCatalogIndexVersionKey(&version_key_buf, group_id)) catch |err| switch (err) {
+            error.NotFound => return error.InvalidDerivedCatalogIndex,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, version, derived_catalog_index_version))
+            return error.InvalidDerivedCatalogIndex;
+
+        var table_key_buf: [160]u8 = undefined;
+        const encoded_table = txn.get(try tableKeyForGroup(&table_key_buf, group_id, expected_table.table_id)) catch |err| switch (err) {
+            error.NotFound => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+        const projected_table = try decodeTableRecord(alloc, encoded_table);
+        defer metadata_table_manager.freeTable(alloc, projected_table);
+        if (!metadata_table_manager.tableDefinitionsEqual(projected_table, expected_table))
+            return error.TableAlreadyExists;
+
+        const fence = try self.loadTableTransitionFenceTxn(&txn, group_id, expected_table.table_id);
+        const indexed_range_group_ids = try self.indexedTableRangeIdsTxn(
+            alloc,
+            &txn,
+            group_id,
+            expected_table.table_id,
+        );
+        defer alloc.free(indexed_range_group_ids);
+        if (!try self.indexedRangeMembershipMatchesTxn(
+            &txn,
+            group_id,
+            expected_table.table_id,
+            indexed_range_group_ids,
+            fence.membership(expected_table.table_id),
+        )) return error.InvalidDerivedCatalogIndex;
+        if (indexed_range_group_ids.len < expected_ranges.len)
+            return error.MetadataMutationOutcomeUnknown;
+        if (indexed_range_group_ids.len > expected_ranges.len)
+            return error.TableAlreadyExists;
+
+        var expected_by_group = std.AutoHashMapUnmanaged(u64, metadata.RangeRecord).empty;
+        defer expected_by_group.deinit(alloc);
+        try expected_by_group.ensureTotalCapacity(alloc, @intCast(expected_ranges.len));
+        for (expected_ranges) |record| {
+            if (record.table_id != expected_table.table_id or expected_by_group.contains(record.group_id))
+                return error.InvalidTableTopologyMutation;
+            expected_by_group.putAssumeCapacity(record.group_id, record);
+        }
+        for (indexed_range_group_ids) |range_group_id| {
+            const expected = expected_by_group.get(range_group_id) orelse
+                return error.TableAlreadyExists;
+            var range_key_buf: [160]u8 = undefined;
+            const encoded = txn.get(try rangeKeyForGroup(&range_key_buf, group_id, range_group_id)) catch |err| switch (err) {
+                error.NotFound => return error.InvalidDerivedCatalogIndex,
+                else => return err,
+            };
+            const projected = try decodeRangeRecord(alloc, encoded);
+            defer metadata_table_manager.freeRange(alloc, projected);
+            if (!metadata_table_manager.rangeRecordsEqual(projected, expected))
+                return error.TableAlreadyExists;
+        }
     }
 
     pub fn listSchemaProgress(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.SchemaProgressRecord {

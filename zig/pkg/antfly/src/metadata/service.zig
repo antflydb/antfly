@@ -213,7 +213,17 @@ fn applyReconciliationPlanAndWaitAppliedWithContextImpl(
     // batch is accepted, cancellation remains observable only while waiting
     // for its exact terminal receipt and is reported as an ambiguous outcome.
     const receipt = try service.proposeTransitionCommandsWithReceipt(commands.items);
-    try service.waitForTransitionAppliedWithContext(receipt, request);
+    service.waitForTransitionAppliedWithContext(receipt, request) catch |err| {
+        // A receipt proves that admission completed. Leadership loss,
+        // cancellation, or a local apply timeout after this point cannot be
+        // distinguished from a committed batch, so never leak a retryable
+        // pre-admission error to callers.
+        std.log.warn(
+            "metadata reconciliation batch outcome became ambiguous after admission err={s}",
+            .{@errorName(err)},
+        );
+        return error.MetadataMutationOutcomeUnknown;
+    };
 }
 
 test "metadata reconciliation plan uses one terminal receipt for ordered apply" {
@@ -297,6 +307,43 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
     try std.testing.expectEqual(CommandTag.upsert_table, fake.tags[0]);
     try std.testing.expectEqual(CommandTag.upsert_range, fake.tags[1]);
     try std.testing.expect(fake.waited);
+}
+
+test "metadata reconciliation plan hides retryable errors after admission" {
+    const FakeStore = struct {
+        fn getTableTransitionFence(_: *@This(), _: u64, _: u64) !metadata_storage.raft_apply_store.TableTransitionFence {
+            return .{};
+        }
+        fn getTable(_: *@This(), _: std.mem.Allocator, _: u64, _: u64) !?metadata_table_manager.TableRecord {
+            return null;
+        }
+    };
+    const FakeService = struct {
+        metadata_group_id: u64 = 1,
+        store: FakeStore = .{},
+        fn projectedStore(self: *@This()) ?*FakeStore {
+            return &self.store;
+        }
+        fn proposeTransitionCommandsWithReceipt(_: *@This(), _: []const metadata_storage.TransitionCommand) !MetadataProposalReceipt {
+            return .{ .term = 3, .index = 9 };
+        }
+        fn waitForTransitionAppliedWithContext(_: *@This(), _: MetadataProposalReceipt, _: api_operation.RequestContext) !void {
+            return error.NotLeader;
+        }
+    };
+    const tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
+    var plan = metadata_reconciler.ReconciliationPlan.empty();
+    plan.table_upserts = @constCast(tables[0..]);
+    var fake: FakeService = .{};
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        applyReconciliationPlanAndWaitAppliedWithContextImpl(
+            &fake,
+            std.testing.allocator,
+            &plan,
+            .{},
+        ),
+    );
 }
 
 fn tableDropAdmissionFromProjection(
@@ -714,11 +761,11 @@ const MetadataProposalProgressDriver = struct {
     }
 };
 
-/// Serializes the expensive peer capability fanout. A positive result is
-/// shared only with callers that actually waited for that same in-flight
-/// probe; a later request always probes again. Peer process rollback does not
-/// change Raft term, membership, or cluster incarnation, so cross-request
-/// caching would turn an ephemeral observation into an unsafe decoder proof.
+/// Serializes the expensive peer capability fanout. Successful proofs remain
+/// reusable while Raft term, membership, cluster incarnation, and required
+/// protocol version are unchanged. Forward-only metadata-format activation
+/// explicitly excludes rolling a member back below the committed format
+/// floor, which is the only process change this durable identity cannot see.
 const TableTopologyProtocolProbeCoordinator = struct {
     lane: std.atomic.Mutex = .unlocked,
     wake_epoch: std.atomic.Value(u32) = .init(0),
@@ -796,7 +843,7 @@ test "metadata proposal receipt progress uses a single transferable driver" {
     next.deinit();
 }
 
-test "table topology protocol probes share only matching in-flight readiness" {
+test "table topology protocol probes cache only matching readiness" {
     var coordinator = TableTopologyProtocolProbeCoordinator{};
     var first = coordinator.tryAcquire() orelse return error.TestExpectedEqual;
     try std.testing.expect(coordinator.tryAcquire() == null);
@@ -818,8 +865,8 @@ test "table topology protocol probes share only matching in-flight readiness" {
 
     var second = coordinator.tryAcquire() orelse return error.TestExpectedEqual;
     try std.testing.expect(tableTopologyReadinessEqual(coordinator.cached.?.readiness, readiness));
-    // Consuming a completed probe is not itself a probe completion. A new
-    // caller blocked behind this consumer must not join the older cohort.
+    // Consuming a completed proof is not itself a probe completion. It remains
+    // reusable until term, membership, incarnation, or required version moves.
     const after_probe = coordinator.currentEpoch();
     second.deinit();
     try std.testing.expectEqual(after_probe, coordinator.currentEpoch());
@@ -3281,19 +3328,43 @@ pub const MetadataService = struct {
         expected_ranges: []const metadata_table_manager.RangeRecord,
     ) !void {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        const projected_table = (try store.getTable(alloc, self.metadata_group_id, expected_table.table_id)) orelse
-            return error.MetadataMutationOutcomeUnknown;
-        defer metadata_table_manager.freeTable(alloc, projected_table);
-        if (!metadata_table_manager.tableDefinitionsEqual(projected_table, expected_table))
-            return error.TableAlreadyExists;
-        for (expected_ranges) |expected| {
-            const projected = (try store.getRange(alloc, self.metadata_group_id, expected.group_id)) orelse
-                return error.MetadataMutationOutcomeUnknown;
-            const matches = metadata_table_manager.rangeRecordsEqual(projected, expected);
-            metadata_table_manager.freeRange(alloc, projected);
-            if (!matches)
-                return error.TableAlreadyExists;
+        var attempt: u8 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            if (attempt == 0) try store.ensureDerivedCatalogIndexes(self.metadata_group_id) else try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
+            return store.verifyTableCreateProjectionExact(
+                alloc,
+                self.metadata_group_id,
+                expected_table,
+                expected_ranges,
+            ) catch |err| switch (err) {
+                error.InvalidDerivedCatalogIndex => continue,
+                else => return err,
+            };
         }
+        return error.InvalidDerivedCatalogIndex;
+    }
+
+    pub fn captureTableRestoreGeneration(
+        self: *MetadataService,
+        alloc: std.mem.Allocator,
+        expected_table: metadata_table_manager.TableRecord,
+        expected_ranges: []const metadata_table_manager.RangeRecord,
+    ) !u64 {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        var attempt: u8 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            if (attempt == 0) try store.ensureDerivedCatalogIndexes(self.metadata_group_id) else try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
+            return store.captureTableRestoreGeneration(
+                alloc,
+                self.metadata_group_id,
+                expected_table,
+                expected_ranges,
+            ) catch |err| switch (err) {
+                error.InvalidDerivedCatalogIndex => continue,
+                else => return err,
+            };
+        }
+        return error.InvalidDerivedCatalogIndex;
     }
 
     pub fn verifyTableDropProjection(self: *MetadataService, alloc: std.mem.Allocator, table_id: u64) !void {
@@ -6352,9 +6423,10 @@ pub const MetadataHttpService = struct {
 
     /// Atomic topology entries use versioned Raft wire semantics, so every
     /// current and configured metadata member must advertise the version
-    /// required by this command before the leader may append it. Concurrent
-    /// waiters share one successful fanout; later calls probe again because a
-    /// peer process rollback does not change the Raft readiness identity.
+    /// required by this command before the leader may append it. Successful
+    /// fanout is cached by term, exact membership, cluster incarnation, and
+    /// required version. Steady-state DDL performs only a bounded local
+    /// membership fingerprint check instead of peer network round trips.
     pub fn ensureTableTopologyProtocolReadyWithContext(
         self: *MetadataHttpService,
         request: api_operation.RequestContext,
@@ -6395,7 +6467,6 @@ pub const MetadataHttpService = struct {
             required_node_ids,
         );
 
-        var joined_completion_epoch: ?u32 = null;
         var probe_lease = while (true) {
             try request.ensureActive();
             const observed_epoch = self.table_topology_protocol_probe.currentEpoch();
@@ -6404,28 +6475,17 @@ pub const MetadataHttpService = struct {
                 observed_epoch,
                 table_topology_protocol_probe_wait_ns,
             );
-            const completed_epoch = self.table_topology_protocol_probe.currentEpoch();
-            if (completed_epoch != observed_epoch) {
-                // This caller is a member of the exact probe cohort that
-                // published completed_epoch. Preserve that identity even if
-                // another cohort member briefly owns the lane before us.
-                joined_completion_epoch = completed_epoch;
-            }
         };
         defer probe_lease.deinit();
-        if (joined_completion_epoch) |joined_epoch| {
-            if (self.table_topology_protocol_probe.cached) |cached| {
-                if (cached.completion_epoch == joined_epoch and
-                    tableTopologyReadinessEqual(cached.readiness, expected_readiness))
-                    return expected_readiness;
-            }
+        if (self.table_topology_protocol_probe.cached) |cached| {
+            if (tableTopologyReadinessEqual(cached.readiness, expected_readiness))
+                return expected_readiness;
         }
         // Every path below performs a real network observation (including a
         // failed one), so its lease publishes exactly one new cohort epoch.
         probe_lease.publishCompletion();
-        // A caller that acquired the lane without waiting must never reuse an
-        // older peer-process observation. Clear it before the fresh fanout so
-        // failures cannot be consumed by concurrent waiters as success.
+        // Clear a stale identity before the fresh fanout so failures cannot be
+        // consumed by concurrent waiters as success.
         self.table_topology_protocol_probe.cached = null;
 
         const now_ns = platform_time.monotonicNs();
@@ -7779,19 +7839,43 @@ pub const MetadataHttpService = struct {
         expected_ranges: []const metadata_table_manager.RangeRecord,
     ) !void {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        const projected_table = (try store.getTable(alloc, self.metadata_group_id, expected_table.table_id)) orelse
-            return error.MetadataMutationOutcomeUnknown;
-        defer metadata_table_manager.freeTable(alloc, projected_table);
-        if (!metadata_table_manager.tableDefinitionsEqual(projected_table, expected_table))
-            return error.TableAlreadyExists;
-        for (expected_ranges) |expected| {
-            const projected = (try store.getRange(alloc, self.metadata_group_id, expected.group_id)) orelse
-                return error.MetadataMutationOutcomeUnknown;
-            const matches = metadata_table_manager.rangeRecordsEqual(projected, expected);
-            metadata_table_manager.freeRange(alloc, projected);
-            if (!matches)
-                return error.TableAlreadyExists;
+        var attempt: u8 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            if (attempt == 0) try store.ensureDerivedCatalogIndexes(self.metadata_group_id) else try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
+            return store.verifyTableCreateProjectionExact(
+                alloc,
+                self.metadata_group_id,
+                expected_table,
+                expected_ranges,
+            ) catch |err| switch (err) {
+                error.InvalidDerivedCatalogIndex => continue,
+                else => return err,
+            };
         }
+        return error.InvalidDerivedCatalogIndex;
+    }
+
+    pub fn captureTableRestoreGeneration(
+        self: *MetadataHttpService,
+        alloc: std.mem.Allocator,
+        expected_table: metadata_table_manager.TableRecord,
+        expected_ranges: []const metadata_table_manager.RangeRecord,
+    ) !u64 {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        var attempt: u8 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            if (attempt == 0) try store.ensureDerivedCatalogIndexes(self.metadata_group_id) else try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
+            return store.captureTableRestoreGeneration(
+                alloc,
+                self.metadata_group_id,
+                expected_table,
+                expected_ranges,
+            ) catch |err| switch (err) {
+                error.InvalidDerivedCatalogIndex => continue,
+                else => return err,
+            };
+        }
+        return error.InvalidDerivedCatalogIndex;
     }
 
     pub fn verifyTableDropProjection(self: *MetadataHttpService, alloc: std.mem.Allocator, table_id: u64) !void {

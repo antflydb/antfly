@@ -53,6 +53,7 @@ const extension_domain = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
+const table_topology_mutations = @import("../metadata/table_topology_mutations.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const metadata_table_workflow = @import("../metadata/table_workflow.zig");
 const schema_mod = @import("../schema/mod.zig");
@@ -2040,16 +2041,12 @@ fn persistRestoreTableIntent(
     var spec = try deriveRestoreMetadataSpec(alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
     defer spec.deinit(alloc);
 
-    var snapshot = try service.adminSnapshot();
-    defer service.freeAdminSnapshot(&snapshot);
-    if (tables_api.findTableByName(&snapshot, table_name)) |existing| {
-        if (!try metadata_table_manager.restoreIntentTopologyCompatible(alloc, existing.*, snapshot.ranges, spec.table, spec.ranges))
-            return error.TableAlreadyExists;
-    }
-
-    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
-    defer workflow.deinit();
-    _ = try workflow.createTableWithRanges(service, spec.table, spec.ranges);
+    try table_topology_mutations.restore(service, alloc, .{}, spec.table, spec.ranges);
+    // Topology is already committed. Reconciliation is continuously driven in
+    // the background, so an opportunistic local round must not turn a durable
+    // restore admission into a misleading retryable failure.
+    runPostMutationRound(service) catch |err|
+        std.log.warn("restore topology committed; immediate reconciliation deferred err={s}", .{@errorName(err)});
 }
 
 pub const default_metadata_mutation_retry_timeout_ns: u64 = 5 * std.time.ns_per_s;
@@ -8416,13 +8413,18 @@ pub const ApiHttpServer = struct {
                     error.UnsupportedBackupFormat,
                     error.UnsupportedMultiRangeTable,
                     error.TableNotFound,
+                    error.TableAlreadyExists,
+                    error.TableTransitionActive,
+                    error.MetadataTopologyCommandTooLarge,
+                    error.InvalidTableTopologyMutation,
                     error.UnsupportedOperation,
                     error.OutOfMemory,
                     => return err,
                     else => {
-                        // A reconciliation plan publishes the table and ranges as
-                        // separate proposals. Any error after one proposal may be
-                        // an interrupted exact restore intent, not a clean abort.
+                        // The atomic topology command may commit even if the
+                        // response is lost after admission. Resolve that
+                        // ambiguity from the exact durable restore intent
+                        // before considering a bounded replay.
                         const intent_state = self.distributedRestoreIntentState(
                             table_name,
                             location_uri,
@@ -12758,7 +12760,7 @@ pub const ApiHttpServer = struct {
         var drop_result = self.source.dropTableExact(self.alloc, table_name) catch |err| return switch (err) {
             error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table name"),
             error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
-            error.MetadataTopologyCommandTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "table topology is too large for the current rolling-upgrade protocol"),
+            error.MetadataTopologyCommandTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "table topology exceeds the 3 MiB metadata command limit; reduce the initial shard count or table definition size"),
             error.TableTransitionActive, error.TableGenerationChanged => try contextual_operations.textAlloc(self.alloc, 409, "table topology changed; retry with the current table state"),
             error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
             error.RaftMutationDeadlineExceeded => try contextualRetryableTextResponse(self.alloc, 503, "metadata mutation deadline exceeded before admission; retry later"),
@@ -38083,22 +38085,6 @@ test "restore job list paginates after authorization filtering" {
     try std.testing.expectEqual(@as(usize, 1), second_jobs.len);
     try std.testing.expectEqualStrings("docs-old", second_jobs[0].object.get("backup_id").?.string);
     try std.testing.expect(second_json.value.object.get("next_cursor") == null);
-}
-
-test "restore metadata intent topology accepts interrupted prefixes and rejects foreign ranges" {
-    const table = metadata_table_manager.TableRecord{ .table_id = 7, .name = "docs", .min_ranges = 2 };
-    const expected = [_]metadata_table_manager.RangeRecord{
-        .{ .group_id = 101, .table_id = 7, .start_key = "", .end_key = "m", .restore_backup_id = "daily", .restore_location = "file:///backup", .restore_snapshot_path = "101" },
-        .{ .group_id = 102, .table_id = 7, .start_key = "m", .restore_backup_id = "daily", .restore_location = "file:///backup", .restore_snapshot_path = "102" },
-    };
-    try std.testing.expect(try metadata_table_manager.restoreIntentTopologyCompatible(std.testing.allocator, table, expected[0..1], table, &expected));
-    try std.testing.expect(try metadata_table_manager.restoreIntentTopologyCompatible(std.testing.allocator, table, &expected, table, &expected));
-
-    const foreign = [_]metadata_table_manager.RangeRecord{.{ .group_id = 103, .table_id = 7, .start_key = "" }};
-    try std.testing.expect(!try metadata_table_manager.restoreIntentTopologyCompatible(std.testing.allocator, table, &foreign, table, &expected));
-    var changed = table;
-    changed.schema_json = "{\"version\":2}";
-    try std.testing.expect(!try metadata_table_manager.restoreIntentTopologyCompatible(std.testing.allocator, changed, &.{}, table, &expected));
 }
 
 test "restore job list bounds authorization scans with an empty continuation page" {

@@ -114,6 +114,16 @@ pub const AdminSource = struct {
             artifact_backup_id: []const u8,
             manifest: *const backups_api.TableBackupManifest,
         ) anyerror!void = null,
+        restore_table_with_context: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            request: operation.RequestContext,
+            table_name: []const u8,
+            location_uri: []const u8,
+            connection: []const u8,
+            artifact_backup_id: []const u8,
+            manifest: *const backups_api.TableBackupManifest,
+        ) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
         drop_table_with_context: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) anyerror!void = null,
         drop_table_exact_with_context: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) anyerror!table_topology_mutations.DropResult = null,
@@ -236,6 +246,22 @@ pub const AdminSource = struct {
     ) !void {
         const fn_ptr = self.vtable.restore_table orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
+    }
+
+    pub fn restoreTableWithContext(
+        self: AdminSource,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        table_name: []const u8,
+        location_uri: []const u8,
+        connection: []const u8,
+        artifact_backup_id: []const u8,
+        manifest: *const backups_api.TableBackupManifest,
+    ) !void {
+        if (self.vtable.restore_table_with_context) |restore|
+            return try restore(self.ptr, alloc, request, table_name, location_uri, connection, artifact_backup_id, manifest);
+        try request.ensureActive();
+        return try self.restoreTable(alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
     }
 
     pub fn dropTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8) !void {
@@ -404,9 +430,13 @@ pub const AdminSource = struct {
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
                 .preflight_table_mutation_authority = metadataServicePreflightTableMutationAuthority,
                 .create_table = metadataServiceCreateTable,
+                .create_table_with_context = metadataServiceCreateTableWithContext,
                 .replace_table_definition = metadataServiceReplaceTableDefinition,
                 .restore_table = metadataServiceRestoreTable,
+                .restore_table_with_context = metadataServiceRestoreTableWithContext,
                 .drop_table = metadataServiceDropTable,
+                .drop_table_with_context = metadataServiceDropTableWithContext,
+                .drop_table_exact_with_context = metadataServiceDropTableExactWithContext,
                 .update_schema = metadataServiceUpdateSchema,
                 .create_index = metadataServiceCreateIndex,
                 .drop_index = metadataServiceDropIndex,
@@ -455,6 +485,7 @@ pub const AdminSource = struct {
                 .create_table_with_context = metadataHttpServiceCreateTableWithContext,
                 .replace_table_definition = metadataHttpServiceReplaceTableDefinition,
                 .restore_table = metadataHttpServiceRestoreTable,
+                .restore_table_with_context = metadataHttpServiceRestoreTableWithContext,
                 .drop_table = metadataHttpServiceDropTable,
                 .drop_table_with_context = metadataHttpServiceDropTableWithContext,
                 .drop_table_exact_with_context = metadataHttpServiceDropTableExactWithContext,
@@ -579,18 +610,12 @@ pub const AdminSource = struct {
     }
 
     fn metadataServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
+        return metadataServiceCreateTableWithContext(ptr, alloc, .{}, table_name, req);
+    }
+
+    fn metadataServiceCreateTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        try svc.ensureLocalTableMutationAuthority();
-        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
-        defer workflow.deinit();
-        const table = tables_api.deriveTableRecord(table_name, req);
-        const ranges = try tables_api.deriveInitialRanges(alloc, table);
-        defer {
-            for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
-            alloc.free(ranges);
-        }
-        _ = try workflow.createTableWithRanges(svc, table, ranges);
-        try flushMetadataServiceMutation(svc);
+        try table_topology_mutations.create(svc, alloc, request, table_name, req);
     }
 
     fn metadataServiceReplaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
@@ -608,23 +633,36 @@ pub const AdminSource = struct {
         artifact_backup_id: []const u8,
         manifest: *const backups_api.TableBackupManifest,
     ) !void {
+        return metadataServiceRestoreTableWithContext(ptr, alloc, .{}, table_name, location_uri, connection, artifact_backup_id, manifest);
+    }
+
+    fn metadataServiceRestoreTableWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        table_name: []const u8,
+        location_uri: []const u8,
+        connection: []const u8,
+        artifact_backup_id: []const u8,
+        manifest: *const backups_api.TableBackupManifest,
+    ) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        try persistRestoreTableIntent(svc, alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
+        try persistRestoreTableIntent(svc, alloc, request, table_name, location_uri, connection, artifact_backup_id, manifest);
         try flushMetadataServiceMutation(svc);
     }
 
     fn metadataServiceDropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
-        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        try svc.ensureLocalTableMutationAuthority();
-        var snapshot = try svc.adminSnapshot();
-        defer svc.freeAdminSnapshot(&snapshot);
-        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        if (extensionOwnsTableScopedObject(&snapshot, table_name)) return error.ExtensionOwnedObject;
+        return metadataServiceDropTableWithContext(ptr, alloc, .{}, table_name);
+    }
 
-        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
-        defer workflow.deinit();
-        _ = try workflow.dropTable(svc, table.table_id);
-        try flushMetadataServiceMutation(svc);
+    fn metadataServiceDropTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) !void {
+        var result = try metadataServiceDropTableExactWithContext(ptr, alloc, request, table_name);
+        defer result.deinit(alloc);
+    }
+
+    fn metadataServiceDropTableExactWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) !table_topology_mutations.DropResult {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        return try table_topology_mutations.drop(svc, alloc, request, table_name);
     }
 
     fn metadataServiceUpdateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
@@ -975,8 +1013,21 @@ pub const AdminSource = struct {
         artifact_backup_id: []const u8,
         manifest: *const backups_api.TableBackupManifest,
     ) !void {
+        return metadataHttpServiceRestoreTableWithContext(ptr, alloc, .{}, table_name, location_uri, connection, artifact_backup_id, manifest);
+    }
+
+    fn metadataHttpServiceRestoreTableWithContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        table_name: []const u8,
+        location_uri: []const u8,
+        connection: []const u8,
+        artifact_backup_id: []const u8,
+        manifest: *const backups_api.TableBackupManifest,
+    ) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try persistRestoreTableIntent(svc, alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
+        try persistRestoreTableIntent(svc, alloc, request, table_name, location_uri, connection, artifact_backup_id, manifest);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -1574,14 +1625,14 @@ pub const MetadataHttpServer = struct {
             return ctx.status(426).text("metadata topology protocol upgrade required");
         }
         if (err == error.MetadataTopologyCommandTooLarge) {
-            // Encoding rejected the complete legacy batch before Raft
+            // Encoding rejected the complete command before Raft
             // admission. Preserve that replay proof and return an actionable
             // capacity response instead of a generic server error.
             try ctx.setHeader(
                 routes.Routes.raft_mutation_outcome_header,
                 routes.Routes.raft_mutation_outcome_not_proposed,
             );
-            return ctx.status(413).text("table topology is too large for this rolling-upgrade protocol");
+            return ctx.status(413).text("table topology exceeds the 3 MiB metadata command limit; reduce the initial shard count or table definition size");
         }
         if (metadata_authority.isMutationNotAdmittedError(err)) {
             // Raft rejected this command before assigning a log index. Only
@@ -1973,6 +2024,7 @@ pub const MetadataHttpServer = struct {
             .create_table_with_context = createTableOperationWithContext,
             .replace_definition = replaceTableDefinitionOperation,
             .restore_table = restoreTableOperation,
+            .restore_table_with_context = restoreTableOperationWithContext,
             .drop_table = dropTableOperation,
             .drop_table_with_context = dropTableOperationWithContext,
             .update_schema = updateTableSchemaOperation,
@@ -2006,6 +2058,11 @@ pub const MetadataHttpServer = struct {
     fn restoreTableOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, request: table_operations.RestoreRequest) !void {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         return self.source.restoreTable(alloc, table_name, request.location, request.connection, request.artifact_backup_id, &request.manifest);
+    }
+
+    fn restoreTableOperationWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, table_name: []const u8, request: table_operations.RestoreRequest) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.restoreTableWithContext(alloc, context, table_name, request.location, request.connection, request.artifact_backup_id, &request.manifest);
     }
 
     fn dropTableOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
@@ -2391,7 +2448,16 @@ pub const MetadataHttpServer = struct {
             if (backups_api.backupLocationErrorMessage(err)) |msg| return ctx.status(400).text(msg);
             return switch (err) {
                 error.TableAlreadyExists => ctx.status(409).text("table already exists"),
+                error.TableTransitionActive => ctx.status(409).text("table topology is changing; retry after the transition completes"),
                 error.InvalidBackupRequest, error.UnsupportedBackupFormat, error.UnsupportedBackupMigrationState => ctx.status(400).text("invalid restore request"),
+                error.InvalidTableTopologyMutation => ctx.status(400).text("backup manifest contains an invalid table topology"),
+                error.MetadataTopologyCommandTooLarge => blk: {
+                    try ctx.setHeader(
+                        routes.Routes.raft_mutation_outcome_header,
+                        routes.Routes.raft_mutation_outcome_not_proposed,
+                    );
+                    break :blk ctx.status(413).text("restore topology exceeds the 3 MiB metadata command limit; restore a backup with fewer shards");
+                },
                 error.BackupIntegrityMissing,
                 error.BackupArtifactIntegrityMismatch,
                 error.BackupArtifactMissing,
@@ -2580,6 +2646,7 @@ fn loadRestoreMetadataSpec(
 fn persistRestoreTableIntent(
     service_impl: anytype,
     alloc: std.mem.Allocator,
+    request: operation.RequestContext,
     table_name: []const u8,
     location_uri: []const u8,
     connection: []const u8,
@@ -2596,16 +2663,7 @@ fn persistRestoreTableIntent(
     );
     defer spec.deinit(alloc);
 
-    var snapshot = try service_impl.adminSnapshot();
-    defer service_impl.freeAdminSnapshot(&snapshot);
-    if (findTableByName(&snapshot, table_name)) |existing| {
-        if (!try metadata_table_manager.restoreIntentTopologyCompatible(alloc, existing.*, snapshot.ranges, spec.table, spec.ranges))
-            return error.TableAlreadyExists;
-    }
-
-    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
-    defer workflow.deinit();
-    _ = try workflow.createTableWithRanges(service_impl, spec.table, spec.ranges);
+    try table_topology_mutations.restore(service_impl, alloc, request, spec.table, spec.ranges);
 }
 
 const ParsedGroupStatus = struct {

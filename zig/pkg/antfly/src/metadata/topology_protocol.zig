@@ -24,7 +24,7 @@ const std = @import("std");
 pub const current_version: u16 = 4;
 /// Minimum decoder capability required by the atomic create/drop wire format.
 /// Later, unrelated metadata features must not unnecessarily stop table DDL
-/// during a rolling upgrade.
+/// when a membership change temporarily includes a lower-capability peer.
 pub const atomic_table_topology_version: u16 = 3;
 /// Decoder capability required only when lifecycle entries carry table CAS
 /// preconditions.
