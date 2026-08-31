@@ -164,15 +164,15 @@ def test_text_quickstart_and_document_artifact(serverless_api):
         mutations=[
             upsert(
                 "theory-relativity",
-                "relativity",
+                json_doc(body="relativity"),
             ),
             upsert(
                 "ancient-rome",
-                "rome",
+                json_doc(body="rome"),
             ),
             upsert(
                 "machine-learning",
-                "learning",
+                json_doc(body="learning"),
             ),
         ],
     )

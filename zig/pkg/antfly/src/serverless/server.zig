@@ -244,8 +244,8 @@ test "serverless server starts managed runtime and serves listener requests" {
     defer ensure.deinit(alloc);
     try std.testing.expect(ensure.created);
 
-    const mutations = [_]api_mod.DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-a", .body = "alpha" },
+    const mutations = [_]api_mod.TableIngestMutation{
+        try api_mod.TableIngestMutation.initUpsert("doc-a", "{\"body\":\"alpha\"}"),
     };
     var ingest = try tables.ingest(base_uri, .{
         .table_name = "docs",
@@ -263,7 +263,7 @@ test "serverless server starts managed runtime and serves listener requests" {
     try std.testing.expectEqualStrings("docs", query.value.table_name);
     try std.testing.expectEqual(@as(usize, 1), query.value.documents.len);
     try std.testing.expectEqualStrings("doc-a", query.value.documents[0].doc_id);
-    try std.testing.expectEqualStrings("alpha", query.value.documents[0].body);
+    try std.testing.expectEqualStrings("{\"body\":\"alpha\"}", query.value.documents[0].body);
 }
 
 test "serverless server query-only role rejects maintenance routes but serves reads" {
@@ -334,8 +334,8 @@ test "serverless server query-only role rejects maintenance routes but serves re
     if (ensure) |*resp| resp.deinit(alloc);
     try std.testing.expect(ensure == null);
 
-    const mutations = [_]api_mod.DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-a", .body = "alpha bravo" },
+    const mutations = [_]api_mod.TableIngestMutation{
+        try api_mod.TableIngestMutation.initUpsert("doc-a", "{\"body\":\"alpha bravo\"}"),
     };
     var ingest_before = tables.ingest(base_uri, .{
         .table_name = "docs",
@@ -356,10 +356,13 @@ test "serverless server query-only role rejects maintenance routes but serves re
     try std.testing.expect(query_before == null);
 
     try std.testing.expect(try server.stack.catalog.ensureTable("docs", 100));
+    const domain_mutations = [_]api_mod.DocumentMutation{
+        .{ .kind = .upsert, .doc_id = "doc-a", .body = "{\"body\":\"alpha bravo\"}" },
+    };
     var ingest = try server.stack.api.ingestTableBatch(.{
         .table_name = "docs",
         .timestamp_ns = 123,
-        .mutations = &mutations,
+        .mutations = &domain_mutations,
     });
     defer ingest.deinit(alloc);
     var build = try server.stack.catalog.buildTable("docs");
@@ -450,8 +453,8 @@ test "serverless server public table routes preserve published and latest cutove
     defer ensure.deinit(alloc);
     try std.testing.expect(ensure.created);
 
-    const initial_mutations = [_]api_mod.DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-a", .body = "alpha" },
+    const initial_mutations = [_]api_mod.TableIngestMutation{
+        try api_mod.TableIngestMutation.initUpsert("doc-a", "{\"body\":\"alpha\"}"),
     };
     var ingest_initial = try tables.ingest(base_uri, .{
         .table_name = "docs",
@@ -475,8 +478,8 @@ test "serverless server public table routes preserve published and latest cutove
     try std.testing.expect(!hasDocId(published_v1.value.documents, "doc-b"));
     try std.testing.expectEqual(@as(usize, 0), published_v1.value.overlay_mutation_count);
 
-    const next_mutations = [_]api_mod.DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-b", .body = "beta" },
+    const next_mutations = [_]api_mod.TableIngestMutation{
+        try api_mod.TableIngestMutation.initUpsert("doc-b", "{\"body\":\"beta\"}"),
     };
     var ingest_next = try tables.ingest(base_uri, .{
         .table_name = "docs",
@@ -618,8 +621,8 @@ test "serverless server hides remapped serving namespaces behind public table ro
     try std.testing.expectEqual(.latest, updated_policy.policy.default_query_view);
     try std.testing.expectEqual(@as(usize, 2), updated_policy.policy.keep_latest_versions);
 
-    const mutations = [_]api_mod.DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-a", .body = "alpha" },
+    const mutations = [_]api_mod.TableIngestMutation{
+        try api_mod.TableIngestMutation.initUpsert("doc-a", "{\"body\":\"alpha\"}"),
     };
     var ingest = try tables.ingest(base_uri, .{
         .table_name = "docs",
@@ -657,8 +660,8 @@ test "serverless server hides remapped serving namespaces behind public table ro
     try std.testing.expectEqual(@as(usize, 1), search.value.hits.len);
     try std.testing.expectEqualStrings("doc-a", search.value.hits[0].doc_id);
 
-    const later_mutations = [_]api_mod.DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-b", .body = "beta" },
+    const later_mutations = [_]api_mod.TableIngestMutation{
+        try api_mod.TableIngestMutation.initUpsert("doc-b", "{\"body\":\"beta\"}"),
     };
     var later_ingest = try tables.ingest(base_uri, .{
         .table_name = "docs",
@@ -750,10 +753,10 @@ test "serverless server public table graph routes stay pinned until publish cuto
     defer ensure.deinit(alloc);
     try std.testing.expect(ensure.created);
 
-    const initial_mutations = [_]api_mod.DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-a", .body = "{\"text\":\"alpha\",\"graph_edges\":[{\"target\":\"doc-b\",\"edge_type\":\"cites\",\"weight\":1.0}]}" },
-        .{ .kind = .upsert, .doc_id = "doc-b", .body = "{\"text\":\"beta\"}" },
-        .{ .kind = .upsert, .doc_id = "doc-c", .body = "{\"text\":\"gamma\"}" },
+    const initial_mutations = [_]api_mod.TableIngestMutation{
+        try api_mod.TableIngestMutation.initUpsert("doc-a", "{\"text\":\"alpha\",\"graph_edges\":[{\"target\":\"doc-b\",\"edge_type\":\"cites\",\"weight\":1.0}]}"),
+        try api_mod.TableIngestMutation.initUpsert("doc-b", "{\"text\":\"beta\"}"),
+        try api_mod.TableIngestMutation.initUpsert("doc-c", "{\"text\":\"gamma\"}"),
     };
     var ingest_initial = try tables.ingest(base_uri, .{
         .table_name = "docs",
@@ -791,8 +794,8 @@ test "serverless server public table graph routes stay pinned until publish cuto
     try std.testing.expectEqual(@as(u64, 1), shortest_before.value.version);
     try std.testing.expect(!shortest_before.value.found);
 
-    const next_mutations = [_]api_mod.DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-b", .body = "{\"text\":\"beta\",\"graph_edges\":[{\"target\":\"doc-c\",\"edge_type\":\"cites\",\"weight\":2.0}]}" },
+    const next_mutations = [_]api_mod.TableIngestMutation{
+        try api_mod.TableIngestMutation.initUpsert("doc-b", "{\"text\":\"beta\",\"graph_edges\":[{\"target\":\"doc-c\",\"edge_type\":\"cites\",\"weight\":2.0}]}"),
     };
     var ingest_next = try tables.ingest(base_uri, .{
         .table_name = "docs",
@@ -889,8 +892,8 @@ test "serverless server serves requests over env-configured s3 backend" {
     defer ensure.deinit(alloc);
     try std.testing.expect(ensure.created);
 
-    const mutations = [_]@import("api/mod.zig").DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-s3", .body = "bravo" },
+    const mutations = [_]@import("api/mod.zig").TableIngestMutation{
+        try @import("api/mod.zig").TableIngestMutation.initUpsert("doc-s3", "{\"body\":\"bravo\"}"),
     };
     var ingest = try tables.ingest(base_uri, .{
         .table_name = "docs",
@@ -908,7 +911,7 @@ test "serverless server serves requests over env-configured s3 backend" {
     try std.testing.expectEqualStrings("docs", query.value.table_name);
     try std.testing.expectEqual(@as(usize, 1), query.value.documents.len);
     try std.testing.expectEqualStrings("doc-s3", query.value.documents[0].doc_id);
-    try std.testing.expectEqualStrings("bravo", query.value.documents[0].body);
+    try std.testing.expectEqualStrings("{\"body\":\"bravo\"}", query.value.documents[0].body);
 }
 
 test "serverless server serves requests over env-configured gs backend" {
@@ -953,8 +956,8 @@ test "serverless server serves requests over env-configured gs backend" {
     defer ensure.deinit(alloc);
     try std.testing.expect(ensure.created);
 
-    const mutations = [_]@import("api/mod.zig").DocumentMutation{
-        .{ .kind = .upsert, .doc_id = "doc-gs", .body = "charlie" },
+    const mutations = [_]@import("api/mod.zig").TableIngestMutation{
+        try @import("api/mod.zig").TableIngestMutation.initUpsert("doc-gs", "{\"body\":\"charlie\"}"),
     };
     var ingest = try tables.ingest(base_uri, .{
         .table_name = "docs",
@@ -972,7 +975,7 @@ test "serverless server serves requests over env-configured gs backend" {
     try std.testing.expectEqualStrings("docs", query.value.table_name);
     try std.testing.expectEqual(@as(usize, 1), query.value.documents.len);
     try std.testing.expectEqualStrings("doc-gs", query.value.documents[0].doc_id);
-    try std.testing.expectEqualStrings("charlie", query.value.documents[0].body);
+    try std.testing.expectEqualStrings("{\"body\":\"charlie\"}", query.value.documents[0].body);
 }
 
 // Publishing is asynchronous and ReleaseSafe CI runners can be heavily loaded.

@@ -15004,6 +15004,7 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol" {
             _: ?[]const u8,
             _: ?[]const u8,
             max_response_size: ?usize,
+            _: ?object_storage.CancellationToken,
         ) !object_storage.S3.TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             const parsed = try std.Uri.parse(url);

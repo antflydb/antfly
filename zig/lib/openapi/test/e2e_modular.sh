@@ -124,8 +124,8 @@ assert_contains "$GEN_DIR/api/server.zig" "@import(\"schema\")" "api server impo
 assert_contains "$GEN_DIR/api/server.zig" "@import(\"embeddings\")" "api server imports embeddings module"
 assert_contains "$GEN_DIR/api/server.zig" "schema.TableSchema" "server uses schema.TableSchema for body parsing"
 assert_contains "$GEN_DIR/api/server.zig" "embeddings.EmbedderConfig" "server uses embeddings.EmbedderConfig for body parsing"
-assert_contains "$GEN_DIR/api/server.zig" "body: schema.TableSchema" "handler interface shows schema.TableSchema"
-assert_contains "$GEN_DIR/api/server.zig" "body: embeddings.EmbedderConfig" "handler interface shows embeddings.EmbedderConfig"
+assert_contains "$GEN_DIR/api/server.zig" "!std.json.Parsed(schema.TableSchema)" "schema body parser returns schema.TableSchema"
+assert_contains "$GEN_DIR/api/server.zig" "!std.json.Parsed(embeddings.EmbedderConfig)" "embeddings body parser returns embeddings.EmbedderConfig"
 
 # Step 4: Test config file path
 echo ""
@@ -145,12 +145,33 @@ echo "--- Testing OpenAPI 3.1 (petstore31.json) ---"
   --generate types,server
 
 assert_contains "$GEN_DIR/petstore31/types.zig" "pub const PetStatus = enum {" "3.1 enum generated"
-assert_contains "$GEN_DIR/petstore31/types.zig" "tag: ?[]const u8 = null," "3.1 type array nullable optional"
-assert_contains "$GEN_DIR/petstore31/types.zig" "details: ?std.json.Value," "3.1 required+nullable (no default)"
-assert_not_contains "$GEN_DIR/petstore31/types.zig" "details: ?std.json.Value = null" "3.1 required+nullable has no = null"
+assert_contains "$GEN_DIR/petstore31/types.zig" "tag: OpenApiOptionalNullable([]const u8) = .absent," "3.1 optional nullable preserves wire presence"
+assert_contains "$GEN_DIR/petstore31/types.zig" "details: ?std.json.ArrayHashMap(std.json.Value)," "3.1 required+nullable free-form object (no default)"
+assert_not_contains "$GEN_DIR/petstore31/types.zig" "details: ?std.json.ArrayHashMap(std.json.Value) = null" "3.1 required+nullable free-form object has no = null"
 assert_contains "$GEN_DIR/petstore31/types.zig" "/// Initial status (defaults to available)" "3.1 \$ref description sibling"
 assert_contains "$GEN_DIR/petstore31/types.zig" "/// Required but nullable error details" "3.1 nullable field description"
+assert_contains "$GEN_DIR/petstore31/types.zig" "pub const FlexibleValue = i64;" "component keeps preferred public name"
+assert_contains "$GEN_DIR/petstore31/types.zig" "pub const FlexibleValue2 = std.json.Value;" "nullable helper avoids component collision deterministically"
+assert_contains "$GEN_DIR/petstore31/types.zig" "pub const Flexible = ?FlexibleValue2;" "multi-type nullable schema remains lossless"
+assert_contains "$GEN_DIR/petstore31/types.zig" "pub const NullableRaw = std.json.Value;" "raw JSON override remains intrinsically nullable"
+assert_contains "$GEN_DIR/petstore31/types.zig" "required_raw: NullableRaw," "required raw JSON field has no invalid default"
+assert_contains "$GEN_DIR/petstore31/types.zig" "optional_raw: OpenApiOptionalNullable(NullableRaw) = .absent," "optional raw JSON field tracks absence separately"
+assert_contains "$GEN_DIR/petstore31/types.zig" "required_inline_raw: std.json.Value," "inline raw JSON override uses intrinsic null representation"
+assert_contains "$GEN_DIR/petstore31/types.zig" "optional_inline_raw: OpenApiOptionalNullable(std.json.Value) = .absent," "optional inline raw JSON tracks absence separately"
+assert_contains "$GEN_DIR/petstore31/types.zig" "metadata: ?std.json.ArrayHashMap(std.json.Value) = null," "free-form object retains its object-only wire kind"
+assert_contains "$GEN_DIR/petstore31/types.zig" "fn openApiParseObject(" "optional non-nullable fields use the schema-faithful streaming parser"
 assert_contains "$GEN_DIR/petstore31/server.zig" "ServerRouter" "3.1 server generated"
+
+# Compile the generated standalone types as a final representation check. Text
+# assertions catch API shape regressions; compilation catches invalid defaults
+# and helper-name collisions that otherwise survive source inspection.
+"$ZIG" test "$GEN_DIR/petstore31/types.zig"
+"$ZIG" test \
+  --dep types \
+  --dep antfly-json \
+  -Mroot="$PROJECT_DIR/test/optional_nullable_runtime.zig" \
+  -Mtypes="$GEN_DIR/petstore31/types.zig" \
+  -Mantfly-json="$PROJECT_DIR/../json/src/mod.zig"
 
 echo ""
 echo "=== All E2E tests passed ==="

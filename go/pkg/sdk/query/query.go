@@ -1,7 +1,42 @@
 //go:generate go tool oapi-codegen --config=cfg.yaml ../../../../specs/openapi/antfly/query.yaml
 package query
 
-import "time"
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
+	"time"
+)
+
+// DecodeInto decodes the retained Query JSON directly into value. Query is a
+// generated structural union, so package consumers should use this extension
+// instead of marshaling the union only to decode it again.
+func (q Query) DecodeInto(value any) error {
+	return json.Unmarshal(q.union, value)
+}
+
+// DecodeStrictInto decodes the retained Query JSON into one selected concrete
+// query type and rejects members that are not part of that type.
+func (q Query) DecodeStrictInto(value any) error {
+	return decodeStrictJSON(q.union, value)
+}
+
+func decodeStrictJSON(encoded []byte, value any) error {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
 
 // Builder helpers for creating Antfly queries with convenience functions
 
@@ -129,6 +164,26 @@ func (v TermRangeQuery) ToQuery() Query {
 		panic(err)
 	}
 	return q
+}
+
+// MarshalJSON normalizes date bounds to UTC before time.Time's RFC 3339
+// encoder sees them. RFC 3339 cannot represent sub-minute UTC offsets, so
+// normalization preserves the instant for historical and fixed-offset zones
+// through every public serialization path (including generated union helpers).
+func (v DateRangeStringQuery) MarshalJSON() ([]byte, error) {
+	type dateRangeStringQuery DateRangeStringQuery
+
+	// time.Time's RFC 3339 encoding can only represent whole-minute UTC
+	// offsets. Work on the value copy so serialization never mutates caller data.
+	if v.Start != nil {
+		start := v.Start.UTC()
+		v.Start = &start
+	}
+	if v.End != nil {
+		end := v.End.UTC()
+		v.End = &end
+	}
+	return json.Marshal(dateRangeStringQuery(v))
 }
 
 // ToQuery creates a Query from a DateRangeStringQuery. Panics on error.
@@ -310,7 +365,7 @@ func NewPrefix(prefix string, field string) Query {
 //
 //	q := query.NewNumericRange(0, 1000, "price")
 func NewNumericRange(min float64, max float64, field string) Query {
-	return NumericRangeQuery{Min: min, Max: max, Field: field}.ToQuery()
+	return NumericRangeQuery{Min: &min, Max: &max, Field: field}.ToQuery()
 }
 
 // NewDateRange creates a DateRangeStringQuery.
@@ -321,7 +376,7 @@ func NewNumericRange(min float64, max float64, field string) Query {
 //	end := time.Date(2024, 12, 31, 23, 59, 59, 0, time.UTC)
 //	q := query.NewDateRange(start, end, "created_at")
 func NewDateRange(start time.Time, end time.Time, field string) Query {
-	return DateRangeStringQuery{Start: start, End: end, Field: field}.ToQuery()
+	return DateRangeStringQuery{Start: &start, End: &end, Field: field}.ToQuery()
 }
 
 // NewMatchAll creates a MatchAllQuery.
@@ -347,7 +402,7 @@ func NewMatchNone() Query {
 // Example:
 //
 //	must := query.NewConjunction([]query.Query{query.NewTerm("published", "status")})
-//	mustNot := query.NewDisjunction([]query.Query{query.NewTerm("archived", "status")}, 0)
+//	mustNot := query.NewDisjunction([]query.Query{query.NewTerm("archived", "status")})
 //	q := query.NewBoolean(must, DisjunctionQuery{}, mustNot)
 func NewBoolean(must ConjunctionQuery, should DisjunctionQuery, mustNot DisjunctionQuery) Query {
 	return BooleanQuery{
@@ -369,16 +424,24 @@ func NewConjunction(queries []Query) ConjunctionQuery {
 	return ConjunctionQuery{Conjuncts: queries}
 }
 
-// NewDisjunction creates a DisjunctionQuery (OR).
+// NewDisjunction creates a conventional DisjunctionQuery (OR), which requires
+// at least one disjunct to match when it is the only positive clause.
 //
 // Example:
 //
 //	q := query.NewDisjunction([]query.Query{
 //	    query.NewTerm("draft", "status"),
 //	    query.NewTerm("pending", "status"),
-//	}, 0)
-func NewDisjunction(queries []Query, min float64) DisjunctionQuery {
-	return DisjunctionQuery{Disjuncts: queries, Min: min}
+//	})
+func NewDisjunction(queries []Query) DisjunctionQuery {
+	return DisjunctionQuery{Disjuncts: queries}
+}
+
+// NewDisjunctionWithMinimum creates a DisjunctionQuery with an explicit
+// minimum-should-match value. A value of zero deliberately makes a pure
+// disjunction optional; this is distinct from omitting the minimum.
+func NewDisjunctionWithMinimum(queries []Query, minimumShouldMatch uint32) DisjunctionQuery {
+	return DisjunctionQuery{Disjuncts: queries, Min: &minimumShouldMatch}
 }
 
 // NewDocIds creates a DocIdQuery.
