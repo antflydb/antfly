@@ -85,8 +85,7 @@ QUERY_REQUEST_PROPERTIES = (
     "profile",
     "reranker",
     "aggregations",
-    "graph_searches",
-    "expand_strategy",
+    "graph_queries",
     "document_renderer",
     "pruner",
     "join",
@@ -106,7 +105,7 @@ QUERY_REQUEST_OPEN_OBJECT_PROPERTIES = {
     "merge_config",
     "reranker",
     "aggregations",
-    "graph_searches",
+    "graph_queries",
     "pruner",
     "join",
     "foreign_sources",
@@ -306,15 +305,19 @@ def generated_content(fragment: Fragment, schemas: dict[str, Any]) -> str:
 
 
 def compact_query_request_schema(schemas: dict[str, Any]) -> dict[str, Any]:
-    """Build the bounded MCP discovery view of the public QueryRequest.
+    """Build the bounded MCP discovery view of QueryRequest.
 
     Property validation and cross-field constraints come from OpenAPI. Large
     recursive query subtrees stay open so this view remains safe for MCP
-    clients with small tools/list budgets.
+    clients with small tools/list budgets. MCP is canonical-only; deprecated
+    stateful graph_searches compatibility must not enter its generated shape.
     """
     component = schemas["QueryRequest"]
     source_properties = component["properties"]
-    properties: dict[str, Any] = {}
+    # Some tool clients materialize every optional REST property as null. The
+    # table-scoped MCP tool owns tableName, so accept only a null inner table;
+    # a concrete duplicate remains invalid and unknown fields still fail.
+    properties: dict[str, Any] = {"table": {"type": "null"}}
     for name in QUERY_REQUEST_PROPERTIES:
         if name in QUERY_REQUEST_OPEN_OBJECT_PROPERTIES:
             properties[name] = {"type": "object", "additionalProperties": True}
@@ -333,9 +336,9 @@ def compact_query_request_schema(schemas: dict[str, Any]) -> dict[str, Any]:
 
     result: dict[str, Any] = {
         "type": "object",
-        "additionalProperties": True,
+        "additionalProperties": False,
         "description": (
-            "Raw Antfly QueryRequest body for POST /tables/{tableName}/query. "
+            "Raw canonical Antfly query body for POST /tables/{tableName}/query. "
             "Use this to access the full OpenAPI query contract. Mutually exclusive "
             "with query shorthand arguments."
         ),

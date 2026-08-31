@@ -1283,6 +1283,13 @@ pub fn searchComposed(
         .total_hits_relation = base.total_hits_relation,
         .resolved_doc_set = fused_resolved_doc_set,
     });
+    try named_sets.append(alloc, .{
+        .name = "$query_results",
+        .hits = base.hits,
+        .total_hits = base.total_hits,
+        .total_hits_relation = base.total_hits_relation,
+        .resolved_doc_set = fused_resolved_doc_set,
+    });
 
     try appendEmbeddingsResultAlias(alloc, shared_req, executor, &named_sets, &owned_results, &owned_resolved_sets);
 
@@ -2114,7 +2121,7 @@ fn deriveNativeDocIdConstraintsArena(
 }
 
 fn compilePatternFilterOptional(alloc: Allocator, value: std.json.Value) !?graph_exec.CompiledPatternFilter {
-    return graph_exec.compilePatternFilter(alloc, value) catch |err| switch (err) {
+    return graph_exec.tryCompilePatternFilter(alloc, value) catch |err| switch (err) {
         error.InvalidArgument => null,
         else => return err,
     };
@@ -10943,6 +10950,44 @@ fn collectExactDocIds(
     };
 }
 
+/// Return an owned, de-duplicated identity set only when the complete stored
+/// predicate is exactly an ID union. This is intentionally narrower than
+/// `collectPositiveDocIdSuperset`: callers use it to bypass secondary-index
+/// planning without leaving a residual predicate that could be evaluated
+/// incompletely.
+pub fn exactStructuredFilterDocIdsAlloc(
+    alloc: Allocator,
+    filter_query_json: []const u8,
+) !?[]const []const u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+    const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch
+        return null;
+    if (patternFilterValueHasRole(parsed.value)) return null;
+    const compiled = (try compilePatternFilterOptional(arena_alloc, parsed.value)) orelse return null;
+    var ids = std.ArrayListUnmanaged([]const u8).empty;
+    defer ids.deinit(arena_alloc);
+    if (!(try collectExactDocIds(arena_alloc, compiled, &ids))) return null;
+    return try dupeDocIdSliceAlloc(alloc, ids.items);
+}
+
+test "exact structured ID filters resolve without a secondary index" {
+    const alloc = std.testing.allocator;
+    const ids = (try exactStructuredFilterDocIdsAlloc(alloc,
+        \\{"disjuncts":[{"doc_id":["doc:b","doc:a"]},{"doc_id":["doc:a","doc:c"]}]}
+    )).?;
+    defer freeDocIdSlice(alloc, ids);
+    try std.testing.expectEqual(@as(usize, 3), ids.len);
+    try std.testing.expectEqualStrings("doc:b", ids[0]);
+    try std.testing.expectEqualStrings("doc:a", ids[1]);
+    try std.testing.expectEqualStrings("doc:c", ids[2]);
+
+    try std.testing.expect((try exactStructuredFilterDocIdsAlloc(alloc,
+        \\{"conjuncts":[{"doc_id":["doc:a"]},{"term":{"path":"/tenant","term":"acme"}}]}
+    )) == null);
+}
+
 fn collectAllExactDocIds(
     alloc: Allocator,
     items: []const graph_exec.CompiledPatternFilter,
@@ -11521,6 +11566,10 @@ pub fn searchTextQuery(
     const total_start_ns = if (bench_query_profile or collect_score_profile) platform_time.monotonicNs() else 0;
     const text_entry = (try executor.text_index_entry(executor.ctx, effective_req.index_name)) orelse return switch (text_query) {
         .match_all => executor.search_match_all(executor.ctx, alloc, effective_req),
+        // Match-none is an index-independent empty relation. Requiring a text
+        // index here makes graph-only coordinator snapshot probes fail on
+        // tables that intentionally define only a graph index.
+        .match_none => emptySearchResult(alloc),
         else => error.IndexNotFound,
     };
     text_entry.lockAnalysisShared();

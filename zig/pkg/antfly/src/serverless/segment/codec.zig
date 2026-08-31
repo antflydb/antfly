@@ -19,6 +19,19 @@ const api_types = @import("../api/types.zig");
 
 const magic = "AFSG";
 const version: u32 = 1;
+pub const header_len: usize = magic.len + 4 + 4;
+
+pub const Header = struct {
+    count: u32,
+};
+
+pub fn decodeHeader(bytes: []const u8) !Header {
+    if (bytes.len < header_len) return error.InvalidSegment;
+    if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidSegmentMagic;
+    var cursor: usize = magic.len;
+    if (readU32(bytes, &cursor) != version) return error.UnsupportedSegmentVersion;
+    return .{ .count = readU32(bytes, &cursor) };
+}
 
 pub fn encodeAlloc(alloc: Allocator, entries: []const segment_types.Entry) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -40,13 +53,9 @@ pub fn encodeAlloc(alloc: Allocator, entries: []const segment_types.Entry) ![]u8
 }
 
 pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) ![]segment_types.Entry {
-    var cursor: usize = 0;
-    if (bytes.len < magic.len + 4 + 4) return error.InvalidSegment;
-    if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidSegmentMagic;
-    cursor += magic.len;
-    const got_version = readU32(bytes, &cursor);
-    if (got_version != version) return error.UnsupportedSegmentVersion;
-    const count = readU32(bytes, &cursor);
+    const header = try decodeHeader(bytes);
+    var cursor: usize = header_len;
+    const count = header.count;
 
     const entries = try alloc.alloc(segment_types.Entry, count);
     errdefer alloc.free(entries);
@@ -131,6 +140,7 @@ test "mutation segment codec round-trips entries" {
 
     const encoded = try encodeAlloc(alloc, entries);
     defer alloc.free(encoded);
+    try std.testing.expectEqual(@as(u32, 2), (try decodeHeader(encoded[0..header_len])).count);
     const decoded = try decodeAlloc(alloc, encoded);
     defer segment_types.freeEntries(alloc, decoded);
 

@@ -46,6 +46,7 @@ pub fn main(init: std.process.Init) !void {
     var gen = GenerateFlags{};
     var config_path: ?[]const u8 = null;
     var import_mapping = std.StringArrayHashMapUnmanaged([]const u8){};
+    var zig_type_mapping = std.StringArrayHashMapUnmanaged([]const u8){};
 
     // Parse CLI args
     const argv = try init.minimal.args.toSlice(arena);
@@ -87,6 +88,22 @@ pub fn main(init: std.process.Init) !void {
                     try import_mapping.put(arena, mapping[0..eq_pos], mapping[eq_pos + 1 ..]);
                 }
             }
+        } else if (std.mem.eql(u8, arg, "--zig-type-mapping")) {
+            i += 1;
+            if (i >= argv.len) {
+                std.debug.print("Error: --zig-type-mapping requires <semantic-name=zig-type>\n", .{});
+                std.process.exit(1);
+            }
+            const mapping: []const u8 = argv[i];
+            const eq_pos = std.mem.indexOfScalar(u8, mapping, '=') orelse {
+                std.debug.print("Error: invalid --zig-type-mapping '{s}'; expected <semantic-name=zig-type>\n", .{mapping});
+                std.process.exit(1);
+            };
+            if (eq_pos == 0 or eq_pos + 1 == mapping.len) {
+                std.debug.print("Error: invalid --zig-type-mapping '{s}'; names and types must be non-empty\n", .{mapping});
+                std.process.exit(1);
+            }
+            try zig_type_mapping.put(arena, mapping[0..eq_pos], mapping[eq_pos + 1 ..]);
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -143,6 +160,15 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         }
+        if (root.object.get("zig_type_mapping")) |v| {
+            if (v == .object) {
+                for (v.object.keys(), v.object.values()) |key, val| {
+                    if (val == .string) {
+                        try zig_type_mapping.put(arena, key, val.string);
+                    }
+                }
+            }
+        }
     }
 
     const path = spec_path orelse {
@@ -180,6 +206,7 @@ pub fn main(init: std.process.Init) !void {
         .generate_server = gen.server,
         .generate_extractors = gen.extractors,
         .import_mapping = import_mapping,
+        .zig_type_mapping = zig_type_mapping,
     });
 
     // Write output files (ignore if directory already exists)
@@ -234,6 +261,7 @@ fn printUsage() void {
         \\  --generate <what>         Comma-separated: types,client,server,extractors (default: types,client)
         \\  --config <path>           Path to JSON config file
         \\  --import-mapping <spec=mod>  Map external $ref file path to Zig module name
+        \\  --zig-type-mapping <name=type> Map semantic x-zig-type name to a Zig type expression
         \\  --help                    Show this help
         \\
         \\Config file format (JSON):
@@ -245,6 +273,9 @@ fn printUsage() void {
         \\    "import_mapping": {
         \\      "../../lib/schema/openapi.yaml": "schema",
         \\      "../../lib/embeddings/openapi.yaml": "embeddings"
+        \\    },
+        \\    "zig_type_mapping": {
+        \\      "raw_json_object": "@import(\\\"json-runtime\\\").RawObject"
         \\    }
         \\  }
         \\
@@ -252,6 +283,7 @@ fn printUsage() void {
         \\  openapi-zig --spec api.json --output src/gen --package my_api
         \\  openapi-zig --config codegen.json
         \\  openapi-zig --spec api.json --import-mapping "../lib/types.yaml=shared_types"
+        \\  openapi-zig --spec api.json --zig-type-mapping 'raw_json_object=@import("json-runtime").RawObject'
         \\
     ;
     std.debug.print("{s}", .{usage});

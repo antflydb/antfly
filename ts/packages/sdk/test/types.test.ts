@@ -6,8 +6,9 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, expectTypeOf, it } from "vitest";
+import type { GraphPathEdge } from "../src/index.js";
 import type { components, operations } from "../src/public-api.js";
-import { match as matchQuery } from "../src/query-helpers.js";
+import { disjunction, match as matchQuery, term } from "../src/query-helpers.js";
 import type {
   AntflyQuery,
   BatchRequest,
@@ -17,7 +18,13 @@ import type {
   ConjunctionQuery,
   CreateIndexRequest,
   DisjunctionQuery,
+  GraphAggregatesResult,
+  GraphBindingsResult,
+  GraphDocumentFilter,
+  GraphMatchQuery,
+  GraphNodesResult,
   IndexRuntimeCapabilities,
+  LegacyGraphSearchResult,
   MatchQuery,
   NumericRangeQuery,
   QueryRequest,
@@ -66,6 +73,20 @@ describe("Antfly Query Type Integration", () => {
       expect(status.index_capabilities?.artifact_sources).toBe(true);
       expect(status.index_capabilities?.artifact_sources_state).toBe("available");
       expect(created.embedding_name).toBe("document_dense_v1");
+    });
+  });
+
+  describe("Disjunction minimum", () => {
+    const clauses = [term("draft", "status"), term("pending", "status")];
+
+    it("distinguishes omission from an explicit zero", () => {
+      expect(disjunction(clauses)).toEqual({ disjuncts: clauses, min: undefined });
+      expect(disjunction(clauses, 0)).toEqual({ disjuncts: clauses, min: 0 });
+    });
+
+    it("rejects values outside the integer execution contract", () => {
+      expect(() => disjunction(clauses, 1.5)).toThrow(RangeError);
+      expect(() => disjunction(clauses, 3)).toThrow(RangeError);
     });
   });
 
@@ -152,18 +173,9 @@ describe("Antfly Query Type Integration", () => {
       const graph: CreateIndexRequest = {
         type: "graph",
         source: {
+          kind: "artifact",
           artifact: "relations_v1",
           format: "extraction_graph",
-          nodes: {
-            model: "document",
-            target: "{{ _item.target.text }}",
-          },
-          edge: {
-            type: "{{ _item.type }}",
-            weight: 0.75,
-            metadata: { source: "extractor" },
-          },
-          context: { doc_fields: ["title", "body"] },
         },
         artifact: {
           name: "relations_v1",
@@ -171,6 +183,17 @@ describe("Antfly Query Type Integration", () => {
           source: { type: "template", value: "{{ body }}" },
           execution: { batch_items: 8 },
         },
+        nodes: {
+          model: "document",
+          source: "{{ _doc.key }}",
+          target: "{{ _item.target.text }}",
+        },
+        edge: {
+          type: "{{ _item.type }}",
+          weight: 0.75,
+          metadata: { source: "extractor" },
+        },
+        context: { doc_fields: ["title", "body"] },
         algebraic_planning: {
           bounded_traversal: {
             law: "provenance_semiring",
@@ -178,7 +201,7 @@ describe("Antfly Query Type Integration", () => {
         },
       };
 
-      expect(graph.source?.edge?.weight).toBe(0.75);
+      expect(graph.edge?.weight).toBe(0.75);
       expect(graph.artifact?.execution?.batch_items).toBe(8);
       expect(graph.algebraic_planning?.bounded_traversal?.law).toBe("provenance_semiring");
     });
@@ -200,10 +223,83 @@ describe("Antfly Query Type Integration", () => {
   });
 
   describe("QueryRequest type safety", () => {
+    it("keeps graph filters in the stored-document predicate subset", () => {
+      const filter: GraphDocumentFilter = { term: "active", path: "/status" };
+      const numeric: GraphDocumentFilter = {
+        numeric_range: { path: "/score", min: 0 },
+      };
+      const graph: GraphMatchQuery = {
+        index: "social",
+        match: { anchor: "person", nodes: { person: { filter } }, edges: [] },
+        return: { aggregates: { count: { count: "*" } } },
+      };
+      const request: QueryRequest = { graph_queries: { people: graph } };
+
+      expect(request.graph_queries?.people).toBeDefined();
+      expect(numeric).toEqual({ numeric_range: { path: "/score", min: 0 } });
+    });
+
+    it("types pre-discriminator graph responses during the compatibility window", () => {
+      const legacy: LegacyGraphSearchResult = {
+        type: "neighbors",
+        total: 0,
+      };
+
+      expect(legacy.kind).toBeUndefined();
+      expectTypeOf(legacy.kind).toEqualTypeOf<"legacy" | undefined>();
+    });
+
+    it("exports each canonical graph result variant", () => {
+      const bindings: GraphBindingsResult = {
+        kind: "bindings",
+        rows: [],
+        stats: { returned_items: 0, truncated: false },
+        took: 0,
+      };
+      const aggregates: GraphAggregatesResult = {
+        kind: "aggregates",
+        aggregates: { count: { value: "0", exact: true } },
+        stats: { returned_items: 1 },
+        took: 0,
+      };
+      const nodes: GraphNodesResult = {
+        kind: "nodes",
+        nodes: [],
+        stats: { returned_items: 0, truncated: false },
+        took: 0,
+      };
+
+      expect(bindings.kind).toBe("bindings");
+      expect(aggregates.aggregates.count?.exact).toBe(true);
+      expect(nodes.kind).toBe("nodes");
+    });
+
+    it("exports table-qualified canonical path edges", () => {
+      const edge: GraphPathEdge = {
+        from: { key: "shared" },
+        to: { key: "shared", table: "entities" },
+        direction: "out",
+        type: "references",
+        weight: 1,
+      };
+
+      expect(edge.from.table).toBeUndefined();
+      expect(edge.to.table).toBe("entities");
+    });
+
+    it("rejects analyzer-backed and full-text range shapes in graph filters", () => {
+      // @ts-expect-error match requires a text index and is not a stored-document predicate.
+      const analyzerBacked: GraphDocumentFilter = { match: "active", field: "status" };
+      // @ts-expect-error graph ranges use an explicit operator wrapper.
+      const ambiguousRange: GraphDocumentFilter = { field: "score", min: 0 };
+
+      expect(analyzerBacked).toBeDefined();
+      expect(ambiguousRange).toBeDefined();
+    });
+
     it("should accept valid MatchQuery in full_text_search", () => {
       const query: QueryRequest = {
         table: "products",
-        full_text_index: "product_text",
         full_text_search: {
           match: "laptop",
           field: "name",
@@ -212,7 +308,6 @@ describe("Antfly Query Type Integration", () => {
       };
 
       expect(query.full_text_search).toBeDefined();
-      expect(query.full_text_index).toBe("product_text");
       expectTypeOf(query.full_text_search).toMatchTypeOf<AntflyQuery | undefined>();
     });
 
