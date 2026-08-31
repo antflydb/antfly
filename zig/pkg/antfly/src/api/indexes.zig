@@ -8555,6 +8555,8 @@ test "embeddings index status ignores inactive stale catch-up progress once dens
         .doc_count = 217_500,
         .node_count = 3_300,
         .root_node = 1,
+        .publication_target_count = 217_500,
+        .publication_target_ready = true,
         .coverage_generation = identity.incarnation,
         .coverage_config_hash = identity.config_hash,
         .coverage_identity_ready = true,
@@ -8599,14 +8601,11 @@ test "embeddings index status ignores inactive stale catch-up progress once dens
 
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "dense_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dense_publish_pending\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":325") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":325") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_applied_sequence\":325") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_phase\":\"idle\"") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"status\":{\"rebuilding\":false,\"backfill_active\":false,\"publication\":{\"target_vectors\":217500,\"searchable_vectors\":217500,\"complete\":true},\"dense_publish_pending\":false,\"replay_applied_sequence\":325,\"replay_target_sequence\":325,\"replay_catch_up_required\":false,\"catch_up_applied_sequence\":325,\"catch_up_phase\":\"idle\"}}",
+        encoded,
+    );
 }
 
 test "managed embeddings readiness ignores finalizing catch-up after rate-limit recovery" {
@@ -9017,6 +9016,8 @@ test "empty embeddings index status is ready without dense artifact visibility" 
         .doc_count = 0,
         .node_count = 0,
         .root_node = 0,
+        .publication_target_count = 0,
+        .publication_target_ready = true,
         .replay_applied_sequence = 1,
         .replay_target_sequence = 1,
         .replay_catch_up_required = false,
@@ -9066,12 +9067,11 @@ test "empty embeddings index status is ready without dense artifact visibility" 
 
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dense_publish_pending\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":1") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"status\":{\"rebuilding\":false,\"backfill_active\":false,\"backfill_state\":\"ready\",\"publication\":{\"target_vectors\":0,\"searchable_vectors\":0,\"complete\":true},\"dense_publish_pending\":false,\"replay_applied_sequence\":1,\"replay_target_sequence\":1}}",
+        encoded,
+    );
 }
 
 test "single embeddings index encoder keeps partial backfill active while indexed docs lag table docs" {
