@@ -11991,15 +11991,7 @@ pub const DataServer = struct {
         // for that group: state-machine apply is deliberately unable to create
         // storage or consult metadata after an entry has committed.
         try self.provisionSplitDestinationsBeforeRaftAdmission(snapshot, next_cached_local_intents);
-        const storage_ownership_fingerprint = dataRaftStorageOwnershipFingerprint(next_cached_local_intents);
-        const storage_ownership_changed = self.last_data_raft_storage_ownership_fingerprint == null or
-            self.last_data_raft_storage_ownership_fingerprint.? != storage_ownership_fingerprint;
-        if (storage_ownership_changed) {
-            self.last_data_raft_storage_ownership_fingerprint = storage_ownership_fingerprint;
-            try self.invalidateRuntimeStatusForLocalPlacements(snapshot, next_cached_local_intents);
-            self.invalidateLocalGroupStatusCache();
-            self.markStoreStatusDirtyImmediate();
-        }
+        try self.applyDataRaftStorageOwnershipChange(snapshot, next_cached_local_intents);
 
         var updates = std.ArrayListUnmanaged(antfly.raft.MetadataUpdate).empty;
         defer {
@@ -12299,6 +12291,25 @@ pub const DataServer = struct {
             self.runtime_status_dirty.store(true, .release);
             self.provisioned_startup_catch_up_dirty.store(true, .release);
         }
+    }
+
+    fn applyDataRaftStorageOwnershipChange(
+        self: *DataServer,
+        snapshot: *const antfly.metadata_api.AdminSnapshot,
+        intents: []const antfly.raft.PlacementIntent,
+    ) !void {
+        const fingerprint = dataRaftStorageOwnershipFingerprint(intents);
+        if (self.last_data_raft_storage_ownership_fingerprint != null and
+            self.last_data_raft_storage_ownership_fingerprint.? == fingerprint)
+            return;
+
+        try self.invalidateRuntimeStatusForLocalPlacements(snapshot, intents);
+        self.invalidateLocalGroupStatusCache();
+        self.markStoreStatusDirtyImmediate();
+        // This is the transaction's commit marker. Publish it only after every
+        // fallible invalidation has completed so the same topology retries all
+        // required side effects after transient allocation pressure.
+        self.last_data_raft_storage_ownership_fingerprint = fingerprint;
     }
 
     fn annotateLocalPlacementStatus(
@@ -21185,6 +21196,85 @@ test "data runtime storage ownership fingerprint excludes transient placement pr
 
     intent.relocation_source_node_id += 1;
     try std.testing.expect(after_generation != dataRaftStorageOwnershipFingerprint(&.{intent}));
+}
+
+test "data runtime retries storage ownership invalidation before publishing fingerprint" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/data-runtime-ownership-invalidation-retry",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root);
+
+    var server = try DataServer.initFromMetadataApiUrl(alloc, .{
+        .enable_data_raft = false,
+        .replica_root_dir = replica_root,
+        .store_registration = .{
+            .node_id = 1,
+            .store_id = 1,
+            .api_url = "http://127.0.0.1:1",
+        },
+    }, "http://127.0.0.1:2");
+    defer server.deinit();
+
+    const snapshot: antfly.metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 9, .metadata_epoch = 1, .metrics = .{} },
+        .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+            .group_id = 77,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        }})[0..]),
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const intents = [_]antfly.raft.PlacementIntent{.{
+        .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 },
+        .store_id = 1,
+        .peer_node_ids = &.{1},
+    }};
+    const fingerprint = dataRaftStorageOwnershipFingerprint(&intents);
+
+    server.runtime_status_dirty.store(false, .release);
+    server.provisioned_startup_catch_up_dirty.store(false, .release);
+    server.store_status_dirty.store(false, .release);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    server.alloc = failing.allocator();
+    const failed = server.applyDataRaftStorageOwnershipChange(&snapshot, &intents);
+    server.alloc = alloc;
+
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expect(server.last_data_raft_storage_ownership_fingerprint == null);
+    try std.testing.expect(!server.runtime_status_dirty.load(.acquire));
+    try std.testing.expect(!server.provisioned_startup_catch_up_dirty.load(.acquire));
+    try std.testing.expect(!server.store_status_dirty.load(.acquire));
+
+    try server.applyDataRaftStorageOwnershipChange(&snapshot, &intents);
+    try std.testing.expectEqual(
+        @as(?u64, fingerprint),
+        server.last_data_raft_storage_ownership_fingerprint,
+    );
+    try std.testing.expect(server.runtime_status_dirty.load(.acquire));
+    try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
+
+    // An already committed fingerprint is a true allocation-free fast path.
+    failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    server.alloc = failing.allocator();
+    const unchanged = server.applyDataRaftStorageOwnershipChange(&snapshot, &intents);
+    server.alloc = alloc;
+    try unchanged;
 }
 
 test "data runtime overlays live raft membership onto cached storage status" {
