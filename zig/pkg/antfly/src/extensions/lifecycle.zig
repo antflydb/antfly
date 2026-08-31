@@ -65,17 +65,13 @@ fn probeLifecycleProtocolReadiness(
     service: anytype,
     required: bool,
 ) !?metadata_service.TableTopologyProtocolReadiness {
-    if (metadata_topology_protocol.extension_lifecycle_table_cas_rollout == .decoder_only)
-        return null;
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
         else => ServiceType,
     };
-    // Lifecycle table preconditions change replicated apply semantics. The
-    // compile-time decoder-first stage is the rollback-safety boundary; once
-    // v2 emission is enabled, this live probe additionally rejects incomplete
-    // or transitional memberships before admission.
+    // Lifecycle table preconditions change replicated apply semantics. Reject
+    // incomplete or transitional memberships before admitting a v2 command.
     if (required and @hasDecl(ServiceDeclType, "ensureTableTopologyProtocolReadyWithContext"))
         return try service.ensureTableTopologyProtocolReadyWithContext(
             .{},
@@ -104,8 +100,6 @@ fn lifecycleMutationReadiness(
     readiness: ?metadata_service.TableTopologyProtocolReadiness,
 ) !?metadata_service.TableTopologyProtocolReadiness {
     if (table_precondition_count == 0) return null;
-    if (metadata_topology_protocol.extension_lifecycle_table_cas_rollout == .decoder_only)
-        return null;
     if (readiness) |ready| return ready;
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
@@ -117,7 +111,7 @@ fn lifecycleMutationReadiness(
     return null;
 }
 
-test "extension lifecycle protocol readiness remains disabled during decoder-only rollout" {
+test "extension lifecycle protocol readiness is required for table CAS" {
     const LegacyService = struct {};
     const ProtocolService = struct {
         pub fn ensureTableTopologyProtocolReadyWithContext(
@@ -132,7 +126,10 @@ test "extension lifecycle protocol readiness remains disabled during decoder-onl
     var protocol = ProtocolService{};
     try std.testing.expect((try lifecycleMutationReadiness(&protocol, 0, null)) == null);
     try std.testing.expect((try lifecycleMutationReadiness(&legacy, 1, null)) == null);
-    try std.testing.expect((try lifecycleMutationReadiness(&protocol, 1, null)) == null);
+    try std.testing.expectError(
+        error.ExtensionLifecycleProtocolReadinessRequired,
+        lifecycleMutationReadiness(&protocol, 1, null),
+    );
 }
 
 fn captureLifecycleSnapshot(service: anytype) !metadata_api.AdminSnapshot {
@@ -254,23 +251,12 @@ fn proposeLifecycleMutation(
     // The remote probe intentionally runs outside the catalog lane. Fence its
     // term and exact membership under the lane immediately before admission.
     try validateLifecycleProtocolReadiness(service, readiness);
-    var emitted = delta;
-    const command: metadata_storage.TransitionCommand = switch (metadata_topology_protocol.extension_lifecycle_table_cas_rollout) {
-        .decoder_only => blk: {
-            // Tag 40 must retain its predecessor semantics and exact JSON
-            // shape. The global catalog lane supplies same-leader ordering
-            // during this release; CAS is activated only with the distinct v2
-            // tag after its decoder has shipped everywhere.
-            emitted.expected_tables = &.{};
-            break :blk .{ .apply_extension_lifecycle = emitted };
-        },
-        .enabled => if (emitted.expected_tables.len == 0)
-            .{ .apply_extension_lifecycle = emitted }
-        else
-            .{ .apply_extension_lifecycle_v2 = emitted },
-    };
+    const command: metadata_storage.TransitionCommand = if (delta.expected_tables.len == 0)
+        .{ .apply_extension_lifecycle = delta }
+    else
+        .{ .apply_extension_lifecycle_v2 = delta };
     try proposeCatalogMutation(service, command);
-    const applied = verifyLifecycleProjection(service, emitted) catch
+    const applied = verifyLifecycleProjection(service, delta) catch
         return error.MetadataMutationOutcomeUnknown;
     if (!applied) return error.ExtensionLifecycleConflict;
 }
@@ -383,22 +369,22 @@ test "extension lifecycle verification distinguishes conflicts from unknown outc
     );
 }
 
-test "extension lifecycle proposal decoder-only writer emits predecessor semantics" {
+test "extension lifecycle proposal emits v2 with table CAS" {
     const FakeService = struct {
         const Receipt = struct { term: u64, index: u64 };
-        proposed_v1: bool = false,
-        verified_without_cas: bool = false,
+        proposed_v2: bool = false,
+        verified_with_cas: bool = false,
 
         pub fn proposeTransitionCommandWithReceipt(
             self: *@This(),
             command: metadata_storage.TransitionCommand,
         ) !Receipt {
-            try std.testing.expect(command == .apply_extension_lifecycle);
+            try std.testing.expect(command == .apply_extension_lifecycle_v2);
             try std.testing.expectEqual(
-                @as(usize, 0),
-                command.apply_extension_lifecycle.expected_tables.len,
+                @as(usize, 1),
+                command.apply_extension_lifecycle_v2.expected_tables.len,
             );
-            self.proposed_v1 = true;
+            self.proposed_v2 = true;
             return .{ .term = 3, .index = 9 };
         }
 
@@ -408,8 +394,8 @@ test "extension lifecycle proposal decoder-only writer emits predecessor semanti
             self: *@This(),
             delta: metadata_storage.ExtensionLifecycleDelta,
         ) !bool {
-            try std.testing.expectEqual(@as(usize, 0), delta.expected_tables.len);
-            self.verified_without_cas = true;
+            try std.testing.expectEqual(@as(usize, 1), delta.expected_tables.len);
+            self.verified_with_cas = true;
             return true;
         }
     };
@@ -423,8 +409,8 @@ test "extension lifecycle proposal decoder-only writer emits predecessor semanti
         }},
         .upsert_tables = &.{table},
     });
-    try std.testing.expect(service.proposed_v1);
-    try std.testing.expect(service.verified_without_cas);
+    try std.testing.expect(service.proposed_v2);
+    try std.testing.expect(service.verified_with_cas);
 }
 
 pub fn installOnService(

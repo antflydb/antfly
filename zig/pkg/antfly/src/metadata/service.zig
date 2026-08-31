@@ -115,12 +115,12 @@ pub const TableDropAdmission = struct {
     }
 };
 
-/// Materialize a legacy reconciliation plan before admitting any part of it,
-/// then append every predecessor-compatible entry atomically in one leader
-/// term. Raft's ordered apply rule makes the terminal receipt a proof for the
-/// entire batch without adding a consensus round trip per entry. This is the
-/// rolling-upgrade bridge; the steady-state topology protocol uses one atomic
-/// `apply_table_topology` entry.
+/// Materialize a multi-command catalog plan before admitting any part of it,
+/// then append every entry atomically in one leader term. Raft's ordered apply
+/// rule makes the terminal receipt a proof for the entire batch without adding
+/// a consensus round trip per entry. This supports workflows such as restore
+/// publication whose manifest supplies explicit table and range identities;
+/// ordinary DDL uses one atomic `apply_table_topology` entry.
 fn applyReconciliationPlanAndWaitAppliedWithContextImpl(
     service: anytype,
     alloc: std.mem.Allocator,
@@ -1492,7 +1492,7 @@ fn prepareEncodedTransitionBatch(
     return .{ .entries = try entries.toOwnedSlice(service.alloc) };
 }
 
-test "metadata service legacy reconciliation batch admits compact plans beyond the former count ceiling" {
+test "metadata service catalog reconciliation batch admits compact plans beyond the former count ceiling" {
     const alloc = std.testing.allocator;
     const command_count: usize = 4097;
     const commands = try alloc.alloc(metadata_storage.TransitionCommand, command_count);
@@ -3343,17 +3343,6 @@ pub const MetadataService = struct {
 
     pub fn unlockTableCatalogMutation(self: *MetadataService, table_name: []const u8) void {
         self.catalog_mutation_mutex.unlockShared(std.Options.debug_io);
-        self.tableCatalogMutationLane(table_name).unlock(std.Options.debug_io);
-    }
-
-    /// Decoder-only topology rollout uses the legacy control loop, which
-    /// takes the exclusive catalog lock itself. Hold only the same-table lane
-    /// here to avoid recursively upgrading a shared catalog lock.
-    pub fn lockTableWorkflowMutation(self: *MetadataService, table_name: []const u8) void {
-        self.tableCatalogMutationLane(table_name).lockUncancelable(std.Options.debug_io);
-    }
-
-    pub fn unlockTableWorkflowMutation(self: *MetadataService, table_name: []const u8) void {
         self.tableCatalogMutationLane(table_name).unlock(std.Options.debug_io);
     }
 
@@ -7140,8 +7129,6 @@ pub const MetadataHttpService = struct {
             .metadata_group_id = self.metadata_group_id,
             .reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
             .table_topology_protocol_version = metadata_topology_protocol.current_version,
-            .atomic_table_topology_writer_enabled = metadata_topology_protocol.atomic_table_topology_rollout == .enabled,
-            .extension_lifecycle_table_cas_writer_enabled = metadata_topology_protocol.extension_lifecycle_table_cas_rollout == .enabled,
             .runtime_status_record_version = metadata_runtime_status_protocol.current_record_version,
             .metadata_epoch = self.lifecycle_signal.currentEpoch(),
             .metrics = self.metrics(),
@@ -8213,14 +8200,6 @@ pub const MetadataHttpService = struct {
 
     pub fn unlockTableCatalogMutation(self: *MetadataHttpService, table_name: []const u8) void {
         self.catalog_mutation_mutex.unlockShared(std.Options.debug_io);
-        self.tableCatalogMutationLane(table_name).unlock(std.Options.debug_io);
-    }
-
-    pub fn lockTableWorkflowMutation(self: *MetadataHttpService, table_name: []const u8) void {
-        self.tableCatalogMutationLane(table_name).lockUncancelable(std.Options.debug_io);
-    }
-
-    pub fn unlockTableWorkflowMutation(self: *MetadataHttpService, table_name: []const u8) void {
         self.tableCatalogMutationLane(table_name).unlock(std.Options.debug_io);
     }
 
@@ -12434,8 +12413,6 @@ pub fn snapshotStatusWithOptions(
         .metadata_group_id = metadata_group_id,
         .reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
         .table_topology_protocol_version = metadata_topology_protocol.current_version,
-        .atomic_table_topology_writer_enabled = metadata_topology_protocol.atomic_table_topology_rollout == .enabled,
-        .extension_lifecycle_table_cas_writer_enabled = metadata_topology_protocol.extension_lifecycle_table_cas_rollout == .enabled,
         .runtime_status_record_version = metadata_runtime_status_protocol.current_record_version,
         .metadata_incarnation = metadata_incarnation,
         .metadata_raft_local_node_id = metadata_raft.local_node_id,

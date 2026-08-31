@@ -20,8 +20,7 @@ const std = @import("std");
 /// replicated transition generation so recreated tables receive fresh data
 /// group identities and stale drop cleanup cannot delete their storage.
 /// Version 4 decodes and enforces the distinct extension-lifecycle-v2 command
-/// carrying table compare-and-set preconditions. Writer activation remains a
-/// separate decoder-first release stage below.
+/// carrying table compare-and-set preconditions.
 pub const current_version: u16 = 4;
 /// Minimum decoder capability required by the atomic create/drop wire format.
 /// Later, unrelated metadata features must not unnecessarily stop table DDL
@@ -30,24 +29,6 @@ pub const atomic_table_topology_version: u16 = 3;
 /// Decoder capability required only when lifecycle entries carry table CAS
 /// preconditions.
 pub const extension_lifecycle_table_cas_version: u16 = 4;
-
-/// Atomic topology entries introduce a new Raft command tag. Capability
-/// probes cannot make a same-release rolling upgrade safe: a peer can restart
-/// into an older binary after a successful probe and still retain the same
-/// Raft membership identity. Ship the decoder first, then change this
-/// compile-time release stage only after every supported predecessor can
-/// decode the command. There is deliberately no runtime override.
-pub const ReplicatedSemanticRollout = enum {
-    decoder_only,
-    enabled,
-};
-pub const AtomicTableTopologyRollout = ReplicatedSemanticRollout;
-pub const atomic_table_topology_rollout: ReplicatedSemanticRollout = .decoder_only;
-
-/// Version 4 is decoded and enforced in this release, but its distinct v2
-/// lifecycle command is not emitted until the predecessor release understands
-/// it. A transient all-member probe cannot protect against binary rollback.
-pub const extension_lifecycle_table_cas_rollout: ReplicatedSemanticRollout = .decoder_only;
 
 /// Creating thousands of Raft groups is an operational workflow, not one
 /// catalog request. Keep one create bounded in CPU, memory, and log growth.
@@ -61,11 +42,10 @@ pub const max_create_definition_bytes: usize = 2 * 1024 * 1024;
 /// Defense in depth on the final encoded Raft command. This includes the
 /// definition, generated range records, and codec overhead.
 pub const max_transition_command_bytes: usize = 3 * 1024 * 1024;
-/// The decoder-only reconciliation bridge emits predecessor-compatible log
-/// entries as one locally atomic Raft batch. Encoded bytes, rather than an
-/// arbitrary entry count, are the resource and replication bound: compact
-/// removals for a valid high-shard table must not fail solely because they
-/// cross a count threshold.
+/// Multi-command catalog workflows emit legacy primitive entries as one
+/// locally atomic Raft batch. Encoded bytes, rather than an arbitrary entry
+/// count, are the resource and replication bound: compact removals for a valid
+/// high-shard table must not fail solely because they cross a count threshold.
 pub const max_legacy_reconciliation_batch_bytes: usize = max_transition_command_bytes;
 /// Every legacy transition frame contains a one-byte tag and at least one
 /// u64 identity. Combine the wire-derived maximum with an explicit in-memory

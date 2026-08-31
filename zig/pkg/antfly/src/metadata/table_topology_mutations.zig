@@ -11,15 +11,14 @@
 // WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 // License for the specific language governing permissions and limitations.
 
-//! Table-topology mutations shared by the public leader path and authenticated
-//! forwarding endpoint, with an explicit decoder-first rollout boundary.
+//! Atomic table-topology mutations shared by the public leader path and
+//! authenticated forwarding endpoint.
 
 const std = @import("std");
 const operation = @import("../api/operation.zig");
 const tables_api = @import("../api/tables.zig");
 const metadata_authority = @import("authority.zig");
 const metadata_table_manager = @import("table_manager.zig");
-const metadata_table_workflow = @import("table_workflow.zig");
 const topology_protocol = @import("topology_protocol.zig");
 
 fn afterAdmission(err: anyerror) anyerror {
@@ -49,120 +48,9 @@ fn unlockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
     }
 }
 
-fn lockTableWorkflowMutation(svc: anytype, table_name: []const u8) bool {
-    const Service = @TypeOf(svc.*);
-    if (comptime @hasDecl(Service, "lockTableWorkflowMutation")) {
-        svc.lockTableWorkflowMutation(table_name);
-        return true;
-    }
-    // The legacy control loop still takes the exclusive catalog lock. Test
-    // doubles without a dedicated same-table lane retain that serialization.
-    return false;
-}
-
-fn unlockTableWorkflowMutation(svc: anytype, table_name: []const u8, locked: bool) void {
-    if (!locked) return;
-    svc.unlockTableWorkflowMutation(table_name);
-}
-
-fn lockCatalogMutation(svc: anytype) void {
-    svc.lockCatalogMutation();
-}
-
-fn unlockCatalogMutation(svc: anytype) void {
-    svc.unlockCatalogMutation();
-}
-
-fn verifyCompatibleTableDropProjection(
-    svc: anytype,
-    alloc: std.mem.Allocator,
-    table_id: u64,
-    range_group_ids: []const u64,
-) !void {
-    try svc.verifyTableDropProjection(alloc, table_id);
-    const Service = @TypeOf(svc.*);
-    if (comptime @hasDecl(Service, "verifyTableDropRangesProjection"))
-        try svc.verifyTableDropRangesProjection(alloc, range_group_ids);
-}
-
 pub const DropResult = topology_protocol.DropResult;
 
 pub fn create(
-    svc: anytype,
-    alloc: std.mem.Allocator,
-    request: operation.RequestContext,
-    table_name: []const u8,
-    req: tables_api.CreateTableRequest,
-) !void {
-    return switch (topology_protocol.atomic_table_topology_rollout) {
-        .decoder_only => createCompatible(svc, alloc, request, table_name, req),
-        .enabled => createAtomic(svc, alloc, request, table_name, req),
-    };
-}
-
-/// Stage-A production path for the decoder rollout. It deliberately emits
-/// only transition tags understood by the predecessor release. The per-table
-/// lane prevents local DDL races; failures after reconciliation begins are
-/// resolved by observing the exact projection and otherwise reported as
-/// ambiguous so forwarding never blindly replays a partially applied plan.
-fn createCompatible(
-    svc: anytype,
-    alloc: std.mem.Allocator,
-    request: operation.RequestContext,
-    table_name: []const u8,
-    req: tables_api.CreateTableRequest,
-) !void {
-    try request.ensureActive();
-    var normalized_req = req;
-    const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(
-        alloc,
-        table_name,
-        req.indexes_json orelse tables_api.default_indexes_json,
-        tables_api.effectiveSchemaJson(req.schema_json),
-    );
-    defer alloc.free(expanded_indexes_json);
-    normalized_req.indexes_json = expanded_indexes_json;
-
-    const lane_locked = lockTableWorkflowMutation(svc, table_name);
-    defer unlockTableWorkflowMutation(svc, table_name, lane_locked);
-    const table = tables_api.deriveTableRecord(table_name, normalized_req);
-    // Generation-salted identities require the atomic drop's durable fence.
-    // Retain the predecessor identity derivation throughout decoder-only
-    // rollout so mixed-version replicas project identical legacy commands.
-    const ranges = try tables_api.deriveInitialRanges(alloc, table);
-    defer {
-        for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
-        alloc.free(ranges);
-    }
-
-    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
-    defer workflow.deinit();
-    // Lease acquisition may drive Raft and perform disk/network work. Complete
-    // it before taking the exclusive catalog lane, then keep the exact
-    // projection refresh, desired mutation, reconcile plan, and verification
-    // in one critical section.
-    try workflow.ensureCatalogMutationReadyWithContext(svc, request);
-    lockCatalogMutation(svc);
-    defer unlockCatalogMutation(svc);
-    try request.ensureActive();
-    try svc.ensureLinearizableReadWithContext(request);
-    _ = workflow.createTableWithRangesCatalogLockedWithContext(svc, request, table, ranges) catch |err| {
-        if (err == error.MetadataTopologyCommandTooLarge)
-            return error.CreateTableRequestTooLarge;
-        svc.ensureLinearizableReadWithContext(request) catch return afterAdmission(err);
-        svc.verifyTableCreateProjection(alloc, table, ranges) catch |verify_err| switch (verify_err) {
-            error.TableAlreadyExists => return verify_err,
-            else => return afterAdmission(err),
-        };
-        return;
-    };
-    svc.verifyTableCreateProjection(alloc, table, ranges) catch |err| switch (err) {
-        error.TableAlreadyExists => return err,
-        else => return afterAdmission(err),
-    };
-}
-
-fn createAtomic(
     svc: anytype,
     alloc: std.mem.Allocator,
     request: operation.RequestContext,
@@ -239,71 +127,6 @@ fn createAtomic(
 }
 
 pub fn drop(
-    svc: anytype,
-    alloc: std.mem.Allocator,
-    request: operation.RequestContext,
-    table_name: []const u8,
-) !DropResult {
-    return switch (topology_protocol.atomic_table_topology_rollout) {
-        .decoder_only => dropCompatible(svc, alloc, request, table_name),
-        .enabled => dropAtomic(svc, alloc, request, table_name),
-    };
-}
-
-fn dropCompatible(
-    svc: anytype,
-    alloc: std.mem.Allocator,
-    request: operation.RequestContext,
-    table_name: []const u8,
-) !DropResult {
-    try request.ensureActive();
-    const lane_locked = lockTableWorkflowMutation(svc, table_name);
-    defer unlockTableWorkflowMutation(svc, table_name, lane_locked);
-
-    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
-    defer workflow.deinit();
-    try workflow.ensureCatalogMutationReadyWithContext(svc, request);
-    lockCatalogMutation(svc);
-    defer unlockCatalogMutation(svc);
-    try request.ensureActive();
-    try svc.ensureLinearizableReadWithContext(request);
-    var admission = try svc.captureTableDropAdmission(alloc, table_name);
-    defer admission.deinit(alloc);
-
-    if (workflow.dropTableCatalogLockedWithContext(svc, request, admission.table_id)) |_| {} else |err| {
-        // Batch construction and encoding complete before Raft admission.
-        // Preserve deterministic capacity failures so the API can report an
-        // actionable request/topology limit instead of claiming an unknown
-        // mutation outcome.
-        if (err == error.MetadataTopologyCommandTooLarge)
-            return err;
-        svc.ensureLinearizableReadWithContext(request) catch return afterAdmission(err);
-        verifyCompatibleTableDropProjection(
-            svc,
-            alloc,
-            admission.table_id,
-            admission.range_group_ids,
-        ) catch
-            return afterAdmission(err);
-    }
-    verifyCompatibleTableDropProjection(
-        svc,
-        alloc,
-        admission.table_id,
-        admission.range_group_ids,
-    ) catch |err|
-        return afterAdmission(err);
-
-    const result = DropResult{
-        .table_id = admission.table_id,
-        .expected_transition_generation = admission.expected_transition_generation,
-        .group_ids = admission.range_group_ids,
-    };
-    admission.range_group_ids = &.{};
-    return result;
-}
-
-fn dropAtomic(
     svc: anytype,
     alloc: std.mem.Allocator,
     request: operation.RequestContext,

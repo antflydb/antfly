@@ -67,29 +67,21 @@ pub const TableWorkflow = struct {
         table: table_manager.TableRecord,
         initial_ranges: []const table_manager.RangeRecord,
     ) !control_loop.ReconcileSummary {
-        try self.ensureCatalogMutationReady(service);
+        const request: api_operation.RequestContext = .{};
+        try self.ensureCatalogMutationReadyWithContext(service, request);
         const catalog_locked = lockCatalogMutation(service);
         defer unlockCatalogMutation(service, catalog_locked);
-        return try self.createTableWithRangesCatalogLocked(service, table, initial_ranges);
+        return try self.createTableWithRangesCatalogLockedWithContext(
+            service,
+            request,
+            table,
+            initial_ranges,
+        );
     }
 
-    /// Apply a table create while the caller owns the exclusive catalog lane.
-    /// The caller may include admission and exact postcondition verification in
-    /// the same critical section, which is required by decoder-only DDL.
-    pub fn createTableWithRangesCatalogLocked(
-        self: *TableWorkflow,
-        service: anytype,
-        table: table_manager.TableRecord,
-        initial_ranges: []const table_manager.RangeRecord,
-    ) !control_loop.ReconcileSummary {
-        try self.bootstrapDesiredFromCommitted(service);
-        try self.loop.stateRef().tableManager().upsertTable(table);
-        for (initial_ranges) |initial_range| {
-            try self.loop.stateRef().tableManager().upsertRange(initial_range);
-        }
-        return try self.loop.reconcilePreparedCatalogLocked(service);
-    }
-
+    /// Atomically publish an explicit table/range topology while the caller
+    /// owns the exclusive catalog lane. Restore uses this path because its
+    /// durable manifest defines the range identities.
     pub fn createTableWithRangesCatalogLockedWithContext(
         self: *TableWorkflow,
         service: anytype,
@@ -103,11 +95,6 @@ pub const TableWorkflow = struct {
             try self.loop.stateRef().tableManager().upsertRange(initial_range);
         }
         return try self.loop.reconcilePreparedCatalogLockedWithContext(service, request);
-    }
-
-    pub fn ensureCatalogMutationReady(self: *TableWorkflow, service: anytype) !void {
-        _ = self;
-        try ensureCatalogWorkflowLease(service);
     }
 
     pub fn ensureCatalogMutationReadyWithContext(
@@ -177,20 +164,11 @@ pub const TableWorkflow = struct {
         service: anytype,
         table_id: u64,
     ) !control_loop.ReconcileSummary {
-        try self.ensureCatalogMutationReady(service);
+        const request: api_operation.RequestContext = .{};
+        try self.ensureCatalogMutationReadyWithContext(service, request);
         const catalog_locked = lockCatalogMutation(service);
         defer unlockCatalogMutation(service, catalog_locked);
-        return try self.dropTableCatalogLocked(service, table_id);
-    }
-
-    pub fn dropTableCatalogLocked(
-        self: *TableWorkflow,
-        service: anytype,
-        table_id: u64,
-    ) !control_loop.ReconcileSummary {
-        try self.bootstrapDesiredFromCommitted(service);
-        _ = self.loop.stateRef().tableManager().removeTableTopology(table_id);
-        return try self.loop.reconcilePreparedCatalogLocked(service);
+        return try self.dropTableCatalogLockedWithContext(service, request, table_id);
     }
 
     pub fn dropTableCatalogLockedWithContext(
@@ -666,6 +644,7 @@ test "table workflow can build desired topology through the control loop seam" {
     const FakeService = struct {
         table_upserts: usize = 0,
         range_upserts: usize = 0,
+        batch_applies: usize = 0,
         lease_checks: usize = 0,
         catalog_locked: bool = false,
 
@@ -734,7 +713,20 @@ test "table workflow can build desired topology through the control loop seam" {
             return null;
         }
 
-        pub fn applyReconciliationPlan(self: *@This(), plan: *const @import("reconciler.zig").ReconciliationPlan) !void {
+        pub fn applyReconciliationPlanAndWaitAppliedWithContext(
+            self: *@This(),
+            plan: *const @import("reconciler.zig").ReconciliationPlan,
+            request: api_operation.RequestContext,
+        ) !void {
+            try request.ensureActive();
+            try self.applyReconciliationPlan(plan);
+            self.batch_applies += 1;
+        }
+
+        pub fn applyReconciliationPlan(
+            self: *@This(),
+            plan: *const @import("reconciler.zig").ReconciliationPlan,
+        ) !void {
             std.debug.assert(self.catalog_locked);
             self.table_upserts += plan.table_upserts.len;
             self.range_upserts += plan.range_upserts.len;
@@ -761,6 +753,7 @@ test "table workflow can build desired topology through the control loop seam" {
     try std.testing.expectEqual(@as(usize, 1), summary.range_upserts);
     try std.testing.expectEqual(@as(usize, 1), fake.table_upserts);
     try std.testing.expectEqual(@as(usize, 1), fake.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), fake.batch_applies);
     try std.testing.expectEqual(@as(usize, 1), fake.lease_checks);
     try std.testing.expect(!fake.catalog_locked);
 }
