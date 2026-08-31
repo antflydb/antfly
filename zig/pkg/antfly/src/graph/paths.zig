@@ -110,6 +110,14 @@ pub const Path = struct {
     length: u32,
     retained_budget: ?*work_budget_mod.WorkBudget = null,
     retained_state_bytes: usize = 0,
+
+    /// Convert this path's live retained-state lease into a consumptive output
+    /// charge before it escapes the request budget's lifetime. Allocation
+    /// ownership remains with the path; only the release hook is detached.
+    pub fn consumeRetainedState(self: *Path) void {
+        self.retained_budget = null;
+        self.retained_state_bytes = 0;
+    }
 };
 
 pub fn freePath(alloc: Allocator, path: Path) void {
@@ -1941,4 +1949,29 @@ test "shortest path retained payloads use the shared request budget" {
     ));
     try std.testing.expectEqual(work_budget_mod.Dimension.retained_state_bytes, budget.exhaustion().?.dimension);
     try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
+
+test "consumed path state detaches its request-scoped release hook" {
+    const alloc = std.testing.allocator;
+    const retained_bytes = 17;
+    var budget = work_budget_mod.WorkBudget.init(100, 100);
+    try budget.retainStateBytes(retained_bytes);
+
+    const nodes = try alloc.alloc([]const u8, 1);
+    nodes[0] = try alloc.dupe(u8, "node");
+    const edges = try alloc.alloc(PathEdge, 0);
+    var path = Path{
+        .nodes = nodes,
+        .edges = edges,
+        .total_weight = 0,
+        .length = 0,
+        .retained_budget = &budget,
+        .retained_state_bytes = retained_bytes,
+    };
+
+    path.consumeRetainedState();
+    try std.testing.expect(path.retained_budget == null);
+    try std.testing.expectEqual(@as(usize, 0), path.retained_state_bytes);
+    freePath(alloc, path);
+    try std.testing.expectEqual(@as(usize, retained_bytes), budget.retained_state_bytes);
 }

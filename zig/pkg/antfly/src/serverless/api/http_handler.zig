@@ -3270,6 +3270,10 @@ pub const HttpHandler = struct {
             });
             initialized += 1;
         }
+        // The shared request budget is stack-owned. Preserve its output
+        // charges across all named operations, then detach release hooks only
+        // once the completed results cross this ownership boundary.
+        for (results[0..initialized]) |*result| result.consumeRetainedState();
         return results;
     }
 

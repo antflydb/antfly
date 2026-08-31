@@ -2110,6 +2110,13 @@ pub const GraphSearchResult = struct {
     total_hits: u32,
     truncated: bool = false,
 
+    /// Detach request-scoped retained-state release hooks at the result
+    /// ownership boundary. The request budget remains consumptively charged,
+    /// while result deinit continues to own and free the allocations.
+    pub fn consumeRetainedState(self: *GraphSearchResult) void {
+        for (self.paths) |*path| path.consumeRetainedState();
+    }
+
     pub fn deinit(self: *GraphSearchResult, alloc: Allocator) void {
         alloc.free(self.name);
         for (self.nodes) |*node| node.deinit(alloc);

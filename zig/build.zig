@@ -3863,6 +3863,7 @@ pub fn build(b: *std.Build) void {
         "projected MATCH rows reserve and release retained output bytes",
         "shortest path preflights live frontier admission",
         "shortest path retained payloads use the shared request budget",
+        "consumed path state detaches its request-scoped release hook",
         "distributed bounded paths retain non-dominated cost and depth labels",
         "distributed frontier reservations precede allocation and release on deinit",
         "anchor-only aggregate fails closed at the shared anchor scan ceiling",

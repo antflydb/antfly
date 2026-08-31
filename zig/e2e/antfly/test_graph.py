@@ -693,7 +693,7 @@ def test_serverless_graph_pattern_optional_inequality_and_antijoin(serverless_ap
     """Cover storage-specific serverless integration for the hardest MATCH shapes."""
     table_name = f"graph_pattern_joins_serverless_{time.time_ns()}"
 
-    def doc(doc_type: str, edges: list[dict] | None = None) -> str:
+    def doc(doc_type: str, edges: list[dict] | None = None) -> dict[str, object]:
         fields = {"type": doc_type}
         if edges:
             fields["graph_edges"] = edges

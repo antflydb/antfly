@@ -518,15 +518,8 @@ pub fn executeGraphQueriesWithSets(
     // must keep their allocation ownership, but cannot retain a release hook
     // into that expired stack frame. Keep their charges consumptive until all
     // named operations have run, then detach only at the ownership boundary.
-    for (results[0..initialized]) |*result| consumeGraphSearchResultState(result);
+    for (results[0..initialized]) |*result| result.consumeRetainedState();
     return results;
-}
-
-fn consumeGraphSearchResultState(result: *types.GraphSearchResult) void {
-    for (result.paths) |*path| {
-        path.retained_budget = null;
-        path.retained_state_bytes = 0;
-    }
 }
 
 fn graphResultHasQualifiedIdentity(result: types.GraphSearchResult) bool {
@@ -1503,7 +1496,7 @@ pub fn executeSingleNonPatternQueryWithSets(
         executor,
         .{ .work = &work_budget, .distinct = &distinct_budget },
     );
-    consumeGraphSearchResultState(&result);
+    result.consumeRetainedState();
     return result;
 }
 
