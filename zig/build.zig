@@ -4616,6 +4616,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db terminal enrichment marker cleanup isolates corrupt cross issue reverse entries",
             "storage.db.db.test.db terminal enrichment marker retirement is bounded and fences stale generations",
             "storage.db.db.test.db enrichment reconfigure refreshes durable state after old worker joins",
+            "storage.db.db.test.db enrichment retry makes monotonic progress across provider batches",
             "storage.db.db.test.db io_threaded executor processes indexed writes",
             "storage.db.db.test.db reopen replays pending derived embeddings",
             "storage.db.db.test.db replay respects per-index applied watermarks",
