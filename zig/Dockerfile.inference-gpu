@@ -1,0 +1,38 @@
+FROM nvidia/cuda:13.0.3-runtime-ubuntu24.04@sha256:76f46f3e649824ebd3685d3d86c42b0ea62af04f59242f419f56cd5804a72efb
+
+LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
+LABEL org.opencontainers.image.description="AntflyDB CUDA inference runtime with production models"
+LABEL org.opencontainers.image.licenses=Elastic-2.0
+LABEL io.antfly.inference.cuda-artifacts=sm89
+LABEL io.antfly.inference.models="antflydb/clipclap:gguf:Q4_K,antflydb/gliner2-base-v1:gguf:Q4_K"
+
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /
+COPY antfly /antfly
+COPY share/antfly /usr/share/antfly
+
+RUN mkdir -p /models /tmp/antflydb/extensions && \
+    /antfly inference pull hf:antflydb/clipclap:gguf:Q4_K \
+      --models-dir /models \
+      --tasks embed \
+      --capabilities text,image,audio && \
+    /antfly inference pull hf:antflydb/gliner2-base-v1:gguf:Q4_K \
+      --models-dir /models \
+      --tasks extract \
+      --capabilities extraction && \
+    chown -R 10001:10001 /models /tmp/antflydb
+
+ENV ANTFLY_EXTENSION_PACKAGE_STORE=/tmp/antflydb/extensions
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl --fail --silent --show-error http://localhost:8080/readyz || exit 1
+
+USER 10001:10001
+
+EXPOSE 8080
+
+ENTRYPOINT ["/antfly"]
+CMD ["inference", "run", "--host", "0.0.0.0", "--port", "8080", "--models-dir", "/models", "--max-loaded-models", "2", "--max-concurrent-requests", "1"]

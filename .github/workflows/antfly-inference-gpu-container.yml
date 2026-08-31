@@ -1,0 +1,143 @@
+name: CUDA inference container
+
+on:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GCP_REGION: us-central1
+  GCP_PROJECT: antfly-image-artifacts
+  GCP_REPOSITORY: containers
+  GAR_REGISTRY: us-central1-docker.pkg.dev
+  CLOUD_BUILD_WORKER_POOL: projects/antfly-image-artifacts/locations/us-central1/workerPools/antfly-container-builders
+  ZIG_ARTIFACT_BUCKET: antfly-image-artifacts-zig-build-artifacts
+  ZIG_VERSION: 0.16.0
+
+concurrency:
+  group: antfly-inference-gpu-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish amd64 CUDA image
+    if: github.ref == 'refs/heads/main'
+    runs-on: arc-antfly-publish
+    environment: container-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Verify amd64 runner
+        run: |
+          if [[ "$(uname -m)" != "x86_64" ]]; then
+            echo "expected x86_64 runner, got $(uname -m)" >&2
+            exit 1
+          fi
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates
+
+      - name: Install Zig
+        run: |
+          curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Build L4 CUDA runtime artifact
+        run: |
+          scripts/packaging/build_zig_release_archive.sh \
+            --version "0.0.0-gpu.${GITHUB_SHA:0:12}" \
+            --target x86_64-linux-gnu \
+            --optimize ReleaseFast \
+            --cuda-artifacts sm89 \
+            --archive-name antfly-zig-gpu-amd64.tar.gz \
+            --out-dir "$RUNNER_TEMP" \
+            --metal false \
+            --system-blas false
+
+      - name: Verify CUDA runtime artifact
+        run: |
+          mkdir -p "$RUNNER_TEMP/gpu-runtime"
+          tar -xzf "$RUNNER_TEMP/antfly-zig-gpu-amd64.tar.gz" -C "$RUNNER_TEMP/gpu-runtime"
+          "$RUNNER_TEMP/gpu-runtime/antfly" version
+          "$RUNNER_TEMP/gpu-runtime/antfly" inference cuda-info --artifact-identity | tee "$RUNNER_TEMP/cuda-artifact-identity.txt"
+          grep -Fx "cuda_artifact_mode: sm89" "$RUNNER_TEMP/cuda-artifact-identity.txt"
+          grep -Fx "cuda_artifact_target: sm_89" "$RUNNER_TEMP/cuda-artifact-identity.txt"
+
+      - name: Upload runtime artifact to GCS
+        run: |
+          gsutil cp \
+            "$RUNNER_TEMP/antfly-zig-gpu-amd64.tar.gz" \
+            "gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-gpu-amd64.tar.gz"
+
+      - name: Package model-baked GAR image with Cloud Build
+        run: |
+          submit_cloud_build() {
+            local attempt sleep_seconds
+            for attempt in 1 2 3; do
+              if gcloud builds submit "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                return 1
+              fi
+              sleep_seconds=$((attempt * 15))
+              echo "gcloud builds submit failed; retrying in ${sleep_seconds}s"
+              sleep "${sleep_seconds}"
+            done
+          }
+          submit_cloud_build . \
+            --project="${GCP_PROJECT}" \
+            --region="${GCP_REGION}" \
+            --worker-pool="${CLOUD_BUILD_WORKER_POOL}" \
+            --config=zig/cloudbuild.runtime.yaml \
+            --substitutions="_ARTIFACT_URI=gs://${ZIG_ARTIFACT_BUCKET}/zig/${GITHUB_SHA}/antfly-zig-gpu-amd64.tar.gz,_IMAGE_NAME=antfly-inference-gpu,_DOCKERFILE=zig/Dockerfile.inference-gpu,_CONTEXT=/workspace/.zig-inference-gpu-container,_ALIAS_TAG=__skip_alias__,_VERSION_TAG=sha-${GITHUB_SHA},_PLATFORMS=linux/amd64,_DESCRIPTION=AntflyDB CUDA inference runtime with production models"
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Resolve and sign immutable image digest
+        id: image
+        run: |
+          echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
+          IMAGE_BASE="$GAR_REGISTRY/$GCP_PROJECT/$GCP_REPOSITORY/antfly-inference-gpu"
+          DIGEST="$(crane digest "$IMAGE_BASE:sha-${GITHUB_SHA}")"
+          IMAGE_REF="$IMAGE_BASE@$DIGEST"
+          cosign sign --yes \
+            -a "repo=${{ github.repository }}" \
+            -a "workflow=${{ github.workflow }}" \
+            -a "ref=${GITHUB_SHA}" \
+            "$IMAGE_REF"
+          echo "image_ref=$IMAGE_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Publish deployment input
+        run: |
+          {
+            echo "### CUDA inference image"
+            echo
+            echo '```text'
+            echo "${{ steps.image.outputs.image_ref }}"
+            echo '```'
+            echo
+            echo "Built for Cloud Run L4 (sm_89) with clipclap and GLiNER2 Q4_K models baked into /models."
+          } >> "$GITHUB_STEP_SUMMARY"

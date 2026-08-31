@@ -17,7 +17,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
+usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--metal true|false] [--cuda-artifacts fatbin|portable|sm89] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
 
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
@@ -37,6 +37,7 @@ target=
 archive_name=
 out_dir=
 metal=false
+cuda_artifacts=fatbin
 system_blas=false
 optimize=ReleaseFast
 strip=true
@@ -62,6 +63,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --metal)
       metal="${2:?missing --metal value}"
+      shift 2
+      ;;
+    --cuda-artifacts)
+      cuda_artifacts="${2:?missing --cuda-artifacts value}"
       shift 2
       ;;
     --system-blas)
@@ -117,6 +122,15 @@ case "$strip" in
   *)
     usage
     echo "--strip must be true or false, got: $strip" >&2
+    exit 2
+    ;;
+esac
+
+case "$cuda_artifacts" in
+  fatbin|portable|sm89) ;;
+  *)
+    usage
+    echo "--cuda-artifacts must be one of fatbin, portable, or sm89; got: $cuda_artifacts" >&2
     exit 2
     ;;
 esac
@@ -182,6 +196,7 @@ zig_build_options=(
   -Donnx=false
   -Dmetal="$metal"
   -Dcuda="$cuda"
+  -Dcuda-artifacts="$cuda_artifacts"
   -Dpjrt="$pjrt"
   -Dsystem-blas="$system_blas"
 )
