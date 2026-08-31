@@ -681,7 +681,8 @@ const CidEncoding = struct {
 };
 
 const TrueTypeFont = struct {
-    bytes: []u8,
+    bytes: []const u8,
+    owns_bytes: bool = true,
     font: font_lib.sfnt.Font,
     units_per_em: u16,
     raw_code_bytes: usize = 0,
@@ -702,7 +703,7 @@ const TrueTypeFont = struct {
         if (self.pdf_widths) |widths| alloc.free(widths);
         if (self.cid_widths) |*widths| widths.deinit(alloc);
         if (self.cid_vertical_metrics) |*metrics| metrics.deinit(alloc);
-        alloc.free(self.bytes);
+        if (self.owns_bytes) alloc.free(self.bytes);
         self.* = undefined;
     }
 };
@@ -1299,9 +1300,11 @@ pub const ImageRun = struct {
     /// A graphics-state soft mask whose group is a single image covering the
     /// painted image. The mask is sampled in the same normalized image space.
     opacity_mask_rgba: ?[]u8 = null,
+    opacity_mask_shared_rgba: ?*SharedImageRgba = null,
     opacity_mask_width: u32 = 0,
     opacity_mask_height: u32 = 0,
     opacity_mask_luminosity: bool = false,
+    opacity_mask_interpolate: bool = false,
     alpha: u8 = 0xff,
     paint_order: usize = 0,
     paint_phase: usize = 0,
@@ -1328,13 +1331,18 @@ pub const ImageRun = struct {
 
     pub fn deinit(self: *ImageRun, alloc: Allocator) void {
         if (self.clip_points) |points| alloc.free(points);
-        if (self.opacity_mask_rgba) |mask| alloc.free(mask);
+        if (self.opacity_mask_shared_rgba) |shared|
+            shared.release(alloc)
+        else if (self.opacity_mask_rgba) |mask|
+            alloc.free(mask);
         if (self.shared_rgba) |shared| shared.release(alloc) else alloc.free(self.rgba);
         self.* = undefined;
     }
 };
 
-const shading_color_sample_count: usize = 64;
+const shading_uniform_color_sample_count: usize = 64;
+const shading_color_sample_capacity: usize = 128;
+const shading_color_sample_count = shading_uniform_color_sample_count;
 
 pub const ShadingRun = struct {
     kind: enum { axial, radial },
@@ -1358,7 +1366,8 @@ pub const ShadingRun = struct {
     r1: f64 = 0,
     c0: [4]u8,
     c1: [4]u8,
-    color_samples: [shading_color_sample_count][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_count,
+    color_samples: [shading_color_sample_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_capacity,
+    color_sample_positions: [shading_color_sample_capacity]f64 = [_]f64{0} ** shading_color_sample_capacity,
     color_sample_count: u8 = 0,
     extend_start: bool = false,
     extend_end: bool = false,
@@ -1719,7 +1728,9 @@ const VectorTextWorkBudget = struct {
             // retained without copying, so only independently owned samples
             // consume the materialization allowance here.
             if (image.shared_rgba == null) resource_bytes = saturatedAddU64(resource_bytes, image.rgba.len);
-            if (image.opacity_mask_rgba) |mask| resource_bytes = saturatedAddU64(resource_bytes, mask.len);
+            if (image.opacity_mask_shared_rgba == null) {
+                if (image.opacity_mask_rgba) |mask| resource_bytes = saturatedAddU64(resource_bytes, mask.len);
+            }
             const corners = [_][2]f64{
                 .{ image.e, image.f },
                 .{ image.a + image.e, image.b + image.f },
@@ -2164,6 +2175,8 @@ const GraphicsSampledTintTransform = struct {
     output_components: u8,
     encode_min: f64,
     encode_max: f64,
+    domain_min: f64,
+    domain_max: f64,
 
     fn deinit(self: *GraphicsSampledTintTransform, alloc: Allocator) void {
         alloc.free(self.values);
@@ -2633,7 +2646,8 @@ const PageShading = struct {
     r1: f64 = 0,
     c0: [4]u8,
     c1: [4]u8,
-    color_samples: [shading_color_sample_count][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_count,
+    color_samples: [shading_color_sample_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_capacity,
+    color_sample_positions: [shading_color_sample_capacity]f64 = [_]f64{0} ** shading_color_sample_capacity,
     color_sample_count: u8 = 0,
     extend_start: bool = false,
     extend_end: bool = false,
@@ -2661,12 +2675,15 @@ const PageExtGState = struct {
 
 const PageSoftMask = struct {
     rgba: []u8,
+    shared_rgba: *SharedImageRgba,
     width: u32,
     height: u32,
     luminosity: bool,
+    interpolate: bool,
+    matrix: GraphicsMatrix,
 
     fn deinit(self: *PageSoftMask, alloc: Allocator) void {
-        alloc.free(self.rgba);
+        self.shared_rgba.release(alloc);
         self.* = undefined;
     }
 };
@@ -2750,6 +2767,8 @@ const PageForm = struct {
 
 const ExponentialTintTransform = struct {
     n: f64,
+    domain_min: f64,
+    domain_max: f64,
     c0: []f64,
     c1: []f64,
     ranges: ?[]ColorComponentRange = null,
@@ -2791,6 +2810,14 @@ const ShadingColorFunction = union(enum) {
             },
             .stitching => |function| function.evaluate(input, output),
         }
+    }
+
+    fn domain(self: *const ShadingColorFunction) [2]f64 {
+        return switch (self.*) {
+            .exponential => |function| .{ function.domain_min, function.domain_max },
+            .sampled => |function| .{ function.domain_min, function.domain_max },
+            .stitching => |function| .{ function.domain_min, function.domain_max },
+        };
     }
 };
 
@@ -4030,7 +4057,7 @@ pub const Reader = struct {
         defer self.alloc.free(decoded_content);
         defer self.alloc.free(stream_ranges.?);
 
-        const fonts = try self.collectPageFontsAlloc(&page);
+        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
@@ -4091,21 +4118,21 @@ pub const Reader = struct {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
-        const fonts = try self.collectPageFontsAlloc(&page);
-        defer {
-            for (fonts) |*font| font.deinit(self.alloc);
-            self.alloc.free(fonts);
-        }
         const contents = page.get("Contents") orelse return .{
             .text = try self.alloc.dupe(u8, ""),
             .runs = try self.alloc.alloc(TextRun, 0),
-            .outline_fallback = pageFontsUsedOutlineFallback(fonts),
+            .outline_fallback = false,
         };
         var stream_ranges: ?[]ContentStreamRange = null;
         const decoded_content = try self.readCombinedContentStreamsWithRangesAlloc(contents, &stream_ranges);
         defer self.alloc.free(decoded_content);
         defer self.alloc.free(stream_ranges.?);
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
+        defer {
+            for (fonts) |*font| font.deinit(self.alloc);
+            self.alloc.free(fonts);
+        }
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
@@ -4137,12 +4164,12 @@ pub const Reader = struct {
         defer self.alloc.free(decoded_content);
         defer self.alloc.free(stream_ranges.?);
 
-        const fonts = try self.collectPageFontsAlloc(&page);
+        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
@@ -4175,7 +4202,7 @@ pub const Reader = struct {
             for (images) |*image| image.deinit(self.alloc);
             self.alloc.free(images);
         }
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
@@ -4208,7 +4235,7 @@ pub const Reader = struct {
             for (shadings) |*shading| shading.deinit(self.alloc);
             self.alloc.free(shadings);
         }
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
@@ -4246,7 +4273,7 @@ pub const Reader = struct {
             for (patterns) |*pattern| pattern.deinit(self.alloc);
             self.alloc.free(patterns);
         }
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
@@ -4280,7 +4307,7 @@ pub const Reader = struct {
         defer self.alloc.free(decoded_content);
         try self.checkCancellation();
 
-        const fonts = try self.collectPageFontsAlloc(&page);
+        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
@@ -4304,7 +4331,7 @@ pub const Reader = struct {
             self.alloc.free(patterns);
         }
         try self.checkCancellation();
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
@@ -4451,7 +4478,7 @@ pub const Reader = struct {
         const contents = page.get("Contents") orelse return try self.alloc.alloc(ShapeRun, 0);
         const decoded_content = try self.readCombinedContentStreamsAlloc(contents);
         defer self.alloc.free(decoded_content);
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
@@ -4484,13 +4511,13 @@ pub const Reader = struct {
         defer self.alloc.free(decoded_content);
         defer self.alloc.free(stream_ranges.?);
 
-        const fonts = try self.collectPageFontsAlloc(&page);
+        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
 
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
@@ -4962,7 +4989,7 @@ pub const Reader = struct {
         defer self.alloc.free(decoded_content);
         defer self.alloc.free(stream_ranges.?);
 
-        const fonts = try self.collectPageFontsAlloc(&page);
+        const fonts = try self.collectPageFontsForContentAlloc(&page, decoded_content);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
@@ -4972,7 +4999,7 @@ pub const Reader = struct {
             for (patterns) |*pattern| pattern.deinit(self.alloc);
             self.alloc.free(patterns);
         }
-        const gstates = try self.collectPageExtGStatesAlloc(&page);
+        const gstates = try self.collectPageExtGStatesForContentAlloc(&page, decoded_content);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
@@ -6397,11 +6424,11 @@ pub const Reader = struct {
         return true;
     }
 
-    fn collectPageFontsAlloc(self: *const Reader, page: *const syntax.Object) ![]PageFont {
+    fn collectPageFontsForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageFont {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PageFont, 0);
         defer if (resources) |*obj| obj.deinit(self.alloc);
-        return try self.collectFontsFromResourcesAlloc(&resources.?);
+        return try self.collectFontsFromResourcesAlloc(&resources.?, content);
     }
 
     fn classifyColorSpaceResource(
@@ -6755,11 +6782,11 @@ pub const Reader = struct {
         return try self.collectPatternsFromResourcesAlloc(&resources.?, &resources.?, 0, content, false);
     }
 
-    fn collectPageExtGStatesAlloc(self: *const Reader, page: *const syntax.Object) ![]PageExtGState {
+    fn collectPageExtGStatesForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageExtGState {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PageExtGState, 0);
         defer if (resources) |*obj| obj.deinit(self.alloc);
-        return try self.collectExtGStatesFromResourcesAlloc(&resources.?);
+        return try self.collectExtGStatesFromResourcesAlloc(&resources.?, content);
     }
 
     fn collectPageFormsAlloc(self: *const Reader, page: *const syntax.Object) ![]PageForm {
@@ -6803,11 +6830,13 @@ pub const Reader = struct {
         return try self.readCombinedContentStreamsAlloc(contents);
     }
 
-    fn collectFontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object) ![]PageFont {
+    fn collectFontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageFont {
         const fonts_obj = resources.get("Font") orelse return try self.alloc.alloc(PageFont, 0);
         var resolved_fonts = try self.resolveValue(fonts_obj);
         defer resolved_fonts.deinit(self.alloc);
         if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
+        var references = try collectReferencedFontNamesAlloc(self.alloc, content);
+        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageFont).empty;
         errdefer {
@@ -6816,6 +6845,7 @@ pub const Reader = struct {
         }
         for (resolved_fonts.dict) |entry| {
             try self.checkCancellation();
+            if (!references.contains(entry.key)) continue;
             if (entry.value == .obj_ref) {
                 const ptr = entry.value.obj_ref;
                 const cache_key = (@as(u64, ptr.id) << 16) | @as(u64, ptr.gen);
@@ -6854,11 +6884,13 @@ pub const Reader = struct {
     /// Type3 CharProcs may paint text with ordinary embedded fonts. Resolve
     /// those fonts without recursively rebuilding Type3 fonts that reference
     /// their own resource dictionary.
-    fn collectNonType3FontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object) anyerror![]PageFont {
+    fn collectNonType3FontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) anyerror![]PageFont {
         const fonts_obj = resources.get("Font") orelse return try self.alloc.alloc(PageFont, 0);
         var resolved_fonts = try self.resolveValue(fonts_obj);
         defer resolved_fonts.deinit(self.alloc);
         if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
+        var references = try collectReferencedFontNamesAlloc(self.alloc, content);
+        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageFont).empty;
         errdefer {
@@ -6867,6 +6899,7 @@ pub const Reader = struct {
         }
         for (resolved_fonts.dict) |entry| {
             try self.checkCancellation();
+            if (!references.contains(entry.key)) continue;
             var font_obj = try self.resolveValue(&entry.value);
             defer font_obj.deinit(self.alloc);
             if (font_obj != .dict) continue;
@@ -7144,16 +7177,19 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn collectExtGStatesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object) ![]PageExtGState {
+    fn collectExtGStatesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageExtGState {
         const ext_obj = resources.get("ExtGState") orelse return try self.alloc.alloc(PageExtGState, 0);
         var resolved_ext = try self.resolveValue(ext_obj);
         defer resolved_ext.deinit(self.alloc);
         if (resolved_ext != .dict) return try self.alloc.alloc(PageExtGState, 0);
+        var references = try collectReferencedResourceNamesAlloc(self.alloc, content, &.{"gs"});
+        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageExtGState).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*gstate| gstate.deinit(self.alloc);
         for (resolved_ext.dict) |entry| {
+            if (!references.contains(entry.key)) continue;
             var gs = try self.resolveValue(&entry.value);
             defer gs.deinit(self.alloc);
             if (gs != .dict) continue;
@@ -7196,16 +7232,53 @@ pub const Reader = struct {
         else
             return error.UnsupportedPdfRendering;
 
+        if (smask.get("TR")) |transfer_obj| {
+            var transfer = try self.resolveValue(transfer_obj);
+            defer transfer.deinit(self.alloc);
+            if (!std.mem.eql(u8, transfer.asName() orelse "", "Identity"))
+                return error.UnsupportedPdfRendering;
+        }
+        if (luminosity) if (smask.get("BC")) |backdrop_obj| {
+            var backdrop = try self.resolveValue(backdrop_obj);
+            defer backdrop.deinit(self.alloc);
+            if (backdrop != .array) return error.UnsupportedPdfRendering;
+            for (backdrop.array) |*component| {
+                const value = (try self.resolvedNumericObjectValue(component)) orelse return error.UnsupportedPdfRendering;
+                // The image-only profile covers the complete group bounds.
+                // Reject non-default backdrops until partial group coverage is
+                // represented, rather than silently changing mask luminance.
+                if (!std.math.isFinite(value) or @abs(value) > 0.000001)
+                    return error.UnsupportedPdfRendering;
+            }
+        };
+
         var group = try self.resolveValue(smask.get("G") orelse return error.UnsupportedPdfRendering);
         defer group.deinit(self.alloc);
         if (group != .stream or !std.mem.eql(u8, (group.get("Subtype") orelse return error.UnsupportedPdfRendering).asName() orelse "", "Form"))
             return error.UnsupportedPdfRendering;
+        var group_attributes = try self.resolveValue(group.get("Group") orelse return error.UnsupportedPdfRendering);
+        defer group_attributes.deinit(self.alloc);
+        if (group_attributes != .dict or
+            !std.mem.eql(u8, (group_attributes.get("S") orelse return error.UnsupportedPdfRendering).asName() orelse "", "Transparency"))
+            return error.UnsupportedPdfRendering;
+        if (luminosity) if (group_attributes.get("CS")) |color_space| {
+            var resolved_color_space = try self.resolveValue(color_space);
+            defer resolved_color_space.deinit(self.alloc);
+            const name = resolved_color_space.asName() orelse return error.UnsupportedPdfRendering;
+            if (!std.mem.eql(u8, name, "DeviceGray") and !std.mem.eql(u8, name, "DeviceRGB"))
+                return error.UnsupportedPdfRendering;
+        };
+        const bbox = parsePageBox(group.get("BBox") orelse return error.UnsupportedPdfRendering) catch
+            return error.UnsupportedPdfRendering;
+        const group_matrix = parseFormMatrix(&group);
         const resources_obj = group.get("Resources") orelse return error.UnsupportedPdfRendering;
         var resources = try self.resolveValue(resources_obj);
         defer resources.deinit(self.alloc);
         if (resources != .dict) return error.UnsupportedPdfRendering;
         const content = try self.readDecodedStreamData(&group);
         defer self.alloc.free(content);
+        if (!try contentIsSingleImageSoftMaskAlloc(self.alloc, content))
+            return error.UnsupportedPdfRendering;
 
         const images = try self.collectImagesFromResourcesAlloc(&resources, content);
         defer {
@@ -7217,15 +7290,46 @@ pub const Reader = struct {
             for (runs.items) |*run| run.deinit(self.alloc);
             runs.deinit(self.alloc);
         }
-        try extractImageRunsFromContentAppendCancelable(self.alloc, &runs, content, images, &.{}, &.{}, self.cancellation);
+        var paint_order: usize = 0;
+        var next_group_id: u32 = 1;
+        try extractImageRunsFromContentAppendWithStateCancelable(
+            self.alloc,
+            &runs,
+            content,
+            images,
+            &.{},
+            &.{},
+            .{ .matrix = group_matrix },
+            &.{},
+            .nonzero,
+            &paint_order,
+            &next_group_id,
+            self.cancellation,
+        );
         if (runs.items.len != 1 or runs.items[0].stencil_color != null)
             return error.UnsupportedPdfRendering;
         const run = &runs.items[0];
+        const run_bounds = transformPageBox(.{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }, .{
+            .a = run.a,
+            .b = run.b,
+            .c = run.c,
+            .d = run.d,
+            .e = run.e,
+            .f = run.f,
+        });
+        const group_bounds = transformPageBox(bbox, group_matrix);
+        if (!pageBoxesApproxEqual(run_bounds, group_bounds))
+            return error.UnsupportedPdfRendering;
+        const shared = run.shared_rgba orelse return error.UnsupportedPdfRendering;
+        shared.retain();
         return .{
-            .rgba = try self.alloc.dupe(u8, run.rgba),
+            .rgba = shared.bytes,
+            .shared_rgba = shared,
             .width = run.width,
             .height = run.height,
             .luminosity = luminosity,
+            .interpolate = run.interpolate,
+            .matrix = .{ .a = run.a, .b = run.b, .c = run.c, .d = run.d, .e = run.e, .f = run.f },
         };
     }
 
@@ -7312,7 +7416,7 @@ pub const Reader = struct {
                 resolved_pattern_resources = try fallback.clone(self.alloc);
             }
 
-            const fonts = if (resolved_pattern_resources) |*pattern_resources| if (exclude_type3_fonts) try self.collectNonType3FontsFromResourcesAlloc(pattern_resources) else try self.collectFontsFromResourcesAlloc(pattern_resources) else try self.alloc.alloc(PageFont, 0);
+            const fonts = if (resolved_pattern_resources) |*pattern_resources| if (exclude_type3_fonts) try self.collectNonType3FontsFromResourcesAlloc(pattern_resources, content) else try self.collectFontsFromResourcesAlloc(pattern_resources, content) else try self.alloc.alloc(PageFont, 0);
             errdefer {
                 for (fonts) |*font| font.deinit(self.alloc);
                 if (fonts.len > 0) self.alloc.free(fonts);
@@ -7332,7 +7436,7 @@ pub const Reader = struct {
                 for (patterns) |*pattern| pattern.deinit(self.alloc);
                 if (patterns.len > 0) self.alloc.free(patterns);
             }
-            const gstates = if (resolved_pattern_resources) |*pattern_resources| try self.collectExtGStatesFromResourcesAlloc(pattern_resources) else try self.alloc.alloc(PageExtGState, 0);
+            const gstates = if (resolved_pattern_resources) |*pattern_resources| try self.collectExtGStatesFromResourcesAlloc(pattern_resources, content) else try self.alloc.alloc(PageExtGState, 0);
             errdefer {
                 for (gstates) |*gstate| gstate.deinit(self.alloc);
                 if (gstates.len > 0) self.alloc.free(gstates);
@@ -7403,7 +7507,7 @@ pub const Reader = struct {
                 resolved_form_resources = try fallback.clone(self.alloc);
             }
 
-            const fonts = if (resolved_form_resources) |*form_resources| if (exclude_type3_fonts) try self.collectNonType3FontsFromResourcesAlloc(form_resources) else try self.collectFontsFromResourcesAlloc(form_resources) else try self.alloc.alloc(PageFont, 0);
+            const fonts = if (resolved_form_resources) |*form_resources| if (exclude_type3_fonts) try self.collectNonType3FontsFromResourcesAlloc(form_resources, content) else try self.collectFontsFromResourcesAlloc(form_resources, content) else try self.alloc.alloc(PageFont, 0);
             errdefer {
                 for (fonts) |*font| font.deinit(self.alloc);
                 if (fonts.len > 0) self.alloc.free(fonts);
@@ -7423,7 +7527,7 @@ pub const Reader = struct {
                 for (patterns) |*pattern| pattern.deinit(self.alloc);
                 if (patterns.len > 0) self.alloc.free(patterns);
             }
-            const gstates = if (resolved_form_resources) |*form_resources| try self.collectExtGStatesFromResourcesAlloc(form_resources) else try self.alloc.alloc(PageExtGState, 0);
+            const gstates = if (resolved_form_resources) |*form_resources| try self.collectExtGStatesFromResourcesAlloc(form_resources, content) else try self.alloc.alloc(PageExtGState, 0);
             errdefer {
                 for (gstates) |*gstate| gstate.deinit(self.alloc);
                 if (gstates.len > 0) self.alloc.free(gstates);
@@ -7538,7 +7642,7 @@ pub const Reader = struct {
             }
 
             var fonts: ?[]PageFont = if (resolved_form_resources) |*form_resources|
-                try self.collectFontsFromResourcesAlloc(form_resources)
+                try self.collectFontsFromResourcesAlloc(form_resources, content.?)
             else
                 try self.alloc.alloc(PageFont, 0);
             errdefer if (fonts) |owned| {
@@ -7630,6 +7734,10 @@ pub const Reader = struct {
             0 => .{ .sampled = try self.parseSampledTintTransform(obj, output_components) },
             2 => .{ .exponential = try self.parseExponentialTintTransform(obj, output_components) },
             3 => blk: {
+                // Sampling preserves every discontinuity of the outer
+                // stitching function. Nested stitching needs a recursive
+                // breakpoint table and remains explicitly unsupported.
+                if (depth != 0) return error.UnsupportedPdfRendering;
                 var resolved = try self.resolveValue(obj);
                 defer resolved.deinit(self.alloc);
                 const dict: []const syntax.DictEntry = switch (resolved) {
@@ -7718,15 +7826,69 @@ pub const Reader = struct {
 
         var function = try self.parseShadingColorFunction(dictGetObject(dict, "Function") orelse return error.UnsupportedPdfRendering, components, 0);
         defer function.deinit(self.alloc);
-        var color_samples: [shading_color_sample_count][4]u8 = undefined;
-        for (&color_samples, 0..) |*color, sample_index| {
-            const input = @as(f64, @floatFromInt(sample_index)) / @as(f64, @floatFromInt(shading_color_sample_count - 1));
+        const function_domain = function.domain();
+        var shading_domain = [2]f64{ 0, 1 };
+        if (dictGetObject(dict, "Domain")) |domain_obj| {
+            var resolved_domain = try self.resolveValue(domain_obj);
+            defer resolved_domain.deinit(self.alloc);
+            if (resolved_domain != .array or resolved_domain.array.len != 2)
+                return error.UnsupportedPdfRendering;
+            shading_domain[0] = (try self.resolvedNumericObjectValue(&resolved_domain.array[0])) orelse return error.UnsupportedPdfRendering;
+            shading_domain[1] = (try self.resolvedNumericObjectValue(&resolved_domain.array[1])) orelse return error.UnsupportedPdfRendering;
+            if (!std.math.isFinite(shading_domain[0]) or !std.math.isFinite(shading_domain[1]) or shading_domain[0] >= shading_domain[1])
+                return error.UnsupportedPdfRendering;
+        }
+        // PDF clips function inputs to the function's declared domain. Doing
+        // that in the evaluator is exact, including a shading domain that is
+        // wider than the function domain.
+        const SamplePoint = struct { position: f64, input: f64, side: u8 };
+        var sample_points: [shading_color_sample_capacity]SamplePoint = undefined;
+        var sample_count: usize = 0;
+        for (0..shading_uniform_color_sample_count) |sample_index| {
+            const position = @as(f64, @floatFromInt(sample_index)) / @as(f64, @floatFromInt(shading_uniform_color_sample_count - 1));
+            sample_points[sample_count] = .{
+                .position = position,
+                .input = shading_domain[0] + position * (shading_domain[1] - shading_domain[0]),
+                .side = 1,
+            };
+            sample_count += 1;
+        }
+        if (function == .stitching) {
+            const stitching = function.stitching;
+            for (stitching.bounds) |bound| {
+                if (bound <= shading_domain[0] or bound >= shading_domain[1]) continue;
+                if (sample_count + 2 > shading_color_sample_capacity) return error.UnsupportedPdfRendering;
+                const position = (bound - shading_domain[0]) / (shading_domain[1] - shading_domain[0]);
+                const left_input = @max(shading_domain[0], bound - @max(1.0, @abs(bound)) * 0.000000000001);
+                sample_points[sample_count] = .{ .position = position, .input = left_input, .side = 0 };
+                sample_count += 1;
+                sample_points[sample_count] = .{ .position = position, .input = bound, .side = 2 };
+                sample_count += 1;
+            }
+        }
+        // The fixed table is tiny; insertion sort is deterministic and keeps
+        // left/right samples at identical breakpoint positions in side order.
+        var sort_index: usize = 1;
+        while (sort_index < sample_count) : (sort_index += 1) {
+            const value = sample_points[sort_index];
+            var insert = sort_index;
+            while (insert > 0 and (sample_points[insert - 1].position > value.position or
+                (sample_points[insert - 1].position == value.position and sample_points[insert - 1].side > value.side))) : (insert -= 1)
+                sample_points[insert] = sample_points[insert - 1];
+            sample_points[insert] = value;
+        }
+        var color_samples: [shading_color_sample_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_capacity;
+        var color_sample_positions: [shading_color_sample_capacity]f64 = [_]f64{0} ** shading_color_sample_capacity;
+        for (sample_points[0..sample_count], 0..) |sample, sample_index| {
             var values = [4]f64{ 0, 0, 0, 0 };
-            function.evaluate(input, values[0..components]);
-            color.* = renderBaseColorSpaceComponents(.{ .kind = color_space_kind }, values);
+            // Clamp explicitly here as well so custom evaluator additions
+            // cannot accidentally escape the function's declared domain.
+            function.evaluate(std.math.clamp(sample.input, function_domain[0], function_domain[1]), values[0..components]);
+            color_samples[sample_index] = renderBaseColorSpaceComponents(.{ .kind = color_space_kind }, values);
+            color_sample_positions[sample_index] = sample.position;
         }
         const c0 = color_samples[0];
-        const c1 = color_samples[shading_color_sample_count - 1];
+        const c1 = color_samples[sample_count - 1];
         const extend = dictGetArray(dict, "Extend");
 
         return .{
@@ -7741,7 +7903,8 @@ pub const Reader = struct {
             .c0 = c0,
             .c1 = c1,
             .color_samples = color_samples,
-            .color_sample_count = shading_color_sample_count,
+            .color_sample_positions = color_sample_positions,
+            .color_sample_count = @intCast(sample_count),
             .extend_start = if (extend) |arr| if (arr.len >= 1) switch (arr[0]) {
                 .boolean => |b| b,
                 else => false,
@@ -9666,7 +9829,7 @@ pub const Reader = struct {
         if (domain != .array or domain.array.len != 2) return error.UnsupportedPdfRendering;
         const domain_min = (try self.resolvedNumericObjectValue(&domain.array[0])) orelse return error.UnsupportedPdfRendering;
         const domain_max = (try self.resolvedNumericObjectValue(&domain.array[1])) orelse return error.UnsupportedPdfRendering;
-        if (!std.math.isFinite(domain_min) or !std.math.isFinite(domain_max) or domain_min != 0 or domain_max != 1)
+        if (!std.math.isFinite(domain_min) or !std.math.isFinite(domain_max) or domain_min >= domain_max)
             return error.UnsupportedPdfRendering;
 
         const size_obj = dictGetObject(dict, "Size") orelse return error.UnsupportedPdfRendering;
@@ -9755,6 +9918,8 @@ pub const Reader = struct {
             .output_components = @intCast(output_components),
             .encode_min = encode_min,
             .encode_max = encode_max,
+            .domain_min = domain_min,
+            .domain_max = domain_max,
         };
         return transform;
     }
@@ -9867,10 +10032,7 @@ pub const Reader = struct {
         if (domain != .array or domain.array.len != 2) return error.UnsupportedPdfRendering;
         const domain_min = (try self.resolvedNumericObjectValue(&domain.array[0])) orelse return error.UnsupportedPdfRendering;
         const domain_max = (try self.resolvedNumericObjectValue(&domain.array[1])) orelse return error.UnsupportedPdfRendering;
-        // Separation and DeviceN tint transforms have the fixed [0, 1]
-        // domain. Reject a mismatched function instead of evaluating it with
-        // the wrong implicit clamp.
-        if (!std.math.isFinite(domain_min) or !std.math.isFinite(domain_max) or domain_min != 0 or domain_max != 1)
+        if (!std.math.isFinite(domain_min) or !std.math.isFinite(domain_max) or domain_min >= domain_max)
             return error.UnsupportedPdfRendering;
 
         var c0 = try self.alloc.alloc(f64, alt_components);
@@ -9919,6 +10081,8 @@ pub const Reader = struct {
 
         return .{
             .n = exponent,
+            .domain_min = domain_min,
+            .domain_max = domain_max,
             .c0 = c0,
             .c1 = c1,
             .ranges = ranges,
@@ -10454,12 +10618,7 @@ pub const Reader = struct {
         var budget = DecodeBudgetAllocator.init(self.alloc, 0, self.decode_limits.max_working_set_bytes);
         const alloc = budget.allocator();
         const bundled = if (bold) standard_fonts.bold else standard_fonts.regular;
-        const bytes = alloc.dupe(u8, bundled) catch |err| {
-            if (err == error.OutOfMemory and budget.limit_exceeded) return error.PdfDecodeWorkingSetTooLarge;
-            return err;
-        };
-        errdefer alloc.free(bytes);
-        var sfnt = font_lib.sfnt.Font.init(alloc, bytes) catch |err| {
+        var sfnt = font_lib.sfnt.Font.init(alloc, bundled) catch |err| {
             if (err == error.OutOfMemory and budget.limit_exceeded) return error.PdfDecodeWorkingSetTooLarge;
             return err;
         };
@@ -10468,7 +10627,7 @@ pub const Reader = struct {
             if (err == error.OutOfMemory and budget.limit_exceeded) return error.PdfDecodeWorkingSetTooLarge;
             return err;
         };
-        var substitute = self.buildTrueTypeFontFromSfnt(font_obj, decoder, bytes, sfnt, head.units_per_em) catch |err| {
+        var substitute = self.buildTrueTypeFontFromSfnt(font_obj, decoder, bundled, sfnt, head.units_per_em) catch |err| {
             if (err == error.OutOfMemory and budget.limit_exceeded) return error.PdfDecodeWorkingSetTooLarge;
             return err;
         };
@@ -10476,6 +10635,9 @@ pub const Reader = struct {
         // In that valid case, use the substitute face's metrics instead of
         // treating the descriptor parser's sentinel zero as a real advance.
         if (font_obj.get("FontDescriptor") == null) substitute.pdf_missing_width = null;
+        // Bundled faces are immutable process-lifetime data. Every substitute
+        // owns only its parsed directory/mappings, not another ~100 KiB copy.
+        substitute.owns_bytes = false;
         return substitute;
     }
 
@@ -10635,9 +10797,9 @@ pub const Reader = struct {
                 }
                 font.images = try self.collectImagesFromResourcesAlloc(&resources, resource_content.items);
                 font.shadings = try self.collectShadingsFromResourcesAlloc(&resources);
-                font.gstates = try self.collectExtGStatesFromResourcesAlloc(&resources);
+                font.gstates = try self.collectExtGStatesFromResourcesAlloc(&resources, resource_content.items);
                 font.color_spaces = try self.collectColorSpacesFromResourcesAlloc(&resources, resource_content.items);
-                font.fonts = try self.collectNonType3FontsFromResourcesAlloc(&resources);
+                font.fonts = try self.collectNonType3FontsFromResourcesAlloc(&resources, resource_content.items);
                 font.patterns = try self.collectPatternsFromResourcesAlloc(&resources, &resources, 0, resource_content.items, true);
                 font.forms = try self.collectFormsFromResourcesAlloc(&resources, &resources, 0, resource_content.items, true);
             }
@@ -10701,7 +10863,7 @@ pub const Reader = struct {
         self: *const Reader,
         font_obj: *const syntax.Object,
         decoder: *const FontDecoder,
-        bytes: []u8,
+        bytes: []const u8,
         font: font_lib.sfnt.Font,
         units_per_em: u16,
     ) !TrueTypeFont {
@@ -14806,6 +14968,11 @@ fn applyImageOperator(
     op: []const u8,
     operands: []const syntax.Object,
 ) anyerror!void {
+    if (state.soft_mask != null and
+        (isShapePaintOperator(op) or isTextShowOperator(op) or std.mem.eql(u8, op, "sh")))
+    {
+        return error.UnsupportedPdfRendering;
+    }
     if (isShapePaintOperator(op)) {
         paint_order.* += 1;
         // Painting consumes the current path. This resource-only pass must
@@ -14863,7 +15030,15 @@ fn applyImageOperator(
             state.fill_alpha = gstate.fill_alpha;
             state.stroke_alpha = gstate.stroke_alpha;
             state.blend_mode = gstate.blend_mode;
-            if (gstate.soft_mask_specified) state.soft_mask = gstate.soft_mask;
+            if (gstate.soft_mask_specified) {
+                state.soft_mask = if (gstate.soft_mask) |mask| blk: {
+                    var placed = mask;
+                    // A soft-mask Form is established in the user space in
+                    // effect at `gs`; later CTM changes do not move it.
+                    placed.matrix = multiplyGraphicsMatrix(mask.matrix, state.matrix);
+                    break :blk placed;
+                } else null;
+            }
         }
         return;
     }
@@ -15020,11 +15195,13 @@ fn applyImageOperator(
                 // groups when both images share sample geometry. This covers
                 // producer-generated transparency pairs without pretending a
                 // general vector soft-mask group is image-local.
-                if (mask.width != image.width or mask.height != image.height)
+                if (mask.width != image.width or mask.height != image.height or
+                    !graphicsMatricesApproxEqual(mask.matrix, state.matrix))
                     return error.UnsupportedPdfRendering;
-                break :blk try alloc.dupe(u8, mask.rgba);
+                mask.shared_rgba.retain();
+                break :blk mask.rgba;
             } else null;
-            errdefer if (opacity_mask_rgba) |mask| alloc.free(mask);
+            errdefer if (state.soft_mask) |mask| mask.shared_rgba.release(alloc);
             const clip_points = if (current_clip_points.items.len > 0) try alloc.dupe([2]f64, current_clip_points.items) else null;
             errdefer if (clip_points) |clip| alloc.free(clip);
             try out.append(alloc, .{
@@ -15036,9 +15213,11 @@ fn applyImageOperator(
                 .bilevel = image.bilevel,
                 .stencil_color = stencil_color,
                 .opacity_mask_rgba = opacity_mask_rgba,
+                .opacity_mask_shared_rgba = if (state.soft_mask) |mask| mask.shared_rgba else null,
                 .opacity_mask_width = if (state.soft_mask) |mask| mask.width else 0,
                 .opacity_mask_height = if (state.soft_mask) |mask| mask.height else 0,
                 .opacity_mask_luminosity = if (state.soft_mask) |mask| mask.luminosity else false,
+                .opacity_mask_interpolate = if (state.soft_mask) |mask| mask.interpolate else false,
                 .alpha = state.fill_alpha,
                 .paint_order = paint_order.*,
                 .blend_mode = state.blend_mode,
@@ -15683,6 +15862,7 @@ fn applyShadingOperator(
                 .c0 = colorWithAlpha(shading.c0, state.fill_alpha),
                 .c1 = colorWithAlpha(shading.c1, state.fill_alpha),
                 .color_samples = shadingColorSamplesWithAlpha(shading, state.fill_alpha),
+                .color_sample_positions = shading.color_sample_positions,
                 .color_sample_count = shading.color_sample_count,
                 .extend_start = shading.extend_start,
                 .extend_end = shading.extend_end,
@@ -16099,6 +16279,7 @@ fn emitPatternShadingRun(
         .c0 = colorWithAlpha(shading.c0, state.fill_alpha),
         .c1 = colorWithAlpha(shading.c1, state.fill_alpha),
         .color_samples = shadingColorSamplesWithAlpha(shading, state.fill_alpha),
+        .color_sample_positions = shading.color_sample_positions,
         .color_sample_count = shading.color_sample_count,
         .extend_start = shading.extend_start,
         .extend_end = shading.extend_end,
@@ -16780,6 +16961,35 @@ fn contentMayContainOperator(bytes: []const u8, operator: []const u8) bool {
     return false;
 }
 
+/// The native soft-mask fast path deliberately supports only a Form whose
+/// painting is one image. Graphics-state structure and matrix composition are
+/// harmless; any other painting operator requires a general transparency
+/// surface and must fail closed.
+fn contentIsSingleImageSoftMaskAlloc(alloc: Allocator, bytes: []const u8) !bool {
+    var scanner = syntax.Scanner.init(alloc, bytes);
+    defer scanner.deinit();
+    var image_count: usize = 0;
+    while (true) {
+        var lex = (try readContentLexeme(&scanner)) orelse return false;
+        defer syntax.Scanner.freeLexeme(alloc, &lex);
+        switch (lex) {
+            .eof => return image_count == 1,
+            .keyword => |operator| {
+                if (std.mem.eql(u8, operator, "Do")) {
+                    image_count += 1;
+                    if (image_count > 1) return false;
+                } else if (!std.mem.eql(u8, operator, "q") and
+                    !std.mem.eql(u8, operator, "Q") and
+                    !std.mem.eql(u8, operator, "cm"))
+                {
+                    return false;
+                }
+            },
+            else => {},
+        }
+    }
+}
+
 const ReferencedResourceNames = struct {
     names: std.StringHashMapUnmanaged(void) = .empty,
     uses_device_gray: bool = false,
@@ -16869,6 +17079,47 @@ fn collectReferencedResourceNamesAlloc(
     }
 }
 
+/// `Tf` takes a font name followed by a numeric size, so the generic
+/// immediate-name collector cannot identify it. Retain the last name in the
+/// current operator's operand list and clear it at every operator boundary.
+fn collectReferencedFontNamesAlloc(alloc: Allocator, bytes: []const u8) !ReferencedResourceNames {
+    var scanner = syntax.Scanner.init(alloc, bytes);
+    defer scanner.deinit();
+    var result = ReferencedResourceNames{};
+    errdefer result.deinit(alloc);
+    var operand_name: ?[]u8 = null;
+    defer if (operand_name) |name| alloc.free(name);
+
+    while (true) {
+        var lex = (try readContentLexeme(&scanner)) orelse {
+            if (operand_name) |name| alloc.free(name);
+            operand_name = null;
+            continue;
+        };
+        defer syntax.Scanner.freeLexeme(alloc, &lex);
+        switch (lex) {
+            .eof => return result,
+            .name => |name| {
+                if (operand_name) |owned| alloc.free(owned);
+                operand_name = try alloc.dupe(u8, name);
+            },
+            .keyword => |operator| {
+                if (std.mem.eql(u8, operator, "Tf")) if (operand_name) |name| {
+                    if (result.names.contains(name)) {
+                        alloc.free(name);
+                    } else {
+                        try result.names.put(alloc, name, {});
+                    }
+                    operand_name = null;
+                };
+                if (operand_name) |name| alloc.free(name);
+                operand_name = null;
+            },
+            else => {},
+        }
+    }
+}
+
 fn contentReferencesXObjectNameAlloc(alloc: Allocator, bytes: []const u8, target: []const u8) !bool {
     var references = try collectReferencedResourceNamesAlloc(alloc, bytes, &.{"Do"});
     defer references.deinit(alloc);
@@ -16926,7 +17177,7 @@ fn colorWithAlpha(color: [4]u8, alpha: u8) [4]u8 {
     };
 }
 
-fn shadingColorSamplesWithAlpha(shading: PageShading, alpha: u8) [shading_color_sample_count][4]u8 {
+fn shadingColorSamplesWithAlpha(shading: PageShading, alpha: u8) [shading_color_sample_capacity][4]u8 {
     var samples = shading.color_samples;
     for (samples[0..shading.color_sample_count]) |*color|
         color.* = colorWithAlpha(color.*, alpha);
@@ -17425,6 +17676,7 @@ fn buildShadingPatternRunAlloc(
             .c0 = colorWithAlpha(shading.c0, paint_alpha),
             .c1 = colorWithAlpha(shading.c1, paint_alpha),
             .color_samples = shadingColorSamplesWithAlpha(shading, paint_alpha),
+            .color_sample_positions = shading.color_sample_positions,
             .color_sample_count = shading.color_sample_count,
             .extend_start = shading.extend_start,
             .extend_end = shading.extend_end,
@@ -17690,6 +17942,27 @@ fn applyMatrixToPoint(m: GraphicsMatrix, x: f64, y: f64) [2]f64 {
         m.a * x + m.c * y + m.e,
         m.b * x + m.d * y + m.f,
     };
+}
+
+fn approximatelyEqualPdfCoordinate(lhs: f64, rhs: f64) bool {
+    if (!std.math.isFinite(lhs) or !std.math.isFinite(rhs)) return false;
+    return @abs(lhs - rhs) <= 0.000001 * @max(1.0, @max(@abs(lhs), @abs(rhs)));
+}
+
+fn graphicsMatricesApproxEqual(lhs: GraphicsMatrix, rhs: GraphicsMatrix) bool {
+    return approximatelyEqualPdfCoordinate(lhs.a, rhs.a) and
+        approximatelyEqualPdfCoordinate(lhs.b, rhs.b) and
+        approximatelyEqualPdfCoordinate(lhs.c, rhs.c) and
+        approximatelyEqualPdfCoordinate(lhs.d, rhs.d) and
+        approximatelyEqualPdfCoordinate(lhs.e, rhs.e) and
+        approximatelyEqualPdfCoordinate(lhs.f, rhs.f);
+}
+
+fn pageBoxesApproxEqual(lhs: PageBox, rhs: PageBox) bool {
+    return approximatelyEqualPdfCoordinate(lhs.min_x, rhs.min_x) and
+        approximatelyEqualPdfCoordinate(lhs.min_y, rhs.min_y) and
+        approximatelyEqualPdfCoordinate(lhs.max_x, rhs.max_x) and
+        approximatelyEqualPdfCoordinate(lhs.max_y, rhs.max_y);
 }
 
 fn parseFormMatrix(obj: *const syntax.Object) GraphicsMatrix {
@@ -17976,7 +18249,7 @@ fn colorFromComponents(color_space_name: []const u8, components: [4]u8, count: u
 }
 
 fn evalExponentialTintComponent(transform: *const ExponentialTintTransform, tint: f64, component: usize) f64 {
-    const t = std.math.clamp(tint, 0.0, 1.0);
+    const t = std.math.clamp(tint, transform.domain_min, transform.domain_max);
     const value = transform.c0[component] + std.math.pow(f64, t, transform.n) * (transform.c1[component] - transform.c0[component]);
     return if (transform.ranges) |ranges|
         clampColorComponent(value, ranges[component])
@@ -17987,7 +18260,8 @@ fn evalExponentialTintComponent(transform: *const ExponentialTintTransform, tint
 fn evalSampledTintComponent(transform: *const GraphicsSampledTintTransform, tint: f64, component: usize) f64 {
     std.debug.assert(transform.size > 0);
     std.debug.assert(component < transform.output_components);
-    const t = std.math.clamp(tint, 0.0, 1.0);
+    const clamped = std.math.clamp(tint, transform.domain_min, transform.domain_max);
+    const t = (clamped - transform.domain_min) / (transform.domain_max - transform.domain_min);
     const encoded = std.math.clamp(
         transform.encode_min + t * (transform.encode_max - transform.encode_min),
         0,
@@ -19478,9 +19752,15 @@ test "reader resource collectors release owned elements on allocation failure" {
                 .{ .key = @constCast("ca"), .value = .{ .real = 0.25 } },
                 .{ .key = @constCast("BM"), .value = .{ .name = @constCast("Multiply") } },
             };
+            var bad_state_entries = [_]syntax.DictEntry{
+                .{ .key = @constCast("SMask"), .value = .{ .integer = 42 } },
+            };
             var state_entries = [_]syntax.DictEntry{
                 .{ .key = @constCast("GS1"), .value = .{ .dict = &first_state_entries } },
                 .{ .key = @constCast("GS2"), .value = .{ .dict = &second_state_entries } },
+                // An unreachable malformed soft mask must not make otherwise
+                // valid page content fail during resource discovery.
+                .{ .key = @constCast("Unused"), .value = .{ .dict = &bad_state_entries } },
             };
             var resource_entries = [_]syntax.DictEntry{
                 .{ .key = @constCast("ExtGState"), .value = .{ .dict = &state_entries } },
@@ -19503,7 +19783,7 @@ test "reader resource collectors release owned elements on allocation failure" {
                 .encrypted_streams = &encrypted_streams,
             };
 
-            const states = try reader.collectExtGStatesFromResourcesAlloc(&resources);
+            const states = try reader.collectExtGStatesFromResourcesAlloc(&resources, "/GS1 gs /GS2 gs");
             defer {
                 for (states) |*state| state.deinit(alloc);
                 if (states.len > 0) alloc.free(states);
@@ -19513,6 +19793,19 @@ test "reader resource collectors release owned elements on allocation failure" {
     };
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "resource reachability recognizes Tf operands and soft mask paint profiles" {
+    const alloc = std.testing.allocator;
+    var fonts = try collectReferencedFontNamesAlloc(alloc, "/F1 12 Tf /NotAFont gs /F2 9.5 Tf");
+    defer fonts.deinit(alloc);
+    try std.testing.expect(fonts.contains("F1"));
+    try std.testing.expect(fonts.contains("F2"));
+    try std.testing.expect(!fonts.contains("NotAFont"));
+
+    try std.testing.expect(try contentIsSingleImageSoftMaskAlloc(alloc, "q 2 0 0 2 0 0 cm /Mask Do Q"));
+    try std.testing.expect(!try contentIsSingleImageSoftMaskAlloc(alloc, "/Mask Do 0 0 1 1 re f"));
+    try std.testing.expect(!try contentIsSingleImageSoftMaskAlloc(alloc, "/One Do /Two Do"));
 }
 
 test "reader ignores an invalid xref sentinel and repairs a stale zero page count" {
@@ -23800,9 +24093,10 @@ test "unembedded Latin Standard-14 fonts use deterministic native outlines" {
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 40] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 40] /Resources << /Font << /F1 5 0 R /Unused 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
         content_object,
         "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>\nendobj\n",
+        "6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
     };
     const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
     defer alloc.free(sample);
@@ -23816,6 +24110,12 @@ test "unembedded Latin Standard-14 fonts use deterministic native outlines" {
     try std.testing.expect(runs.shape_runs.len > 0);
     try std.testing.expectEqual(@as(u32, 1), runs.diagnostics.vector_text_groups);
     try std.testing.expectEqual(@as(u32, 0), runs.diagnostics.fallback_text_groups);
+    try std.testing.expectEqual(@as(usize, 1), reader.font_cache.count());
+    var cached_fonts = reader.font_cache.valueIterator();
+    const cached_font = cached_fonts.next().?;
+    try std.testing.expect(cached_font.truetype != null);
+    try std.testing.expect(!cached_font.truetype.?.owns_bytes);
+    try std.testing.expectEqual(@intFromPtr(standard_fonts.regular.ptr), @intFromPtr(cached_font.truetype.?.bytes.ptr));
     try std.testing.expectEqual(@as(?bool, false), standard14LatinFontIsBold("ABCDEF+Times-Italic"));
     try std.testing.expectEqual(@as(?bool, true), standard14LatinFontIsBold("Helvetica-BoldOblique"));
     try std.testing.expectEqual(@as(?bool, null), standard14LatinFontIsBold("Symbol"));
@@ -23856,6 +24156,45 @@ test "unembedded nonsymbolic simple fonts use deterministic native substitutes" 
     try std.testing.expectEqual(@as(?bool, true), substituteLatinFontIsBold("ABCDEF+StoneSans-Semibold"));
     try std.testing.expectEqual(@as(?bool, false), substituteLatinFontIsBold("TimesNewRomanPSMT"));
     try std.testing.expectEqual(@as(?bool, null), substituteLatinFontIsBold("CustomSymbol"));
+}
+
+test "shading domain and stitching discontinuity survive bounded sampling" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /Shading << /S 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "4 0 obj\n<< /Length 6 >>\nstream\n/S sh\nendstream\nendobj\n",
+        "5 0 obj\n<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 10 0] /Domain [2 4] /Function 6 0 R >>\nendobj\n",
+        "6 0 obj\n<< /FunctionType 3 /Domain [2 4] /Functions [7 0 R 8 0 R] /Bounds [3] /Encode [0 1 0 1] >>\nendobj\n",
+        "7 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 0 0] /N 1 >>\nendobj\n",
+        "8 0 obj\n<< /FunctionType 2 /Domain [0 1] /C0 [0 0 1] /C1 [1 1 1] /N 1 >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var pdf_reader = try Reader.init(alloc, sample);
+    defer pdf_reader.deinit();
+    const runs = try pdf_reader.extractPageShadingRunsAlloc(1);
+    defer {
+        for (runs) |*run| run.deinit(alloc);
+        alloc.free(runs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(u8, shading_uniform_color_sample_count + 2), runs[0].color_sample_count);
+    var boundary_index: ?usize = null;
+    for (runs[0].color_sample_positions[0..runs[0].color_sample_count], 0..) |position, index| {
+        if (position == 0.5 and index + 1 < runs[0].color_sample_count and
+            runs[0].color_sample_positions[index + 1] == 0.5)
+        {
+            boundary_index = index;
+            break;
+        }
+    }
+    const index = boundary_index orelse return error.TestExpectedEqual;
+    try std.testing.expect(runs[0].color_samples[index][0] > 0xf0);
+    try std.testing.expect(runs[0].color_samples[index][2] == 0);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0xff, 0xff }, runs[0].color_samples[index + 1]);
 }
 
 test "default device color spaces remap abbreviated explicit and initial selections" {

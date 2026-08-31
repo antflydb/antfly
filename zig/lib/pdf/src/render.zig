@@ -368,7 +368,9 @@ fn peakRenderCanvasCountAlloc(alloc: Allocator, groups: []const GroupMeta) !usiz
                 try visit(all_groups, all_states, all_counts, parent)
             else
                 1; // The page canvas.
-            const group_canvases: usize = 1 + if (all_groups[index].knockout) @as(usize, 2) else 0;
+            const boundary_coverage_canvas: usize = if (!all_groups[index].isolated and
+                (all_groups[index].alpha != 0xff or all_groups[index].blend_mode != .normal)) 1 else 0;
+            const group_canvases: usize = 1 + boundary_coverage_canvas + if (all_groups[index].knockout) @as(usize, 2) else 0;
             const count = std.math.add(usize, parent_count, group_canvases) catch return error.RenderedPageTooLarge;
             all_counts[index] = count;
             all_states[index] = .complete;
@@ -538,14 +540,25 @@ fn renderChildGroupAlloc(
     const meta = plan.groups[group_index];
     const child = try alloc.alloc(u8, width * height * 4);
     defer alloc.free(child);
-    const needs_boundary_composite = meta.isolated or meta.alpha != 0xff or meta.blend_mode != .normal;
-    if (needs_boundary_composite) {
+    const nonisolated_boundary = !meta.isolated and (meta.alpha != 0xff or meta.blend_mode != .normal);
+    if (meta.isolated) {
         @memset(child, 0);
     } else {
         @memcpy(child, target);
     }
+    const coverage_budget_start = bilevel_sample_budget.*;
     try renderGroupChildrenAlloc(alloc, child, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout, cancellation, bilevel_sample_budget);
-    if (needs_boundary_composite) {
+    if (nonisolated_boundary) {
+        // A non-isolated group must see the real backdrop while its children
+        // blend. Render its coverage independently, then remove the backdrop
+        // contribution from the result before applying boundary alpha/blend.
+        const coverage = try alloc.alloc(u8, width * height * 4);
+        defer alloc.free(coverage);
+        @memset(coverage, 0);
+        var coverage_bilevel_budget = coverage_budget_start;
+        try renderGroupChildrenAlloc(alloc, coverage, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout, cancellation, &coverage_bilevel_budget);
+        try compositeNonisolatedGroupCanvasModeCancelable(target, child, coverage, meta.alpha, meta.blend_mode, cancellation);
+    } else if (meta.isolated) {
         try compositeGroupCanvasModeCancelable(target, child, meta.alpha, meta.blend_mode, cancellation);
     } else {
         try copyCanvasCancelable(target, child, width, height, cancellation);
@@ -991,7 +1004,7 @@ fn drawImageRunCancelable(
                 sample[3] = @intCast((@as(u16, sample[3]) * @as(u16, color[3]) + 127) / 255);
             }
             if (run.opacity_mask_rgba != null) {
-                const mask_alpha = imageRunOpacityMaskSample(run, u, 1.0 - v, filtered);
+                const mask_alpha = imageRunOpacityMaskSample(run, u, 1.0 - v, run.opacity_mask_interpolate);
                 sample[3] = @intCast((@as(u16, sample[3]) * @as(u16, mask_alpha) + 127) / 255);
             }
             sample[3] = @intCast((@as(u16, sample[3]) * @as(u16, run.alpha) + 127) / 255);
@@ -1551,10 +1564,21 @@ fn drawShadingRunCancelable(canvas: []u8, canvas_w: usize, canvas_h: usize, min_
 fn shadingColorAt(run: reader.ShadingRun, t: f64) [4]u8 {
     if (run.color_sample_count < 2) return lerpColor(run.c0, run.c1, t);
     const count: usize = run.color_sample_count;
-    const position = std.math.clamp(t, 0.0, 1.0) * @as(f64, @floatFromInt(count - 1));
-    const lower: usize = @intFromFloat(@floor(position));
-    const upper = @min(lower + 1, count - 1);
-    return lerpColor(run.color_samples[lower], run.color_samples[upper], position - @as(f64, @floatFromInt(lower)));
+    const position = std.math.clamp(t, 0.0, 1.0);
+    var lower: usize = 0;
+    // Advance across equal-position samples so an exact stitching boundary
+    // selects its right-hand function, while interpolation approaching it
+    // terminates at the left-hand sample.
+    while (lower + 1 < count and run.color_sample_positions[lower + 1] <= position) : (lower += 1) {}
+    if (lower + 1 >= count) return run.color_samples[count - 1];
+    const upper = lower + 1;
+    const lower_position = run.color_sample_positions[lower];
+    const upper_position = run.color_sample_positions[upper];
+    const fraction = if (upper_position > lower_position)
+        (position - lower_position) / (upper_position - lower_position)
+    else
+        0;
+    return lerpColor(run.color_samples[lower], run.color_samples[upper], fraction);
 }
 
 fn drawPatternRun(
@@ -2572,6 +2596,35 @@ fn compositeGroupCanvasModeCancelable(canvas: []u8, group_canvas: []const u8, al
     }
 }
 
+fn compositeNonisolatedGroupCanvasModeCancelable(
+    canvas: []u8,
+    group_result: []const u8,
+    group_coverage: []const u8,
+    alpha: u8,
+    blend_mode: reader.BlendMode,
+    cancellation: reader.CancellationProbe,
+) !void {
+    std.debug.assert(canvas.len == group_result.len and canvas.len == group_coverage.len);
+    var i: usize = 0;
+    while (i + 3 < canvas.len) : (i += 4) {
+        if (i & 65_535 == 0) try cancellation.check();
+        const coverage_alpha = group_coverage[i + 3];
+        if (coverage_alpha == 0) continue;
+        const group_alpha = @as(f64, @floatFromInt(coverage_alpha)) / 255.0;
+        const backdrop_alpha = @as(f64, @floatFromInt(canvas[i + 3])) / 255.0;
+        const result_alpha = @as(f64, @floatFromInt(group_result[i + 3])) / 255.0;
+        var source: [4]u8 = undefined;
+        inline for (0..3) |channel| {
+            const result_premultiplied = (@as(f64, @floatFromInt(group_result[i + channel])) / 255.0) * result_alpha;
+            const backdrop_premultiplied = (@as(f64, @floatFromInt(canvas[i + channel])) / 255.0) * backdrop_alpha;
+            const recovered = (result_premultiplied - backdrop_premultiplied * (1.0 - group_alpha)) / group_alpha;
+            source[channel] = @intFromFloat(@round(std.math.clamp(recovered, 0.0, 1.0) * 255.0));
+        }
+        source[3] = @intCast((@as(u16, coverage_alpha) * @as(u16, alpha) + 127) / 255);
+        blendPixelMode(canvas, i, source, blend_mode);
+    }
+}
+
 fn copyCanvasCancelable(dst: []u8, src: []const u8, width: usize, height: usize, cancellation: reader.CancellationProbe) !void {
     const row_bytes = std.math.mul(usize, width, 4) catch return error.RenderedPageTooLarge;
     for (0..height) |row| {
@@ -2785,6 +2838,44 @@ test "transparency group boundary applies alpha and blend mode once" {
     const group = [_]u8{ 0x00, 0x00, 0x00, 0xff };
     try compositeGroupCanvasModeCancelable(&canvas, &group, 0x80, .multiply, .{});
     try std.testing.expectEqualSlices(u8, &.{ 0x7f, 0x7f, 0x7f, 0xff }, &canvas);
+}
+
+test "non-isolated group boundary removes backdrop before applying alpha" {
+    // Red at 50% was painted into an opaque blue non-isolated backdrop.
+    // Applying 50% group alpha must make the recovered red source 25%
+    // effective coverage; treating the purple result as an isolated source
+    // would incorrectly count blue twice.
+    var canvas = [_]u8{ 0x00, 0x00, 0xff, 0xff };
+    const group_result = [_]u8{ 0x80, 0x00, 0x7f, 0xff };
+    const coverage = [_]u8{ 0xff, 0x00, 0x00, 0x80 };
+    try compositeNonisolatedGroupCanvasModeCancelable(&canvas, &group_result, &coverage, 0x80, .normal, .{});
+    try std.testing.expect(@abs(@as(i16, canvas[0]) - 0x40) <= 1);
+    try std.testing.expectEqual(@as(u8, 0), canvas[1]);
+    try std.testing.expect(@abs(@as(i16, canvas[2]) - 0xbf) <= 1);
+    try std.testing.expectEqual(@as(u8, 0xff), canvas[3]);
+}
+
+test "shading samples select the right side of a stitching discontinuity" {
+    var run = reader.ShadingRun{
+        .kind = .axial,
+        .x0 = 0,
+        .y0 = 0,
+        .x1 = 1,
+        .y1 = 0,
+        .c0 = .{ 0, 0, 0, 0xff },
+        .c1 = .{ 0xff, 0xff, 0xff, 0xff },
+        .color_sample_count = 4,
+    };
+    run.color_sample_positions[0..4].* = .{ 0, 0.5, 0.5, 1 };
+    run.color_samples[0..4].* = .{
+        .{ 0, 0, 0, 0xff },
+        .{ 0xff, 0, 0, 0xff },
+        .{ 0, 0, 0xff, 0xff },
+        .{ 0xff, 0xff, 0xff, 0xff },
+    };
+    try std.testing.expectEqual([4]u8{ 0, 0, 0xff, 0xff }, shadingColorAt(run, 0.5));
+    const left = shadingColorAt(run, 0.499);
+    try std.testing.expect(left[0] > 0xf0 and left[2] == 0);
 }
 
 test "knockout groups remove prior sibling contribution before compositing" {
