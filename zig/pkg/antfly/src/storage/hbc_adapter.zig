@@ -794,9 +794,11 @@ fn noteHbcKindEviction(stats: *HbcCacheStats, kind: HbcCacheKind) void {
 /// maps long enough to retain an entry; entry lifetime is then ref-counted.
 ///
 /// This lock therefore uses one atomic word for ownership and a writer-intent
-/// counter to bound writer starvation. The read hot path performs one CAS on
-/// acquire and one subtraction on release, with no telemetry writes. Writers
-/// retain exclusive map/invalidation semantics.
+/// counter to bound writer starvation. A separate writer-admission gate keeps
+/// nonblocking reclaim from bypassing an already queued structural writer. The
+/// read hot path performs one CAS on acquire and one subtraction on release,
+/// with no telemetry writes. Writers retain exclusive map/invalidation
+/// semantics.
 const CacheRwLock = struct {
     const vector_read_stripe_count = 64;
     const writer_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
@@ -804,6 +806,7 @@ const CacheRwLock = struct {
 
     state: std.atomic.Value(usize) = .init(0),
     writers_waiting: std.atomic.Value(u32) = .init(0),
+    writer_gate: std.atomic.Mutex = .unlocked,
     vector_fence_pending: std.atomic.Value(bool) = .init(false),
     // Vector lookups dominate the shared-cache hot path. Key-striped reader
     // ownership lets independent lookups proceed without modifying the same
@@ -904,16 +907,33 @@ const CacheRwLock = struct {
 
     fn tryLockExclusive(self: *@This()) bool {
         _ = self.exclusive_lock_calls.fetchAdd(1, .monotonic);
-        if (self.state.cmpxchgStrong(0, writer_bit, .acquire, .monotonic) != null) return false;
+
+        // The first check avoids competing for the gate when a blocking writer
+        // has already announced intent. The second closes the race where that
+        // announcement occurs between the first check and gate acquisition.
+        if (self.writers_waiting.load(.acquire) != 0) return false;
+        if (!self.writer_gate.tryLock()) return false;
+        if (self.writers_waiting.load(.acquire) != 0) {
+            self.writer_gate.unlock();
+            return false;
+        }
+
+        // Fence striped readers before testing the global ownership word. A
+        // failed nonblocking acquisition rolls the fence back immediately.
         self.vector_fence_pending.store(true, .release);
+        if (self.state.cmpxchgStrong(0, writer_bit, .acquire, .monotonic) != null) {
+            self.vector_fence_pending.store(false, .release);
+            self.writer_gate.unlock();
+            return false;
+        }
         const locked = self.tryLockVectorStripes() orelse unreachable;
         if (locked != vector_read_stripe_count) {
             self.unlockVectorStripes(locked);
-            self.vector_fence_pending.store(false, .release);
             self.state.store(0, .release);
+            self.vector_fence_pending.store(false, .release);
+            self.writer_gate.unlock();
             return false;
         }
-        self.vector_fence_pending.store(false, .release);
         return true;
     }
 
@@ -921,16 +941,25 @@ const CacheRwLock = struct {
         const started_ns = nowNs();
         _ = self.exclusive_lock_calls.fetchAdd(1, .monotonic);
         _ = self.writers_waiting.fetchAdd(1, .acq_rel);
-        defer _ = self.writers_waiting.fetchSub(1, .release);
 
-        var attempts: usize = 0;
-        while (self.state.cmpxchgWeak(0, writer_bit, .acquire, .monotonic) != null) : (attempts += 1) {
-            backoff(attempts);
+        var gate_attempts: usize = 0;
+        while (!self.writer_gate.tryLock()) : (gate_attempts += 1) {
+            backoff(gate_attempts);
         }
+
+        // Publishing this fence while holding the admission gate turns the
+        // striped-reader population into a finite set before the writer drains
+        // either ownership domain.
         self.vector_fence_pending.store(true, .release);
+
+        var state_attempts: usize = 0;
+        while (self.state.cmpxchgWeak(0, writer_bit, .acquire, .monotonic) != null) : (state_attempts += 1) {
+            backoff(state_attempts);
+        }
         const stripes_contended = self.lockVectorStripes();
-        self.vector_fence_pending.store(false, .release);
-        if (attempts != 0 or stripes_contended) {
+        _ = self.writers_waiting.fetchSub(1, .release);
+
+        if (gate_attempts != 0 or state_attempts != 0 or stripes_contended) {
             const waited_ns = elapsedSince(started_ns);
             _ = self.exclusive_contended_calls.fetchAdd(1, .monotonic);
             _ = self.exclusive_wait_ns.fetchAdd(waited_ns, .monotonic);
@@ -945,6 +974,8 @@ const CacheRwLock = struct {
         self.unlockVectorStripes(vector_read_stripe_count);
         const previous = self.state.swap(0, .release);
         std.debug.assert(previous == writer_bit);
+        self.vector_fence_pending.store(false, .release);
+        self.writer_gate.unlock();
     }
 
     fn snapshot(self: *const @This()) apply_rw_lock_mod.ApplyRwLock.Stats {
@@ -10893,6 +10924,78 @@ test "hbc shared vector replacement cannot return an older external value" {
     try std.testing.expectEqual(@as(u64, 1), cache.namespaceStats(namespace).vector.replacements);
 }
 
+test "hbc shared vector leases remain coherent during invalidate and replacement" {
+    const Reader = struct {
+        fn run(
+            cache: *Cache,
+            namespace: u64,
+            ready: *std.atomic.Value(u32),
+            start: *std.atomic.Value(bool),
+            stop: *std.atomic.Value(bool),
+            borrows: *std.atomic.Value(u64),
+            failed: *std.atomic.Value(bool),
+        ) void {
+            const value_a = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+            const value_b = [_]f32{ 9.0, 8.0, 7.0, 6.0 };
+            _ = ready.fetchAdd(1, .release);
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            while (!stop.load(.acquire)) {
+                if (cache.borrowVector(namespace, 7)) |lease_value| {
+                    var lease = lease_value;
+                    _ = borrows.fetchAdd(1, .monotonic);
+                    const view = lease.view();
+                    if (!std.mem.eql(f32, view, &value_a) and !std.mem.eql(f32, view, &value_b)) {
+                        failed.store(true, .release);
+                    }
+                    lease.deinit();
+                }
+            }
+        }
+    };
+
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const namespace = hbcCacheNamespace("/tmp/hbc-vector-lease-replacement-stress");
+    const value_a = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const value_b = [_]f32{ 9.0, 8.0, 7.0, 6.0 };
+    _ = try cache.cacheVector(namespace, 7, &value_a);
+
+    var ready = std.atomic.Value(u32).init(0);
+    var start = std.atomic.Value(bool).init(false);
+    var stop = std.atomic.Value(bool).init(false);
+    var borrows = std.atomic.Value(u64).init(0);
+    var failed = std.atomic.Value(bool).init(false);
+    var readers: [8]std.Thread = undefined;
+    for (&readers) |*reader| {
+        reader.* = try std.Thread.spawn(.{}, Reader.run, .{
+            &cache,
+            namespace,
+            &ready,
+            &start,
+            &stop,
+            &borrows,
+            &failed,
+        });
+    }
+    while (ready.load(.acquire) != readers.len) std.atomic.spinLoopHint();
+    start.store(true, .release);
+    while (borrows.load(.acquire) == 0) std.atomic.spinLoopHint();
+
+    for (0..512) |iteration| {
+        if (iteration % 4 == 0) cache.invalidateVector(namespace, 7);
+        const value = if (iteration & 1 == 0) &value_a else &value_b;
+        _ = cache.cacheVector(namespace, 7, value) catch {
+            failed.store(true, .release);
+            break;
+        };
+    }
+
+    stop.store(true, .release);
+    for (&readers) |*reader| reader.join();
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expect(borrows.load(.acquire) > 0);
+}
+
 test "hbc vector fill captured before a committed mutation cannot repopulate stale data" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -11857,6 +11960,44 @@ test "hbc shared vector lookup stats preserve compulsory and cross-stripe misses
 
 test "hbc shared cache lock reports striped reader wait" {
     const Writer = struct {
+        fn run(
+            lock: *CacheRwLock,
+            acquired: *std.atomic.Value(bool),
+            release: *std.atomic.Value(bool),
+        ) void {
+            lock.lockExclusive();
+            acquired.store(true, .release);
+            while (!release.load(.acquire)) std.atomic.spinLoopHint();
+            lock.unlockExclusive();
+        }
+    };
+
+    var lock: CacheRwLock = .{};
+    const read_stripe = lock.lockVectorShared(1, 1);
+    var writer_acquired = std.atomic.Value(bool).init(false);
+    var release_writer = std.atomic.Value(bool).init(false);
+    var writer = try std.Thread.spawn(.{}, Writer.run, .{ &lock, &writer_acquired, &release_writer });
+    while (!lock.vector_fence_pending.load(.acquire)) std.atomic.spinLoopHint();
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    try io_impl.io().sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+    lock.unlockVectorShared(read_stripe);
+    while (!writer_acquired.load(.acquire)) std.atomic.spinLoopHint();
+    try std.testing.expect(lock.vector_fence_pending.load(.acquire));
+    release_writer.store(true, .release);
+    writer.join();
+
+    try std.testing.expect(writer_acquired.load(.acquire));
+    try std.testing.expect(!lock.vector_fence_pending.load(.acquire));
+    const stats = lock.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), stats.exclusive_lock_calls);
+    try std.testing.expectEqual(@as(u64, 1), stats.exclusive_contended_calls);
+    try std.testing.expect(stats.exclusive_wait_ns > 0);
+    try std.testing.expect(stats.exclusive_max_wait_ns > 0);
+}
+
+test "hbc shared cache queued writer cannot be bypassed by nonblocking reclaim" {
+    const Writer = struct {
         fn run(lock: *CacheRwLock, acquired: *std.atomic.Value(bool)) void {
             lock.lockExclusive();
             acquired.store(true, .release);
@@ -11865,22 +12006,88 @@ test "hbc shared cache lock reports striped reader wait" {
     };
 
     var lock: CacheRwLock = .{};
-    const read_stripe = lock.lockVectorShared(1, 1);
+    lockAtomic(&lock.writer_gate);
     var writer_acquired = std.atomic.Value(bool).init(false);
     var writer = try std.Thread.spawn(.{}, Writer.run, .{ &lock, &writer_acquired });
-    while (!lock.vector_fence_pending.load(.acquire)) std.atomic.spinLoopHint();
+    while (lock.writers_waiting.load(.acquire) == 0) std.atomic.spinLoopHint();
+
+    try std.testing.expect(!lock.tryLockExclusive());
+    try std.testing.expect(!writer_acquired.load(.acquire));
+
+    lock.writer_gate.unlock();
+    writer.join();
+    try std.testing.expect(writer_acquired.load(.acquire));
+
+    try std.testing.expect(lock.tryLockExclusive());
+    try std.testing.expect(lock.vector_fence_pending.load(.acquire));
+    lock.unlockExclusive();
+    try std.testing.expect(!lock.vector_fence_pending.load(.acquire));
+}
+
+test "hbc shared cache writer progresses under continuous striped reads" {
+    const Reader = struct {
+        fn run(
+            lock: *CacheRwLock,
+            namespace: u64,
+            vector_id: u64,
+            ready: *std.atomic.Value(u32),
+            start: *std.atomic.Value(bool),
+            stop: *std.atomic.Value(bool),
+            reads: *std.atomic.Value(u64),
+        ) void {
+            _ = ready.fetchAdd(1, .release);
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            while (!stop.load(.acquire)) {
+                const stripe = lock.lockVectorShared(namespace, vector_id);
+                _ = reads.fetchAdd(1, .monotonic);
+                std.atomic.spinLoopHint();
+                lock.unlockVectorShared(stripe);
+            }
+        }
+    };
+    const Writer = struct {
+        fn run(lock: *CacheRwLock, acquired: *std.atomic.Value(bool)) void {
+            lock.lockExclusive();
+            acquired.store(true, .release);
+            lock.unlockExclusive();
+        }
+    };
+
+    var lock: CacheRwLock = .{};
+    var ready = std.atomic.Value(u32).init(0);
+    var start = std.atomic.Value(bool).init(false);
+    var stop = std.atomic.Value(bool).init(false);
+    var reads = std.atomic.Value(u64).init(0);
+    var writer_acquired = std.atomic.Value(bool).init(false);
+    var readers: [8]std.Thread = undefined;
+    for (&readers, 0..) |*reader, index| {
+        reader.* = try std.Thread.spawn(.{}, Reader.run, .{
+            &lock,
+            @as(u64, @intCast(index + 1)),
+            @as(u64, @intCast(index * 17 + 1)),
+            &ready,
+            &start,
+            &stop,
+            &reads,
+        });
+    }
+    while (ready.load(.acquire) != readers.len) std.atomic.spinLoopHint();
+    start.store(true, .release);
+    while (reads.load(.acquire) < readers.len) std.atomic.spinLoopHint();
+
+    var writer = try std.Thread.spawn(.{}, Writer.run, .{ &lock, &writer_acquired });
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
-    try io_impl.io().sleep(std.Io.Duration.fromMilliseconds(10), .awake);
-    lock.unlockVectorShared(read_stripe);
+    var attempts: usize = 0;
+    while (!writer_acquired.load(.acquire) and attempts < 1_000) : (attempts += 1) {
+        try io_impl.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    const progressed_under_load = writer_acquired.load(.acquire);
+    stop.store(true, .release);
+    for (&readers) |*reader| reader.join();
     writer.join();
 
-    try std.testing.expect(writer_acquired.load(.acquire));
-    const stats = lock.snapshot();
-    try std.testing.expectEqual(@as(u64, 1), stats.exclusive_lock_calls);
-    try std.testing.expectEqual(@as(u64, 1), stats.exclusive_contended_calls);
-    try std.testing.expect(stats.exclusive_wait_ns > 0);
-    try std.testing.expect(stats.exclusive_max_wait_ns > 0);
+    try std.testing.expect(progressed_under_load);
 }
 
 test "hbc stable cache namespace canonicalizes equivalent path spellings" {
