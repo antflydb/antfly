@@ -39423,7 +39423,7 @@ test "api http server prefers metadata-owned restore over inline write-source re
     try std.testing.expect(restore_source.restored);
 }
 
-test "api http server retries stale metadata table-exists restore race" {
+test "api http server does not retry authoritative metadata table-exists conflict" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -39431,8 +39431,8 @@ test "api http server retries stale metadata table-exists restore race" {
     defer alloc.free(location_uri);
 
     const RestoreSource = struct {
-        attempts: usize = 0,
-        restored: bool = false,
+        attempts: std.atomic.Value(usize) = .init(0),
+        restored: std.atomic.Value(bool) = .init(false),
         expected_location: []const u8,
 
         fn iface(self: *@This()) StatusSource {
@@ -39465,9 +39465,9 @@ test "api http server retries stale metadata table-exists restore race" {
             try std.testing.expectEqualStrings("snap1", artifact_backup_id);
             try std.testing.expectEqualStrings("snap1", manifest.backup_id);
             try std.testing.expectEqualStrings("docs", manifest.table_name);
-            self.attempts += 1;
-            if (self.attempts == 1) return error.TableAlreadyExists;
-            self.restored = true;
+            const attempt = self.attempts.fetchAdd(1, .acq_rel) + 1;
+            if (attempt == 1) return error.TableAlreadyExists;
+            self.restored.store(true, .release);
         }
     };
 
@@ -39496,8 +39496,12 @@ test "api http server retries stale metadata table-exists restore race" {
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
     const terminal_restore = try waitForTerminalRestoreJobAlloc(alloc, &server, restore_resp.body);
     defer alloc.free(terminal_restore);
-    try std.testing.expectEqual(@as(usize, 2), restore_source.attempts);
-    try std.testing.expect(restore_source.restored);
+    var parsed_terminal = try std.json.parseFromSlice(restore_jobs.JobState, alloc, terminal_restore, .{ .ignore_unknown_fields = true });
+    defer parsed_terminal.deinit();
+    try std.testing.expectEqual(restore_jobs.Phase.failed, parsed_terminal.value.phase);
+    try std.testing.expectEqualStrings("TableAlreadyExists", parsed_terminal.value.last_error orelse "");
+    try std.testing.expectEqual(@as(usize, 1), restore_source.attempts.load(.acquire));
+    try std.testing.expect(!restore_source.restored.load(.acquire));
 }
 
 test "api http server retries interrupted metadata restore publication" {
