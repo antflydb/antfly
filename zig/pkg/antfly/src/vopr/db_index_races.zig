@@ -11,6 +11,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const vopr = @import("vopr");
 const db_mod = @import("../storage/db/db.zig");
+const db_types = @import("../storage/db/types.zig");
+const embedder_mod = @import("../storage/db/enrichment/embedder.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 const text_merge_runtime = @import("../storage/db/maintenance/text_merge_runtime.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
@@ -662,6 +664,514 @@ pub const TextAdmissionScenario = struct {
     }
 };
 
+/// End-to-end managed dense-index publication on the same production DB,
+/// enrichment, replay, repair, HBC, and status paths used by a DataServer.
+/// The primary and repair stores are externally owned so a process reopen
+/// preserves durable state, while task scheduling, synchronization, clocks,
+/// and sleeps remain on one borrowed VoprIo. Physical HBC bytes are the
+/// repository's explicit native differential boundary, as in the other DB
+/// index VOPR histories.
+const ManagedReadinessFixture = struct {
+    allocator: std.mem.Allocator,
+    tmp: std.testing.TmpDir,
+    root: [:0]u8,
+    sim: *vopr.vopr_io.VoprIo,
+    backend: background_runtime.BackendRuntimeHandle,
+    primary_storage: *lsm_backend.MemoryStorage,
+    repair_storage: *lsm_backend.MemoryStorage,
+    embedder: *embedder_mod.DeterministicDenseEmbedder,
+    db: db_mod.DB,
+
+    fn openDb(self: *@This()) !db_mod.DB {
+        var db = try db_mod.DB.open(self.allocator, self.root, .{
+            .backend_runtime = self.backend.ptr(),
+            .executor = .{ .backend = .manual },
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .storage = self.primary_storage.storage(),
+            .physical_root_mode = .external_backend,
+            .external_root_incarnation = 1,
+            .index_repair_checkpoint_storage = self.repair_storage.storage(),
+            .start_index_workers = false,
+            .start_optional_runtime_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+            .enrichment = .{
+                .owner_id = "vopr-managed-index",
+                .dense_embedder = self.embedder.interface(),
+                .inline_retry_max_attempts = 1,
+            },
+        });
+        // vopr-audit: allow(host_filesystem) HBC's mmap/native storage remains
+        // the reviewed differential boundary; all protocol scheduling above
+        // it borrows VoprIo.
+        db.core.index_manager.setIo(std.testing.io);
+        return db;
+    }
+
+    fn init(allocator: std.mem.Allocator) !ManagedReadinessFixture {
+        var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) physical index bytes are an explicit differential boundary
+        errdefer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator); // vopr-audit: allow(host_filesystem) physical index bytes are an explicit differential boundary
+        errdefer allocator.free(root);
+        const sim = try allocator.create(vopr.vopr_io.VoprIo);
+        errdefer allocator.destroy(sim);
+        sim.* = try vopr.vopr_io.VoprIo.init(.{
+            .seed = 0x4d41_4e41_4745_4452,
+            .required = .of(&.{ .clock_read, .task_scheduling, .synchronization, .sleep }),
+            .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+        });
+        errdefer sim.deinit();
+        var backend = try background_runtime.BackendRuntimeHandle.init(allocator, .{
+            .backend = .manual,
+            .borrowed_io = .{ .general = sim.io(), .inference = sim.io() },
+        });
+        errdefer backend.deinit();
+        const primary_storage = try allocator.create(lsm_backend.MemoryStorage);
+        errdefer allocator.destroy(primary_storage);
+        primary_storage.* = lsm_backend.MemoryStorage.init(allocator);
+        errdefer primary_storage.deinit();
+        const repair_storage = try allocator.create(lsm_backend.MemoryStorage);
+        errdefer allocator.destroy(repair_storage);
+        repair_storage.* = lsm_backend.MemoryStorage.init(allocator);
+        errdefer repair_storage.deinit();
+        const embedder = try allocator.create(embedder_mod.DeterministicDenseEmbedder);
+        errdefer allocator.destroy(embedder);
+        embedder.* = .{};
+
+        var fixture = ManagedReadinessFixture{
+            .allocator = allocator,
+            .tmp = tmp,
+            .root = root,
+            .sim = sim,
+            .backend = backend,
+            .primary_storage = primary_storage,
+            .repair_storage = repair_storage,
+            .embedder = embedder,
+            .db = undefined,
+        };
+        fixture.db = try fixture.openDb();
+        return fixture;
+    }
+
+    fn reopen(self: *@This()) !void {
+        self.db.close();
+        self.db = try self.openDb();
+    }
+
+    fn deinit(self: *@This()) void {
+        self.db.close();
+        self.allocator.destroy(self.embedder);
+        self.repair_storage.deinit();
+        self.allocator.destroy(self.repair_storage);
+        self.primary_storage.deinit();
+        self.allocator.destroy(self.primary_storage);
+        self.backend.deinit();
+        self.sim.deinit();
+        self.allocator.destroy(self.sim);
+        self.allocator.free(self.root);
+        self.tmp.cleanup();
+        self.* = undefined;
+    }
+};
+
+const managed_readiness_index_name = "semantic_idx";
+const managed_readiness_progressive_config =
+    \\{"field":"body","dims":3,"metric":"cosine","embedding_name":"semantic_idx","publication_policy":"progressive","execution":{"embedding":{"batch_items":1}},"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic_idx"}}
+;
+const managed_readiness_atomic_config =
+    \\{"field":"body","dims":3,"metric":"cosine","embedding_name":"semantic_idx","publication_policy":"atomic","execution":{"embedding":{"batch_items":1}},"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic_idx"}}
+;
+
+pub const ManagedReadinessScenario = struct {
+    pub const name: []const u8 = "managed-index-readiness";
+    pub const version: u32 = 1;
+
+    const fail_closed_id = vopr.id.stable(name, "atomic-and-initial-publication-fail-closed");
+    const progressive_id = vopr.id.stable(name, "progressive-checkpoint-is-queryable");
+    const restart_id = vopr.id.stable(name, "restart-preserves-publication-contract");
+    const cancellation_id = vopr.id.stable(name, "cancellation-retains-durable-repair");
+    const converged_id = vopr.id.stable(name, "replay-and-coverage-converge");
+    const complete_id = vopr.id.stable(name, "mode-completes");
+    pub const properties = &[_]vopr.property.Declaration{
+        .{ .id = fail_closed_id, .name = name ++ ".atomic-and-initial-publication-fail-closed", .kind = .always },
+        .{ .id = progressive_id, .name = name ++ ".progressive-checkpoint-is-queryable", .kind = .always },
+        .{ .id = restart_id, .name = name ++ ".restart-preserves-publication-contract", .kind = .always },
+        .{ .id = cancellation_id, .name = name ++ ".cancellation-retains-durable-repair", .kind = .always },
+        .{ .id = converged_id, .name = name ++ ".replay-and-coverage-converge", .kind = .always },
+        .{ .id = complete_id, .name = name ++ ".mode-completes", .kind = .reachable },
+    };
+
+    const Mode = enum { progressive_reopen, atomic_reopen, cancellation_recovery };
+    const mode_ids = [_]vopr.id.StableId{
+        vopr.id.stable(name, "progressive-reopen"),
+        vopr.id.stable(name, "atomic-reopen"),
+        vopr.id.stable(name, "cancellation-recovery"),
+    };
+    const mode_names = [_][]const u8{
+        name ++ ".progressive-reopen",
+        name ++ ".atomic-reopen",
+        name ++ ".cancellation-recovery",
+    };
+    const step_id = vopr.id.stable(name, "next-production-step");
+    const step_name = name ++ ".next-production-step";
+
+    const Stage = enum(u8) {
+        choose,
+        seed,
+        admit,
+        first_checkpoint,
+        grow,
+        observe_publication,
+        reopen,
+        cancel_repair,
+        converge,
+        finalize,
+        complete,
+    };
+
+    const State = struct {
+        allocator: std.mem.Allocator,
+        fixture: *ManagedReadinessFixture,
+        mode: ?Mode = null,
+        stage: Stage = .choose,
+        repair_id: ?u128 = null,
+        progress: u64 = 0,
+        initial_fail_closed: bool = false,
+        progressive_partial_queryable: bool = false,
+        progressive_partial_hits: u32 = 0,
+        restart_contract_preserved: bool = false,
+        cancellation_deferred: bool = false,
+        cancellation_intent_retained: bool = false,
+        final_ready: bool = false,
+        final_hits: u32 = 0,
+        replay_converged: bool = false,
+        cleanup_sound: bool = false,
+
+        fn modeValue(self: *@This()) Mode {
+            return self.mode.?;
+        }
+
+        fn indexConfig(self: *@This()) db_types.IndexConfig {
+            const progressive = self.modeValue() == .progressive_reopen;
+            return .{
+                .name = managed_readiness_index_name,
+                .kind = .dense_vector,
+                .config_json = if (progressive) managed_readiness_progressive_config else managed_readiness_atomic_config,
+                .coverage_generation = if (progressive) 501 else 502,
+            };
+        }
+
+        fn searchHits(self: *@This()) !u32 {
+            const query = try self.fixture.embedder.interface().embedDense(
+                self.allocator,
+                managed_readiness_index_name,
+                "alpha concept",
+                3,
+            );
+            defer self.allocator.free(query);
+            var result = try self.fixture.db.search(self.allocator, .{
+                .index_name = managed_readiness_index_name,
+                .query = .{ .dense_knn = .{ .vector = query, .k = 3 } },
+                .limit = 3,
+            });
+            defer result.deinit();
+            return result.total_hits;
+        }
+
+        const ReadinessStats = struct {
+            doc_count: u64,
+            backfill_active: bool,
+            repair_degraded: bool,
+            index_repair_active_generation_serviceable: bool,
+            replay_applied_sequence: u64,
+            replay_target_sequence: u64,
+        };
+
+        fn indexStats(self: *@This()) !ReadinessStats {
+            const stats = try self.fixture.db.stats(self.allocator);
+            defer db_types.freeDBStats(self.allocator, stats);
+            for (stats.indexes) |item| {
+                if (std.mem.eql(u8, item.name, managed_readiness_index_name)) return .{
+                    .doc_count = item.doc_count,
+                    .backfill_active = item.backfill_active,
+                    .repair_degraded = item.repair_degraded,
+                    .index_repair_active_generation_serviceable = item.index_repair_active_generation_serviceable,
+                    .replay_applied_sequence = item.replay_applied_sequence,
+                    .replay_target_sequence = item.replay_target_sequence,
+                };
+            }
+            return error.ManagedIndexReadinessStatusMissing;
+        }
+
+        fn seed(self: *@This()) !void {
+            const writes: []const db_types.BatchWrite = if (self.modeValue() == .progressive_reopen)
+                &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha concept\"}" }}
+            else
+                &.{
+                    .{ .key = "doc:a", .value = "{\"body\":\"alpha concept\"}" },
+                    .{ .key = "doc:b", .value = "{\"body\":\"beta architecture\"}" },
+                    .{ .key = "doc:c", .value = "{\"body\":\"gamma implementation\"}" },
+                };
+            try self.fixture.db.batch(.{ .writes = writes, .sync_level = .write });
+            self.stage = .admit;
+        }
+
+        fn admit(self: *@This()) !void {
+            self.repair_id = (try self.fixture.db.admitManagedIndex(self.indexConfig())) orelse
+                return error.ManagedIndexReadinessRepairMissing;
+            if (self.searchHits()) |_| {
+                return error.ManagedIndexReadinessPublishedBeforeReady;
+            } else |err| switch (err) {
+                error.IndexRebuilding => self.initial_fail_closed = true,
+                else => return err,
+            }
+            self.stage = if (self.modeValue() == .progressive_reopen)
+                .first_checkpoint
+            else
+                .observe_publication;
+        }
+
+        fn firstCheckpoint(self: *@This()) !void {
+            try self.fixture.db.runUntilIdle();
+            self.stage = .grow;
+        }
+
+        fn grow(self: *@This()) !void {
+            try self.fixture.db.batch(.{
+                .writes = &.{
+                    .{ .key = "doc:b", .value = "{\"body\":\"beta architecture\"}" },
+                    .{ .key = "doc:c", .value = "{\"body\":\"gamma implementation\"}" },
+                },
+                .sync_level = .write,
+            });
+            self.stage = .observe_publication;
+        }
+
+        fn observePublication(self: *@This()) !void {
+            if (self.modeValue() == .progressive_reopen) {
+                const stats = try self.indexStats();
+                self.progressive_partial_hits = try self.searchHits();
+                self.progressive_partial_queryable =
+                    stats.index_repair_active_generation_serviceable and
+                    stats.repair_degraded and
+                    stats.doc_count == 1 and
+                    self.progressive_partial_hits == 1 and
+                    try self.fixture.db.hasPendingIndexRepairIntents(self.allocator);
+                if (!self.progressive_partial_queryable)
+                    return error.ManagedIndexProgressiveCheckpointNotQueryable;
+            } else {
+                if (self.searchHits()) |_| {
+                    return error.ManagedIndexAtomicPublicationExposedPartialResult;
+                } else |err| switch (err) {
+                    error.IndexRebuilding => {},
+                    else => return err,
+                }
+            }
+            self.stage = .reopen;
+        }
+
+        fn reopen(self: *@This()) !void {
+            try self.fixture.reopen();
+            if (self.modeValue() == .progressive_reopen) {
+                const stats = try self.indexStats();
+                self.restart_contract_preserved =
+                    stats.index_repair_active_generation_serviceable and
+                    try self.searchHits() == 1 and
+                    try self.fixture.db.hasPendingIndexRepairIntents(self.allocator);
+            } else {
+                if (self.searchHits()) |_| {
+                    self.restart_contract_preserved = false;
+                } else |err| switch (err) {
+                    error.IndexRebuilding => self.restart_contract_preserved =
+                        try self.fixture.db.hasPendingIndexRepairIntents(self.allocator),
+                    else => return err,
+                }
+            }
+            if (!self.restart_contract_preserved)
+                return error.ManagedIndexRestartPublicationContractLost;
+            self.stage = if (self.modeValue() == .cancellation_recovery)
+                .cancel_repair
+            else
+                .converge;
+        }
+
+        fn cancelRepair(self: *@This()) !void {
+            const Cancel = struct {
+                fn requested(_: *anyopaque) bool {
+                    return true;
+                }
+            };
+            var token: u8 = 0;
+            const result = try self.fixture.db.advanceIndexRepairIntent(
+                self.allocator,
+                self.repair_id.?,
+                .{ .cancel_check = .{ .ptr = &token, .is_requested = Cancel.requested } },
+            );
+            self.cancellation_deferred = result.deferred and !result.repaired and !result.terminal;
+            self.cancellation_intent_retained = try self.fixture.db.hasPendingIndexRepairIntents(self.allocator);
+            if (!self.cancellation_deferred or !self.cancellation_intent_retained)
+                return error.ManagedIndexCancellationDidNotRetainRepair;
+            self.stage = .converge;
+        }
+
+        fn converge(self: *@This()) !void {
+            try self.fixture.db.runUntilIdle();
+            self.stage = .finalize;
+        }
+
+        fn finalize(self: *@This()) !void {
+            var repaired = false;
+            for (0..64) |_| {
+                const result = try self.fixture.db.advanceIndexRepairIntent(
+                    self.allocator,
+                    self.repair_id.?,
+                    .{},
+                );
+                if (result.repaired) {
+                    repaired = true;
+                    break;
+                }
+                if (result.terminal) return error.ManagedIndexRepairBecameTerminal;
+                if (!result.deferred and !result.attempted and !result.busy)
+                    return error.ManagedIndexRepairMadeNoProgress;
+                try self.fixture.db.runUntilIdle();
+            }
+            if (!repaired) return error.ManagedIndexRepairDidNotConverge;
+            const stats = try self.indexStats();
+            self.final_hits = try self.searchHits();
+            self.replay_converged =
+                stats.replay_applied_sequence == stats.replay_target_sequence and
+                !stats.backfill_active and
+                !stats.repair_degraded and
+                !try self.fixture.db.hasPendingIndexRepairIntents(self.allocator);
+            self.final_ready = stats.doc_count == 3 and self.final_hits == 3 and
+                self.replay_converged;
+            if (!self.final_ready) return error.ManagedIndexFinalReadinessInvalid;
+            try self.fixture.db.runUntilIdle();
+            try self.fixture.sim.ensureNoCapabilityViolation();
+            self.cleanup_sound = true;
+            self.stage = .complete;
+        }
+
+        fn executeStep(self: *@This()) !void {
+            switch (self.stage) {
+                .choose, .complete => return error.InvalidManagedIndexReadinessStage,
+                .seed => try self.seed(),
+                .admit => try self.admit(),
+                .first_checkpoint => try self.firstCheckpoint(),
+                .grow => try self.grow(),
+                .observe_publication => try self.observePublication(),
+                .reopen => try self.reopen(),
+                .cancel_repair => try self.cancelRepair(),
+                .converge => try self.converge(),
+                .finalize => try self.finalize(),
+            }
+            self.progress += 1;
+        }
+    };
+
+    pub const World = struct { state: *State };
+
+    pub fn init(allocator: std.mem.Allocator) !World {
+        const fixture = try allocator.create(ManagedReadinessFixture);
+        errdefer allocator.destroy(fixture);
+        fixture.* = try ManagedReadinessFixture.init(allocator);
+        errdefer fixture.deinit();
+        const state = try allocator.create(State);
+        state.* = .{ .allocator = allocator, .fixture = fixture };
+        return .{ .state = state };
+    }
+
+    pub fn deinit(world: *World, allocator: std.mem.Allocator) void {
+        world.state.fixture.deinit();
+        allocator.destroy(world.state.fixture);
+        allocator.destroy(world.state);
+        world.* = undefined;
+    }
+
+    pub fn enumerate(world: *World, list: *vopr.transition.List, allocator: std.mem.Allocator) !void {
+        const state = world.state;
+        if (state.stage == .complete) return;
+        if (state.stage == .choose) {
+            inline for (std.meta.tags(Mode), mode_ids, mode_names) |mode, id, transition_name| try list.append(allocator, .{
+                .id = id,
+                .name = transition_name,
+                .kind = if (mode == .cancellation_recovery) .fault else .workload,
+            });
+            return;
+        }
+        try list.append(allocator, .{
+            .id = step_id,
+            .name = step_name,
+            .kind = switch (state.stage) {
+                .reopen, .cancel_repair => .fault,
+                .first_checkpoint, .converge, .finalize => .maintenance,
+                else => .workload,
+            },
+        });
+    }
+
+    pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, allocator: std.mem.Allocator) !vopr.outcome.TransitionOutcome {
+        const state = world.state;
+        if (state.stage == .choose) {
+            inline for (std.meta.tags(Mode), mode_ids) |mode, id| {
+                if (selected.id == id) {
+                    state.mode = mode;
+                    state.stage = .seed;
+                    try events.emitNamed(allocator, .domain, selected.name, @intFromEnum(mode));
+                    return .applied();
+                }
+            }
+            return error.InvalidManagedIndexReadinessMode;
+        }
+        if (selected.id != step_id) return error.InvalidManagedIndexReadinessTransition;
+        try state.executeStep();
+        try events.emitNamed(allocator, .state_change, @tagName(state.stage), state.progress);
+        return .applied();
+    }
+
+    pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
+        const state = world.state;
+        try builder.addNamed(allocator, name ++ ".stage", @intFromEnum(state.stage));
+        try builder.addNamed(allocator, name ++ ".progress", @intCast(state.progress));
+        try builder.addNamed(allocator, name ++ ".initial-fail-closed", @intFromBool(state.initial_fail_closed));
+        try builder.addNamed(allocator, name ++ ".partial-queryable", @intFromBool(state.progressive_partial_queryable));
+        try builder.addNamed(allocator, name ++ ".restart-preserved", @intFromBool(state.restart_contract_preserved));
+        try builder.addNamed(allocator, name ++ ".cancellation-deferred", @intFromBool(state.cancellation_deferred));
+        try builder.addNamed(allocator, name ++ ".final-ready", @intFromBool(state.final_ready));
+        try builder.addNamed(allocator, name ++ ".final-hits", @intCast(state.final_hits));
+    }
+
+    pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: std.mem.Allocator) !void {
+        const state = world.state;
+        const complete = state.stage == .complete;
+        try sink.check(allocator, fail_closed_id, !complete or state.initial_fail_closed);
+        try sink.check(allocator, progressive_id, !complete or state.modeValue() != .progressive_reopen or
+            (state.progressive_partial_queryable and state.progressive_partial_hits == 1));
+        try sink.check(allocator, restart_id, !complete or state.restart_contract_preserved);
+        try sink.check(allocator, cancellation_id, !complete or state.modeValue() != .cancellation_recovery or
+            (state.cancellation_deferred and state.cancellation_intent_retained));
+        try sink.check(allocator, converged_id, !complete or
+            (state.final_ready and state.final_hits == 3 and state.replay_converged and state.cleanup_sound));
+        try sink.check(allocator, complete_id, complete);
+    }
+
+    pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
+        const state = world.state;
+        return state.fixture.sim.healthSnapshot(.{
+            .progress_expected = true,
+            .progress_units = state.progress,
+            .recovery_expected = state.stage == .reopen or state.stage == .cancel_repair,
+            .recovery_complete = state.stage == .complete,
+            .consistency_valid = !state.final_ready or state.replay_converged,
+            .cleanup_complete = state.stage == .complete and state.cleanup_sound,
+        });
+    }
+
+    pub fn done(world: *World) bool {
+        return world.state.stage == .complete;
+    }
+};
+
 fn runManagedOrder(allocator: std.mem.Allocator, order: []const u64) !void {
     var scripted = vopr.choice.Scripted{ .selections = order };
     var artifact = try vopr.runner.run(ManagedAdmissionScenario, allocator, scripted.source(), .{
@@ -713,6 +1223,31 @@ fn runAdmissionMode(allocator: std.mem.Allocator, mode_id: u64) !void {
     }
 }
 
+fn runManagedReadinessMode(allocator: std.mem.Allocator, mode_id: u64) !void {
+    var script = [_]u64{ManagedReadinessScenario.step_id} ** 9;
+    script[0] = mode_id;
+    const script_len: usize = if (mode_id == ManagedReadinessScenario.mode_ids[0])
+        9
+    else if (mode_id == ManagedReadinessScenario.mode_ids[1])
+        7
+    else
+        8;
+    var scripted = vopr.choice.Scripted{ .selections = script[0..script_len] };
+    var artifact = try vopr.runner.run(ManagedReadinessScenario, allocator, scripted.source(), .{
+        .system = "antfly",
+        .transition_budget = 12,
+        .source_revision = "managed-index-readiness-vopr-v1",
+        .target = "native",
+        .optimize = @tagName(builtin.mode),
+    });
+    defer artifact.deinit();
+    try std.testing.expectEqual(@as(u64, 0), artifact.summary.?.property_failures);
+    for (0..5) |_| {
+        var replayed = try vopr.replay.exact(ManagedReadinessScenario, allocator, &artifact);
+        replayed.deinit();
+    }
+}
+
 test "DB index request races VOPR exact replays delete materialize and capture handoff" {
     // Zig's debug allocator captures native stack traces by default, which is
     // not defined while executing on a switched fiber stack. Retain allocator
@@ -726,4 +1261,5 @@ test "DB index request races VOPR exact replays delete materialize and capture h
     try runCaptureOrder(allocator, &.{ capture_begin_id, barrier_begin_id, capture_end_id, barrier_end_id, delete_dense_id });
     try runCaptureOrder(allocator, &.{ barrier_begin_id, capture_begin_id, barrier_end_id, delete_dense_id });
     for (TextAdmissionScenario.mode_ids) |mode_id| try runAdmissionMode(allocator, mode_id);
+    for (ManagedReadinessScenario.mode_ids) |mode_id| try runManagedReadinessMode(allocator, mode_id);
 }
