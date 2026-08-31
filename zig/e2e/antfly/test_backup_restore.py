@@ -290,7 +290,7 @@ def _is_metadata_not_leader_response(response: requests.Response) -> bool:
     return response.headers.get("X-Antfly-Metadata-Not-Leader", "").lower() == "true"
 
 
-def _metadata_quorum_leader_index(
+def _metadata_quorum_leader_id(
     statuses: list[dict | None], *, cluster_size: int
 ) -> int | None:
     """Return a self-confirmed leader backed by a same-term voter quorum.
@@ -342,8 +342,24 @@ def _metadata_quorum_leader_index(
             and self_leader_id == leader_id
             and leader_status.get("metadata_raft_role") == "leader"
         ):
-            return leader_id - 1
+            return leader_id
     return None
+
+
+def _metadata_status_observations(statuses: list[dict | None]) -> list[dict | None]:
+    """Keep leader-discovery failures compact and operationally useful."""
+    fields = (
+        "metadata_raft_local_node_id",
+        "metadata_raft_role",
+        "metadata_raft_leader_id",
+        "metadata_raft_term",
+        "metadata_raft_commit_index",
+        "metadata_raft_local_voter",
+    )
+    return [
+        {field: status.get(field) for field in fields} if status else None
+        for status in statuses
+    ]
 
 
 def _metadata_status(
@@ -370,7 +386,18 @@ def test_metadata_quorum_leader_discovery_tolerates_one_stale_follower() -> None
         _metadata_status(2, term=8, leader_id=2, role="leader"),
         _metadata_status(3, term=7, leader_id=1),
     ]
-    assert _metadata_quorum_leader_index(statuses, cluster_size=3) == 1
+    assert _metadata_quorum_leader_id(statuses, cluster_size=3) == 2
+
+
+def test_metadata_quorum_leader_discovery_keeps_node_ids_truthy() -> None:
+    statuses = [
+        _metadata_status(1, term=8, leader_id=1, role="leader"),
+        _metadata_status(2, term=8, leader_id=1),
+        _metadata_status(3, term=8, leader_id=1),
+    ]
+    # Readiness polling treats falsey values as pending, so carry Raft's
+    # one-based node ID and convert to a zero-based URL index only at the edge.
+    assert _metadata_quorum_leader_id(statuses, cluster_size=3) == 1
 
 
 def test_metadata_quorum_leader_discovery_requires_a_quorum() -> None:
@@ -379,7 +406,7 @@ def test_metadata_quorum_leader_discovery_requires_a_quorum() -> None:
         _metadata_status(2, term=8, leader_id=2, role="leader", voter=False),
         None,
     ]
-    assert _metadata_quorum_leader_index(statuses, cluster_size=3) is None
+    assert _metadata_quorum_leader_id(statuses, cluster_size=3) is None
 
 
 def test_metadata_quorum_leader_discovery_requires_self_confirmation() -> None:
@@ -388,7 +415,7 @@ def test_metadata_quorum_leader_discovery_requires_self_confirmation() -> None:
         _metadata_status(2, term=8, leader_id=2),
         _metadata_status(3, term=7, leader_id=1),
     ]
-    assert _metadata_quorum_leader_index(statuses, cluster_size=3) is None
+    assert _metadata_quorum_leader_id(statuses, cluster_size=3) is None
 
 
 class MultiMetadataBackupCluster:
@@ -563,10 +590,12 @@ class MultiMetadataBackupCluster:
                     f"metadata server failed to start at {url}\n{self.debug_logs()}"
                 )
 
-        if self.metadata_stable_leader_index(timeout_s=30.0) is None:
+        if self.metadata_stable_leader_id(timeout_s=30.0) is None:
             raise RuntimeError(
                 "metadata cluster did not elect a leader; "
-                f"last_statuses={self.last_metadata_statuses!r}\n{self.debug_logs()}"
+                "last_statuses="
+                f"{_metadata_status_observations(self.last_metadata_statuses)!r}\n"
+                f"{self.debug_logs()}"
             )
 
         data_command = self._data_command()
@@ -613,21 +642,21 @@ class MultiMetadataBackupCluster:
         self.last_metadata_statuses = statuses
         return statuses
 
-    def metadata_leader_index_once(self, *, request_timeout_s: float) -> int | None:
+    def metadata_leader_id_once(self, *, request_timeout_s: float) -> int | None:
         statuses = self.metadata_statuses(request_timeout_s=request_timeout_s)
-        return _metadata_quorum_leader_index(
+        return _metadata_quorum_leader_id(
             statuses, cluster_size=len(self.metadata_admin_urls)
         )
 
-    def metadata_leader_index(self, *, timeout_s: float) -> int | None:
+    def metadata_leader_id(self, *, timeout_s: float) -> int | None:
         def current_leader() -> int | None:
-            return self.metadata_leader_index_once(
+            return self.metadata_leader_id_once(
                 request_timeout_s=min(1.0, max(0.05, timeout_s))
             )
 
         return wait_until(current_leader, timeout_s=timeout_s, interval_s=0.25)
 
-    def metadata_stable_leader_index(
+    def metadata_stable_leader_id(
         self,
         *,
         timeout_s: float,
@@ -639,35 +668,37 @@ class MultiMetadataBackupCluster:
 
         def current_stable_leader() -> int | None:
             nonlocal last_leader, observed
-            leader_index = self.metadata_leader_index_once(
+            leader_id = self.metadata_leader_id_once(
                 # Poll cadence and per-request latency are independent. A
                 # 250ms status deadline was too aggressive under loaded CI and
                 # amplified transient scheduler delay into a false outage.
                 request_timeout_s=1.0
             )
-            if leader_index is None:
+            if leader_id is None:
                 last_leader = None
                 observed = 0
                 return None
-            if leader_index == last_leader:
+            if leader_id == last_leader:
                 observed += 1
             else:
-                last_leader = leader_index
+                last_leader = leader_id
                 observed = 1
-            return leader_index if observed >= stable_observations else None
+            return leader_id if observed >= stable_observations else None
 
         return wait_until(
             current_stable_leader, timeout_s=timeout_s, interval_s=interval_s
         )
 
     def metadata_leader_public_url(self, *, timeout_s: float = 30.0) -> str:
-        leader_index = self.metadata_stable_leader_index(timeout_s=timeout_s)
-        if leader_index is None:
+        leader_id = self.metadata_stable_leader_id(timeout_s=timeout_s)
+        if leader_id is None:
             raise AssertionError(
                 "metadata leader unavailable; "
-                f"last_statuses={self.last_metadata_statuses!r}\n{self.debug_logs()}"
+                "last_statuses="
+                f"{_metadata_status_observations(self.last_metadata_statuses)!r}\n"
+                f"{self.debug_logs()}"
             )
-        return self.metadata_public_urls[leader_index]
+        return self.metadata_public_urls[leader_id - 1]
 
     def stop(self) -> None:
         self.port_reservations.close()
