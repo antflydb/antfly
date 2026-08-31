@@ -333,7 +333,7 @@ fn visitGraphQuery(
 
 fn graphQueryDependencyName(selector: anytype) ?[]const u8 {
     return switch (selector) {
-        .keys => null,
+        .keys, .identities => null,
         .result_ref => |result_ref| if (std.mem.startsWith(u8, result_ref.ref, "$graph_results."))
             result_ref.ref["$graph_results.".len..]
         else

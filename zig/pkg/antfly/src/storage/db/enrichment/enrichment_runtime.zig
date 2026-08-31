@@ -2166,6 +2166,33 @@ fn getOrCreateRequestChunks(
     return cache.items[cache.items.len - 1].chunks;
 }
 
+fn inheritProcessTelemetryUnlocked(runtime: anytype, previous: types.EnrichmentStats) void {
+    runtime.processed_requests = @max(runtime.processed_requests, previous.processed_requests);
+    runtime.error_count = @max(runtime.error_count, previous.error_count);
+    runtime.retryable_error_count = @max(runtime.retryable_error_count, previous.retryable_error_count);
+    runtime.fatal_error_count = @max(runtime.fatal_error_count, previous.fatal_error_count);
+    runtime.skip_by_hash_count = @max(runtime.skip_by_hash_count, previous.skip_by_hash_count);
+    runtime.skipped_source_count = @max(runtime.skipped_source_count, previous.skipped_source_count);
+    runtime.codec_decode_failures = @max(runtime.codec_decode_failures, previous.codec_decode_failures);
+    runtime.embed_batches_started = @max(runtime.embed_batches_started, previous.embed_batches_started);
+    runtime.embed_batches_completed = @max(runtime.embed_batches_completed, previous.embed_batches_completed);
+    runtime.embed_items_started = @max(runtime.embed_items_started, previous.embed_items_started);
+    runtime.embed_items_completed = @max(runtime.embed_items_completed, previous.embed_items_completed);
+    if (previous.embed_batches_completed != 0 and
+        previous.last_embed_batch_completed_ms >= runtime.last_embed_batch_completed_ms)
+    {
+        runtime.last_embed_batch_items = previous.last_embed_batch_items;
+        runtime.last_embed_batch_bytes = previous.last_embed_batch_bytes;
+        runtime.last_embed_batch_max_bytes = previous.last_embed_batch_max_bytes;
+        runtime.last_embed_batch_completed_ms = previous.last_embed_batch_completed_ms;
+        runtime.last_embed_batch_ns = previous.last_embed_batch_ns;
+    }
+    runtime.total_embed_ns = @max(runtime.total_embed_ns, previous.total_embed_ns);
+    runtime.dense_artifact_bytes_written = @max(runtime.dense_artifact_bytes_written, previous.dense_artifact_bytes_written);
+    runtime.sparse_artifact_bytes_written = @max(runtime.sparse_artifact_bytes_written, previous.sparse_artifact_bytes_written);
+    runtime.chunk_artifact_bytes_written = @max(runtime.chunk_artifact_bytes_written, previous.chunk_artifact_bytes_written);
+}
+
 pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     alloc: Allocator,
     store: backend_erased.Store,
@@ -2549,6 +2576,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .chunk_artifact_bytes_written = self.chunk_artifact_bytes_written,
             .artifact_bytes_written = self.dense_artifact_bytes_written + self.sparse_artifact_bytes_written + self.chunk_artifact_bytes_written,
         };
+    }
+
+    pub fn inheritProcessTelemetry(self: *@This(), previous: types.EnrichmentStats) void {
+        inheritProcessTelemetryUnlocked(self, previous);
     }
 
     pub fn indexHasIsolatedFailure(self: *@This(), index_name: []const u8) bool {
@@ -3133,6 +3164,16 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .chunk_artifact_bytes_written = self.chunk_artifact_bytes_written,
             .artifact_bytes_written = self.dense_artifact_bytes_written + self.sparse_artifact_bytes_written + self.chunk_artifact_bytes_written,
         };
+    }
+
+    /// Reconfiguration replaces the provider/runtime object without replacing
+    /// the owning DB. Keep cumulative process telemetry monotonic across that
+    /// handoff; durable replay state is reloaded separately before this call.
+    pub fn inheritProcessTelemetry(self: *EnrichmentRuntime, previous: types.EnrichmentStats) void {
+        const maybe_io = if (self.io_impl) |io_impl| io_impl.io() else null;
+        if (maybe_io) |io| self.mutex.lockUncancelable(io);
+        defer if (maybe_io) |io| self.mutex.unlock(io);
+        inheritProcessTelemetryUnlocked(self, previous);
     }
 
     pub fn indexHasIsolatedFailure(self: *EnrichmentRuntime, index_name: []const u8) bool {

@@ -64,6 +64,7 @@ const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-
 const cors_default_exposed_headers = [_][]const u8{
     "X-Request-ID",
     "Retry-After",
+    "Deprecation",
     "X-RateLimit-Limit",
     "X-RateLimit-Remaining",
     "X-RateLimit-Reset",
@@ -2311,6 +2312,7 @@ pub fn runFromIterator(
             .experimental = cli.experimental,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
             .inference_request_admission_source = .{
@@ -6004,7 +6006,7 @@ test "standalone CORS middleware enforces dynamic configuration" {
         try std.testing.expectEqual(@as(u16, 209), response.status.code);
         try std.testing.expectEqualStrings("*", response.headers.get("Access-Control-Allow-Origin").?);
         try std.testing.expectEqualStrings(
-            "X-Request-ID, Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset",
+            "X-Request-ID, Retry-After, Deprecation, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset",
             response.headers.get("Access-Control-Expose-Headers").?,
         );
     }

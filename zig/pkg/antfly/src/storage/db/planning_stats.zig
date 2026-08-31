@@ -535,7 +535,7 @@ fn buildPreflightStructuredFilterProbeRequest(req: types.SearchRequest) types.Se
     probe_req.full_text_queries = &.{};
     probe_req.dense_queries = &.{};
     probe_req.sparse_queries = &.{};
-    probe_req.graph_queries = &.{};
+    probe_req.clearGraphQueries();
     probe_req.merge_config = null;
     probe_req.search_effort = null;
     probe_req.filter_prefix = "";

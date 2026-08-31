@@ -91,7 +91,7 @@ const admin_routes = @import("../admin/routes.zig");
 const internal_routes = @import("../internal/routes.zig");
 
 const ParsedGlobalQueryTable = struct {
-    parsed: std.json.Parsed(metadata_openapi.QueryRequest),
+    parsed: std.json.Parsed(metadata_openapi.StatefulQueryRequest),
     table_name: []const u8,
 
     fn deinit(self: *@This()) void {
@@ -1238,6 +1238,9 @@ pub const AntflyApiHandler = struct {
             error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            error.QueryCandidateBudgetExceeded => textResponse(ctx, 422, "query candidate budget exceeded"),
+            error.GraphExploredEdgesBudgetExceeded => textResponse(ctx, 422, "graph explored edges budget exceeded"),
+            error.GraphExploredEdgeBytesBudgetExceeded => textResponse(ctx, 422, "graph explored edge bytes budget exceeded"),
             else => textResponse(ctx, 500, "internal server error"),
         };
     }
@@ -2004,7 +2007,9 @@ pub const AntflyApiHandler = struct {
         var result = self.internalGroupOperations().graphExpand(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return if (err == error.InvalidArgument) textResponse(ctx, 400, @errorName(err)) else internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
-        return ctx.json(result);
+        const encoded = try distributed_graph.encodeGraphExpandResponse(ctx.allocator, result);
+        defer ctx.allocator.free(encoded);
+        return jsonResponse(ctx, 200, encoded);
     }
 
     fn internalGraphHydrate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -2016,7 +2021,9 @@ pub const AntflyApiHandler = struct {
         var result = self.internalGroupOperations().graphHydrate(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
-        return ctx.json(result);
+        const encoded = try distributed_graph.encodeGraphHydrateResponse(ctx.allocator, result);
+        defer ctx.allocator.free(encoded);
+        return jsonResponse(ctx, 200, encoded);
     }
 
     fn internalGraphEdges(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -2028,7 +2035,9 @@ pub const AntflyApiHandler = struct {
         var result = self.internalGroupOperations().graphEdges(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return if (err == error.InvalidArgument) textResponse(ctx, 400, "invalid graph edges request") else internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
-        return ctx.json(result);
+        const encoded = try distributed_graph.encodeGraphEdgesResponse(ctx.allocator, result);
+        defer ctx.allocator.free(encoded);
+        return jsonResponse(ctx, 200, encoded);
     }
 
     fn internalTextStats(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -2396,7 +2405,7 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         var public_status = try self.api_server.loadClusterStatus(alloc);
         defer public_status.deinit(alloc);
-        return ctx.json(public_status);
+        return ctx.openApiJson(public_status);
     }
 
     pub fn getCluster(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -2406,7 +2415,7 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         var topology = try self.api_server.loadClusterTopology(alloc);
         defer topology.deinit(alloc);
-        return ctx.json(topology);
+        return ctx.openApiJson(topology);
     }
 
     pub fn listConnections(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListConnectionsParams) !httpx.Response {
@@ -2480,7 +2489,7 @@ pub const AntflyApiHandler = struct {
         defer common_secrets.freeListedSecrets(alloc, listed);
         const secret_list = try http_server_mod.makeSecretList(alloc, listed);
         defer alloc.free(secret_list.secrets);
-        return ctx.json(secret_list);
+        return ctx.openApiJson(secret_list);
     }
 
     pub fn putSecret(self: *AntflyApiHandler, ctx: *httpx.Context, key: []const u8) !httpx.Response {
@@ -2509,7 +2518,7 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         defer listed.deinit(alloc);
-        return ctx.json(http_server_mod.makeSecretEntry(listed));
+        return ctx.openApiJson(http_server_mod.makeSecretEntry(listed));
     }
 
     pub fn deleteSecret(self: *AntflyApiHandler, ctx: *httpx.Context, key: []const u8) !httpx.Response {
@@ -2617,7 +2626,7 @@ pub const AntflyApiHandler = struct {
                 null,
             );
             _ = ctx.status(409);
-            return ctx.json(response);
+            return ctx.openApiJson(response);
         }
 
         const commit_request = operationContext(ctx, authenticated_identity);
@@ -2643,7 +2652,7 @@ pub const AntflyApiHandler = struct {
                     null,
                 );
                 _ = ctx.status(409);
-                return ctx.json(response);
+                return ctx.openApiJson(response);
             },
             error.DecisionConflict => {
                 var arena_impl = std.heap.ArenaAllocator.init(alloc);
@@ -2655,7 +2664,7 @@ pub const AntflyApiHandler = struct {
                     null,
                 );
                 _ = ctx.status(409);
-                return ctx.json(response);
+                return ctx.openApiJson(response);
             },
             error.DocIdentityNamespaceMismatch => {
                 var arena_impl = std.heap.ArenaAllocator.init(alloc);
@@ -2667,7 +2676,7 @@ pub const AntflyApiHandler = struct {
                     null,
                 );
                 _ = ctx.status(409);
-                return ctx.json(response);
+                return ctx.openApiJson(response);
             },
             error.TxnNotFound, error.InvalidTxnRecord => {
                 var arena_impl = std.heap.ArenaAllocator.init(alloc);
@@ -2679,7 +2688,7 @@ pub const AntflyApiHandler = struct {
                     null,
                 );
                 _ = ctx.status(409);
-                return ctx.json(response);
+                return ctx.openApiJson(response);
             },
             error.CommitVisibilityNotSatisfied,
             error.EnrichmentWaitCanceled,
@@ -2690,13 +2699,13 @@ pub const AntflyApiHandler = struct {
                 defer arena_impl.deinit();
                 _ = ctx.status(202);
                 return switch (response_mode) {
-                    .transaction => ctx.json(try transactions_api.buildCommitResponse(
+                    .transaction => ctx.openApiJson(try transactions_api.buildCommitResponse(
                         arena_impl.allocator(),
                         "committed_visibility_pending",
                         null,
                         commit_req.tables,
                     )),
-                    .multi_batch => ctx.json(try transactions_api.buildMultiBatchResponse(
+                    .multi_batch => ctx.openApiJson(try transactions_api.buildMultiBatchResponse(
                         arena_impl.allocator(),
                         "committed_visibility_pending",
                         commit_req.tables,
@@ -2708,13 +2717,13 @@ pub const AntflyApiHandler = struct {
                 defer arena_impl.deinit();
                 _ = ctx.status(202);
                 return switch (response_mode) {
-                    .transaction => ctx.json(try transactions_api.buildCommitResponse(
+                    .transaction => ctx.openApiJson(try transactions_api.buildCommitResponse(
                         arena_impl.allocator(),
                         "committed_repair_required",
                         null,
                         commit_req.tables,
                     )),
-                    .multi_batch => ctx.json(try transactions_api.buildMultiBatchResponse(
+                    .multi_batch => ctx.openApiJson(try transactions_api.buildMultiBatchResponse(
                         arena_impl.allocator(),
                         "committed_repair_required",
                         commit_req.tables,
@@ -2726,13 +2735,13 @@ pub const AntflyApiHandler = struct {
                 defer arena_impl.deinit();
                 _ = ctx.status(202);
                 return switch (response_mode) {
-                    .transaction => ctx.json(try transactions_api.buildCommitResponse(
+                    .transaction => ctx.openApiJson(try transactions_api.buildCommitResponse(
                         arena_impl.allocator(),
                         "committed_recovery_pending",
                         null,
                         commit_req.tables,
                     )),
-                    .multi_batch => ctx.json(try transactions_api.buildMultiBatchResponse(
+                    .multi_batch => ctx.openApiJson(try transactions_api.buildMultiBatchResponse(
                         arena_impl.allocator(),
                         "committed_recovery_pending",
                         commit_req.tables,
@@ -2780,7 +2789,7 @@ pub const AntflyApiHandler = struct {
                         const response = try transactions_api.buildCommitResponse(arena_impl.allocator(), status, null, commit_req.tables);
                         if (terminal_status != .committed or committed.visibility_repair_required)
                             _ = ctx.status(202);
-                        return ctx.json(response);
+                        return ctx.openApiJson(response);
                     },
                     .multi_batch => {
                         const terminal_status = transactions_api.terminalCommitStatusForOutcome(
@@ -2795,7 +2804,7 @@ pub const AntflyApiHandler = struct {
                         );
                         const response = try transactions_api.buildMultiBatchResponse(arena_impl.allocator(), status, commit_req.tables);
                         _ = ctx.status(if (terminal_status == .committed and !committed.visibility_repair_required) 201 else 202);
-                        return ctx.json(response);
+                        return ctx.openApiJson(response);
                     },
                 }
             },
@@ -2810,7 +2819,7 @@ pub const AntflyApiHandler = struct {
                     null,
                 );
                 _ = ctx.status(409);
-                return ctx.json(response);
+                return ctx.openApiJson(response);
             },
         }
     }
@@ -2825,7 +2834,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
         const response = try transactions_api.buildSessionListResponse(arena_impl.allocator(), sessions);
-        return ctx.json(response);
+        return ctx.openApiJson(response);
     }
 
     pub fn cleanupTransactionSessions(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.CleanupTransactionSessionsParams) !httpx.Response {
@@ -2845,7 +2854,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("missing cutoff");
         };
         const removed = try self.api_server.cleanupExpiredSessions(cutoff_ns);
-        return ctx.json(transactions_api.buildSessionCleanupResponse(removed, cutoff_ns));
+        return ctx.openApiJson(transactions_api.buildSessionCleanupResponse(removed, cutoff_ns));
     }
 
     pub fn beginTransaction(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -2868,7 +2877,7 @@ pub const AntflyApiHandler = struct {
         defer arena_impl.deinit();
         const response = try transactions_api.buildBeginResponse(arena_impl.allocator(), session);
         _ = ctx.status(201);
-        return ctx.json(response);
+        return ctx.openApiJson(response);
     }
 
     pub fn getTransactionSession(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
@@ -2899,7 +2908,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
         const response = try transactions_api.buildSessionDetailsResponse(arena_impl.allocator(), details);
-        return ctx.json(response);
+        return ctx.openApiJson(response);
     }
 
     pub fn stageTransactionSession(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
@@ -2946,7 +2955,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
         const response = try transactions_api.buildStageResponse(arena_impl.allocator(), session.txn_id);
-        return ctx.json(response);
+        return ctx.openApiJson(response);
     }
 
     pub fn stageTransactionRead(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
@@ -3027,7 +3036,7 @@ pub const AntflyApiHandler = struct {
                 null,
             );
             _ = ctx.status(409);
-            return ctx.json(response);
+            return ctx.openApiJson(response);
         }
 
         var stage_req = try transactions_api.ownedRequestFromStageReadRequest(alloc, read_req);
@@ -3050,7 +3059,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
         const response = try transactions_api.buildStageReadResponse(arena_impl.allocator(), txn_id, owned_snapshot.stage());
-        return ctx.json(response);
+        return ctx.openApiJson(response);
     }
 
     pub fn stageTransactionWrite(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
@@ -3110,7 +3119,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
         const response = try transactions_api.buildStageResponse(arena_impl.allocator(), session.txn_id);
-        return ctx.json(response);
+        return ctx.openApiJson(response);
     }
 
     pub fn createTransactionSavepoint(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
@@ -3148,7 +3157,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
         const response = try transactions_api.buildSavepointResponse(arena_impl.allocator(), info);
-        return ctx.json(response);
+        return ctx.openApiJson(response);
     }
 
     pub fn rollbackTransactionSavepoint(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8, savepoint_id: []const u8) !httpx.Response {
@@ -3186,7 +3195,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
         const response = try transactions_api.buildRollbackResponse(arena_impl.allocator(), info);
-        return ctx.json(response);
+        return ctx.openApiJson(response);
     }
 
     pub fn commitTransactionSession(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
@@ -3239,7 +3248,7 @@ pub const AntflyApiHandler = struct {
                     null,
                 );
                 _ = ctx.status(409);
-                return ctx.json(response);
+                return ctx.openApiJson(response);
             },
             else => return err,
         }) orelse {
@@ -3294,7 +3303,7 @@ pub const AntflyApiHandler = struct {
                 commit_req.tables,
             );
             _ = ctx.status(if (status == .committed and !terminal.repair_required) 200 else 202);
-            return ctx.json(response);
+            return ctx.openApiJson(response);
         }
 
         const distributed_tables = try commit_req.distributedTables(alloc);
@@ -3322,7 +3331,7 @@ pub const AntflyApiHandler = struct {
                 null,
             );
             _ = ctx.status(409);
-            return ctx.json(response);
+            return ctx.openApiJson(response);
         }
 
         if (try self.acquirePublicOperation(ctx, "commitTransactionSession")) |response| return response;
@@ -3375,7 +3384,7 @@ pub const AntflyApiHandler = struct {
                     null,
                 );
                 _ = ctx.status(409);
-                return ctx.json(response);
+                return ctx.openApiJson(response);
             },
             error.DecisionConflict => {
                 _ = self.api_server.txn_sessions.remove(alloc, txn_id);
@@ -3389,7 +3398,7 @@ pub const AntflyApiHandler = struct {
                     null,
                 );
                 _ = ctx.status(409);
-                return ctx.json(response);
+                return ctx.openApiJson(response);
             },
             error.DocIdentityNamespaceMismatch => {
                 _ = self.api_server.txn_sessions.remove(alloc, txn_id);
@@ -3403,7 +3412,7 @@ pub const AntflyApiHandler = struct {
                     null,
                 );
                 _ = ctx.status(409);
-                return ctx.json(response);
+                return ctx.openApiJson(response);
             },
             error.UnsupportedOperation => {
                 _ = self.api_server.txn_sessions.remove(alloc, txn_id);
@@ -3427,7 +3436,7 @@ pub const AntflyApiHandler = struct {
                     null,
                 );
                 _ = ctx.status(409);
-                return ctx.json(response);
+                return ctx.openApiJson(response);
             },
             error.CommitVisibilityNotSatisfied,
             error.EnrichmentWaitCanceled,
@@ -3449,7 +3458,7 @@ pub const AntflyApiHandler = struct {
                     commit_req.tables,
                 );
                 _ = ctx.status(202);
-                return ctx.json(response);
+                return ctx.openApiJson(response);
             },
             error.EnrichmentWorkerFailed => {
                 // Terminal repair debt is also post-commit. Recovery still owns
@@ -3484,7 +3493,7 @@ pub const AntflyApiHandler = struct {
                     commit_req.tables,
                 );
                 _ = ctx.status(202);
-                return ctx.json(response);
+                return ctx.openApiJson(response);
             },
             error.CommitPropagationIncomplete => {
                 _ = ctx.status(503);
@@ -3560,7 +3569,7 @@ pub const AntflyApiHandler = struct {
                     commit_req.tables,
                 );
                 _ = ctx.status(if (status == .committed and !committed.visibility_repair_required) 200 else 202);
-                return ctx.json(response);
+                return ctx.openApiJson(response);
             },
             .conflict => |conflict| {
                 _ = self.api_server.txn_sessions.remove(alloc, txn_id);
@@ -3575,7 +3584,7 @@ pub const AntflyApiHandler = struct {
                     null,
                 );
                 _ = ctx.status(409);
-                return ctx.json(response);
+                return ctx.openApiJson(response);
             },
         }
     }
@@ -3607,7 +3616,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
         const response = try transactions_api.buildAbortResponse(arena_impl.allocator(), txn_id);
-        return ctx.json(response);
+        return ctx.openApiJson(response);
     }
 
     pub fn backup(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3762,7 +3771,7 @@ pub const AntflyApiHandler = struct {
             },
             else => return err,
         };
-        return ctx.json(response);
+        return ctx.openApiJson(response);
     }
 
     pub fn queryBuilderAgent(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3850,6 +3859,7 @@ pub const AntflyApiHandler = struct {
                     return err;
                 };
                 defer query_req.deinit(a);
+                query_req.req.graph_execution_limits = runner.server.cfg.graph_execution_limits;
                 runner.server.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
                     error.TableNotFound => return err,
                     error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidRetrievalAgentRequest,
@@ -4004,7 +4014,7 @@ pub const AntflyApiHandler = struct {
         const response = try std.json.parseFromSliceLeaky(metadata_openapi.RetrievalAgentResult, arena_impl.allocator(), retrieval_resp.body, .{
             .allocate = .alloc_always,
         });
-        return ctx.json(response);
+        return ctx.openApiJson(response);
     }
 
     pub fn listTables(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListTablesParams) !httpx.Response {
@@ -4026,7 +4036,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const response = try tables_api.buildTableListWithStorageStatuses(arena_impl.allocator(), &snapshot, params.prefix, storage_statuses);
-        return ctx.json(response);
+        return ctx.openApiJson(response);
     }
 
     pub fn getTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -4255,7 +4265,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
-        return ctx.json(response);
+        return ctx.openApiJson(response);
     }
 
     pub fn dropTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -4423,7 +4433,7 @@ pub const AntflyApiHandler = struct {
             },
             else => return err,
         };
-        return ctx.json(response);
+        return ctx.openApiJson(response);
     }
 
     pub fn backupTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -4531,7 +4541,7 @@ pub const AntflyApiHandler = struct {
             var arena_impl = std.heap.ArenaAllocator.init(alloc);
             defer arena_impl.deinit();
             const value = try http_server_mod.buildLocalSchemaUpdateStatus(arena_impl.allocator(), decoded_table_name, schema_json);
-            return ctx.json(value);
+            return ctx.openApiJson(value);
         }
         defer metadata_table_manager.freeTable(alloc, table_before.?);
 
@@ -5052,7 +5062,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const current_user = try http_server_mod.makeCurrentUserResponse(arena_impl.allocator(), identity.username, identity.permissions, identity.metadata_json);
-        return ctx.json(current_user);
+        return ctx.openApiJson(current_user);
     }
 
     pub fn listUsers(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -5068,7 +5078,7 @@ pub const AntflyApiHandler = struct {
         defer http_server_mod.freeOwnedStrings(alloc, users);
         const listed_users = try http_server_mod.makeListedUsers(alloc, users);
         defer alloc.free(listed_users);
-        return ctx.json(listed_users);
+        return ctx.openApiJson(listed_users);
     }
 
     pub fn getUserByName(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
@@ -5091,7 +5101,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const generated = try http_server_mod.userToOpenApi(arena_impl.allocator(), user);
-        return ctx.json(generated);
+        return ctx.openApiJson(generated);
     }
 
     pub fn createUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
@@ -5128,7 +5138,7 @@ pub const AntflyApiHandler = struct {
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const generated = try http_server_mod.userToOpenApi(arena_impl.allocator(), created);
-        return ctx.json(generated);
+        return ctx.openApiJson(generated);
     }
 
     pub fn deleteUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
@@ -5175,7 +5185,7 @@ pub const AntflyApiHandler = struct {
             },
             else => return err,
         };
-        return ctx.json(.{ .message = "Password updated successfully" });
+        return ctx.openApiJson(.{ .message = "Password updated successfully" });
     }
 
     pub fn getUserPermissions(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
@@ -5197,7 +5207,7 @@ pub const AntflyApiHandler = struct {
         defer http_server_mod.freePermissions(alloc, permissions);
         const generated_permissions = try http_server_mod.clonePermissionsToOpenApi(alloc, permissions);
         defer alloc.free(generated_permissions);
-        return ctx.json(generated_permissions);
+        return ctx.openApiJson(generated_permissions);
     }
 
     pub fn addPermissionToUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
@@ -5230,7 +5240,7 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         _ = ctx.status(201);
-        return ctx.json(.{ .message = "Permission added successfully" });
+        return ctx.openApiJson(.{ .message = "Permission added successfully" });
     }
 
     pub fn removePermissionFromUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, params: usermgr_openapi.server.RemovePermissionFromUserParams) !httpx.Response {
@@ -5276,7 +5286,7 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         defer http_server_mod.freeOwnedStrings(alloc, roles);
-        return ctx.json(roles);
+        return ctx.openApiJson(roles);
     }
 
     pub fn addRoleToUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
@@ -5309,7 +5319,7 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         _ = ctx.status(201);
-        return ctx.json(.{ .message = "Role added successfully" });
+        return ctx.openApiJson(.{ .message = "Role added successfully" });
     }
 
     pub fn removeRoleFromUser(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, params: usermgr_openapi.server.RemoveRoleFromUserParams) !httpx.Response {
@@ -5344,7 +5354,7 @@ pub const AntflyApiHandler = struct {
         defer http_server_mod.freeAuthSubjects(alloc, subjects);
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
-        return ctx.json(try http_server_mod.authSubjectsToResponse(arena_impl.allocator(), subjects));
+        return ctx.openApiJson(try http_server_mod.authSubjectsToResponse(arena_impl.allocator(), subjects));
     }
 
     pub fn listRowFilters(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
@@ -5371,7 +5381,7 @@ pub const AntflyApiHandler = struct {
         for (row_filters, 0..) |entry, i| {
             generated[i] = try http_server_mod.rowFilterEntryToOpenApi(arena, entry);
         }
-        return ctx.json(generated);
+        return ctx.openApiJson(generated);
     }
 
     pub fn getRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response {
@@ -5397,7 +5407,7 @@ pub const AntflyApiHandler = struct {
             .table = @constCast(table),
             .filter = @constCast(filter_json),
         });
-        return ctx.json(generated);
+        return ctx.openApiJson(generated);
     }
 
     pub fn setRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response {
@@ -5436,7 +5446,7 @@ pub const AntflyApiHandler = struct {
             .table = @constCast(table),
             .filter = @constCast(normalized_filter),
         });
-        return ctx.json(generated);
+        return ctx.openApiJson(generated);
     }
 
     pub fn removeRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response {
@@ -5476,7 +5486,7 @@ pub const AntflyApiHandler = struct {
         for (row_filters, 0..) |entry, i| {
             generated[i] = try http_server_mod.rowFilterEntryToOpenApi(arena, entry);
         }
-        return ctx.json(generated);
+        return ctx.openApiJson(generated);
     }
 
     pub fn getSubjectRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response {
@@ -5502,7 +5512,7 @@ pub const AntflyApiHandler = struct {
             .table = @constCast(table),
             .filter = @constCast(filter_json),
         });
-        return ctx.json(generated);
+        return ctx.openApiJson(generated);
     }
 
     pub fn setSubjectRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response {
@@ -5535,7 +5545,7 @@ pub const AntflyApiHandler = struct {
             .table = @constCast(table),
             .filter = @constCast(normalized_filter),
         });
-        return ctx.json(generated);
+        return ctx.openApiJson(generated);
     }
 
     pub fn removeSubjectRowFilter(self: *AntflyApiHandler, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response {
@@ -5581,7 +5591,7 @@ pub const AntflyApiHandler = struct {
         for (keys, 0..) |api_key, i| {
             generated[i] = try http_server_mod.apiKeyToOpenApi(arena, api_key);
         }
-        return ctx.json(generated);
+        return ctx.openApiJson(generated);
     }
 
     pub fn createApiKey(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8) !httpx.Response {
@@ -5624,7 +5634,7 @@ pub const AntflyApiHandler = struct {
         defer arena_impl.deinit();
         const generated = try http_server_mod.createdApiKeyToOpenApi(arena_impl.allocator(), created);
         _ = ctx.status(201);
-        return ctx.json(generated);
+        return ctx.openApiJson(generated);
     }
 
     pub fn deleteApiKey(self: *AntflyApiHandler, ctx: *httpx.Context, user_name: []const u8, key_id: []const u8) !httpx.Response {

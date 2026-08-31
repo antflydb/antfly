@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const native_endian = builtin.target.cpu.arch.endian();
+const edge_weight = @import("../../../graph/edge_weight.zig");
 
 pub const codec_version: u16 = 1;
 pub const graph_edge_codec_version: u16 = 2;
@@ -273,7 +274,7 @@ pub fn encodeGraphEdgeAlloc(
     updated_at: u64,
     metadata_json: []const u8,
 ) ![]u8 {
-    if (!std.math.isFinite(weight)) return error.InvalidGraphEdgeWeight;
+    try edge_weight.validateStored(weight);
     const payload_len = @sizeOf(u64) * 4 + @sizeOf(u32) + metadata_json.len;
     const total_len = header_len + payload_len;
     const out = try alloc.alloc(u8, total_len);
@@ -300,6 +301,17 @@ pub fn encodeGraphEdgeAlloc(
     pos += @sizeOf(u32);
     @memcpy(out[pos .. pos + metadata_json.len], metadata_json);
     return out;
+}
+
+test "graph edge artifacts reject weights outside the durable domain" {
+    try std.testing.expectError(
+        error.InvalidGraphEdges,
+        encodeGraphEdgeAlloc(std.testing.allocator, null, 1, -0.1, 0, 0, ""),
+    );
+    try std.testing.expectError(
+        error.InvalidGraphEdges,
+        encodeGraphEdgeAlloc(std.testing.allocator, null, 1, std.math.inf(f64), 0, 0, ""),
+    );
 }
 
 pub fn encodePortableUnboundGraphEdgeAlloc(
@@ -391,6 +403,7 @@ pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
         break :blk 0;
     };
     const weight = @as(f64, @bitCast(std.mem.readInt(u64, payload[pos..][0..8], .little)));
+    if (!edge_weight.isStoredValid(weight)) return error.InvalidArtifactPayload;
     pos += @sizeOf(u64);
     const created_at = std.mem.readInt(u64, payload[pos..][0..8], .little);
     pos += @sizeOf(u64);
@@ -609,11 +622,11 @@ test "artifact codec encodes graph edge with version and source hash" {
     try std.testing.expectEqualStrings("{\"k\":1}", decoded.metadata_json);
 }
 
-test "artifact codec rejects non-finite graph weights" {
+test "artifact codec rejects weights outside the durable domain" {
     const alloc = std.testing.allocator;
-    for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |weight| {
+    for ([_]f64{ -0.1, std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |weight| {
         try std.testing.expectError(
-            error.InvalidGraphEdgeWeight,
+            error.InvalidGraphEdges,
             encodeGraphEdgeAlloc(alloc, null, 42, weight, 0, 0, "{}"),
         );
     }

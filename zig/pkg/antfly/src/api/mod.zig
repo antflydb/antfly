@@ -451,16 +451,16 @@ test "api public table query rejects only top-level internal fields" {
     try std.testing.expectEqual(@as(@TypeOf(hierarchy_query.req.return_mode), .parent_with_chunks), hierarchy_query.req.return_mode);
     try std.testing.expectEqual(@as(u32, 2), hierarchy_query.req.max_chunks_per_parent);
     try public_graph_query.rejectInternalDocIdentityFields(alloc,
-        \\{"graph_searches":{"g":{"type":"neighbors","index_name":"graph","start_nodes":{"keys":["doc:a"]}}}}
+        \\{"graph_queries":{"g":{"index":"graph","traverse":{"start":{"keys":["doc:a"]},"max_depth":1}}}}
     );
     try std.testing.expectError(error.InvalidQueryRequest, public_graph_query.rejectInternalDocIdentityFields(alloc,
-        \\{"graph_searches":{"g":{"type":"neighbors","index_name":"graph","start_nodes":{"keys":["doc:a"]}}},"identity_read_generation":1}
+        \\{"graph_queries":{"g":{"index":"graph","traverse":{"start":{"keys":["doc:a"]},"max_depth":1}}},"identity_read_generation":1}
     ));
     try std.testing.expectError(error.InvalidQueryRequest, public_graph_query.rejectInternalDocIdentityFields(alloc,
-        \\{"graph_searches":{"g":{"type":"neighbors","index_name":"graph","start_nodes":{"keys":["doc:a"]}}},"allow_doc_identity_reassignment":true}
+        \\{"graph_queries":{"g":{"index":"graph","traverse":{"start":{"keys":["doc:a"]},"max_depth":1}}},"allow_doc_identity_reassignment":true}
     ));
     try std.testing.expectError(error.InvalidQueryRequest, public_graph_query.rejectInternalDocIdentityFields(alloc,
-        \\{"graph_searches":{"g":{"type":"neighbors","index_name":"graph","start_nodes":{"keys":["doc:a"]}}},"native_doc_id_constraints":{"include_doc_ids":["doc:a"]}}
+        \\{"graph_queries":{"g":{"index":"graph","traverse":{"start":{"keys":["doc:a"]},"max_depth":1}}},"native_doc_id_constraints":{"include_doc_ids":["doc:a"]}}
     ));
 }
 
