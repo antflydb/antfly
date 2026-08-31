@@ -2204,7 +2204,7 @@ test "lite backup output restores schema indexes enrichments and documents" {
         const graph = try searchJson(
             allocator,
             &restored.db,
-            "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"graph_links_v1\",\"start_nodes\":{\"keys\":[\"doc:backup-roundtrip\"]},\"params\":{\"edge_types\":[\"links\"]}}},\"limit\":10}",
+            "{\"graph_queries\":{\"neighbors\":{\"index\":\"graph_links_v1\",\"traverse\":{\"start\":{\"keys\":[\"doc:backup-roundtrip\"]},\"edge_types\":[\"links\"],\"max_depth\":1}}},\"limit\":10}",
         );
         defer allocator.free(graph);
         try std.testing.expect(std.mem.indexOf(u8, graph, "\"doc:backup-target\"") != null);

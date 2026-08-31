@@ -7149,7 +7149,7 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
     defer parsed.deinit();
     const choice = if (parsed.value.choices.len > 0) parsed.value.choices[0] else return error.EmptyResponse;
 
-    print("{s}\n", .{choice.message.content orelse ""});
+    print("{s}\n", .{choice.message.content.valueOrNull() orelse ""});
     if (opts.print_finish_reason or opts.print_token_count) {
         if (opts.print_finish_reason and opts.print_token_count) {
             print("finish_reason={s} tokens={d}\n", .{ @tagName(choice.finish_reason), parsed.value.usage.completion_tokens });
@@ -7165,7 +7165,7 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
             @as(f64, @floatFromInt(parsed.value.usage.completion_tokens)) * 1000.0 / @as(f64, @floatFromInt(total_ms))
         else
             0;
-        if (parsed.value.speculation) |status| {
+        if (parsed.value.speculation.valueOrNull()) |status| {
             const summary = try formatServerSpeculationStatus(allocator, status);
             defer allocator.free(summary);
             print("{s}\n", .{summary});
@@ -7195,7 +7195,7 @@ fn formatServerSpeculationStatus(allocator: std.mem.Allocator, status: api.Gener
     return std.fmt.allocPrint(
         allocator,
         "speculation: policy={s} calibration={s} decision={s} disabled_reason={s}",
-        .{ status.policy, status.calibration, status.decision, status.disabled_reason orelse "none" },
+        .{ status.policy, status.calibration, status.decision, status.disabled_reason.valueOrNull() orelse "none" },
     );
 }
 
@@ -7266,14 +7266,14 @@ pub const ServerGenerateSseWriter = struct {
 
         var parsed = try std.json.parseFromSlice(api.GenerateChunk, self.allocator, data.items, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        if (parsed.value.speculation) |status| {
+        if (parsed.value.speculation.valueOrNull()) |status| {
             const summary = try formatServerSpeculationStatus(self.allocator, status);
             if (self.speculation_summary) |old| self.allocator.free(old);
             self.speculation_summary = summary;
         }
-        if (parsed.value.usage) |usage| self.usage = usage;
+        if (parsed.value.usage.valueOrNull()) |usage| self.usage = usage;
         for (parsed.value.choices) |choice| {
-            if (choice.delta.content) |content| {
+            if (choice.delta.content.valueOrNull()) |content| {
                 print("{s}", .{content});
                 if (self.capture) |capture| {
                     try capture.appendSlice(self.allocator, content);

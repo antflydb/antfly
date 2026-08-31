@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.query_request_expand_strategy import QueryRequestExpandStrategy
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -22,6 +21,7 @@ if TYPE_CHECKING:
     from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
     from ..models.geo_distance_query import GeoDistanceQuery
     from ..models.geo_shape_query import GeoShapeQuery
+    from ..models.graph_queries import GraphQueries
     from ..models.ip_range_query import IPRangeQuery
     from ..models.join_clause import JoinClause
     from ..models.match_all_query import MatchAllQuery
@@ -39,7 +39,6 @@ if TYPE_CHECKING:
     from ..models.query_request_aggregations import QueryRequestAggregations
     from ..models.query_request_embeddings import QueryRequestEmbeddings
     from ..models.query_request_foreign_sources import QueryRequestForeignSources
-    from ..models.query_request_graph_searches import QueryRequestGraphSearches
     from ..models.query_request_query import QueryRequestQuery
     from ..models.query_string_query import QueryStringQuery
     from ..models.regexp_query import RegexpQuery
@@ -56,8 +55,9 @@ T = TypeVar("T", bound="RetrievalQueryRequest")
 
 @_attrs_define
 class RetrievalQueryRequest:
-    r"""A query in the retrieval pipeline. Extends QueryRequest with an optional
-    tree search configuration. Each query specifies its own table.
+    r"""A canonical query in the retrieval pipeline with an optional tree search
+    configuration. Each query specifies its own table. Deprecated stateful
+    graph_searches compatibility is intentionally unavailable here.
 
     When both search fields (semantic_search, full_text_search) and tree_search
     are provided, the search results are used as start nodes for tree navigation.
@@ -301,12 +301,9 @@ class RetrievalQueryRequest:
             reranker (RerankerConfig | Unset): A unified configuration for a reranking provider. Example: {'provider':
                 'ollama', 'model': 'dengcao/Qwen3-Reranker-0.6B:F16', 'field': 'content'}.
             analyses (Analyses | Unset):
-            graph_searches (QueryRequestGraphSearches | Unset): Declarative graph queries to execute after full-text/vector
-                searches.
-                Results can reference search results using node selectors like $full_text_results.
-            expand_strategy (QueryRequestExpandStrategy | Unset): Strategy for merging graph results with search results:
-                - union: Include nodes from both search and graph results
-                - intersection: Only include nodes appearing in both
+            graph_queries (GraphQueries | Unset): Named canonical graph operations. When graph_queries is present it must
+                contain at least one operation. A request may contain at most 64 operations, of which at most eight may be MATCH
+                operations. Keys use the versioned GraphIdentifier policy.
             document_renderer (str | Unset): Optional Handlebars template string for rendering document content in RAG
                 queries.
                 Template has access to document fields via `{{this.fields.fieldName}}`.
@@ -357,7 +354,7 @@ class RetrievalQueryRequest:
                 product catalogs, etc.) without ingesting that data into Antfly.
 
                 **Supported operations on foreign tables:** filter_query, field selection, limit/offset.
-                **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker.
+                **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker.
 
                 **Example - Join Antfly products with Postgres customers:**
                 ```json
@@ -494,8 +491,7 @@ class RetrievalQueryRequest:
     profile: bool | Unset = UNSET
     reranker: RerankerConfig | Unset = UNSET
     analyses: Analyses | Unset = UNSET
-    graph_searches: QueryRequestGraphSearches | Unset = UNSET
-    expand_strategy: QueryRequestExpandStrategy | Unset = UNSET
+    graph_queries: GraphQueries | Unset = UNSET
     document_renderer: str | Unset = UNSET
     pruner: Pruner | Unset = UNSET
     join: JoinClause | Unset = UNSET
@@ -775,13 +771,9 @@ class RetrievalQueryRequest:
         if not isinstance(self.analyses, Unset):
             analyses = self.analyses.to_dict()
 
-        graph_searches: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.graph_searches, Unset):
-            graph_searches = self.graph_searches.to_dict()
-
-        expand_strategy: str | Unset = UNSET
-        if not isinstance(self.expand_strategy, Unset):
-            expand_strategy = self.expand_strategy.value
+        graph_queries: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.graph_queries, Unset):
+            graph_queries = self.graph_queries.to_dict()
 
         document_renderer = self.document_renderer
 
@@ -860,10 +852,8 @@ class RetrievalQueryRequest:
             field_dict["reranker"] = reranker
         if analyses is not UNSET:
             field_dict["analyses"] = analyses
-        if graph_searches is not UNSET:
-            field_dict["graph_searches"] = graph_searches
-        if expand_strategy is not UNSET:
-            field_dict["expand_strategy"] = expand_strategy
+        if graph_queries is not UNSET:
+            field_dict["graph_queries"] = graph_queries
         if document_renderer is not UNSET:
             field_dict["document_renderer"] = document_renderer
         if pruner is not UNSET:
@@ -891,6 +881,7 @@ class RetrievalQueryRequest:
         from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
         from ..models.geo_distance_query import GeoDistanceQuery
         from ..models.geo_shape_query import GeoShapeQuery
+        from ..models.graph_queries import GraphQueries
         from ..models.ip_range_query import IPRangeQuery
         from ..models.join_clause import JoinClause
         from ..models.match_all_query import MatchAllQuery
@@ -908,7 +899,6 @@ class RetrievalQueryRequest:
         from ..models.query_request_aggregations import QueryRequestAggregations
         from ..models.query_request_embeddings import QueryRequestEmbeddings
         from ..models.query_request_foreign_sources import QueryRequestForeignSources
-        from ..models.query_request_graph_searches import QueryRequestGraphSearches
         from ..models.query_request_query import QueryRequestQuery
         from ..models.query_string_query import QueryStringQuery
         from ..models.regexp_query import RegexpQuery
@@ -1735,19 +1725,12 @@ class RetrievalQueryRequest:
         else:
             analyses = Analyses.from_dict(_analyses)
 
-        _graph_searches = d.pop("graph_searches", UNSET)
-        graph_searches: QueryRequestGraphSearches | Unset
-        if isinstance(_graph_searches, Unset):
-            graph_searches = UNSET
+        _graph_queries = d.pop("graph_queries", UNSET)
+        graph_queries: GraphQueries | Unset
+        if isinstance(_graph_queries, Unset):
+            graph_queries = UNSET
         else:
-            graph_searches = QueryRequestGraphSearches.from_dict(_graph_searches)
-
-        _expand_strategy = d.pop("expand_strategy", UNSET)
-        expand_strategy: QueryRequestExpandStrategy | Unset
-        if isinstance(_expand_strategy, Unset):
-            expand_strategy = UNSET
-        else:
-            expand_strategy = QueryRequestExpandStrategy(_expand_strategy)
+            graph_queries = GraphQueries.from_dict(_graph_queries)
 
         document_renderer = d.pop("document_renderer", UNSET)
 
@@ -1808,8 +1791,7 @@ class RetrievalQueryRequest:
             profile=profile,
             reranker=reranker,
             analyses=analyses,
-            graph_searches=graph_searches,
-            expand_strategy=expand_strategy,
+            graph_queries=graph_queries,
             document_renderer=document_renderer,
             pruner=pruner,
             join=join,

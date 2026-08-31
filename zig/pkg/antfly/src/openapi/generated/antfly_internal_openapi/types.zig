@@ -7,6 +7,31 @@ pub const HACreateReplicationSlotRequest = struct {
     slot_name: HASlotName,
     /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
     initial_lsn: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "slot_name", "slot_name", false },
+        .{ "initial_lsn", "initial_lsn", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("slot_name");
+        try jw.write(self.slot_name);
+        if (self.initial_lsn) |value| {
+            try jw.objectField("initial_lsn");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
@@ -118,8 +143,42 @@ pub const HAReplicationSlotResponse = struct {
     safe_read_lsn: i64,
     active: bool,
     reseed_required: bool,
-    last_error: ?[]const u8 = null,
+    last_error: OpenApiOptionalNullable([]const u8) = .absent,
     current_lsn: i64,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("slot_name");
+        try jw.write(self.slot_name);
+        try jw.objectField("timeline_id");
+        try jw.write(self.timeline_id);
+        try jw.objectField("restart_lsn");
+        try jw.write(self.restart_lsn);
+        try jw.objectField("received_lsn");
+        try jw.write(self.received_lsn);
+        try jw.objectField("applied_lsn");
+        try jw.write(self.applied_lsn);
+        try jw.objectField("safe_read_lsn");
+        try jw.write(self.safe_read_lsn);
+        try jw.objectField("active");
+        try jw.write(self.active);
+        try jw.objectField("reseed_required");
+        try jw.write(self.reseed_required);
+        switch (self.last_error) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_error");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_error");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("current_lsn");
+        try jw.write(self.current_lsn);
+        try jw.endObject();
+    }
 };
 
 /// Stable standby replication slot name.
@@ -132,6 +191,40 @@ pub const HAStandbyStatusUpdateRequest = struct {
     applied_lsn: i64,
     /// Optional safe-read boundary. Defaults to applied_lsn.
     safe_read_lsn: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "slot_name", "slot_name", false },
+        .{ "timeline_id", "timeline_id", false },
+        .{ "received_lsn", "received_lsn", false },
+        .{ "applied_lsn", "applied_lsn", false },
+        .{ "safe_read_lsn", "safe_read_lsn", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("slot_name");
+        try jw.write(self.slot_name);
+        try jw.objectField("timeline_id");
+        try jw.write(self.timeline_id);
+        try jw.objectField("received_lsn");
+        try jw.write(self.received_lsn);
+        try jw.objectField("applied_lsn");
+        try jw.write(self.applied_lsn);
+        if (self.safe_read_lsn) |value| {
+            try jw.objectField("safe_read_lsn");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HAStandbyStatusUpdateResponse = struct {
@@ -143,8 +236,42 @@ pub const HAStandbyStatusUpdateResponse = struct {
     safe_read_lsn: i64,
     active: bool,
     reseed_required: bool,
-    last_error: ?[]const u8 = null,
+    last_error: OpenApiOptionalNullable([]const u8) = .absent,
     current_lsn: i64,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("slot_name");
+        try jw.write(self.slot_name);
+        try jw.objectField("timeline_id");
+        try jw.write(self.timeline_id);
+        try jw.objectField("restart_lsn");
+        try jw.write(self.restart_lsn);
+        try jw.objectField("received_lsn");
+        try jw.write(self.received_lsn);
+        try jw.objectField("applied_lsn");
+        try jw.write(self.applied_lsn);
+        try jw.objectField("safe_read_lsn");
+        try jw.write(self.safe_read_lsn);
+        try jw.objectField("active");
+        try jw.write(self.active);
+        try jw.objectField("reseed_required");
+        try jw.write(self.reseed_required);
+        switch (self.last_error) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_error");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_error");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("current_lsn");
+        try jw.write(self.current_lsn);
+        try jw.endObject();
+    }
 };
 
 pub const HAStartReplicationRequest = struct {
@@ -154,6 +281,39 @@ pub const HAStartReplicationRequest = struct {
     max_records: ?i64 = null,
     /// Optional encoded byte budget. Zero means no byte limit.
     max_encoded_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "slot_name", "slot_name", false },
+        .{ "from_lsn", "from_lsn", false },
+        .{ "max_records", "max_records", true },
+        .{ "max_encoded_bytes", "max_encoded_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("slot_name");
+        try jw.write(self.slot_name);
+        try jw.objectField("from_lsn");
+        try jw.write(self.from_lsn);
+        if (self.max_records) |value| {
+            try jw.objectField("max_records");
+            try jw.write(value);
+        }
+        if (self.max_encoded_bytes) |value| {
+            try jw.objectField("max_encoded_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HAStartReplicationResponse = struct {
@@ -169,3 +329,152 @@ pub const HAStartReplicationResponse = struct {
     encoded_bytes: i64,
     records: []const HAReplicationFrame,
 };
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+            if (source == .null) return .null_value;
+            return .{ .value = try std.json.parseFromValueLeaky(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}
+
+/// Parse an OpenAPI object without materializing a second JSON tree while
+/// rejecting explicit null for optional properties whose schemas are non-nullable.
+fn openApiParseObject(
+    comptime T: type,
+    comptime openapi_fields: anytype,
+    allocator: std.mem.Allocator,
+    source: anytype,
+    options: std.json.ParseOptions,
+) !T {
+    @setEvalBranchQuota(100_000);
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (openapi_fields.len != struct_info.fields.len) @compileError("OpenAPI object field descriptors must match the generated struct");
+    if (.object_begin != try source.next()) return error.UnexpectedToken;
+
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    while (true) {
+        var name_token: ?std.json.Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+        const field_name = switch (name_token.?) {
+            inline .string, .allocated_string => |slice| slice,
+            .object_end => break,
+            else => return error.UnexpectedToken,
+        };
+
+        inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field[0], field_name)) {
+                openApiFreeAllocatedToken(allocator, name_token.?);
+                name_token = null;
+                if (openapi_field[2] and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
+                if (fields_seen[i]) {
+                    switch (options.duplicate_field_behavior) {
+                        .use_first => {
+                            _ = try std.json.innerParse(field.type, allocator, source, options);
+                            break;
+                        },
+                        .@"error" => return error.DuplicateField,
+                        .use_last => {},
+                    }
+                }
+                @field(result, field.name) = try std.json.innerParse(field.type, allocator, source, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else {
+            openApiFreeAllocatedToken(allocator, name_token.?);
+            if (options.ignore_unknown_fields) try source.skipValue() else return error.UnknownField;
+        }
+    }
+    try openApiFillDefaultStructValues(T, openapi_fields, &result, &fields_seen);
+    return result;
+}
+
+fn openApiParseObjectFromValue(
+    comptime T: type,
+    comptime openapi_fields: anytype,
+    allocator: std.mem.Allocator,
+    source: std.json.Value,
+    options: std.json.ParseOptions,
+) !T {
+    @setEvalBranchQuota(100_000);
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (openapi_fields.len != struct_info.fields.len) @compileError("OpenAPI object field descriptors must match the generated struct");
+    if (source != .object) return error.UnexpectedToken;
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    var it = source.object.iterator();
+    while (it.next()) |entry| {
+        const field_name = entry.key_ptr.*;
+        inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field[0], field_name)) {
+                if (openapi_field[2] and entry.value_ptr.* == .null) return error.UnexpectedToken;
+                @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else if (!options.ignore_unknown_fields) return error.UnknownField;
+    }
+    try openApiFillDefaultStructValues(T, openapi_fields, &result, &fields_seen);
+    return result;
+}
+
+fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: anytype, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+    @setEvalBranchQuota(100_000);
+    inline for (@typeInfo(T).@"struct".fields, openapi_fields, 0..) |field, openapi_field, i| {
+        if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+        if (!fields_seen[i]) {
+            if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
+        }
+    }
+}
+
+fn openApiFreeAllocatedToken(allocator: std.mem.Allocator, token: std.json.Token) void {
+    switch (token) {
+        .allocated_number, .allocated_string => |slice| allocator.free(slice),
+        else => {},
+    }
+}

@@ -1,4 +1,4 @@
-import type { AntflyClient, GraphQueryResult, IndexStatus, QueryRequest } from "@antfly/sdk";
+import type { AntflyClient, GraphResult, IndexStatus, TableQueryRequest } from "@antfly/sdk";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { GraphIndexExplorer } from "../components/GraphIndexExplorer";
 import { ApiConfigContext } from "../contexts/api-config-context";
@@ -59,102 +59,137 @@ const graphIndex = {
   },
 } as unknown as IndexStatus;
 
-const traversalResult: GraphQueryResult = {
-  type: "traverse",
-  total: 5,
+const traversalResult: GraphResult = {
+  kind: "nodes",
   nodes: [
     {
       key: "paper:vector-db",
       depth: 1,
-      distance: 0.92,
       document: documents["paper:vector-db"],
-      path: ["paper:graph-rag", "paper:vector-db"],
+      path: [{ key: "paper:graph-rag" }, { key: "paper:vector-db" }],
       path_edges: [
-        { source: "paper:graph-rag", target: "paper:vector-db", type: "cites", weight: 0.92 },
-      ],
-      edges: [
-        { source: "paper:vector-db", target: "paper:path-ranking", type: "extends", weight: 0.78 },
-        { source: "paper:vector-db", target: "paper:entity-links", type: "mentions", weight: 0.64 },
+        {
+          from: { key: "paper:graph-rag" },
+          to: { key: "paper:vector-db" },
+          direction: "out",
+          type: "cites",
+          weight: 0.92,
+        },
       ],
     },
     {
       key: "paper:path-ranking",
       depth: 2,
-      distance: 1.7,
       document: documents["paper:path-ranking"],
-      path: ["paper:graph-rag", "paper:vector-db", "paper:path-ranking"],
+      path: [{ key: "paper:graph-rag" }, { key: "paper:vector-db" }, { key: "paper:path-ranking" }],
       path_edges: [
-        { source: "paper:graph-rag", target: "paper:vector-db", type: "cites", weight: 0.92 },
-        { source: "paper:vector-db", target: "paper:path-ranking", type: "extends", weight: 0.78 },
+        {
+          from: { key: "paper:graph-rag" },
+          to: { key: "paper:vector-db" },
+          direction: "out",
+          type: "cites",
+          weight: 0.92,
+        },
+        {
+          from: { key: "paper:vector-db" },
+          to: { key: "paper:path-ranking" },
+          direction: "out",
+          type: "extends",
+          weight: 0.78,
+        },
       ],
     },
     {
       key: "paper:agent-memory",
       depth: 1,
-      distance: 0.88,
       document: documents["paper:agent-memory"],
-      path: ["paper:graph-rag", "paper:agent-memory"],
+      path: [{ key: "paper:graph-rag" }, { key: "paper:agent-memory" }],
       path_edges: [
-        { source: "paper:graph-rag", target: "paper:agent-memory", type: "extends", weight: 0.88 },
-      ],
-      edges: [
         {
-          source: "paper:agent-memory",
-          target: "paper:entity-links",
-          type: "mentions",
-          weight: 0.72,
+          from: { key: "paper:graph-rag" },
+          to: { key: "paper:agent-memory" },
+          direction: "out",
+          type: "extends",
+          weight: 0.88,
         },
       ],
     },
     {
       key: "paper:entity-links",
       depth: 2,
-      distance: 1.6,
       document: documents["paper:entity-links"],
-      path: ["paper:graph-rag", "paper:agent-memory", "paper:entity-links"],
+      path: [
+        { key: "paper:graph-rag" },
+        { key: "paper:agent-memory" },
+        { key: "paper:entity-links" },
+      ],
       path_edges: [
-        { source: "paper:graph-rag", target: "paper:agent-memory", type: "extends", weight: 0.88 },
         {
-          source: "paper:agent-memory",
-          target: "paper:entity-links",
+          from: { key: "paper:graph-rag" },
+          to: { key: "paper:agent-memory" },
+          direction: "out",
+          type: "extends",
+          weight: 0.88,
+        },
+        {
+          from: { key: "paper:agent-memory" },
+          to: { key: "paper:entity-links" },
+          direction: "out",
           type: "mentions",
           weight: 0.72,
         },
       ],
     },
   ],
+  stats: { returned_items: 4, truncated: false },
 };
 
-const shortestPathResult: GraphQueryResult = {
-  type: "shortest_path",
-  total: 1,
+const shortestPathResult: GraphResult = {
+  kind: "paths",
   paths: [
     {
-      nodes: ["paper:graph-rag", "paper:agent-memory", "paper:entity-links"],
-      edges: [
-        { source: "paper:graph-rag", target: "paper:agent-memory", type: "extends", weight: 0.88 },
-        {
-          source: "paper:agent-memory",
-          target: "paper:entity-links",
-          type: "mentions",
-          weight: 0.72,
-        },
-      ],
-      total_weight: 0.63,
+      path: {
+        nodes: [
+          { key: "paper:graph-rag" },
+          { key: "paper:agent-memory" },
+          { key: "paper:entity-links" },
+        ],
+        edges: [
+          {
+            from: { key: "paper:graph-rag" },
+            to: { key: "paper:agent-memory" },
+            direction: "out",
+            type: "extends",
+            weight: 0.88,
+          },
+          {
+            from: { key: "paper:agent-memory" },
+            to: { key: "paper:entity-links" },
+            direction: "out",
+            type: "mentions",
+            weight: 0.72,
+          },
+        ],
+        length: 2,
+        objective: "min_hops",
+        weight_sum: 1.6,
+        objective_value: 2,
+      },
     },
   ],
+  stats: { returned_items: 1 },
 };
 
-function graphResultFor(request: QueryRequest): GraphQueryResult {
-  const query = request.graph_searches?.explorer;
-  if (query?.type === "shortest_path") return shortestPathResult;
+function graphResultFor(request: TableQueryRequest): GraphResult {
+  const query = request.graph_queries?.explorer;
+  if (query && "shortest_path" in query) return shortestPathResult;
   return traversalResult;
 }
 
 const fakeClient = {
   tables: {
-    query: async (_tableName: string, request: QueryRequest) => {
-      if (!request.graph_searches) {
+    query: async (_tableName: string, request: TableQueryRequest) => {
+      if (!request.graph_queries) {
         return {
           responses: [
             {

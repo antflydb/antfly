@@ -65,6 +65,10 @@ pub fn parseRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedLinearMerg
 
     var it = records_value.object.iterator();
     while (it.next()) |entry| {
+        // Linear merge is a public document-ingestion surface just like
+        // BatchRequest.inserts. Reject scalars before hashing or storage so a
+        // successful merge can always be represented as QueryHit._source.
+        if (entry.value_ptr.* != .object) return error.InvalidLinearMergeRequest;
         writes[initialized] = .{
             .key = try alloc.dupe(u8, entry.key_ptr.*),
             .value = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.*, .{}),
@@ -314,6 +318,24 @@ test "linear merge request parser accepts raw payload value under public request
 
     try std.testing.expectEqual(@as(usize, 1), req.writes.len);
     try std.testing.expect(std.mem.indexOf(u8, req.writes[0].value, "\"raw_payload\"") != null);
+}
+
+test "linear merge request parser rejects non-object records" {
+    inline for (.{
+        \\{"records":{"doc:a":"text"}}
+        ,
+        \\{"records":{"doc:a":42}}
+        ,
+        \\{"records":{"doc:a":[1,2]}}
+        ,
+        \\{"records":{"doc:a":null}}
+        ,
+    }) |body| {
+        try std.testing.expectError(
+            error.InvalidLinearMergeRequest,
+            parseRequest(std.testing.allocator, body),
+        );
+    }
 }
 
 test "linear merge request parser accepts explicit final cleanup" {

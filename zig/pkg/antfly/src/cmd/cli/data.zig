@@ -84,10 +84,10 @@ pub fn insert(allocator: std.mem.Allocator, _: std.Io, client: *antfly_client.An
     const k = options.key orelse cli.fatal("--key is required", .{});
     const v = options.value_json orelse cli.fatal("--document is required", .{});
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, v, .{});
+    var parsed = try std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator, v, .{});
     defer parsed.deinit();
 
-    var inserts: std.json.ArrayHashMap(std.json.Value) = .{};
+    var inserts: std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)) = .{};
     defer inserts.deinit(allocator);
     try inserts.map.put(allocator, k, parsed.value);
 
@@ -350,7 +350,7 @@ const LineScanner = struct {
 const BatchBuilder = struct {
     parent_alloc: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
-    inserts: std.json.ArrayHashMap(std.json.Value) = .{},
+    inserts: std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)) = .{},
     docs: usize = 0,
     bytes: usize = 0,
 
@@ -457,7 +457,7 @@ const LoadProcessor = struct {
 
         _ = self.line_arena.reset(.retain_capacity);
         const line_alloc = self.line_arena.allocator();
-        const parsed_for_id = std.json.parseFromSliceLeaky(std.json.Value, line_alloc, line.bytes, .{
+        const parsed_for_id = std.json.parseFromSliceLeaky(std.json.ArrayHashMap(std.json.Value), line_alloc, line.bytes, .{
             .allocate = .alloc_always,
         }) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -471,7 +471,7 @@ const LoadProcessor = struct {
         };
 
         const batch_alloc = self.batch.allocator();
-        const doc_id = self.documentId(batch_alloc, parsed_for_id, line.bytes) catch |err| switch (err) {
+        const doc_id = self.documentId(batch_alloc, .{ .object = parsed_for_id.map }, line.bytes) catch |err| switch (err) {
             error.BadDocumentId => {
                 self.last_committed_offset = line.end_offset;
                 self.last_committed_line = line.line_number;
@@ -483,7 +483,7 @@ const LoadProcessor = struct {
         if (is_duplicate) {
             self.stats.duplicate_in_batch += 1;
         }
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, batch_alloc, line.bytes, .{
+        const parsed = std.json.parseFromSliceLeaky(std.json.ArrayHashMap(std.json.Value), batch_alloc, line.bytes, .{
             .allocate = .alloc_always,
         }) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -1190,8 +1190,8 @@ test "load processor allocates parsed strings independent of streaming buffer" {
     try std.testing.expectEqual(@as(usize, 2), processor.batch.docs);
     const doc1 = processor.batch.inserts.map.get("doc-1").?;
     const doc2 = processor.batch.inserts.map.get("doc-2").?;
-    try std.testing.expectEqualStrings("first boundary value", doc1.object.get("body").?.string);
-    try std.testing.expectEqualStrings("second boundary value", doc2.object.get("body").?.string);
+    try std.testing.expectEqualStrings("first boundary value", doc1.map.get("body").?.string);
+    try std.testing.expectEqualStrings("second boundary value", doc2.map.get("body").?.string);
 }
 
 test "load processor rejects malformed json and bad ids" {
@@ -1277,7 +1277,7 @@ test "load processor handles duplicate ids as last write wins without inflating 
     try std.testing.expectEqual(@as(u64, 0), processor.stats.rejected());
     try std.testing.expectEqual(@as(u64, 37), processor.last_committed_offset);
     const doc = processor.batch.inserts.map.get("dup").?;
-    try std.testing.expectEqual(@as(i64, 2), doc.object.get("v").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), doc.map.get("v").?.integer);
 }
 
 test "load processor renders ids from handlebars template" {

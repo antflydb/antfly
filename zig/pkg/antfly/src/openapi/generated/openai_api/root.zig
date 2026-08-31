@@ -927,3 +927,4 @@ pub const WebhookResponseIncomplete = types.WebhookResponseIncomplete;
 pub const WidgetMessageItem = types.WidgetMessageItem;
 pub const WorkflowParam = types.WorkflowParam;
 pub const WorkflowTracingParam = types.WorkflowTracingParam;
+pub const StopConfigurationValue = types.StopConfigurationValue;

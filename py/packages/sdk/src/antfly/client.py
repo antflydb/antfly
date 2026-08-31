@@ -2,6 +2,7 @@
 
 import base64
 import json
+import math
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any, TypeAlias, cast
@@ -28,6 +29,11 @@ from antfly.client_generated.models import (
     EmbedderConfig,
     EmbedderProvider,
     Error,
+    GraphKShortestPathsQuery,
+    GraphMatchQuery,
+    GraphQueries,
+    GraphShortestPathQuery,
+    GraphTraverseQuery,
     InferenceGenerateChunk,
     InferenceGenerateRequest,
     InferenceGenerateResponse,
@@ -42,6 +48,8 @@ from .exceptions import (
     InferenceCapacityError,
     StorageResourceExhaustedError,
 )
+from .graph_queries import require_graph_identifier as _require_graph_identifier
+from .graph_results import decode_query_responses
 from .index_config import validate_create_index_request_relationships
 
 DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20
@@ -54,11 +62,16 @@ MAX_INFERENCE_ERROR_BYTES = 1 << 20
 MAX_GENERATION_RESPONSE_BYTES = 16 << 20
 MAX_GENERATION_SSE_EVENT_BYTES = 16 << 20
 MAX_GENERATION_SSE_LINE_BYTES = 16 << 20
+MAX_GRAPH_EDGE_TYPES = 64
+MAX_GRAPH_EDGE_TYPE_UTF8_BYTES = 64 << 10
+MAX_GRAPH_MATCH_QUERIES = 8
 
 CreateIndexRequest: TypeAlias = (
     CreateFullTextIndexRequest | CreateEmbeddingsIndexRequest | CreateGraphIndexRequest | CreateAlgebraicIndexRequest
 )
 CreatedIndex: TypeAlias = CreatedFullTextIndex | CreatedEmbeddingsIndex | CreatedGraphIndex | CreatedAlgebraicIndex
+GraphQueryInput: TypeAlias = GraphMatchQuery | GraphTraverseQuery | GraphShortestPathQuery | GraphKShortestPathsQuery
+GraphQueriesInput: TypeAlias = GraphQueries | Mapping[str, GraphQueryInput | Mapping[str, Any]]
 _CREATE_INDEX_REQUEST_TYPES = (
     CreateFullTextIndexRequest,
     CreateEmbeddingsIndexRequest,
@@ -71,6 +84,253 @@ _CREATED_INDEX_TYPES = {
     "graph": CreatedGraphIndex,
     "algebraic": CreatedAlgebraicIndex,
 }
+
+MAX_GRAPH_HYDRATED_BINDINGS = 10_000
+
+
+def _require_graph_table_qualifier(value: object, path: str) -> None:
+    if not isinstance(value, str) or not any(char not in " \t\r\n" for char in value):
+        raise AntflyException(f"{path} must contain a non-whitespace character")
+
+
+def _validate_graph_hydration(value: Mapping[str, Any], path: str, *, binding_count: int | None = None) -> None:
+    if "fields" in value and value.get("include_documents") is not True:
+        raise AntflyException(f"{path}.fields requires include_documents=true")
+    if binding_count is None or value.get("include_documents") is not True:
+        return
+    raw_limit = value.get("limit", 100)
+    if type(raw_limit) is int and raw_limit * binding_count > MAX_GRAPH_HYDRATED_BINDINGS:
+        raise AntflyException(
+            f"{path} hydration requests {raw_limit * binding_count} binding documents; "
+            f"the maximum is {MAX_GRAPH_HYDRATED_BINDINGS}"
+        )
+
+
+def _require_graph_edge_types(value: object, path: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, list) or len(value) > MAX_GRAPH_EDGE_TYPES:
+        raise AntflyException(f"{path} must contain at most {MAX_GRAPH_EDGE_TYPES} edge types")
+    seen: set[str] = set()
+    total_bytes = 0
+    for index, edge_type in enumerate(value):
+        if not isinstance(edge_type, str) or not edge_type:
+            raise AntflyException(f"{path}[{index}] must be a non-empty valid UTF-8 string")
+        try:
+            encoded_len = len(edge_type.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise AntflyException(f"{path}[{index}] must be a non-empty valid UTF-8 string") from exc
+        if edge_type in seen:
+            raise AntflyException(f"{path} must not contain duplicate edge types")
+        seen.add(edge_type)
+        total_bytes += encoded_len
+        if total_bytes > MAX_GRAPH_EDGE_TYPE_UTF8_BYTES:
+            raise AntflyException(f"{path} must encode to at most {MAX_GRAPH_EDGE_TYPE_UTF8_BYTES} UTF-8 bytes")
+
+
+def _validate_graph_edge_weight(value: Mapping[str, Any], path: str) -> None:
+    if "edge_weight" not in value:
+        return
+    raw_range = value["edge_weight"]
+    if not isinstance(raw_range, Mapping):
+        raise AntflyException(f"{path}.edge_weight must be an object with min and/or max")
+    if not raw_range or any(field not in {"min", "max"} for field in raw_range):
+        raise AntflyException(f"{path}.edge_weight must contain min and/or max only")
+    bounds: dict[str, float] = {}
+    for field, label in (("min", "minimum"), ("max", "maximum")):
+        if field not in raw_range:
+            continue
+        bound = raw_range[field]
+        if isinstance(bound, bool) or not isinstance(bound, (int, float)):
+            raise AntflyException(f"{path}.edge_weight.{field} must be a finite non-negative number")
+        try:
+            normalized = float(bound)
+        except (OverflowError, ValueError) as exc:
+            raise AntflyException(f"{path}.edge_weight.{field} must be a finite non-negative number") from exc
+        if not math.isfinite(normalized) or normalized < 0:
+            raise AntflyException(f"{path}.edge_weight.{field} must be a finite non-negative number")
+        bounds[label] = normalized
+    if bounds.get("minimum", 0) > bounds.get("maximum", math.inf):
+        raise AntflyException(f"{path}.edge_weight.min must not exceed edge_weight.max")
+
+
+def _validate_graph_path_objective(value: Mapping[str, Any], path: str) -> None:
+    if "objective" not in value:
+        return
+    objective = value["objective"]
+    if objective not in {"min_hops", "min_weight_sum", "max_weight_product"}:
+        raise AntflyException(f"{path}.objective must be min_hops, min_weight_sum, or max_weight_product")
+
+
+def _validate_graph_edges(edges: object, path: str) -> None:
+    if not isinstance(edges, list):
+        return
+    for index, edge in enumerate(edges):
+        if not isinstance(edge, Mapping):
+            continue
+        edge_path = f"{path}[{index}]"
+        _require_graph_identifier(edge.get("from"), f"{edge_path}.from")
+        _require_graph_identifier(edge.get("to"), f"{edge_path}.to")
+        _validate_graph_direction(edge, edge_path)
+        _require_graph_edge_types(edge.get("types"), f"{edge_path}.types")
+        _validate_graph_edge_weight(edge, edge_path)
+
+
+def _validate_graph_direction(value: Mapping[str, Any], path: str) -> None:
+    if "direction" not in value:
+        return
+    direction = value["direction"]
+    if not isinstance(direction, str) or direction not in {"out", "in", "both"}:
+        raise AntflyException(f"{path}.direction must be out, in, or both")
+
+
+def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, path: str) -> None:
+    _require_graph_identifier(match.get("anchor"), f"{path}.match.anchor")
+
+    nodes = match.get("nodes")
+    if isinstance(nodes, Mapping):
+        for alias, node in nodes.items():
+            _require_graph_identifier(alias, f"{path}.match.nodes key")
+            if isinstance(node, Mapping) and "table" in node:
+                _require_graph_table_qualifier(node["table"], f"{path}.match.nodes[{alias!r}].table")
+
+    edge_groups: list[tuple[object, str]] = [(match.get("edges"), f"{path}.match.edges")]
+    where_groups: list[tuple[object, str, int]] = [(match.get("where"), f"{path}.match.where", 0)]
+    optional = match.get("optional")
+    if isinstance(optional, list):
+        for index, optional_match in enumerate(optional):
+            if not isinstance(optional_match, Mapping):
+                continue
+            optional_path = f"{path}.match.optional[{index}]"
+            optional_nodes = optional_match.get("nodes")
+            if isinstance(optional_nodes, Mapping):
+                for alias, node in optional_nodes.items():
+                    _require_graph_identifier(alias, f"{optional_path}.nodes key")
+                    if isinstance(node, Mapping) and "table" in node:
+                        _require_graph_table_qualifier(node["table"], f"{optional_path}.nodes[{alias!r}].table")
+            edge_groups.append((optional_match.get("edges"), f"{optional_path}.edges"))
+            where_groups.append((optional_match.get("where"), f"{optional_path}.where", 0))
+
+    for edges, edges_path in edge_groups:
+        _validate_graph_edges(edges, edges_path)
+
+    while where_groups:
+        where, where_path, depth = where_groups.pop()
+        if where is None or not isinstance(where, Mapping):
+            continue
+        if depth >= 16:
+            raise AntflyException(f"{where_path} exceeds the maximum graph predicate depth")
+        conjunction = where.get("and")
+        if isinstance(conjunction, list):
+            where_groups.extend(
+                (child, f"{where_path}.and[{index}]", depth + 1) for index, child in enumerate(conjunction)
+            )
+        not_equal = where.get("not_equal")
+        if isinstance(not_equal, Mapping):
+            for side in ("left", "right"):
+                operand = not_equal.get(side)
+                if isinstance(operand, Mapping):
+                    _require_graph_identifier(operand.get("alias"), f"{where_path}.not_equal.{side}.alias")
+        not_exists = where.get("not_exists")
+        if isinstance(not_exists, Mapping):
+            _validate_graph_edges(not_exists.get("edges"), f"{where_path}.not_exists.edges")
+
+    if not isinstance(result, Mapping):
+        return
+    bindings = result.get("bindings")
+    if isinstance(bindings, list):
+        for index, alias in enumerate(bindings):
+            _require_graph_identifier(alias, f"{path}.return.bindings[{index}]")
+        _validate_graph_hydration(result, f"{path}.return", binding_count=len(bindings))
+    aggregates = result.get("aggregates")
+    if isinstance(aggregates, Mapping):
+        for name, aggregate in aggregates.items():
+            _require_graph_identifier(name, f"{path}.return.aggregates key")
+            if not isinstance(aggregate, Mapping):
+                continue
+            count = aggregate.get("count")
+            if count == "*":
+                if "distinct" in aggregate:
+                    raise AntflyException(f"{path}.return.aggregates[{name!r}].distinct is only valid for alias counts")
+            else:
+                _require_graph_identifier(count, f"{path}.return.aggregates[{name!r}].count")
+
+
+def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]:
+    """Serialize typed canonical graph operations while preserving raw-map compatibility."""
+    operations = graph_queries.to_dict() if isinstance(graph_queries, GraphQueries) else graph_queries
+    if not operations:
+        raise AntflyException("graph_queries must contain at least one named operation")
+    if len(operations) > 64:
+        raise AntflyException("graph_queries accepts at most 64 named operations")
+
+    encoded: dict[str, Any] = {}
+    match_queries = 0
+    typed_queries = (GraphMatchQuery, GraphTraverseQuery, GraphShortestPathQuery, GraphKShortestPathsQuery)
+    for name, query in operations.items():
+        _require_graph_identifier(name, "graph_queries key")
+        if isinstance(query, typed_queries):
+            encoded_query = query.to_dict()
+        elif isinstance(query, Mapping):
+            encoded_query = dict(query)
+        else:
+            raise AntflyException(f"graph query {name!r} must be a generated graph query model or mapping")
+        match = encoded_query.get("match")
+        if isinstance(match, Mapping):
+            match_queries += 1
+            if match_queries > MAX_GRAPH_MATCH_QUERIES:
+                raise AntflyException(f"graph_queries accepts at most {MAX_GRAPH_MATCH_QUERIES} match operations")
+            _validate_graph_match_identifiers(match, encoded_query.get("return"), f"graph_queries[{name!r}]")
+        traverse = encoded_query.get("traverse")
+        if isinstance(traverse, Mapping):
+            _validate_graph_direction(traverse, f"graph_queries[{name!r}].traverse")
+            _require_graph_edge_types(traverse.get("edge_types"), f"graph_queries[{name!r}].traverse.edge_types")
+            _validate_graph_edge_weight(traverse, f"graph_queries[{name!r}].traverse")
+            start = traverse.get("start")
+            if isinstance(start, Mapping) and isinstance(start.get("identities"), list):
+                for index, identity in enumerate(start["identities"]):
+                    if isinstance(identity, Mapping) and "table" in identity:
+                        _require_graph_table_qualifier(
+                            identity["table"],
+                            f"graph_queries[{name!r}].traverse.start.identities[{index}].table",
+                        )
+            if isinstance(start, Mapping) and "result_ref" in start:
+                path = f"graph_queries[{name!r}].traverse.start"
+                result_ref = start.get("result_ref")
+                if result_ref != "$query_results":
+                    prefix = "$graph_results."
+                    if not isinstance(result_ref, str) or not result_ref.startswith(prefix):
+                        raise AntflyException(
+                            f"{path}.result_ref must be $query_results or $graph_results.<query-name>"
+                        )
+                    _require_graph_identifier(result_ref[len(prefix) :], f"{path}.result_ref query name")
+                binding = start.get("binding")
+                if binding is not None:
+                    if result_ref == "$query_results":
+                        raise AntflyException(f"{path}.binding requires a $graph_results.<query-name> reference")
+                    _require_graph_identifier(binding, f"{path}.binding")
+            _validate_graph_hydration(traverse, f"graph_queries[{name!r}].traverse")
+        for operation in ("shortest_path", "k_shortest_paths"):
+            path_query = encoded_query.get(operation)
+            if isinstance(path_query, Mapping):
+                _validate_graph_direction(path_query, f"graph_queries[{name!r}].{operation}")
+                operation_path = f"graph_queries[{name!r}].{operation}"
+                _validate_graph_edge_weight(path_query, operation_path)
+                _validate_graph_path_objective(path_query, operation_path)
+                _require_graph_edge_types(
+                    path_query.get("edge_types"),
+                    f"graph_queries[{name!r}].{operation}.edge_types",
+                )
+                for endpoint in ("from", "to"):
+                    identity = path_query.get(endpoint)
+                    if isinstance(identity, Mapping) and "table" in identity:
+                        _require_graph_table_qualifier(
+                            identity["table"],
+                            f"graph_queries[{name!r}].{operation}.{endpoint}.table",
+                        )
+                _validate_graph_hydration(path_query, operation_path)
+        encoded[name] = encoded_query
+    return encoded
 
 
 def antfly_embedder(model: str, *, api_url: str | None = None) -> EmbedderConfig:
@@ -617,13 +877,11 @@ class AntflyClient:
         profile: bool | None = None,
         reranker: dict[str, Any] | None = None,
         analyses: dict[str, Any] | None = None,
-        graph_searches: dict[str, Any] | None = None,
-        expand_strategy: str | None = None,
+        graph_queries: GraphQueriesInput | None = None,
         document_renderer: str | None = None,
         pruner: dict[str, Any] | None = None,
         join: dict[str, Any] | None = None,
         foreign_sources: dict[str, Any] | None = None,
-        extra: dict[str, Any] | None = None,
     ) -> QueryResponses:
         """
         Query a table.
@@ -660,13 +918,12 @@ class AntflyClient:
             profile: Include execution profile when true
             reranker: Reranker configuration
             analyses: Analysis configuration
-            graph_searches: Graph query configuration
-            expand_strategy: Graph result expansion strategy
+            graph_queries: Named canonical graph operations. Accepts generated graph query models,
+                ``GraphQueries``, or raw mappings.
             document_renderer: Handlebars document renderer
             pruner: Result pruning configuration
             join: Join configuration
             foreign_sources: Query-time foreign source configuration
-            extra: Additional query request fields for forward compatibility
 
         Returns:
             Generated ``QueryResponses`` model.
@@ -677,10 +934,9 @@ class AntflyClient:
         """
         if aggregations is not None and facets is not None:
             raise AntflyException("query accepts either aggregations or facets, not both")
+        encoded_graph_queries = _serialize_graph_queries(graph_queries) if graph_queries is not None else None
 
         body: dict[str, Any] = {}
-        if extra is not None:
-            body.update(extra)
 
         query_fields = {
             "query": query,
@@ -709,8 +965,7 @@ class AntflyClient:
             "profile": profile,
             "reranker": reranker,
             "analyses": analyses,
-            "graph_searches": graph_searches,
-            "expand_strategy": expand_strategy,
+            "graph_queries": encoded_graph_queries,
             "document_renderer": document_renderer,
             "pruner": pruner,
             "join": join,
@@ -721,7 +976,23 @@ class AntflyClient:
                 body[key] = value
 
         response = self._request("POST", f"/db/v1/tables/{quote(table, safe='')}/query", json=body)
-        return QueryResponses.from_dict(response)
+        expected_graph_queries = None
+        if encoded_graph_queries is not None:
+            graph_dialect = "canonical"
+            expected_graph_operations = None
+            expected_graph_queries = encoded_graph_queries
+        else:
+            graph_dialect = "none"
+            # Absence of graph_queries means graph validation is disabled, not
+            # that a graph result envelope with zero operations is required.
+            expected_graph_operations = None
+        return decode_query_responses(
+            response,
+            graph_dialect=graph_dialect,
+            expected_graph_operations=expected_graph_operations,
+            expected_graph_queries=expected_graph_queries,
+            query_table=table,
+        )
 
     def get(self, table: str, key: str) -> dict[str, Any]:
         """

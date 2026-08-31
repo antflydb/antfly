@@ -267,7 +267,10 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
     }
     for (batch.graph_doc_clears) |clear| try appendUniqueString(alloc, &changed_doc_keys, clear.key);
     for (batch.graph_writes) |write| try appendUniqueString(alloc, &changed_doc_keys, write.source);
-    for (batch.graph_deletes) |delete| try appendUniqueString(alloc, &deleted_doc_keys, delete.source);
+    // Edge deletes preserve the source document. Recording the source as
+    // deleted makes graph replay clear its complete adjacency instead of only
+    // applying the target-specific artifact deletion.
+    for (batch.graph_deletes) |delete| try appendUniqueString(alloc, &changed_doc_keys, delete.source);
     for (batch.graph_writes) |write| {
         const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
         defer alloc.free(artifact_key);
@@ -961,6 +964,26 @@ test "change journal record derives thin identities from derived batch" {
     try std.testing.expect(recordHasHint(record, .full_text));
     try std.testing.expect(recordHasHint(record, .dense_vector));
     try std.testing.expect(recordHasHint(record, .sparse_vector));
+    try std.testing.expect(recordHasHint(record, .graph));
+}
+
+test "change journal edge deletion preserves source document identity" {
+    const alloc = std.testing.allocator;
+
+    var record = try recordFromDerivedBatch(alloc, .{
+        .graph_deletes = &.{.{
+            .index_name = "graph",
+            .source = "doc:a",
+            .target = "doc:b",
+            .edge_type = "links",
+        }},
+    }, 43);
+    defer deinitRecord(alloc, &record);
+
+    try std.testing.expectEqual(@as(usize, 1), record.changed_doc_keys.len);
+    try std.testing.expectEqualStrings("doc:a", record.changed_doc_keys[0]);
+    try std.testing.expectEqual(@as(usize, 0), record.deleted_doc_keys.len);
+    try std.testing.expectEqual(@as(usize, 1), record.changed_artifact_keys.len);
     try std.testing.expect(recordHasHint(record, .graph));
 }
 
