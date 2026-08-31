@@ -2046,18 +2046,17 @@ func graphVisualizationQuery(searchText string) map[string]any {
 			"query": searchText,
 		},
 		"limit": 8,
-		"graph_searches": map[string]any{
+		"graph_queries": map[string]any{
 			"relations": map[string]any{
-				"type":              "traverse",
-				"index_name":        DefaultAutographIndex,
-				"start_nodes":       map[string]any{"result_ref": "$full_text_results", "limit": 8},
-				"include_documents": true,
-				"fields":            []string{"title", "url", "metadata"},
-				"params": map[string]any{
-					"direction":     "both",
-					"max_depth":     1,
-					"max_results":   80,
-					"include_paths": true,
+				"index": DefaultAutographIndex,
+				"traverse": map[string]any{
+					"start":             map[string]any{"result_ref": "$query_results", "limit": 8},
+					"direction":         "both",
+					"max_depth":         1,
+					"limit":             80,
+					"include_paths":     true,
+					"include_documents": true,
+					"fields":            []string{"title", "url", "metadata"},
 				},
 			},
 		},
@@ -2070,18 +2069,17 @@ func graphVisualizationSampleQuery() map[string]any {
 			"match_all": map[string]any{},
 		},
 		"limit": 8,
-		"graph_searches": map[string]any{
+		"graph_queries": map[string]any{
 			"relations": map[string]any{
-				"type":              "traverse",
-				"index_name":        DefaultAutographIndex,
-				"start_nodes":       map[string]any{"result_ref": "$fused_results", "limit": 8},
-				"include_documents": true,
-				"fields":            []string{"title", "url", "metadata"},
-				"params": map[string]any{
-					"direction":     "both",
-					"max_depth":     1,
-					"max_results":   80,
-					"include_paths": true,
+				"index": DefaultAutographIndex,
+				"traverse": map[string]any{
+					"start":             map[string]any{"result_ref": "$query_results", "limit": 8},
+					"direction":         "both",
+					"max_depth":         1,
+					"limit":             80,
+					"include_paths":     true,
+					"include_documents": true,
+					"fields":            []string{"title", "url", "metadata"},
 				},
 			},
 		},
@@ -2097,7 +2095,10 @@ func buildGraphVisualization(query string, resp *antfly.QueryResponses) GraphVis
 	if !ok {
 		return viz
 	}
-
+	graphValue, err := antfly.DecodeCanonicalGraphResult(graph)
+	if err != nil {
+		return viz
+	}
 	nodeByID := map[string]int{}
 	addNode := func(node GraphNode) {
 		if node.ID == "" {
@@ -2137,27 +2138,24 @@ func buildGraphVisualization(query string, resp *antfly.QueryResponses) GraphVis
 		viz.Edges = append(viz.Edges, edge)
 	}
 
-	for _, resultNode := range graph.Nodes {
-		addNode(graphNodeFromResult(resultNode))
-		for _, edge := range resultNode.PathEdges {
-			addEdge(GraphEdge{
-				Source: edge.Source,
-				Target: edge.Target,
-				Type:   edge.Type,
-				Weight: edge.Weight,
-			})
+	switch result := graphValue.(type) {
+	case antfly.GraphNodesResult:
+		for _, resultNode := range result.Nodes {
+			addNode(graphNodeFromResult(resultNode))
+			for _, edge := range resultNode.PathEdges {
+				addEdge(GraphEdge{
+					Source: graphEndpointID(edge.From),
+					Target: graphEndpointID(edge.To),
+					Type:   edge.Type,
+					Weight: edge.Weight,
+				})
+			}
+			for _, edge := range graphEdgesFromPath(resultNode) {
+				addEdge(edge)
+			}
 		}
-		for _, edge := range graphEdgesFromPath(resultNode) {
-			addEdge(edge)
-		}
-		for _, edge := range resultNode.Edges {
-			addEdge(GraphEdge{
-				Source: string(edge.Source),
-				Target: string(edge.Target),
-				Type:   edge.Type,
-				Weight: edge.Weight,
-			})
-		}
+	default:
+		return viz
 	}
 
 	return viz
@@ -2170,36 +2168,47 @@ func graphEdgesFromPath(node antfly.GraphResultNode) []GraphEdge {
 	edges := make([]GraphEdge, 0, len(node.Path)-1)
 	for i := 1; i < len(node.Path); i++ {
 		edges = append(edges, GraphEdge{
-			Source: node.Path[i-1],
-			Target: node.Path[i],
+			Source: graphEndpointID(node.Path[i-1]),
+			Target: graphEndpointID(node.Path[i]),
 			Type:   "related",
-			Weight: node.Distance,
+			Weight: 1,
 		})
 	}
 	return edges
 }
 
+func graphEndpointID(endpoint antfly.GraphPathEndpoint) string {
+	if endpoint.Table == nil {
+		return endpoint.Key
+	}
+	return *endpoint.Table + "/" + endpoint.Key
+}
+
 func graphNodeFromResult(node antfly.GraphResultNode) GraphNode {
-	title := node.Key
+	return graphNodeFromDocument(graphEndpointID(antfly.GraphPathEndpoint{Table: node.Table, Key: node.Key}), node.Document, node.Depth)
+}
+
+func graphNodeFromDocument(id string, document map[string]any, depth int) GraphNode {
+	title := id
 	url := ""
 	subtitle := ""
-	if node.Document != nil {
-		if value, ok := node.Document["title"].(string); ok && strings.TrimSpace(value) != "" {
+	if document != nil {
+		if value, ok := document["title"].(string); ok && strings.TrimSpace(value) != "" {
 			title = value
 		}
-		if value, ok := node.Document["url"].(string); ok {
+		if value, ok := document["url"].(string); ok {
 			url = value
 		}
-		if metadata, ok := node.Document["metadata"].(map[string]any); ok {
+		if metadata, ok := document["metadata"].(map[string]any); ok {
 			subtitle = graphNodeSubtitle(metadata)
 		}
 	}
 	return GraphNode{
-		ID:       node.Key,
+		ID:       id,
 		Label:    title,
 		Subtitle: subtitle,
 		URL:      url,
-		Depth:    node.Depth,
+		Depth:    depth,
 	}
 }
 
@@ -2348,36 +2357,27 @@ func createArtifactGraphIndex(indexName, artifactName, producerType, model, infe
 
 	producerJSON := artifactProducerConfig(producerType, model, inferenceAPIURL, labelEnum, relationEnum, relationSchemas)
 
-	raw := map[string]any{
-		"name": indexName,
-		"type": antfly.IndexTypeGraph,
-		"source": map[string]any{
-			"kind":     "artifact",
-			"artifact": artifactName,
-			"path":     "$.relations[*]",
-			"format":   "extraction_relation",
-		},
-		"artifact": map[string]any{
-			"name":          artifactName,
-			"kind":          "asset",
-			"field":         "content",
-			"content_type":  "application/json",
-			"producer_json": producerJSON,
-		},
-		"algebraic_planning": map[string]any{
-			"bounded_traversal": map[string]any{
-				"law": "provenance_semiring",
-			},
-		},
+	graphSource := antfly.GraphArtifactSourceConfig{
+		Artifact: artifactName,
+		Path:     "$.relations[*]",
+		Format:   antfly.GraphArtifactSourceConfigFormatExtractionRelation,
 	}
 	if producerType == "extractor" {
-		raw["nodes"] = map[string]any{
-			"model":  "document",
-			"target": "{{ _item.target.text }}",
+		target, err := antfly.NewGraphTemplateValue("{{ _item.target.text }}")
+		if err != nil {
+			return nil, fmt.Errorf("build graph target mapping: %w", err)
 		}
-		raw["edge"] = map[string]any{
-			"weight": "{{ _item.score }}",
-			"metadata": map[string]any{
+		weight, err := antfly.NewGraphTemplateValue("{{ _item.score }}")
+		if err != nil {
+			return nil, fmt.Errorf("build graph weight mapping: %w", err)
+		}
+		graphSource.Nodes = antfly.GraphArtifactNodeMappingConfig{
+			Model:  antfly.GraphArtifactNodeMappingConfigModelDocument,
+			Target: target,
+		}
+		graphSource.Edge = antfly.GraphArtifactEdgeMappingConfig{
+			Weight: weight,
+			Metadata: map[string]any{
 				"type":          "{{ _item.type }}",
 				"source_entity": "{{ _item.source.text }}",
 				"target_entity": "{{ _item.target.text }}",
@@ -2385,16 +2385,28 @@ func createArtifactGraphIndex(indexName, artifactName, producerType, model, infe
 			},
 		}
 	}
-
-	encoded, err := json.Marshal(raw)
+	graphSources, err := antfly.NewGraphIndexSources(graphSource)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("build graph artifact source: %w", err)
 	}
-	var cfg antfly.IndexConfig
-	if err := json.Unmarshal(encoded, &cfg); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
+	return antfly.NewIndexConfig(indexName, antfly.GraphIndexConfig{
+		Source: graphSources[0],
+		Artifact: antfly.GraphArtifactProducerConfig{
+			Name: artifactName,
+			Kind: antfly.GraphArtifactProducerConfigKindAsset,
+			Source: antfly.GraphArtifactProducerSourceConfig{
+				Type:  antfly.GraphArtifactProducerSourceConfigTypeField,
+				Value: "content",
+			},
+			ContentType:  "application/json",
+			ProducerJson: producerJSON,
+		},
+		AlgebraicPlanning: antfly.GraphAlgebraicPlanningConfig{
+			BoundedTraversal: antfly.GraphBoundedTraversalConfig{
+				Law: antfly.GraphBoundedTraversalConfigLawProvenanceSemiring,
+			},
+		},
+	})
 }
 
 func artifactProducerConfig(producerType, model, inferenceAPIURL string, labels, relationLabels []string, relationSchemas []map[string]any) map[string]any {

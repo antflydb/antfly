@@ -88,7 +88,6 @@ def _document_units_index_config() -> dict:
     return {
         "type": "graph",
         "source": {
-            "kind": "artifact",
             "artifact": DOCUMENT_UNITS_ARTIFACT,
             "path": "$.edges[*]",
             "format": "extraction_relation",

@@ -225,7 +225,7 @@ pub const AntflyClient = struct {
     // --- Query operations ---
 
     pub fn query(self: *AntflyClient, body: openapi.types.QueryRequest) !openapi.ApiResponse(openapi.types.QueryResponses) {
-        var resp = try self.inner.globalQuery(body);
+        var resp = try self.queryCanonicalPath("/db/v1/query", body);
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
@@ -234,7 +234,11 @@ pub const AntflyClient = struct {
     }
 
     pub fn queryTable(self: *AntflyClient, table_name: []const u8, body: openapi.types.QueryRequest) !openapi.ApiResponse(openapi.types.QueryResponses) {
-        var resp = try self.inner.queryTable(table_name, body);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const path = try std.fmt.allocPrint(self.allocator, "/db/v1/tables/{s}/query", .{encoded_table_name});
+        defer self.allocator.free(path);
+        var resp = try self.queryCanonicalPath(path, body);
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
@@ -242,7 +246,33 @@ pub const AntflyClient = struct {
         return resp;
     }
 
-    pub fn lookupKey(self: *AntflyClient, table_name: []const u8, key: []const u8, params: openapi.client.LookupKeyParams) !openapi.ApiResponse(std.json.Value) {
+    // The public stateful transport accepts a deprecated request/response
+    // union, but new SDK entry points intentionally expose only the canonical
+    // contract. Encoding and decoding the narrow models here makes that
+    // boundary executable instead of relying on a lossy struct conversion.
+    fn queryCanonicalPath(
+        self: *AntflyClient,
+        path: []const u8,
+        body: openapi.types.QueryRequest,
+    ) !openapi.ApiResponse(openapi.types.QueryResponses) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.inner.base_url, path });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header|
+            @as(*const [1][2][]const u8, header)
+        else
+            null;
+        var response = try self.inner.http.post(url, .{ .json = json_body, .headers = headers });
+        return openapi.ApiResponse(openapi.types.QueryResponses).fromResponse(self.allocator, &response);
+    }
+
+    pub fn lookupKey(
+        self: *AntflyClient,
+        table_name: []const u8,
+        key: []const u8,
+        params: openapi.client.LookupKeyParams,
+    ) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
         var resp = try self.inner.lookupKey(table_name, key, params);
         if (resp.status_code >= 300) {
             defer resp.deinit();
@@ -284,7 +314,7 @@ pub const AntflyClient = struct {
         table_name: []const u8,
         artifact_name: []const u8,
         body: openapi.types.EnrichmentConfig,
-    ) !openapi.ApiResponse(std.json.Value) {
+    ) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
         return try self.inner.putArtifactEnrichment(table_name, artifact_name, body);
     }
 
@@ -292,7 +322,7 @@ pub const AntflyClient = struct {
         self: *AntflyClient,
         table_name: []const u8,
         artifact_name: []const u8,
-    ) !openapi.ApiResponse(std.json.Value) {
+    ) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
         return try self.inner.deleteArtifactEnrichment(table_name, artifact_name);
     }
 

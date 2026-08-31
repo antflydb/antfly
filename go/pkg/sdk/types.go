@@ -68,15 +68,17 @@ type (
 	TableArtifactEnrichmentList              = oapi.TableArtifactEnrichmentList
 
 	// Index config types
-	EmbeddingsIndexConfig = oapi.EmbeddingsIndexConfig
-	DistanceMetric        = oapi.DistanceMetric
-	EmbeddingsIndexStats  = oapi.EmbeddingsIndexStats
-	EnrichmentConfig      = oapi.EnrichmentConfig
-	EnrichmentKind        = oapi.EnrichmentKind
-	ExecutionPolicy       = oapi.ExecutionPolicy
-	FullTextIndexConfig   = oapi.FullTextIndexConfig
-	AlgebraicIndexConfig  = oapi.AlgebraicIndexConfig
-	FullTextIndexStats    = oapi.FullTextIndexStats
+	EmbeddingsIndexConfig       = oapi.EmbeddingsIndexConfig
+	ArtifactIndexSource         = oapi.ArtifactIndexSource
+	FullTextArtifactIndexSource = oapi.FullTextArtifactIndexSource
+	DistanceMetric              = oapi.DistanceMetric
+	EmbeddingsIndexStats        = oapi.EmbeddingsIndexStats
+	EnrichmentConfig            = oapi.EnrichmentConfig
+	EnrichmentKind              = oapi.EnrichmentKind
+	ExecutionPolicy             = oapi.ExecutionPolicy
+	FullTextIndexConfig         = oapi.FullTextIndexConfig
+	AlgebraicIndexConfig        = oapi.AlgebraicIndexConfig
+	FullTextIndexStats          = oapi.FullTextIndexStats
 
 	EmbedderProvider         = oapi.EmbedderProvider
 	GeneratorProvider        = oapi.GeneratorProvider
@@ -274,7 +276,6 @@ type (
 	GraphIndexStats                       = oapi.GraphIndexStats
 	GraphArtifactSourceConfig             = oapi.GraphArtifactSourceConfig
 	GraphArtifactSourceConfigFormat       = oapi.GraphArtifactSourceConfigFormat
-	GraphArtifactSourceConfigKind         = oapi.GraphArtifactSourceConfigKind
 	GraphArtifactProducerConfig           = oapi.GraphArtifactProducerConfig
 	GraphArtifactProducerConfigKind       = oapi.GraphArtifactProducerConfigKind
 	GraphArtifactProducerSourceConfig     = oapi.GraphArtifactProducerSourceConfig
@@ -296,17 +297,73 @@ type (
 	EdgesResponse                         = oapi.EdgesResponse
 
 	// Graph query types
-	GraphQuery        = oapi.GraphQuery
-	GraphQueryParams  = oapi.GraphQueryParams
-	GraphQueryResult  = oapi.GraphQueryResult
-	GraphQueryType    = oapi.GraphQueryType
-	GraphNodeSelector = oapi.GraphNodeSelector
-	GraphResultNode   = oapi.GraphResultNode
-
-	// Graph pattern types
-	PatternEdgeStep = oapi.PatternEdgeStep
-	PatternMatch    = oapi.PatternMatch
-	PatternStep     = oapi.PatternStep
+	GraphQuery                     = oapi.GraphQuery
+	LegacyGraphQuery               = oapi.LegacyGraphQuery
+	LegacyGraphNodeSelector        = oapi.LegacyGraphNodeSelector
+	LegacyGraphDocumentQuery       = oapi.LegacyGraphDocumentQuery
+	GraphQueryType                 = oapi.GraphQueryType
+	GraphQueryParams               = oapi.GraphQueryParams
+	PatternStep                    = oapi.PatternStep
+	PatternEdgeStep                = oapi.PatternEdgeStep
+	PatternMatch                   = oapi.PatternMatch
+	GraphResult                    = oapi.GraphResult
+	GraphBindingsResult            = oapi.GraphBindingsResult
+	GraphBindingsResultKind        = oapi.GraphBindingsResultKind
+	GraphAggregatesResult          = oapi.GraphAggregatesResult
+	GraphAggregatesResultKind      = oapi.GraphAggregatesResultKind
+	GraphNodesResult               = oapi.GraphNodesResult
+	GraphNodesResultKind           = oapi.GraphNodesResultKind
+	GraphPathResult                = oapi.GraphPathResult
+	GraphPathsResult               = oapi.GraphPathsResult
+	GraphPathsResultKind           = oapi.GraphPathsResultKind
+	LegacyGraphSearchResult        = oapi.LegacyGraphSearchResult
+	LegacyGraphSearchResultKind    = oapi.LegacyGraphSearchResultKind
+	GraphResultStats               = oapi.GraphResultStats
+	GraphExactResultStats          = oapi.GraphExactResultStats
+	GraphNodeSelector              = oapi.GraphNodeSelector
+	GraphKeyNodeSelector           = oapi.GraphKeyNodeSelector
+	GraphIdentityNodeSelector      = oapi.GraphIdentityNodeSelector
+	GraphResultRefNodeSelector     = oapi.GraphResultRefNodeSelector
+	GraphPath                      = oapi.GraphPath
+	GraphPathEdge                  = oapi.GraphPathEdge
+	GraphPathEdgeDirection         = oapi.GraphPathEdgeDirection
+	GraphPathEndpoint              = oapi.GraphPathEndpoint
+	GraphResultNode                = oapi.GraphResultNode
+	GraphBindingNode               = oapi.GraphBindingNode
+	GraphResultBinding             = oapi.GraphResultBinding
+	GraphResultRow                 = oapi.GraphResultRow
+	GraphAggregateValue            = oapi.GraphAggregateValue
+	GraphMatchQuery                = oapi.GraphMatchQuery
+	GraphTraverseQuery             = oapi.GraphTraverseQuery
+	GraphShortestPathQuery         = oapi.GraphShortestPathQuery
+	GraphKShortestPathsQuery       = oapi.GraphKShortestPathsQuery
+	GraphTraversal                 = oapi.GraphTraversal
+	GraphShortestPath              = oapi.GraphShortestPath
+	GraphKShortestPaths            = oapi.GraphKShortestPaths
+	GraphMatch                     = oapi.GraphMatch
+	GraphMatchNode                 = oapi.GraphMatchNode
+	GraphMatchEdge                 = oapi.GraphMatchEdge
+	GraphOptionalMatch             = oapi.GraphOptionalMatch
+	GraphReturn                    = oapi.GraphReturn
+	GraphBindingsReturn            = oapi.GraphBindingsReturn
+	GraphAggregatesReturn          = oapi.GraphAggregatesReturn
+	GraphCountAggregate            = oapi.GraphCountAggregate
+	GraphRowCountAggregate         = oapi.GraphRowCountAggregate
+	GraphRowCountTarget            = oapi.GraphRowCountTarget
+	GraphAliasCountAggregate       = oapi.GraphAliasCountAggregate
+	GraphWhereExpression           = oapi.GraphWhereExpression
+	GraphAliasOperand              = oapi.GraphAliasOperand
+	GraphNotEqualPredicate         = oapi.GraphNotEqualPredicate
+	GraphNotExistsPattern          = oapi.GraphNotExistsPattern
+	GraphWhereAnd                  = oapi.GraphWhereAnd
+	GraphWhereNotEqual             = oapi.GraphWhereNotEqual
+	GraphWhereNotExists            = oapi.GraphWhereNotExists
+	GraphDocumentFilter            = oapi.GraphDocumentFilter
+	GraphDocumentFilterBoolean     = oapi.GraphDocumentFilterBoolean
+	GraphDocumentFilterConjunction = oapi.GraphDocumentFilterConjunction
+	GraphDocumentFilterDisjunction = oapi.GraphDocumentFilterDisjunction
+	GraphEdgeWeightRange           = oapi.GraphEdgeWeightRange
+	GraphPathObjective             = oapi.GraphPathObjective
 
 	// Graph traversal types
 	TraverseResponse = oapi.TraverseResponse
@@ -447,6 +504,14 @@ func (c CreatedIndex) requireKind(expected IndexType) error {
 const (
 	QueryHitsTotalRelationExact = oapi.QueryHitsTotalRelationExact
 	QueryHitsTotalRelationGte   = oapi.QueryHitsTotalRelationGte
+
+	GraphBindingsResultKindBindings     = oapi.GraphBindingsResultKindBindings
+	GraphAggregatesResultKindAggregates = oapi.GraphAggregatesResultKindAggregates
+	GraphNodesResultKindNodes           = oapi.GraphNodesResultKindNodes
+	GraphPathsResultKindPaths           = oapi.GraphPathsResultKindPaths
+	LegacyGraphSearchResultKindLegacy   = oapi.LegacyGraphSearchResultKindLegacy
+	GraphPathEdgeDirectionIn            = oapi.GraphPathEdgeDirectionIn
+	GraphPathEdgeDirectionOut           = oapi.GraphPathEdgeDirectionOut
 
 	HierarchyArtifactKindAsset           = oapi.HierarchyArtifactKindAsset
 	HierarchyArtifactKindChunk           = oapi.HierarchyArtifactKindChunk
@@ -750,6 +815,7 @@ const (
 	TransformOpTypeUnset       = oapi.TransformOpTypeUNSET
 	TransformOpTypeInc         = oapi.TransformOpTypeINC
 	TransformOpTypePush        = oapi.TransformOpTypePUSH
+	TransformOpTypePull        = oapi.TransformOpTypePULL
 	TransformOpTypeMin         = oapi.TransformOpTypeMIN
 	TransformOpTypeMax         = oapi.TransformOpTypeMAX
 	TransformOpTypeAddToSet    = oapi.TransformOpTypeADDTOSET
@@ -767,7 +833,6 @@ const (
 	EdgeTypeConfigTopologyTree  = oapi.EdgeTypeConfigTopologyTree
 
 	// Graph artifact mapping values
-	GraphArtifactSourceConfigKindArtifact             = oapi.GraphArtifactSourceConfigKindArtifact
 	GraphArtifactSourceConfigFormatExtractionGraph    = oapi.GraphArtifactSourceConfigFormatExtractionGraph
 	GraphArtifactSourceConfigFormatExtractionRelation = oapi.GraphArtifactSourceConfigFormatExtractionRelation
 	GraphArtifactProducerConfigKindAsset              = oapi.GraphArtifactProducerConfigKindAsset
@@ -794,6 +859,11 @@ const (
 	PathWeightModeMaxWeight = oapi.PathWeightModeMaxWeight
 	PathWeightModeMinHops   = oapi.PathWeightModeMinHops
 	PathWeightModeMinWeight = oapi.PathWeightModeMinWeight
+
+	// GraphPathObjective values
+	GraphPathObjectiveMinHops          = oapi.GraphPathObjectiveMinHops
+	GraphPathObjectiveMinWeightSum     = oapi.GraphPathObjectiveMinWeightSum
+	GraphPathObjectiveMaxWeightProduct = oapi.GraphPathObjectiveMaxWeightProduct
 )
 
 // allToolNames is the complete set of valid ChatToolName values.

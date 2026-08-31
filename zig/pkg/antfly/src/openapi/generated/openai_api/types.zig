@@ -30,6 +30,49 @@ pub const AdminApiKey = struct {
     created_at: i64,
     last_used_at: std.json.Value,
     owner: std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "id", "id", false },
+        .{ "name", "name", false },
+        .{ "redacted_value", "redacted_value", false },
+        .{ "value", "value", true },
+        .{ "created_at", "created_at", false },
+        .{ "last_used_at", "last_used_at", false },
+        .{ "owner", "owner", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("redacted_value");
+        try jw.write(self.redacted_value);
+        if (self.value) |value| {
+            try jw.objectField("value");
+            try jw.write(value);
+        }
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("last_used_at");
+        try jw.write(self.last_used_at);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        try jw.endObject();
+    }
 };
 
 /// An annotation that applies to a span of output text.
@@ -39,6 +82,39 @@ pub const Annotation = union(enum) {
     container_file_citation_body: ContainerFileCitationBody,
     file_path: FilePath,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "FileCitationBody")) {
+            return .{ .file_citation_body = try std.json.parseFromSliceLeaky(FileCitationBody, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "UrlCitationBody")) {
+            return .{ .url_citation_body = try std.json.parseFromSliceLeaky(UrlCitationBody, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ContainerFileCitationBody")) {
+            return .{ .container_file_citation_body = try std.json.parseFromSliceLeaky(ContainerFileCitationBody, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FilePath")) {
+            return .{ .file_path = try std.json.parseFromSliceLeaky(FilePath, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -46,7 +122,9 @@ pub const Annotation = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -82,6 +160,48 @@ pub const ApiKeyList = struct {
     has_more: ?bool = null,
     first_id: ?[]const u8 = null,
     last_id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", true },
+        .{ "data", "data", true },
+        .{ "has_more", "has_more", true },
+        .{ "first_id", "first_id", true },
+        .{ "last_id", "last_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        if (self.data) |value| {
+            try jw.objectField("data");
+            try jw.write(value);
+        }
+        if (self.has_more) |value| {
+            try jw.objectField("has_more");
+            try jw.write(value);
+        }
+        if (self.first_id) |value| {
+            try jw.objectField("first_id");
+            try jw.write(value);
+        }
+        if (self.last_id) |value| {
+            try jw.objectField("last_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ApplyPatchCallOutputStatus = enum {
@@ -228,6 +348,36 @@ pub const ApplyPatchOperationParam = union(enum) {
     apply_patch_delete_file_operation_param: ApplyPatchDeleteFileOperationParam,
     apply_patch_update_file_operation_param: ApplyPatchUpdateFileOperationParam,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "ApplyPatchCreateFileOperationParam")) {
+            return .{ .apply_patch_create_file_operation_param = try std.json.parseFromSliceLeaky(ApplyPatchCreateFileOperationParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchDeleteFileOperationParam")) {
+            return .{ .apply_patch_delete_file_operation_param = try std.json.parseFromSliceLeaky(ApplyPatchDeleteFileOperationParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchUpdateFileOperationParam")) {
+            return .{ .apply_patch_update_file_operation_param = try std.json.parseFromSliceLeaky(ApplyPatchUpdateFileOperationParam, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -235,7 +385,9 @@ pub const ApplyPatchOperationParam = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -275,6 +427,43 @@ pub const ApplyPatchToolCall = struct {
     operation: std.json.Value,
     /// The ID of the entity that created this tool call.
     created_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "call_id", "call_id", false },
+        .{ "status", "status", false },
+        .{ "operation", "operation", false },
+        .{ "created_by", "created_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("operation");
+        try jw.write(self.operation);
+        if (self.created_by) |value| {
+            try jw.objectField("created_by");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A tool call representing a request to create, delete, or update files using diff patches.
@@ -288,6 +477,40 @@ pub const ApplyPatchToolCallItemParam = struct {
     status: ApplyPatchCallStatusParam,
     /// The specific create, delete, or update instruction for the apply_patch tool call.
     operation: ApplyPatchOperationParam,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", true },
+        .{ "call_id", "call_id", false },
+        .{ "status", "status", false },
+        .{ "operation", "operation", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("operation");
+        try jw.write(self.operation);
+        try jw.endObject();
+    }
 };
 
 /// The output emitted by an apply patch tool call.
@@ -303,6 +526,45 @@ pub const ApplyPatchToolCallOutput = struct {
     output: ?std.json.Value = null,
     /// The ID of the entity that created this tool call output.
     created_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "call_id", "call_id", false },
+        .{ "status", "status", false },
+        .{ "output", "output", true },
+        .{ "created_by", "created_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        }
+        if (self.created_by) |value| {
+            try jw.objectField("created_by");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The streamed output emitted by an apply patch tool call.
@@ -315,6 +577,42 @@ pub const ApplyPatchToolCallOutputItemParam = struct {
     /// The status of the apply patch tool call output. One of `completed` or `failed`.
     status: ApplyPatchCallOutputStatusParam,
     output: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", true },
+        .{ "call_id", "call_id", false },
+        .{ "status", "status", false },
+        .{ "output", "output", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Allows the assistant to create, delete, or update files using unified diffs.
@@ -350,6 +648,46 @@ pub const ApproximateLocation = struct {
     region: ?std.json.Value = null,
     city: ?std.json.Value = null,
     timezone: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "country", "country", true },
+        .{ "region", "region", true },
+        .{ "city", "city", true },
+        .{ "timezone", "timezone", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.country) |value| {
+            try jw.objectField("country");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.city) |value| {
+            try jw.objectField("city");
+            try jw.write(value);
+        }
+        if (self.timezone) |value| {
+            try jw.objectField("timezone");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Detailed information about a role assignment entry returned when listing assignments.
@@ -414,6 +752,70 @@ pub const AssistantObject = struct {
     temperature: ?std.json.Value = null,
     top_p: ?std.json.Value = null,
     response_format: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "created_at", "created_at", false },
+        .{ "name", "name", false },
+        .{ "description", "description", false },
+        .{ "model", "model", false },
+        .{ "instructions", "instructions", false },
+        .{ "tools", "tools", false },
+        .{ "tool_resources", "tool_resources", true },
+        .{ "metadata", "metadata", false },
+        .{ "temperature", "temperature", true },
+        .{ "top_p", "top_p", true },
+        .{ "response_format", "response_format", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("description");
+        try jw.write(self.description);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("instructions");
+        try jw.write(self.instructions);
+        try jw.objectField("tools");
+        try jw.write(self.tools);
+        if (self.tool_resources) |value| {
+            try jw.objectField("tool_resources");
+            try jw.write(value);
+        }
+        try jw.objectField("metadata");
+        try jw.write(self.metadata);
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.response_format) |value| {
+            try jw.objectField("response_format");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Represents an event emitted when streaming a Run. Each event in a server-sent events stream has an `event` and `data` property: ``` event: thread.created data: {"id": "thread_123", "object": "thread", ...} ``` We emit events whenever a new object is created, transitions to a new state, or is being streamed in parts (deltas). For example, we emit `thread.run.created` when a new run is created, `thread.run.completed` when a run completes, and so on. When an Assistant chooses to create a message during a run, we emit a `thread.message.created event`, a `thread.message.in_progress` event, many `thread.message.delta` events, and finally a `thread.message.completed` event. We may add additional events over time, so we recommend handling unknown events gracefully in your code. See the [Assistants API quickstart](/docs/assistants/overview) to learn how to integrate the Assistants API with streaming.
@@ -574,6 +976,31 @@ pub const AssistantToolsFileSearch = struct {
     type: []const u8,
     /// Overrides for the file search tool.
     file_search: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "file_search", "file_search", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.file_search) |value| {
+            try jw.objectField("file_search");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const AssistantToolsFileSearchTypeOnly = struct {
@@ -598,6 +1025,31 @@ pub const AssistantsNamedToolChoice = struct {
     /// The type of the tool. If type is `function`, the function name must be set
     type: []const u8,
     function: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "function", "function", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.function) |value| {
+            try jw.objectField("function");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Attachment metadata included on thread items.
@@ -683,6 +1135,38 @@ pub const AudioTranscription = struct {
     language: ?[]const u8 = null,
     /// An optional text to guide the model's style or continue a previous audio segment. For `whisper-1`, the [prompt is a list of keywords](/docs/guides/speech-to-text#prompting). For `gpt-4o-transcribe` models (excluding `gpt-4o-transcribe-diarize`), the prompt is a free text string, for example "expect words related to technology".
     prompt: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "language", "language", true },
+        .{ "prompt", "prompt", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A log of a user action or configuration change within this organization.
@@ -736,11 +1220,11 @@ pub const AuditLog = struct {
     /// The details for events with this `type`.
     ip_allowlist_config_deactivated: ?std.json.Value = null,
     /// This event has no additional fields beyond the standard audit log attributes.
-    login_succeeded: ?std.json.Value = null,
+    login_succeeded: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// The details for events with this `type`.
     login_failed: ?std.json.Value = null,
     /// This event has no additional fields beyond the standard audit log attributes.
-    logout_succeeded: ?std.json.Value = null,
+    logout_succeeded: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// The details for events with this `type`.
     logout_failed: ?std.json.Value = null,
     /// The details for events with this `type`.
@@ -789,6 +1273,275 @@ pub const AuditLog = struct {
     certificates_activated: ?std.json.Value = null,
     /// The details for events with this `type`.
     certificates_deactivated: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "type", "type", false },
+        .{ "effective_at", "effective_at", false },
+        .{ "project", "project", true },
+        .{ "actor", "actor", false },
+        .{ "api_key.created", "api_key_created", true },
+        .{ "api_key.updated", "api_key_updated", true },
+        .{ "api_key.deleted", "api_key_deleted", true },
+        .{ "checkpoint.permission.created", "checkpoint_permission_created", true },
+        .{ "checkpoint.permission.deleted", "checkpoint_permission_deleted", true },
+        .{ "external_key.registered", "external_key_registered", true },
+        .{ "external_key.removed", "external_key_removed", true },
+        .{ "group.created", "group_created", true },
+        .{ "group.updated", "group_updated", true },
+        .{ "group.deleted", "group_deleted", true },
+        .{ "scim.enabled", "scim_enabled", true },
+        .{ "scim.disabled", "scim_disabled", true },
+        .{ "invite.sent", "invite_sent", true },
+        .{ "invite.accepted", "invite_accepted", true },
+        .{ "invite.deleted", "invite_deleted", true },
+        .{ "ip_allowlist.created", "ip_allowlist_created", true },
+        .{ "ip_allowlist.updated", "ip_allowlist_updated", true },
+        .{ "ip_allowlist.deleted", "ip_allowlist_deleted", true },
+        .{ "ip_allowlist.config.activated", "ip_allowlist_config_activated", true },
+        .{ "ip_allowlist.config.deactivated", "ip_allowlist_config_deactivated", true },
+        .{ "login.succeeded", "login_succeeded", true },
+        .{ "login.failed", "login_failed", true },
+        .{ "logout.succeeded", "logout_succeeded", true },
+        .{ "logout.failed", "logout_failed", true },
+        .{ "organization.updated", "organization_updated", true },
+        .{ "project.created", "project_created", true },
+        .{ "project.updated", "project_updated", true },
+        .{ "project.archived", "project_archived", true },
+        .{ "project.deleted", "project_deleted", true },
+        .{ "rate_limit.updated", "rate_limit_updated", true },
+        .{ "rate_limit.deleted", "rate_limit_deleted", true },
+        .{ "role.created", "role_created", true },
+        .{ "role.updated", "role_updated", true },
+        .{ "role.deleted", "role_deleted", true },
+        .{ "role.assignment.created", "role_assignment_created", true },
+        .{ "role.assignment.deleted", "role_assignment_deleted", true },
+        .{ "service_account.created", "service_account_created", true },
+        .{ "service_account.updated", "service_account_updated", true },
+        .{ "service_account.deleted", "service_account_deleted", true },
+        .{ "user.added", "user_added", true },
+        .{ "user.updated", "user_updated", true },
+        .{ "user.deleted", "user_deleted", true },
+        .{ "certificate.created", "certificate_created", true },
+        .{ "certificate.updated", "certificate_updated", true },
+        .{ "certificate.deleted", "certificate_deleted", true },
+        .{ "certificates.activated", "certificates_activated", true },
+        .{ "certificates.deactivated", "certificates_deactivated", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("effective_at");
+        try jw.write(self.effective_at);
+        if (self.project) |value| {
+            try jw.objectField("project");
+            try jw.write(value);
+        }
+        try jw.objectField("actor");
+        try jw.write(self.actor);
+        if (self.api_key_created) |value| {
+            try jw.objectField("api_key.created");
+            try jw.write(value);
+        }
+        if (self.api_key_updated) |value| {
+            try jw.objectField("api_key.updated");
+            try jw.write(value);
+        }
+        if (self.api_key_deleted) |value| {
+            try jw.objectField("api_key.deleted");
+            try jw.write(value);
+        }
+        if (self.checkpoint_permission_created) |value| {
+            try jw.objectField("checkpoint.permission.created");
+            try jw.write(value);
+        }
+        if (self.checkpoint_permission_deleted) |value| {
+            try jw.objectField("checkpoint.permission.deleted");
+            try jw.write(value);
+        }
+        if (self.external_key_registered) |value| {
+            try jw.objectField("external_key.registered");
+            try jw.write(value);
+        }
+        if (self.external_key_removed) |value| {
+            try jw.objectField("external_key.removed");
+            try jw.write(value);
+        }
+        if (self.group_created) |value| {
+            try jw.objectField("group.created");
+            try jw.write(value);
+        }
+        if (self.group_updated) |value| {
+            try jw.objectField("group.updated");
+            try jw.write(value);
+        }
+        if (self.group_deleted) |value| {
+            try jw.objectField("group.deleted");
+            try jw.write(value);
+        }
+        if (self.scim_enabled) |value| {
+            try jw.objectField("scim.enabled");
+            try jw.write(value);
+        }
+        if (self.scim_disabled) |value| {
+            try jw.objectField("scim.disabled");
+            try jw.write(value);
+        }
+        if (self.invite_sent) |value| {
+            try jw.objectField("invite.sent");
+            try jw.write(value);
+        }
+        if (self.invite_accepted) |value| {
+            try jw.objectField("invite.accepted");
+            try jw.write(value);
+        }
+        if (self.invite_deleted) |value| {
+            try jw.objectField("invite.deleted");
+            try jw.write(value);
+        }
+        if (self.ip_allowlist_created) |value| {
+            try jw.objectField("ip_allowlist.created");
+            try jw.write(value);
+        }
+        if (self.ip_allowlist_updated) |value| {
+            try jw.objectField("ip_allowlist.updated");
+            try jw.write(value);
+        }
+        if (self.ip_allowlist_deleted) |value| {
+            try jw.objectField("ip_allowlist.deleted");
+            try jw.write(value);
+        }
+        if (self.ip_allowlist_config_activated) |value| {
+            try jw.objectField("ip_allowlist.config.activated");
+            try jw.write(value);
+        }
+        if (self.ip_allowlist_config_deactivated) |value| {
+            try jw.objectField("ip_allowlist.config.deactivated");
+            try jw.write(value);
+        }
+        if (self.login_succeeded) |value| {
+            try jw.objectField("login.succeeded");
+            try jw.write(value);
+        }
+        if (self.login_failed) |value| {
+            try jw.objectField("login.failed");
+            try jw.write(value);
+        }
+        if (self.logout_succeeded) |value| {
+            try jw.objectField("logout.succeeded");
+            try jw.write(value);
+        }
+        if (self.logout_failed) |value| {
+            try jw.objectField("logout.failed");
+            try jw.write(value);
+        }
+        if (self.organization_updated) |value| {
+            try jw.objectField("organization.updated");
+            try jw.write(value);
+        }
+        if (self.project_created) |value| {
+            try jw.objectField("project.created");
+            try jw.write(value);
+        }
+        if (self.project_updated) |value| {
+            try jw.objectField("project.updated");
+            try jw.write(value);
+        }
+        if (self.project_archived) |value| {
+            try jw.objectField("project.archived");
+            try jw.write(value);
+        }
+        if (self.project_deleted) |value| {
+            try jw.objectField("project.deleted");
+            try jw.write(value);
+        }
+        if (self.rate_limit_updated) |value| {
+            try jw.objectField("rate_limit.updated");
+            try jw.write(value);
+        }
+        if (self.rate_limit_deleted) |value| {
+            try jw.objectField("rate_limit.deleted");
+            try jw.write(value);
+        }
+        if (self.role_created) |value| {
+            try jw.objectField("role.created");
+            try jw.write(value);
+        }
+        if (self.role_updated) |value| {
+            try jw.objectField("role.updated");
+            try jw.write(value);
+        }
+        if (self.role_deleted) |value| {
+            try jw.objectField("role.deleted");
+            try jw.write(value);
+        }
+        if (self.role_assignment_created) |value| {
+            try jw.objectField("role.assignment.created");
+            try jw.write(value);
+        }
+        if (self.role_assignment_deleted) |value| {
+            try jw.objectField("role.assignment.deleted");
+            try jw.write(value);
+        }
+        if (self.service_account_created) |value| {
+            try jw.objectField("service_account.created");
+            try jw.write(value);
+        }
+        if (self.service_account_updated) |value| {
+            try jw.objectField("service_account.updated");
+            try jw.write(value);
+        }
+        if (self.service_account_deleted) |value| {
+            try jw.objectField("service_account.deleted");
+            try jw.write(value);
+        }
+        if (self.user_added) |value| {
+            try jw.objectField("user.added");
+            try jw.write(value);
+        }
+        if (self.user_updated) |value| {
+            try jw.objectField("user.updated");
+            try jw.write(value);
+        }
+        if (self.user_deleted) |value| {
+            try jw.objectField("user.deleted");
+            try jw.write(value);
+        }
+        if (self.certificate_created) |value| {
+            try jw.objectField("certificate.created");
+            try jw.write(value);
+        }
+        if (self.certificate_updated) |value| {
+            try jw.objectField("certificate.updated");
+            try jw.write(value);
+        }
+        if (self.certificate_deleted) |value| {
+            try jw.objectField("certificate.deleted");
+            try jw.write(value);
+        }
+        if (self.certificates_activated) |value| {
+            try jw.objectField("certificates.activated");
+            try jw.write(value);
+        }
+        if (self.certificates_deactivated) |value| {
+            try jw.objectField("certificates.deactivated");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The actor who performed the audit logged action.
@@ -797,6 +1550,38 @@ pub const AuditLogActor = struct {
     type: ?[]const u8 = null,
     session: ?AuditLogActorSession = null,
     api_key: ?AuditLogActorApiKey = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", true },
+        .{ "session", "session", true },
+        .{ "api_key", "api_key", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        if (self.session) |value| {
+            try jw.objectField("session");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The API Key used to perform the audit logged action.
@@ -807,12 +1592,71 @@ pub const AuditLogActorApiKey = struct {
     type: ?[]const u8 = null,
     user: ?AuditLogActorUser = null,
     service_account: ?AuditLogActorServiceAccount = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "type", "type", true },
+        .{ "user", "user", true },
+        .{ "service_account", "service_account", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        if (self.service_account) |value| {
+            try jw.objectField("service_account");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The service account that performed the audit logged action.
 pub const AuditLogActorServiceAccount = struct {
     /// The service account id.
     id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The session in which the audit logged action was performed.
@@ -820,6 +1664,33 @@ pub const AuditLogActorSession = struct {
     user: ?AuditLogActorUser = null,
     /// The IP address from which the action was performed.
     ip_address: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "user", "user", true },
+        .{ "ip_address", "ip_address", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        if (self.ip_address) |value| {
+            try jw.objectField("ip_address");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The user who performed the audit logged action.
@@ -828,6 +1699,33 @@ pub const AuditLogActorUser = struct {
     id: ?[]const u8 = null,
     /// The user email.
     email: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "email", "email", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.email) |value| {
+            try jw.objectField("email");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The event type.
@@ -1018,12 +1916,69 @@ pub const AutoCodeInterpreterToolParam = struct {
     memory_limit: ?std.json.Value = null,
     /// Network access policy for the container.
     network_policy: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "file_ids", "file_ids", true },
+        .{ "memory_limit", "memory_limit", true },
+        .{ "network_policy", "network_policy", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.file_ids) |value| {
+            try jw.objectField("file_ids");
+            try jw.write(value);
+        }
+        if (self.memory_limit) |value| {
+            try jw.objectField("memory_limit");
+            try jw.write(value);
+        }
+        if (self.network_policy) |value| {
+            try jw.objectField("network_policy");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Controls whether ChatKit automatically generates thread titles.
 pub const AutomaticThreadTitlingParam = struct {
     /// Enable automatic thread title generation. Defaults to true.
     enabled: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.enabled) |value| {
+            try jw.objectField("enabled");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const Batch = struct {
@@ -1068,6 +2023,119 @@ pub const Batch = struct {
     /// Represents token usage details including input tokens, output tokens, a breakdown of output tokens, and the total tokens used. Only populated on batches created after September 7, 2025.
     usage: ?std.json.Value = null,
     metadata: ?Metadata = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "endpoint", "endpoint", false },
+        .{ "model", "model", true },
+        .{ "errors", "errors", true },
+        .{ "input_file_id", "input_file_id", false },
+        .{ "completion_window", "completion_window", false },
+        .{ "status", "status", false },
+        .{ "output_file_id", "output_file_id", true },
+        .{ "error_file_id", "error_file_id", true },
+        .{ "created_at", "created_at", false },
+        .{ "in_progress_at", "in_progress_at", true },
+        .{ "expires_at", "expires_at", true },
+        .{ "finalizing_at", "finalizing_at", true },
+        .{ "completed_at", "completed_at", true },
+        .{ "failed_at", "failed_at", true },
+        .{ "expired_at", "expired_at", true },
+        .{ "cancelling_at", "cancelling_at", true },
+        .{ "cancelled_at", "cancelled_at", true },
+        .{ "request_counts", "request_counts", true },
+        .{ "usage", "usage", true },
+        .{ "metadata", "metadata", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("endpoint");
+        try jw.write(self.endpoint);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.errors) |value| {
+            try jw.objectField("errors");
+            try jw.write(value);
+        }
+        try jw.objectField("input_file_id");
+        try jw.write(self.input_file_id);
+        try jw.objectField("completion_window");
+        try jw.write(self.completion_window);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.output_file_id) |value| {
+            try jw.objectField("output_file_id");
+            try jw.write(value);
+        }
+        if (self.error_file_id) |value| {
+            try jw.objectField("error_file_id");
+            try jw.write(value);
+        }
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        if (self.in_progress_at) |value| {
+            try jw.objectField("in_progress_at");
+            try jw.write(value);
+        }
+        if (self.expires_at) |value| {
+            try jw.objectField("expires_at");
+            try jw.write(value);
+        }
+        if (self.finalizing_at) |value| {
+            try jw.objectField("finalizing_at");
+            try jw.write(value);
+        }
+        if (self.completed_at) |value| {
+            try jw.objectField("completed_at");
+            try jw.write(value);
+        }
+        if (self.failed_at) |value| {
+            try jw.objectField("failed_at");
+            try jw.write(value);
+        }
+        if (self.expired_at) |value| {
+            try jw.objectField("expired_at");
+            try jw.write(value);
+        }
+        if (self.cancelling_at) |value| {
+            try jw.objectField("cancelling_at");
+            try jw.write(value);
+        }
+        if (self.cancelled_at) |value| {
+            try jw.objectField("cancelled_at");
+            try jw.write(value);
+        }
+        if (self.request_counts) |value| {
+            try jw.objectField("request_counts");
+            try jw.write(value);
+        }
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The expiration policy for the output and/or error file that are generated for a batch.
@@ -1091,6 +2159,43 @@ pub const Certificate = struct {
     certificate_details: std.json.Value,
     /// Whether the certificate is currently active at the specified scope. Not returned when getting details for a specific certificate.
     active: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "id", "id", false },
+        .{ "name", "name", false },
+        .{ "created_at", "created_at", false },
+        .{ "certificate_details", "certificate_details", false },
+        .{ "active", "active", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("certificate_details");
+        try jw.write(self.certificate_details);
+        if (self.active) |value| {
+            try jw.objectField("active");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Constrains the tools available to the model to a pre-defined set.
@@ -1098,7 +2203,7 @@ pub const ChatCompletionAllowedTools = struct {
     /// Constrains the tools available to the model to a pre-defined set. `auto` allows the model to pick from among the allowed tools and generate a message. `required` requires the model to call one or more of the allowed tools.
     mode: []const u8,
     /// A list of tool definitions that the model should be allowed to call. For the Chat Completions API, the list of tool definitions might look like: ```json [ { "type": "function", "function": { "name": "get_weather" } }, { "type": "function", "function": { "name": "get_time" } } ] ```
-    tools: []const std.json.Value,
+    tools: []const std.json.ArrayHashMap(std.json.Value),
 };
 
 /// Constrains the tools available to the model to a pre-defined set.
@@ -1129,6 +2234,36 @@ pub const ChatCompletionFunctions = struct {
     /// The name of the function to be called. Must be a-z, A-Z, 0-9, or contain underscores and dashes, with a maximum length of 64.
     name: []const u8,
     parameters: ?FunctionParameters = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "description", "description", true },
+        .{ "name", "name", false },
+        .{ "parameters", "parameters", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.parameters) |value| {
+            try jw.objectField("parameters");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// An object representing a list of Chat Completions.
@@ -1186,6 +2321,41 @@ pub const ChatCompletionMessageToolCallChunk = struct {
     /// The type of the tool. Currently, only `function` is supported.
     type: ?[]const u8 = null,
     function: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "id", "id", true },
+        .{ "type", "type", true },
+        .{ "function", "function", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        if (self.function) |value| {
+            try jw.objectField("function");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The tool calls generated by the model, such as function calls.
@@ -1218,11 +2388,88 @@ pub const ChatCompletionRequestAssistantMessage = struct {
     audio: ?std.json.Value = null,
     tool_calls: ?ChatCompletionMessageToolCalls = null,
     function_call: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "content", "content", true },
+        .{ "refusal", "refusal", true },
+        .{ "role", "role", false },
+        .{ "name", "name", true },
+        .{ "audio", "audio", true },
+        .{ "tool_calls", "tool_calls", true },
+        .{ "function_call", "function_call", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.content) |value| {
+            try jw.objectField("content");
+            try jw.write(value);
+        }
+        if (self.refusal) |value| {
+            try jw.objectField("refusal");
+            try jw.write(value);
+        }
+        try jw.objectField("role");
+        try jw.write(self.role);
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
+        if (self.tool_calls) |value| {
+            try jw.objectField("tool_calls");
+            try jw.write(value);
+        }
+        if (self.function_call) |value| {
+            try jw.objectField("function_call");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ChatCompletionRequestAssistantMessageContentPart = union(enum) {
     chat_completion_request_message_content_part_text: ChatCompletionRequestMessageContentPartText,
     chat_completion_request_message_content_part_refusal: ChatCompletionRequestMessageContentPartRefusal,
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestMessageContentPartText")) {
+            return .{ .chat_completion_request_message_content_part_text = try std.json.parseFromSliceLeaky(ChatCompletionRequestMessageContentPartText, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestMessageContentPartRefusal")) {
+            return .{ .chat_completion_request_message_content_part_refusal = try std.json.parseFromSliceLeaky(ChatCompletionRequestMessageContentPartRefusal, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
@@ -1231,7 +2478,9 @@ pub const ChatCompletionRequestAssistantMessageContentPart = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -1261,6 +2510,34 @@ pub const ChatCompletionRequestDeveloperMessage = struct {
     role: []const u8,
     /// An optional name for the participant. Provides the model information to differentiate between participants of the same role.
     name: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "content", "content", false },
+        .{ "role", "role", false },
+        .{ "name", "name", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.objectField("role");
+        try jw.write(self.role);
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ChatCompletionRequestFunctionMessage = struct {
@@ -1279,6 +2556,45 @@ pub const ChatCompletionRequestMessage = union(enum) {
     chat_completion_request_tool_message: ChatCompletionRequestToolMessage,
     chat_completion_request_function_message: ChatCompletionRequestFunctionMessage,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { role: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.role) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestDeveloperMessage")) {
+            return .{ .chat_completion_request_developer_message = try std.json.parseFromSliceLeaky(ChatCompletionRequestDeveloperMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestSystemMessage")) {
+            return .{ .chat_completion_request_system_message = try std.json.parseFromSliceLeaky(ChatCompletionRequestSystemMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestUserMessage")) {
+            return .{ .chat_completion_request_user_message = try std.json.parseFromSliceLeaky(ChatCompletionRequestUserMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestAssistantMessage")) {
+            return .{ .chat_completion_request_assistant_message = try std.json.parseFromSliceLeaky(ChatCompletionRequestAssistantMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestToolMessage")) {
+            return .{ .chat_completion_request_tool_message = try std.json.parseFromSliceLeaky(ChatCompletionRequestToolMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ChatCompletionRequestFunctionMessage")) {
+            return .{ .chat_completion_request_function_message = try std.json.parseFromSliceLeaky(ChatCompletionRequestFunctionMessage, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -1286,7 +2602,9 @@ pub const ChatCompletionRequestMessage = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("role") orelse return error.MissingField;
+        const disc_val = source.object.get("role") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -1368,6 +2686,34 @@ pub const ChatCompletionRequestSystemMessage = struct {
     role: []const u8,
     /// An optional name for the participant. Provides the model information to differentiate between participants of the same role.
     name: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "content", "content", false },
+        .{ "role", "role", false },
+        .{ "name", "name", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.objectField("role");
+        try jw.write(self.role);
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ChatCompletionRequestSystemMessageContentPart = union(enum) {
@@ -1390,13 +2736,53 @@ pub const ChatCompletionRequestSystemMessageContentPart = union(enum) {
         return false;
     }
 
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        switch (probe.type) {
+            .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "text")) return .{ .chat_completion_request_message_content_part_text = try parseStructuralVariantFromSlice(ChatCompletionRequestMessageContentPartText, allocator, input, options) };
+                return error.UnexpectedToken;
+            },
+            .missing => {
+                return error.MissingField;
+            },
+        }
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "text",
-        })) {
-            if (try parseStructuralVariant(ChatCompletionRequestMessageContentPartText, allocator, source, options)) |parsed| return .{ .chat_completion_request_message_content_part_text = parsed };
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |value| value,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "text")) {
+            const parsed = try parseStructuralVariant(ChatCompletionRequestMessageContentPartText, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .chat_completion_request_message_content_part_text = parsed };
         }
         return error.UnexpectedToken;
     }
@@ -1437,13 +2823,53 @@ pub const ChatCompletionRequestToolMessageContentPart = union(enum) {
         return false;
     }
 
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        switch (probe.type) {
+            .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "text")) return .{ .chat_completion_request_message_content_part_text = try parseStructuralVariantFromSlice(ChatCompletionRequestMessageContentPartText, allocator, input, options) };
+                return error.UnexpectedToken;
+            },
+            .missing => {
+                return error.MissingField;
+            },
+        }
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "text",
-        })) {
-            if (try parseStructuralVariant(ChatCompletionRequestMessageContentPartText, allocator, source, options)) |parsed| return .{ .chat_completion_request_message_content_part_text = parsed };
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |value| value,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "text")) {
+            const parsed = try parseStructuralVariant(ChatCompletionRequestMessageContentPartText, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .chat_completion_request_message_content_part_text = parsed };
         }
         return error.UnexpectedToken;
     }
@@ -1463,6 +2889,34 @@ pub const ChatCompletionRequestUserMessage = struct {
     role: []const u8,
     /// An optional name for the participant. Provides the model information to differentiate between participants of the same role.
     name: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "content", "content", false },
+        .{ "role", "role", false },
+        .{ "name", "name", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.objectField("role");
+        try jw.write(self.role);
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ChatCompletionRequestUserMessageContentPart = union(enum) {
@@ -1488,31 +2942,68 @@ pub const ChatCompletionRequestUserMessageContentPart = union(enum) {
         return false;
     }
 
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        switch (probe.type) {
+            .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "input_audio")) return .{ .chat_completion_request_message_content_part_audio = try parseStructuralVariantFromSlice(ChatCompletionRequestMessageContentPartAudio, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "file")) return .{ .chat_completion_request_message_content_part_file = try parseStructuralVariantFromSlice(ChatCompletionRequestMessageContentPartFile, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "image_url")) return .{ .chat_completion_request_message_content_part_image = try parseStructuralVariantFromSlice(ChatCompletionRequestMessageContentPartImage, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "text")) return .{ .chat_completion_request_message_content_part_text = try parseStructuralVariantFromSlice(ChatCompletionRequestMessageContentPartText, allocator, input, options) };
+                return error.UnexpectedToken;
+            },
+            .missing => {
+                return error.MissingField;
+            },
+        }
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "input_audio",
-        })) {
-            if (try parseStructuralVariant(ChatCompletionRequestMessageContentPartAudio, allocator, source, options)) |parsed| return .{ .chat_completion_request_message_content_part_audio = parsed };
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |value| value,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "input_audio")) {
+            const parsed = try parseStructuralVariant(ChatCompletionRequestMessageContentPartAudio, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .chat_completion_request_message_content_part_audio = parsed };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "file",
-        })) {
-            if (try parseStructuralVariant(ChatCompletionRequestMessageContentPartFile, allocator, source, options)) |parsed| return .{ .chat_completion_request_message_content_part_file = parsed };
+        if (std.mem.eql(u8, disc_str, "file")) {
+            const parsed = try parseStructuralVariant(ChatCompletionRequestMessageContentPartFile, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .chat_completion_request_message_content_part_file = parsed };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "image_url",
-        })) {
-            if (try parseStructuralVariant(ChatCompletionRequestMessageContentPartImage, allocator, source, options)) |parsed| return .{ .chat_completion_request_message_content_part_image = parsed };
+        if (std.mem.eql(u8, disc_str, "image_url")) {
+            const parsed = try parseStructuralVariant(ChatCompletionRequestMessageContentPartImage, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .chat_completion_request_message_content_part_image = parsed };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "text",
-        })) {
-            if (try parseStructuralVariant(ChatCompletionRequestMessageContentPartText, allocator, source, options)) |parsed| return .{ .chat_completion_request_message_content_part_text = parsed };
+        if (std.mem.eql(u8, disc_str, "text")) {
+            const parsed = try parseStructuralVariant(ChatCompletionRequestMessageContentPartText, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .chat_completion_request_message_content_part_text = parsed };
         }
         return error.UnexpectedToken;
     }
@@ -1539,6 +3030,52 @@ pub const ChatCompletionResponseMessage = struct {
     /// Deprecated and replaced by `tool_calls`. The name and arguments of a function that should be called, as generated by the model.
     function_call: ?std.json.Value = null,
     audio: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "content", "content", false },
+        .{ "refusal", "refusal", false },
+        .{ "tool_calls", "tool_calls", true },
+        .{ "annotations", "annotations", true },
+        .{ "role", "role", false },
+        .{ "function_call", "function_call", true },
+        .{ "audio", "audio", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.objectField("refusal");
+        try jw.write(self.refusal);
+        if (self.tool_calls) |value| {
+            try jw.objectField("tool_calls");
+            try jw.write(value);
+        }
+        if (self.annotations) |value| {
+            try jw.objectField("annotations");
+            try jw.write(value);
+        }
+        try jw.objectField("role");
+        try jw.write(self.role);
+        if (self.function_call) |value| {
+            try jw.objectField("function_call");
+            try jw.write(value);
+        }
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The role of the author of a message
@@ -1590,6 +3127,48 @@ pub const ChatCompletionStreamResponseDelta = struct {
     /// The role of the author of this message.
     role: ?[]const u8 = null,
     refusal: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "content", "content", true },
+        .{ "function_call", "function_call", true },
+        .{ "tool_calls", "tool_calls", true },
+        .{ "role", "role", true },
+        .{ "refusal", "refusal", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.content) |value| {
+            try jw.objectField("content");
+            try jw.write(value);
+        }
+        if (self.function_call) |value| {
+            try jw.objectField("function_call");
+            try jw.write(value);
+        }
+        if (self.tool_calls) |value| {
+            try jw.objectField("tool_calls");
+            try jw.write(value);
+        }
+        if (self.role) |value| {
+            try jw.objectField("role");
+            try jw.write(value);
+        }
+        if (self.refusal) |value| {
+            try jw.objectField("refusal");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ChatCompletionTokenLogprob = struct {
@@ -1709,6 +3288,38 @@ pub const ChatkitConfigurationParam = struct {
     file_upload: ?FileUploadParam = null,
     /// Configuration for chat history retention. When omitted, history is enabled by default with no limit on recent_threads (null).
     history: ?HistoryParam = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "automatic_thread_titling", "automatic_thread_titling", true },
+        .{ "file_upload", "file_upload", true },
+        .{ "history", "history", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.automatic_thread_titling) |value| {
+            try jw.objectField("automatic_thread_titling");
+            try jw.write(value);
+        }
+        if (self.file_upload) |value| {
+            try jw.objectField("file_upload");
+            try jw.write(value);
+        }
+        if (self.history) |value| {
+            try jw.objectField("history");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Workflow metadata and state returned for the session.
@@ -1732,6 +3343,33 @@ pub const ChunkingStrategyRequestParam = union(enum) {
     auto_chunking_strategy_request_param: AutoChunkingStrategyRequestParam,
     static_chunking_strategy_request_param: StaticChunkingStrategyRequestParam,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "AutoChunkingStrategyRequestParam")) {
+            return .{ .auto_chunking_strategy_request_param = try std.json.parseFromSliceLeaky(AutoChunkingStrategyRequestParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "StaticChunkingStrategyRequestParam")) {
+            return .{ .static_chunking_strategy_request_param = try std.json.parseFromSliceLeaky(StaticChunkingStrategyRequestParam, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -1739,7 +3377,9 @@ pub const ChunkingStrategyRequestParam = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -1806,6 +3446,40 @@ pub const ClickParam = struct {
     /// The y-coordinate where the click occurred.
     y: i64,
     keys: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "button", "button", false },
+        .{ "x", "x", false },
+        .{ "y", "y", false },
+        .{ "keys", "keys", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("button");
+        try jw.write(self.button);
+        try jw.objectField("x");
+        try jw.write(self.x);
+        try jw.objectField("y");
+        try jw.write(self.y);
+        if (self.keys) |value| {
+            try jw.objectField("keys");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Record of a client side tool invocation initiated by the assistant.
@@ -1935,6 +3609,46 @@ pub const CompactResponseMethodPublicBody = struct {
     previous_response_id: ?std.json.Value = null,
     instructions: ?std.json.Value = null,
     prompt_cache_key: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "input", "input", true },
+        .{ "previous_response_id", "previous_response_id", true },
+        .{ "instructions", "instructions", true },
+        .{ "prompt_cache_key", "prompt_cache_key", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.input) |value| {
+            try jw.objectField("input");
+            try jw.write(value);
+        }
+        if (self.previous_response_id) |value| {
+            try jw.objectField("previous_response_id");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.prompt_cache_key) |value| {
+            try jw.objectField("prompt_cache_key");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A compaction item generated by the [`v1/responses/compact` API](/docs/api-reference/responses/compact).
@@ -1947,6 +3661,37 @@ pub const CompactionBody = struct {
     encrypted_content: []const u8,
     /// The identifier of the actor that created the item.
     created_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "encrypted_content", "encrypted_content", false },
+        .{ "created_by", "created_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("encrypted_content");
+        try jw.write(self.encrypted_content);
+        if (self.created_by) |value| {
+            try jw.objectField("created_by");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A compaction item generated by the [`v1/responses/compact` API](/docs/api-reference/responses/compact).
@@ -1956,6 +3701,34 @@ pub const CompactionSummaryItemParam = struct {
     type: []const u8,
     /// The encrypted content of the compaction summary.
     encrypted_content: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "type", "type", false },
+        .{ "encrypted_content", "encrypted_content", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("encrypted_content");
+        try jw.write(self.encrypted_content);
+        try jw.endObject();
+    }
 };
 
 /// A filter used to compare a specified attribute key to a given value using a defined comparison operation.
@@ -1973,6 +3746,31 @@ pub const CompleteUploadRequest = struct {
     part_ids: []const []const u8,
     /// The optional md5 checksum for the file contents to verify if the bytes uploaded matches what you expect.
     md5: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "part_ids", "part_ids", false },
+        .{ "md5", "md5", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("part_ids");
+        try jw.write(self.part_ids);
+        if (self.md5) |value| {
+            try jw.objectField("md5");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Usage statistics for the completion request.
@@ -1987,6 +3785,42 @@ pub const CompletionUsage = struct {
     completion_tokens_details: ?std.json.Value = null,
     /// Breakdown of tokens used in the prompt.
     prompt_tokens_details: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "completion_tokens", "completion_tokens", false },
+        .{ "prompt_tokens", "prompt_tokens", false },
+        .{ "total_tokens", "total_tokens", false },
+        .{ "completion_tokens_details", "completion_tokens_details", true },
+        .{ "prompt_tokens_details", "prompt_tokens_details", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("completion_tokens");
+        try jw.write(self.completion_tokens);
+        try jw.objectField("prompt_tokens");
+        try jw.write(self.prompt_tokens);
+        try jw.objectField("total_tokens");
+        try jw.write(self.total_tokens);
+        if (self.completion_tokens_details) |value| {
+            try jw.objectField("completion_tokens_details");
+            try jw.write(value);
+        }
+        if (self.prompt_tokens_details) |value| {
+            try jw.objectField("prompt_tokens_details");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Combine multiple filters using `and` or `or`.
@@ -2008,6 +3842,54 @@ pub const ComputerAction = union(enum) {
     type_param: TypeParam,
     wait_param: WaitParam,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "ClickParam")) {
+            return .{ .click_param = try std.json.parseFromSliceLeaky(ClickParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "DoubleClickAction")) {
+            return .{ .double_click_action = try std.json.parseFromSliceLeaky(DoubleClickAction, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "DragParam")) {
+            return .{ .drag_param = try std.json.parseFromSliceLeaky(DragParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "KeyPressAction")) {
+            return .{ .key_press_action = try std.json.parseFromSliceLeaky(KeyPressAction, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MoveParam")) {
+            return .{ .move_param = try std.json.parseFromSliceLeaky(MoveParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ScreenshotParam")) {
+            return .{ .screenshot_param = try std.json.parseFromSliceLeaky(ScreenshotParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ScrollParam")) {
+            return .{ .scroll_param = try std.json.parseFromSliceLeaky(ScrollParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "TypeParam")) {
+            return .{ .type_param = try std.json.parseFromSliceLeaky(TypeParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WaitParam")) {
+            return .{ .wait_param = try std.json.parseFromSliceLeaky(WaitParam, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -2015,7 +3897,9 @@ pub const ComputerAction = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -2078,6 +3962,47 @@ pub const ComputerCallOutputItemParam = struct {
     output: ComputerScreenshotImage,
     acknowledged_safety_checks: ?std.json.Value = null,
     status: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "call_id", "call_id", false },
+        .{ "type", "type", false },
+        .{ "output", "output", false },
+        .{ "acknowledged_safety_checks", "acknowledged_safety_checks", true },
+        .{ "status", "status", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("output");
+        try jw.write(self.output);
+        if (self.acknowledged_safety_checks) |value| {
+            try jw.objectField("acknowledged_safety_checks");
+            try jw.write(value);
+        }
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ComputerCallOutputStatus = enum {
@@ -2114,6 +4039,36 @@ pub const ComputerCallSafetyCheckParam = struct {
     id: []const u8,
     code: ?std.json.Value = null,
     message: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "code", "code", true },
+        .{ "message", "message", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        if (self.code) |value| {
+            try jw.objectField("code");
+            try jw.write(value);
+        }
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ComputerEnvironment = enum {
@@ -2168,6 +4123,36 @@ pub const ComputerScreenshotImage = struct {
     image_url: ?[]const u8 = null,
     /// The identifier of an uploaded file that contains the screenshot.
     file_id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "image_url", "image_url", true },
+        .{ "file_id", "file_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.image_url) |value| {
+            try jw.objectField("image_url");
+            try jw.write(value);
+        }
+        if (self.file_id) |value| {
+            try jw.objectField("file_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A tool that controls a virtual computer. Learn more about the [computer tool](https://platform.openai.com/docs/guides/tools-computer-use).
@@ -2190,6 +4175,48 @@ pub const ComputerToolCall = struct {
     pending_safety_checks: []const ComputerCallSafetyCheckParam,
     /// The status of the item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
     status: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "call_id", "call_id", false },
+        .{ "action", "action", true },
+        .{ "actions", "actions", true },
+        .{ "pending_safety_checks", "pending_safety_checks", false },
+        .{ "status", "status", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        if (self.action) |value| {
+            try jw.objectField("action");
+            try jw.write(value);
+        }
+        if (self.actions) |value| {
+            try jw.objectField("actions");
+            try jw.write(value);
+        }
+        try jw.objectField("pending_safety_checks");
+        try jw.write(self.pending_safety_checks);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.endObject();
+    }
 };
 
 /// The output of a computer tool call.
@@ -2205,6 +4232,47 @@ pub const ComputerToolCallOutput = struct {
     output: ComputerScreenshotImage,
     /// The status of the message input. One of `in_progress`, `completed`, or `incomplete`. Populated when input items are returned via API.
     status: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", true },
+        .{ "call_id", "call_id", false },
+        .{ "acknowledged_safety_checks", "acknowledged_safety_checks", true },
+        .{ "output", "output", false },
+        .{ "status", "status", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        if (self.acknowledged_safety_checks) |value| {
+            try jw.objectField("acknowledged_safety_checks");
+            try jw.write(value);
+        }
+        try jw.objectField("output");
+        try jw.write(self.output);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ComputerToolCallOutputResource = struct {
@@ -2221,6 +4289,48 @@ pub const ComputerToolCallOutputResource = struct {
     status: ?[]const u8 = null,
     /// The identifier of the actor that created the item.
     created_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "call_id", "call_id", false },
+        .{ "acknowledged_safety_checks", "acknowledged_safety_checks", true },
+        .{ "output", "output", false },
+        .{ "status", "status", false },
+        .{ "created_by", "created_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        if (self.acknowledged_safety_checks) |value| {
+            try jw.objectField("acknowledged_safety_checks");
+            try jw.write(value);
+        }
+        try jw.objectField("output");
+        try jw.write(self.output);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.created_by) |value| {
+            try jw.objectField("created_by");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A tool that controls a virtual computer. Learn more about the [computer tool](https://platform.openai.com/docs/guides/tools-computer-use).
@@ -2245,6 +4355,46 @@ pub const ContainerAutoParam = struct {
     network_policy: ?std.json.Value = null,
     /// An optional list of skills referenced by id or inline data.
     skills: ?[]const std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "file_ids", "file_ids", true },
+        .{ "memory_limit", "memory_limit", true },
+        .{ "network_policy", "network_policy", true },
+        .{ "skills", "skills", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.file_ids) |value| {
+            try jw.objectField("file_ids");
+            try jw.write(value);
+        }
+        if (self.memory_limit) |value| {
+            try jw.objectField("memory_limit");
+            try jw.write(value);
+        }
+        if (self.network_policy) |value| {
+            try jw.objectField("network_policy");
+            try jw.write(value);
+        }
+        if (self.skills) |value| {
+            try jw.objectField("skills");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A citation for a container file used to generate a model response.
@@ -2344,6 +4494,34 @@ pub const ContainerNetworkPolicyAllowlistParam = struct {
     allowed_domains: []const []const u8,
     /// Optional domain-scoped secrets for allowlisted domains.
     domain_secrets: ?[]const ContainerNetworkPolicyDomainSecretParam = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "allowed_domains", "allowed_domains", false },
+        .{ "domain_secrets", "domain_secrets", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("allowed_domains");
+        try jw.write(self.allowed_domains);
+        if (self.domain_secrets) |value| {
+            try jw.objectField("domain_secrets");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ContainerNetworkPolicyDisabledParam = struct {
@@ -2393,15 +4571,203 @@ pub const ContainerResource = struct {
     memory_limit: ?[]const u8 = null,
     /// Network access policy for the container.
     network_policy: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "name", "name", false },
+        .{ "created_at", "created_at", false },
+        .{ "status", "status", false },
+        .{ "last_active_at", "last_active_at", true },
+        .{ "expires_after", "expires_after", true },
+        .{ "memory_limit", "memory_limit", true },
+        .{ "network_policy", "network_policy", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.last_active_at) |value| {
+            try jw.objectField("last_active_at");
+            try jw.write(value);
+        }
+        if (self.expires_after) |value| {
+            try jw.objectField("expires_after");
+            try jw.write(value);
+        }
+        if (self.memory_limit) |value| {
+            try jw.objectField("memory_limit");
+            try jw.write(value);
+        }
+        if (self.network_policy) |value| {
+            try jw.objectField("network_policy");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Multi-modal input and output contents.
-pub const Content = std.json.Value;
+pub const Content = union(enum) {
+    input_file_content: *InputFileContent,
+    input_image_content: *InputImageContent,
+    output_text_content: *OutputTextContent,
+    input_text_content: *InputTextContent,
+    reasoning_text_content: *ReasoningTextContent,
+    refusal_content: *RefusalContent,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        switch (probe.type) {
+            .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "input_file")) return .{ .input_file_content = try parseStructuralVariantFromSlice(InputFileContent, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "input_image")) return .{ .input_image_content = try parseStructuralVariantFromSlice(InputImageContent, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "output_text")) return .{ .output_text_content = try parseStructuralVariantFromSlice(OutputTextContent, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "input_text")) return .{ .input_text_content = try parseStructuralVariantFromSlice(InputTextContent, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "reasoning_text")) return .{ .reasoning_text_content = try parseStructuralVariantFromSlice(ReasoningTextContent, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "refusal")) return .{ .refusal_content = try parseStructuralVariantFromSlice(RefusalContent, allocator, input, options) };
+                return error.UnexpectedToken;
+            },
+            .missing => {
+                return error.MissingField;
+            },
+        }
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |value| value,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "input_file")) {
+            const parsed = try parseStructuralVariant(InputFileContent, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .input_file_content = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "input_image")) {
+            const parsed = try parseStructuralVariant(InputImageContent, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .input_image_content = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "output_text")) {
+            const parsed = try parseStructuralVariant(OutputTextContent, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .output_text_content = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "input_text")) {
+            const parsed = try parseStructuralVariant(InputTextContent, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .input_text_content = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "reasoning_text")) {
+            const parsed = try parseStructuralVariant(ReasoningTextContent, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .reasoning_text_content = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "refusal")) {
+            const parsed = try parseStructuralVariant(RefusalContent, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .refusal_content = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .input_file_content => |v| try jw.write(v.*),
+            .input_image_content => |v| try jw.write(v.*),
+            .output_text_content => |v| try jw.write(v.*),
+            .input_text_content => |v| try jw.write(v.*),
+            .reasoning_text_content => |v| try jw.write(v.*),
+            .refusal_content => |v| try jw.write(v.*),
+        }
+    }
+};
 
 pub const ContextManagementParam = struct {
     /// The context management entry type. Currently only 'compaction' is supported.
     type: []const u8,
     compact_threshold: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "compact_threshold", "compact_threshold", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.compact_threshold) |value| {
+            try jw.objectField("compact_threshold");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The conversation that this response belonged to. Input items and output items from this response were automatically added to this conversation.
@@ -2438,6 +4804,102 @@ pub const ConversationItem = union(enum) {
     custom_tool_call: CustomToolCall,
     custom_tool_call_output: CustomToolCallOutput,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "Message")) {
+            return .{ .message = try std.json.parseFromSliceLeaky(Message, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCallResource")) {
+            return .{ .function_tool_call_resource = try std.json.parseFromSliceLeaky(FunctionToolCallResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCallOutputResource")) {
+            return .{ .function_tool_call_output_resource = try std.json.parseFromSliceLeaky(FunctionToolCallOutputResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FileSearchToolCall")) {
+            return .{ .file_search_tool_call = try std.json.parseFromSliceLeaky(FileSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchToolCall")) {
+            return .{ .web_search_tool_call = try std.json.parseFromSliceLeaky(WebSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ImageGenToolCall")) {
+            return .{ .image_gen_tool_call = try std.json.parseFromSliceLeaky(ImageGenToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCall")) {
+            return .{ .computer_tool_call = try std.json.parseFromSliceLeaky(ComputerToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCallOutputResource")) {
+            return .{ .computer_tool_call_output_resource = try std.json.parseFromSliceLeaky(ComputerToolCallOutputResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchCall")) {
+            return .{ .tool_search_call = try std.json.parseFromSliceLeaky(ToolSearchCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchOutput")) {
+            return .{ .tool_search_output = try std.json.parseFromSliceLeaky(ToolSearchOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ReasoningItem")) {
+            return .{ .reasoning_item = try std.json.parseFromSliceLeaky(ReasoningItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CompactionBody")) {
+            return .{ .compaction_body = try std.json.parseFromSliceLeaky(CompactionBody, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CodeInterpreterToolCall")) {
+            return .{ .code_interpreter_tool_call = try std.json.parseFromSliceLeaky(CodeInterpreterToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCall")) {
+            return .{ .local_shell_tool_call = try std.json.parseFromSliceLeaky(LocalShellToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCallOutput")) {
+            return .{ .local_shell_tool_call_output = try std.json.parseFromSliceLeaky(LocalShellToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCall")) {
+            return .{ .function_shell_call = try std.json.parseFromSliceLeaky(FunctionShellCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutput")) {
+            return .{ .function_shell_call_output = try std.json.parseFromSliceLeaky(FunctionShellCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCall")) {
+            return .{ .apply_patch_tool_call = try std.json.parseFromSliceLeaky(ApplyPatchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCallOutput")) {
+            return .{ .apply_patch_tool_call_output = try std.json.parseFromSliceLeaky(ApplyPatchToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPListTools")) {
+            return .{ .mcp_list_tools = try std.json.parseFromSliceLeaky(MCPListTools, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalRequest")) {
+            return .{ .mcp_approval_request = try std.json.parseFromSliceLeaky(MCPApprovalRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalResponseResource")) {
+            return .{ .mcp_approval_response_resource = try std.json.parseFromSliceLeaky(MCPApprovalResponseResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPToolCall")) {
+            return .{ .mcp_tool_call = try std.json.parseFromSliceLeaky(MCPToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCall")) {
+            return .{ .custom_tool_call = try std.json.parseFromSliceLeaky(CustomToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCallOutput")) {
+            return .{ .custom_tool_call_output = try std.json.parseFromSliceLeaky(CustomToolCallOutput, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -2445,7 +4907,9 @@ pub const ConversationItem = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -2608,6 +5072,41 @@ pub const CostsResult = struct {
     amount: ?std.json.Value = null,
     line_item: ?std.json.Value = null,
     project_id: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "amount", "amount", true },
+        .{ "line_item", "line_item", true },
+        .{ "project_id", "project_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        if (self.amount) |value| {
+            try jw.objectField("amount");
+            try jw.write(value);
+        }
+        if (self.line_item) |value| {
+            try jw.objectField("line_item");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateAssistantRequest = struct {
@@ -2624,6 +5123,76 @@ pub const CreateAssistantRequest = struct {
     temperature: ?std.json.Value = null,
     top_p: ?std.json.Value = null,
     response_format: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "name", "name", true },
+        .{ "description", "description", true },
+        .{ "instructions", "instructions", true },
+        .{ "reasoning_effort", "reasoning_effort", true },
+        .{ "tools", "tools", true },
+        .{ "tool_resources", "tool_resources", true },
+        .{ "metadata", "metadata", true },
+        .{ "temperature", "temperature", true },
+        .{ "top_p", "top_p", true },
+        .{ "response_format", "response_format", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_resources) |value| {
+            try jw.objectField("tool_resources");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.response_format) |value| {
+            try jw.objectField("response_format");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateChatCompletionRequest = struct {
@@ -2647,34 +5216,34 @@ pub const CreateChatCompletionRequest = struct {
     verbosity: ?Verbosity = null,
     reasoning_effort: ?ReasoningEffort = null,
     /// An upper bound for the number of tokens that can be generated for a completion, including visible output tokens and [reasoning tokens](/docs/guides/reasoning).
-    max_completion_tokens: ?i64 = null,
+    max_completion_tokens: OpenApiOptionalNullable(i64) = .absent,
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far, decreasing the model's likelihood to repeat the same line verbatim.
-    frequency_penalty: ?f64 = null,
+    frequency_penalty: OpenApiOptionalNullable(f64) = .absent,
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the text so far, increasing the model's likelihood to talk about new topics.
-    presence_penalty: ?f64 = null,
+    presence_penalty: OpenApiOptionalNullable(f64) = .absent,
     /// This tool searches the web for relevant results to use in a response. Learn more about the [web search tool](/docs/guides/tools-web-search?api-mode=chat).
     web_search_options: ?std.json.Value = null,
     /// An object specifying the format that the model must output. Setting to `{ "type": "json_schema", "json_schema": {...} }` enables Structured Outputs which ensures the model will match your supplied JSON schema. Learn more in the [Structured Outputs guide](/docs/guides/structured-outputs). Setting to `{ "type": "json_object" }` enables the older JSON mode, which ensures the message the model generates is valid JSON. Using `json_schema` is preferred for models that support it.
     response_format: ?std.json.Value = null,
     /// Parameters for audio output. Required when audio output is requested with `modalities: ["audio"]`. [Learn more](/docs/guides/audio).
-    audio: ?std.json.Value = null,
+    audio: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// Whether or not to store the output of this chat completion request for use in our [model distillation](/docs/guides/distillation) or [evals](/docs/guides/evals) products. Supports text and image inputs. Note: image inputs over 8MB will be dropped.
-    store: ?bool = null,
+    store: OpenApiOptionalNullable(bool) = .absent,
     /// If set to true, the model response data will be streamed to the client as it is generated using [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#Event_stream_format). See the [Streaming section below](/docs/api-reference/chat/streaming) for more information, along with the [streaming responses](/docs/guides/streaming-responses) guide for more information on how to handle the streaming events.
-    stream: ?bool = null,
-    stop: ?StopConfiguration = null,
+    stream: OpenApiOptionalNullable(bool) = .absent,
+    stop: OpenApiOptionalNullable(std.meta.Child(StopConfiguration)) = .absent,
     /// Modify the likelihood of specified tokens appearing in the completion. Accepts a JSON object that maps tokens (specified by their token ID in the tokenizer) to an associated bias value from -100 to 100. Mathematically, the bias is added to the logits generated by the model prior to sampling. The exact effect will vary per model, but values between -1 and 1 should decrease or increase likelihood of selection; values like -100 or 100 should result in a ban or exclusive selection of the relevant token.
-    logit_bias: ?std.json.ArrayHashMap(i64) = null,
+    logit_bias: OpenApiOptionalNullable(std.json.ArrayHashMap(i64)) = .absent,
     /// Whether to return log probabilities of the output tokens or not. If true, returns the log probabilities of each output token returned in the `content` of `message`.
-    logprobs: ?bool = null,
+    logprobs: OpenApiOptionalNullable(bool) = .absent,
     /// The maximum number of [tokens](/tokenizer) that can be generated in the chat completion. This value can be used to control [costs](https://openai.com/api/pricing/) for text generated via API. This value is now deprecated in favor of `max_completion_tokens`, and is not compatible with [o-series models](/docs/guides/reasoning).
-    max_tokens: ?i64 = null,
+    max_tokens: OpenApiOptionalNullable(i64) = .absent,
     /// How many chat completion choices to generate for each input message. Note that you will be charged based on the number of generated tokens across all of the choices. Keep `n` as `1` to minimize costs.
-    n: ?i64 = null,
+    n: OpenApiOptionalNullable(i64) = .absent,
     /// Configuration for a [Predicted Output](/docs/guides/predicted-outputs), which can greatly improve response times when large parts of the model response are known ahead of time. This is most common when you are regenerating a file with only minor changes to most of the content.
-    prediction: ?std.json.Value = null,
+    prediction: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// This feature is in Beta. If specified, our system will make a best effort to sample deterministically, such that repeated requests with the same `seed` and parameters should return the same result. Determinism is not guaranteed, and you should refer to the `system_fingerprint` response parameter to monitor changes in the backend.
-    seed: ?i64 = null,
+    seed: OpenApiOptionalNullable(i64) = .absent,
     stream_options: ?ChatCompletionStreamOptions = null,
     /// A list of tools the model may call. You can provide either [custom tools](/docs/guides/function-calling#custom-tools) or [function tools](/docs/guides/function-calling).
     tools: ?[]const std.json.Value = null,
@@ -2684,6 +5253,285 @@ pub const CreateChatCompletionRequest = struct {
     function_call: ?std.json.Value = null,
     /// Deprecated in favor of `tools`. A list of functions the model may generate JSON inputs for.
     functions: ?[]const ChatCompletionFunctions = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "metadata", "metadata", true },
+        .{ "top_logprobs", "top_logprobs", true },
+        .{ "temperature", "temperature", true },
+        .{ "top_p", "top_p", true },
+        .{ "user", "user", true },
+        .{ "safety_identifier", "safety_identifier", true },
+        .{ "prompt_cache_key", "prompt_cache_key", true },
+        .{ "service_tier", "service_tier", true },
+        .{ "prompt_cache_retention", "prompt_cache_retention", true },
+        .{ "messages", "messages", false },
+        .{ "model", "model", false },
+        .{ "modalities", "modalities", true },
+        .{ "verbosity", "verbosity", true },
+        .{ "reasoning_effort", "reasoning_effort", true },
+        .{ "max_completion_tokens", "max_completion_tokens", false },
+        .{ "frequency_penalty", "frequency_penalty", false },
+        .{ "presence_penalty", "presence_penalty", false },
+        .{ "web_search_options", "web_search_options", true },
+        .{ "response_format", "response_format", true },
+        .{ "audio", "audio", false },
+        .{ "store", "store", false },
+        .{ "stream", "stream", false },
+        .{ "stop", "stop", false },
+        .{ "logit_bias", "logit_bias", false },
+        .{ "logprobs", "logprobs", false },
+        .{ "max_tokens", "max_tokens", false },
+        .{ "n", "n", false },
+        .{ "prediction", "prediction", false },
+        .{ "seed", "seed", false },
+        .{ "stream_options", "stream_options", true },
+        .{ "tools", "tools", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "parallel_tool_calls", "parallel_tool_calls", true },
+        .{ "function_call", "function_call", true },
+        .{ "functions", "functions", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.top_logprobs) |value| {
+            try jw.objectField("top_logprobs");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        if (self.safety_identifier) |value| {
+            try jw.objectField("safety_identifier");
+            try jw.write(value);
+        }
+        if (self.prompt_cache_key) |value| {
+            try jw.objectField("prompt_cache_key");
+            try jw.write(value);
+        }
+        if (self.service_tier) |value| {
+            try jw.objectField("service_tier");
+            try jw.write(value);
+        }
+        if (self.prompt_cache_retention) |value| {
+            try jw.objectField("prompt_cache_retention");
+            try jw.write(value);
+        }
+        try jw.objectField("messages");
+        try jw.write(self.messages);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.modalities) |value| {
+            try jw.objectField("modalities");
+            try jw.write(value);
+        }
+        if (self.verbosity) |value| {
+            try jw.objectField("verbosity");
+            try jw.write(value);
+        }
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
+        switch (self.max_completion_tokens) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max_completion_tokens");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max_completion_tokens");
+                try jw.write(value);
+            },
+        }
+        switch (self.frequency_penalty) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("frequency_penalty");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("frequency_penalty");
+                try jw.write(value);
+            },
+        }
+        switch (self.presence_penalty) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("presence_penalty");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("presence_penalty");
+                try jw.write(value);
+            },
+        }
+        if (self.web_search_options) |value| {
+            try jw.objectField("web_search_options");
+            try jw.write(value);
+        }
+        if (self.response_format) |value| {
+            try jw.objectField("response_format");
+            try jw.write(value);
+        }
+        switch (self.audio) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("audio");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("audio");
+                try jw.write(value);
+            },
+        }
+        switch (self.store) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("store");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("store");
+                try jw.write(value);
+            },
+        }
+        switch (self.stream) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("stream");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("stream");
+                try jw.write(value);
+            },
+        }
+        switch (self.stop) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("stop");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("stop");
+                try jw.write(value);
+            },
+        }
+        switch (self.logit_bias) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("logit_bias");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("logit_bias");
+                try jw.write(value);
+            },
+        }
+        switch (self.logprobs) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("logprobs");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("logprobs");
+                try jw.write(value);
+            },
+        }
+        switch (self.max_tokens) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max_tokens");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max_tokens");
+                try jw.write(value);
+            },
+        }
+        switch (self.n) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("n");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("n");
+                try jw.write(value);
+            },
+        }
+        switch (self.prediction) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("prediction");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("prediction");
+                try jw.write(value);
+            },
+        }
+        switch (self.seed) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("seed");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("seed");
+                try jw.write(value);
+            },
+        }
+        if (self.stream_options) |value| {
+            try jw.objectField("stream_options");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.parallel_tool_calls) |value| {
+            try jw.objectField("parallel_tool_calls");
+            try jw.write(value);
+        }
+        if (self.function_call) |value| {
+            try jw.objectField("function_call");
+            try jw.write(value);
+        }
+        if (self.functions) |value| {
+            try jw.objectField("functions");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Represents a chat completion response returned by model, based on the provided input.
@@ -2702,6 +5550,53 @@ pub const CreateChatCompletionResponse = struct {
     /// The object type, which is always `chat.completion`.
     object: []const u8,
     usage: ?CompletionUsage = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "choices", "choices", false },
+        .{ "created", "created", false },
+        .{ "model", "model", false },
+        .{ "service_tier", "service_tier", true },
+        .{ "system_fingerprint", "system_fingerprint", true },
+        .{ "object", "object", false },
+        .{ "usage", "usage", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("choices");
+        try jw.write(self.choices);
+        try jw.objectField("created");
+        try jw.write(self.created);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.service_tier) |value| {
+            try jw.objectField("service_tier");
+            try jw.write(value);
+        }
+        if (self.system_fingerprint) |value| {
+            try jw.objectField("system_fingerprint");
+            try jw.write(value);
+        }
+        try jw.objectField("object");
+        try jw.write(self.object);
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Represents a streamed chunk of a chat completion response returned by the model, based on the provided input. [Learn more](/docs/guides/streaming-responses).
@@ -2721,6 +5616,53 @@ pub const CreateChatCompletionStreamResponse = struct {
     object: []const u8,
     /// An optional field that will only be present when you set `stream_options: {"include_usage": true}` in your request. When present, it contains a null value **except for the last chunk** which contains the token usage statistics for the entire request. **NOTE:** If the stream is interrupted or cancelled, you may not receive the final usage chunk which contains the total token usage for the request.
     usage: ?CompletionUsage = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "choices", "choices", false },
+        .{ "created", "created", false },
+        .{ "model", "model", false },
+        .{ "service_tier", "service_tier", true },
+        .{ "system_fingerprint", "system_fingerprint", true },
+        .{ "object", "object", false },
+        .{ "usage", "usage", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("choices");
+        try jw.write(self.choices);
+        try jw.objectField("created");
+        try jw.write(self.created);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.service_tier) |value| {
+            try jw.objectField("service_tier");
+            try jw.write(value);
+        }
+        if (self.system_fingerprint) |value| {
+            try jw.objectField("system_fingerprint");
+            try jw.write(value);
+        }
+        try jw.objectField("object");
+        try jw.write(self.object);
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Parameters for provisioning a new ChatKit session.
@@ -2735,6 +5677,44 @@ pub const CreateChatSessionBody = struct {
     rate_limits: ?RateLimitsParam = null,
     /// Optional overrides for ChatKit runtime configuration features
     chatkit_configuration: ?ChatkitConfigurationParam = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "workflow", "workflow", false },
+        .{ "user", "user", false },
+        .{ "expires_after", "expires_after", true },
+        .{ "rate_limits", "rate_limits", true },
+        .{ "chatkit_configuration", "chatkit_configuration", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("workflow");
+        try jw.write(self.workflow);
+        try jw.objectField("user");
+        try jw.write(self.user);
+        if (self.expires_after) |value| {
+            try jw.objectField("expires_after");
+            try jw.write(value);
+        }
+        if (self.rate_limits) |value| {
+            try jw.objectField("rate_limits");
+            try jw.write(value);
+        }
+        if (self.chatkit_configuration) |value| {
+            try jw.objectField("chatkit_configuration");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateCompletionRequest = struct {
@@ -2743,35 +5723,236 @@ pub const CreateCompletionRequest = struct {
     /// The prompt(s) to generate completions for, encoded as a string, array of strings, array of tokens, or array of token arrays. Note that <|endoftext|> is the document separator that the model sees during training, so if a prompt is not specified the model will generate as if from the beginning of a new document.
     prompt: ?std.json.Value,
     /// Generates `best_of` completions server-side and returns the "best" (the one with the highest log probability per token). Results cannot be streamed. When used with `n`, `best_of` controls the number of candidate completions and `n` specifies how many to return – `best_of` must be greater than `n`. **Note:** Because this parameter generates many completions, it can quickly consume your token quota. Use carefully and ensure that you have reasonable settings for `max_tokens` and `stop`.
-    best_of: ?i64 = null,
+    best_of: OpenApiOptionalNullable(i64) = .absent,
     /// Echo back the prompt in addition to the completion
-    echo: ?bool = null,
+    echo: OpenApiOptionalNullable(bool) = .absent,
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far, decreasing the model's likelihood to repeat the same line verbatim. [See more information about frequency and presence penalties.](/docs/guides/text-generation)
-    frequency_penalty: ?f64 = null,
+    frequency_penalty: OpenApiOptionalNullable(f64) = .absent,
     /// Modify the likelihood of specified tokens appearing in the completion. Accepts a JSON object that maps tokens (specified by their token ID in the GPT tokenizer) to an associated bias value from -100 to 100. You can use this [tokenizer tool](/tokenizer?view=bpe) to convert text to token IDs. Mathematically, the bias is added to the logits generated by the model prior to sampling. The exact effect will vary per model, but values between -1 and 1 should decrease or increase likelihood of selection; values like -100 or 100 should result in a ban or exclusive selection of the relevant token. As an example, you can pass `{"50256": -100}` to prevent the <|endoftext|> token from being generated.
-    logit_bias: ?std.json.ArrayHashMap(i64) = null,
+    logit_bias: OpenApiOptionalNullable(std.json.ArrayHashMap(i64)) = .absent,
     /// Include the log probabilities on the `logprobs` most likely output tokens, as well the chosen tokens. For example, if `logprobs` is 5, the API will return a list of the 5 most likely tokens. The API will always return the `logprob` of the sampled token, so there may be up to `logprobs+1` elements in the response. The maximum value for `logprobs` is 5.
-    logprobs: ?i64 = null,
+    logprobs: OpenApiOptionalNullable(i64) = .absent,
     /// The maximum number of [tokens](/tokenizer) that can be generated in the completion. The token count of your prompt plus `max_tokens` cannot exceed the model's context length. [Example Python code](https://cookbook.openai.com/examples/how_to_count_tokens_with_tiktoken) for counting tokens.
-    max_tokens: ?i64 = null,
+    max_tokens: OpenApiOptionalNullable(i64) = .absent,
     /// How many completions to generate for each prompt. **Note:** Because this parameter generates many completions, it can quickly consume your token quota. Use carefully and ensure that you have reasonable settings for `max_tokens` and `stop`.
-    n: ?i64 = null,
+    n: OpenApiOptionalNullable(i64) = .absent,
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the text so far, increasing the model's likelihood to talk about new topics. [See more information about frequency and presence penalties.](/docs/guides/text-generation)
-    presence_penalty: ?f64 = null,
+    presence_penalty: OpenApiOptionalNullable(f64) = .absent,
     /// If specified, our system will make a best effort to sample deterministically, such that repeated requests with the same `seed` and parameters should return the same result. Determinism is not guaranteed, and you should refer to the `system_fingerprint` response parameter to monitor changes in the backend.
-    seed: ?i64 = null,
-    stop: ?StopConfiguration = null,
+    seed: OpenApiOptionalNullable(i64) = .absent,
+    stop: OpenApiOptionalNullable(std.meta.Child(StopConfiguration)) = .absent,
     /// Whether to stream back partial progress. If set, tokens will be sent as data-only [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#Event_stream_format) as they become available, with the stream terminated by a `data: [DONE]` message. [Example Python code](https://cookbook.openai.com/examples/how_to_stream_completions).
-    stream: ?bool = null,
+    stream: OpenApiOptionalNullable(bool) = .absent,
     stream_options: ?ChatCompletionStreamOptions = null,
     /// The suffix that comes after a completion of inserted text. This parameter is only supported for `gpt-3.5-turbo-instruct`.
-    suffix: ?[]const u8 = null,
+    suffix: OpenApiOptionalNullable([]const u8) = .absent,
     /// What sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic. We generally recommend altering this or `top_p` but not both.
-    temperature: ?f64 = null,
+    temperature: OpenApiOptionalNullable(f64) = .absent,
     /// An alternative to sampling with temperature, called nucleus sampling, where the model considers the results of the tokens with top_p probability mass. So 0.1 means only the tokens comprising the top 10% probability mass are considered. We generally recommend altering this or `temperature` but not both.
-    top_p: ?f64 = null,
+    top_p: OpenApiOptionalNullable(f64) = .absent,
     /// A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](/docs/guides/safety-best-practices#end-user-ids).
     user: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "prompt", "prompt", false },
+        .{ "best_of", "best_of", false },
+        .{ "echo", "echo", false },
+        .{ "frequency_penalty", "frequency_penalty", false },
+        .{ "logit_bias", "logit_bias", false },
+        .{ "logprobs", "logprobs", false },
+        .{ "max_tokens", "max_tokens", false },
+        .{ "n", "n", false },
+        .{ "presence_penalty", "presence_penalty", false },
+        .{ "seed", "seed", false },
+        .{ "stop", "stop", false },
+        .{ "stream", "stream", false },
+        .{ "stream_options", "stream_options", true },
+        .{ "suffix", "suffix", false },
+        .{ "temperature", "temperature", false },
+        .{ "top_p", "top_p", false },
+        .{ "user", "user", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("prompt");
+        try jw.write(self.prompt);
+        switch (self.best_of) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("best_of");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("best_of");
+                try jw.write(value);
+            },
+        }
+        switch (self.echo) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("echo");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("echo");
+                try jw.write(value);
+            },
+        }
+        switch (self.frequency_penalty) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("frequency_penalty");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("frequency_penalty");
+                try jw.write(value);
+            },
+        }
+        switch (self.logit_bias) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("logit_bias");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("logit_bias");
+                try jw.write(value);
+            },
+        }
+        switch (self.logprobs) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("logprobs");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("logprobs");
+                try jw.write(value);
+            },
+        }
+        switch (self.max_tokens) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max_tokens");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max_tokens");
+                try jw.write(value);
+            },
+        }
+        switch (self.n) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("n");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("n");
+                try jw.write(value);
+            },
+        }
+        switch (self.presence_penalty) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("presence_penalty");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("presence_penalty");
+                try jw.write(value);
+            },
+        }
+        switch (self.seed) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("seed");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("seed");
+                try jw.write(value);
+            },
+        }
+        switch (self.stop) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("stop");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("stop");
+                try jw.write(value);
+            },
+        }
+        switch (self.stream) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("stream");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("stream");
+                try jw.write(value);
+            },
+        }
+        if (self.stream_options) |value| {
+            try jw.objectField("stream_options");
+            try jw.write(value);
+        }
+        switch (self.suffix) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("suffix");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("suffix");
+                try jw.write(value);
+            },
+        }
+        switch (self.temperature) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("temperature");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("temperature");
+                try jw.write(value);
+            },
+        }
+        switch (self.top_p) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("top_p");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("top_p");
+                try jw.write(value);
+            },
+        }
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Represents a completion response from the API. Note: both the streamed and non-streamed response objects share the same shape (unlike the chat endpoint).
@@ -2789,6 +5970,48 @@ pub const CreateCompletionResponse = struct {
     /// The object type, which is always "text_completion"
     object: []const u8,
     usage: ?CompletionUsage = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "choices", "choices", false },
+        .{ "created", "created", false },
+        .{ "model", "model", false },
+        .{ "system_fingerprint", "system_fingerprint", true },
+        .{ "object", "object", false },
+        .{ "usage", "usage", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("choices");
+        try jw.write(self.choices);
+        try jw.objectField("created");
+        try jw.write(self.created);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.system_fingerprint) |value| {
+            try jw.objectField("system_fingerprint");
+            try jw.write(value);
+        }
+        try jw.objectField("object");
+        try jw.write(self.object);
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateContainerBody = struct {
@@ -2804,6 +6027,51 @@ pub const CreateContainerBody = struct {
     memory_limit: ?[]const u8 = null,
     /// Network access policy for the container.
     network_policy: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "file_ids", "file_ids", true },
+        .{ "expires_after", "expires_after", true },
+        .{ "skills", "skills", true },
+        .{ "memory_limit", "memory_limit", true },
+        .{ "network_policy", "network_policy", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.file_ids) |value| {
+            try jw.objectField("file_ids");
+            try jw.write(value);
+        }
+        if (self.expires_after) |value| {
+            try jw.objectField("expires_after");
+            try jw.write(value);
+        }
+        if (self.skills) |value| {
+            try jw.objectField("skills");
+            try jw.write(value);
+        }
+        if (self.memory_limit) |value| {
+            try jw.objectField("memory_limit");
+            try jw.write(value);
+        }
+        if (self.network_policy) |value| {
+            try jw.objectField("network_policy");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateContainerFileBody = struct {
@@ -2811,11 +6079,65 @@ pub const CreateContainerFileBody = struct {
     file_id: ?[]const u8 = null,
     /// The File object (not file name) to be uploaded.
     file: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "file_id", "file_id", true },
+        .{ "file", "file", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.file_id) |value| {
+            try jw.objectField("file_id");
+            try jw.write(value);
+        }
+        if (self.file) |value| {
+            try jw.objectField("file");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateConversationBody = struct {
     metadata: ?std.json.Value = null,
     items: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "metadata", "metadata", true },
+        .{ "items", "items", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.items) |value| {
+            try jw.objectField("items");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateEmbeddingRequest = struct {
@@ -2829,6 +6151,44 @@ pub const CreateEmbeddingRequest = struct {
     dimensions: ?i64 = null,
     /// A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](/docs/guides/safety-best-practices#end-user-ids).
     user: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "input", "input", false },
+        .{ "model", "model", false },
+        .{ "encoding_format", "encoding_format", true },
+        .{ "dimensions", "dimensions", true },
+        .{ "user", "user", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("input");
+        try jw.write(self.input);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.encoding_format) |value| {
+            try jw.objectField("encoding_format");
+            try jw.write(value);
+        }
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateEmbeddingResponse = struct {
@@ -2853,6 +6213,44 @@ pub const CreateEvalCompletionsRunDataSource = struct {
     model: ?[]const u8 = null,
     /// Determines what populates the `item` namespace in this run's data source.
     source: std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "input_messages", "input_messages", true },
+        .{ "sampling_params", "sampling_params", true },
+        .{ "model", "model", true },
+        .{ "source", "source", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.input_messages) |value| {
+            try jw.objectField("input_messages");
+            try jw.write(value);
+        }
+        if (self.sampling_params) |value| {
+            try jw.objectField("sampling_params");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        try jw.objectField("source");
+        try jw.write(self.source);
+        try jw.endObject();
+    }
 };
 
 /// A CustomDataSourceConfig object that defines the schema for the data source used for the evaluation runs. This schema is used to define the shape of the data that will be: - Used to define your testing criteria and - What data is required when creating a run
@@ -2860,50 +6258,41 @@ pub const CreateEvalCustomDataSourceConfig = struct {
     /// The type of data source. Always `custom`.
     type: []const u8,
     /// The json schema for each row in the data source.
-    item_schema: std.json.Value,
+    item_schema: std.json.ArrayHashMap(std.json.Value),
     /// Whether the eval should expect you to populate the sample namespace (ie, by generating responses off of your data source)
     include_sample_schema: ?bool = null,
-};
 
-/// A chat message that makes up the prompt or context. May include variable references to the `item` namespace, ie {{item.name}}.
-pub const CreateEvalItem = union(enum) {
-    eval_item: *EvalItem,
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "item_schema", "item_schema", false },
+        .{ "include_sample_schema", "include_sample_schema", true },
+    };
 
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "role",
-            "content",
-            "type",
-        })) {
-            if (try parseStructuralVariant(EvalItem, allocator, source, options)) |parsed| return .{ .eval_item = parsed };
-        }
-        return error.UnexpectedToken;
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .eval_item => |v| try jw.write(v.*),
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("item_schema");
+        try jw.write(self.item_schema);
+        if (self.include_sample_schema) |value| {
+            try jw.objectField("include_sample_schema");
+            try jw.write(value);
         }
+        try jw.endObject();
     }
 };
+
+/// A chat message that makes up the prompt or context. May include variable references to the `item` namespace, ie {{item.name}}.
+pub const CreateEvalItem = std.json.Value;
 
 /// A JsonlRunDataSource object with that specifies a JSONL file that matches the eval
 pub const CreateEvalJsonlRunDataSource = struct {
@@ -2934,7 +6323,32 @@ pub const CreateEvalLogsDataSourceConfig = struct {
     /// The type of data source. Always `logs`.
     type: []const u8,
     /// Metadata filters for the logs data source.
-    metadata: ?std.json.Value = null,
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "metadata", "metadata", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateEvalRequest = struct {
@@ -2942,9 +6356,42 @@ pub const CreateEvalRequest = struct {
     name: ?[]const u8 = null,
     metadata: ?Metadata = null,
     /// The configuration for the data source used for the evaluation runs. Dictates the schema of the data used in the evaluation.
-    data_source_config: std.json.Value,
+    data_source_config: std.json.ArrayHashMap(std.json.Value),
     /// A list of graders for all eval runs in this group. Graders can reference variables in the data source using double curly braces notation, like `{{item.variable_name}}`. To reference the model's output, use the `sample` namespace (ie, `{{sample.output_text}}`).
     testing_criteria: []const std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", true },
+        .{ "metadata", "metadata", true },
+        .{ "data_source_config", "data_source_config", false },
+        .{ "testing_criteria", "testing_criteria", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.objectField("data_source_config");
+        try jw.write(self.data_source_config);
+        try jw.objectField("testing_criteria");
+        try jw.write(self.testing_criteria);
+        try jw.endObject();
+    }
 };
 
 /// A ResponsesRunDataSource object describing a model sampling configuration.
@@ -2958,6 +6405,44 @@ pub const CreateEvalResponsesRunDataSource = struct {
     model: ?[]const u8 = null,
     /// Determines what populates the `item` namespace in this run's data source.
     source: std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "input_messages", "input_messages", true },
+        .{ "sampling_params", "sampling_params", true },
+        .{ "model", "model", true },
+        .{ "source", "source", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.input_messages) |value| {
+            try jw.objectField("input_messages");
+            try jw.write(value);
+        }
+        if (self.sampling_params) |value| {
+            try jw.objectField("sampling_params");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        try jw.objectField("source");
+        try jw.write(self.source);
+        try jw.endObject();
+    }
 };
 
 pub const CreateEvalRunRequest = struct {
@@ -2965,7 +6450,37 @@ pub const CreateEvalRunRequest = struct {
     name: ?[]const u8 = null,
     metadata: ?Metadata = null,
     /// Details about the run's data source.
-    data_source: std.json.Value,
+    data_source: std.json.ArrayHashMap(std.json.Value),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", true },
+        .{ "metadata", "metadata", true },
+        .{ "data_source", "data_source", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.objectField("data_source");
+        try jw.write(self.data_source);
+        try jw.endObject();
+    }
 };
 
 /// Deprecated in favor of LogsDataSourceConfig.
@@ -2973,7 +6488,32 @@ pub const CreateEvalStoredCompletionsDataSourceConfig = struct {
     /// The type of data source. Always `stored_completions`.
     type: []const u8,
     /// Metadata filters for the stored completions data source.
-    metadata: ?std.json.Value = null,
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "metadata", "metadata", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateFileRequest = struct {
@@ -2982,6 +6522,34 @@ pub const CreateFileRequest = struct {
     /// The intended purpose of the uploaded file. One of: - `assistants`: Used in the Assistants API - `batch`: Used in the Batch API - `fine-tune`: Used for fine-tuning - `vision`: Images used for vision fine-tuning - `user_data`: Flexible file type for any purpose - `evals`: Used for eval data sets
     purpose: []const u8,
     expires_after: ?FileExpirationAfter = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "file", "file", false },
+        .{ "purpose", "purpose", false },
+        .{ "expires_after", "expires_after", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("file");
+        try jw.write(self.file);
+        try jw.objectField("purpose");
+        try jw.write(self.purpose);
+        if (self.expires_after) |value| {
+            try jw.objectField("expires_after");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateFineTuningCheckpointPermissionRequest = struct {
@@ -2997,15 +6565,101 @@ pub const CreateFineTuningJobRequest = struct {
     /// The hyperparameters used for the fine-tuning job. This value is now deprecated in favor of `method`, and should be passed in under the `method` parameter.
     hyperparameters: ?std.json.Value = null,
     /// A string of up to 64 characters that will be added to your fine-tuned model name. For example, a `suffix` of "custom-model-name" would produce a model name like `ft:gpt-4o-mini:openai:custom-model-name:7p4lURel`.
-    suffix: ?[]const u8 = null,
+    suffix: OpenApiOptionalNullable([]const u8) = .absent,
     /// The ID of an uploaded file that contains validation data. If you provide this file, the data is used to generate validation metrics periodically during fine-tuning. These metrics can be viewed in the fine-tuning results file. The same data should not be present in both train and validation files. Your dataset must be formatted as a JSONL file. You must upload your file with the purpose `fine-tune`. See the [fine-tuning guide](/docs/guides/model-optimization) for more details.
-    validation_file: ?[]const u8 = null,
+    validation_file: OpenApiOptionalNullable([]const u8) = .absent,
     /// A list of integrations to enable for your fine-tuning job.
-    integrations: ?[]const std.json.Value = null,
+    integrations: OpenApiOptionalNullable([]const std.json.Value) = .absent,
     /// The seed controls the reproducibility of the job. Passing in the same seed and job parameters should produce the same results, but may differ in rare cases. If a seed is not specified, one will be generated for you.
-    seed: ?i64 = null,
+    seed: OpenApiOptionalNullable(i64) = .absent,
     method: ?FineTuneMethod = null,
     metadata: ?Metadata = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "training_file", "training_file", false },
+        .{ "hyperparameters", "hyperparameters", true },
+        .{ "suffix", "suffix", false },
+        .{ "validation_file", "validation_file", false },
+        .{ "integrations", "integrations", false },
+        .{ "seed", "seed", false },
+        .{ "method", "method", true },
+        .{ "metadata", "metadata", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("training_file");
+        try jw.write(self.training_file);
+        if (self.hyperparameters) |value| {
+            try jw.objectField("hyperparameters");
+            try jw.write(value);
+        }
+        switch (self.suffix) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("suffix");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("suffix");
+                try jw.write(value);
+            },
+        }
+        switch (self.validation_file) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("validation_file");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("validation_file");
+                try jw.write(value);
+            },
+        }
+        switch (self.integrations) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("integrations");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("integrations");
+                try jw.write(value);
+            },
+        }
+        switch (self.seed) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("seed");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("seed");
+                try jw.write(value);
+            },
+        }
+        if (self.method) |value| {
+            try jw.objectField("method");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Request payload for creating a new group in the organization.
@@ -3028,72 +6682,458 @@ pub const CreateImageEditRequest = struct {
     /// An additional image whose fully transparent areas (e.g. where alpha is zero) indicate where `image` should be edited. If there are multiple images provided, the mask will be applied on the first image. Must be a valid PNG file, less than 4MB, and have the same dimensions as `image`.
     mask: ?[]const u8 = null,
     /// Allows to set transparency for the background of the generated image(s). This parameter is only supported for the GPT image models. Must be one of `transparent`, `opaque` or `auto` (default value). When `auto` is used, the model will automatically determine the best background for the image. If `transparent`, the output format needs to support transparency, so it should be set to either `png` (default value) or `webp`.
-    background: ?[]const u8 = null,
+    background: OpenApiOptionalNullable([]const u8) = .absent,
     /// The model to use for image generation. Defaults to `gpt-image-1.5`.
-    model: ?std.json.Value = null,
+    model: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// The number of images to generate. Must be between 1 and 10.
-    n: ?i64 = null,
+    n: OpenApiOptionalNullable(i64) = .absent,
     /// The size of the generated images. Must be one of `1024x1024`, `1536x1024` (landscape), `1024x1536` (portrait), or `auto` (default value) for the GPT image models, and one of `256x256`, `512x512`, or `1024x1024` for `dall-e-2`.
-    size: ?[]const u8 = null,
+    size: OpenApiOptionalNullable([]const u8) = .absent,
     /// The format in which the generated images are returned. Must be one of `url` or `b64_json`. URLs are only valid for 60 minutes after the image has been generated. This parameter is only supported for `dall-e-2` (default is `url` for `dall-e-2`), as GPT image models always return base64-encoded images.
-    response_format: ?[]const u8 = null,
+    response_format: OpenApiOptionalNullable([]const u8) = .absent,
     /// The format in which the generated images are returned. This parameter is only supported for the GPT image models. Must be one of `png`, `jpeg`, or `webp`. The default value is `png`.
-    output_format: ?[]const u8 = null,
+    output_format: OpenApiOptionalNullable([]const u8) = .absent,
     /// The compression level (0-100%) for the generated images. This parameter is only supported for the GPT image models with the `webp` or `jpeg` output formats, and defaults to 100.
-    output_compression: ?i64 = null,
+    output_compression: OpenApiOptionalNullable(i64) = .absent,
     /// A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](/docs/guides/safety-best-practices#end-user-ids).
     user: ?[]const u8 = null,
     input_fidelity: ?std.json.Value = null,
     /// Edit the image in streaming mode. Defaults to `false`. See the [Image generation guide](/docs/guides/image-generation) for more information.
-    stream: ?bool = null,
+    stream: OpenApiOptionalNullable(bool) = .absent,
     partial_images: ?PartialImages = null,
     /// The quality of the image that will be generated for GPT image models. Defaults to `auto`.
-    quality: ?[]const u8 = null,
+    quality: OpenApiOptionalNullable([]const u8) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "image", "image", false },
+        .{ "prompt", "prompt", false },
+        .{ "mask", "mask", true },
+        .{ "background", "background", false },
+        .{ "model", "model", false },
+        .{ "n", "n", false },
+        .{ "size", "size", false },
+        .{ "response_format", "response_format", false },
+        .{ "output_format", "output_format", false },
+        .{ "output_compression", "output_compression", false },
+        .{ "user", "user", true },
+        .{ "input_fidelity", "input_fidelity", true },
+        .{ "stream", "stream", false },
+        .{ "partial_images", "partial_images", true },
+        .{ "quality", "quality", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("image");
+        try jw.write(self.image);
+        try jw.objectField("prompt");
+        try jw.write(self.prompt);
+        if (self.mask) |value| {
+            try jw.objectField("mask");
+            try jw.write(value);
+        }
+        switch (self.background) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("background");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("background");
+                try jw.write(value);
+            },
+        }
+        switch (self.model) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("model");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("model");
+                try jw.write(value);
+            },
+        }
+        switch (self.n) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("n");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("n");
+                try jw.write(value);
+            },
+        }
+        switch (self.size) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("size");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("size");
+                try jw.write(value);
+            },
+        }
+        switch (self.response_format) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("response_format");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("response_format");
+                try jw.write(value);
+            },
+        }
+        switch (self.output_format) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("output_format");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("output_format");
+                try jw.write(value);
+            },
+        }
+        switch (self.output_compression) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("output_compression");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("output_compression");
+                try jw.write(value);
+            },
+        }
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        if (self.input_fidelity) |value| {
+            try jw.objectField("input_fidelity");
+            try jw.write(value);
+        }
+        switch (self.stream) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("stream");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("stream");
+                try jw.write(value);
+            },
+        }
+        if (self.partial_images) |value| {
+            try jw.objectField("partial_images");
+            try jw.write(value);
+        }
+        switch (self.quality) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("quality");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("quality");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateImageRequest = struct {
     /// A text description of the desired image(s). The maximum length is 32000 characters for the GPT image models, 1000 characters for `dall-e-2` and 4000 characters for `dall-e-3`.
     prompt: []const u8,
     /// The model to use for image generation. One of `dall-e-2`, `dall-e-3`, or a GPT image model (`gpt-image-1`, `gpt-image-1-mini`, `gpt-image-1.5`). Defaults to `dall-e-2` unless a parameter specific to the GPT image models is used.
-    model: ?std.json.Value = null,
+    model: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// The number of images to generate. Must be between 1 and 10. For `dall-e-3`, only `n=1` is supported.
-    n: ?i64 = null,
+    n: OpenApiOptionalNullable(i64) = .absent,
     /// The quality of the image that will be generated. - `auto` (default value) will automatically select the best quality for the given model. - `high`, `medium` and `low` are supported for the GPT image models. - `hd` and `standard` are supported for `dall-e-3`. - `standard` is the only option for `dall-e-2`.
-    quality: ?[]const u8 = null,
+    quality: OpenApiOptionalNullable([]const u8) = .absent,
     /// The format in which generated images with `dall-e-2` and `dall-e-3` are returned. Must be one of `url` or `b64_json`. URLs are only valid for 60 minutes after the image has been generated. This parameter isn't supported for the GPT image models, which always return base64-encoded images.
-    response_format: ?[]const u8 = null,
+    response_format: OpenApiOptionalNullable([]const u8) = .absent,
     /// The format in which the generated images are returned. This parameter is only supported for the GPT image models. Must be one of `png`, `jpeg`, or `webp`.
-    output_format: ?[]const u8 = null,
+    output_format: OpenApiOptionalNullable([]const u8) = .absent,
     /// The compression level (0-100%) for the generated images. This parameter is only supported for the GPT image models with the `webp` or `jpeg` output formats, and defaults to 100.
-    output_compression: ?i64 = null,
+    output_compression: OpenApiOptionalNullable(i64) = .absent,
     /// Generate the image in streaming mode. Defaults to `false`. See the [Image generation guide](/docs/guides/image-generation) for more information. This parameter is only supported for the GPT image models.
-    stream: ?bool = null,
+    stream: OpenApiOptionalNullable(bool) = .absent,
     partial_images: ?PartialImages = null,
     /// The size of the generated images. Must be one of `1024x1024`, `1536x1024` (landscape), `1024x1536` (portrait), or `auto` (default value) for the GPT image models, one of `256x256`, `512x512`, or `1024x1024` for `dall-e-2`, and one of `1024x1024`, `1792x1024`, or `1024x1792` for `dall-e-3`.
-    size: ?[]const u8 = null,
+    size: OpenApiOptionalNullable([]const u8) = .absent,
     /// Control the content-moderation level for images generated by the GPT image models. Must be either `low` for less restrictive filtering or `auto` (default value).
-    moderation: ?[]const u8 = null,
+    moderation: OpenApiOptionalNullable([]const u8) = .absent,
     /// Allows to set transparency for the background of the generated image(s). This parameter is only supported for the GPT image models. Must be one of `transparent`, `opaque` or `auto` (default value). When `auto` is used, the model will automatically determine the best background for the image. If `transparent`, the output format needs to support transparency, so it should be set to either `png` (default value) or `webp`.
-    background: ?[]const u8 = null,
+    background: OpenApiOptionalNullable([]const u8) = .absent,
     /// The style of the generated images. This parameter is only supported for `dall-e-3`. Must be one of `vivid` or `natural`. Vivid causes the model to lean towards generating hyper-real and dramatic images. Natural causes the model to produce more natural, less hyper-real looking images.
-    style: ?[]const u8 = null,
+    style: OpenApiOptionalNullable([]const u8) = .absent,
     /// A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](/docs/guides/safety-best-practices#end-user-ids).
     user: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "prompt", "prompt", false },
+        .{ "model", "model", false },
+        .{ "n", "n", false },
+        .{ "quality", "quality", false },
+        .{ "response_format", "response_format", false },
+        .{ "output_format", "output_format", false },
+        .{ "output_compression", "output_compression", false },
+        .{ "stream", "stream", false },
+        .{ "partial_images", "partial_images", true },
+        .{ "size", "size", false },
+        .{ "moderation", "moderation", false },
+        .{ "background", "background", false },
+        .{ "style", "style", false },
+        .{ "user", "user", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("prompt");
+        try jw.write(self.prompt);
+        switch (self.model) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("model");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("model");
+                try jw.write(value);
+            },
+        }
+        switch (self.n) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("n");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("n");
+                try jw.write(value);
+            },
+        }
+        switch (self.quality) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("quality");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("quality");
+                try jw.write(value);
+            },
+        }
+        switch (self.response_format) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("response_format");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("response_format");
+                try jw.write(value);
+            },
+        }
+        switch (self.output_format) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("output_format");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("output_format");
+                try jw.write(value);
+            },
+        }
+        switch (self.output_compression) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("output_compression");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("output_compression");
+                try jw.write(value);
+            },
+        }
+        switch (self.stream) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("stream");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("stream");
+                try jw.write(value);
+            },
+        }
+        if (self.partial_images) |value| {
+            try jw.objectField("partial_images");
+            try jw.write(value);
+        }
+        switch (self.size) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("size");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("size");
+                try jw.write(value);
+            },
+        }
+        switch (self.moderation) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("moderation");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("moderation");
+                try jw.write(value);
+            },
+        }
+        switch (self.background) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("background");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("background");
+                try jw.write(value);
+            },
+        }
+        switch (self.style) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("style");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("style");
+                try jw.write(value);
+            },
+        }
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateImageVariationRequest = struct {
     /// The image to use as the basis for the variation(s). Must be a valid PNG file, less than 4MB, and square.
     image: []const u8,
     /// The model to use for image generation. Only `dall-e-2` is supported at this time.
-    model: ?std.json.Value = null,
+    model: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// The number of images to generate. Must be between 1 and 10.
-    n: ?i64 = null,
+    n: OpenApiOptionalNullable(i64) = .absent,
     /// The format in which the generated images are returned. Must be one of `url` or `b64_json`. URLs are only valid for 60 minutes after the image has been generated.
-    response_format: ?[]const u8 = null,
+    response_format: OpenApiOptionalNullable([]const u8) = .absent,
     /// The size of the generated images. Must be one of `256x256`, `512x512`, or `1024x1024`.
-    size: ?[]const u8 = null,
+    size: OpenApiOptionalNullable([]const u8) = .absent,
     /// A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](/docs/guides/safety-best-practices#end-user-ids).
     user: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "image", "image", false },
+        .{ "model", "model", false },
+        .{ "n", "n", false },
+        .{ "response_format", "response_format", false },
+        .{ "size", "size", false },
+        .{ "user", "user", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("image");
+        try jw.write(self.image);
+        switch (self.model) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("model");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("model");
+                try jw.write(value);
+            },
+        }
+        switch (self.n) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("n");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("n");
+                try jw.write(value);
+            },
+        }
+        switch (self.response_format) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("response_format");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("response_format");
+                try jw.write(value);
+            },
+        }
+        switch (self.size) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("size");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("size");
+                try jw.write(value);
+            },
+        }
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateMessageRequest = struct {
@@ -3102,6 +7142,39 @@ pub const CreateMessageRequest = struct {
     content: std.json.Value,
     attachments: ?std.json.Value = null,
     metadata: ?Metadata = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "role", "role", false },
+        .{ "content", "content", false },
+        .{ "attachments", "attachments", true },
+        .{ "metadata", "metadata", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("content");
+        try jw.write(self.content);
+        if (self.attachments) |value| {
+            try jw.objectField("attachments");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateModelResponseProperties = struct {
@@ -3117,6 +7190,68 @@ pub const CreateModelResponseProperties = struct {
     prompt_cache_key: ?[]const u8 = null,
     service_tier: ?ServiceTier = null,
     prompt_cache_retention: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "metadata", "metadata", true },
+        .{ "top_logprobs", "top_logprobs", true },
+        .{ "temperature", "temperature", true },
+        .{ "top_p", "top_p", true },
+        .{ "user", "user", true },
+        .{ "safety_identifier", "safety_identifier", true },
+        .{ "prompt_cache_key", "prompt_cache_key", true },
+        .{ "service_tier", "service_tier", true },
+        .{ "prompt_cache_retention", "prompt_cache_retention", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.top_logprobs) |value| {
+            try jw.objectField("top_logprobs");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        if (self.safety_identifier) |value| {
+            try jw.objectField("safety_identifier");
+            try jw.write(value);
+        }
+        if (self.prompt_cache_key) |value| {
+            try jw.objectField("prompt_cache_key");
+            try jw.write(value);
+        }
+        if (self.service_tier) |value| {
+            try jw.objectField("service_tier");
+            try jw.write(value);
+        }
+        if (self.prompt_cache_retention) |value| {
+            try jw.objectField("prompt_cache_retention");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateModerationRequest = struct {
@@ -3124,6 +7259,31 @@ pub const CreateModerationRequest = struct {
     input: std.json.Value,
     /// The content moderation model you would like to use. Learn more in [the moderation guide](/docs/guides/moderation), and learn about available models [here](/docs/models#moderation).
     model: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "input", "input", false },
+        .{ "model", "model", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("input");
+        try jw.write(self.input);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Represents if a given text input is potentially harmful.
@@ -3170,37 +7330,369 @@ pub const CreateResponse = struct {
     stream_options: ?ResponseStreamOptions = null,
     conversation: ?std.json.Value = null,
     context_management: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "metadata", "metadata", true },
+        .{ "top_logprobs", "top_logprobs", true },
+        .{ "temperature", "temperature", true },
+        .{ "top_p", "top_p", true },
+        .{ "user", "user", true },
+        .{ "safety_identifier", "safety_identifier", true },
+        .{ "prompt_cache_key", "prompt_cache_key", true },
+        .{ "service_tier", "service_tier", true },
+        .{ "prompt_cache_retention", "prompt_cache_retention", true },
+        .{ "previous_response_id", "previous_response_id", true },
+        .{ "model", "model", true },
+        .{ "reasoning", "reasoning", true },
+        .{ "background", "background", true },
+        .{ "max_output_tokens", "max_output_tokens", true },
+        .{ "max_tool_calls", "max_tool_calls", true },
+        .{ "text", "text", true },
+        .{ "tools", "tools", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "prompt", "prompt", true },
+        .{ "truncation", "truncation", true },
+        .{ "input", "input", true },
+        .{ "include", "include", true },
+        .{ "parallel_tool_calls", "parallel_tool_calls", true },
+        .{ "store", "store", true },
+        .{ "instructions", "instructions", true },
+        .{ "stream", "stream", true },
+        .{ "stream_options", "stream_options", true },
+        .{ "conversation", "conversation", true },
+        .{ "context_management", "context_management", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.top_logprobs) |value| {
+            try jw.objectField("top_logprobs");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        if (self.safety_identifier) |value| {
+            try jw.objectField("safety_identifier");
+            try jw.write(value);
+        }
+        if (self.prompt_cache_key) |value| {
+            try jw.objectField("prompt_cache_key");
+            try jw.write(value);
+        }
+        if (self.service_tier) |value| {
+            try jw.objectField("service_tier");
+            try jw.write(value);
+        }
+        if (self.prompt_cache_retention) |value| {
+            try jw.objectField("prompt_cache_retention");
+            try jw.write(value);
+        }
+        if (self.previous_response_id) |value| {
+            try jw.objectField("previous_response_id");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.reasoning) |value| {
+            try jw.objectField("reasoning");
+            try jw.write(value);
+        }
+        if (self.background) |value| {
+            try jw.objectField("background");
+            try jw.write(value);
+        }
+        if (self.max_output_tokens) |value| {
+            try jw.objectField("max_output_tokens");
+            try jw.write(value);
+        }
+        if (self.max_tool_calls) |value| {
+            try jw.objectField("max_tool_calls");
+            try jw.write(value);
+        }
+        if (self.text) |value| {
+            try jw.objectField("text");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.truncation) |value| {
+            try jw.objectField("truncation");
+            try jw.write(value);
+        }
+        if (self.input) |value| {
+            try jw.objectField("input");
+            try jw.write(value);
+        }
+        if (self.include) |value| {
+            try jw.objectField("include");
+            try jw.write(value);
+        }
+        if (self.parallel_tool_calls) |value| {
+            try jw.objectField("parallel_tool_calls");
+            try jw.write(value);
+        }
+        if (self.store) |value| {
+            try jw.objectField("store");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.stream) |value| {
+            try jw.objectField("stream");
+            try jw.write(value);
+        }
+        if (self.stream_options) |value| {
+            try jw.objectField("stream_options");
+            try jw.write(value);
+        }
+        if (self.conversation) |value| {
+            try jw.objectField("conversation");
+            try jw.write(value);
+        }
+        if (self.context_management) |value| {
+            try jw.objectField("context_management");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateRunRequest = struct {
     /// The ID of the [assistant](/docs/api-reference/assistants) to use to execute this run.
     assistant_id: []const u8,
     /// The ID of the [Model](/docs/api-reference/models) to be used to execute this run. If a value is provided here, it will override the model associated with the assistant. If not, the model associated with the assistant will be used.
-    model: ?std.json.Value = null,
+    model: OpenApiOptionalNullable(std.json.Value) = .absent,
     reasoning_effort: ?ReasoningEffort = null,
     /// Overrides the [instructions](/docs/api-reference/assistants/createAssistant) of the assistant. This is useful for modifying the behavior on a per-run basis.
-    instructions: ?[]const u8 = null,
+    instructions: OpenApiOptionalNullable([]const u8) = .absent,
     /// Appends additional instructions at the end of the instructions for the run. This is useful for modifying the behavior on a per-run basis without overriding other instructions.
-    additional_instructions: ?[]const u8 = null,
+    additional_instructions: OpenApiOptionalNullable([]const u8) = .absent,
     /// Adds additional messages to the thread before creating the run.
-    additional_messages: ?[]const CreateMessageRequest = null,
+    additional_messages: OpenApiOptionalNullable([]const CreateMessageRequest) = .absent,
     /// Override the tools the assistant can use for this run. This is useful for modifying the behavior on a per-run basis.
-    tools: ?[]const std.json.Value = null,
+    tools: OpenApiOptionalNullable([]const std.json.Value) = .absent,
     metadata: ?Metadata = null,
     /// What sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic.
-    temperature: ?f64 = null,
+    temperature: OpenApiOptionalNullable(f64) = .absent,
     /// An alternative to sampling with temperature, called nucleus sampling, where the model considers the results of the tokens with top_p probability mass. So 0.1 means only the tokens comprising the top 10% probability mass are considered. We generally recommend altering this or temperature but not both.
-    top_p: ?f64 = null,
+    top_p: OpenApiOptionalNullable(f64) = .absent,
     /// If `true`, returns a stream of events that happen during the Run as server-sent events, terminating when the Run enters a terminal state with a `data: [DONE]` message.
-    stream: ?bool = null,
+    stream: OpenApiOptionalNullable(bool) = .absent,
     /// The maximum number of prompt tokens that may be used over the course of the run. The run will make a best effort to use only the number of prompt tokens specified, across multiple turns of the run. If the run exceeds the number of prompt tokens specified, the run will end with status `incomplete`. See `incomplete_details` for more info.
-    max_prompt_tokens: ?i64 = null,
+    max_prompt_tokens: OpenApiOptionalNullable(i64) = .absent,
     /// The maximum number of completion tokens that may be used over the course of the run. The run will make a best effort to use only the number of completion tokens specified, across multiple turns of the run. If the run exceeds the number of completion tokens specified, the run will end with status `incomplete`. See `incomplete_details` for more info.
-    max_completion_tokens: ?i64 = null,
+    max_completion_tokens: OpenApiOptionalNullable(i64) = .absent,
     truncation_strategy: ?std.json.Value = null,
     tool_choice: ?std.json.Value = null,
     parallel_tool_calls: ?ParallelToolCalls = null,
     response_format: ?AssistantsApiResponseFormatOption = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "assistant_id", "assistant_id", false },
+        .{ "model", "model", false },
+        .{ "reasoning_effort", "reasoning_effort", true },
+        .{ "instructions", "instructions", false },
+        .{ "additional_instructions", "additional_instructions", false },
+        .{ "additional_messages", "additional_messages", false },
+        .{ "tools", "tools", false },
+        .{ "metadata", "metadata", true },
+        .{ "temperature", "temperature", false },
+        .{ "top_p", "top_p", false },
+        .{ "stream", "stream", false },
+        .{ "max_prompt_tokens", "max_prompt_tokens", false },
+        .{ "max_completion_tokens", "max_completion_tokens", false },
+        .{ "truncation_strategy", "truncation_strategy", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "parallel_tool_calls", "parallel_tool_calls", true },
+        .{ "response_format", "response_format", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("assistant_id");
+        try jw.write(self.assistant_id);
+        switch (self.model) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("model");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("model");
+                try jw.write(value);
+            },
+        }
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
+        switch (self.instructions) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("instructions");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("instructions");
+                try jw.write(value);
+            },
+        }
+        switch (self.additional_instructions) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("additional_instructions");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("additional_instructions");
+                try jw.write(value);
+            },
+        }
+        switch (self.additional_messages) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("additional_messages");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("additional_messages");
+                try jw.write(value);
+            },
+        }
+        switch (self.tools) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("tools");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("tools");
+                try jw.write(value);
+            },
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        switch (self.temperature) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("temperature");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("temperature");
+                try jw.write(value);
+            },
+        }
+        switch (self.top_p) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("top_p");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("top_p");
+                try jw.write(value);
+            },
+        }
+        switch (self.stream) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("stream");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("stream");
+                try jw.write(value);
+            },
+        }
+        switch (self.max_prompt_tokens) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max_prompt_tokens");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max_prompt_tokens");
+                try jw.write(value);
+            },
+        }
+        switch (self.max_completion_tokens) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max_completion_tokens");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max_completion_tokens");
+                try jw.write(value);
+            },
+        }
+        if (self.truncation_strategy) |value| {
+            try jw.objectField("truncation_strategy");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.parallel_tool_calls) |value| {
+            try jw.objectField("parallel_tool_calls");
+            try jw.write(value);
+        }
+        if (self.response_format) |value| {
+            try jw.objectField("response_format");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Uploads a skill either as a directory (multipart `files[]`) or as a single zip file.
@@ -3213,6 +7705,31 @@ pub const CreateSkillVersionBody = struct {
     files: std.json.Value,
     /// Whether to set this version as the default.
     default: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "files", "files", false },
+        .{ "default", "default", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("files");
+        try jw.write(self.files);
+        if (self.default) |value| {
+            try jw.objectField("default");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateSpeechRequest = struct {
@@ -3230,6 +7747,52 @@ pub const CreateSpeechRequest = struct {
     speed: ?f64 = null,
     /// The format to stream the audio in. Supported formats are `sse` and `audio`. `sse` is not supported for `tts-1` or `tts-1-hd`.
     stream_format: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "input", "input", false },
+        .{ "instructions", "instructions", true },
+        .{ "voice", "voice", false },
+        .{ "response_format", "response_format", true },
+        .{ "speed", "speed", true },
+        .{ "stream_format", "stream_format", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("input");
+        try jw.write(self.input);
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        try jw.objectField("voice");
+        try jw.write(self.voice);
+        if (self.response_format) |value| {
+            try jw.objectField("response_format");
+            try jw.write(value);
+        }
+        if (self.speed) |value| {
+            try jw.objectField("speed");
+            try jw.write(value);
+        }
+        if (self.stream_format) |value| {
+            try jw.objectField("stream_format");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateSpeechResponseStreamEvent = std.json.Value;
@@ -3239,28 +7802,186 @@ pub const CreateThreadAndRunRequest = struct {
     assistant_id: []const u8,
     thread: ?CreateThreadRequest = null,
     /// The ID of the [Model](/docs/api-reference/models) to be used to execute this run. If a value is provided here, it will override the model associated with the assistant. If not, the model associated with the assistant will be used.
-    model: ?std.json.Value = null,
+    model: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// Override the default system message of the assistant. This is useful for modifying the behavior on a per-run basis.
-    instructions: ?[]const u8 = null,
+    instructions: OpenApiOptionalNullable([]const u8) = .absent,
     /// Override the tools the assistant can use for this run. This is useful for modifying the behavior on a per-run basis.
-    tools: ?[]const std.json.Value = null,
+    tools: OpenApiOptionalNullable([]const std.json.Value) = .absent,
     /// A set of resources that are used by the assistant's tools. The resources are specific to the type of tool. For example, the `code_interpreter` tool requires a list of file IDs, while the `file_search` tool requires a list of vector store IDs.
-    tool_resources: ?std.json.Value = null,
+    tool_resources: OpenApiOptionalNullable(std.json.Value) = .absent,
     metadata: ?Metadata = null,
     /// What sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic.
-    temperature: ?f64 = null,
+    temperature: OpenApiOptionalNullable(f64) = .absent,
     /// An alternative to sampling with temperature, called nucleus sampling, where the model considers the results of the tokens with top_p probability mass. So 0.1 means only the tokens comprising the top 10% probability mass are considered. We generally recommend altering this or temperature but not both.
-    top_p: ?f64 = null,
+    top_p: OpenApiOptionalNullable(f64) = .absent,
     /// If `true`, returns a stream of events that happen during the Run as server-sent events, terminating when the Run enters a terminal state with a `data: [DONE]` message.
-    stream: ?bool = null,
+    stream: OpenApiOptionalNullable(bool) = .absent,
     /// The maximum number of prompt tokens that may be used over the course of the run. The run will make a best effort to use only the number of prompt tokens specified, across multiple turns of the run. If the run exceeds the number of prompt tokens specified, the run will end with status `incomplete`. See `incomplete_details` for more info.
-    max_prompt_tokens: ?i64 = null,
+    max_prompt_tokens: OpenApiOptionalNullable(i64) = .absent,
     /// The maximum number of completion tokens that may be used over the course of the run. The run will make a best effort to use only the number of completion tokens specified, across multiple turns of the run. If the run exceeds the number of completion tokens specified, the run will end with status `incomplete`. See `incomplete_details` for more info.
-    max_completion_tokens: ?i64 = null,
+    max_completion_tokens: OpenApiOptionalNullable(i64) = .absent,
     truncation_strategy: ?std.json.Value = null,
     tool_choice: ?std.json.Value = null,
     parallel_tool_calls: ?ParallelToolCalls = null,
     response_format: ?AssistantsApiResponseFormatOption = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "assistant_id", "assistant_id", false },
+        .{ "thread", "thread", true },
+        .{ "model", "model", false },
+        .{ "instructions", "instructions", false },
+        .{ "tools", "tools", false },
+        .{ "tool_resources", "tool_resources", false },
+        .{ "metadata", "metadata", true },
+        .{ "temperature", "temperature", false },
+        .{ "top_p", "top_p", false },
+        .{ "stream", "stream", false },
+        .{ "max_prompt_tokens", "max_prompt_tokens", false },
+        .{ "max_completion_tokens", "max_completion_tokens", false },
+        .{ "truncation_strategy", "truncation_strategy", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "parallel_tool_calls", "parallel_tool_calls", true },
+        .{ "response_format", "response_format", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("assistant_id");
+        try jw.write(self.assistant_id);
+        if (self.thread) |value| {
+            try jw.objectField("thread");
+            try jw.write(value);
+        }
+        switch (self.model) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("model");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("model");
+                try jw.write(value);
+            },
+        }
+        switch (self.instructions) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("instructions");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("instructions");
+                try jw.write(value);
+            },
+        }
+        switch (self.tools) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("tools");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("tools");
+                try jw.write(value);
+            },
+        }
+        switch (self.tool_resources) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("tool_resources");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("tool_resources");
+                try jw.write(value);
+            },
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        switch (self.temperature) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("temperature");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("temperature");
+                try jw.write(value);
+            },
+        }
+        switch (self.top_p) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("top_p");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("top_p");
+                try jw.write(value);
+            },
+        }
+        switch (self.stream) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("stream");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("stream");
+                try jw.write(value);
+            },
+        }
+        switch (self.max_prompt_tokens) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max_prompt_tokens");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max_prompt_tokens");
+                try jw.write(value);
+            },
+        }
+        switch (self.max_completion_tokens) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max_completion_tokens");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max_completion_tokens");
+                try jw.write(value);
+            },
+        }
+        if (self.truncation_strategy) |value| {
+            try jw.objectField("truncation_strategy");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.parallel_tool_calls) |value| {
+            try jw.objectField("parallel_tool_calls");
+            try jw.write(value);
+        }
+        if (self.response_format) |value| {
+            try jw.objectField("response_format");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Options to create a new thread. If no thread is provided when running a request, an empty thread will be created.
@@ -3269,6 +7990,38 @@ pub const CreateThreadRequest = struct {
     messages: ?[]const CreateMessageRequest = null,
     tool_resources: ?std.json.Value = null,
     metadata: ?Metadata = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "messages", "messages", true },
+        .{ "tool_resources", "tool_resources", true },
+        .{ "metadata", "metadata", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.messages) |value| {
+            try jw.objectField("messages");
+            try jw.write(value);
+        }
+        if (self.tool_resources) |value| {
+            try jw.objectField("tool_resources");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateTranscriptionRequest = struct {
@@ -3293,6 +8046,79 @@ pub const CreateTranscriptionRequest = struct {
     known_speaker_names: ?[]const []const u8 = null,
     /// Optional list of audio samples (as [data URLs](https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/Data_URLs)) that contain known speaker references matching `known_speaker_names[]`. Each sample must be between 2 and 10 seconds, and can use any of the same input audio formats supported by `file`.
     known_speaker_references: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "file", "file", false },
+        .{ "model", "model", false },
+        .{ "language", "language", true },
+        .{ "prompt", "prompt", true },
+        .{ "response_format", "response_format", true },
+        .{ "temperature", "temperature", true },
+        .{ "include", "include", true },
+        .{ "timestamp_granularities", "timestamp_granularities", true },
+        .{ "stream", "stream", true },
+        .{ "chunking_strategy", "chunking_strategy", true },
+        .{ "known_speaker_names", "known_speaker_names", true },
+        .{ "known_speaker_references", "known_speaker_references", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("file");
+        try jw.write(self.file);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.response_format) |value| {
+            try jw.objectField("response_format");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.include) |value| {
+            try jw.objectField("include");
+            try jw.write(value);
+        }
+        if (self.timestamp_granularities) |value| {
+            try jw.objectField("timestamp_granularities");
+            try jw.write(value);
+        }
+        if (self.stream) |value| {
+            try jw.objectField("stream");
+            try jw.write(value);
+        }
+        if (self.chunking_strategy) |value| {
+            try jw.objectField("chunking_strategy");
+            try jw.write(value);
+        }
+        if (self.known_speaker_names) |value| {
+            try jw.objectField("known_speaker_names");
+            try jw.write(value);
+        }
+        if (self.known_speaker_references) |value| {
+            try jw.objectField("known_speaker_references");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Represents a diarized transcription response returned by the model, including the combined transcript and speaker-segment annotations.
@@ -3306,7 +8132,41 @@ pub const CreateTranscriptionResponseDiarizedJson = struct {
     /// Segments of the transcript annotated with timestamps and speaker labels.
     segments: []const TranscriptionDiarizedSegment,
     /// Token or duration usage statistics for the request.
-    usage: ?std.json.Value = null,
+    usage: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "task", "task", false },
+        .{ "duration", "duration", false },
+        .{ "text", "text", false },
+        .{ "segments", "segments", false },
+        .{ "usage", "usage", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("task");
+        try jw.write(self.task);
+        try jw.objectField("duration");
+        try jw.write(self.duration);
+        try jw.objectField("text");
+        try jw.write(self.text);
+        try jw.objectField("segments");
+        try jw.write(self.segments);
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Represents a transcription response returned by model, based on the provided input.
@@ -3316,7 +8176,37 @@ pub const CreateTranscriptionResponseJson = struct {
     /// The log probabilities of the tokens in the transcription. Only returned with the models `gpt-4o-transcribe` and `gpt-4o-mini-transcribe` if `logprobs` is added to the `include` array.
     logprobs: ?[]const std.json.Value = null,
     /// Token usage statistics for the request.
-    usage: ?std.json.Value = null,
+    usage: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "text", "text", false },
+        .{ "logprobs", "logprobs", true },
+        .{ "usage", "usage", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        if (self.logprobs) |value| {
+            try jw.objectField("logprobs");
+            try jw.write(value);
+        }
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateTranscriptionResponseStreamEvent = std.json.Value;
@@ -3334,6 +8224,47 @@ pub const CreateTranscriptionResponseVerboseJson = struct {
     /// Segments of the transcribed text and their corresponding details.
     segments: ?[]const TranscriptionSegment = null,
     usage: ?TranscriptTextUsageDuration = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "language", "language", false },
+        .{ "duration", "duration", false },
+        .{ "text", "text", false },
+        .{ "words", "words", true },
+        .{ "segments", "segments", true },
+        .{ "usage", "usage", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("language");
+        try jw.write(self.language);
+        try jw.objectField("duration");
+        try jw.write(self.duration);
+        try jw.objectField("text");
+        try jw.write(self.text);
+        if (self.words) |value| {
+            try jw.objectField("words");
+            try jw.write(value);
+        }
+        if (self.segments) |value| {
+            try jw.objectField("segments");
+            try jw.write(value);
+        }
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateTranslationRequest = struct {
@@ -3347,6 +8278,44 @@ pub const CreateTranslationRequest = struct {
     response_format: ?[]const u8 = null,
     /// The sampling temperature, between 0 and 1. Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic. If set to 0, the model will use [log probability](https://en.wikipedia.org/wiki/Log_probability) to automatically increase the temperature until certain thresholds are hit.
     temperature: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "file", "file", false },
+        .{ "model", "model", false },
+        .{ "prompt", "prompt", true },
+        .{ "response_format", "response_format", true },
+        .{ "temperature", "temperature", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("file");
+        try jw.write(self.file);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.response_format) |value| {
+            try jw.objectField("response_format");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateTranslationResponseJson = struct {
@@ -3362,6 +8331,37 @@ pub const CreateTranslationResponseVerboseJson = struct {
     text: []const u8,
     /// Segments of the translated text and their corresponding details.
     segments: ?[]const TranscriptionSegment = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "language", "language", false },
+        .{ "duration", "duration", false },
+        .{ "text", "text", false },
+        .{ "segments", "segments", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("language");
+        try jw.write(self.language);
+        try jw.objectField("duration");
+        try jw.write(self.duration);
+        try jw.objectField("text");
+        try jw.write(self.text);
+        if (self.segments) |value| {
+            try jw.objectField("segments");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateUploadRequest = struct {
@@ -3374,6 +8374,40 @@ pub const CreateUploadRequest = struct {
     /// The MIME type of the file. This must fall within the supported MIME types for your file purpose. See the supported MIME types for assistants and vision.
     mime_type: []const u8,
     expires_after: ?FileExpirationAfter = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "filename", "filename", false },
+        .{ "purpose", "purpose", false },
+        .{ "bytes", "bytes", false },
+        .{ "mime_type", "mime_type", false },
+        .{ "expires_after", "expires_after", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("filename");
+        try jw.write(self.filename);
+        try jw.objectField("purpose");
+        try jw.write(self.purpose);
+        try jw.objectField("bytes");
+        try jw.write(self.bytes);
+        try jw.objectField("mime_type");
+        try jw.write(self.mime_type);
+        if (self.expires_after) |value| {
+            try jw.objectField("expires_after");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateVectorStoreFileBatchRequest = struct {
@@ -3383,6 +8417,22 @@ pub const CreateVectorStoreFileBatchRequest = struct {
     files: ?[]const CreateVectorStoreFileRequest = null,
     chunking_strategy: ?ChunkingStrategyRequestParam = null,
     attributes: ?VectorStoreFileAttributes = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "file_ids", "file_ids", true },
+        .{ "files", "files", true },
+        .{ "chunking_strategy", "chunking_strategy", true },
+        .{ "attributes", "attributes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -3411,6 +8461,36 @@ pub const CreateVectorStoreFileRequest = struct {
     file_id: []const u8,
     chunking_strategy: ?ChunkingStrategyRequestParam = null,
     attributes: ?VectorStoreFileAttributes = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "file_id", "file_id", false },
+        .{ "chunking_strategy", "chunking_strategy", true },
+        .{ "attributes", "attributes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("file_id");
+        try jw.write(self.file_id);
+        if (self.chunking_strategy) |value| {
+            try jw.objectField("chunking_strategy");
+            try jw.write(value);
+        }
+        if (self.attributes) |value| {
+            try jw.objectField("attributes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateVectorStoreRequest = struct {
@@ -3422,8 +8502,55 @@ pub const CreateVectorStoreRequest = struct {
     description: ?[]const u8 = null,
     expires_after: ?VectorStoreExpirationAfter = null,
     /// The chunking strategy used to chunk the file(s). If not set, will use the `auto` strategy. Only applicable if `file_ids` is non-empty.
-    chunking_strategy: ?std.json.Value = null,
+    chunking_strategy: ?std.json.ArrayHashMap(std.json.Value) = null,
     metadata: ?Metadata = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "file_ids", "file_ids", true },
+        .{ "name", "name", true },
+        .{ "description", "description", true },
+        .{ "expires_after", "expires_after", true },
+        .{ "chunking_strategy", "chunking_strategy", true },
+        .{ "metadata", "metadata", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.file_ids) |value| {
+            try jw.objectField("file_ids");
+            try jw.write(value);
+        }
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.expires_after) |value| {
+            try jw.objectField("expires_after");
+            try jw.write(value);
+        }
+        if (self.chunking_strategy) |value| {
+            try jw.objectField("chunking_strategy");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Parameters for creating a character from an uploaded video.
@@ -3480,6 +8607,46 @@ pub const CreateVideoJsonBody = struct {
     seconds: ?VideoSeconds = null,
     /// Output resolution formatted as width x height (allowed values: 720x1280, 1280x720, 1024x1792, 1792x1024). Defaults to 720x1280.
     size: ?VideoSize = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "prompt", "prompt", false },
+        .{ "input_reference", "input_reference", true },
+        .{ "seconds", "seconds", true },
+        .{ "size", "size", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        try jw.objectField("prompt");
+        try jw.write(self.prompt);
+        if (self.input_reference) |value| {
+            try jw.objectField("input_reference");
+            try jw.write(value);
+        }
+        if (self.seconds) |value| {
+            try jw.objectField("seconds");
+            try jw.write(value);
+        }
+        if (self.size) |value| {
+            try jw.objectField("size");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Multipart parameters for creating a new video generation job.
@@ -3493,6 +8660,46 @@ pub const CreateVideoMultipartBody = struct {
     seconds: ?VideoSeconds = null,
     /// Output resolution formatted as width x height (allowed values: 720x1280, 1280x720, 1024x1792, 1792x1024). Defaults to 720x1280.
     size: ?VideoSize = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "prompt", "prompt", false },
+        .{ "input_reference", "input_reference", true },
+        .{ "seconds", "seconds", true },
+        .{ "size", "size", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        try jw.objectField("prompt");
+        try jw.write(self.prompt);
+        if (self.input_reference) |value| {
+            try jw.objectField("input_reference");
+            try jw.write(value);
+        }
+        if (self.seconds) |value| {
+            try jw.objectField("seconds");
+            try jw.write(value);
+        }
+        if (self.size) |value| {
+            try jw.objectField("size");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Parameters for remixing an existing generated video.
@@ -3549,6 +8756,45 @@ pub const CustomToolCall = struct {
     name: []const u8,
     /// The input for the custom tool call generated by the model.
     input: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", true },
+        .{ "call_id", "call_id", false },
+        .{ "namespace", "namespace", true },
+        .{ "name", "name", false },
+        .{ "input", "input", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("input");
+        try jw.write(self.input);
+        try jw.endObject();
+    }
 };
 
 /// The output of a custom tool call from your code, being sent back to the model.
@@ -3561,6 +8807,37 @@ pub const CustomToolCallOutput = struct {
     call_id: []const u8,
     /// The output from the custom tool call generated by your code. Can be a string or an list of output content.
     output: std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", true },
+        .{ "call_id", "call_id", false },
+        .{ "output", "output", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("output");
+        try jw.write(self.output);
+        try jw.endObject();
+    }
 };
 
 pub const CustomToolCallOutputResource = struct {
@@ -3576,6 +8853,43 @@ pub const CustomToolCallOutputResource = struct {
     status: FunctionCallOutputStatusEnum,
     /// The identifier of the actor that created the item.
     created_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "call_id", "call_id", false },
+        .{ "output", "output", false },
+        .{ "status", "status", false },
+        .{ "created_by", "created_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("output");
+        try jw.write(self.output);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.created_by) |value| {
+            try jw.objectField("created_by");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CustomToolCallResource = struct {
@@ -3595,6 +8909,51 @@ pub const CustomToolCallResource = struct {
     status: FunctionCallStatus,
     /// The identifier of the actor that created the item.
     created_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "call_id", "call_id", false },
+        .{ "namespace", "namespace", true },
+        .{ "name", "name", false },
+        .{ "input", "input", false },
+        .{ "status", "status", false },
+        .{ "created_by", "created_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("input");
+        try jw.write(self.input);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.created_by) |value| {
+            try jw.objectField("created_by");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A custom tool that processes input using a specified format.
@@ -3617,6 +8976,44 @@ pub const CustomToolParam = struct {
     format: ?std.json.Value = null,
     /// Whether this tool should be deferred and discovered via tool search.
     defer_loading: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "name", "name", false },
+        .{ "description", "description", true },
+        .{ "format", "format", true },
+        .{ "defer_loading", "defer_loading", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.format) |value| {
+            try jw.objectField("format");
+            try jw.write(value);
+        }
+        if (self.defer_loading) |value| {
+            try jw.objectField("defer_loading");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const DeleteAssistantResponse = struct {
@@ -3786,6 +9183,34 @@ pub const DragParam = struct {
     /// An array of coordinates representing the path of the drag action. Coordinates will appear as an array of objects, eg ``` [ { x: 100, y: 200 }, { x: 200, y: 300 } ] ```
     path: []const CoordParam,
     keys: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "path", "path", false },
+        .{ "keys", "keys", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("path");
+        try jw.write(self.path);
+        if (self.keys) |value| {
+            try jw.objectField("keys");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// An x/y coordinate pair, e.g. `{ x: 100, y: 200 }`.
@@ -3805,6 +9230,39 @@ pub const EasyInputMessage = struct {
     phase: ?std.json.Value = null,
     /// The type of the message input. Always `message`.
     type: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "role", "role", false },
+        .{ "content", "content", false },
+        .{ "phase", "phase", true },
+        .{ "type", "type", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("content");
+        try jw.write(self.content);
+        if (self.phase) |value| {
+            try jw.objectField("phase");
+            try jw.write(value);
+        }
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// JSON request body for image edits. Use `images` (array of `ImageRefParam`) instead of multipart `image` uploads. You can reference images via external URLs, data URLs, or uploaded file IDs. JSON edits support GPT image models only; DALL-E edits require multipart (`dall-e-2` only).
@@ -3837,6 +9295,94 @@ pub const EditImageBodyJsonParam = struct {
     /// Stream partial image results as events.
     stream: ?std.json.Value = null,
     partial_images: ?PartialImages = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "images", "images", false },
+        .{ "mask", "mask", true },
+        .{ "prompt", "prompt", false },
+        .{ "n", "n", true },
+        .{ "quality", "quality", true },
+        .{ "input_fidelity", "input_fidelity", true },
+        .{ "size", "size", true },
+        .{ "user", "user", true },
+        .{ "output_format", "output_format", true },
+        .{ "output_compression", "output_compression", true },
+        .{ "moderation", "moderation", true },
+        .{ "background", "background", true },
+        .{ "stream", "stream", true },
+        .{ "partial_images", "partial_images", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        try jw.objectField("images");
+        try jw.write(self.images);
+        if (self.mask) |value| {
+            try jw.objectField("mask");
+            try jw.write(value);
+        }
+        try jw.objectField("prompt");
+        try jw.write(self.prompt);
+        if (self.n) |value| {
+            try jw.objectField("n");
+            try jw.write(value);
+        }
+        if (self.quality) |value| {
+            try jw.objectField("quality");
+            try jw.write(value);
+        }
+        if (self.input_fidelity) |value| {
+            try jw.objectField("input_fidelity");
+            try jw.write(value);
+        }
+        if (self.size) |value| {
+            try jw.objectField("size");
+            try jw.write(value);
+        }
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        if (self.output_format) |value| {
+            try jw.objectField("output_format");
+            try jw.write(value);
+        }
+        if (self.output_compression) |value| {
+            try jw.objectField("output_compression");
+            try jw.write(value);
+        }
+        if (self.moderation) |value| {
+            try jw.objectField("moderation");
+            try jw.write(value);
+        }
+        if (self.background) |value| {
+            try jw.objectField("background");
+            try jw.write(value);
+        }
+        if (self.stream) |value| {
+            try jw.objectField("stream");
+            try jw.write(value);
+        }
+        if (self.partial_images) |value| {
+            try jw.objectField("partial_images");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Represents an embedding vector returned by embedding endpoint.
@@ -3849,7 +9395,7 @@ pub const Embedding = struct {
     object: []const u8,
 };
 
-pub const EmptyModelParam = struct {};
+pub const EmptyModelParam = std.json.ArrayHashMap(std.json.Value);
 
 pub const Error = struct {
     code: std.json.Value,
@@ -3885,7 +9431,7 @@ pub const Eval = struct {
     /// The name of the evaluation.
     name: []const u8,
     /// Configuration of data sources used in runs of the evaluation.
-    data_source_config: std.json.Value,
+    data_source_config: std.json.ArrayHashMap(std.json.Value),
     /// A list of testing criteria.
     testing_criteria: []const std.json.Value,
     /// The Unix timestamp (in seconds) for when the eval was created.
@@ -3906,7 +9452,7 @@ pub const EvalCustomDataSourceConfig = struct {
     /// The type of data source. Always `custom`.
     type: []const u8,
     /// The json schema for the run data source items. Learn how to build JSON schemas [here](https://json-schema.org/).
-    schema: std.json.Value,
+    schema: std.json.ArrayHashMap(std.json.Value),
 };
 
 pub const EvalGraderLabelModel = struct {
@@ -3934,6 +9480,42 @@ pub const EvalGraderPython = struct {
     image_tag: ?[]const u8 = null,
     /// The threshold for the score.
     pass_threshold: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "name", "name", false },
+        .{ "source", "source", false },
+        .{ "image_tag", "image_tag", true },
+        .{ "pass_threshold", "pass_threshold", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("source");
+        try jw.write(self.source);
+        if (self.image_tag) |value| {
+            try jw.objectField("image_tag");
+            try jw.write(value);
+        }
+        if (self.pass_threshold) |value| {
+            try jw.objectField("pass_threshold");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const EvalGraderScoreModel = struct {
@@ -3951,6 +9533,50 @@ pub const EvalGraderScoreModel = struct {
     range: ?[]const f64 = null,
     /// The threshold for the score.
     pass_threshold: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "name", "name", false },
+        .{ "model", "model", false },
+        .{ "sampling_params", "sampling_params", true },
+        .{ "input", "input", false },
+        .{ "range", "range", true },
+        .{ "pass_threshold", "pass_threshold", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.sampling_params) |value| {
+            try jw.objectField("sampling_params");
+            try jw.write(value);
+        }
+        try jw.objectField("input");
+        try jw.write(self.input);
+        if (self.range) |value| {
+            try jw.objectField("range");
+            try jw.write(value);
+        }
+        if (self.pass_threshold) |value| {
+            try jw.objectField("pass_threshold");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const EvalGraderStringCheck = struct {
@@ -3988,6 +9614,34 @@ pub const EvalItem = struct {
     content: EvalItemContent,
     /// The type of the message input. Always `message`.
     type: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "role", "role", false },
+        .{ "content", "content", false },
+        .{ "type", "type", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("content");
+        try jw.write(self.content);
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Inputs to the model - can contain template strings. Supports text, output text, input images, and input audio, either as a single item or an array of items.
@@ -4018,6 +9672,34 @@ pub const EvalItemInputImage = struct {
     image_url: []const u8,
     /// The detail level of the image to be sent to the model. One of `high`, `low`, or `auto`. Defaults to `auto`.
     detail: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "image_url", "image_url", false },
+        .{ "detail", "detail", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("image_url");
+        try jw.write(self.image_url);
+        if (self.detail) |value| {
+            try jw.objectField("detail");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const EvalJsonlFileContentSource = struct {
@@ -4054,7 +9736,35 @@ pub const EvalLogsDataSourceConfig = struct {
     type: []const u8,
     metadata: ?Metadata = null,
     /// The json schema for the run data source items. Learn how to build JSON schemas [here](https://json-schema.org/).
-    schema: std.json.Value,
+    schema: std.json.ArrayHashMap(std.json.Value),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "metadata", "metadata", true },
+        .{ "schema", "schema", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.objectField("schema");
+        try jw.write(self.schema);
+        try jw.endObject();
+    }
 };
 
 /// A EvalResponsesSource object describing a run data source configuration.
@@ -4071,6 +9781,76 @@ pub const EvalResponsesSource = struct {
     top_p: ?std.json.Value = null,
     users: ?std.json.Value = null,
     tools: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "metadata", "metadata", true },
+        .{ "model", "model", true },
+        .{ "instructions_search", "instructions_search", true },
+        .{ "created_after", "created_after", true },
+        .{ "created_before", "created_before", true },
+        .{ "reasoning_effort", "reasoning_effort", true },
+        .{ "temperature", "temperature", true },
+        .{ "top_p", "top_p", true },
+        .{ "users", "users", true },
+        .{ "tools", "tools", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.instructions_search) |value| {
+            try jw.objectField("instructions_search");
+            try jw.write(value);
+        }
+        if (self.created_after) |value| {
+            try jw.objectField("created_after");
+            try jw.write(value);
+        }
+        if (self.created_before) |value| {
+            try jw.objectField("created_before");
+            try jw.write(value);
+        }
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.users) |value| {
+            try jw.objectField("users");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A schema representing an evaluation run.
@@ -4098,7 +9878,7 @@ pub const EvalRun = struct {
     /// Results per testing criteria applied during the evaluation run.
     per_testing_criteria_results: []const std.json.Value,
     /// Information about the run's data source.
-    data_source: std.json.Value,
+    data_source: std.json.ArrayHashMap(std.json.Value),
     metadata: Metadata,
     @"error": EvalApiError,
 };
@@ -4134,7 +9914,7 @@ pub const EvalRunOutputItem = struct {
     /// The identifier for the data source item.
     datasource_item_id: i64,
     /// Details of the input data source item.
-    datasource_item: std.json.Value,
+    datasource_item: std.json.ArrayHashMap(std.json.Value),
     /// A list of grader results for this output item.
     results: []const EvalRunOutputItemResult,
     /// A sample containing the input and output of the evaluation run.
@@ -4167,6 +9947,42 @@ pub const EvalRunOutputItemResult = struct {
     passed: bool,
     /// Optional sample or intermediate data produced by the grader.
     sample: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "type", "type", true },
+        .{ "score", "score", false },
+        .{ "passed", "passed", false },
+        .{ "sample", "sample", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        try jw.objectField("score");
+        try jw.write(self.score);
+        try jw.objectField("passed");
+        try jw.write(self.passed);
+        if (self.sample) |value| {
+            try jw.objectField("sample");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Deprecated in favor of LogsDataSourceConfig.
@@ -4175,7 +9991,35 @@ pub const EvalStoredCompletionsDataSourceConfig = struct {
     type: []const u8,
     metadata: ?Metadata = null,
     /// The json schema for the run data source items. Learn how to build JSON schemas [here](https://json-schema.org/).
-    schema: std.json.Value,
+    schema: std.json.ArrayHashMap(std.json.Value),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "metadata", "metadata", true },
+        .{ "schema", "schema", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.objectField("schema");
+        try jw.write(self.schema);
+        try jw.endObject();
+    }
 };
 
 /// A StoredCompletionsRunDataSource configuration describing a set of filters
@@ -4187,6 +10031,51 @@ pub const EvalStoredCompletionsSource = struct {
     created_after: ?std.json.Value = null,
     created_before: ?std.json.Value = null,
     limit: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "metadata", "metadata", true },
+        .{ "model", "model", true },
+        .{ "created_after", "created_after", true },
+        .{ "created_before", "created_before", true },
+        .{ "limit", "limit", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.created_after) |value| {
+            try jw.objectField("created_after");
+            try jw.write(value);
+        }
+        if (self.created_before) |value| {
+            try jw.objectField("created_before");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Controls when the session expires relative to an anchor timestamp.
@@ -4274,6 +10163,31 @@ pub const FileSearchRankingOptions = struct {
     ranker: ?FileSearchRanker = null,
     /// The score threshold for the file search. All values must be a floating point number between 0 and 1.
     score_threshold: f64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "ranker", "ranker", true },
+        .{ "score_threshold", "score_threshold", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.ranker) |value| {
+            try jw.objectField("ranker");
+            try jw.write(value);
+        }
+        try jw.objectField("score_threshold");
+        try jw.write(self.score_threshold);
+        try jw.endObject();
+    }
 };
 
 /// A tool that searches for relevant content from uploaded files. Learn more about the [file search tool](https://platform.openai.com/docs/guides/tools-file-search).
@@ -4287,6 +10201,44 @@ pub const FileSearchTool = struct {
     /// Ranking options for search.
     ranking_options: ?RankingOptions = null,
     filters: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "vector_store_ids", "vector_store_ids", false },
+        .{ "max_num_results", "max_num_results", true },
+        .{ "ranking_options", "ranking_options", true },
+        .{ "filters", "filters", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("vector_store_ids");
+        try jw.write(self.vector_store_ids);
+        if (self.max_num_results) |value| {
+            try jw.objectField("max_num_results");
+            try jw.write(value);
+        }
+        if (self.ranking_options) |value| {
+            try jw.objectField("ranking_options");
+            try jw.write(value);
+        }
+        if (self.filters) |value| {
+            try jw.objectField("filters");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The results of a file search tool call. See the [file search guide](/docs/guides/tools-file-search) for more information.
@@ -4300,6 +10252,40 @@ pub const FileSearchToolCall = struct {
     /// The queries used to search for files.
     queries: []const []const u8,
     results: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "type", "type", false },
+        .{ "status", "status", false },
+        .{ "queries", "queries", false },
+        .{ "results", "results", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("queries");
+        try jw.write(self.queries);
+        if (self.results) |value| {
+            try jw.objectField("results");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Controls whether users can upload files.
@@ -4310,6 +10296,38 @@ pub const FileUploadParam = struct {
     max_file_size: ?i64 = null,
     /// Maximum number of files that can be uploaded to the session. Defaults to 10.
     max_files: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", true },
+        .{ "max_file_size", "max_file_size", true },
+        .{ "max_files", "max_files", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.enabled) |value| {
+            try jw.objectField("enabled");
+            try jw.write(value);
+        }
+        if (self.max_file_size) |value| {
+            try jw.objectField("max_file_size");
+            try jw.write(value);
+        }
+        if (self.max_files) |value| {
+            try jw.objectField("max_files");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const Filters = std.json.Value;
@@ -4326,6 +10344,61 @@ pub const FineTuneChatCompletionRequestAssistantMessage = struct {
     audio: ?std.json.Value = null,
     tool_calls: ?ChatCompletionMessageToolCalls = null,
     function_call: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "weight", "weight", true },
+        .{ "content", "content", true },
+        .{ "refusal", "refusal", true },
+        .{ "role", "role", false },
+        .{ "name", "name", true },
+        .{ "audio", "audio", true },
+        .{ "tool_calls", "tool_calls", true },
+        .{ "function_call", "function_call", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.weight) |value| {
+            try jw.objectField("weight");
+            try jw.write(value);
+        }
+        if (self.content) |value| {
+            try jw.objectField("content");
+            try jw.write(value);
+        }
+        if (self.refusal) |value| {
+            try jw.objectField("refusal");
+            try jw.write(value);
+        }
+        try jw.objectField("role");
+        try jw.write(self.role);
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
+        if (self.tool_calls) |value| {
+            try jw.objectField("tool_calls");
+            try jw.write(value);
+        }
+        if (self.function_call) |value| {
+            try jw.objectField("function_call");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The hyperparameters used for the DPO fine-tuning job.
@@ -4338,11 +10411,70 @@ pub const FineTuneDPOHyperparameters = struct {
     learning_rate_multiplier: ?std.json.Value = null,
     /// The number of epochs to train the model for. An epoch refers to one full cycle through the training dataset.
     n_epochs: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "beta", "beta", true },
+        .{ "batch_size", "batch_size", true },
+        .{ "learning_rate_multiplier", "learning_rate_multiplier", true },
+        .{ "n_epochs", "n_epochs", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.beta) |value| {
+            try jw.objectField("beta");
+            try jw.write(value);
+        }
+        if (self.batch_size) |value| {
+            try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        if (self.learning_rate_multiplier) |value| {
+            try jw.objectField("learning_rate_multiplier");
+            try jw.write(value);
+        }
+        if (self.n_epochs) |value| {
+            try jw.objectField("n_epochs");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for the DPO fine-tuning method.
 pub const FineTuneDPOMethod = struct {
     hyperparameters: ?FineTuneDPOHyperparameters = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "hyperparameters", "hyperparameters", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.hyperparameters) |value| {
+            try jw.objectField("hyperparameters");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The method used for fine-tuning.
@@ -4352,6 +10484,41 @@ pub const FineTuneMethod = struct {
     supervised: ?FineTuneSupervisedMethod = null,
     dpo: ?FineTuneDPOMethod = null,
     reinforcement: ?FineTuneReinforcementMethod = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "supervised", "supervised", true },
+        .{ "dpo", "dpo", true },
+        .{ "reinforcement", "reinforcement", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.supervised) |value| {
+            try jw.objectField("supervised");
+            try jw.write(value);
+        }
+        if (self.dpo) |value| {
+            try jw.objectField("dpo");
+            try jw.write(value);
+        }
+        if (self.reinforcement) |value| {
+            try jw.objectField("reinforcement");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The hyperparameters used for the reinforcement fine-tuning job.
@@ -4370,13 +10537,90 @@ pub const FineTuneReinforcementHyperparameters = struct {
     eval_interval: ?std.json.Value = null,
     /// Number of evaluation samples to generate per training step.
     eval_samples: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "batch_size", "batch_size", true },
+        .{ "learning_rate_multiplier", "learning_rate_multiplier", true },
+        .{ "n_epochs", "n_epochs", true },
+        .{ "reasoning_effort", "reasoning_effort", true },
+        .{ "compute_multiplier", "compute_multiplier", true },
+        .{ "eval_interval", "eval_interval", true },
+        .{ "eval_samples", "eval_samples", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.batch_size) |value| {
+            try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        if (self.learning_rate_multiplier) |value| {
+            try jw.objectField("learning_rate_multiplier");
+            try jw.write(value);
+        }
+        if (self.n_epochs) |value| {
+            try jw.objectField("n_epochs");
+            try jw.write(value);
+        }
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
+        if (self.compute_multiplier) |value| {
+            try jw.objectField("compute_multiplier");
+            try jw.write(value);
+        }
+        if (self.eval_interval) |value| {
+            try jw.objectField("eval_interval");
+            try jw.write(value);
+        }
+        if (self.eval_samples) |value| {
+            try jw.objectField("eval_samples");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for the reinforcement fine-tuning method.
 pub const FineTuneReinforcementMethod = struct {
     /// The grader used for the fine-tuning job.
-    grader: std.json.Value,
+    grader: std.json.ArrayHashMap(std.json.Value),
     hyperparameters: ?FineTuneReinforcementHyperparameters = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "grader", "grader", false },
+        .{ "hyperparameters", "hyperparameters", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("grader");
+        try jw.write(self.grader);
+        if (self.hyperparameters) |value| {
+            try jw.objectField("hyperparameters");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The hyperparameters used for the fine-tuning job.
@@ -4387,11 +10631,65 @@ pub const FineTuneSupervisedHyperparameters = struct {
     learning_rate_multiplier: ?std.json.Value = null,
     /// The number of epochs to train the model for. An epoch refers to one full cycle through the training dataset.
     n_epochs: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "batch_size", "batch_size", true },
+        .{ "learning_rate_multiplier", "learning_rate_multiplier", true },
+        .{ "n_epochs", "n_epochs", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.batch_size) |value| {
+            try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        if (self.learning_rate_multiplier) |value| {
+            try jw.objectField("learning_rate_multiplier");
+            try jw.write(value);
+        }
+        if (self.n_epochs) |value| {
+            try jw.objectField("n_epochs");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for the supervised fine-tuning method.
 pub const FineTuneSupervisedMethod = struct {
     hyperparameters: ?FineTuneSupervisedHyperparameters = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "hyperparameters", "hyperparameters", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.hyperparameters) |value| {
+            try jw.objectField("hyperparameters");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The `checkpoint.permission` object represents a permission for a fine-tuned model checkpoint.
@@ -4444,6 +10742,88 @@ pub const FineTuningJob = struct {
     estimated_finish: ?std.json.Value = null,
     method: ?FineTuneMethod = null,
     metadata: ?Metadata = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "created_at", "created_at", false },
+        .{ "error", "error", false },
+        .{ "fine_tuned_model", "fine_tuned_model", false },
+        .{ "finished_at", "finished_at", false },
+        .{ "hyperparameters", "hyperparameters", false },
+        .{ "model", "model", false },
+        .{ "object", "object", false },
+        .{ "organization_id", "organization_id", false },
+        .{ "result_files", "result_files", false },
+        .{ "status", "status", false },
+        .{ "trained_tokens", "trained_tokens", false },
+        .{ "training_file", "training_file", false },
+        .{ "validation_file", "validation_file", false },
+        .{ "integrations", "integrations", true },
+        .{ "seed", "seed", false },
+        .{ "estimated_finish", "estimated_finish", true },
+        .{ "method", "method", true },
+        .{ "metadata", "metadata", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("error");
+        try jw.write(self.@"error");
+        try jw.objectField("fine_tuned_model");
+        try jw.write(self.fine_tuned_model);
+        try jw.objectField("finished_at");
+        try jw.write(self.finished_at);
+        try jw.objectField("hyperparameters");
+        try jw.write(self.hyperparameters);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("organization_id");
+        try jw.write(self.organization_id);
+        try jw.objectField("result_files");
+        try jw.write(self.result_files);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("trained_tokens");
+        try jw.write(self.trained_tokens);
+        try jw.objectField("training_file");
+        try jw.write(self.training_file);
+        try jw.objectField("validation_file");
+        try jw.write(self.validation_file);
+        if (self.integrations) |value| {
+            try jw.objectField("integrations");
+            try jw.write(value);
+        }
+        try jw.objectField("seed");
+        try jw.write(self.seed);
+        if (self.estimated_finish) |value| {
+            try jw.objectField("estimated_finish");
+            try jw.write(value);
+        }
+        if (self.method) |value| {
+            try jw.objectField("method");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The `fine_tuning.job.checkpoint` object represents a model checkpoint for a fine-tuning job that is ready to use.
@@ -4479,13 +10859,85 @@ pub const FineTuningJobEvent = struct {
     /// The type of event.
     type: ?[]const u8 = null,
     /// The data associated with the event.
-    data: ?std.json.Value = null,
+    data: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "id", "id", false },
+        .{ "created_at", "created_at", false },
+        .{ "level", "level", false },
+        .{ "message", "message", false },
+        .{ "type", "type", true },
+        .{ "data", "data", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("level");
+        try jw.write(self.level);
+        try jw.objectField("message");
+        try jw.write(self.message);
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        if (self.data) |value| {
+            try jw.objectField("data");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const FunctionAndCustomToolCallOutput = union(enum) {
     input_text_content: InputTextContent,
     input_image_content: InputImageContent,
     input_file_content: InputFileContent,
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "InputTextContent")) {
+            return .{ .input_text_content = try std.json.parseFromSliceLeaky(InputTextContent, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "InputImageContent")) {
+            return .{ .input_image_content = try std.json.parseFromSliceLeaky(InputImageContent, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "InputFileContent")) {
+            return .{ .input_file_content = try std.json.parseFromSliceLeaky(InputFileContent, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
@@ -4494,7 +10946,9 @@ pub const FunctionAndCustomToolCallOutput = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -4558,6 +11012,42 @@ pub const FunctionCallOutputItemParam = struct {
     /// Text, image, or file output of the function tool call.
     output: std.json.Value,
     status: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "call_id", "call_id", false },
+        .{ "type", "type", false },
+        .{ "output", "output", false },
+        .{ "status", "status", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("output");
+        try jw.write(self.output);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const FunctionCallOutputStatusEnum = enum {
@@ -4623,10 +11113,45 @@ pub const FunctionObject = struct {
     name: []const u8,
     parameters: ?FunctionParameters = null,
     strict: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "description", "description", true },
+        .{ "name", "name", false },
+        .{ "parameters", "parameters", true },
+        .{ "strict", "strict", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.parameters) |value| {
+            try jw.objectField("parameters");
+            try jw.write(value);
+        }
+        if (self.strict) |value| {
+            try jw.objectField("strict");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The parameters the functions accepts, described as a JSON Schema object. See the [guide](/docs/guides/function-calling) for examples, and the [JSON Schema reference](https://json-schema.org/understanding-json-schema/) for documentation about the format. Omitting `parameters` defines a function with an empty parameter list.
-pub const FunctionParameters = struct {};
+pub const FunctionParameters = std.json.ArrayHashMap(std.json.Value);
 
 /// Execute a shell command.
 pub const FunctionShellAction = struct {
@@ -4641,6 +11166,36 @@ pub const FunctionShellActionParam = struct {
     commands: []const []const u8,
     timeout_ms: ?std.json.Value = null,
     max_output_length: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "commands", "commands", false },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "max_output_length", "max_output_length", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("commands");
+        try jw.write(self.commands);
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.max_output_length) |value| {
+            try jw.objectField("max_output_length");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A tool call that executes one or more shell commands in a managed environment.
@@ -4658,6 +11213,46 @@ pub const FunctionShellCall = struct {
     environment: std.json.Value,
     /// The ID of the entity that created this tool call.
     created_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "call_id", "call_id", false },
+        .{ "action", "action", false },
+        .{ "status", "status", false },
+        .{ "environment", "environment", false },
+        .{ "created_by", "created_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("environment");
+        try jw.write(self.environment);
+        if (self.created_by) |value| {
+            try jw.objectField("created_by");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A tool representing a request to execute one or more shell commands.
@@ -4671,6 +11266,47 @@ pub const FunctionShellCallItemParam = struct {
     action: FunctionShellActionParam,
     status: ?std.json.Value = null,
     environment: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "call_id", "call_id", false },
+        .{ "type", "type", false },
+        .{ "action", "action", false },
+        .{ "status", "status", true },
+        .{ "environment", "environment", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.environment) |value| {
+            try jw.objectField("environment");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Status values reported for shell tool calls.
@@ -4717,6 +11353,46 @@ pub const FunctionShellCallOutput = struct {
     max_output_length: std.json.Value,
     /// The identifier of the actor that created the item.
     created_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "call_id", "call_id", false },
+        .{ "status", "status", false },
+        .{ "output", "output", false },
+        .{ "max_output_length", "max_output_length", false },
+        .{ "created_by", "created_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("output");
+        try jw.write(self.output);
+        try jw.objectField("max_output_length");
+        try jw.write(self.max_output_length);
+        if (self.created_by) |value| {
+            try jw.objectField("created_by");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The content of a shell tool call output that was emitted.
@@ -4729,6 +11405,37 @@ pub const FunctionShellCallOutputContent = struct {
     outcome: std.json.Value,
     /// The identifier of the actor that created the item.
     created_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "stdout", "stdout", false },
+        .{ "stderr", "stderr", false },
+        .{ "outcome", "outcome", false },
+        .{ "created_by", "created_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("stdout");
+        try jw.write(self.stdout);
+        try jw.objectField("stderr");
+        try jw.write(self.stderr);
+        try jw.objectField("outcome");
+        try jw.write(self.outcome);
+        if (self.created_by) |value| {
+            try jw.objectField("created_by");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Captured stdout and stderr for a portion of a shell tool call output.
@@ -4768,12 +11475,80 @@ pub const FunctionShellCallOutputItemParam = struct {
     output: []const FunctionShellCallOutputContentParam,
     status: ?std.json.Value = null,
     max_output_length: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "call_id", "call_id", false },
+        .{ "type", "type", false },
+        .{ "output", "output", false },
+        .{ "status", "status", true },
+        .{ "max_output_length", "max_output_length", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("output");
+        try jw.write(self.output);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.max_output_length) |value| {
+            try jw.objectField("max_output_length");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The exit or timeout outcome associated with this shell call.
 pub const FunctionShellCallOutputOutcomeParam = union(enum) {
     function_shell_call_output_timeout_outcome_param: FunctionShellCallOutputTimeoutOutcomeParam,
     function_shell_call_output_exit_outcome_param: FunctionShellCallOutputExitOutcomeParam,
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutputTimeoutOutcomeParam")) {
+            return .{ .function_shell_call_output_timeout_outcome_param = try std.json.parseFromSliceLeaky(FunctionShellCallOutputTimeoutOutcomeParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutputExitOutcomeParam")) {
+            return .{ .function_shell_call_output_exit_outcome_param = try std.json.parseFromSliceLeaky(FunctionShellCallOutputExitOutcomeParam, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
@@ -4782,7 +11557,9 @@ pub const FunctionShellCallOutputOutcomeParam = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -4821,6 +11598,31 @@ pub const FunctionShellToolParam = struct {
     /// The type of the shell tool. Always `shell`.
     type: []const u8,
     environment: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "environment", "environment", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.environment) |value| {
+            try jw.objectField("environment");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Defines a function in your own code the model can choose to call. Learn more about [function calling](https://platform.openai.com/docs/guides/function-calling).
@@ -4834,6 +11636,45 @@ pub const FunctionTool = struct {
     strict: std.json.Value,
     /// Whether this function is deferred and loaded via tool search.
     defer_loading: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "name", "name", false },
+        .{ "description", "description", true },
+        .{ "parameters", "parameters", false },
+        .{ "strict", "strict", false },
+        .{ "defer_loading", "defer_loading", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.objectField("parameters");
+        try jw.write(self.parameters);
+        try jw.objectField("strict");
+        try jw.write(self.strict);
+        if (self.defer_loading) |value| {
+            try jw.objectField("defer_loading");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A tool call to run a function. See the [function calling guide](/docs/guides/function-calling) for more information.
@@ -4852,6 +11693,50 @@ pub const FunctionToolCall = struct {
     arguments: []const u8,
     /// The status of the item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
     status: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "type", "type", false },
+        .{ "call_id", "call_id", false },
+        .{ "namespace", "namespace", true },
+        .{ "name", "name", false },
+        .{ "arguments", "arguments", false },
+        .{ "status", "status", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("arguments");
+        try jw.write(self.arguments);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The output of a function tool call.
@@ -4866,6 +11751,42 @@ pub const FunctionToolCallOutput = struct {
     output: std.json.Value,
     /// The status of the item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
     status: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "type", "type", false },
+        .{ "call_id", "call_id", false },
+        .{ "output", "output", false },
+        .{ "status", "status", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("output");
+        try jw.write(self.output);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const FunctionToolCallOutputResource = struct {
@@ -4881,6 +11802,43 @@ pub const FunctionToolCallOutputResource = struct {
     status: ?[]const u8 = null,
     /// The identifier of the actor that created the item.
     created_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "type", "type", false },
+        .{ "call_id", "call_id", false },
+        .{ "output", "output", false },
+        .{ "status", "status", false },
+        .{ "created_by", "created_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("output");
+        try jw.write(self.output);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.created_by) |value| {
+            try jw.objectField("created_by");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const FunctionToolCallResource = struct {
@@ -4900,6 +11858,51 @@ pub const FunctionToolCallResource = struct {
     status: ?[]const u8 = null,
     /// The identifier of the actor that created the item.
     created_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "type", "type", false },
+        .{ "call_id", "call_id", false },
+        .{ "namespace", "namespace", true },
+        .{ "name", "name", false },
+        .{ "arguments", "arguments", false },
+        .{ "status", "status", false },
+        .{ "created_by", "created_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("arguments");
+        try jw.write(self.arguments);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.created_by) |value| {
+            try jw.objectField("created_by");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const FunctionToolParam = struct {
@@ -4910,6 +11913,49 @@ pub const FunctionToolParam = struct {
     type: []const u8,
     /// Whether this function should be deferred and discovered via tool search.
     defer_loading: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "description", "description", true },
+        .{ "parameters", "parameters", true },
+        .{ "strict", "strict", true },
+        .{ "type", "type", false },
+        .{ "defer_loading", "defer_loading", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.parameters) |value| {
+            try jw.objectField("parameters");
+            try jw.write(value);
+        }
+        if (self.strict) |value| {
+            try jw.objectField("strict");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.defer_loading) |value| {
+            try jw.objectField("defer_loading");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A LabelModelGrader object which uses a model to assign labels to each item in the evaluation.
@@ -4948,6 +11994,37 @@ pub const GraderPython = struct {
     source: []const u8,
     /// The image tag to use for the python script.
     image_tag: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "name", "name", false },
+        .{ "source", "source", false },
+        .{ "image_tag", "image_tag", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("source");
+        try jw.write(self.source);
+        if (self.image_tag) |value| {
+            try jw.objectField("image_tag");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A ScoreModelGrader object that uses a model to assign a score to the input.
@@ -4964,6 +12041,45 @@ pub const GraderScoreModel = struct {
     input: []const EvalItem,
     /// The range of the score. Defaults to `[0, 1]`.
     range: ?[]const f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "name", "name", false },
+        .{ "model", "model", false },
+        .{ "sampling_params", "sampling_params", true },
+        .{ "input", "input", false },
+        .{ "range", "range", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.sampling_params) |value| {
+            try jw.objectField("sampling_params");
+            try jw.write(value);
+        }
+        try jw.objectField("input");
+        try jw.write(self.input);
+        if (self.range) |value| {
+            try jw.objectField("range");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A StringCheckGrader object that performs a string comparison between input and reference using a specified operation.
@@ -5111,6 +12227,33 @@ pub const HistoryParam = struct {
     enabled: ?bool = null,
     /// Number of recent ChatKit threads users have access to. Defaults to unlimited when unset.
     recent_threads: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", true },
+        .{ "recent_threads", "recent_threads", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.enabled) |value| {
+            try jw.objectField("enabled");
+            try jw.write(value);
+        }
+        if (self.recent_threads) |value| {
+            try jw.objectField("recent_threads");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HybridSearchOptions = struct {
@@ -5128,6 +12271,38 @@ pub const Image = struct {
     url: ?[]const u8 = null,
     /// For `dall-e-3` only, the revised prompt that was used to generate the image.
     revised_prompt: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "b64_json", "b64_json", true },
+        .{ "url", "url", true },
+        .{ "revised_prompt", "revised_prompt", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.b64_json) |value| {
+            try jw.objectField("b64_json");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.revised_prompt) |value| {
+            try jw.objectField("revised_prompt");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ImageDetail = enum {
@@ -5311,6 +12486,81 @@ pub const ImageGenTool = struct {
     partial_images: ?i64 = null,
     /// Whether to generate a new image or edit an existing image. Default: `auto`.
     action: ?ImageGenActionEnum = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "model", "model", true },
+        .{ "quality", "quality", true },
+        .{ "size", "size", true },
+        .{ "output_format", "output_format", true },
+        .{ "output_compression", "output_compression", true },
+        .{ "moderation", "moderation", true },
+        .{ "background", "background", true },
+        .{ "input_fidelity", "input_fidelity", true },
+        .{ "input_image_mask", "input_image_mask", true },
+        .{ "partial_images", "partial_images", true },
+        .{ "action", "action", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.quality) |value| {
+            try jw.objectField("quality");
+            try jw.write(value);
+        }
+        if (self.size) |value| {
+            try jw.objectField("size");
+            try jw.write(value);
+        }
+        if (self.output_format) |value| {
+            try jw.objectField("output_format");
+            try jw.write(value);
+        }
+        if (self.output_compression) |value| {
+            try jw.objectField("output_compression");
+            try jw.write(value);
+        }
+        if (self.moderation) |value| {
+            try jw.objectField("moderation");
+            try jw.write(value);
+        }
+        if (self.background) |value| {
+            try jw.objectField("background");
+            try jw.write(value);
+        }
+        if (self.input_fidelity) |value| {
+            try jw.objectField("input_fidelity");
+            try jw.write(value);
+        }
+        if (self.input_image_mask) |value| {
+            try jw.objectField("input_image_mask");
+            try jw.write(value);
+        }
+        if (self.partial_images) |value| {
+            try jw.objectField("partial_images");
+            try jw.write(value);
+        }
+        if (self.action) |value| {
+            try jw.objectField("action");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// An image generation request made by the model.
@@ -5334,6 +12584,40 @@ pub const ImageGenUsage = struct {
     output_tokens: i64,
     output_tokens_details: ?ImageGenOutputTokensDetails = null,
     input_tokens_details: ImageGenInputUsageDetails,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "input_tokens", "input_tokens", false },
+        .{ "total_tokens", "total_tokens", false },
+        .{ "output_tokens", "output_tokens", false },
+        .{ "output_tokens_details", "output_tokens_details", true },
+        .{ "input_tokens_details", "input_tokens_details", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("input_tokens");
+        try jw.write(self.input_tokens);
+        try jw.objectField("total_tokens");
+        try jw.write(self.total_tokens);
+        try jw.objectField("output_tokens");
+        try jw.write(self.output_tokens);
+        if (self.output_tokens_details) |value| {
+            try jw.objectField("output_tokens_details");
+            try jw.write(value);
+        }
+        try jw.objectField("input_tokens_details");
+        try jw.write(self.input_tokens_details);
+        try jw.endObject();
+    }
 };
 
 /// Reference an input image by either URL or uploaded file ID. Provide exactly one of `image_url` or `file_id`.
@@ -5342,6 +12626,20 @@ pub const ImageRefParam = struct {
     image_url: ?[]const u8 = null,
     /// The File API ID of an uploaded image to use as input.
     file_id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "image_url", "image_url", true },
+        .{ "file_id", "file_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -5361,6 +12659,33 @@ pub const ImageRefParam2 = struct {
     /// A fully qualified URL or base64-encoded data URL.
     image_url: ?[]const u8 = null,
     file_id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "image_url", "image_url", true },
+        .{ "file_id", "file_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.image_url) |value| {
+            try jw.objectField("image_url");
+            try jw.write(value);
+        }
+        if (self.file_id) |value| {
+            try jw.objectField("file_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The response from the image generation endpoint.
@@ -5378,6 +12703,56 @@ pub const ImagesResponse = struct {
     /// The quality of the image generated. Either `low`, `medium`, or `high`.
     quality: ?[]const u8 = null,
     usage: ?ImageGenUsage = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created", "created", false },
+        .{ "data", "data", true },
+        .{ "background", "background", true },
+        .{ "output_format", "output_format", true },
+        .{ "size", "size", true },
+        .{ "quality", "quality", true },
+        .{ "usage", "usage", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created");
+        try jw.write(self.created);
+        if (self.data) |value| {
+            try jw.objectField("data");
+            try jw.write(value);
+        }
+        if (self.background) |value| {
+            try jw.objectField("background");
+            try jw.write(value);
+        }
+        if (self.output_format) |value| {
+            try jw.objectField("output_format");
+            try jw.write(value);
+        }
+        if (self.size) |value| {
+            try jw.objectField("size");
+            try jw.write(value);
+        }
+        if (self.quality) |value| {
+            try jw.objectField("quality");
+            try jw.write(value);
+        }
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// For the GPT image models only, the token usage information for the image generation.
@@ -5475,6 +12850,36 @@ pub const InputContent = union(enum) {
     input_image_content: InputImageContent,
     input_file_content: InputFileContent,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "InputTextContent")) {
+            return .{ .input_text_content = try std.json.parseFromSliceLeaky(InputTextContent, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "InputImageContent")) {
+            return .{ .input_image_content = try std.json.parseFromSliceLeaky(InputImageContent, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "InputFileContent")) {
+            return .{ .input_file_content = try std.json.parseFromSliceLeaky(InputFileContent, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -5482,7 +12887,9 @@ pub const InputContent = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -5545,6 +12952,46 @@ pub const InputFileContent = struct {
     file_data: ?[]const u8 = null,
     /// The URL of the file to be sent to the model.
     file_url: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "file_id", "file_id", true },
+        .{ "filename", "filename", true },
+        .{ "file_data", "file_data", true },
+        .{ "file_url", "file_url", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.file_id) |value| {
+            try jw.objectField("file_id");
+            try jw.write(value);
+        }
+        if (self.filename) |value| {
+            try jw.objectField("filename");
+            try jw.write(value);
+        }
+        if (self.file_data) |value| {
+            try jw.objectField("file_data");
+            try jw.write(value);
+        }
+        if (self.file_url) |value| {
+            try jw.objectField("file_url");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A file input to the model.
@@ -5555,6 +13002,46 @@ pub const InputFileContentParam = struct {
     filename: ?std.json.Value = null,
     file_data: ?std.json.Value = null,
     file_url: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "file_id", "file_id", true },
+        .{ "filename", "filename", true },
+        .{ "file_data", "file_data", true },
+        .{ "file_url", "file_url", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.file_id) |value| {
+            try jw.objectField("file_id");
+            try jw.write(value);
+        }
+        if (self.filename) |value| {
+            try jw.objectField("filename");
+            try jw.write(value);
+        }
+        if (self.file_data) |value| {
+            try jw.objectField("file_data");
+            try jw.write(value);
+        }
+        if (self.file_url) |value| {
+            try jw.objectField("file_url");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// An image input to the model. Learn about [image inputs](/docs/guides/vision).
@@ -5565,6 +13052,39 @@ pub const InputImageContent = struct {
     file_id: ?std.json.Value = null,
     /// The detail level of the image to be sent to the model. One of `high`, `low`, `auto`, or `original`. Defaults to `auto`.
     detail: ImageDetail,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "image_url", "image_url", true },
+        .{ "file_id", "file_id", true },
+        .{ "detail", "detail", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.image_url) |value| {
+            try jw.objectField("image_url");
+            try jw.write(value);
+        }
+        if (self.file_id) |value| {
+            try jw.objectField("file_id");
+            try jw.write(value);
+        }
+        try jw.objectField("detail");
+        try jw.write(self.detail);
+        try jw.endObject();
+    }
 };
 
 /// An image input to the model. Learn about [image inputs](/docs/guides/vision)
@@ -5574,12 +13094,77 @@ pub const InputImageContentParamAutoParam = struct {
     image_url: ?std.json.Value = null,
     file_id: ?std.json.Value = null,
     detail: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "image_url", "image_url", true },
+        .{ "file_id", "file_id", true },
+        .{ "detail", "detail", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.image_url) |value| {
+            try jw.objectField("image_url");
+            try jw.write(value);
+        }
+        if (self.file_id) |value| {
+            try jw.objectField("file_id");
+            try jw.write(value);
+        }
+        if (self.detail) |value| {
+            try jw.objectField("detail");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const InputItem = union(enum) {
     easy_input_message: EasyInputMessage,
     item: Item,
     item_reference_param: ItemReferenceParam,
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "EasyInputMessage")) {
+            return .{ .easy_input_message = try std.json.parseFromSliceLeaky(EasyInputMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "Item")) {
+            return .{ .item = try std.json.parseFromSliceLeaky(Item, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ItemReferenceParam")) {
+            return .{ .item_reference_param = try std.json.parseFromSliceLeaky(ItemReferenceParam, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
@@ -5588,7 +13173,9 @@ pub const InputItem = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -5623,6 +13210,39 @@ pub const InputMessage = struct {
     /// The status of item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
     status: ?[]const u8 = null,
     content: InputMessageContentList,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", true },
+        .{ "role", "role", false },
+        .{ "status", "status", true },
+        .{ "content", "content", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        try jw.objectField("role");
+        try jw.write(self.role);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.endObject();
+    }
 };
 
 /// A list of one or many input items to the model, containing different content types.
@@ -5638,6 +13258,40 @@ pub const InputMessageResource = struct {
     content: InputMessageContentList,
     /// The unique ID of the message input.
     id: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "role", "role", false },
+        .{ "status", "status", true },
+        .{ "content", "content", false },
+        .{ "id", "id", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("role");
+        try jw.write(self.role);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.endObject();
+    }
 };
 
 /// Text, image, or file inputs to the model, used to generate a response. Learn more: - [Text inputs and outputs](/docs/guides/text) - [Image inputs](/docs/guides/images) - [File inputs](/docs/guides/pdf-files) - [Conversation state](/docs/guides/conversation-state) - [Function calling](/docs/guides/function-calling)
@@ -5679,6 +13333,54 @@ pub const Invite = struct {
     accepted_at: ?i64 = null,
     /// The projects that were granted membership upon acceptance of the invite.
     projects: ?[]const std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "id", "id", false },
+        .{ "email", "email", false },
+        .{ "role", "role", false },
+        .{ "status", "status", false },
+        .{ "invited_at", "invited_at", false },
+        .{ "expires_at", "expires_at", false },
+        .{ "accepted_at", "accepted_at", true },
+        .{ "projects", "projects", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("email");
+        try jw.write(self.email);
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("invited_at");
+        try jw.write(self.invited_at);
+        try jw.objectField("expires_at");
+        try jw.write(self.expires_at);
+        if (self.accepted_at) |value| {
+            try jw.objectField("accepted_at");
+            try jw.write(value);
+        }
+        if (self.projects) |value| {
+            try jw.objectField("projects");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const InviteDeleteResponse = struct {
@@ -5698,6 +13400,44 @@ pub const InviteListResponse = struct {
     last_id: ?[]const u8 = null,
     /// The `has_more` property is used for pagination to indicate there are additional results.
     has_more: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "data", "data", false },
+        .{ "first_id", "first_id", true },
+        .{ "last_id", "last_id", true },
+        .{ "has_more", "has_more", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.first_id) |value| {
+            try jw.objectField("first_id");
+            try jw.write(value);
+        }
+        if (self.last_id) |value| {
+            try jw.objectField("last_id");
+            try jw.write(value);
+        }
+        if (self.has_more) |value| {
+            try jw.objectField("has_more");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Request payload for granting a group access to a project.
@@ -5715,6 +13455,34 @@ pub const InviteRequest = struct {
     role: []const u8,
     /// An array of projects to which membership is granted at the same time the org invite is accepted. If omitted, the user will be invited to the default project for compatibility with legacy behavior.
     projects: ?[]const std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "email", "email", false },
+        .{ "role", "role", false },
+        .{ "projects", "projects", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("email");
+        try jw.write(self.email);
+        try jw.objectField("role");
+        try jw.write(self.role);
+        if (self.projects) |value| {
+            try jw.objectField("projects");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Content item used to generate a response.
@@ -5746,6 +13514,105 @@ pub const Item = union(enum) {
     custom_tool_call_output: CustomToolCallOutput,
     custom_tool_call: CustomToolCall,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return .{ .input_message = try std.json.parseFromSliceLeaky(InputMessage, allocator, input, options) };
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "InputMessage")) {
+            return .{ .input_message = try std.json.parseFromSliceLeaky(InputMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "OutputMessage")) {
+            return .{ .output_message = try std.json.parseFromSliceLeaky(OutputMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FileSearchToolCall")) {
+            return .{ .file_search_tool_call = try std.json.parseFromSliceLeaky(FileSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCall")) {
+            return .{ .computer_tool_call = try std.json.parseFromSliceLeaky(ComputerToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerCallOutputItemParam")) {
+            return .{ .computer_call_output_item_param = try std.json.parseFromSliceLeaky(ComputerCallOutputItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchToolCall")) {
+            return .{ .web_search_tool_call = try std.json.parseFromSliceLeaky(WebSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCall")) {
+            return .{ .function_tool_call = try std.json.parseFromSliceLeaky(FunctionToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionCallOutputItemParam")) {
+            return .{ .function_call_output_item_param = try std.json.parseFromSliceLeaky(FunctionCallOutputItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchCallItemParam")) {
+            return .{ .tool_search_call_item_param = try std.json.parseFromSliceLeaky(ToolSearchCallItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchOutputItemParam")) {
+            return .{ .tool_search_output_item_param = try std.json.parseFromSliceLeaky(ToolSearchOutputItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ReasoningItem")) {
+            return .{ .reasoning_item = try std.json.parseFromSliceLeaky(ReasoningItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CompactionSummaryItemParam")) {
+            return .{ .compaction_summary_item_param = try std.json.parseFromSliceLeaky(CompactionSummaryItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ImageGenToolCall")) {
+            return .{ .image_gen_tool_call = try std.json.parseFromSliceLeaky(ImageGenToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CodeInterpreterToolCall")) {
+            return .{ .code_interpreter_tool_call = try std.json.parseFromSliceLeaky(CodeInterpreterToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCall")) {
+            return .{ .local_shell_tool_call = try std.json.parseFromSliceLeaky(LocalShellToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCallOutput")) {
+            return .{ .local_shell_tool_call_output = try std.json.parseFromSliceLeaky(LocalShellToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallItemParam")) {
+            return .{ .function_shell_call_item_param = try std.json.parseFromSliceLeaky(FunctionShellCallItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutputItemParam")) {
+            return .{ .function_shell_call_output_item_param = try std.json.parseFromSliceLeaky(FunctionShellCallOutputItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCallItemParam")) {
+            return .{ .apply_patch_tool_call_item_param = try std.json.parseFromSliceLeaky(ApplyPatchToolCallItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCallOutputItemParam")) {
+            return .{ .apply_patch_tool_call_output_item_param = try std.json.parseFromSliceLeaky(ApplyPatchToolCallOutputItemParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPListTools")) {
+            return .{ .mcp_list_tools = try std.json.parseFromSliceLeaky(MCPListTools, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalRequest")) {
+            return .{ .mcp_approval_request = try std.json.parseFromSliceLeaky(MCPApprovalRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalResponse")) {
+            return .{ .mcp_approval_response = try std.json.parseFromSliceLeaky(MCPApprovalResponse, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPToolCall")) {
+            return .{ .mcp_tool_call = try std.json.parseFromSliceLeaky(MCPToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCallOutput")) {
+            return .{ .custom_tool_call_output = try std.json.parseFromSliceLeaky(CustomToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCall")) {
+            return .{ .custom_tool_call = try std.json.parseFromSliceLeaky(CustomToolCall, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -5753,7 +13620,9 @@ pub const Item = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return .{ .input_message = try std.json.parseFromValueLeaky(InputMessage, allocator, source, options) };
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -5899,6 +13768,102 @@ pub const ItemField = union(enum) {
     custom_tool_call: CustomToolCall,
     custom_tool_call_output: CustomToolCallOutput,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "Message")) {
+            return .{ .message = try std.json.parseFromSliceLeaky(Message, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCall")) {
+            return .{ .function_tool_call = try std.json.parseFromSliceLeaky(FunctionToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchCall")) {
+            return .{ .tool_search_call = try std.json.parseFromSliceLeaky(ToolSearchCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchOutput")) {
+            return .{ .tool_search_output = try std.json.parseFromSliceLeaky(ToolSearchOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCallOutput")) {
+            return .{ .function_tool_call_output = try std.json.parseFromSliceLeaky(FunctionToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FileSearchToolCall")) {
+            return .{ .file_search_tool_call = try std.json.parseFromSliceLeaky(FileSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchToolCall")) {
+            return .{ .web_search_tool_call = try std.json.parseFromSliceLeaky(WebSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ImageGenToolCall")) {
+            return .{ .image_gen_tool_call = try std.json.parseFromSliceLeaky(ImageGenToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCall")) {
+            return .{ .computer_tool_call = try std.json.parseFromSliceLeaky(ComputerToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCallOutputResource")) {
+            return .{ .computer_tool_call_output_resource = try std.json.parseFromSliceLeaky(ComputerToolCallOutputResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ReasoningItem")) {
+            return .{ .reasoning_item = try std.json.parseFromSliceLeaky(ReasoningItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CompactionBody")) {
+            return .{ .compaction_body = try std.json.parseFromSliceLeaky(CompactionBody, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CodeInterpreterToolCall")) {
+            return .{ .code_interpreter_tool_call = try std.json.parseFromSliceLeaky(CodeInterpreterToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCall")) {
+            return .{ .local_shell_tool_call = try std.json.parseFromSliceLeaky(LocalShellToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCallOutput")) {
+            return .{ .local_shell_tool_call_output = try std.json.parseFromSliceLeaky(LocalShellToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCall")) {
+            return .{ .function_shell_call = try std.json.parseFromSliceLeaky(FunctionShellCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutput")) {
+            return .{ .function_shell_call_output = try std.json.parseFromSliceLeaky(FunctionShellCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCall")) {
+            return .{ .apply_patch_tool_call = try std.json.parseFromSliceLeaky(ApplyPatchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCallOutput")) {
+            return .{ .apply_patch_tool_call_output = try std.json.parseFromSliceLeaky(ApplyPatchToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPListTools")) {
+            return .{ .mcp_list_tools = try std.json.parseFromSliceLeaky(MCPListTools, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalRequest")) {
+            return .{ .mcp_approval_request = try std.json.parseFromSliceLeaky(MCPApprovalRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalResponseResource")) {
+            return .{ .mcp_approval_response_resource = try std.json.parseFromSliceLeaky(MCPApprovalResponseResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPToolCall")) {
+            return .{ .mcp_tool_call = try std.json.parseFromSliceLeaky(MCPToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCall")) {
+            return .{ .custom_tool_call = try std.json.parseFromSliceLeaky(CustomToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCallOutput")) {
+            return .{ .custom_tool_call_output = try std.json.parseFromSliceLeaky(CustomToolCallOutput, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -5906,7 +13871,9 @@ pub const ItemField = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -6025,6 +13992,31 @@ pub const ItemReferenceParam = struct {
     type: ?std.json.Value = null,
     /// The ID of the item to reference.
     id: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", true },
+        .{ "id", "id", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.endObject();
+    }
 };
 
 /// Content item used to generate a response.
@@ -6056,6 +14048,105 @@ pub const ItemResource = union(enum) {
     custom_tool_call_resource: CustomToolCallResource,
     custom_tool_call_output_resource: CustomToolCallOutputResource,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "InputMessageResource")) {
+            return .{ .input_message_resource = try std.json.parseFromSliceLeaky(InputMessageResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "OutputMessage")) {
+            return .{ .output_message = try std.json.parseFromSliceLeaky(OutputMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FileSearchToolCall")) {
+            return .{ .file_search_tool_call = try std.json.parseFromSliceLeaky(FileSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCall")) {
+            return .{ .computer_tool_call = try std.json.parseFromSliceLeaky(ComputerToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCallOutputResource")) {
+            return .{ .computer_tool_call_output_resource = try std.json.parseFromSliceLeaky(ComputerToolCallOutputResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchToolCall")) {
+            return .{ .web_search_tool_call = try std.json.parseFromSliceLeaky(WebSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCallResource")) {
+            return .{ .function_tool_call_resource = try std.json.parseFromSliceLeaky(FunctionToolCallResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCallOutputResource")) {
+            return .{ .function_tool_call_output_resource = try std.json.parseFromSliceLeaky(FunctionToolCallOutputResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchCall")) {
+            return .{ .tool_search_call = try std.json.parseFromSliceLeaky(ToolSearchCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchOutput")) {
+            return .{ .tool_search_output = try std.json.parseFromSliceLeaky(ToolSearchOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ReasoningItem")) {
+            return .{ .reasoning_item = try std.json.parseFromSliceLeaky(ReasoningItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CompactionBody")) {
+            return .{ .compaction_body = try std.json.parseFromSliceLeaky(CompactionBody, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ImageGenToolCall")) {
+            return .{ .image_gen_tool_call = try std.json.parseFromSliceLeaky(ImageGenToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CodeInterpreterToolCall")) {
+            return .{ .code_interpreter_tool_call = try std.json.parseFromSliceLeaky(CodeInterpreterToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCall")) {
+            return .{ .local_shell_tool_call = try std.json.parseFromSliceLeaky(LocalShellToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCallOutput")) {
+            return .{ .local_shell_tool_call_output = try std.json.parseFromSliceLeaky(LocalShellToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCall")) {
+            return .{ .function_shell_call = try std.json.parseFromSliceLeaky(FunctionShellCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutput")) {
+            return .{ .function_shell_call_output = try std.json.parseFromSliceLeaky(FunctionShellCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCall")) {
+            return .{ .apply_patch_tool_call = try std.json.parseFromSliceLeaky(ApplyPatchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCallOutput")) {
+            return .{ .apply_patch_tool_call_output = try std.json.parseFromSliceLeaky(ApplyPatchToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPListTools")) {
+            return .{ .mcp_list_tools = try std.json.parseFromSliceLeaky(MCPListTools, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalRequest")) {
+            return .{ .mcp_approval_request = try std.json.parseFromSliceLeaky(MCPApprovalRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalResponseResource")) {
+            return .{ .mcp_approval_response_resource = try std.json.parseFromSliceLeaky(MCPApprovalResponseResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPToolCall")) {
+            return .{ .mcp_tool_call = try std.json.parseFromSliceLeaky(MCPToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCallResource")) {
+            return .{ .custom_tool_call_resource = try std.json.parseFromSliceLeaky(CustomToolCallResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCallOutputResource")) {
+            return .{ .custom_tool_call_output_resource = try std.json.parseFromSliceLeaky(CustomToolCallOutputResource, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -6063,7 +14154,9 @@ pub const ItemResource = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -6211,6 +14304,42 @@ pub const ListBatchesResponse = struct {
     last_id: ?[]const u8 = null,
     has_more: bool,
     object: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "data", "data", false },
+        .{ "first_id", "first_id", true },
+        .{ "last_id", "last_id", true },
+        .{ "has_more", "has_more", false },
+        .{ "object", "object", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.first_id) |value| {
+            try jw.objectField("first_id");
+            try jw.write(value);
+        }
+        if (self.last_id) |value| {
+            try jw.objectField("last_id");
+            try jw.write(value);
+        }
+        try jw.objectField("has_more");
+        try jw.write(self.has_more);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.endObject();
+    }
 };
 
 pub const ListCertificatesResponse = struct {
@@ -6219,6 +14348,42 @@ pub const ListCertificatesResponse = struct {
     last_id: ?[]const u8 = null,
     has_more: bool,
     object: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "data", "data", false },
+        .{ "first_id", "first_id", true },
+        .{ "last_id", "last_id", true },
+        .{ "has_more", "has_more", false },
+        .{ "object", "object", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.first_id) |value| {
+            try jw.objectField("first_id");
+            try jw.write(value);
+        }
+        if (self.last_id) |value| {
+            try jw.objectField("last_id");
+            try jw.write(value);
+        }
+        try jw.objectField("has_more");
+        try jw.write(self.has_more);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.endObject();
+    }
 };
 
 pub const ListFilesResponse = struct {
@@ -6235,6 +14400,42 @@ pub const ListFineTuningCheckpointPermissionResponse = struct {
     first_id: ?std.json.Value = null,
     last_id: ?std.json.Value = null,
     has_more: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "data", "data", false },
+        .{ "object", "object", false },
+        .{ "first_id", "first_id", true },
+        .{ "last_id", "last_id", true },
+        .{ "has_more", "has_more", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("data");
+        try jw.write(self.data);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        if (self.first_id) |value| {
+            try jw.objectField("first_id");
+            try jw.write(value);
+        }
+        if (self.last_id) |value| {
+            try jw.objectField("last_id");
+            try jw.write(value);
+        }
+        try jw.objectField("has_more");
+        try jw.write(self.has_more);
+        try jw.endObject();
+    }
 };
 
 pub const ListFineTuningJobCheckpointsResponse = struct {
@@ -6243,6 +14444,42 @@ pub const ListFineTuningJobCheckpointsResponse = struct {
     first_id: ?std.json.Value = null,
     last_id: ?std.json.Value = null,
     has_more: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "data", "data", false },
+        .{ "object", "object", false },
+        .{ "first_id", "first_id", true },
+        .{ "last_id", "last_id", true },
+        .{ "has_more", "has_more", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("data");
+        try jw.write(self.data);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        if (self.first_id) |value| {
+            try jw.objectField("first_id");
+            try jw.write(value);
+        }
+        if (self.last_id) |value| {
+            try jw.objectField("last_id");
+            try jw.write(value);
+        }
+        try jw.objectField("has_more");
+        try jw.write(self.has_more);
+        try jw.endObject();
+    }
 };
 
 pub const ListFineTuningJobEventsResponse = struct {
@@ -6307,6 +14544,31 @@ pub const LocalEnvironmentParam = struct {
     type: []const u8,
     /// An optional list of skills.
     skills: ?[]const LocalSkillParam = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "skills", "skills", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.skills) |value| {
+            try jw.objectField("skills");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Represents the use of a local environment to perform shell actions.
@@ -6382,6 +14644,47 @@ pub const LocalShellExecAction = struct {
     /// Environment variables to set for the command.
     env: std.json.ArrayHashMap([]const u8),
     user: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "command", "command", false },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "working_directory", "working_directory", true },
+        .{ "env", "env", false },
+        .{ "user", "user", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("command");
+        try jw.write(self.command);
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.working_directory) |value| {
+            try jw.objectField("working_directory");
+            try jw.write(value);
+        }
+        try jw.objectField("env");
+        try jw.write(self.env);
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A tool call to run a command on the local shell.
@@ -6406,6 +14709,37 @@ pub const LocalShellToolCallOutput = struct {
     /// A JSON string of the output of the local shell tool call.
     output: []const u8,
     status: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "output", "output", false },
+        .{ "status", "status", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("output");
+        try jw.write(self.output);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A tool that allows the model to execute shell commands in a local environment.
@@ -6472,6 +14806,42 @@ pub const MCPApprovalResponse = struct {
     /// Whether the request was approved.
     approve: bool,
     reason: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", true },
+        .{ "approval_request_id", "approval_request_id", false },
+        .{ "approve", "approve", false },
+        .{ "reason", "reason", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("approval_request_id");
+        try jw.write(self.approval_request_id);
+        try jw.objectField("approve");
+        try jw.write(self.approve);
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A response to an MCP approval request.
@@ -6485,6 +14855,40 @@ pub const MCPApprovalResponseResource = struct {
     /// Whether the request was approved.
     approve: bool,
     reason: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "approval_request_id", "approval_request_id", false },
+        .{ "approve", "approve", false },
+        .{ "reason", "reason", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("approval_request_id");
+        try jw.write(self.approval_request_id);
+        try jw.objectField("approve");
+        try jw.write(self.approve);
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A list of tools available on an MCP server.
@@ -6498,6 +14902,40 @@ pub const MCPListTools = struct {
     /// The tools available on the server.
     tools: []const MCPListToolsTool,
     @"error": ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "server_label", "server_label", false },
+        .{ "tools", "tools", false },
+        .{ "error", "error", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("server_label");
+        try jw.write(self.server_label);
+        try jw.objectField("tools");
+        try jw.write(self.tools);
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A tool available on an MCP server.
@@ -6506,8 +14944,41 @@ pub const MCPListToolsTool = struct {
     name: []const u8,
     description: ?std.json.Value = null,
     /// The JSON schema describing the tool's input.
-    input_schema: std.json.Value,
+    input_schema: std.json.ArrayHashMap(std.json.Value),
     annotations: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "description", "description", true },
+        .{ "input_schema", "input_schema", false },
+        .{ "annotations", "annotations", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.objectField("input_schema");
+        try jw.write(self.input_schema);
+        if (self.annotations) |value| {
+            try jw.objectField("annotations");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Give the model access to additional tools via remote Model Context Protocol (MCP) servers. [Learn more about MCP](/docs/guides/tools-remote-mcp).
@@ -6529,6 +15000,69 @@ pub const MCPTool = struct {
     require_approval: ?std.json.Value = null,
     /// Whether this MCP tool is deferred and discovered via tool search.
     defer_loading: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "server_label", "server_label", false },
+        .{ "server_url", "server_url", true },
+        .{ "connector_id", "connector_id", true },
+        .{ "authorization", "authorization", true },
+        .{ "server_description", "server_description", true },
+        .{ "headers", "headers", true },
+        .{ "allowed_tools", "allowed_tools", true },
+        .{ "require_approval", "require_approval", true },
+        .{ "defer_loading", "defer_loading", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("server_label");
+        try jw.write(self.server_label);
+        if (self.server_url) |value| {
+            try jw.objectField("server_url");
+            try jw.write(value);
+        }
+        if (self.connector_id) |value| {
+            try jw.objectField("connector_id");
+            try jw.write(value);
+        }
+        if (self.authorization) |value| {
+            try jw.objectField("authorization");
+            try jw.write(value);
+        }
+        if (self.server_description) |value| {
+            try jw.objectField("server_description");
+            try jw.write(value);
+        }
+        if (self.headers) |value| {
+            try jw.objectField("headers");
+            try jw.write(value);
+        }
+        if (self.allowed_tools) |value| {
+            try jw.objectField("allowed_tools");
+            try jw.write(value);
+        }
+        if (self.require_approval) |value| {
+            try jw.objectField("require_approval");
+            try jw.write(value);
+        }
+        if (self.defer_loading) |value| {
+            try jw.objectField("defer_loading");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// An invocation of a tool on an MCP server.
@@ -6548,6 +15082,58 @@ pub const MCPToolCall = struct {
     /// The status of the tool call. One of `in_progress`, `completed`, `incomplete`, `calling`, or `failed`.
     status: ?MCPToolCallStatus = null,
     approval_request_id: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "server_label", "server_label", false },
+        .{ "name", "name", false },
+        .{ "arguments", "arguments", false },
+        .{ "output", "output", true },
+        .{ "error", "error", true },
+        .{ "status", "status", true },
+        .{ "approval_request_id", "approval_request_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("server_label");
+        try jw.write(self.server_label);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("arguments");
+        try jw.write(self.arguments);
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.approval_request_id) |value| {
+            try jw.objectField("approval_request_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const MCPToolCallStatus = enum {
@@ -6590,6 +15176,33 @@ pub const MCPToolFilter = struct {
     tool_names: ?[]const []const u8 = null,
     /// Indicates whether or not a tool modifies data or is read-only. If an MCP server is [annotated with `readOnlyHint`](https://modelcontextprotocol.io/specification/2025-06-18/schema#toolannotations-readonlyhint), it will match this filter.
     read_only: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "tool_names", "tool_names", true },
+        .{ "read_only", "read_only", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.tool_names) |value| {
+            try jw.objectField("tool_names");
+            try jw.write(value);
+        }
+        if (self.read_only) |value| {
+            try jw.objectField("read_only");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A message to or from the model.
@@ -6663,6 +15276,34 @@ pub const MessageDeltaContentImageFileObject = struct {
     /// Always `image_file`.
     type: []const u8,
     image_file: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "type", "type", false },
+        .{ "image_file", "image_file", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.image_file) |value| {
+            try jw.objectField("image_file");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// References an image URL in the content of a message.
@@ -6672,6 +15313,34 @@ pub const MessageDeltaContentImageUrlObject = struct {
     /// Always `image_url`.
     type: []const u8,
     image_url: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "type", "type", false },
+        .{ "image_url", "image_url", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.image_url) |value| {
+            try jw.objectField("image_url");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The refusal content that is part of a message.
@@ -6681,6 +15350,34 @@ pub const MessageDeltaContentRefusalObject = struct {
     /// Always `refusal`.
     type: []const u8,
     refusal: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "type", "type", false },
+        .{ "refusal", "refusal", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.refusal) |value| {
+            try jw.objectField("refusal");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A citation within the message that points to a specific quote from a specific File associated with the assistant or the message. Generated when the assistant uses the "file_search" tool to search files.
@@ -6694,6 +15391,49 @@ pub const MessageDeltaContentTextAnnotationsFileCitationObject = struct {
     file_citation: ?std.json.Value = null,
     start_index: ?i64 = null,
     end_index: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "type", "type", false },
+        .{ "text", "text", true },
+        .{ "file_citation", "file_citation", true },
+        .{ "start_index", "start_index", true },
+        .{ "end_index", "end_index", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.text) |value| {
+            try jw.objectField("text");
+            try jw.write(value);
+        }
+        if (self.file_citation) |value| {
+            try jw.objectField("file_citation");
+            try jw.write(value);
+        }
+        if (self.start_index) |value| {
+            try jw.objectField("start_index");
+            try jw.write(value);
+        }
+        if (self.end_index) |value| {
+            try jw.objectField("end_index");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A URL for the file that's generated when the assistant used the `code_interpreter` tool to generate a file.
@@ -6707,6 +15447,49 @@ pub const MessageDeltaContentTextAnnotationsFilePathObject = struct {
     file_path: ?std.json.Value = null,
     start_index: ?i64 = null,
     end_index: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "type", "type", false },
+        .{ "text", "text", true },
+        .{ "file_path", "file_path", true },
+        .{ "start_index", "start_index", true },
+        .{ "end_index", "end_index", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.text) |value| {
+            try jw.objectField("text");
+            try jw.write(value);
+        }
+        if (self.file_path) |value| {
+            try jw.objectField("file_path");
+            try jw.write(value);
+        }
+        if (self.start_index) |value| {
+            try jw.objectField("start_index");
+            try jw.write(value);
+        }
+        if (self.end_index) |value| {
+            try jw.objectField("end_index");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The text content that is part of a message.
@@ -6716,6 +15499,34 @@ pub const MessageDeltaContentTextObject = struct {
     /// Always `text`.
     type: []const u8,
     text: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "type", "type", false },
+        .{ "text", "text", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.text) |value| {
+            try jw.objectField("text");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Represents a message delta i.e. any changed fields on a message during streaming.
@@ -6858,31 +15669,7 @@ pub const MessageStatus = enum {
     }
 };
 
-pub const MessageStreamEvent = union(enum) {
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(_: @This(), _: anytype) !void {}
-};
+pub const MessageStreamEvent = std.json.Value;
 
 pub const Metadata = std.json.Value;
 
@@ -6920,6 +15707,68 @@ pub const ModelResponseProperties = struct {
     prompt_cache_key: ?[]const u8 = null,
     service_tier: ?ServiceTier = null,
     prompt_cache_retention: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "metadata", "metadata", true },
+        .{ "top_logprobs", "top_logprobs", true },
+        .{ "temperature", "temperature", true },
+        .{ "top_p", "top_p", true },
+        .{ "user", "user", true },
+        .{ "safety_identifier", "safety_identifier", true },
+        .{ "prompt_cache_key", "prompt_cache_key", true },
+        .{ "service_tier", "service_tier", true },
+        .{ "prompt_cache_retention", "prompt_cache_retention", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.top_logprobs) |value| {
+            try jw.objectField("top_logprobs");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        if (self.safety_identifier) |value| {
+            try jw.objectField("safety_identifier");
+            try jw.write(value);
+        }
+        if (self.prompt_cache_key) |value| {
+            try jw.objectField("prompt_cache_key");
+            try jw.write(value);
+        }
+        if (self.service_tier) |value| {
+            try jw.objectField("service_tier");
+            try jw.write(value);
+        }
+        if (self.prompt_cache_retention) |value| {
+            try jw.objectField("prompt_cache_retention");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ModifyAssistantRequest = struct {
@@ -6936,6 +15785,78 @@ pub const ModifyAssistantRequest = struct {
     temperature: ?std.json.Value = null,
     top_p: ?std.json.Value = null,
     response_format: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "reasoning_effort", "reasoning_effort", true },
+        .{ "name", "name", true },
+        .{ "description", "description", true },
+        .{ "instructions", "instructions", true },
+        .{ "tools", "tools", true },
+        .{ "tool_resources", "tool_resources", true },
+        .{ "metadata", "metadata", true },
+        .{ "temperature", "temperature", true },
+        .{ "top_p", "top_p", true },
+        .{ "response_format", "response_format", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_resources) |value| {
+            try jw.objectField("tool_resources");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.response_format) |value| {
+            try jw.objectField("response_format");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ModifyCertificateRequest = struct {
@@ -6945,15 +15866,86 @@ pub const ModifyCertificateRequest = struct {
 
 pub const ModifyMessageRequest = struct {
     metadata: ?Metadata = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "metadata", "metadata", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ModifyRunRequest = struct {
     metadata: ?Metadata = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "metadata", "metadata", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ModifyThreadRequest = struct {
     tool_resources: ?std.json.Value = null,
     metadata: ?Metadata = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "tool_resources", "tool_resources", true },
+        .{ "metadata", "metadata", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.tool_resources) |value| {
+            try jw.objectField("tool_resources");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A mouse move action.
@@ -6965,6 +15957,37 @@ pub const MoveParam = struct {
     /// The y-coordinate to move to.
     y: i64,
     keys: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "x", "x", false },
+        .{ "y", "y", false },
+        .{ "keys", "keys", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("x");
+        try jw.write(self.x);
+        try jw.objectField("y");
+        try jw.write(self.y);
+        if (self.keys) |value| {
+            try jw.objectField("keys");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Groups function/custom tools under a shared namespace.
@@ -7025,6 +16048,54 @@ pub const OpenAIFile = struct {
     status: []const u8,
     /// Deprecated. For details on why a fine-tuning training file failed validation, see the `error` field on `fine_tuning.job`.
     status_details: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "bytes", "bytes", false },
+        .{ "created_at", "created_at", false },
+        .{ "expires_at", "expires_at", true },
+        .{ "filename", "filename", false },
+        .{ "object", "object", false },
+        .{ "purpose", "purpose", false },
+        .{ "status", "status", false },
+        .{ "status_details", "status_details", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("bytes");
+        try jw.write(self.bytes);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        if (self.expires_at) |value| {
+            try jw.objectField("expires_at");
+            try jw.write(value);
+        }
+        try jw.objectField("filename");
+        try jw.write(self.filename);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("purpose");
+        try jw.write(self.purpose);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.status_details) |value| {
+            try jw.objectField("status_details");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const OrderEnum = enum {
@@ -7073,6 +16144,36 @@ pub const OutputContent = union(enum) {
     refusal_content: RefusalContent,
     reasoning_text_content: ReasoningTextContent,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "OutputTextContent")) {
+            return .{ .output_text_content = try std.json.parseFromSliceLeaky(OutputTextContent, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "RefusalContent")) {
+            return .{ .refusal_content = try std.json.parseFromSliceLeaky(RefusalContent, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ReasoningTextContent")) {
+            return .{ .reasoning_text_content = try std.json.parseFromSliceLeaky(ReasoningTextContent, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -7080,7 +16181,9 @@ pub const OutputContent = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -7133,6 +16236,102 @@ pub const OutputItem = union(enum) {
     custom_tool_call: CustomToolCall,
     custom_tool_call_output_resource: CustomToolCallOutputResource,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "OutputMessage")) {
+            return .{ .output_message = try std.json.parseFromSliceLeaky(OutputMessage, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FileSearchToolCall")) {
+            return .{ .file_search_tool_call = try std.json.parseFromSliceLeaky(FileSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCall")) {
+            return .{ .function_tool_call = try std.json.parseFromSliceLeaky(FunctionToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCallOutputResource")) {
+            return .{ .function_tool_call_output_resource = try std.json.parseFromSliceLeaky(FunctionToolCallOutputResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchToolCall")) {
+            return .{ .web_search_tool_call = try std.json.parseFromSliceLeaky(WebSearchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCall")) {
+            return .{ .computer_tool_call = try std.json.parseFromSliceLeaky(ComputerToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCallOutputResource")) {
+            return .{ .computer_tool_call_output_resource = try std.json.parseFromSliceLeaky(ComputerToolCallOutputResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ReasoningItem")) {
+            return .{ .reasoning_item = try std.json.parseFromSliceLeaky(ReasoningItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchCall")) {
+            return .{ .tool_search_call = try std.json.parseFromSliceLeaky(ToolSearchCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchOutput")) {
+            return .{ .tool_search_output = try std.json.parseFromSliceLeaky(ToolSearchOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CompactionBody")) {
+            return .{ .compaction_body = try std.json.parseFromSliceLeaky(CompactionBody, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ImageGenToolCall")) {
+            return .{ .image_gen_tool_call = try std.json.parseFromSliceLeaky(ImageGenToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CodeInterpreterToolCall")) {
+            return .{ .code_interpreter_tool_call = try std.json.parseFromSliceLeaky(CodeInterpreterToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCall")) {
+            return .{ .local_shell_tool_call = try std.json.parseFromSliceLeaky(LocalShellToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCallOutput")) {
+            return .{ .local_shell_tool_call_output = try std.json.parseFromSliceLeaky(LocalShellToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCall")) {
+            return .{ .function_shell_call = try std.json.parseFromSliceLeaky(FunctionShellCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutput")) {
+            return .{ .function_shell_call_output = try std.json.parseFromSliceLeaky(FunctionShellCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCall")) {
+            return .{ .apply_patch_tool_call = try std.json.parseFromSliceLeaky(ApplyPatchToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCallOutput")) {
+            return .{ .apply_patch_tool_call_output = try std.json.parseFromSliceLeaky(ApplyPatchToolCallOutput, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPToolCall")) {
+            return .{ .mcp_tool_call = try std.json.parseFromSliceLeaky(MCPToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPListTools")) {
+            return .{ .mcp_list_tools = try std.json.parseFromSliceLeaky(MCPListTools, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalRequest")) {
+            return .{ .mcp_approval_request = try std.json.parseFromSliceLeaky(MCPApprovalRequest, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalResponseResource")) {
+            return .{ .mcp_approval_response_resource = try std.json.parseFromSliceLeaky(MCPApprovalResponseResource, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCall")) {
+            return .{ .custom_tool_call = try std.json.parseFromSliceLeaky(CustomToolCall, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCallOutputResource")) {
+            return .{ .custom_tool_call_output_resource = try std.json.parseFromSliceLeaky(CustomToolCallOutputResource, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -7140,7 +16339,9 @@ pub const OutputItem = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -7267,11 +16468,75 @@ pub const OutputMessage = struct {
     phase: ?std.json.Value = null,
     /// The status of the message input. One of `in_progress`, `completed`, or `incomplete`. Populated when input items are returned via API.
     status: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "type", "type", false },
+        .{ "role", "role", false },
+        .{ "content", "content", false },
+        .{ "phase", "phase", true },
+        .{ "status", "status", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("content");
+        try jw.write(self.content);
+        if (self.phase) |value| {
+            try jw.objectField("phase");
+            try jw.write(value);
+        }
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.endObject();
+    }
 };
 
 pub const OutputMessageContent = union(enum) {
     output_text_content: OutputTextContent,
     refusal_content: RefusalContent,
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "OutputTextContent")) {
+            return .{ .output_text_content = try std.json.parseFromSliceLeaky(OutputTextContent, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "RefusalContent")) {
+            return .{ .refusal_content = try std.json.parseFromSliceLeaky(RefusalContent, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
@@ -7280,7 +16545,9 @@ pub const OutputMessageContent = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -7339,6 +16606,43 @@ pub const Project = struct {
     archived_at: ?std.json.Value = null,
     /// `active` or `archived`
     status: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "name", "name", false },
+        .{ "created_at", "created_at", false },
+        .{ "archived_at", "archived_at", true },
+        .{ "status", "status", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        if (self.archived_at) |value| {
+            try jw.objectField("archived_at");
+            try jw.write(value);
+        }
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.endObject();
+    }
 };
 
 /// Represents an individual API key in a project.
@@ -7377,6 +16681,31 @@ pub const ProjectCreateRequest = struct {
     name: []const u8,
     /// Create the project with the specified data residency region. Your organization must have access to Data residency functionality in order to use. See [data residency controls](/docs/guides/your-data#data-residency-controls) to review the functionality and limitations of setting this field.
     geography: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "geography", "geography", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.geography) |value| {
+            try jw.objectField("geography");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Details about a group's membership in a project.
@@ -7441,6 +16770,58 @@ pub const ProjectRateLimit = struct {
     max_requests_per_1_day: ?i64 = null,
     /// The maximum batch input tokens per day. Only present for relevant models.
     batch_1_day_max_input_tokens: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "id", "id", false },
+        .{ "model", "model", false },
+        .{ "max_requests_per_1_minute", "max_requests_per_1_minute", false },
+        .{ "max_tokens_per_1_minute", "max_tokens_per_1_minute", false },
+        .{ "max_images_per_1_minute", "max_images_per_1_minute", true },
+        .{ "max_audio_megabytes_per_1_minute", "max_audio_megabytes_per_1_minute", true },
+        .{ "max_requests_per_1_day", "max_requests_per_1_day", true },
+        .{ "batch_1_day_max_input_tokens", "batch_1_day_max_input_tokens", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("max_requests_per_1_minute");
+        try jw.write(self.max_requests_per_1_minute);
+        try jw.objectField("max_tokens_per_1_minute");
+        try jw.write(self.max_tokens_per_1_minute);
+        if (self.max_images_per_1_minute) |value| {
+            try jw.objectField("max_images_per_1_minute");
+            try jw.write(value);
+        }
+        if (self.max_audio_megabytes_per_1_minute) |value| {
+            try jw.objectField("max_audio_megabytes_per_1_minute");
+            try jw.write(value);
+        }
+        if (self.max_requests_per_1_day) |value| {
+            try jw.objectField("max_requests_per_1_day");
+            try jw.write(value);
+        }
+        if (self.batch_1_day_max_input_tokens) |value| {
+            try jw.objectField("batch_1_day_max_input_tokens");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ProjectRateLimitListResponse = struct {
@@ -7464,6 +16845,53 @@ pub const ProjectRateLimitUpdateRequest = struct {
     max_requests_per_1_day: ?i64 = null,
     /// The maximum batch input tokens per day. Only relevant for certain models.
     batch_1_day_max_input_tokens: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_requests_per_1_minute", "max_requests_per_1_minute", true },
+        .{ "max_tokens_per_1_minute", "max_tokens_per_1_minute", true },
+        .{ "max_images_per_1_minute", "max_images_per_1_minute", true },
+        .{ "max_audio_megabytes_per_1_minute", "max_audio_megabytes_per_1_minute", true },
+        .{ "max_requests_per_1_day", "max_requests_per_1_day", true },
+        .{ "batch_1_day_max_input_tokens", "batch_1_day_max_input_tokens", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_requests_per_1_minute) |value| {
+            try jw.objectField("max_requests_per_1_minute");
+            try jw.write(value);
+        }
+        if (self.max_tokens_per_1_minute) |value| {
+            try jw.objectField("max_tokens_per_1_minute");
+            try jw.write(value);
+        }
+        if (self.max_images_per_1_minute) |value| {
+            try jw.objectField("max_images_per_1_minute");
+            try jw.write(value);
+        }
+        if (self.max_audio_megabytes_per_1_minute) |value| {
+            try jw.objectField("max_audio_megabytes_per_1_minute");
+            try jw.write(value);
+        }
+        if (self.max_requests_per_1_day) |value| {
+            try jw.objectField("max_requests_per_1_day");
+            try jw.write(value);
+        }
+        if (self.batch_1_day_max_input_tokens) |value| {
+            try jw.objectField("batch_1_day_max_input_tokens");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Represents an individual service account in a project.
@@ -7581,6 +17009,34 @@ pub const PublicCreateOrganizationRoleBody = struct {
     permissions: []const []const u8,
     /// Optional description of the role.
     description: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "role_name", "role_name", false },
+        .{ "permissions", "permissions", false },
+        .{ "description", "description", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("role_name");
+        try jw.write(self.role_name);
+        try jw.objectField("permissions");
+        try jw.write(self.permissions);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Paginated list of roles available on an organization or project.
@@ -7603,6 +17059,38 @@ pub const PublicUpdateOrganizationRoleBody = struct {
     description: ?std.json.Value = null,
     /// New name for the role.
     role_name: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "permissions", "permissions", true },
+        .{ "description", "description", true },
+        .{ "role_name", "role_name", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.permissions) |value| {
+            try jw.objectField("permissions");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.role_name) |value| {
+            try jw.objectField("role_name");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const RankerVersionType = enum {
@@ -7637,12 +17125,66 @@ pub const RankingOptions = struct {
     score_threshold: ?f64 = null,
     /// Weights that control how reciprocal rank fusion balances semantic embedding matches versus sparse keyword matches when hybrid search is enabled.
     hybrid_search: ?HybridSearchOptions = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "ranker", "ranker", true },
+        .{ "score_threshold", "score_threshold", true },
+        .{ "hybrid_search", "hybrid_search", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.ranker) |value| {
+            try jw.objectField("ranker");
+            try jw.write(value);
+        }
+        if (self.score_threshold) |value| {
+            try jw.objectField("score_threshold");
+            try jw.write(value);
+        }
+        if (self.hybrid_search) |value| {
+            try jw.objectField("hybrid_search");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Controls request rate limits for the session.
 pub const RateLimitsParam = struct {
     /// Maximum number of requests allowed per minute for the session. Defaults to 10.
     max_requests_per_1_minute: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_requests_per_1_minute", "max_requests_per_1_minute", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_requests_per_1_minute) |value| {
+            try jw.objectField("max_requests_per_1_minute");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const RealtimeAudioFormats = std.json.Value;
@@ -7656,6 +17198,39 @@ pub const RealtimeBetaClientEventConversationItemCreate = struct {
     /// The ID of the preceding item after which the new item will be inserted. If not set, the new item will be appended to the end of the conversation. If set to `root`, the new item will be added to the beginning of the conversation. If set to an existing ID, it allows an item to be inserted mid-conversation. If the ID cannot be found, an error will be returned and the item will not be added.
     previous_item_id: ?[]const u8 = null,
     item: RealtimeConversationItem,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "previous_item_id", "previous_item_id", true },
+        .{ "item", "item", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.previous_item_id) |value| {
+            try jw.objectField("previous_item_id");
+            try jw.write(value);
+        }
+        try jw.objectField("item");
+        try jw.write(self.item);
+        try jw.endObject();
+    }
 };
 
 /// Send this event when you want to remove any item from the conversation history. The server will respond with a `conversation.item.deleted` event, unless the item does not exist in the conversation history, in which case the server will respond with an error.
@@ -7666,6 +17241,34 @@ pub const RealtimeBetaClientEventConversationItemDelete = struct {
     type: []const u8,
     /// The ID of the item to delete.
     item_id: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "item_id", "item_id", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("item_id");
+        try jw.write(self.item_id);
+        try jw.endObject();
+    }
 };
 
 /// Send this event when you want to retrieve the server's representation of a specific item in the conversation history. This is useful, for example, to inspect user audio after noise cancellation and VAD. The server will respond with a `conversation.item.retrieved` event, unless the item does not exist in the conversation history, in which case the server will respond with an error.
@@ -7676,6 +17279,34 @@ pub const RealtimeBetaClientEventConversationItemRetrieve = struct {
     type: []const u8,
     /// The ID of the item to retrieve.
     item_id: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "item_id", "item_id", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("item_id");
+        try jw.write(self.item_id);
+        try jw.endObject();
+    }
 };
 
 /// Send this event to truncate a previous assistant message’s audio. The server will produce audio faster than realtime, so this event is useful when the user interrupts to truncate audio that has already been sent to the client but not yet played. This will synchronize the server's understanding of the audio with the client's playback. Truncating audio will delete the server-side text transcript to ensure there is not text in the context that hasn't been heard by the user. If successful, the server will respond with a `conversation.item.truncated` event.
@@ -7690,6 +17321,40 @@ pub const RealtimeBetaClientEventConversationItemTruncate = struct {
     content_index: i64,
     /// Inclusive duration up to which audio is truncated, in milliseconds. If the audio_end_ms is greater than the actual audio duration, the server will respond with an error.
     audio_end_ms: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "item_id", "item_id", false },
+        .{ "content_index", "content_index", false },
+        .{ "audio_end_ms", "audio_end_ms", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("item_id");
+        try jw.write(self.item_id);
+        try jw.objectField("content_index");
+        try jw.write(self.content_index);
+        try jw.objectField("audio_end_ms");
+        try jw.write(self.audio_end_ms);
+        try jw.endObject();
+    }
 };
 
 /// Send this event to append audio bytes to the input audio buffer. The audio buffer is temporary storage you can write to and later commit. In Server VAD mode, the audio buffer is used to detect speech and the server will decide when to commit. When Server VAD is disabled, you must commit the audio buffer manually. The client may choose how much audio to place in each event up to a maximum of 15 MiB, for example streaming smaller chunks from the client may allow the VAD to be more responsive. Unlike made other client events, the server will not send a confirmation response to this event.
@@ -7700,6 +17365,34 @@ pub const RealtimeBetaClientEventInputAudioBufferAppend = struct {
     type: []const u8,
     /// Base64-encoded audio bytes. This must be in the format specified by the `input_audio_format` field in the session configuration.
     audio: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "audio", "audio", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("audio");
+        try jw.write(self.audio);
+        try jw.endObject();
+    }
 };
 
 /// Send this event to clear the audio bytes in the buffer. The server will respond with an `input_audio_buffer.cleared` event.
@@ -7708,6 +17401,31 @@ pub const RealtimeBetaClientEventInputAudioBufferClear = struct {
     event_id: ?[]const u8 = null,
     /// The event type, must be `input_audio_buffer.clear`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Send this event to commit the user input audio buffer, which will create a new user message item in the conversation. This event will produce an error if the input audio buffer is empty. When in Server VAD mode, the client does not need to send this event, the server will commit the audio buffer automatically. Committing the input audio buffer will trigger input audio transcription (if enabled in session configuration), but it will not create a response from the model. The server will respond with an `input_audio_buffer.committed` event.
@@ -7716,6 +17434,31 @@ pub const RealtimeBetaClientEventInputAudioBufferCommit = struct {
     event_id: ?[]const u8 = null,
     /// The event type, must be `input_audio_buffer.commit`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// **WebRTC/SIP Only:** Emit to cut off the current audio response. This will trigger the server to stop generating audio and emit a `output_audio_buffer.cleared` event. This event should be preceded by a `response.cancel` client event to stop the generation of the current response. [Learn more](/docs/guides/realtime-conversations#client-and-server-events-for-audio-in-webrtc).
@@ -7724,6 +17467,31 @@ pub const RealtimeBetaClientEventOutputAudioBufferClear = struct {
     event_id: ?[]const u8 = null,
     /// The event type, must be `output_audio_buffer.clear`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Send this event to cancel an in-progress response. The server will respond with a `response.done` event with a status of `response.status=cancelled`. If there is no response to cancel, the server will respond with an error.
@@ -7734,6 +17502,36 @@ pub const RealtimeBetaClientEventResponseCancel = struct {
     type: []const u8,
     /// A specific response ID to cancel - if not provided, will cancel an in-progress response in the default conversation.
     response_id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "response_id", "response_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.response_id) |value| {
+            try jw.objectField("response_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// This event instructs the server to create a Response, which means triggering model inference. When in Server VAD mode, the server will create Responses automatically. A Response will include at least one Item, and may have two, in which case the second will be a function call. These Items will be appended to the conversation history. The server will respond with a `response.created` event, events for Items and content created, and finally a `response.done` event to indicate the Response is complete. The `response.create` event can optionally include inference configuration like `instructions`, and `temperature`. These fields will override the Session's configuration for this Response only. Responses can be created out-of-band of the default Conversation, meaning that they can have arbitrary input, and it's possible to disable writing the output to the Conversation. Only one Response can write to the default Conversation at a time, but otherwise multiple Responses can be created in parallel. Clients can set `conversation` to `none` to create a Response that does not write to the default Conversation. Arbitrary input can be provided with the `input` field, which is an array accepting raw Items and references to existing Items.
@@ -7743,6 +17541,36 @@ pub const RealtimeBetaClientEventResponseCreate = struct {
     /// The event type, must be `response.create`.
     type: []const u8,
     response: ?RealtimeBetaResponseCreateParams = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "response", "response", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.response) |value| {
+            try jw.objectField("response");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Send this event to update the session’s default configuration. The client may send this event at any time to update any field, except for `voice`. However, note that once a session has been initialized with a particular `model`, it can’t be changed to another model using `session.update`. When the server receives a `session.update`, it will respond with a `session.updated` event showing the full, effective configuration. Only the fields that are present are updated. To clear a field like `instructions`, pass an empty string.
@@ -7752,6 +17580,34 @@ pub const RealtimeBetaClientEventSessionUpdate = struct {
     /// The event type, must be `session.update`.
     type: []const u8,
     session: RealtimeSessionCreateRequest,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "session", "session", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("session");
+        try jw.write(self.session);
+        try jw.endObject();
+    }
 };
 
 /// Send this event to update a transcription session.
@@ -7761,6 +17617,34 @@ pub const RealtimeBetaClientEventTranscriptionSessionUpdate = struct {
     /// The event type, must be `transcription_session.update`.
     type: []const u8,
     session: RealtimeTranscriptionSessionCreateRequest,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "session", "session", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("session");
+        try jw.write(self.session);
+        try jw.endObject();
+    }
 };
 
 /// The response resource.
@@ -7790,6 +17674,88 @@ pub const RealtimeBetaResponse = struct {
     temperature: ?f64 = null,
     /// Maximum number of output tokens for a single assistant response, inclusive of tool calls, that was used in this response.
     max_output_tokens: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "object", "object", true },
+        .{ "status", "status", true },
+        .{ "status_details", "status_details", true },
+        .{ "output", "output", true },
+        .{ "metadata", "metadata", true },
+        .{ "usage", "usage", true },
+        .{ "conversation_id", "conversation_id", true },
+        .{ "voice", "voice", true },
+        .{ "modalities", "modalities", true },
+        .{ "output_audio_format", "output_audio_format", true },
+        .{ "temperature", "temperature", true },
+        .{ "max_output_tokens", "max_output_tokens", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.status_details) |value| {
+            try jw.objectField("status_details");
+            try jw.write(value);
+        }
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        if (self.conversation_id) |value| {
+            try jw.objectField("conversation_id");
+            try jw.write(value);
+        }
+        if (self.voice) |value| {
+            try jw.objectField("voice");
+            try jw.write(value);
+        }
+        if (self.modalities) |value| {
+            try jw.objectField("modalities");
+            try jw.write(value);
+        }
+        if (self.output_audio_format) |value| {
+            try jw.objectField("output_audio_format");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.max_output_tokens) |value| {
+            try jw.objectField("max_output_tokens");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Create a new Realtime response with these parameters
@@ -7816,6 +17782,83 @@ pub const RealtimeBetaResponseCreateParams = struct {
     prompt: ?Prompt = null,
     /// Input items to include in the prompt for the model. Using this field creates a new context for this Response instead of using the default conversation. An empty array `[]` will clear the context for this Response. Note that this can include references to items from the default conversation.
     input: ?[]const RealtimeConversationItem = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "modalities", "modalities", true },
+        .{ "instructions", "instructions", true },
+        .{ "voice", "voice", true },
+        .{ "output_audio_format", "output_audio_format", true },
+        .{ "tools", "tools", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "temperature", "temperature", true },
+        .{ "max_output_tokens", "max_output_tokens", true },
+        .{ "conversation", "conversation", true },
+        .{ "metadata", "metadata", true },
+        .{ "prompt", "prompt", true },
+        .{ "input", "input", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.modalities) |value| {
+            try jw.objectField("modalities");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.voice) |value| {
+            try jw.objectField("voice");
+            try jw.write(value);
+        }
+        if (self.output_audio_format) |value| {
+            try jw.objectField("output_audio_format");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.max_output_tokens) |value| {
+            try jw.objectField("max_output_tokens");
+            try jw.write(value);
+        }
+        if (self.conversation) |value| {
+            try jw.objectField("conversation");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.input) |value| {
+            try jw.objectField("input");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Returned when a conversation item is created. There are several scenarios that produce this event: - The server is generating a Response, which if successful will produce either one or two Items, which will be of type `message` (role `assistant`) or type `function_call`. - The input audio buffer has been committed, either by the client or the server (in `server_vad` mode). The server will take the content of the input audio buffer and add it to a new user message Item. - The client has sent a `conversation.item.create` event to add a new Item to the Conversation.
@@ -7826,6 +17869,37 @@ pub const RealtimeBetaServerEventConversationItemCreated = struct {
     type: []const u8,
     previous_item_id: ?std.json.Value = null,
     item: RealtimeConversationItem,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", false },
+        .{ "type", "type", false },
+        .{ "previous_item_id", "previous_item_id", true },
+        .{ "item", "item", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("event_id");
+        try jw.write(self.event_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.previous_item_id) |value| {
+            try jw.objectField("previous_item_id");
+            try jw.write(value);
+        }
+        try jw.objectField("item");
+        try jw.write(self.item);
+        try jw.endObject();
+    }
 };
 
 /// Returned when an item in the conversation is deleted by the client with a `conversation.item.delete` event. This event is used to synchronize the server's understanding of the conversation history with the client's view.
@@ -7852,7 +17926,47 @@ pub const RealtimeBetaServerEventConversationItemInputAudioTranscriptionComplete
     transcript: []const u8,
     logprobs: ?std.json.Value = null,
     /// Usage statistics for the transcription.
-    usage: std.json.Value,
+    usage: std.json.ArrayHashMap(std.json.Value),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", false },
+        .{ "type", "type", false },
+        .{ "item_id", "item_id", false },
+        .{ "content_index", "content_index", false },
+        .{ "transcript", "transcript", false },
+        .{ "logprobs", "logprobs", true },
+        .{ "usage", "usage", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("event_id");
+        try jw.write(self.event_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("item_id");
+        try jw.write(self.item_id);
+        try jw.objectField("content_index");
+        try jw.write(self.content_index);
+        try jw.objectField("transcript");
+        try jw.write(self.transcript);
+        if (self.logprobs) |value| {
+            try jw.objectField("logprobs");
+            try jw.write(value);
+        }
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        try jw.endObject();
+    }
 };
 
 /// Returned when the text value of an input audio transcription content part is updated.
@@ -7868,6 +17982,47 @@ pub const RealtimeBetaServerEventConversationItemInputAudioTranscriptionDelta = 
     /// The text delta.
     delta: ?[]const u8 = null,
     logprobs: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", false },
+        .{ "type", "type", false },
+        .{ "item_id", "item_id", false },
+        .{ "content_index", "content_index", true },
+        .{ "delta", "delta", true },
+        .{ "logprobs", "logprobs", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("event_id");
+        try jw.write(self.event_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("item_id");
+        try jw.write(self.item_id);
+        if (self.content_index) |value| {
+            try jw.objectField("content_index");
+            try jw.write(value);
+        }
+        if (self.delta) |value| {
+            try jw.objectField("delta");
+            try jw.write(value);
+        }
+        if (self.logprobs) |value| {
+            try jw.objectField("logprobs");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Returned when input audio transcription is configured, and a transcription request for a user message failed. These events are separate from other `error` events so that the client can identify the related Item.
@@ -7956,6 +18111,37 @@ pub const RealtimeBetaServerEventInputAudioBufferCommitted = struct {
     previous_item_id: ?std.json.Value = null,
     /// The ID of the user message item that will be created.
     item_id: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", false },
+        .{ "type", "type", false },
+        .{ "previous_item_id", "previous_item_id", true },
+        .{ "item_id", "item_id", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("event_id");
+        try jw.write(self.event_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.previous_item_id) |value| {
+            try jw.objectField("previous_item_id");
+            try jw.write(value);
+        }
+        try jw.objectField("item_id");
+        try jw.write(self.item_id);
+        try jw.endObject();
+    }
 };
 
 /// Sent by the server when in `server_vad` mode to indicate that speech has been detected in the audio buffer. This can happen any time audio is added to the buffer (unless speech is already detected). The client may want to use this event to interrupt audio playback or provide visual feedback to the user. The client should expect to receive a `input_audio_buffer.speech_stopped` event when speech stops. The `item_id` property is the ID of the user message item that will be created when speech stops and will also be included in the `input_audio_buffer.speech_stopped` event (unless the client manually commits the audio buffer during VAD activation).
@@ -8199,6 +18385,46 @@ pub const RealtimeBetaServerEventResponseMCPCallArgumentsDelta = struct {
     /// The JSON-encoded arguments delta.
     delta: []const u8,
     obfuscation: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", false },
+        .{ "type", "type", false },
+        .{ "response_id", "response_id", false },
+        .{ "item_id", "item_id", false },
+        .{ "output_index", "output_index", false },
+        .{ "delta", "delta", false },
+        .{ "obfuscation", "obfuscation", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("event_id");
+        try jw.write(self.event_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("response_id");
+        try jw.write(self.response_id);
+        try jw.objectField("item_id");
+        try jw.write(self.item_id);
+        try jw.objectField("output_index");
+        try jw.write(self.output_index);
+        try jw.objectField("delta");
+        try jw.write(self.delta);
+        if (self.obfuscation) |value| {
+            try jw.objectField("obfuscation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Returned when MCP tool call arguments are finalized during response generation.
@@ -8357,6 +18583,31 @@ pub const RealtimeCallCreateRequest = struct {
     sdp: []const u8,
     /// Optional session configuration to apply before the realtime session is created. Use the same parameters you would send in a [`create client secret`](/docs/api-reference/realtime-sessions/create-realtime-client-secret) request.
     session: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "sdp", "sdp", false },
+        .{ "session", "session", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("sdp");
+        try jw.write(self.sdp);
+        if (self.session) |value| {
+            try jw.objectField("session");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Parameters required to transfer a SIP call to a new destination using the Realtime API.
@@ -8369,6 +18620,28 @@ pub const RealtimeCallReferRequest = struct {
 pub const RealtimeCallRejectRequest = struct {
     /// SIP response code to send back to the caller. Defaults to `603` (Decline) when omitted.
     status_code: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "status_code", "status_code", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.status_code) |value| {
+            try jw.objectField("status_code");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A realtime client event.
@@ -8383,6 +18656,39 @@ pub const RealtimeClientEventConversationItemCreate = struct {
     /// The ID of the preceding item after which the new item will be inserted. If not set, the new item will be appended to the end of the conversation. If set to `root`, the new item will be added to the beginning of the conversation. If set to an existing ID, it allows an item to be inserted mid-conversation. If the ID cannot be found, an error will be returned and the item will not be added.
     previous_item_id: ?[]const u8 = null,
     item: RealtimeConversationItem,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "previous_item_id", "previous_item_id", true },
+        .{ "item", "item", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.previous_item_id) |value| {
+            try jw.objectField("previous_item_id");
+            try jw.write(value);
+        }
+        try jw.objectField("item");
+        try jw.write(self.item);
+        try jw.endObject();
+    }
 };
 
 /// Send this event when you want to remove any item from the conversation history. The server will respond with a `conversation.item.deleted` event, unless the item does not exist in the conversation history, in which case the server will respond with an error.
@@ -8393,6 +18699,34 @@ pub const RealtimeClientEventConversationItemDelete = struct {
     type: []const u8,
     /// The ID of the item to delete.
     item_id: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "item_id", "item_id", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("item_id");
+        try jw.write(self.item_id);
+        try jw.endObject();
+    }
 };
 
 /// Send this event when you want to retrieve the server's representation of a specific item in the conversation history. This is useful, for example, to inspect user audio after noise cancellation and VAD. The server will respond with a `conversation.item.retrieved` event, unless the item does not exist in the conversation history, in which case the server will respond with an error.
@@ -8403,6 +18737,34 @@ pub const RealtimeClientEventConversationItemRetrieve = struct {
     type: []const u8,
     /// The ID of the item to retrieve.
     item_id: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "item_id", "item_id", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("item_id");
+        try jw.write(self.item_id);
+        try jw.endObject();
+    }
 };
 
 /// Send this event to truncate a previous assistant message’s audio. The server will produce audio faster than realtime, so this event is useful when the user interrupts to truncate audio that has already been sent to the client but not yet played. This will synchronize the server's understanding of the audio with the client's playback. Truncating audio will delete the server-side text transcript to ensure there is not text in the context that hasn't been heard by the user. If successful, the server will respond with a `conversation.item.truncated` event.
@@ -8417,6 +18779,40 @@ pub const RealtimeClientEventConversationItemTruncate = struct {
     content_index: i64,
     /// Inclusive duration up to which audio is truncated, in milliseconds. If the audio_end_ms is greater than the actual audio duration, the server will respond with an error.
     audio_end_ms: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "item_id", "item_id", false },
+        .{ "content_index", "content_index", false },
+        .{ "audio_end_ms", "audio_end_ms", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("item_id");
+        try jw.write(self.item_id);
+        try jw.objectField("content_index");
+        try jw.write(self.content_index);
+        try jw.objectField("audio_end_ms");
+        try jw.write(self.audio_end_ms);
+        try jw.endObject();
+    }
 };
 
 /// Send this event to append audio bytes to the input audio buffer. The audio buffer is temporary storage you can write to and later commit. A "commit" will create a new user message item in the conversation history from the buffer content and clear the buffer. Input audio transcription (if enabled) will be generated when the buffer is committed. If VAD is enabled the audio buffer is used to detect speech and the server will decide when to commit. When Server VAD is disabled, you must commit the audio buffer manually. Input audio noise reduction operates on writes to the audio buffer. The client may choose how much audio to place in each event up to a maximum of 15 MiB, for example streaming smaller chunks from the client may allow the VAD to be more responsive. Unlike most other client events, the server will not send a confirmation response to this event.
@@ -8427,6 +18823,34 @@ pub const RealtimeClientEventInputAudioBufferAppend = struct {
     type: []const u8,
     /// Base64-encoded audio bytes. This must be in the format specified by the `input_audio_format` field in the session configuration.
     audio: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "audio", "audio", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("audio");
+        try jw.write(self.audio);
+        try jw.endObject();
+    }
 };
 
 /// Send this event to clear the audio bytes in the buffer. The server will respond with an `input_audio_buffer.cleared` event.
@@ -8435,6 +18859,31 @@ pub const RealtimeClientEventInputAudioBufferClear = struct {
     event_id: ?[]const u8 = null,
     /// The event type, must be `input_audio_buffer.clear`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Send this event to commit the user input audio buffer, which will create a new user message item in the conversation. This event will produce an error if the input audio buffer is empty. When in Server VAD mode, the client does not need to send this event, the server will commit the audio buffer automatically. Committing the input audio buffer will trigger input audio transcription (if enabled in session configuration), but it will not create a response from the model. The server will respond with an `input_audio_buffer.committed` event.
@@ -8443,6 +18892,31 @@ pub const RealtimeClientEventInputAudioBufferCommit = struct {
     event_id: ?[]const u8 = null,
     /// The event type, must be `input_audio_buffer.commit`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// **WebRTC/SIP Only:** Emit to cut off the current audio response. This will trigger the server to stop generating audio and emit a `output_audio_buffer.cleared` event. This event should be preceded by a `response.cancel` client event to stop the generation of the current response. [Learn more](/docs/guides/realtime-conversations#client-and-server-events-for-audio-in-webrtc).
@@ -8451,6 +18925,31 @@ pub const RealtimeClientEventOutputAudioBufferClear = struct {
     event_id: ?[]const u8 = null,
     /// The event type, must be `output_audio_buffer.clear`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Send this event to cancel an in-progress response. The server will respond with a `response.done` event with a status of `response.status=cancelled`. If there is no response to cancel, the server will respond with an error. It's safe to call `response.cancel` even if no response is in progress, an error will be returned the session will remain unaffected.
@@ -8461,6 +18960,36 @@ pub const RealtimeClientEventResponseCancel = struct {
     type: []const u8,
     /// A specific response ID to cancel - if not provided, will cancel an in-progress response in the default conversation.
     response_id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "response_id", "response_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.response_id) |value| {
+            try jw.objectField("response_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// This event instructs the server to create a Response, which means triggering model inference. When in Server VAD mode, the server will create Responses automatically. A Response will include at least one Item, and may have two, in which case the second will be a function call. These Items will be appended to the conversation history by default. The server will respond with a `response.created` event, events for Items and content created, and finally a `response.done` event to indicate the Response is complete. The `response.create` event includes inference configuration like `instructions` and `tools`. If these are set, they will override the Session's configuration for this Response only. Responses can be created out-of-band of the default Conversation, meaning that they can have arbitrary input, and it's possible to disable writing the output to the Conversation. Only one Response can write to the default Conversation at a time, but otherwise multiple Responses can be created in parallel. The `metadata` field is a good way to disambiguate multiple simultaneous Responses. Clients can set `conversation` to `none` to create a Response that does not write to the default Conversation. Arbitrary input can be provided with the `input` field, which is an array accepting raw Items and references to existing Items.
@@ -8470,6 +18999,36 @@ pub const RealtimeClientEventResponseCreate = struct {
     /// The event type, must be `response.create`.
     type: []const u8,
     response: ?RealtimeResponseCreateParams = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "response", "response", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.response) |value| {
+            try jw.objectField("response");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Send this event to update the session’s configuration. The client may send this event at any time to update any field except for `voice` and `model`. `voice` can be updated only if there have been no other audio outputs yet. When the server receives a `session.update`, it will respond with a `session.updated` event showing the full, effective configuration. Only the fields that are present in the `session.update` are updated. To clear a field like `instructions`, pass an empty string. To clear a field like `tools`, pass an empty array. To clear a field like `turn_detection`, pass `null`.
@@ -8479,7 +19038,35 @@ pub const RealtimeClientEventSessionUpdate = struct {
     /// The event type, must be `session.update`.
     type: []const u8,
     /// Update the Realtime session. Choose either a realtime session or a transcription session.
-    session: std.json.Value,
+    session: std.json.ArrayHashMap(std.json.Value),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "session", "session", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("session");
+        try jw.write(self.session);
+        try jw.endObject();
+    }
 };
 
 /// Send this event to update a transcription session.
@@ -8489,6 +19076,34 @@ pub const RealtimeClientEventTranscriptionSessionUpdate = struct {
     /// The event type, must be `transcription_session.update`.
     type: []const u8,
     session: RealtimeTranscriptionSessionCreateRequest,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", true },
+        .{ "type", "type", false },
+        .{ "session", "session", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.event_id) |value| {
+            try jw.objectField("event_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("session");
+        try jw.write(self.session);
+        try jw.endObject();
+    }
 };
 
 /// A single item within a Realtime conversation.
@@ -8510,6 +19125,52 @@ pub const RealtimeConversationItemFunctionCall = struct {
     name: []const u8,
     /// The arguments of the function call. This is a JSON-encoded string representing the arguments passed to the function, for example `{"arg1": "value1", "arg2": 42}`.
     arguments: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+        .{ "status", "status", true },
+        .{ "call_id", "call_id", true },
+        .{ "name", "name", false },
+        .{ "arguments", "arguments", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.call_id) |value| {
+            try jw.objectField("call_id");
+            try jw.write(value);
+        }
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("arguments");
+        try jw.write(self.arguments);
+        try jw.endObject();
+    }
 };
 
 /// A function call output item in a Realtime conversation.
@@ -8526,6 +19187,47 @@ pub const RealtimeConversationItemFunctionCallOutput = struct {
     call_id: []const u8,
     /// The output of the function call, this is free text and can contain any information or simply be empty.
     output: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+        .{ "status", "status", true },
+        .{ "call_id", "call_id", false },
+        .{ "output", "output", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("output");
+        try jw.write(self.output);
+        try jw.endObject();
+    }
 };
 
 /// An assistant message item in a Realtime conversation.
@@ -8542,6 +19244,47 @@ pub const RealtimeConversationItemMessageAssistant = struct {
     role: []const u8,
     /// The content of the message.
     content: []const std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+        .{ "status", "status", true },
+        .{ "role", "role", false },
+        .{ "content", "content", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.endObject();
+    }
 };
 
 /// A system message in a Realtime conversation can be used to provide additional context or instructions to the model. This is similar but distinct from the instruction prompt provided at the start of a conversation, as system messages can be added at any point in the conversation. For major changes to the conversation's behavior, use instructions, but for smaller updates (e.g. "the user is now asking about a different topic"), use system messages.
@@ -8558,6 +19301,47 @@ pub const RealtimeConversationItemMessageSystem = struct {
     role: []const u8,
     /// The content of the message.
     content: []const std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+        .{ "status", "status", true },
+        .{ "role", "role", false },
+        .{ "content", "content", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.endObject();
+    }
 };
 
 /// A user message item in a Realtime conversation.
@@ -8574,6 +19358,47 @@ pub const RealtimeConversationItemMessageUser = struct {
     role: []const u8,
     /// The content of the message.
     content: []const std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+        .{ "status", "status", true },
+        .{ "role", "role", false },
+        .{ "content", "content", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.endObject();
+    }
 };
 
 /// The item to add to the conversation.
@@ -8598,6 +19423,73 @@ pub const RealtimeConversationItemWithReference = struct {
     arguments: ?[]const u8 = null,
     /// The output of the function call (for `function_call_output` items).
     output: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "type", "type", true },
+        .{ "object", "object", true },
+        .{ "status", "status", true },
+        .{ "role", "role", true },
+        .{ "content", "content", true },
+        .{ "call_id", "call_id", true },
+        .{ "name", "name", true },
+        .{ "arguments", "arguments", true },
+        .{ "output", "output", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.role) |value| {
+            try jw.objectField("role");
+            try jw.write(value);
+        }
+        if (self.content) |value| {
+            try jw.objectField("content");
+            try jw.write(value);
+        }
+        if (self.call_id) |value| {
+            try jw.objectField("call_id");
+            try jw.write(value);
+        }
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        if (self.arguments) |value| {
+            try jw.objectField("arguments");
+            try jw.write(value);
+        }
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Create a session and client secret for the Realtime API. The request can specify either a realtime or a transcription session configuration. [Learn more about the Realtime API](/docs/guides/realtime).
@@ -8606,6 +19498,33 @@ pub const RealtimeCreateClientSecretRequest = struct {
     expires_after: ?std.json.Value = null,
     /// Session configuration to use for the client secret. Choose either a realtime session or a transcription session.
     session: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "expires_after", "expires_after", true },
+        .{ "session", "session", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.expires_after) |value| {
+            try jw.objectField("expires_after");
+            try jw.write(value);
+        }
+        if (self.session) |value| {
+            try jw.objectField("session");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Response from creating a session and client secret for the Realtime API.
@@ -8626,7 +19545,44 @@ pub const RealtimeFunctionTool = struct {
     /// The description of the function, including guidance on when and how to call it, and guidance about what to tell the user when calling (if anything).
     description: ?[]const u8 = null,
     /// Parameters of the function in JSON Schema.
-    parameters: ?std.json.Value = null,
+    parameters: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", true },
+        .{ "name", "name", true },
+        .{ "description", "description", true },
+        .{ "parameters", "parameters", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.parameters) |value| {
+            try jw.objectField("parameters");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A Realtime item requesting human approval of a tool invocation.
@@ -8654,6 +19610,40 @@ pub const RealtimeMCPApprovalResponse = struct {
     /// Whether the request was approved.
     approve: bool,
     reason: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "approval_request_id", "approval_request_id", false },
+        .{ "approve", "approve", false },
+        .{ "reason", "reason", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("approval_request_id");
+        try jw.write(self.approval_request_id);
+        try jw.objectField("approve");
+        try jw.write(self.approve);
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const RealtimeMCPHTTPError = struct {
@@ -8672,6 +19662,37 @@ pub const RealtimeMCPListTools = struct {
     server_label: []const u8,
     /// The tools available on the server.
     tools: []const MCPListToolsTool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", true },
+        .{ "server_label", "server_label", false },
+        .{ "tools", "tools", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("server_label");
+        try jw.write(self.server_label);
+        try jw.objectField("tools");
+        try jw.write(self.tools);
+        try jw.endObject();
+    }
 };
 
 pub const RealtimeMCPProtocolError = struct {
@@ -8695,6 +19716,53 @@ pub const RealtimeMCPToolCall = struct {
     approval_request_id: ?std.json.Value = null,
     output: ?std.json.Value = null,
     @"error": ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "server_label", "server_label", false },
+        .{ "name", "name", false },
+        .{ "arguments", "arguments", false },
+        .{ "approval_request_id", "approval_request_id", true },
+        .{ "output", "output", true },
+        .{ "error", "error", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("server_label");
+        try jw.write(self.server_label);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("arguments");
+        try jw.write(self.arguments);
+        if (self.approval_request_id) |value| {
+            try jw.objectField("approval_request_id");
+            try jw.write(value);
+        }
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const RealtimeMCPToolExecutionError = struct {
@@ -8725,6 +19793,78 @@ pub const RealtimeResponse = struct {
     output_modalities: ?[]const []const u8 = null,
     /// Maximum number of output tokens for a single assistant response, inclusive of tool calls, that was used in this response.
     max_output_tokens: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "object", "object", true },
+        .{ "status", "status", true },
+        .{ "status_details", "status_details", true },
+        .{ "output", "output", true },
+        .{ "metadata", "metadata", true },
+        .{ "audio", "audio", true },
+        .{ "usage", "usage", true },
+        .{ "conversation_id", "conversation_id", true },
+        .{ "output_modalities", "output_modalities", true },
+        .{ "max_output_tokens", "max_output_tokens", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.status_details) |value| {
+            try jw.objectField("status_details");
+            try jw.write(value);
+        }
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        if (self.conversation_id) |value| {
+            try jw.objectField("conversation_id");
+            try jw.write(value);
+        }
+        if (self.output_modalities) |value| {
+            try jw.objectField("output_modalities");
+            try jw.write(value);
+        }
+        if (self.max_output_tokens) |value| {
+            try jw.objectField("max_output_tokens");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Create a new Realtime response with these parameters
@@ -8747,6 +19887,73 @@ pub const RealtimeResponseCreateParams = struct {
     prompt: ?Prompt = null,
     /// Input items to include in the prompt for the model. Using this field creates a new context for this Response instead of using the default conversation. An empty array `[]` will clear the context for this Response. Note that this can include references to items that previously appeared in the session using their id.
     input: ?[]const RealtimeConversationItem = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "output_modalities", "output_modalities", true },
+        .{ "instructions", "instructions", true },
+        .{ "audio", "audio", true },
+        .{ "tools", "tools", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "max_output_tokens", "max_output_tokens", true },
+        .{ "conversation", "conversation", true },
+        .{ "metadata", "metadata", true },
+        .{ "prompt", "prompt", true },
+        .{ "input", "input", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.output_modalities) |value| {
+            try jw.objectField("output_modalities");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.max_output_tokens) |value| {
+            try jw.objectField("max_output_tokens");
+            try jw.write(value);
+        }
+        if (self.conversation) |value| {
+            try jw.objectField("conversation");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.input) |value| {
+            try jw.objectField("input");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A realtime server event.
@@ -8770,6 +19977,37 @@ pub const RealtimeServerEventConversationItemAdded = struct {
     type: []const u8,
     previous_item_id: ?std.json.Value = null,
     item: RealtimeConversationItem,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", false },
+        .{ "type", "type", false },
+        .{ "previous_item_id", "previous_item_id", true },
+        .{ "item", "item", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("event_id");
+        try jw.write(self.event_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.previous_item_id) |value| {
+            try jw.objectField("previous_item_id");
+            try jw.write(value);
+        }
+        try jw.objectField("item");
+        try jw.write(self.item);
+        try jw.endObject();
+    }
 };
 
 /// Returned when a conversation item is created. There are several scenarios that produce this event: - The server is generating a Response, which if successful will produce either one or two Items, which will be of type `message` (role `assistant`) or type `function_call`. - The input audio buffer has been committed, either by the client or the server (in `server_vad` mode). The server will take the content of the input audio buffer and add it to a new user message Item. - The client has sent a `conversation.item.create` event to add a new Item to the Conversation.
@@ -8780,6 +20018,37 @@ pub const RealtimeServerEventConversationItemCreated = struct {
     type: []const u8,
     previous_item_id: ?std.json.Value = null,
     item: RealtimeConversationItem,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", false },
+        .{ "type", "type", false },
+        .{ "previous_item_id", "previous_item_id", true },
+        .{ "item", "item", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("event_id");
+        try jw.write(self.event_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.previous_item_id) |value| {
+            try jw.objectField("previous_item_id");
+            try jw.write(value);
+        }
+        try jw.objectField("item");
+        try jw.write(self.item);
+        try jw.endObject();
+    }
 };
 
 /// Returned when an item in the conversation is deleted by the client with a `conversation.item.delete` event. This event is used to synchronize the server's understanding of the conversation history with the client's view.
@@ -8800,6 +20069,37 @@ pub const RealtimeServerEventConversationItemDone = struct {
     type: []const u8,
     previous_item_id: ?std.json.Value = null,
     item: RealtimeConversationItem,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", false },
+        .{ "type", "type", false },
+        .{ "previous_item_id", "previous_item_id", true },
+        .{ "item", "item", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("event_id");
+        try jw.write(self.event_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.previous_item_id) |value| {
+            try jw.objectField("previous_item_id");
+            try jw.write(value);
+        }
+        try jw.objectField("item");
+        try jw.write(self.item);
+        try jw.endObject();
+    }
 };
 
 /// This event is the output of audio transcription for user audio written to the user audio buffer. Transcription begins when the input audio buffer is committed by the client or server (when VAD is enabled). Transcription runs asynchronously with Response creation, so this event may come before or after the Response events. Realtime API models accept audio natively, and thus input transcription is a separate process run on a separate ASR (Automatic Speech Recognition) model. The transcript may diverge somewhat from the model's interpretation, and should be treated as a rough guide.
@@ -8816,7 +20116,47 @@ pub const RealtimeServerEventConversationItemInputAudioTranscriptionCompleted = 
     transcript: []const u8,
     logprobs: ?std.json.Value = null,
     /// Usage statistics for the transcription, this is billed according to the ASR model's pricing rather than the realtime model's pricing.
-    usage: std.json.Value,
+    usage: std.json.ArrayHashMap(std.json.Value),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", false },
+        .{ "type", "type", false },
+        .{ "item_id", "item_id", false },
+        .{ "content_index", "content_index", false },
+        .{ "transcript", "transcript", false },
+        .{ "logprobs", "logprobs", true },
+        .{ "usage", "usage", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("event_id");
+        try jw.write(self.event_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("item_id");
+        try jw.write(self.item_id);
+        try jw.objectField("content_index");
+        try jw.write(self.content_index);
+        try jw.objectField("transcript");
+        try jw.write(self.transcript);
+        if (self.logprobs) |value| {
+            try jw.objectField("logprobs");
+            try jw.write(value);
+        }
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        try jw.endObject();
+    }
 };
 
 /// Returned when the text value of an input audio transcription content part is updated with incremental transcription results.
@@ -8832,6 +20172,47 @@ pub const RealtimeServerEventConversationItemInputAudioTranscriptionDelta = stru
     /// The text delta.
     delta: ?[]const u8 = null,
     logprobs: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", false },
+        .{ "type", "type", false },
+        .{ "item_id", "item_id", false },
+        .{ "content_index", "content_index", true },
+        .{ "delta", "delta", true },
+        .{ "logprobs", "logprobs", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("event_id");
+        try jw.write(self.event_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("item_id");
+        try jw.write(self.item_id);
+        if (self.content_index) |value| {
+            try jw.objectField("content_index");
+            try jw.write(value);
+        }
+        if (self.delta) |value| {
+            try jw.objectField("delta");
+            try jw.write(value);
+        }
+        if (self.logprobs) |value| {
+            try jw.objectField("logprobs");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Returned when input audio transcription is configured, and a transcription request for a user message failed. These events are separate from other `error` events so that the client can identify the related Item.
@@ -8920,6 +20301,37 @@ pub const RealtimeServerEventInputAudioBufferCommitted = struct {
     previous_item_id: ?std.json.Value = null,
     /// The ID of the user message item that will be created.
     item_id: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", false },
+        .{ "type", "type", false },
+        .{ "previous_item_id", "previous_item_id", true },
+        .{ "item_id", "item_id", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("event_id");
+        try jw.write(self.event_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.previous_item_id) |value| {
+            try jw.objectField("previous_item_id");
+            try jw.write(value);
+        }
+        try jw.objectField("item_id");
+        try jw.write(self.item_id);
+        try jw.endObject();
+    }
 };
 
 /// **SIP Only:** Returned when an DTMF event is received. A DTMF event is a message that represents a telephone keypad press (0–9, *, #, A–D). The `event` property is the keypad that the user press. The `received_at` is the UTC Unix Timestamp that the server received the event.
@@ -9217,6 +20629,46 @@ pub const RealtimeServerEventResponseMCPCallArgumentsDelta = struct {
     /// The JSON-encoded arguments delta.
     delta: []const u8,
     obfuscation: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "event_id", "event_id", false },
+        .{ "type", "type", false },
+        .{ "response_id", "response_id", false },
+        .{ "item_id", "item_id", false },
+        .{ "output_index", "output_index", false },
+        .{ "delta", "delta", false },
+        .{ "obfuscation", "obfuscation", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("event_id");
+        try jw.write(self.event_id);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("response_id");
+        try jw.write(self.response_id);
+        try jw.objectField("item_id");
+        try jw.write(self.item_id);
+        try jw.objectField("output_index");
+        try jw.write(self.output_index);
+        try jw.objectField("delta");
+        try jw.write(self.delta);
+        if (self.obfuscation) |value| {
+            try jw.objectField("obfuscation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Returned when MCP tool call arguments are finalized during response generation.
@@ -9399,6 +20851,123 @@ pub const RealtimeSession = struct {
     expires_at: ?i64 = null,
     prompt: ?std.json.Value = null,
     include: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "object", "object", true },
+        .{ "modalities", "modalities", true },
+        .{ "model", "model", true },
+        .{ "instructions", "instructions", true },
+        .{ "voice", "voice", true },
+        .{ "input_audio_format", "input_audio_format", true },
+        .{ "output_audio_format", "output_audio_format", true },
+        .{ "input_audio_transcription", "input_audio_transcription", true },
+        .{ "turn_detection", "turn_detection", true },
+        .{ "input_audio_noise_reduction", "input_audio_noise_reduction", true },
+        .{ "speed", "speed", true },
+        .{ "tracing", "tracing", true },
+        .{ "tools", "tools", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "temperature", "temperature", true },
+        .{ "max_response_output_tokens", "max_response_output_tokens", true },
+        .{ "expires_at", "expires_at", true },
+        .{ "prompt", "prompt", true },
+        .{ "include", "include", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        if (self.modalities) |value| {
+            try jw.objectField("modalities");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.voice) |value| {
+            try jw.objectField("voice");
+            try jw.write(value);
+        }
+        if (self.input_audio_format) |value| {
+            try jw.objectField("input_audio_format");
+            try jw.write(value);
+        }
+        if (self.output_audio_format) |value| {
+            try jw.objectField("output_audio_format");
+            try jw.write(value);
+        }
+        if (self.input_audio_transcription) |value| {
+            try jw.objectField("input_audio_transcription");
+            try jw.write(value);
+        }
+        if (self.turn_detection) |value| {
+            try jw.objectField("turn_detection");
+            try jw.write(value);
+        }
+        if (self.input_audio_noise_reduction) |value| {
+            try jw.objectField("input_audio_noise_reduction");
+            try jw.write(value);
+        }
+        if (self.speed) |value| {
+            try jw.objectField("speed");
+            try jw.write(value);
+        }
+        if (self.tracing) |value| {
+            try jw.objectField("tracing");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.max_response_output_tokens) |value| {
+            try jw.objectField("max_response_output_tokens");
+            try jw.write(value);
+        }
+        if (self.expires_at) |value| {
+            try jw.objectField("expires_at");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.include) |value| {
+            try jw.objectField("include");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A new Realtime session configuration, with an ephemeral key. Default TTL for keys is one minute.
@@ -9433,6 +21002,101 @@ pub const RealtimeSessionCreateRequest = struct {
     max_response_output_tokens: ?std.json.Value = null,
     truncation: ?RealtimeTruncation = null,
     prompt: ?Prompt = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "client_secret", "client_secret", false },
+        .{ "modalities", "modalities", true },
+        .{ "instructions", "instructions", true },
+        .{ "voice", "voice", true },
+        .{ "input_audio_format", "input_audio_format", true },
+        .{ "output_audio_format", "output_audio_format", true },
+        .{ "input_audio_transcription", "input_audio_transcription", true },
+        .{ "speed", "speed", true },
+        .{ "tracing", "tracing", true },
+        .{ "turn_detection", "turn_detection", true },
+        .{ "tools", "tools", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "temperature", "temperature", true },
+        .{ "max_response_output_tokens", "max_response_output_tokens", true },
+        .{ "truncation", "truncation", true },
+        .{ "prompt", "prompt", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("client_secret");
+        try jw.write(self.client_secret);
+        if (self.modalities) |value| {
+            try jw.objectField("modalities");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.voice) |value| {
+            try jw.objectField("voice");
+            try jw.write(value);
+        }
+        if (self.input_audio_format) |value| {
+            try jw.objectField("input_audio_format");
+            try jw.write(value);
+        }
+        if (self.output_audio_format) |value| {
+            try jw.objectField("output_audio_format");
+            try jw.write(value);
+        }
+        if (self.input_audio_transcription) |value| {
+            try jw.objectField("input_audio_transcription");
+            try jw.write(value);
+        }
+        if (self.speed) |value| {
+            try jw.objectField("speed");
+            try jw.write(value);
+        }
+        if (self.tracing) |value| {
+            try jw.objectField("tracing");
+            try jw.write(value);
+        }
+        if (self.turn_detection) |value| {
+            try jw.objectField("turn_detection");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.max_response_output_tokens) |value| {
+            try jw.objectField("max_response_output_tokens");
+            try jw.write(value);
+        }
+        if (self.truncation) |value| {
+            try jw.objectField("truncation");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Realtime session object configuration.
@@ -9450,7 +21114,7 @@ pub const RealtimeSessionCreateRequestGA = struct {
     /// Additional fields to include in server outputs. `item.input_audio_transcription.logprobs`: Include logprobs for input audio transcription.
     include: ?[]const []const u8 = null,
     /// Realtime API can write session traces to the [Traces Dashboard](/logs?api=traces). Set to null to disable tracing. Once tracing is enabled for a session, the configuration cannot be modified. `auto` will create a trace for the session with default values for the workflow name, group id, and metadata.
-    tracing: ?std.json.Value = null,
+    tracing: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// Tools available to the model.
     tools: ?[]const std.json.Value = null,
     /// How the model chooses tools. Provide one of the string modes or force a specific function/MCP tool.
@@ -9459,6 +21123,88 @@ pub const RealtimeSessionCreateRequestGA = struct {
     max_output_tokens: ?std.json.Value = null,
     truncation: ?RealtimeTruncation = null,
     prompt: ?Prompt = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "output_modalities", "output_modalities", true },
+        .{ "model", "model", true },
+        .{ "instructions", "instructions", true },
+        .{ "audio", "audio", true },
+        .{ "include", "include", true },
+        .{ "tracing", "tracing", false },
+        .{ "tools", "tools", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "max_output_tokens", "max_output_tokens", true },
+        .{ "truncation", "truncation", true },
+        .{ "prompt", "prompt", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.output_modalities) |value| {
+            try jw.objectField("output_modalities");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
+        if (self.include) |value| {
+            try jw.objectField("include");
+            try jw.write(value);
+        }
+        switch (self.tracing) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("tracing");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("tracing");
+                try jw.write(value);
+            },
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.max_output_tokens) |value| {
+            try jw.objectField("max_output_tokens");
+            try jw.write(value);
+        }
+        if (self.truncation) |value| {
+            try jw.objectField("truncation");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A Realtime session configuration object.
@@ -9489,6 +21235,88 @@ pub const RealtimeSessionCreateResponse = struct {
     tool_choice: ?[]const u8 = null,
     /// Maximum number of output tokens for a single assistant response, inclusive of tool calls. Provide an integer between 1 and 4096 to limit output tokens, or `inf` for the maximum available tokens for a given model. Defaults to `inf`.
     max_output_tokens: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "object", "object", true },
+        .{ "expires_at", "expires_at", true },
+        .{ "include", "include", true },
+        .{ "model", "model", true },
+        .{ "output_modalities", "output_modalities", true },
+        .{ "instructions", "instructions", true },
+        .{ "audio", "audio", true },
+        .{ "tracing", "tracing", true },
+        .{ "turn_detection", "turn_detection", true },
+        .{ "tools", "tools", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "max_output_tokens", "max_output_tokens", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        if (self.expires_at) |value| {
+            try jw.objectField("expires_at");
+            try jw.write(value);
+        }
+        if (self.include) |value| {
+            try jw.objectField("include");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.output_modalities) |value| {
+            try jw.objectField("output_modalities");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
+        if (self.tracing) |value| {
+            try jw.objectField("tracing");
+            try jw.write(value);
+        }
+        if (self.turn_detection) |value| {
+            try jw.objectField("turn_detection");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.max_output_tokens) |value| {
+            try jw.objectField("max_output_tokens");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A new Realtime session configuration, with an ephemeral key. Default TTL for keys is one minute.
@@ -9516,6 +21344,84 @@ pub const RealtimeSessionCreateResponseGA = struct {
     max_output_tokens: ?std.json.Value = null,
     truncation: ?RealtimeTruncation = null,
     prompt: ?Prompt = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "client_secret", "client_secret", false },
+        .{ "type", "type", false },
+        .{ "output_modalities", "output_modalities", true },
+        .{ "model", "model", true },
+        .{ "instructions", "instructions", true },
+        .{ "audio", "audio", true },
+        .{ "include", "include", true },
+        .{ "tracing", "tracing", true },
+        .{ "tools", "tools", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "max_output_tokens", "max_output_tokens", true },
+        .{ "truncation", "truncation", true },
+        .{ "prompt", "prompt", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("client_secret");
+        try jw.write(self.client_secret);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.output_modalities) |value| {
+            try jw.objectField("output_modalities");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
+        if (self.include) |value| {
+            try jw.objectField("include");
+            try jw.write(value);
+        }
+        if (self.tracing) |value| {
+            try jw.objectField("tracing");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.max_output_tokens) |value| {
+            try jw.objectField("max_output_tokens");
+            try jw.write(value);
+        }
+        if (self.truncation) |value| {
+            try jw.objectField("truncation");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Realtime transcription session object configuration.
@@ -9530,6 +21436,48 @@ pub const RealtimeTranscriptionSessionCreateRequest = struct {
     input_audio_transcription: ?AudioTranscription = null,
     /// The set of items to include in the transcription. Current available items are: `item.input_audio_transcription.logprobs`
     include: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "turn_detection", "turn_detection", true },
+        .{ "input_audio_noise_reduction", "input_audio_noise_reduction", true },
+        .{ "input_audio_format", "input_audio_format", true },
+        .{ "input_audio_transcription", "input_audio_transcription", true },
+        .{ "include", "include", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.turn_detection) |value| {
+            try jw.objectField("turn_detection");
+            try jw.write(value);
+        }
+        if (self.input_audio_noise_reduction) |value| {
+            try jw.objectField("input_audio_noise_reduction");
+            try jw.write(value);
+        }
+        if (self.input_audio_format) |value| {
+            try jw.objectField("input_audio_format");
+            try jw.write(value);
+        }
+        if (self.input_audio_transcription) |value| {
+            try jw.objectField("input_audio_transcription");
+            try jw.write(value);
+        }
+        if (self.include) |value| {
+            try jw.objectField("include");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Realtime transcription session object configuration.
@@ -9540,6 +21488,36 @@ pub const RealtimeTranscriptionSessionCreateRequestGA = struct {
     audio: ?std.json.Value = null,
     /// Additional fields to include in server outputs. `item.input_audio_transcription.logprobs`: Include logprobs for input audio transcription.
     include: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "audio", "audio", true },
+        .{ "include", "include", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
+        if (self.include) |value| {
+            try jw.objectField("include");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A new Realtime transcription session configuration. When a session is created on the server via REST API, the session object also contains an ephemeral key. Default TTL for keys is 10 minutes. This property is not present when a session is updated via the WebSocket API.
@@ -9554,6 +21532,46 @@ pub const RealtimeTranscriptionSessionCreateResponse = struct {
     input_audio_transcription: ?AudioTranscription = null,
     /// Configuration for turn detection. Can be set to `null` to turn off. Server VAD means that the model will detect the start and end of speech based on audio volume and respond at the end of user speech.
     turn_detection: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "client_secret", "client_secret", false },
+        .{ "modalities", "modalities", true },
+        .{ "input_audio_format", "input_audio_format", true },
+        .{ "input_audio_transcription", "input_audio_transcription", true },
+        .{ "turn_detection", "turn_detection", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("client_secret");
+        try jw.write(self.client_secret);
+        if (self.modalities) |value| {
+            try jw.objectField("modalities");
+            try jw.write(value);
+        }
+        if (self.input_audio_format) |value| {
+            try jw.objectField("input_audio_format");
+            try jw.write(value);
+        }
+        if (self.input_audio_transcription) |value| {
+            try jw.objectField("input_audio_transcription");
+            try jw.write(value);
+        }
+        if (self.turn_detection) |value| {
+            try jw.objectField("turn_detection");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A Realtime transcription session configuration object.
@@ -9570,6 +21588,47 @@ pub const RealtimeTranscriptionSessionCreateResponseGA = struct {
     include: ?[]const []const u8 = null,
     /// Configuration for input audio for the session.
     audio: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "expires_at", "expires_at", true },
+        .{ "include", "include", true },
+        .{ "audio", "audio", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        if (self.expires_at) |value| {
+            try jw.objectField("expires_at");
+            try jw.write(value);
+        }
+        if (self.include) |value| {
+            try jw.objectField("include");
+            try jw.write(value);
+        }
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// When the number of tokens in a conversation exceeds the model's input token limit, the conversation be truncated, meaning messages (starting from the oldest) will not be included in the model's context. A 32k context model with 4,096 max output tokens can only include 28,224 tokens in the context before truncation occurs. Clients can configure truncation behavior to truncate with a lower max token limit, which is an effective way to control token usage and cost. Truncation will reduce the number of cached tokens on the next turn (busting the cache), since messages are dropped from the beginning of the context. However, clients can also configure truncation to retain messages up to a fraction of the maximum context size, which will reduce the need for future truncations and thus improve the cache rate. Truncation can be disabled entirely, which means the server will never truncate but would instead return an error if the conversation exceeds the model's input token limit.
@@ -9582,6 +21641,38 @@ pub const Reasoning = struct {
     effort: ?ReasoningEffort = null,
     summary: ?std.json.Value = null,
     generate_summary: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "effort", "effort", true },
+        .{ "summary", "summary", true },
+        .{ "generate_summary", "generate_summary", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.effort) |value| {
+            try jw.objectField("effort");
+            try jw.write(value);
+        }
+        if (self.summary) |value| {
+            try jw.objectField("summary");
+            try jw.write(value);
+        }
+        if (self.generate_summary) |value| {
+            try jw.objectField("generate_summary");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ReasoningEffort = std.json.Value;
@@ -9599,6 +21690,47 @@ pub const ReasoningItem = struct {
     content: ?[]const ReasoningTextContent = null,
     /// The status of the item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
     status: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "encrypted_content", "encrypted_content", true },
+        .{ "summary", "summary", false },
+        .{ "content", "content", true },
+        .{ "status", "status", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        if (self.encrypted_content) |value| {
+            try jw.objectField("encrypted_content");
+            try jw.write(value);
+        }
+        try jw.objectField("summary");
+        try jw.write(self.summary);
+        if (self.content) |value| {
+            try jw.objectField("content");
+            try jw.write(value);
+        }
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Reasoning text from the model.
@@ -9661,6 +21793,160 @@ pub const Response = struct {
     /// Whether to allow the model to run tool calls in parallel.
     parallel_tool_calls: bool,
     conversation: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "metadata", "metadata", false },
+        .{ "top_logprobs", "top_logprobs", true },
+        .{ "temperature", "temperature", false },
+        .{ "top_p", "top_p", false },
+        .{ "user", "user", true },
+        .{ "safety_identifier", "safety_identifier", true },
+        .{ "prompt_cache_key", "prompt_cache_key", true },
+        .{ "service_tier", "service_tier", true },
+        .{ "prompt_cache_retention", "prompt_cache_retention", true },
+        .{ "previous_response_id", "previous_response_id", true },
+        .{ "model", "model", false },
+        .{ "reasoning", "reasoning", true },
+        .{ "background", "background", true },
+        .{ "max_output_tokens", "max_output_tokens", true },
+        .{ "max_tool_calls", "max_tool_calls", true },
+        .{ "text", "text", true },
+        .{ "tools", "tools", false },
+        .{ "tool_choice", "tool_choice", false },
+        .{ "prompt", "prompt", true },
+        .{ "truncation", "truncation", true },
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "status", "status", true },
+        .{ "created_at", "created_at", false },
+        .{ "completed_at", "completed_at", true },
+        .{ "error", "error", false },
+        .{ "incomplete_details", "incomplete_details", false },
+        .{ "output", "output", false },
+        .{ "instructions", "instructions", false },
+        .{ "output_text", "output_text", true },
+        .{ "usage", "usage", true },
+        .{ "parallel_tool_calls", "parallel_tool_calls", false },
+        .{ "conversation", "conversation", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("metadata");
+        try jw.write(self.metadata);
+        if (self.top_logprobs) |value| {
+            try jw.objectField("top_logprobs");
+            try jw.write(value);
+        }
+        try jw.objectField("temperature");
+        try jw.write(self.temperature);
+        try jw.objectField("top_p");
+        try jw.write(self.top_p);
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        if (self.safety_identifier) |value| {
+            try jw.objectField("safety_identifier");
+            try jw.write(value);
+        }
+        if (self.prompt_cache_key) |value| {
+            try jw.objectField("prompt_cache_key");
+            try jw.write(value);
+        }
+        if (self.service_tier) |value| {
+            try jw.objectField("service_tier");
+            try jw.write(value);
+        }
+        if (self.prompt_cache_retention) |value| {
+            try jw.objectField("prompt_cache_retention");
+            try jw.write(value);
+        }
+        if (self.previous_response_id) |value| {
+            try jw.objectField("previous_response_id");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.reasoning) |value| {
+            try jw.objectField("reasoning");
+            try jw.write(value);
+        }
+        if (self.background) |value| {
+            try jw.objectField("background");
+            try jw.write(value);
+        }
+        if (self.max_output_tokens) |value| {
+            try jw.objectField("max_output_tokens");
+            try jw.write(value);
+        }
+        if (self.max_tool_calls) |value| {
+            try jw.objectField("max_tool_calls");
+            try jw.write(value);
+        }
+        if (self.text) |value| {
+            try jw.objectField("text");
+            try jw.write(value);
+        }
+        try jw.objectField("tools");
+        try jw.write(self.tools);
+        try jw.objectField("tool_choice");
+        try jw.write(self.tool_choice);
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.truncation) |value| {
+            try jw.objectField("truncation");
+            try jw.write(value);
+        }
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        if (self.completed_at) |value| {
+            try jw.objectField("completed_at");
+            try jw.write(value);
+        }
+        try jw.objectField("error");
+        try jw.write(self.@"error");
+        try jw.objectField("incomplete_details");
+        try jw.write(self.incomplete_details);
+        try jw.objectField("output");
+        try jw.write(self.output);
+        try jw.objectField("instructions");
+        try jw.write(self.instructions);
+        if (self.output_text) |value| {
+            try jw.objectField("output_text");
+            try jw.write(value);
+        }
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        try jw.objectField("parallel_tool_calls");
+        try jw.write(self.parallel_tool_calls);
+        if (self.conversation) |value| {
+            try jw.objectField("conversation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Emitted when there is a partial audio response.
@@ -9992,7 +22278,7 @@ pub const ResponseFormatJsonSchema = struct {
 };
 
 /// The schema for the response format, described as a JSON Schema object. Learn how to build JSON schemas [here](https://json-schema.org/).
-pub const ResponseFormatJsonSchemaSchema = struct {};
+pub const ResponseFormatJsonSchemaSchema = std.json.ArrayHashMap(std.json.Value);
 
 /// Default response format. Used to generate text responses.
 pub const ResponseFormatText = struct {
@@ -10137,6 +22423,34 @@ pub const ResponseLogProb = struct {
     logprob: f64,
     /// The log probability of the top 20 most likely tokens.
     top_logprobs: ?[]const std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "token", "token", false },
+        .{ "logprob", "logprob", false },
+        .{ "top_logprobs", "top_logprobs", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("token");
+        try jw.write(self.token);
+        try jw.objectField("logprob");
+        try jw.write(self.logprob);
+        if (self.top_logprobs) |value| {
+            try jw.objectField("top_logprobs");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Emitted when there is a delta (partial update) to the arguments of an MCP tool call.
@@ -10290,7 +22604,7 @@ pub const ResponseOutputTextAnnotationAddedEvent = struct {
     /// The sequence number of this event.
     sequence_number: i64,
     /// The annotation object being added. (See annotation schema for details.)
-    annotation: std.json.Value,
+    annotation: std.json.ArrayHashMap(std.json.Value),
 };
 
 pub const ResponsePromptVariables = std.json.Value;
@@ -10308,6 +22622,78 @@ pub const ResponseProperties = struct {
     tool_choice: ?ToolChoiceParam = null,
     prompt: ?Prompt = null,
     truncation: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "previous_response_id", "previous_response_id", true },
+        .{ "model", "model", true },
+        .{ "reasoning", "reasoning", true },
+        .{ "background", "background", true },
+        .{ "max_output_tokens", "max_output_tokens", true },
+        .{ "max_tool_calls", "max_tool_calls", true },
+        .{ "text", "text", true },
+        .{ "tools", "tools", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "prompt", "prompt", true },
+        .{ "truncation", "truncation", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.previous_response_id) |value| {
+            try jw.objectField("previous_response_id");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.reasoning) |value| {
+            try jw.objectField("reasoning");
+            try jw.write(value);
+        }
+        if (self.background) |value| {
+            try jw.objectField("background");
+            try jw.write(value);
+        }
+        if (self.max_output_tokens) |value| {
+            try jw.objectField("max_output_tokens");
+            try jw.write(value);
+        }
+        if (self.max_tool_calls) |value| {
+            try jw.objectField("max_tool_calls");
+            try jw.write(value);
+        }
+        if (self.text) |value| {
+            try jw.objectField("text");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.truncation) |value| {
+            try jw.objectField("truncation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Emitted when a response is queued and waiting to be processed.
@@ -10492,6 +22878,33 @@ pub const ResponseTextDoneEvent = struct {
 pub const ResponseTextParam = struct {
     format: ?TextResponseFormatConfiguration = null,
     verbosity: ?Verbosity = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "format", "format", true },
+        .{ "verbosity", "verbosity", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.format) |value| {
+            try jw.objectField("format");
+            try jw.write(value);
+        }
+        if (self.verbosity) |value| {
+            try jw.objectField("verbosity");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Represents token usage details including input tokens, output tokens, a breakdown of output tokens, and the total tokens used.
@@ -10584,6 +22997,171 @@ pub const ResponsesClientEventResponseCreate = struct {
     stream_options: ?ResponseStreamOptions = null,
     conversation: ?std.json.Value = null,
     context_management: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "metadata", "metadata", true },
+        .{ "top_logprobs", "top_logprobs", true },
+        .{ "temperature", "temperature", true },
+        .{ "top_p", "top_p", true },
+        .{ "user", "user", true },
+        .{ "safety_identifier", "safety_identifier", true },
+        .{ "prompt_cache_key", "prompt_cache_key", true },
+        .{ "service_tier", "service_tier", true },
+        .{ "prompt_cache_retention", "prompt_cache_retention", true },
+        .{ "previous_response_id", "previous_response_id", true },
+        .{ "model", "model", true },
+        .{ "reasoning", "reasoning", true },
+        .{ "background", "background", true },
+        .{ "max_output_tokens", "max_output_tokens", true },
+        .{ "max_tool_calls", "max_tool_calls", true },
+        .{ "text", "text", true },
+        .{ "tools", "tools", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "prompt", "prompt", true },
+        .{ "truncation", "truncation", true },
+        .{ "input", "input", true },
+        .{ "include", "include", true },
+        .{ "parallel_tool_calls", "parallel_tool_calls", true },
+        .{ "store", "store", true },
+        .{ "instructions", "instructions", true },
+        .{ "stream", "stream", true },
+        .{ "stream_options", "stream_options", true },
+        .{ "conversation", "conversation", true },
+        .{ "context_management", "context_management", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.top_logprobs) |value| {
+            try jw.objectField("top_logprobs");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        }
+        if (self.safety_identifier) |value| {
+            try jw.objectField("safety_identifier");
+            try jw.write(value);
+        }
+        if (self.prompt_cache_key) |value| {
+            try jw.objectField("prompt_cache_key");
+            try jw.write(value);
+        }
+        if (self.service_tier) |value| {
+            try jw.objectField("service_tier");
+            try jw.write(value);
+        }
+        if (self.prompt_cache_retention) |value| {
+            try jw.objectField("prompt_cache_retention");
+            try jw.write(value);
+        }
+        if (self.previous_response_id) |value| {
+            try jw.objectField("previous_response_id");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.reasoning) |value| {
+            try jw.objectField("reasoning");
+            try jw.write(value);
+        }
+        if (self.background) |value| {
+            try jw.objectField("background");
+            try jw.write(value);
+        }
+        if (self.max_output_tokens) |value| {
+            try jw.objectField("max_output_tokens");
+            try jw.write(value);
+        }
+        if (self.max_tool_calls) |value| {
+            try jw.objectField("max_tool_calls");
+            try jw.write(value);
+        }
+        if (self.text) |value| {
+            try jw.objectField("text");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.truncation) |value| {
+            try jw.objectField("truncation");
+            try jw.write(value);
+        }
+        if (self.input) |value| {
+            try jw.objectField("input");
+            try jw.write(value);
+        }
+        if (self.include) |value| {
+            try jw.objectField("include");
+            try jw.write(value);
+        }
+        if (self.parallel_tool_calls) |value| {
+            try jw.objectField("parallel_tool_calls");
+            try jw.write(value);
+        }
+        if (self.store) |value| {
+            try jw.objectField("store");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.stream) |value| {
+            try jw.objectField("stream");
+            try jw.write(value);
+        }
+        if (self.stream_options) |value| {
+            try jw.objectField("stream_options");
+            try jw.write(value);
+        }
+        if (self.conversation) |value| {
+            try jw.objectField("conversation");
+            try jw.write(value);
+        }
+        if (self.context_management) |value| {
+            try jw.objectField("context_management");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Server events emitted by the Responses WebSocket server.
@@ -10633,11 +23211,39 @@ pub const RunCompletionUsage = std.json.Value;
 
 pub const RunGraderRequest = struct {
     /// The grader used for the fine-tuning job.
-    grader: std.json.Value,
+    grader: std.json.ArrayHashMap(std.json.Value),
     /// The dataset item provided to the grader. This will be used to populate the `item` namespace. See [the guide](/docs/guides/graders) for more details.
-    item: ?std.json.Value = null,
+    item: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// The model sample to be evaluated. This value will be used to populate the `sample` namespace. See [the guide](/docs/guides/graders) for more details. The `output_json` variable will be populated if the model sample is a valid JSON string.
     model_sample: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "grader", "grader", false },
+        .{ "item", "item", true },
+        .{ "model_sample", "model_sample", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("grader");
+        try jw.write(self.grader);
+        if (self.item) |value| {
+            try jw.objectField("item");
+            try jw.write(value);
+        }
+        try jw.objectField("model_sample");
+        try jw.write(self.model_sample);
+        try jw.endObject();
+    }
 };
 
 pub const RunGraderResponse = struct {
@@ -10686,9 +23292,9 @@ pub const RunObject = struct {
     metadata: Metadata,
     usage: RunCompletionUsage,
     /// The sampling temperature used for this run. If not set, defaults to 1.
-    temperature: ?f64 = null,
+    temperature: OpenApiOptionalNullable(f64) = .absent,
     /// The nucleus sampling value used for this run. If not set, defaults to 1.
-    top_p: ?f64 = null,
+    top_p: OpenApiOptionalNullable(f64) = .absent,
     /// The maximum number of prompt tokens specified to have been used over the course of the run.
     max_prompt_tokens: ?i64,
     /// The maximum number of completion tokens specified to have been used over the course of the run.
@@ -10697,6 +23303,122 @@ pub const RunObject = struct {
     tool_choice: std.json.Value,
     parallel_tool_calls: ParallelToolCalls,
     response_format: AssistantsApiResponseFormatOption,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "created_at", "created_at", false },
+        .{ "thread_id", "thread_id", false },
+        .{ "assistant_id", "assistant_id", false },
+        .{ "status", "status", false },
+        .{ "required_action", "required_action", false },
+        .{ "last_error", "last_error", false },
+        .{ "expires_at", "expires_at", false },
+        .{ "started_at", "started_at", false },
+        .{ "cancelled_at", "cancelled_at", false },
+        .{ "failed_at", "failed_at", false },
+        .{ "completed_at", "completed_at", false },
+        .{ "incomplete_details", "incomplete_details", false },
+        .{ "model", "model", false },
+        .{ "instructions", "instructions", false },
+        .{ "tools", "tools", false },
+        .{ "metadata", "metadata", false },
+        .{ "usage", "usage", false },
+        .{ "temperature", "temperature", false },
+        .{ "top_p", "top_p", false },
+        .{ "max_prompt_tokens", "max_prompt_tokens", false },
+        .{ "max_completion_tokens", "max_completion_tokens", false },
+        .{ "truncation_strategy", "truncation_strategy", false },
+        .{ "tool_choice", "tool_choice", false },
+        .{ "parallel_tool_calls", "parallel_tool_calls", false },
+        .{ "response_format", "response_format", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("thread_id");
+        try jw.write(self.thread_id);
+        try jw.objectField("assistant_id");
+        try jw.write(self.assistant_id);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("required_action");
+        try jw.write(self.required_action);
+        try jw.objectField("last_error");
+        try jw.write(self.last_error);
+        try jw.objectField("expires_at");
+        try jw.write(self.expires_at);
+        try jw.objectField("started_at");
+        try jw.write(self.started_at);
+        try jw.objectField("cancelled_at");
+        try jw.write(self.cancelled_at);
+        try jw.objectField("failed_at");
+        try jw.write(self.failed_at);
+        try jw.objectField("completed_at");
+        try jw.write(self.completed_at);
+        try jw.objectField("incomplete_details");
+        try jw.write(self.incomplete_details);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("instructions");
+        try jw.write(self.instructions);
+        try jw.objectField("tools");
+        try jw.write(self.tools);
+        try jw.objectField("metadata");
+        try jw.write(self.metadata);
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        switch (self.temperature) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("temperature");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("temperature");
+                try jw.write(value);
+            },
+        }
+        switch (self.top_p) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("top_p");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("top_p");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("max_prompt_tokens");
+        try jw.write(self.max_prompt_tokens);
+        try jw.objectField("max_completion_tokens");
+        try jw.write(self.max_completion_tokens);
+        try jw.objectField("truncation_strategy");
+        try jw.write(self.truncation_strategy);
+        try jw.objectField("tool_choice");
+        try jw.write(self.tool_choice);
+        try jw.objectField("parallel_tool_calls");
+        try jw.write(self.parallel_tool_calls);
+        try jw.objectField("response_format");
+        try jw.write(self.response_format);
+        try jw.endObject();
+    }
 };
 
 pub const RunStepCompletionUsage = std.json.Value;
@@ -10716,6 +23438,31 @@ pub const RunStepDeltaStepDetailsMessageCreationObject = struct {
     /// Always `message_creation`.
     type: []const u8,
     message_creation: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "message_creation", "message_creation", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.message_creation) |value| {
+            try jw.objectField("message_creation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Details of the Code Interpreter tool call the run step was involved in.
@@ -10728,6 +23475,39 @@ pub const RunStepDeltaStepDetailsToolCallsCodeObject = struct {
     type: []const u8,
     /// The Code Interpreter tool call definition.
     code_interpreter: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "id", "id", true },
+        .{ "type", "type", false },
+        .{ "code_interpreter", "code_interpreter", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.code_interpreter) |value| {
+            try jw.objectField("code_interpreter");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const RunStepDeltaStepDetailsToolCallsCodeOutputImageObject = struct {
@@ -10736,6 +23516,34 @@ pub const RunStepDeltaStepDetailsToolCallsCodeOutputImageObject = struct {
     /// Always `image`.
     type: []const u8,
     image: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "type", "type", false },
+        .{ "image", "image", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.image) |value| {
+            try jw.objectField("image");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Text output from the Code Interpreter tool call as part of a run step.
@@ -10746,6 +23554,34 @@ pub const RunStepDeltaStepDetailsToolCallsCodeOutputLogsObject = struct {
     type: []const u8,
     /// The text output from the Code Interpreter tool call.
     logs: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "type", "type", false },
+        .{ "logs", "logs", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.logs) |value| {
+            try jw.objectField("logs");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const RunStepDeltaStepDetailsToolCallsFileSearchObject = struct {
@@ -10756,7 +23592,38 @@ pub const RunStepDeltaStepDetailsToolCallsFileSearchObject = struct {
     /// The type of tool call. This is always going to be `file_search` for this type of tool call.
     type: []const u8,
     /// For now, this is always going to be an empty object.
-    file_search: std.json.Value,
+    file_search: std.json.ArrayHashMap(std.json.Value),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "id", "id", true },
+        .{ "type", "type", false },
+        .{ "file_search", "file_search", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("file_search");
+        try jw.write(self.file_search);
+        try jw.endObject();
+    }
 };
 
 pub const RunStepDeltaStepDetailsToolCallsFunctionObject = struct {
@@ -10768,6 +23635,39 @@ pub const RunStepDeltaStepDetailsToolCallsFunctionObject = struct {
     type: []const u8,
     /// The definition of the function that was called.
     function: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "id", "id", true },
+        .{ "type", "type", false },
+        .{ "function", "function", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.function) |value| {
+            try jw.objectField("function");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Details of the tool call.
@@ -10776,6 +23676,31 @@ pub const RunStepDeltaStepDetailsToolCallsObject = struct {
     type: []const u8,
     /// An array of tool calls the run step was involved in. These can be associated with one of three types of tools: `code_interpreter`, `file_search`, or `function`.
     tool_calls: ?[]const std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "tool_calls", "tool_calls", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.tool_calls) |value| {
+            try jw.objectField("tool_calls");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Details of the message creation by the run step.
@@ -10835,6 +23760,37 @@ pub const RunStepDetailsToolCallsFileSearchResultObject = struct {
     score: f64,
     /// The content of the result that was found. The content is only included if requested via the include query parameter.
     content: ?[]const std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "file_id", "file_id", false },
+        .{ "file_name", "file_name", false },
+        .{ "score", "score", false },
+        .{ "content", "content", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("file_id");
+        try jw.write(self.file_id);
+        try jw.objectField("file_name");
+        try jw.write(self.file_name);
+        try jw.objectField("score");
+        try jw.write(self.score);
+        if (self.content) |value| {
+            try jw.objectField("content");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const RunStepDetailsToolCallsFunctionObject = struct {
@@ -10873,7 +23829,7 @@ pub const RunStepObject = struct {
     /// The status of the run step, which can be either `in_progress`, `cancelled`, `failed`, `completed`, or `expired`.
     status: []const u8,
     /// The details of the run step.
-    step_details: std.json.Value,
+    step_details: std.json.ArrayHashMap(std.json.Value),
     last_error: std.json.Value,
     expired_at: std.json.Value,
     cancelled_at: std.json.Value,
@@ -10883,57 +23839,9 @@ pub const RunStepObject = struct {
     usage: RunStepCompletionUsage,
 };
 
-pub const RunStepStreamEvent = union(enum) {
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
+pub const RunStepStreamEvent = std.json.Value;
 
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(_: @This(), _: anytype) !void {}
-};
-
-pub const RunStreamEvent = union(enum) {
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(_: @This(), _: anytype) !void {}
-};
+pub const RunStreamEvent = std.json.Value;
 
 /// Tool call objects
 pub const RunToolCallObject = struct {
@@ -10964,6 +23872,43 @@ pub const ScrollParam = struct {
     /// The vertical scroll distance.
     scroll_y: i64,
     keys: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "x", "x", false },
+        .{ "y", "y", false },
+        .{ "scroll_x", "scroll_x", false },
+        .{ "scroll_y", "scroll_y", false },
+        .{ "keys", "keys", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("x");
+        try jw.write(self.x);
+        try jw.objectField("y");
+        try jw.write(self.y);
+        try jw.objectField("scroll_x");
+        try jw.write(self.scroll_x);
+        try jw.objectField("scroll_y");
+        try jw.write(self.scroll_y);
+        if (self.keys) |value| {
+            try jw.objectField("keys");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const SearchContentType = enum {
@@ -11045,6 +23990,34 @@ pub const SkillReferenceParam = struct {
     skill_id: []const u8,
     /// Optional skill version. Use a positive integer or 'latest'. Omit for default.
     version: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "skill_id", "skill_id", false },
+        .{ "version", "version", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("skill_id");
+        try jw.write(self.skill_id);
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const SkillResource = struct {
@@ -11140,13 +24113,40 @@ pub const StaticChunkingStrategyResponseParam = struct {
     static: StaticChunkingStrategy,
 };
 
+pub const StopConfigurationValue = std.json.Value;
+
 /// Not supported with latest reasoning models `o3` and `o4-mini`. Up to 4 sequences where the API will stop generating further tokens. The returned text will not contain the stop sequence.
-pub const StopConfiguration = std.json.Value;
+pub const StopConfiguration = ?StopConfigurationValue;
 
 pub const SubmitToolOutputsRunRequest = struct {
     /// A list of tools for which the outputs are being submitted.
     tool_outputs: []const std.json.Value,
     stream: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "tool_outputs", "tool_outputs", false },
+        .{ "stream", "stream", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("tool_outputs");
+        try jw.write(self.tool_outputs);
+        if (self.stream) |value| {
+            try jw.objectField("stream");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A summary text from the model.
@@ -11253,26 +24253,63 @@ pub const TextResponseFormatConfiguration = union(enum) {
         return false;
     }
 
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        switch (probe.type) {
+            .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "json_schema")) return .{ .text_response_format_json_schema = try parseStructuralVariantFromSlice(TextResponseFormatJsonSchema, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "json_object")) return .{ .response_format_json_object = try parseStructuralVariantFromSlice(ResponseFormatJsonObject, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "text")) return .{ .response_format_text = try parseStructuralVariantFromSlice(ResponseFormatText, allocator, input, options) };
+                return error.UnexpectedToken;
+            },
+            .missing => {
+                return error.MissingField;
+            },
+        }
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "description",
-            "name",
-            "schema",
-            "strict",
-        })) {
-            if (try parseStructuralVariant(TextResponseFormatJsonSchema, allocator, source, options)) |parsed| return .{ .text_response_format_json_schema = parsed };
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |value| value,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "json_schema")) {
+            const parsed = try parseStructuralVariant(TextResponseFormatJsonSchema, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .text_response_format_json_schema = parsed };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-        })) {
-            if (try parseStructuralVariant(ResponseFormatJsonObject, allocator, source, options)) |parsed| return .{ .response_format_json_object = parsed };
+        if (std.mem.eql(u8, disc_str, "json_object")) {
+            const parsed = try parseStructuralVariant(ResponseFormatJsonObject, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .response_format_json_object = parsed };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-        })) {
-            if (try parseStructuralVariant(ResponseFormatText, allocator, source, options)) |parsed| return .{ .response_format_text = parsed };
+        if (std.mem.eql(u8, disc_str, "text")) {
+            const parsed = try parseStructuralVariant(ResponseFormatText, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .response_format_text = parsed };
         }
         return error.UnexpectedToken;
     }
@@ -11296,6 +24333,42 @@ pub const TextResponseFormatJsonSchema = struct {
     name: []const u8,
     schema: ResponseFormatJsonSchemaSchema,
     strict: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "description", "description", true },
+        .{ "name", "name", false },
+        .{ "schema", "schema", false },
+        .{ "strict", "strict", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("schema");
+        try jw.write(self.schema);
+        if (self.strict) |value| {
+            try jw.objectField("strict");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ThreadItem = union(enum) {
@@ -11306,6 +24379,45 @@ pub const ThreadItem = union(enum) {
     task_item: TaskItem,
     task_group_item: TaskGroupItem,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "UserMessageItem")) {
+            return .{ .user_message_item = try std.json.parseFromSliceLeaky(UserMessageItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "AssistantMessageItem")) {
+            return .{ .assistant_message_item = try std.json.parseFromSliceLeaky(AssistantMessageItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WidgetMessageItem")) {
+            return .{ .widget_message_item = try std.json.parseFromSliceLeaky(WidgetMessageItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ClientToolCallItem")) {
+            return .{ .client_tool_call_item = try std.json.parseFromSliceLeaky(ClientToolCallItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "TaskItem")) {
+            return .{ .task_item = try std.json.parseFromSliceLeaky(TaskItem, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "TaskGroupItem")) {
+            return .{ .task_group_item = try std.json.parseFromSliceLeaky(TaskGroupItem, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -11313,7 +24425,9 @@ pub const ThreadItem = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -11402,31 +24516,7 @@ pub const ThreadResource = struct {
     user: []const u8,
 };
 
-pub const ThreadStreamEvent = union(enum) {
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(_: @This(), _: anytype) !void {}
-};
+pub const ThreadStreamEvent = std.json.Value;
 
 pub const ToggleCertificatesRequest = struct {
     certificate_ids: []const []const u8,
@@ -11445,6 +24535,78 @@ pub const TokenCountsBody = struct {
     conversation: ?std.json.Value = null,
     tool_choice: ?std.json.Value = null,
     parallel_tool_calls: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "input", "input", true },
+        .{ "previous_response_id", "previous_response_id", true },
+        .{ "tools", "tools", true },
+        .{ "text", "text", true },
+        .{ "reasoning", "reasoning", true },
+        .{ "truncation", "truncation", true },
+        .{ "instructions", "instructions", true },
+        .{ "conversation", "conversation", true },
+        .{ "tool_choice", "tool_choice", true },
+        .{ "parallel_tool_calls", "parallel_tool_calls", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.input) |value| {
+            try jw.objectField("input");
+            try jw.write(value);
+        }
+        if (self.previous_response_id) |value| {
+            try jw.objectField("previous_response_id");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        }
+        if (self.text) |value| {
+            try jw.objectField("text");
+            try jw.write(value);
+        }
+        if (self.reasoning) |value| {
+            try jw.objectField("reasoning");
+            try jw.write(value);
+        }
+        if (self.truncation) |value| {
+            try jw.objectField("truncation");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.conversation) |value| {
+            try jw.objectField("conversation");
+            try jw.write(value);
+        }
+        if (self.tool_choice) |value| {
+            try jw.objectField("tool_choice");
+            try jw.write(value);
+        }
+        if (self.parallel_tool_calls) |value| {
+            try jw.objectField("parallel_tool_calls");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const TokenCountsResource = struct {
@@ -11470,6 +24632,72 @@ pub const Tool = union(enum) {
     web_search_preview_tool: WebSearchPreviewTool,
     apply_patch_tool_param: ApplyPatchToolParam,
 
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "FunctionTool")) {
+            return .{ .function_tool = try std.json.parseFromSliceLeaky(FunctionTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FileSearchTool")) {
+            return .{ .file_search_tool = try std.json.parseFromSliceLeaky(FileSearchTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerTool")) {
+            return .{ .computer_tool = try std.json.parseFromSliceLeaky(ComputerTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerUsePreviewTool")) {
+            return .{ .computer_use_preview_tool = try std.json.parseFromSliceLeaky(ComputerUsePreviewTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchTool")) {
+            return .{ .web_search_tool = try std.json.parseFromSliceLeaky(WebSearchTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPTool")) {
+            return .{ .mcp_tool = try std.json.parseFromSliceLeaky(MCPTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CodeInterpreterTool")) {
+            return .{ .code_interpreter_tool = try std.json.parseFromSliceLeaky(CodeInterpreterTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ImageGenTool")) {
+            return .{ .image_gen_tool = try std.json.parseFromSliceLeaky(ImageGenTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolParam")) {
+            return .{ .local_shell_tool_param = try std.json.parseFromSliceLeaky(LocalShellToolParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellToolParam")) {
+            return .{ .function_shell_tool_param = try std.json.parseFromSliceLeaky(FunctionShellToolParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolParam")) {
+            return .{ .custom_tool_param = try std.json.parseFromSliceLeaky(CustomToolParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "NamespaceToolParam")) {
+            return .{ .namespace_tool_param = try std.json.parseFromSliceLeaky(NamespaceToolParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchToolParam")) {
+            return .{ .tool_search_tool_param = try std.json.parseFromSliceLeaky(ToolSearchToolParam, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchPreviewTool")) {
+            return .{ .web_search_preview_tool = try std.json.parseFromSliceLeaky(WebSearchPreviewTool, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolParam")) {
+            return .{ .apply_patch_tool_param = try std.json.parseFromSliceLeaky(ApplyPatchToolParam, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         const value = try std.json.innerParse(std.json.Value, allocator, source, options);
         return try jsonParseFromValue(allocator, value, options);
@@ -11477,7 +24705,9 @@ pub const Tool = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
         const disc_str = switch (disc_val) {
             .string => |s| s,
             else => return error.UnexpectedToken,
@@ -11564,7 +24794,7 @@ pub const ToolChoiceAllowed = struct {
     /// Constrains the tools available to the model to a pre-defined set. `auto` allows the model to pick from among the allowed tools and generate a message. `required` requires the model to call one or more of the allowed tools.
     mode: []const u8,
     /// A list of tool definitions that the model should be allowed to call. For the Responses API, the list of tool definitions might look like: ```json [ { "type": "function", "name": "get_weather" }, { "type": "mcp", "server_label": "deepwiki" }, { "type": "image_generation" } ] ```
-    tools: []const std.json.Value,
+    tools: []const std.json.ArrayHashMap(std.json.Value),
 };
 
 /// Use this option to force the model to call a specific custom tool.
@@ -11590,6 +24820,34 @@ pub const ToolChoiceMCP = struct {
     /// The label of the MCP server to use.
     server_label: []const u8,
     name: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "server_label", "server_label", false },
+        .{ "name", "name", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("server_label");
+        try jw.write(self.server_label);
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Controls which (if any) tool is called by the model. `none` means the model will not call any tool and instead generates a message. `auto` means the model can pick between generating a message or calling one or more tools. `required` means the model must call one or more tools.
@@ -11644,6 +24902,46 @@ pub const ToolSearchCall = struct {
     status: FunctionCallStatus,
     /// The identifier of the actor that created the item.
     created_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "call_id", "call_id", false },
+        .{ "execution", "execution", false },
+        .{ "arguments", "arguments", false },
+        .{ "status", "status", false },
+        .{ "created_by", "created_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("execution");
+        try jw.write(self.execution);
+        try jw.objectField("arguments");
+        try jw.write(self.arguments);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.created_by) |value| {
+            try jw.objectField("created_by");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ToolSearchCallItemParam = struct {
@@ -11656,6 +24954,49 @@ pub const ToolSearchCallItemParam = struct {
     /// The arguments supplied to the tool search call.
     arguments: EmptyModelParam,
     status: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "call_id", "call_id", true },
+        .{ "type", "type", false },
+        .{ "execution", "execution", true },
+        .{ "arguments", "arguments", false },
+        .{ "status", "status", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.call_id) |value| {
+            try jw.objectField("call_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.objectField("arguments");
+        try jw.write(self.arguments);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ToolSearchExecutionType = enum {
@@ -11697,6 +25038,46 @@ pub const ToolSearchOutput = struct {
     status: FunctionCallOutputStatusEnum,
     /// The identifier of the actor that created the item.
     created_by: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "call_id", "call_id", false },
+        .{ "execution", "execution", false },
+        .{ "tools", "tools", false },
+        .{ "status", "status", false },
+        .{ "created_by", "created_by", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("call_id");
+        try jw.write(self.call_id);
+        try jw.objectField("execution");
+        try jw.write(self.execution);
+        try jw.objectField("tools");
+        try jw.write(self.tools);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.created_by) |value| {
+            try jw.objectField("created_by");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ToolSearchOutputItemParam = struct {
@@ -11709,6 +25090,49 @@ pub const ToolSearchOutputItemParam = struct {
     /// The loaded tool definitions returned by the tool search output.
     tools: []const Tool,
     status: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "call_id", "call_id", true },
+        .{ "type", "type", false },
+        .{ "execution", "execution", true },
+        .{ "tools", "tools", false },
+        .{ "status", "status", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.call_id) |value| {
+            try jw.objectField("call_id");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.objectField("tools");
+        try jw.write(self.tools);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Hosted or BYOT tool search configuration for deferred tools.
@@ -11719,6 +25143,41 @@ pub const ToolSearchToolParam = struct {
     execution: ?ToolSearchExecutionType = null,
     description: ?std.json.Value = null,
     parameters: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "execution", "execution", true },
+        .{ "description", "description", true },
+        .{ "parameters", "parameters", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.parameters) |value| {
+            try jw.objectField("parameters");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// An array of tools the model may call while generating a response. You can specify which tool to use by setting the `tool_choice` parameter. We support the following categories of tools: - **Built-in tools**: Tools that are provided by OpenAI that extend the model's capabilities, like [web search](/docs/guides/tools-web-search) or [file search](/docs/guides/tools-file-search). Learn more about [built-in tools](/docs/guides/tools). - **MCP Tools**: Integrations with third-party systems via custom MCP servers or predefined connectors such as Google Drive and SharePoint. Learn more about [MCP Tools](/docs/guides/tools-connectors-mcp). - **Function calls (custom tools)**: Functions that are defined by you, enabling the model to call your own code with strongly typed arguments and outputs. Learn more about [function calling](/docs/guides/function-calling). You can also use custom tools to call your own code.
@@ -11741,6 +25200,39 @@ pub const TranscriptTextDeltaEvent = struct {
     logprobs: ?[]const std.json.Value = null,
     /// Identifier of the diarized segment that this delta belongs to. Only present when using `gpt-4o-transcribe-diarize`.
     segment_id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "delta", "delta", false },
+        .{ "logprobs", "logprobs", true },
+        .{ "segment_id", "segment_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("delta");
+        try jw.write(self.delta);
+        if (self.logprobs) |value| {
+            try jw.objectField("logprobs");
+            try jw.write(value);
+        }
+        if (self.segment_id) |value| {
+            try jw.objectField("segment_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Emitted when the transcription is complete. Contains the complete transcription text. Only emitted when you [create a transcription](/docs/api-reference/audio/create-transcription) with the `Stream` parameter set to `true`.
@@ -11752,6 +25244,39 @@ pub const TranscriptTextDoneEvent = struct {
     /// The log probabilities of the individual tokens in the transcription. Only included if you [create a transcription](/docs/api-reference/audio/create-transcription) with the `include[]` parameter set to `logprobs`.
     logprobs: ?[]const std.json.Value = null,
     usage: ?TranscriptTextUsageTokens = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "text", "text", false },
+        .{ "logprobs", "logprobs", true },
+        .{ "usage", "usage", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("text");
+        try jw.write(self.text);
+        if (self.logprobs) |value| {
+            try jw.objectField("logprobs");
+            try jw.write(value);
+        }
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Emitted when a diarized transcription returns a completed segment with speaker information. Only emitted when you [create a transcription](/docs/api-reference/audio/create-transcription) with `stream` set to `true` and `response_format` set to `diarized_json`.
@@ -11790,6 +25315,40 @@ pub const TranscriptTextUsageTokens = struct {
     output_tokens: i64,
     /// Total number of tokens used (input + output).
     total_tokens: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "input_tokens", "input_tokens", false },
+        .{ "input_token_details", "input_token_details", true },
+        .{ "output_tokens", "output_tokens", false },
+        .{ "total_tokens", "total_tokens", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("input_tokens");
+        try jw.write(self.input_tokens);
+        if (self.input_token_details) |value| {
+            try jw.objectField("input_token_details");
+            try jw.write(value);
+        }
+        try jw.objectField("output_tokens");
+        try jw.write(self.output_tokens);
+        try jw.objectField("total_tokens");
+        try jw.write(self.total_tokens);
+        try jw.endObject();
+    }
 };
 
 /// Controls how the audio is cut into chunks. When set to `"auto"`, the server first normalizes loudness and then uses voice activity detection (VAD) to choose boundaries. `server_vad` object can be provided to tweak VAD detection parameters manually. If unset, the audio is transcribed as a single block.
@@ -11895,6 +25454,31 @@ pub const TruncationObject = struct {
     /// The truncation strategy to use for the thread. The default is `auto`. If set to `last_messages`, the thread will be truncated to the n most recent messages in the thread. When set to `auto`, messages in the middle of the thread will be dropped to fit the context length of the model, `max_prompt_tokens`.
     type: []const u8,
     last_messages: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "last_messages", "last_messages", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.last_messages) |value| {
+            try jw.objectField("last_messages");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// An action to type in text.
@@ -11922,9 +25506,48 @@ pub const UpdateVectorStoreFileAttributesRequest = struct {
 
 pub const UpdateVectorStoreRequest = struct {
     /// The name of the vector store.
-    name: ?[]const u8 = null,
+    name: OpenApiOptionalNullable([]const u8) = .absent,
     expires_after: ?std.json.Value = null,
     metadata: ?Metadata = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "expires_after", "expires_after", true },
+        .{ "metadata", "metadata", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        switch (self.name) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("name");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("name");
+                try jw.write(value);
+            },
+        }
+        if (self.expires_after) |value| {
+            try jw.objectField("expires_after");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const UpdateVoiceConsentRequest = struct {
@@ -11951,6 +25574,54 @@ pub const Upload = struct {
     /// The object type, which is always "upload".
     object: ?[]const u8 = null,
     file: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "created_at", "created_at", false },
+        .{ "filename", "filename", false },
+        .{ "bytes", "bytes", false },
+        .{ "purpose", "purpose", false },
+        .{ "status", "status", false },
+        .{ "expires_at", "expires_at", false },
+        .{ "object", "object", true },
+        .{ "file", "file", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("filename");
+        try jw.write(self.filename);
+        try jw.objectField("bytes");
+        try jw.write(self.bytes);
+        try jw.objectField("purpose");
+        try jw.write(self.purpose);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("expires_at");
+        try jw.write(self.expires_at);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        if (self.file) |value| {
+            try jw.objectField("file");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const UploadCertificateRequest = struct {
@@ -11958,6 +25629,31 @@ pub const UploadCertificateRequest = struct {
     name: ?[]const u8 = null,
     /// The certificate content in PEM format
     content: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", true },
+        .{ "content", "content", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.endObject();
+    }
 };
 
 /// The upload Part represents a chunk of bytes we can add to an Upload object.
@@ -12013,6 +25709,52 @@ pub const UsageAudioSpeechesResult = struct {
     user_id: ?std.json.Value = null,
     api_key_id: ?std.json.Value = null,
     model: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "characters", "characters", false },
+        .{ "num_model_requests", "num_model_requests", false },
+        .{ "project_id", "project_id", true },
+        .{ "user_id", "user_id", true },
+        .{ "api_key_id", "api_key_id", true },
+        .{ "model", "model", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("characters");
+        try jw.write(self.characters);
+        try jw.objectField("num_model_requests");
+        try jw.write(self.num_model_requests);
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.user_id) |value| {
+            try jw.objectField("user_id");
+            try jw.write(value);
+        }
+        if (self.api_key_id) |value| {
+            try jw.objectField("api_key_id");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The aggregated audio transcriptions usage details of the specific time bucket.
@@ -12026,6 +25768,52 @@ pub const UsageAudioTranscriptionsResult = struct {
     user_id: ?std.json.Value = null,
     api_key_id: ?std.json.Value = null,
     model: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "seconds", "seconds", false },
+        .{ "num_model_requests", "num_model_requests", false },
+        .{ "project_id", "project_id", true },
+        .{ "user_id", "user_id", true },
+        .{ "api_key_id", "api_key_id", true },
+        .{ "model", "model", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("seconds");
+        try jw.write(self.seconds);
+        try jw.objectField("num_model_requests");
+        try jw.write(self.num_model_requests);
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.user_id) |value| {
+            try jw.objectField("user_id");
+            try jw.write(value);
+        }
+        if (self.api_key_id) |value| {
+            try jw.objectField("api_key_id");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The aggregated code interpreter sessions usage details of the specific time bucket.
@@ -12034,6 +25822,36 @@ pub const UsageCodeInterpreterSessionsResult = struct {
     /// The number of code interpreter sessions.
     num_sessions: ?i64 = null,
     project_id: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "num_sessions", "num_sessions", true },
+        .{ "project_id", "project_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        if (self.num_sessions) |value| {
+            try jw.objectField("num_sessions");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The aggregated completions usage details of the specific time bucket.
@@ -12057,6 +25875,80 @@ pub const UsageCompletionsResult = struct {
     model: ?std.json.Value = null,
     batch: ?std.json.Value = null,
     service_tier: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "input_tokens", "input_tokens", false },
+        .{ "input_cached_tokens", "input_cached_tokens", true },
+        .{ "output_tokens", "output_tokens", false },
+        .{ "input_audio_tokens", "input_audio_tokens", true },
+        .{ "output_audio_tokens", "output_audio_tokens", true },
+        .{ "num_model_requests", "num_model_requests", false },
+        .{ "project_id", "project_id", true },
+        .{ "user_id", "user_id", true },
+        .{ "api_key_id", "api_key_id", true },
+        .{ "model", "model", true },
+        .{ "batch", "batch", true },
+        .{ "service_tier", "service_tier", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("input_tokens");
+        try jw.write(self.input_tokens);
+        if (self.input_cached_tokens) |value| {
+            try jw.objectField("input_cached_tokens");
+            try jw.write(value);
+        }
+        try jw.objectField("output_tokens");
+        try jw.write(self.output_tokens);
+        if (self.input_audio_tokens) |value| {
+            try jw.objectField("input_audio_tokens");
+            try jw.write(value);
+        }
+        if (self.output_audio_tokens) |value| {
+            try jw.objectField("output_audio_tokens");
+            try jw.write(value);
+        }
+        try jw.objectField("num_model_requests");
+        try jw.write(self.num_model_requests);
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.user_id) |value| {
+            try jw.objectField("user_id");
+            try jw.write(value);
+        }
+        if (self.api_key_id) |value| {
+            try jw.objectField("api_key_id");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.batch) |value| {
+            try jw.objectField("batch");
+            try jw.write(value);
+        }
+        if (self.service_tier) |value| {
+            try jw.objectField("service_tier");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The aggregated embeddings usage details of the specific time bucket.
@@ -12070,6 +25962,52 @@ pub const UsageEmbeddingsResult = struct {
     user_id: ?std.json.Value = null,
     api_key_id: ?std.json.Value = null,
     model: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "input_tokens", "input_tokens", false },
+        .{ "num_model_requests", "num_model_requests", false },
+        .{ "project_id", "project_id", true },
+        .{ "user_id", "user_id", true },
+        .{ "api_key_id", "api_key_id", true },
+        .{ "model", "model", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("input_tokens");
+        try jw.write(self.input_tokens);
+        try jw.objectField("num_model_requests");
+        try jw.write(self.num_model_requests);
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.user_id) |value| {
+            try jw.objectField("user_id");
+            try jw.write(value);
+        }
+        if (self.api_key_id) |value| {
+            try jw.objectField("api_key_id");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The aggregated images usage details of the specific time bucket.
@@ -12085,6 +26023,62 @@ pub const UsageImagesResult = struct {
     user_id: ?std.json.Value = null,
     api_key_id: ?std.json.Value = null,
     model: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "images", "images", false },
+        .{ "num_model_requests", "num_model_requests", false },
+        .{ "source", "source", true },
+        .{ "size", "size", true },
+        .{ "project_id", "project_id", true },
+        .{ "user_id", "user_id", true },
+        .{ "api_key_id", "api_key_id", true },
+        .{ "model", "model", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("images");
+        try jw.write(self.images);
+        try jw.objectField("num_model_requests");
+        try jw.write(self.num_model_requests);
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.size) |value| {
+            try jw.objectField("size");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.user_id) |value| {
+            try jw.objectField("user_id");
+            try jw.write(value);
+        }
+        if (self.api_key_id) |value| {
+            try jw.objectField("api_key_id");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The aggregated moderations usage details of the specific time bucket.
@@ -12098,6 +26092,52 @@ pub const UsageModerationsResult = struct {
     user_id: ?std.json.Value = null,
     api_key_id: ?std.json.Value = null,
     model: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "input_tokens", "input_tokens", false },
+        .{ "num_model_requests", "num_model_requests", false },
+        .{ "project_id", "project_id", true },
+        .{ "user_id", "user_id", true },
+        .{ "api_key_id", "api_key_id", true },
+        .{ "model", "model", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("input_tokens");
+        try jw.write(self.input_tokens);
+        try jw.objectField("num_model_requests");
+        try jw.write(self.num_model_requests);
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.user_id) |value| {
+            try jw.objectField("user_id");
+            try jw.write(value);
+        }
+        if (self.api_key_id) |value| {
+            try jw.objectField("api_key_id");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const UsageResponse = struct {
@@ -12120,6 +26160,34 @@ pub const UsageVectorStoresResult = struct {
     /// The vector stores usage in bytes.
     usage_bytes: i64,
     project_id: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "usage_bytes", "usage_bytes", false },
+        .{ "project_id", "project_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("usage_bytes");
+        try jw.write(self.usage_bytes);
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Represents an individual `user` within an organization.
@@ -12220,16 +26288,73 @@ pub const VadConfig = struct {
     silence_duration_ms: ?i64 = null,
     /// Sensitivity threshold (0.0 to 1.0) for voice activity detection. A higher threshold will require louder audio to activate the model, and thus might perform better in noisy environments.
     threshold: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "prefix_padding_ms", "prefix_padding_ms", true },
+        .{ "silence_duration_ms", "silence_duration_ms", true },
+        .{ "threshold", "threshold", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.prefix_padding_ms) |value| {
+            try jw.objectField("prefix_padding_ms");
+            try jw.write(value);
+        }
+        if (self.silence_duration_ms) |value| {
+            try jw.objectField("silence_duration_ms");
+            try jw.write(value);
+        }
+        if (self.threshold) |value| {
+            try jw.objectField("threshold");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ValidateGraderRequest = struct {
     /// The grader used for the fine-tuning job.
-    grader: std.json.Value,
+    grader: std.json.ArrayHashMap(std.json.Value),
 };
 
 pub const ValidateGraderResponse = struct {
     /// The grader used for the fine-tuning job.
-    grader: ?std.json.Value = null,
+    grader: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "grader", "grader", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.grader) |value| {
+            try jw.objectField("grader");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The expiration policy for a vector store.
@@ -12284,8 +26409,56 @@ pub const VectorStoreFileObject = struct {
     status: []const u8,
     last_error: std.json.Value,
     /// The strategy used to chunk the file.
-    chunking_strategy: ?std.json.Value = null,
+    chunking_strategy: ?std.json.ArrayHashMap(std.json.Value) = null,
     attributes: ?VectorStoreFileAttributes = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "usage_bytes", "usage_bytes", false },
+        .{ "created_at", "created_at", false },
+        .{ "vector_store_id", "vector_store_id", false },
+        .{ "status", "status", false },
+        .{ "last_error", "last_error", false },
+        .{ "chunking_strategy", "chunking_strategy", true },
+        .{ "attributes", "attributes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("usage_bytes");
+        try jw.write(self.usage_bytes);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("vector_store_id");
+        try jw.write(self.vector_store_id);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("last_error");
+        try jw.write(self.last_error);
+        if (self.chunking_strategy) |value| {
+            try jw.objectField("chunking_strategy");
+            try jw.write(value);
+        }
+        if (self.attributes) |value| {
+            try jw.objectField("attributes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A vector store is a collection of processed files can be used by the `file_search` tool.
@@ -12307,6 +26480,60 @@ pub const VectorStoreObject = struct {
     expires_at: ?std.json.Value = null,
     last_active_at: std.json.Value,
     metadata: Metadata,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "created_at", "created_at", false },
+        .{ "name", "name", false },
+        .{ "usage_bytes", "usage_bytes", false },
+        .{ "file_counts", "file_counts", false },
+        .{ "status", "status", false },
+        .{ "expires_after", "expires_after", true },
+        .{ "expires_at", "expires_at", true },
+        .{ "last_active_at", "last_active_at", false },
+        .{ "metadata", "metadata", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("usage_bytes");
+        try jw.write(self.usage_bytes);
+        try jw.objectField("file_counts");
+        try jw.write(self.file_counts);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.expires_after) |value| {
+            try jw.objectField("expires_after");
+            try jw.write(value);
+        }
+        if (self.expires_at) |value| {
+            try jw.objectField("expires_at");
+            try jw.write(value);
+        }
+        try jw.objectField("last_active_at");
+        try jw.write(self.last_active_at);
+        try jw.objectField("metadata");
+        try jw.write(self.metadata);
+        try jw.endObject();
+    }
 };
 
 pub const VectorStoreSearchRequest = struct {
@@ -12320,6 +26547,46 @@ pub const VectorStoreSearchRequest = struct {
     filters: ?std.json.Value = null,
     /// Ranking options for search.
     ranking_options: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "query", "query", false },
+        .{ "rewrite_query", "rewrite_query", true },
+        .{ "max_num_results", "max_num_results", true },
+        .{ "filters", "filters", true },
+        .{ "ranking_options", "ranking_options", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("query");
+        try jw.write(self.query);
+        if (self.rewrite_query) |value| {
+            try jw.objectField("rewrite_query");
+            try jw.write(value);
+        }
+        if (self.max_num_results) |value| {
+            try jw.objectField("max_num_results");
+            try jw.write(value);
+        }
+        if (self.filters) |value| {
+            try jw.objectField("filters");
+            try jw.write(value);
+        }
+        if (self.ranking_options) |value| {
+            try jw.objectField("ranking_options");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const VectorStoreSearchResultContentObject = struct {
@@ -12536,6 +26803,42 @@ pub const VoiceConsentListResource = struct {
     first_id: ?std.json.Value = null,
     last_id: ?std.json.Value = null,
     has_more: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "data", "data", false },
+        .{ "first_id", "first_id", true },
+        .{ "last_id", "last_id", true },
+        .{ "has_more", "has_more", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.first_id) |value| {
+            try jw.objectField("first_id");
+            try jw.write(value);
+        }
+        if (self.last_id) |value| {
+            try jw.objectField("last_id");
+            try jw.write(value);
+        }
+        try jw.objectField("has_more");
+        try jw.write(self.has_more);
+        try jw.endObject();
+    }
 };
 
 /// A consent recording used to authorize creation of a custom voice.
@@ -12591,6 +26894,31 @@ pub const WebSearchActionOpenPage = struct {
     type: []const u8,
     /// The URL opened by the model.
     url: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "url", "url", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Action type "search" - Performs a web search query.
@@ -12603,6 +26931,39 @@ pub const WebSearchActionSearch = struct {
     queries: ?[]const []const u8 = null,
     /// The sources used in the search.
     sources: ?[]const std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "query", "query", false },
+        .{ "queries", "queries", true },
+        .{ "sources", "sources", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("query");
+        try jw.write(self.query);
+        if (self.queries) |value| {
+            try jw.objectField("queries");
+            try jw.write(value);
+        }
+        if (self.sources) |value| {
+            try jw.objectField("sources");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const WebSearchApproximateLocation = std.json.Value;
@@ -12646,6 +27007,43 @@ pub const WebSearchLocation = struct {
     city: ?[]const u8 = null,
     /// The [IANA timezone](https://timeapi.io/documentation/iana-timezones) of the user, e.g. `America/Los_Angeles`.
     timezone: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "country", "country", true },
+        .{ "region", "region", true },
+        .{ "city", "city", true },
+        .{ "timezone", "timezone", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.country) |value| {
+            try jw.objectField("country");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.city) |value| {
+            try jw.objectField("city");
+            try jw.write(value);
+        }
+        if (self.timezone) |value| {
+            try jw.objectField("timezone");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// This tool searches the web for relevant results to use in a response. Learn more about the [web search tool](https://platform.openai.com/docs/guides/tools-web-search).
@@ -12656,6 +27054,41 @@ pub const WebSearchPreviewTool = struct {
     /// High level guidance for the amount of context window space to use for the search. One of `low`, `medium`, or `high`. `medium` is the default.
     search_context_size: ?SearchContextSize = null,
     search_content_types: ?[]const SearchContentType = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "user_location", "user_location", true },
+        .{ "search_context_size", "search_context_size", true },
+        .{ "search_content_types", "search_content_types", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.user_location) |value| {
+            try jw.objectField("user_location");
+            try jw.write(value);
+        }
+        if (self.search_context_size) |value| {
+            try jw.objectField("search_context_size");
+            try jw.write(value);
+        }
+        if (self.search_content_types) |value| {
+            try jw.objectField("search_content_types");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Search the Internet for sources related to the prompt. Learn more about the [web search tool](/docs/guides/tools-web-search).
@@ -12666,6 +27099,41 @@ pub const WebSearchTool = struct {
     user_location: ?WebSearchApproximateLocation = null,
     /// High level guidance for the amount of context window space to use for the search. One of `low`, `medium`, or `high`. `medium` is the default.
     search_context_size: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "filters", "filters", true },
+        .{ "user_location", "user_location", true },
+        .{ "search_context_size", "search_context_size", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.filters) |value| {
+            try jw.objectField("filters");
+            try jw.write(value);
+        }
+        if (self.user_location) |value| {
+            try jw.objectField("user_location");
+            try jw.write(value);
+        }
+        if (self.search_context_size) |value| {
+            try jw.objectField("search_context_size");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The results of a web search tool call. See the [web search guide](/docs/guides/tools-web-search) for more information.
@@ -12677,7 +27145,7 @@ pub const WebSearchToolCall = struct {
     /// The status of the web search tool call.
     status: []const u8,
     /// An object describing the specific action taken in this web search call. Includes details on how the model used the web (search, open_page, find_in_page).
-    action: std.json.Value,
+    action: std.json.ArrayHashMap(std.json.Value),
 };
 
 /// Sent when a batch API request has been cancelled.
@@ -12692,6 +27160,40 @@ pub const WebhookBatchCancelled = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `batch.cancelled`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Sent when a batch API request has been completed.
@@ -12706,6 +27208,40 @@ pub const WebhookBatchCompleted = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `batch.completed`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Sent when a batch API request has expired.
@@ -12720,6 +27256,40 @@ pub const WebhookBatchExpired = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `batch.expired`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Sent when a batch API request has failed.
@@ -12734,6 +27304,40 @@ pub const WebhookBatchFailed = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `batch.failed`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Sent when an eval run has been canceled.
@@ -12748,6 +27352,40 @@ pub const WebhookEvalRunCanceled = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `eval.run.canceled`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Sent when an eval run has failed.
@@ -12762,6 +27400,40 @@ pub const WebhookEvalRunFailed = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `eval.run.failed`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Sent when an eval run has succeeded.
@@ -12776,6 +27448,40 @@ pub const WebhookEvalRunSucceeded = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `eval.run.succeeded`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Sent when a fine-tuning job has been cancelled.
@@ -12790,6 +27496,40 @@ pub const WebhookFineTuningJobCancelled = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `fine_tuning.job.cancelled`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Sent when a fine-tuning job has failed.
@@ -12804,6 +27544,40 @@ pub const WebhookFineTuningJobFailed = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `fine_tuning.job.failed`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Sent when a fine-tuning job has succeeded.
@@ -12818,6 +27592,40 @@ pub const WebhookFineTuningJobSucceeded = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `fine_tuning.job.succeeded`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Sent when Realtime API Receives a incoming SIP call.
@@ -12832,6 +27640,40 @@ pub const WebhookRealtimeCallIncoming = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `realtime.call.incoming`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Sent when a background response has been cancelled.
@@ -12846,6 +27688,40 @@ pub const WebhookResponseCancelled = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `response.cancelled`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Sent when a background response has been completed.
@@ -12860,6 +27736,40 @@ pub const WebhookResponseCompleted = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `response.completed`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Sent when a background response has failed.
@@ -12874,6 +27784,40 @@ pub const WebhookResponseFailed = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `response.failed`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Sent when a background response has been interrupted.
@@ -12888,6 +27832,40 @@ pub const WebhookResponseIncomplete = struct {
     object: ?[]const u8 = null,
     /// The type of the event. Always `response.incomplete`.
     type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "created_at", "created_at", false },
+        .{ "id", "id", false },
+        .{ "data", "data", false },
+        .{ "object", "object", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        if (self.object) |value| {
+            try jw.objectField("object");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Thread item that renders a widget payload.
@@ -12916,10 +27894,216 @@ pub const WorkflowParam = struct {
     state_variables: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Optional tracing overrides for the workflow invocation. When omitted, tracing is enabled by default.
     tracing: ?WorkflowTracingParam = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "version", "version", true },
+        .{ "state_variables", "state_variables", true },
+        .{ "tracing", "tracing", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.state_variables) |value| {
+            try jw.objectField("state_variables");
+            try jw.write(value);
+        }
+        if (self.tracing) |value| {
+            try jw.objectField("tracing");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Controls diagnostic tracing during the session.
 pub const WorkflowTracingParam = struct {
     /// Whether tracing is enabled during the session. Defaults to true.
     enabled: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.enabled) |value| {
+            try jw.objectField("enabled");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+            if (source == .null) return .null_value;
+            return .{ .value = try std.json.parseFromValueLeaky(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}
+
+/// Parse an OpenAPI object without materializing a second JSON tree while
+/// rejecting explicit null for optional properties whose schemas are non-nullable.
+fn openApiParseObject(
+    comptime T: type,
+    comptime openapi_fields: anytype,
+    allocator: std.mem.Allocator,
+    source: anytype,
+    options: std.json.ParseOptions,
+) !T {
+    @setEvalBranchQuota(100_000);
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (openapi_fields.len != struct_info.fields.len) @compileError("OpenAPI object field descriptors must match the generated struct");
+    if (.object_begin != try source.next()) return error.UnexpectedToken;
+
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    while (true) {
+        var name_token: ?std.json.Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+        const field_name = switch (name_token.?) {
+            inline .string, .allocated_string => |slice| slice,
+            .object_end => break,
+            else => return error.UnexpectedToken,
+        };
+
+        inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field[0], field_name)) {
+                openApiFreeAllocatedToken(allocator, name_token.?);
+                name_token = null;
+                if (openapi_field[2] and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
+                if (fields_seen[i]) {
+                    switch (options.duplicate_field_behavior) {
+                        .use_first => {
+                            _ = try std.json.innerParse(field.type, allocator, source, options);
+                            break;
+                        },
+                        .@"error" => return error.DuplicateField,
+                        .use_last => {},
+                    }
+                }
+                @field(result, field.name) = try std.json.innerParse(field.type, allocator, source, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else {
+            openApiFreeAllocatedToken(allocator, name_token.?);
+            if (options.ignore_unknown_fields) try source.skipValue() else return error.UnknownField;
+        }
+    }
+    try openApiFillDefaultStructValues(T, openapi_fields, &result, &fields_seen);
+    return result;
+}
+
+fn openApiParseObjectFromValue(
+    comptime T: type,
+    comptime openapi_fields: anytype,
+    allocator: std.mem.Allocator,
+    source: std.json.Value,
+    options: std.json.ParseOptions,
+) !T {
+    @setEvalBranchQuota(100_000);
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (openapi_fields.len != struct_info.fields.len) @compileError("OpenAPI object field descriptors must match the generated struct");
+    if (source != .object) return error.UnexpectedToken;
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    var it = source.object.iterator();
+    while (it.next()) |entry| {
+        const field_name = entry.key_ptr.*;
+        inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field[0], field_name)) {
+                if (openapi_field[2] and entry.value_ptr.* == .null) return error.UnexpectedToken;
+                @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else if (!options.ignore_unknown_fields) return error.UnknownField;
+    }
+    try openApiFillDefaultStructValues(T, openapi_fields, &result, &fields_seen);
+    return result;
+}
+
+fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: anytype, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+    @setEvalBranchQuota(100_000);
+    inline for (@typeInfo(T).@"struct".fields, openapi_fields, 0..) |field, openapi_field, i| {
+        if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+        if (!fields_seen[i]) {
+            if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
+        }
+    }
+}
+
+fn openApiFreeAllocatedToken(allocator: std.mem.Allocator, token: std.json.Token) void {
+    switch (token) {
+        .allocated_number, .allocated_string => |slice| allocator.free(slice),
+        else => {},
+    }
+}

@@ -1072,10 +1072,10 @@ and target and published revisions. Physical vector or sparse-entry counts are
 reported separately from generation-scoped source coverage; clients must not
 infer completeness from physical cardinality.
 
-`antfly index wait` waits for complete readiness. `antfly index wait
---queryable` exits for either `queryable_partial` or `ready`. Search uses the
-best safely published generation by default. Long waits belong in this waiter,
-not in a held search request.
+`antfly index wait --until complete` waits for complete readiness. `antfly
+index wait --until queryable` exits for either `queryable_partial` or `ready`.
+Search uses the best safely published generation by default. Long waits belong
+in this waiter, not in a held search request.
 
 Write synchronization remains the derived-replay contract defined in
 [ENRICHMENTS.md](ENRICHMENTS.md#derived-replay-and-indexing-contract):
