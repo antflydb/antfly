@@ -218,6 +218,34 @@ def test_ready_index_status_requires_current_coverage_observation():
     }
     assert ready_index_status(ready_status) is ready_status["status"]
 
+    canonical_ready = json.loads(json.dumps(ready_status))
+    canonical_ready["status"]["backfill_state"] = "ready"
+    canonical_ready["status"]["readiness"] = {
+        "state": "ready",
+        "queryable": True,
+        "complete": True,
+        "incarnation": "g-0000000000000001",
+        "published_revision": 12,
+        "target_revision": 12,
+        "pending_reasons": [],
+    }
+    assert ready_index_status(canonical_ready) is canonical_ready["status"]
+
+    for state, queryable in (
+        ("pending", False),
+        ("queryable_partial", True),
+        ("failed", False),
+    ):
+        incomplete = json.loads(json.dumps(canonical_ready))
+        incomplete["status"]["readiness"].update(
+            state=state, queryable=queryable, complete=False
+        )
+        assert ready_index_status(incomplete) is None
+
+    stale_receipt = json.loads(json.dumps(canonical_ready))
+    stale_receipt["status"]["readiness"]["published_revision"] = 11
+    assert ready_index_status(stale_receipt) is None
+
     stale_incarnation = json.loads(json.dumps(ready_status))
     stale_incarnation["status"]["coverage"]["observation_complete"] = False
     stale_incarnation["status"]["coverage"]["config_mismatch_group_count"] = 1
@@ -230,6 +258,8 @@ def test_ready_index_status_requires_current_coverage_observation():
     for field, value in (
         ("error", "load failed: UnsupportedVersion"),
         ("backfill_state", "failed"),
+        ("backfill_state", "running"),
+        ("backfill_state", "retrying"),
         ("repair_degraded", True),
         ("repair_summary_ready", False),
         ("repair_issue_count", 1),

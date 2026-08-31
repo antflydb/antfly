@@ -472,7 +472,9 @@ pub const ReplicaCatalogToken = struct {
 
 /// An owned catalog transaction whose expensive preparation has completed.
 /// Handles are single-use and must always be deinitialized, including after a
-/// successful commit, so implementation-owned transaction memory is released.
+/// successful commit. Implementations may transfer the retired generation to
+/// the handle so reclamation stays out of a caller's publication barrier;
+/// callers should therefore defer deinit until after releasing that barrier.
 pub const PreparedReplicaCatalogBatch = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -507,6 +509,7 @@ pub const MemoryReplicaCatalog = struct {
     mutex: std.atomic.Mutex = .unlocked,
     current_revision: u64 = 1,
     records: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
+    test_prepared_reclamations: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
 
     pub fn init(alloc: std.mem.Allocator) MemoryReplicaCatalog {
         return .{ .alloc = alloc };
@@ -633,6 +636,7 @@ pub const MemoryReplicaCatalog = struct {
         owner: *MemoryReplicaCatalog,
         expected_token: ReplicaCatalogToken,
         next: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
+        retired: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
         changed: bool,
         commit_attempted: bool = false,
         map_transferred: bool = false,
@@ -647,7 +651,7 @@ pub const MemoryReplicaCatalog = struct {
                 return error.ReplicaCatalogRevisionChanged;
             if (!self.changed) return .{ .revision = self.owner.current_revision };
             const next_revision = try nextRevision(self.owner.current_revision);
-            deinitReplicaMap(self.owner.alloc, &self.owner.records);
+            self.retired = self.owner.records;
             self.owner.records = self.next;
             self.next = .empty;
             self.map_transferred = true;
@@ -658,6 +662,9 @@ pub const MemoryReplicaCatalog = struct {
         fn deinitOpaque(ptr: *anyopaque) void {
             const self: *PreparedBatch = @ptrCast(@alignCast(ptr));
             if (!self.map_transferred) deinitReplicaMap(self.owner.alloc, &self.next);
+            if (builtin.is_test and self.retired.count() != 0)
+                self.owner.test_prepared_reclamations += 1;
+            deinitReplicaMap(self.owner.alloc, &self.retired);
             const alloc = self.owner.alloc;
             alloc.destroy(self);
         }
@@ -715,6 +722,7 @@ pub const FileReplicaCatalog = struct {
     current_revision: u64 = 1,
     records: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
     test_persist_failure_boundary: if (builtin.is_test) ?TestPersistFailureBoundary else void = if (builtin.is_test) null else {},
+    test_prepared_reclamations: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileReplicaCatalog {
         var self = FileReplicaCatalog{
@@ -911,6 +919,7 @@ pub const FileReplicaCatalog = struct {
         owner: *FileReplicaCatalog,
         expected_token: ReplicaCatalogToken,
         next: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
+        retired: std.AutoHashMapUnmanaged(u64, ReplicaRecord) = .empty,
         staging_path: ?[]u8 = null,
         changed: bool,
         commit_attempted: bool = false,
@@ -946,12 +955,11 @@ pub const FileReplicaCatalog = struct {
             // reflect it even if the following directory sync reports an
             // error. This avoids allowing a later write to resurrect the
             // pre-rename ownership set.
-            var previous = self.owner.records;
+            self.retired = self.owner.records;
             self.owner.records = self.next;
             self.next = .empty;
             self.map_transferred = true;
             self.owner.current_revision = next_revision;
-            deinitReplicaMap(self.owner.alloc, &previous);
             try fs_paths.syncDirPortable(
                 self.owner.io(),
                 std.fs.path.dirname(self.owner.path) orelse ".",
@@ -962,6 +970,9 @@ pub const FileReplicaCatalog = struct {
         fn deinitOpaque(ptr: *anyopaque) void {
             const self: *PreparedBatch = @ptrCast(@alignCast(ptr));
             if (!self.map_transferred) deinitReplicaMap(self.owner.alloc, &self.next);
+            if (builtin.is_test and self.retired.count() != 0)
+                self.owner.test_prepared_reclamations += 1;
+            deinitReplicaMap(self.owner.alloc, &self.retired);
             if (self.staging_path) |path| {
                 if (!self.staging_published) {
                     if (std.fs.path.isAbsolute(path)) {
@@ -1577,6 +1588,24 @@ test "memory replica catalog batch is revision fenced and publishes atomically" 
     }
 }
 
+test "prepared memory catalog reclaims retired maps after publication" {
+    var replica_catalog = MemoryReplicaCatalog.init(std.testing.allocator);
+    defer replica_catalog.deinit();
+    const iface = replica_catalog.catalog();
+
+    try iface.upsertReplica(.{ .group_id = 21, .replica_id = 1, .local_node_id = 3 });
+    var prepared = try iface.prepareBatch(iface.token(), &.{}, &.{21});
+    var prepared_live = true;
+    defer if (prepared_live) prepared.deinit();
+    _ = try prepared.commit();
+    try std.testing.expectEqual(@as(usize, 0), replica_catalog.test_prepared_reclamations);
+    try std.testing.expect(!iface.containsReplica(21));
+
+    prepared.deinit();
+    prepared_live = false;
+    try std.testing.expectEqual(@as(usize, 1), replica_catalog.test_prepared_reclamations);
+}
+
 test "file replica catalog prepares durable images without publishing stale ownership" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1604,13 +1633,20 @@ test "file replica catalog prepares durable images without publishing stale owne
         try std.testing.expect(iface.containsReplica(41));
         try std.testing.expect(iface.containsReplica(43));
 
-        var current = try iface.prepareBatch(iface.token(), &.{}, &.{41});
-        defer current.deinit();
-        const committed = try current.commit();
-        try std.testing.expectEqual(committed.revision, iface.revision());
-        try std.testing.expect(!iface.containsReplica(41));
-        try std.testing.expect(iface.containsReplica(42));
-        try std.testing.expect(iface.containsReplica(43));
+        {
+            var current = try iface.prepareBatch(iface.token(), &.{}, &.{41});
+            var current_live = true;
+            defer if (current_live) current.deinit();
+            const committed = try current.commit();
+            try std.testing.expectEqual(committed.revision, iface.revision());
+            try std.testing.expect(!iface.containsReplica(41));
+            try std.testing.expect(iface.containsReplica(42));
+            try std.testing.expect(iface.containsReplica(43));
+            try std.testing.expectEqual(@as(usize, 0), replica_catalog.test_prepared_reclamations);
+            current.deinit();
+            current_live = false;
+            try std.testing.expectEqual(@as(usize, 1), replica_catalog.test_prepared_reclamations);
+        }
     }
 
     const crash_debris = try std.fmt.allocPrint(

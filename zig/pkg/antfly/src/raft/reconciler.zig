@@ -311,6 +311,56 @@ pub const ReconcileFailure = struct {
 
 pub const max_reconcile_failure_details: usize = 32;
 
+const FailureAggregate = struct {
+    failure: ReconcileFailure,
+    detail_index: ?u8,
+};
+
+/// Per-round exact failure accounting. Operator-facing details remain bounded,
+/// while the scratch map prevents repeated failures for an omitted group from
+/// inflating the unique-group metric. Capacity is reserved during planning so
+/// recording a failure never allocates inside a publication phase.
+const FailureAccumulator = struct {
+    groups: std.AutoHashMapUnmanaged(u64, FailureAggregate) = .empty,
+
+    fn deinit(self: *FailureAccumulator, alloc: std.mem.Allocator) void {
+        self.groups.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn record(
+        self: *FailureAccumulator,
+        result: *ReconcileResult,
+        failure: ReconcileFailure,
+    ) void {
+        result.placement_incomplete = result.placement_incomplete or failure.phase != .routes;
+        const entry = self.groups.getOrPutAssumeCapacity(failure.group_id);
+        if (!entry.found_existing) {
+            const detail_index: ?u8 = if (result.failure_detail_count < result.failure_details.len)
+                @intCast(result.failure_detail_count)
+            else
+                null;
+            entry.value_ptr.* = .{ .failure = failure, .detail_index = detail_index };
+            result.failed_groups += 1;
+            if (detail_index) |index| {
+                result.failure_details[index] = failure;
+                result.failure_detail_count += 1;
+            }
+            result.omitted_failure_details = result.failed_groups - result.failure_detail_count;
+            return;
+        }
+
+        const existing_domain = failureDomainForPhase(entry.value_ptr.failure.phase);
+        const new_domain = failureDomainForPhase(failure.phase);
+        if (existing_domain == new_domain or
+            failureDomainPriority(new_domain) < failureDomainPriority(existing_domain))
+        {
+            entry.value_ptr.failure = failure;
+            if (entry.value_ptr.detail_index) |index| result.failure_details[index] = failure;
+        }
+    }
+};
+
 pub const ReconcileResult = struct {
     ensured: usize = 0,
     removed: usize = 0,
@@ -343,26 +393,12 @@ pub const ReconcileResult = struct {
         return self.failure_details[0..self.failure_detail_count];
     }
 
-    fn recordFailure(self: *ReconcileResult, failure: ReconcileFailure) void {
-        self.placement_incomplete = self.placement_incomplete or failure.phase != .routes;
-        for (self.failure_details[0..self.failure_detail_count]) |*existing| {
-            if (existing.group_id != failure.group_id) continue;
-            const existing_domain = failureDomainForPhase(existing.phase);
-            const new_domain = failureDomainForPhase(failure.phase);
-            if (existing_domain == new_domain or
-                failureDomainPriority(new_domain) < failureDomainPriority(existing_domain))
-            {
-                existing.* = failure;
-            }
-            return;
-        }
-        self.failed_groups += 1;
-        if (self.failure_detail_count == self.failure_details.len) {
-            self.omitted_failure_details += 1;
-            return;
-        }
-        self.failure_details[self.failure_detail_count] = failure;
-        self.failure_detail_count += 1;
+    fn recordFailure(
+        self: *ReconcileResult,
+        accumulator: *FailureAccumulator,
+        failure: ReconcileFailure,
+    ) void {
+        accumulator.record(self, failure);
     }
 
     fn recordMembership(self: *ReconcileResult, outcome: MembershipConvergence) void {
@@ -502,6 +538,7 @@ pub const PreparedLiveConvergence = struct {
     route_groups: []PreparedRouteGroup,
     route_peers: []PreparedRoutePeer,
     policies: []PreparedPolicyValidation,
+    failure_accumulator: FailureAccumulator,
     prepared: bool = false,
     committed: bool = false,
 
@@ -515,6 +552,7 @@ pub const PreparedLiveConvergence = struct {
         self.owner.alloc.free(self.route_groups);
         self.owner.alloc.free(self.route_peers);
         self.owner.alloc.free(self.policies);
+        self.failure_accumulator.deinit(self.owner.alloc);
         self.* = undefined;
     }
 
@@ -545,6 +583,7 @@ pub const PreparedLiveConvergence = struct {
 
     pub fn commit(self: *PreparedLiveConvergence, result: *ReconcileResult) !void {
         if (!self.prepared or self.committed) return error.InvalidReconcilePhase;
+        const failures = &self.failure_accumulator;
         for (self.route_groups) |group| {
             const intent = self.intents[group.intent_index];
             // Route publication belongs to the live-runtime phase. A catalog
@@ -576,7 +615,7 @@ pub const PreparedLiveConvergence = struct {
             result.refreshed_peers += refreshed;
             self.owner.recordRouteRefreshResult(intent.record.group_id, last_error);
             if (last_error) |err| {
-                self.owner.recordGroupFailure(result, intent.record.group_id, .routes, err);
+                self.owner.recordGroupFailure(result, failures, intent.record.group_id, .routes, err);
             } else {
                 self.owner.clearGroupFailure(intent.record.group_id, .routes);
             }
@@ -585,13 +624,13 @@ pub const PreparedLiveConvergence = struct {
             const intent = self.intents[policy.intent_index];
             if (policy.prepare_error) |err| {
                 self.owner.recordPolicyValidationResult(intent.record.group_id, null, err);
-                self.owner.recordGroupFailure(result, intent.record.group_id, .admission_classify, err);
+                self.owner.recordGroupFailure(result, failures, intent.record.group_id, .admission_classify, err);
                 continue;
             }
             const prepared = if (policy.prepared) |*value| value else continue;
             const conflict = self.owner.host.commitReplicaAdmissionValidation(prepared) catch |err| {
                 self.owner.recordPolicyValidationResult(intent.record.group_id, null, err);
-                self.owner.recordGroupFailure(result, intent.record.group_id, .admission_classify, err);
+                self.owner.recordGroupFailure(result, failures, intent.record.group_id, .admission_classify, err);
                 continue;
             };
             self.owner.recordPolicyValidationResult(intent.record.group_id, conflict != null, null);
@@ -761,7 +800,8 @@ pub const PreparedReconcile = struct {
     pub fn publishLive(self: *PreparedReconcile) !void {
         if (!self.admission_commit_complete or self.live_commit_complete or self.committed or self.aborted)
             return error.InvalidReconcilePhase;
-        for (self.deferred_failures) |failure| self.result.recordFailure(failure);
+        for (self.deferred_failures) |failure|
+            self.result.recordFailure(&self.live.failure_accumulator, failure);
         for (self.catalog_upserts[0..self.catalog_upsert_count]) |record|
             self.owner.clearGroupFailure(record.group_id, .catalog_admission);
         for (self.ensures) |*entry| {
@@ -784,7 +824,7 @@ pub const PreparedReconcile = struct {
             }
             const prepared = if (entry.replica) |*replica| replica else return error.InvalidReconcilePhase;
             _ = self.owner.host.installPreparedReplica(intent.record, prepared) catch |err| {
-                self.owner.recordIntentFailure(&self.result, intent.record.group_id, entry.intent_hash, .live_install, err);
+                self.owner.recordIntentFailure(&self.result, &self.live.failure_accumulator, intent.record.group_id, entry.intent_hash, .live_install, err);
                 continue;
             };
             self.result.ensured += 1;
@@ -798,7 +838,7 @@ pub const PreparedReconcile = struct {
         for (self.intents) |intent| {
             if (!self.owner.host.hasReplica(intent.record.group_id)) continue;
             const outcome = self.owner.reconcileRaftMembership(intent) catch |err| {
-                self.owner.recordGroupFailure(&self.result, intent.record.group_id, .membership, err);
+                self.owner.recordGroupFailure(&self.result, &self.live.failure_accumulator, intent.record.group_id, .membership, err);
                 continue;
             };
             self.owner.membership_convergence.putAssumeCapacity(intent.record.group_id, outcome);
@@ -865,6 +905,7 @@ pub const PreparedReconcile = struct {
         ) |record, intent_hash| {
             self.owner.recordGroupFailureImpl(
                 &self.result,
+                &self.live.failure_accumulator,
                 record.group_id,
                 intent_hash,
                 .catalog_admission,
@@ -893,6 +934,7 @@ pub const PreparedReconcile = struct {
             self.owner.host.noteReplicaBootstrapPreparationFailure(intent.record, err);
         self.owner.recordIntentFailure(
             &self.result,
+            &self.live.failure_accumulator,
             intent.record.group_id,
             entry.intent_hash,
             entry.failure_phase,
@@ -903,7 +945,7 @@ pub const PreparedReconcile = struct {
 
     pub fn noteRetirementDurabilityFailure(self: *PreparedReconcile, err: anyerror) void {
         for (self.removals) |group_id|
-            self.owner.recordGroupFailure(&self.result, group_id, .catalog_retirement, err);
+            self.owner.recordGroupFailure(&self.result, &self.live.failure_accumulator, group_id, .catalog_retirement, err);
     }
 
     /// Prevents a stale desired-state snapshot from retiring ownership after
@@ -922,6 +964,7 @@ pub const PreparedReconcile = struct {
             for (self.removals) |group_id| {
                 self.owner.recordGroupFailure(
                     &self.result,
+                    &self.live.failure_accumulator,
                     group_id,
                     .catalog_retirement,
                     error.RetirementPrerequisitePending,
@@ -938,7 +981,7 @@ pub const PreparedReconcile = struct {
         for (self.removals) |group_id| {
             if (self.owner.host.hasReplica(group_id)) {
                 self.owner.host.removePreparedReplica(group_id) catch |err| {
-                    self.owner.recordGroupFailure(&self.result, group_id, .live_retirement, err);
+                    self.owner.recordGroupFailure(&self.result, &self.live.failure_accumulator, group_id, .live_retirement, err);
                     continue;
                 };
             }
@@ -1165,12 +1208,18 @@ pub const Reconciler = struct {
         errdefer self.alloc.free(owned_route_peers);
         const owned_policies = try policies.toOwnedSlice(self.alloc);
         errdefer self.alloc.free(owned_policies);
+        var failure_accumulator: FailureAccumulator = .{};
+        errdefer failure_accumulator.deinit(self.alloc);
+        const failure_capacity = std.math.cast(u32, intents.len) orelse
+            return error.TooManyPlacementIntents;
+        try failure_accumulator.groups.ensureTotalCapacity(self.alloc, failure_capacity);
         return .{
             .owner = self,
             .intents = intents,
             .route_groups = owned_route_groups,
             .route_peers = owned_route_peers,
             .policies = owned_policies,
+            .failure_accumulator = failure_accumulator,
         };
     }
 
@@ -1392,6 +1441,11 @@ pub const Reconciler = struct {
         for (owned_ensures) |entry| force_routes[entry.intent_index] = true;
         var live = try self.buildLiveConvergence(intents, force_routes);
         errdefer live.deinit();
+        const failure_capacity = std.math.cast(
+            u32,
+            intents.len +| owned_removals.len +| owned_deferred_failures.len,
+        ) orelse return error.TooManyPlacementIntents;
+        try live.failure_accumulator.groups.ensureTotalCapacity(self.alloc, failure_capacity);
         return .{
             .owner = self,
             .intents = intents,
@@ -1421,27 +1475,30 @@ pub const Reconciler = struct {
     fn recordGroupFailure(
         self: *Reconciler,
         result: *ReconcileResult,
+        failures: *FailureAccumulator,
         group_id: u64,
         phase: ReconcileFailurePhase,
         err: anyerror,
     ) void {
-        self.recordGroupFailureImpl(result, group_id, null, phase, err);
+        self.recordGroupFailureImpl(result, failures, group_id, null, phase, err);
     }
 
     fn recordIntentFailure(
         self: *Reconciler,
         result: *ReconcileResult,
+        failures: *FailureAccumulator,
         group_id: u64,
         intent_hash: u64,
         phase: ReconcileFailurePhase,
         err: anyerror,
     ) void {
-        self.recordGroupFailureImpl(result, group_id, intent_hash, phase, err);
+        self.recordGroupFailureImpl(result, failures, group_id, intent_hash, phase, err);
     }
 
     fn recordGroupFailureImpl(
         self: *Reconciler,
         result: *ReconcileResult,
+        failures: *FailureAccumulator,
         group_id: u64,
         intent_hash: ?u64,
         phase: ReconcileFailurePhase,
@@ -1469,7 +1526,7 @@ pub const Reconciler = struct {
             .attempts = attempts,
             .next_retry_ns = next_retry_ns,
         });
-        result.recordFailure(.{
+        result.recordFailure(failures, .{
             .group_id = group_id,
             .phase = phase,
             .classification = classification,
@@ -1720,11 +1777,17 @@ fn classifyReconcileFailure(
 }
 
 test "reconcile result bounds failure details while preserving failure count" {
+    var accumulator: FailureAccumulator = .{};
+    defer accumulator.deinit(std.testing.allocator);
+    try accumulator.groups.ensureTotalCapacity(
+        std.testing.allocator,
+        max_reconcile_failure_details + 1,
+    );
     var result: ReconcileResult = .{};
     for (0..max_reconcile_failure_details + 1) |index| {
-        result.recordFailure(.{
+        result.recordFailure(&accumulator, .{
             .group_id = @intCast(index + 1),
-            .phase = .live_install,
+            .phase = if (index == max_reconcile_failure_details) .routes else .live_install,
             .classification = .retryable,
             .err = error.InjectedFailure,
         });
@@ -1733,7 +1796,7 @@ test "reconcile result bounds failure details while preserving failure count" {
     try std.testing.expectEqual(max_reconcile_failure_details, result.failures().len);
     try std.testing.expectEqual(@as(usize, 1), result.omitted_failure_details);
 
-    result.recordFailure(.{
+    result.recordFailure(&accumulator, .{
         .group_id = 1,
         .phase = .routes,
         .classification = .retryable,
@@ -1742,6 +1805,28 @@ test "reconcile result bounds failure details while preserving failure count" {
     try std.testing.expectEqual(max_reconcile_failure_details + 1, result.failed_groups);
     try std.testing.expectEqual(ReconcileFailurePhase.live_install, result.failures()[0].phase);
     try std.testing.expectEqual(@as(usize, 1), result.omitted_failure_details);
+
+    // The omitted group is tracked in the exact scratch map even though it has
+    // no retained detail slot. Repeated domains must not turn the unique-group
+    // metric or omitted count into event counters.
+    result.recordFailure(&accumulator, .{
+        .group_id = max_reconcile_failure_details + 1,
+        .phase = .routes,
+        .classification = .retryable,
+        .err = error.UpdatedFailure,
+    });
+    result.recordFailure(&accumulator, .{
+        .group_id = max_reconcile_failure_details + 1,
+        .phase = .catalog_retirement,
+        .classification = .retryable,
+        .err = error.UpdatedFailure,
+    });
+    try std.testing.expectEqual(max_reconcile_failure_details + 1, result.failed_groups);
+    try std.testing.expectEqual(@as(usize, 1), result.omitted_failure_details);
+    try std.testing.expectEqual(
+        ReconcileFailurePhase.catalog_retirement,
+        accumulator.groups.get(max_reconcile_failure_details + 1).?.failure.phase,
+    );
 }
 
 test "reconcile retry domains preserve admission backoff and primary diagnostics" {
@@ -1757,9 +1842,13 @@ test "reconcile retry domains preserve admission backoff and primary diagnostics
     defer owner.deinit();
     try owner.ensureConvergenceCapacity(1);
 
+    var accumulator: FailureAccumulator = .{};
+    defer accumulator.deinit(std.testing.allocator);
+    try accumulator.groups.ensureTotalCapacity(std.testing.allocator, 1);
     var result: ReconcileResult = .{};
     owner.recordIntentFailure(
         &result,
+        &accumulator,
         71,
         0xabc,
         .admission_prepare,
@@ -1767,8 +1856,8 @@ test "reconcile retry domains preserve admission backoff and primary diagnostics
     );
     const admission_deadline = owner.failureDiagnosticsForDomain(71, .admission).?.next_retry_ns;
     try std.testing.expect(admission_deadline != 0);
-    owner.recordGroupFailure(&result, 71, .routes, error.NoPeerEndpoints);
-    owner.recordGroupFailure(&result, 71, .membership, error.NotLeader);
+    owner.recordGroupFailure(&result, &accumulator, 71, .routes, error.NoPeerEndpoints);
+    owner.recordGroupFailure(&result, &accumulator, 71, .membership, error.NotLeader);
 
     try std.testing.expectEqual(
         ReconcileFailurePhase.admission_prepare,

@@ -767,14 +767,13 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
 
     before_chunks = before_scan[0]["_chunks"]["semantic_chunked_idx_chunks"]
     assert len(before_chunks) >= 2
-    backup_api.wait_index_ready(
+    before_status = backup_api.wait_index_ready(
         table_name,
         "semantic_chunked_idx",
         timeout_s=60.0,
         interval_s=0.5,
         require_query_fresh=True,
     )
-    before_status = backup_api.get_index(table_name, "semantic_chunked_idx")["status"]
     before_readiness_incarnation = before_status["readiness"]["incarnation"]
     before_coverage = {
         key: before_status["coverage"][key]
@@ -829,16 +828,13 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
         assert restored_doc is not None
         assert restored_doc["title"] == "Alpha backup"
 
-        backup_api.wait_index_ready(
+        after_status = backup_api.wait_index_ready(
             table_name,
             "semantic_chunked_idx",
             timeout_s=180.0,
             interval_s=1.0,
             require_query_fresh=True,
         )
-        after_status = backup_api.get_index(table_name, "semantic_chunked_idx")[
-            "status"
-        ]
         if backup_format == "native":
             assert (
                 after_status["readiness"]["incarnation"] == before_readiness_incarnation

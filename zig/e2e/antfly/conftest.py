@@ -322,11 +322,31 @@ def ready_index_status(
         return None
     if status.get("error"):
         return None
+    # `readiness` is the authoritative, incarnation-scoped contract. Prefer
+    # it over the legacy activity flags so a polling client cannot mistake a
+    # queryable or still-running generation for complete readiness.
+    readiness = status.get("readiness")
+    if isinstance(readiness, dict):
+        if readiness.get("state") != "ready":
+            return None
+        if readiness.get("queryable") is not True or readiness.get("complete") is not True:
+            return None
+        published_revision = readiness.get("published_revision")
+        target_revision = readiness.get("target_revision")
+        if (
+            type(published_revision) is not int
+            or type(target_revision) is not int
+            or published_revision < target_revision
+        ):
+            return None
+    elif "backfill_state" in status and status.get("backfill_state") != "ready":
+        # Compatibility for older servers that predate canonical readiness.
+        # Presence of the field is meaningful: running/retrying/degraded are
+        # all incomplete, not merely non-terminal alternatives to `failed`.
+        return None
     if status.get("materialization_blocked", False):
         return None
     if status.get("rebuilding", status.get("backfill_active", False)):
-        return None
-    if status.get("backfill_state") == "failed":
         return None
     if isinstance(status.get("repair"), dict):
         return None
