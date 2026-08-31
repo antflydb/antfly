@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const metadata_state = @import("state.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const extension_domain = @import("../extensions/mod.zig");
@@ -319,6 +320,9 @@ pub const catalog_route_fence_protocol_current: u16 = 1;
 pub const catalog_route_fence_header = "X-Antfly-Catalog-Route-Fence";
 pub const catalog_route_fence_ack_header = "X-Antfly-Catalog-Route-Fence-Ack";
 pub const catalog_route_fence_ack_value = "1";
+pub const catalog_route_deadline_ms_header = "X-Antfly-Catalog-Route-Deadline-Ms";
+pub const catalog_route_default_deadline_ms: u32 = 5_000;
+pub const catalog_route_max_deadline_ms: u32 = 30_000;
 
 /// Immutable authority and identity carried with every first-party
 /// group-local read. The receiver validates this against its compact routing
@@ -332,6 +336,50 @@ pub const CatalogRouteFence = struct {
     table_id: u64,
     topology_epoch: u64,
     route: CatalogGroupRoute,
+    /// Receiver-local admission context. These fields are intentionally
+    /// excluded from the wire representation: monotonic clocks and borrowed
+    /// cancellation callbacks are process-local capabilities.
+    admission_deadline_ns: ?u64 = null,
+    admission_cancellation: CancellationToken = .none,
+
+    const Wire = struct {
+        protocol: u16 = catalog_route_fence_protocol_current,
+        metadata_group_id: u64,
+        metadata_incarnation: ?MetadataClusterIncarnation = null,
+        catalog_revision: u64,
+        table_id: u64,
+        topology_epoch: u64,
+        route: CatalogGroupRoute,
+    };
+
+    fn wire(self: @This()) Wire {
+        return .{
+            .protocol = self.protocol,
+            .metadata_group_id = self.metadata_group_id,
+            .metadata_incarnation = self.metadata_incarnation,
+            .catalog_revision = self.catalog_revision,
+            .table_id = self.table_id,
+            .topology_epoch = self.topology_epoch,
+            .route = self.route,
+        };
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.write(self.wire());
+    }
+
+    pub fn jsonParse(alloc: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(Wire, alloc, source, options);
+        return .{
+            .protocol = value.protocol,
+            .metadata_group_id = value.metadata_group_id,
+            .metadata_incarnation = value.metadata_incarnation,
+            .catalog_revision = value.catalog_revision,
+            .table_id = value.table_id,
+            .topology_epoch = value.topology_epoch,
+            .route = value.route,
+        };
+    }
 
     pub fn validate(self: @This()) !void {
         if (self.protocol != catalog_route_fence_protocol_current) return error.UnsupportedCatalogRouteFence;

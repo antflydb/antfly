@@ -44,13 +44,19 @@ pub const CatalogProjectionReader = struct {
     };
 
     pub const Snapshot = struct {
+        const RangeSpan = struct { start: usize, len: usize };
+
         metadata_incarnation: ?metadata_api.MetadataClusterIncarnation = null,
         catalog_revision: u64 = 0,
         tables: []metadata_table_manager.TableRecord = &.{},
         ranges: []metadata_table_manager.RangeRecord = &.{},
         index: metadata_api.CatalogProjectionIndex = .{},
+        table_name_indexes: std.StringHashMapUnmanaged(usize) = .empty,
+        table_range_spans: std.AutoHashMapUnmanaged(u64, RangeSpan) = .empty,
 
         pub fn deinit(self: *Snapshot, alloc: std.mem.Allocator) void {
+            self.table_name_indexes.deinit(alloc);
+            self.table_range_spans.deinit(alloc);
             self.index.deinit(alloc);
             freeTables(alloc, self.tables);
             freeRanges(alloc, self.ranges);
@@ -157,6 +163,67 @@ pub const CatalogProjectionReader = struct {
         };
     }
 
+    /// Clone only one table and its ranges from the shared immutable cache.
+    /// Indexed lookup is constant-time and allocation/copy cost scales with
+    /// the selected table rather than total tenant count.
+    pub fn tableRoutingSnapshot(
+        self: *CatalogProjectionReader,
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64,
+        source: Source,
+        table_name: []const u8,
+        deadline_ns: ?u64,
+    ) !metadata_api.CatalogRoutingSnapshot {
+        if (!self.lockUntil(deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        defer self.unlock();
+
+        const snapshot = try self.validationSnapshotLocked(alloc, metadata_group_id, source, deadline_ns);
+        const table_index = snapshot.table_name_indexes.get(table_name) orelse return .{
+            .metadata_group_id = metadata_group_id,
+            .metadata_incarnation = snapshot.metadata_incarnation,
+            .catalog_revision = snapshot.catalog_revision,
+            .change_token = .{
+                .metadata_group_id = metadata_group_id,
+                .metadata_incarnation = snapshot.metadata_incarnation,
+                .revision = snapshot.catalog_revision,
+            },
+            .tables = &.{},
+            .ranges = &.{},
+        };
+        const table = snapshot.tables[table_index];
+
+        const tables = try alloc.alloc(metadata_table_manager.TableRecord, 1);
+        errdefer alloc.free(tables);
+        tables[0] = try metadata_table_manager.cloneRoutingTable(alloc, table);
+        errdefer metadata_table_manager.freeTable(alloc, tables[0]);
+        const span = snapshot.table_range_spans.get(table.table_id) orelse .{ .start = 0, .len = 0 };
+        const table_ranges = snapshot.ranges[span.start..][0..span.len];
+        const ranges = try alloc.alloc(metadata_table_manager.RangeRecord, table_ranges.len);
+        var cloned: usize = 0;
+        errdefer {
+            for (ranges[0..cloned]) |range| metadata_table_manager.freeRange(alloc, range);
+            alloc.free(ranges);
+        }
+        for (table_ranges) |range| {
+            try ensureBeforeDeadline(deadline_ns);
+            ranges[cloned] = try metadata_table_manager.cloneRoutingRange(alloc, range);
+            cloned += 1;
+        }
+        try ensureBeforeDeadline(deadline_ns);
+        return .{
+            .metadata_group_id = metadata_group_id,
+            .metadata_incarnation = snapshot.metadata_incarnation,
+            .catalog_revision = snapshot.catalog_revision,
+            .change_token = .{
+                .metadata_group_id = metadata_group_id,
+                .metadata_incarnation = snapshot.metadata_incarnation,
+                .revision = snapshot.catalog_revision,
+            },
+            .tables = tables,
+            .ranges = ranges,
+        };
+    }
+
     pub fn freeRoutingSnapshot(
         _: *CatalogProjectionReader,
         alloc: std.mem.Allocator,
@@ -190,10 +257,35 @@ pub const CatalogProjectionReader = struct {
         snapshot.catalog_revision = projected.catalog_revision;
         snapshot.tables = projected.tables;
         snapshot.ranges = projected.ranges;
+        std.sort.pdq(metadata_table_manager.RangeRecord, snapshot.ranges, {}, rangeLessThan);
         snapshot.index = try metadata_api.CatalogProjectionIndex.init(alloc, snapshot.tables, snapshot.ranges);
+        try snapshot.table_name_indexes.ensureTotalCapacity(alloc, @intCast(snapshot.tables.len));
+        try snapshot.table_range_spans.ensureTotalCapacity(alloc, @intCast(snapshot.tables.len));
+        for (snapshot.tables, 0..) |table, index| {
+            if (snapshot.table_name_indexes.contains(table.name)) return error.InvalidCatalogProjection;
+            snapshot.table_name_indexes.putAssumeCapacity(table.name, index);
+        }
+        var first: usize = 0;
+        while (first < snapshot.ranges.len) {
+            var end = first + 1;
+            while (end < snapshot.ranges.len and snapshot.ranges[end].table_id == snapshot.ranges[first].table_id) : (end += 1) {}
+            const table_id = snapshot.ranges[first].table_id;
+            if (!snapshot.index.table_indexes.contains(table_id)) return error.InvalidCatalogProjection;
+            snapshot.table_range_spans.putAssumeCapacity(table_id, .{ .start = first, .len = end - first });
+            first = end;
+        }
         return snapshot;
     }
 };
+
+fn rangeLessThan(_: void, a: metadata_table_manager.RangeRecord, b: metadata_table_manager.RangeRecord) bool {
+    if (a.table_id != b.table_id) return a.table_id < b.table_id;
+    return switch (std.mem.order(u8, a.start_key, b.start_key)) {
+        .lt => true,
+        .gt => false,
+        .eq => a.group_id < b.group_id,
+    };
+}
 
 fn ensureBeforeDeadline(deadline_ns: ?u64) !void {
     if (deadline_ns) |deadline| {

@@ -39,9 +39,13 @@ pub const CatalogSource = struct {
         /// override the unsupported defaults; test doubles that never route may
         /// retain them without silently falling back to an admin snapshot.
         routing_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = unsupportedRoutingSnapshot,
+        /// Allocation-efficient point projection used by mutation routing.
+        /// It returns the same owned wire type with zero or one table.
+        table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         /// Compact projection captured after a linearizable read barrier. It
         /// is only required to confirm an eventual negative routing result.
         linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
+        linearizable_table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         /// Request-scoped route capabilities may pin DB identity through this
         /// callback. When present, consumers must not re-derive identity from
@@ -118,7 +122,9 @@ pub const CatalogSource = struct {
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
                 .routing_snapshot = metadataServiceRoutingSnapshot,
+                .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
+                .linearizable_table_routing_snapshot = metadataServiceLinearizableTableRoutingSnapshot,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServiceWaitForRoutingChange,
                 .requires_linearizable_publication_fence = true,
@@ -135,7 +141,9 @@ pub const CatalogSource = struct {
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
+                .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
+                .linearizable_table_routing_snapshot = metadataHttpServiceLinearizableTableRoutingSnapshot,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataHttpServiceWaitForRoutingChange,
                 .requires_linearizable_publication_fence = true,
@@ -152,7 +160,9 @@ pub const CatalogSource = struct {
                 .admin_snapshot = metadataServerAdminSnapshot,
                 .free_admin_snapshot = metadataServerFreeAdminSnapshot,
                 .routing_snapshot = metadataServerRoutingSnapshot,
+                .table_routing_snapshot = metadataServerTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServerLinearizableRoutingSnapshot,
+                .linearizable_table_routing_snapshot = metadataServerLinearizableTableRoutingSnapshot,
                 .free_routing_snapshot = metadataServerFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServerWaitForRoutingChange,
                 .requires_linearizable_publication_fence = true,
@@ -950,15 +960,42 @@ pub const AuthoritativeTableRoutingSnapshot = struct {
         }
         return null;
     }
+
+    pub fn coversKeyspace(self: *const @This()) bool {
+        if (self.ranges.len == 0 or self.ranges[0].start_key.len != 0) return false;
+        for (self.ranges[0 .. self.ranges.len - 1], self.ranges[1..]) |left, right| {
+            const end_key = left.end_key orelse return false;
+            if (std.mem.order(u8, left.start_key, end_key) != .lt) return false;
+            if (!std.mem.eql(u8, end_key, right.start_key)) return false;
+        }
+        const last = self.ranges[self.ranges.len - 1];
+        return last.end_key == null;
+    }
+
+    /// Materialize the complete immutable capability selected with a route.
+    /// The name of this container is retained for source compatibility, but
+    /// callers may obtain it from either the observed or authoritative compact
+    /// projection. Safety comes from validating this fence under mutation
+    /// admission at the data-Raft leader, not from making every coordinator
+    /// perform a metadata quorum read.
+    pub fn fenceForRoute(self: *const @This(), route: CatalogGroupRoute) metadata_api.CatalogRouteFence {
+        return .{
+            .metadata_group_id = self.snapshot.value.metadata_group_id,
+            .metadata_incarnation = self.snapshot.value.metadata_incarnation,
+            .catalog_revision = self.snapshot.value.catalog_revision,
+            .table_id = self.table_id,
+            .topology_epoch = self.topology_epoch,
+            .route = route,
+        };
+    }
 };
 
-pub fn authoritativeTableRoutingSnapshot(
+fn tableRoutingSnapshotFromOwned(
     alloc: std.mem.Allocator,
-    catalog: CatalogSource,
+    snapshot_value: OwnedRoutingSnapshot,
     table_name: []const u8,
-    deadline_ns: ?u64,
 ) !?AuthoritativeTableRoutingSnapshot {
-    var snapshot = try (try catalog.routingSource()).linearizableSnapshot(deadline_ns);
+    var snapshot = snapshot_value;
     errdefer snapshot.deinit();
     const table = findTableByName(snapshot.value.tables, table_name) orelse {
         snapshot.deinit();
@@ -978,6 +1015,80 @@ pub fn authoritativeTableRoutingSnapshot(
         .ranges = ranges,
         .topology_epoch = topologyEpochFromSortedRanges(table.*, ranges),
     };
+}
+
+/// Capture the latest locally observed compact projection for positive write
+/// routing. A stale capability is harmless because the mutation leader must
+/// validate it while holding structural admission before proposing it.
+pub fn observedTableRoutingSnapshot(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    deadline_ns: ?u64,
+) !?AuthoritativeTableRoutingSnapshot {
+    const routing = try catalog.routingSource();
+    return try tableRoutingSnapshotFromOwned(
+        alloc,
+        try routing.eventualSnapshot(deadline_ns),
+        table_name,
+    );
+}
+
+/// Fast positive routing with authoritative negative confirmation. This is
+/// the coordinator-side half of routed write admission: normal traffic reads
+/// the cached projection, while a missing table/range cannot be reported until
+/// a compact linearizable snapshot confirms it.
+pub fn tableRoutingSnapshotForWrite(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    deadline_ns: ?u64,
+) !?AuthoritativeTableRoutingSnapshot {
+    const point_capture = catalog.vtable.table_routing_snapshot;
+    const point_authority = catalog.vtable.linearizable_table_routing_snapshot;
+    if ((point_capture == null) != (point_authority == null)) {
+        return error.CatalogRoutingUnavailable;
+    }
+    if (point_capture != null and catalog.vtable.free_routing_snapshot == unsupportedFreeRoutingSnapshot) {
+        return error.CatalogRoutingUnavailable;
+    }
+    const projection_source = CatalogProjectionSource{
+        .ptr = catalog.ptr,
+        .snapshot = unsupportedRoutingSnapshot,
+        .free_snapshot = catalog.vtable.free_routing_snapshot,
+    };
+    const observed_value = if (point_capture) |capture|
+        try tableRoutingSnapshotFromOwned(alloc, .{
+            .source = projection_source,
+            .value = try capture(catalog.ptr, table_name, deadline_ns),
+        }, table_name)
+    else
+        try observedTableRoutingSnapshot(alloc, catalog, table_name, deadline_ns);
+    if (observed_value) |value| {
+        var observed = value;
+        if (observed.coversKeyspace()) return observed;
+        observed.deinit(alloc);
+    }
+    if (point_authority) |capture|
+        return try tableRoutingSnapshotFromOwned(alloc, .{
+            .source = projection_source,
+            .value = try capture(catalog.ptr, table_name, deadline_ns),
+        }, table_name);
+    return try authoritativeTableRoutingSnapshot(alloc, catalog, table_name, deadline_ns);
+}
+
+pub fn authoritativeTableRoutingSnapshot(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    deadline_ns: ?u64,
+) !?AuthoritativeTableRoutingSnapshot {
+    const routing = try catalog.routingSource();
+    return try tableRoutingSnapshotFromOwned(
+        alloc,
+        try routing.linearizableSnapshot(deadline_ns),
+        table_name,
+    );
 }
 
 /// Owns one catalog snapshot and its sorted table-range projection for the
@@ -1148,6 +1259,8 @@ test "routing topology epoch fences identity-only changes" {
 
 test "authoritative write routing pins keys and identity in one compact snapshot" {
     const State = struct {
+        eventual_calls: usize = 0,
+        point_calls: usize = 0,
         linearizable_calls: usize = 0,
         free_calls: usize = 0,
 
@@ -1162,7 +1275,9 @@ test "authoritative write routing pins keys and identity in one compact snapshot
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
                 .routing_snapshot = eventualSnapshot,
+                .table_routing_snapshot = tableSnapshot,
                 .linearizable_routing_snapshot = linearizableSnapshot,
+                .linearizable_table_routing_snapshot = linearizableTableSnapshot,
                 .free_routing_snapshot = freeRoutingSnapshot,
             } };
         }
@@ -1173,8 +1288,22 @@ test "authoritative write routing pins keys and identity in one compact snapshot
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
-        fn eventualSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
-            return error.EventualSnapshotUsedForWriteRouting;
+        fn eventualSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.eventual_calls += 1;
+            return .{
+                .metadata_group_id = 3,
+                .catalog_revision = 18,
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn tableSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.point_calls += 1;
+            return eventualSnapshot(ptr, deadline_ns);
         }
 
         fn linearizableSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
@@ -1185,6 +1314,10 @@ test "authoritative write routing pins keys and identity in one compact snapshot
                 .tables = @constCast(tables[0..]),
                 .ranges = @constCast(ranges[0..]),
             };
+        }
+
+        fn linearizableTableSnapshot(ptr: *anyopaque, _: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return linearizableSnapshot(ptr, deadline_ns);
         }
 
         fn freeRoutingSnapshot(ptr: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {
@@ -1212,6 +1345,24 @@ test "authoritative write routing pins keys and identity in one compact snapshot
     }
     try std.testing.expectEqual(@as(usize, 1), state.linearizable_calls);
     try std.testing.expectEqual(@as(usize, 1), state.free_calls);
+    {
+        var routing = (try tableRoutingSnapshotForWrite(
+            std.testing.allocator,
+            state.source(),
+            "docs",
+            null,
+        )).?;
+        defer routing.deinit(std.testing.allocator);
+        const route = routing.resolveRouteForKey("a").?;
+        const fence = routing.fenceForRoute(route);
+        try std.testing.expectEqual(@as(u64, 3), fence.metadata_group_id);
+        try std.testing.expectEqual(@as(u64, 18), fence.catalog_revision);
+        try std.testing.expectEqual(@as(u64, 7001), fence.route.group_id);
+    }
+    try std.testing.expectEqual(@as(usize, 1), state.eventual_calls);
+    try std.testing.expectEqual(@as(usize, 1), state.point_calls);
+    try std.testing.expectEqual(@as(usize, 1), state.linearizable_calls);
+    try std.testing.expectEqual(@as(usize, 2), state.free_calls);
 }
 
 pub fn transactionTopologyEpoch(
@@ -1996,11 +2147,27 @@ fn metadataServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_
     return try svc.catalogRoutingSnapshot(deadline_ns);
 }
 
+fn metadataServiceTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    return try svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
+}
+
 fn metadataServiceLinearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     return try metadata_service.linearizableCatalogRoutingSnapshot(metadata_service.MetadataService, svc, .{
         .deadline_ns = deadline_ns,
     });
+}
+
+fn metadataServiceLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+        error.DeadlineExceeded,
+        error.MetadataLinearizableReadTimeout,
+        => return error.CatalogRoutingSnapshotTimeout,
+        else => return err,
+    };
+    return try svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
 }
 
 fn metadataServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -2042,11 +2209,27 @@ fn metadataHttpServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metad
     return try svc.catalogRoutingSnapshot(deadline_ns);
 }
 
+fn metadataHttpServiceTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    return try svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
+}
+
 fn metadataHttpServiceLinearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     return try metadata_service.linearizableCatalogRoutingSnapshot(metadata_service.MetadataHttpService, svc, .{
         .deadline_ns = deadline_ns,
     });
+}
+
+fn metadataHttpServiceLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+        error.DeadlineExceeded,
+        error.MetadataLinearizableReadTimeout,
+        => return error.CatalogRoutingSnapshotTimeout,
+        else => return err,
+    };
+    return try svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
 }
 
 fn metadataHttpServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -2088,11 +2271,27 @@ fn metadataServerRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_a
     return try srv.svc.catalogRoutingSnapshot(deadline_ns);
 }
 
+fn metadataServerTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    return try srv.svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
+}
+
 fn metadataServerLinearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     return try metadata_service.linearizableCatalogRoutingSnapshot(metadata_service.MetadataHttpService, srv.svc, .{
         .deadline_ns = deadline_ns,
     });
+}
+
+fn metadataServerLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    srv.svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+        error.DeadlineExceeded,
+        error.MetadataLinearizableReadTimeout,
+        => return error.CatalogRoutingSnapshotTimeout,
+        else => return err,
+    };
+    return try srv.svc.catalogTableRoutingSnapshot(table_name, deadline_ns);
 }
 
 fn metadataServerFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {

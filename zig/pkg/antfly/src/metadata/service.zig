@@ -3134,6 +3134,16 @@ pub const MetadataService = struct {
         );
     }
 
+    pub fn catalogTableRoutingSnapshot(self: *MetadataService, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        return try self.catalog_projection_reader.tableRoutingSnapshot(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            table_name,
+            deadline_ns,
+        );
+    }
+
     pub fn freeCatalogRoutingSnapshot(self: *MetadataService, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
         self.catalog_projection_reader.freeRoutingSnapshot(self.alloc, snapshot);
     }
@@ -5915,6 +5925,16 @@ pub const MetadataHttpService = struct {
             self.alloc,
             self.metadata_group_id,
             self.catalogProjectionSource(),
+            deadline_ns,
+        );
+    }
+
+    pub fn catalogTableRoutingSnapshot(self: *MetadataHttpService, table_name: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        return try self.catalog_projection_reader.tableRoutingSnapshot(
+            self.alloc,
+            self.metadata_group_id,
+            self.catalogProjectionSource(),
+            table_name,
             deadline_ns,
         );
     }

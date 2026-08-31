@@ -58,6 +58,11 @@ const query_contract = @import("query_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const table_read_source = @import("table_read_source.zig");
+
+fn earliestDeadline(a: ?u64, b: ?u64) ?u64 {
+    if (a) |left| return if (b) |right| @min(left, right) else left;
+    return b;
+}
 const http_route_helpers = @import("http_route_helpers.zig");
 
 fn publishRuntimeStatusGroupForTest(
@@ -3138,8 +3143,13 @@ pub const ProvisionedTableReadSource = struct {
         kind: ReadPreparation.Kind,
         expected_epoch: u64,
     ) !?ReadPreparation.Activity {
-        const deadline_ns = if (request) |value| provisionedConsistencyDeadline(value) else null;
+        const request_deadline_ns = if (request) |value| provisionedConsistencyDeadline(value) else null;
+        const deadline_ns = earliestDeadline(
+            request_deadline_ns,
+            if (self.expected_route_fence) |fence| fence.admission_deadline_ns else null,
+        );
         if (self.expected_route_fence) |fence| {
+            try fence.admission_cancellation.check();
             if (fence.route.group_id != group_id) return error.TopologyChanged;
             if (consistency != .stale) {
                 if (request) |gate_request| try self.prepareGroupsForReadAdmission(alloc, &.{group_id}, gate_request, consistency);
@@ -3153,6 +3163,7 @@ pub const ProvisionedTableReadSource = struct {
                 fence,
                 deadline_ns,
             );
+            try fence.admission_cancellation.check();
             return activity;
         }
         if (consistency == .stale) {
@@ -4302,15 +4313,23 @@ pub const HostedProvisionedTableReadSource = struct {
         defer if (encoded_fence) |value| alloc.free(value);
         var owned_headers: ?[]http_common.RequestHeader = null;
         defer if (owned_headers) |value| alloc.free(value);
+        var route_deadline_buf: [10]u8 = undefined;
         if (internalGroupIdFromUri(request.uri)) |group_id| {
             if (self.catalog.vtable.route_fence) |resolve| {
                 const fence = (try resolve(self.catalog.ptr, group_id)) orelse return error.CatalogRouteFenceRequired;
                 encoded_fence = try std.json.Stringify.valueAlloc(alloc, fence, .{});
-                const headers = try alloc.alloc(http_common.RequestHeader, request.headers.len + 1);
+                const headers = try alloc.alloc(http_common.RequestHeader, request.headers.len + 2);
                 @memcpy(headers[0..request.headers.len], request.headers);
                 headers[request.headers.len] = .{
                     .name = metadata_api.catalog_route_fence_header,
                     .value = encoded_fence.?,
+                };
+                headers[request.headers.len + 1] = .{
+                    .name = metadata_api.catalog_route_deadline_ms_header,
+                    .value = try std.fmt.bufPrint(&route_deadline_buf, "{d}", .{@min(
+                        request.timeout_ms orelse metadata_api.catalog_route_default_deadline_ms,
+                        metadata_api.catalog_route_max_deadline_ms,
+                    )}),
                 };
                 owned_headers = headers;
                 routed_request.headers = headers;
@@ -4364,7 +4383,9 @@ pub const HostedProvisionedTableReadSource = struct {
         routed: *HostedProvisionedTableReadSource,
     ) !void {
         try fence.validate();
-        try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, null);
+        try fence.admission_cancellation.check();
+        try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, fence.admission_deadline_ns);
+        try fence.admission_cancellation.check();
         pinned.* = routePinnedCatalogForFence(self.catalog, table_name, fence, route_storage);
         routed.* = self.*;
         routed.catalog = pinned.source();

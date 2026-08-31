@@ -5092,6 +5092,17 @@ pub const RaftBatcher = struct {
             req: db_mod.types.BatchRequest,
             cancellation: db_mod.types.CancellationToken,
         ) anyerror!void = null,
+        /// First-party public mutations must carry the immutable catalog
+        /// capability used to select this group. Implementations validate it
+        /// at the mutation leader immediately before Raft proposal.
+        batch_group_routed_with_cancellation: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            fence: metadata_api.CatalogRouteFence,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+            cancellation: db_mod.types.CancellationToken,
+        ) anyerror!void = null,
         batch_group_local: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -5138,6 +5149,20 @@ pub const RaftBatcher = struct {
         const fn_ptr = self.vtable.batch_group_with_cancellation orelse
             return try self.batchGroup(alloc, group_id, table_name, req);
         return try fn_ptr(self.ptr, alloc, group_id, table_name, req, cancellation);
+    }
+
+    pub fn batchGroupRoutedWithCancellation(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        cancellation: db_mod.types.CancellationToken,
+    ) !void {
+        const fn_ptr = self.vtable.batch_group_routed_with_cancellation orelse
+            return error.CatalogRouteFenceUnsupported;
+        try fence.validate();
+        return try fn_ptr(self.ptr, alloc, fence, table_name, req, cancellation);
     }
 
     pub fn batchGroupLocal(
@@ -8854,6 +8879,54 @@ pub const ProvisionedTableWriteSource = struct {
             .table_name = table_name,
             .group_id = group_id,
         };
+    }
+
+    /// A leader-side capability lease spanning route validation and Raft
+    /// proposal. Structural split/merge work uses the same table activity
+    /// gate, so either the mutation is admitted before cutover or it observes
+    /// the post-cutover projection and is rejected as `TopologyChanged`.
+    pub const RoutedWriteAdmission = struct {
+        source: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+
+        pub fn deinit(self: *@This()) void {
+            self.source.endTableRequest(self.table_name);
+            self.* = undefined;
+        }
+    };
+
+    pub fn acquireRoutedWriteAdmission(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        fence: metadata_api.CatalogRouteFence,
+        deadline_ns: u64,
+        cancellation: db_mod.types.CancellationToken,
+    ) !RoutedWriteAdmission {
+        try fence.validate();
+        const admission_deadline_ns = if (fence.admission_deadline_ns) |fence_deadline|
+            @min(deadline_ns, fence_deadline)
+        else
+            deadline_ns;
+        while (!self.tryBeginTableRequest(table_name)) {
+            try cancellation.check();
+            try fence.admission_cancellation.check();
+            if (platform_time.monotonicNs() >= admission_deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+            platform.clock.Clock.real().sleepMs(1);
+        }
+        errdefer self.endTableRequest(table_name);
+        try cancellation.check();
+        try fence.admission_cancellation.check();
+        try table_catalog.validateCatalogRouteFenceUntil(
+            alloc,
+            self.catalog,
+            table_name,
+            fence,
+            admission_deadline_ns,
+        );
+        try cancellation.check();
+        try fence.admission_cancellation.check();
+        return .{ .source = self, .table_name = table_name };
     }
 
     fn tryBeginStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
@@ -16049,10 +16122,22 @@ pub const ProvisionedTableWriteSource = struct {
             return;
         }
 
+        // Never combine waiters selected under different catalog authority or
+        // topology generations. Even though local apply validates durable DB
+        // identity, preserving the exact capability boundary keeps a future
+        // routed local admission check from being bypassed by coalescing.
+        for (entries[1..]) |entry| {
+            if (!std.meta.eql(entry.group.route_fence, entries[0].group.route_fence)) {
+                self.applyCoalescedEntriesIndividually(alloc, table_name, entries);
+                return;
+            }
+        }
+
         var merged = GroupBatch{
             .group_id = group_id,
             .identity_namespace = entries[0].group.identity_namespace,
             .topology_epoch = entries[0].group.topology_epoch,
+            .route_fence = entries[0].group.route_fence,
         };
         merged.writes.ensureTotalCapacity(arena_alloc, totalCoalescedWrites(entries)) catch |err| {
             self.finishCoalescedEntries(entries, err);
@@ -16227,34 +16312,36 @@ pub const ProvisionedTableWriteSource = struct {
             grouped.deinit(alloc);
         }
 
-        var routing = (try table_catalog.authoritativeTableRoutingSnapshot(
+        try cancellation.check();
+        var routing = (try table_catalog.tableRoutingSnapshotForWrite(
             alloc,
             self.catalog,
             table_name,
             platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
         )) orelse return null;
         defer routing.deinit(alloc);
+        try cancellation.check();
 
         for (req.writes) |write| {
             const route = routing.resolveRouteForKey(write.key) orelse return null;
-            const group = try ensureRoutedGroupBatch(alloc, &grouped, route, routing.topology_epoch);
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, routing.fenceForRoute(route));
             try group.writes.append(alloc, write);
         }
         for (req.deletes) |key| {
             const route = routing.resolveRouteForKey(key) orelse return null;
-            const group = try ensureRoutedGroupBatch(alloc, &grouped, route, routing.topology_epoch);
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, routing.fenceForRoute(route));
             try group.deletes.append(alloc, key);
         }
         for (req.transforms) |transform| {
             const route = routing.resolveRouteForKey(transform.key) orelse return null;
-            const group = try ensureRoutedGroupBatch(alloc, &grouped, route, routing.topology_epoch);
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, routing.fenceForRoute(route));
             try group.transforms.append(alloc, transform);
         }
 
         if (self.raft_batcher) |batcher| {
             var accepted_groups: usize = 0;
             for (grouped.items) |group| {
-                batcher.batchGroupWithCancellation(alloc, group.group_id, table_name, .{
+                batcher.batchGroupRoutedWithCancellation(alloc, group.route_fence orelse return error.CatalogRouteFenceRequired, table_name, .{
                     .writes = group.writes.items,
                     .deletes = group.deletes.items,
                     .transforms = group.transforms.items,
@@ -16966,38 +17053,39 @@ pub const ProvisionedTableWriteSource = struct {
         if (table_req.predicates.len != 0) return null;
         if (try tableCommitHasGraphProjectionTransform(table_req)) return null;
 
-        var snapshot = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&snapshot);
-        const table = tables_api.findTableByName(&snapshot, table_req.table_name) orelse return null;
-        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
-        defer metadata_admin.freeRangeRefs(alloc, ranges);
-        if (ranges.len == 0) return null;
+        var routing = (try table_catalog.tableRoutingSnapshotForWrite(
+            alloc,
+            self.catalog,
+            table_req.table_name,
+            platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+        )) orelse return null;
+        defer routing.deinit(alloc);
 
-        var group_id_opt: ?u64 = null;
+        var selected_route: ?table_catalog.CatalogGroupRoute = null;
         const resolveOpGroup = struct {
-            fn run(current: *?u64, range_refs: []const *const metadata_table_manager.RangeRecord, key: []const u8) !void {
-                const group_id = table_catalog.resolveGroupForKeyFromRanges(range_refs, key) orelse return error.NotFound;
+            fn run(current: *?table_catalog.CatalogGroupRoute, route_snapshot: *const table_catalog.AuthoritativeTableRoutingSnapshot, key: []const u8) !void {
+                const route = route_snapshot.resolveRouteForKey(key) orelse return error.NotFound;
                 if (current.*) |existing| {
-                    if (existing != group_id) return error.MultipleGroups;
+                    if (!std.meta.eql(existing, route)) return error.MultipleGroups;
                 } else {
-                    current.* = group_id;
+                    current.* = route;
                 }
             }
         }.run;
 
-        for (table_req.writes) |write| resolveOpGroup(&group_id_opt, ranges, write.key) catch |err| switch (err) {
+        for (table_req.writes) |write| resolveOpGroup(&selected_route, &routing, write.key) catch |err| switch (err) {
             error.MultipleGroups => return null,
             else => return err,
         };
-        for (table_req.deletes) |key| resolveOpGroup(&group_id_opt, ranges, key) catch |err| switch (err) {
+        for (table_req.deletes) |key| resolveOpGroup(&selected_route, &routing, key) catch |err| switch (err) {
             error.MultipleGroups => return null,
             else => return err,
         };
-        for (table_req.transforms) |transform| resolveOpGroup(&group_id_opt, ranges, transform.key) catch |err| switch (err) {
+        for (table_req.transforms) |transform| resolveOpGroup(&selected_route, &routing, transform.key) catch |err| switch (err) {
             error.MultipleGroups => return null,
             else => return err,
         };
-        const group_id = group_id_opt orelse return .{ .committed = .{ .participant_count = 0 } };
+        const route = selected_route orelse return .{ .committed = .{ .participant_count = 0 } };
 
         const batcher = self.raft_batcher orelse return null;
         const req: db_mod.types.BatchRequest = .{
@@ -17006,7 +17094,7 @@ pub const ProvisionedTableWriteSource = struct {
             .transforms = table_req.transforms,
             .sync_level = sync_level,
         };
-        batcher.batchGroupWithCancellation(alloc, group_id, table_req.table_name, req, cancellation) catch |err| switch (err) {
+        batcher.batchGroupRoutedWithCancellation(alloc, routing.fenceForRoute(route), table_req.table_name, req, cancellation) catch |err| switch (err) {
             error.IntentConflict, error.VersionConflict => return .{ .conflict = boundConflict(table_req, err) },
             else => return err,
         };
@@ -20589,6 +20677,7 @@ const GroupBatch = struct {
     /// acquisition consumes this capability instead of re-reading metadata.
     identity_namespace: ?doc_identity.Namespace = null,
     topology_epoch: u64 = 0,
+    route_fence: ?metadata_api.CatalogRouteFence = null,
     writes: std.ArrayListUnmanaged(db_mod.types.BatchWrite) = .empty,
     deletes: std.ArrayListUnmanaged([]const u8) = .empty,
     transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
@@ -20609,6 +20698,7 @@ fn cloneWriteCoalesceGroupBatch(
         .group_id = group.group_id,
         .identity_namespace = group.identity_namespace,
         .topology_epoch = group.topology_epoch,
+        .route_fence = group.route_fence,
     };
     errdefer freeWriteCoalesceGroupBatch(alloc, &cloned);
 
@@ -20655,13 +20745,15 @@ fn ensureGroupBatch(
 fn ensureRoutedGroupBatch(
     alloc: std.mem.Allocator,
     grouped: *std.ArrayListUnmanaged(GroupBatch),
-    route: table_catalog.CatalogGroupRoute,
-    topology_epoch: u64,
+    fence: metadata_api.CatalogRouteFence,
 ) !*GroupBatch {
+    try fence.validate();
+    const route = fence.route;
     const identity_namespace = docIdentityNamespaceFromCatalog(route.identity_namespace);
     for (grouped.items) |*group| {
         if (group.group_id != route.group_id) continue;
-        if (group.topology_epoch != topology_epoch or
+        if (group.topology_epoch != fence.topology_epoch or
+            !std.meta.eql(group.route_fence, @as(?metadata_api.CatalogRouteFence, fence)) or
             !std.meta.eql(group.identity_namespace, @as(?doc_identity.Namespace, identity_namespace)))
         {
             return error.TopologyChanged;
@@ -20671,7 +20763,8 @@ fn ensureRoutedGroupBatch(
     try grouped.append(alloc, .{
         .group_id = route.group_id,
         .identity_namespace = identity_namespace,
-        .topology_epoch = topology_epoch,
+        .topology_epoch = fence.topology_epoch,
+        .route_fence = fence,
     });
     return &grouped.items[grouped.items.len - 1];
 }
@@ -21169,6 +21262,10 @@ test "raft single-group fast path excludes graph projection transforms only" {
             self.transforms = req.transforms.len;
         }
 
+        fn batchGroupRouted(ptr: *anyopaque, allocator: std.mem.Allocator, route_capability: metadata_api.CatalogRouteFence, table_name: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
+            return batchGroup(ptr, allocator, route_capability.route.group_id, table_name, req);
+        }
+
         fn batchGroupLocal(
             _: *anyopaque,
             _: std.mem.Allocator,
@@ -21187,6 +21284,7 @@ test "raft single-group fast path excludes graph projection transforms only" {
         .ptr = &capture,
         .vtable = &.{
             .batch_group = Capture.batchGroup,
+            .batch_group_routed_with_cancellation = Capture.batchGroupRouted,
             .batch_group_local = Capture.batchGroupLocal,
         },
     });
@@ -21274,6 +21372,10 @@ test "provisioned stateless batch retries definite aborts to the production boun
             }
         }
 
+        fn batchGroupRouted(ptr: *anyopaque, allocator: std.mem.Allocator, route_capability: metadata_api.CatalogRouteFence, table_name: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
+            return batchGroup(ptr, allocator, route_capability.route.group_id, table_name, req);
+        }
+
         fn batchGroupLocal(
             _: *anyopaque,
             _: std.mem.Allocator,
@@ -21292,6 +21394,7 @@ test "provisioned stateless batch retries definite aborts to the production boun
         .ptr = &batcher,
         .vtable = &.{
             .batch_group = Batcher.batchGroup,
+            .batch_group_routed_with_cancellation = Batcher.batchGroupRouted,
             .batch_group_local = Batcher.batchGroupLocal,
         },
     });
@@ -34964,6 +35067,10 @@ test "provisioned create index updates cached writer in place" {
             state.last_timestamp_ns = req.timestamp_ns;
         }
 
+        fn batchGroupRouted(ptr: *anyopaque, allocator: std.mem.Allocator, route_capability: metadata_api.CatalogRouteFence, table_name: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
+            return batchGroup(ptr, allocator, route_capability.route.group_id, table_name, req);
+        }
+
         fn batchGroupLocal(
             ptr: *anyopaque,
             _: std.mem.Allocator,
@@ -34984,6 +35091,7 @@ test "provisioned create index updates cached writer in place" {
         .ptr = &raft_capture,
         .vtable = &.{
             .batch_group = RaftCapture.batchGroup,
+            .batch_group_routed_with_cancellation = RaftCapture.batchGroupRouted,
             .batch_group_local = RaftCapture.batchGroupLocal,
         },
     });
@@ -35069,6 +35177,10 @@ test "raft batch aggregation makes failures after an accepted group non-retryabl
             self.accepted += 1;
         }
 
+        fn batchGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
+            return batchGroup(ptr, alloc, fence.route.group_id, table_name, req);
+        }
+
         fn batchGroupLocal(
             _: *anyopaque,
             _: std.mem.Allocator,
@@ -35090,6 +35202,7 @@ test "raft batch aggregation makes failures after an accepted group non-retryabl
         .ptr = &capture,
         .vtable = &.{
             .batch_group = Capture.batchGroup,
+            .batch_group_routed_with_cancellation = Capture.batchGroupRouted,
             .batch_group_local = Capture.batchGroupLocal,
         },
     });

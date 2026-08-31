@@ -51,7 +51,7 @@ pub const Operations = struct {
         reads: table_reads.TableReadSource,
     } {
         var reads = self.reads orelse return error.NotFound;
-        reads.bindCatalogRouteFenceJson(alloc, request.catalog_route_fence_json, group_id) catch |err| switch (err) {
+        reads.bindCatalogRouteFenceJson(alloc, request.catalog_route_fence_json, group_id, request.deadline_ns, request.cancellation) catch |err| switch (err) {
             error.UnsupportedCatalogRouteFence => return error.Unsupported,
             else => return error.InvalidArgument,
         };

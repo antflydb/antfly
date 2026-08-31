@@ -27,6 +27,7 @@ const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const metadata_api = @import("../metadata/api.zig");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 
 pub const LookupResponse = struct {
     json: []u8,
@@ -473,6 +474,8 @@ pub const TableReadSource = struct {
         alloc: std.mem.Allocator,
         encoded: []const u8,
         expected_group_id: u64,
+        deadline_ns: ?u64,
+        cancellation: CancellationToken,
     ) !void {
         if (encoded.len == 0) return;
         var parsed = std.json.parseFromSlice(metadata_api.CatalogRouteFence, alloc, encoded, .{ .ignore_unknown_fields = false }) catch
@@ -480,6 +483,8 @@ pub const TableReadSource = struct {
         defer parsed.deinit();
         try parsed.value.validate();
         if (parsed.value.route.group_id != expected_group_id) return error.InvalidCatalogRouteFence;
+        parsed.value.admission_deadline_ns = deadline_ns;
+        parsed.value.admission_cancellation = cancellation;
         self.route_fence = parsed.value;
     }
 
@@ -1039,7 +1044,8 @@ test "catalog route fence dispatch is strict and fail closed" {
         }
     };
 
-    const fence = metadata_api.CatalogRouteFence{
+    var wire_cancellation = std.atomic.Value(bool).init(false);
+    var fence = metadata_api.CatalogRouteFence{
         .metadata_group_id = 3,
         .catalog_revision = 19,
         .table_id = 17,
@@ -1050,8 +1056,12 @@ test "catalog route fence dispatch is strict and fail closed" {
             .identity_namespace = .{ .table_id = 17, .shard_id = 37, .range_id = 31 },
         },
     };
+    fence.admission_deadline_ns = 999;
+    fence.admission_cancellation = CancellationToken.fromAtomic(&wire_cancellation);
     const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, fence, .{});
     defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "admission_deadline") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "admission_cancellation") == null);
 
     var fake = Fake{};
     const legacy_vtable = TableReadSource.VTable{
@@ -1065,7 +1075,10 @@ test "catalog route fence dispatch is strict and fail closed" {
         .join_finalize_group_local_with_timeout = Fake.joinLegacy,
     };
     var source = TableReadSource{ .ptr = &fake, .vtable = &legacy_vtable };
-    try source.bindCatalogRouteFenceJson(std.testing.allocator, encoded, 29);
+    const ingress_deadline: u64 = 1234;
+    try source.bindCatalogRouteFenceJson(std.testing.allocator, encoded, 29, ingress_deadline, CancellationToken.fromAtomic(&wire_cancellation));
+    try std.testing.expectEqual(@as(?u64, ingress_deadline), source.route_fence.?.admission_deadline_ns);
+    try std.testing.expect(source.route_fence.?.admission_cancellation.ptr == @as(*const anyopaque, @ptrCast(&wire_cancellation)));
     try std.testing.expectError(
         error.CatalogRouteFenceUnsupported,
         source.lookupGroupLocal(std.testing.allocator, 29, "docs", "key", .{}, .stale),
@@ -1118,6 +1131,6 @@ test "catalog route fence dispatch is strict and fail closed" {
     var wrong_group_source = TableReadSource{ .ptr = &fake, .vtable = &routed_vtable };
     try std.testing.expectError(
         error.InvalidCatalogRouteFence,
-        wrong_group_source.bindCatalogRouteFenceJson(std.testing.allocator, encoded, 30),
+        wrong_group_source.bindCatalogRouteFenceJson(std.testing.allocator, encoded, 30, null, .none),
     );
 }

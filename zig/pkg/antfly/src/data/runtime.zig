@@ -350,6 +350,9 @@ const DataRaftBatchRoute = struct {
     /// Borrowed only by the local visibility phase after Raft apply confirms
     /// the durable outcome. It is never forwarded or serialized.
     visibility_cancellation: antfly.db.types.CancellationToken = .none,
+    /// Immutable catalog authority selected with the public mutation. This is
+    /// forwarded unchanged and consumed only by the confirmed Raft leader.
+    write_route_fence: ?antfly.metadata_api.CatalogRouteFence = null,
 };
 
 const DataRaftBatchForwardState = struct {
@@ -7411,6 +7414,7 @@ pub const DataServer = struct {
             .vtable = &.{
                 .batch_group = localRaftBatchGroup,
                 .batch_group_with_cancellation = localRaftBatchGroupWithCancellation,
+                .batch_group_routed_with_cancellation = localRaftBatchGroupRoutedWithCancellation,
                 .batch_group_local = localRaftBatchGroupLocal,
                 .batch_group_local_with_cancellation = localRaftBatchGroupLocalWithCancellation,
                 .batch_group_local_with_pre_decision_context = localRaftBatchGroupLocalWithPreDecisionContext,
@@ -7518,6 +7522,23 @@ pub const DataServer = struct {
         });
     }
 
+    fn localRaftBatchGroupRoutedWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: antfly.metadata_api.CatalogRouteFence,
+        table_name: []const u8,
+        req: antfly.db.types.BatchRequest,
+        cancellation: antfly.db.types.CancellationToken,
+    ) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try fence.validate();
+        try self.proposeRaftBatchGroup(alloc, fence.route.group_id, table_name, req, .{
+            .refresh_metadata = true,
+            .visibility_cancellation = cancellation,
+            .write_route_fence = fence,
+        });
+    }
+
     fn localRaftBatchGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -7577,6 +7598,7 @@ pub const DataServer = struct {
     fn localRaftBatchGroupForwarded(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
+        fence: antfly.metadata_api.CatalogRouteFence,
         group_id: u64,
         table_name: []const u8,
         req: antfly.db.types.BatchRequest,
@@ -7598,6 +7620,7 @@ pub const DataServer = struct {
                 .forwards_remaining = forwarding.forwards_remaining,
                 .cancellation = if (cancellation_token.ptr != null) &cancellation else null,
                 .visibility_cancellation = cancellation_token,
+                .write_route_fence = fence,
             },
             leader_wait_ns,
         );
@@ -8023,8 +8046,10 @@ pub const DataServer = struct {
             var protocol_preflight: DataRaftBatchProtocolPreflight = .{};
             var protocol_activation_entry: ?*DataRaftProtocolActivationEntry = null;
             var protocol_activation_lock_owned = false;
+            var routed_write_admission: ?antfly.public_api.table_writes.ProvisionedTableWriteSource.RoutedWriteAdmission = null;
             defer if (protocol_activation_entry) |entry| entry.release(self.alloc);
             defer if (protocol_activation_lock_owned) protocol_activation_entry.?.activation_mutex.unlock();
+            defer if (routed_write_admission) |*admission| admission.deinit();
             if (preflighted_local_leader) {
                 const activation_entry = try self.dataRaftProtocolActivationEntry(group_id);
                 protocol_activation_entry = activation_entry;
@@ -8089,6 +8114,15 @@ pub const DataServer = struct {
                 try ensureDataRaftBatchRouteActive(route);
                 if (platform_time.monotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
+                if (route.write_route_fence) |fence| {
+                    routed_write_admission = try admission_source.acquireRoutedWriteAdmission(
+                        alloc,
+                        table_name,
+                        fence,
+                        deadline_ns,
+                        route.visibility_cancellation,
+                    );
+                }
                 try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
             }
 
@@ -8227,6 +8261,15 @@ pub const DataServer = struct {
                 }
             }
 
+            // The structural lease only fences validation through proposal
+            // acceptance. Once Raft assigns an index, log ordering owns the
+            // mutation; holding the table gate through apply/visibility would
+            // unnecessarily stall split and merge progress.
+            if (routed_write_admission) |*admission| {
+                admission.deinit();
+                routed_write_admission = null;
+            }
+
             if (retry_for_leader_preflight) {
                 if (platform_time.monotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 continue;
@@ -8342,6 +8385,11 @@ pub const DataServer = struct {
                                     sleepDataRaftBatchLeaderRetry();
                                     continue;
                                 };
+                                const encoded_route_fence = if (route.write_route_fence) |fence|
+                                    try std.json.Stringify.valueAlloc(alloc, fence, .{})
+                                else
+                                    null;
+                                defer if (encoded_route_fence) |encoded| alloc.free(encoded);
                                 var response = client.fetchGroupBatchWithForwarding(
                                     base_uri,
                                     group_id,
@@ -8350,6 +8398,7 @@ pub const DataServer = struct {
                                     dataRaftBatchHttpTimeoutMs(deadline_ns),
                                     forwarding,
                                     route.cancellation,
+                                    encoded_route_fence,
                                 ) catch |err| {
                                     switch (classifyDataRaftForwardError(err)) {
                                         .safe_to_retry => {
@@ -8534,6 +8583,11 @@ pub const DataServer = struct {
         const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
         defer alloc.free(body);
         const forwarding = nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse return false;
+        const encoded_route_fence = if (route.write_route_fence) |fence|
+            try std.json.Stringify.valueAlloc(alloc, fence, .{})
+        else
+            null;
+        defer if (encoded_route_fence) |encoded| alloc.free(encoded);
         var response = client.fetchGroupBatchWithForwarding(
             target_store.api_url,
             group_id,
@@ -8542,6 +8596,7 @@ pub const DataServer = struct {
             dataRaftBatchHttpTimeoutMs(deadline_ns),
             forwarding,
             route.cancellation,
+            encoded_route_fence,
         ) catch |err| {
             switch (classifyDataRaftForwardError(err)) {
                 .safe_to_retry => {

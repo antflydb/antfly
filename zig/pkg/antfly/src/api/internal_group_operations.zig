@@ -13,6 +13,7 @@ const distributed_graph = @import("distributed_graph.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const metadata_mod = @import("../metadata/domain.zig");
+const metadata_api = @import("../metadata/api.zig");
 const operation = @import("operation.zig");
 const raft_mod = @import("../raft/mod.zig");
 const table_reads = @import("table_reads.zig");
@@ -56,6 +57,7 @@ pub const RoutedRaftBatchWriter = struct {
     write_fn: *const fn (
         *anyopaque,
         std.mem.Allocator,
+        metadata_api.CatalogRouteFence,
         u64,
         []const u8,
         db_mod.types.BatchRequest,
@@ -63,8 +65,8 @@ pub const RoutedRaftBatchWriter = struct {
         CancellationToken,
     ) anyerror!?void,
 
-    fn write(self: @This(), alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, cancellation: CancellationToken) !?void {
-        return self.write_fn(self.ptr, alloc, group_id, table_name, input, forwarding, cancellation);
+    fn write(self: @This(), alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, cancellation: CancellationToken) !?void {
+        return self.write_fn(self.ptr, alloc, fence, group_id, table_name, input, forwarding, cancellation);
     }
 };
 
@@ -112,7 +114,7 @@ pub const Operations = struct {
         group_id: u64,
     ) Error!table_reads.TableReadSource {
         var reads = self.reads orelse return error.NotFound;
-        reads.bindCatalogRouteFenceJson(alloc, request.catalog_route_fence_json, group_id) catch |err| switch (err) {
+        reads.bindCatalogRouteFenceJson(alloc, request.catalog_route_fence_json, group_id, request.deadline_ns, request.cancellation) catch |err| switch (err) {
             error.UnsupportedCatalogRouteFence => return error.Unsupported,
             else => return error.InvalidArgument,
         };
@@ -288,8 +290,24 @@ pub const Operations = struct {
             else => return error.Internal,
         };
         const writer = self.routed_raft_batch_writer orelse return error.Unavailable;
-        _ = (writer.write(alloc, group_id, table_name, input, forwarding, request.cancellation) catch |err| switch (err) {
+        if (request.catalog_route_fence_json.len == 0) return error.Unavailable;
+        var parsed_fence = std.json.parseFromSlice(
+            metadata_api.CatalogRouteFence,
+            alloc,
+            request.catalog_route_fence_json,
+            .{ .ignore_unknown_fields = false },
+        ) catch return error.InvalidArgument;
+        defer parsed_fence.deinit();
+        parsed_fence.value.validate() catch return error.InvalidArgument;
+        if (parsed_fence.value.route.group_id != group_id) return error.InvalidArgument;
+        parsed_fence.value.admission_deadline_ns = request.deadline_ns;
+        parsed_fence.value.admission_cancellation = request.cancellation;
+        _ = (writer.write(alloc, parsed_fence.value, group_id, table_name, input, forwarding, request.cancellation) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
+            error.TopologyChanged => return error.TopologyChanged,
+            error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.Canceled, error.Cancelled => return error.Canceled,
+            error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.RaftBatchWriteOutcomeUnknown => return error.RaftBatchWriteOutcomeUnknown,
             error.EnrichmentWaitCanceled => return error.EnrichmentWaitCanceled,
@@ -1164,6 +1182,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
         fn write(
             ptr: *anyopaque,
             _: std.mem.Allocator,
+            fence: metadata_api.CatalogRouteFence,
             group_id: u64,
             table_name: []const u8,
             _: db_mod.types.BatchRequest,
@@ -1173,6 +1192,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             try std.testing.expectEqual(@as(u64, 17), group_id);
+            try std.testing.expectEqual(group_id, fence.route.group_id);
             try std.testing.expectEqualStrings("documents", table_name);
             try std.testing.expectEqual(@as(u32, 425), forwarding.remaining_ms);
             try std.testing.expectEqual(@as(u8, 1), forwarding.forwards_remaining);
@@ -1200,6 +1220,7 @@ test "typed routed batch preserves forwarding cancellation and identity conflict
     };
     const request: operation.RequestContext = .{
         .cancellation = CancellationToken.fromAtomic(&cancelled),
+        .catalog_route_fence_json = "{\"metadata_group_id\":1,\"catalog_revision\":2,\"table_id\":3,\"topology_epoch\":4,\"route\":{\"group_id\":17,\"range_id\":5,\"identity_namespace\":{\"table_id\":3,\"shard_id\":17,\"range_id\":5}}}",
     };
 
     const result = try operations.routedBatch(
