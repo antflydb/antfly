@@ -6745,6 +6745,11 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "hbc shared",
+            "hbc concurrent vector admission",
+            "hbc decoded residency",
+            "hbc sequential cold-start leases",
+            "hbc overlapping cold-start leases",
+            "hbc concurrent cold-start lease acquisition",
             "resource manager derives elastic HBC cache-class policy from pressure",
         },
         .test_runner = .{

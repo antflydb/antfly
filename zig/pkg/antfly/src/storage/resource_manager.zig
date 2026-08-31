@@ -2339,13 +2339,12 @@ pub const ResourceManager = struct {
             .quantized_protected_bytes = target_bytes / 4,
             .metadata_protected_bytes = target_bytes / 32,
             .concurrent_vector_admission_stride = switch (pressure) {
-                // A cold concurrent query can discover hundreds of unique
-                // vectors. Admitting every miss serializes those workers on
-                // the shared cache publication lock before pressure has had a
-                // chance to react. Keep a doorkeeper active from the first
-                // overlapping fill; stronger pressure samples more sparsely.
-                .normal => 8,
-                .soft => 16,
+                // Normal-pressure serial searches should warm decoded
+                // residency eagerly. The cache adds an overlap-aware
+                // doorkeeper while another decoded fill is active and also
+                // samples replacement once the byte target is full.
+                .normal => 1,
+                .soft => 8,
                 .hard => 0,
             },
         };
@@ -3366,12 +3365,12 @@ test "resource manager derives elastic HBC cache-class policy from pressure" {
     try std.testing.expectEqual(@as(u64, 200), policy.protectedBytes(.quantized));
     try std.testing.expectEqual(@as(u64, 25), policy.protectedBytes(.metadata));
     try std.testing.expectEqual(@as(u64, 0), policy.protectedBytes(.vector));
-    try std.testing.expectEqual(@as(u32, 8), policy.concurrent_vector_admission_stride);
+    try std.testing.expectEqual(@as(u32, 1), policy.concurrent_vector_admission_stride);
 
     var observed: u64 = 0;
     manager.observeUsage(.hbc_node_metadata_cache, &observed, 900);
     policy = manager.hbcCachePolicy();
-    try std.testing.expectEqual(@as(u32, 16), policy.concurrent_vector_admission_stride);
+    try std.testing.expectEqual(@as(u32, 8), policy.concurrent_vector_admission_stride);
 
     manager.observeUsage(.hbc_node_metadata_cache, &observed, 1001);
     policy = manager.hbcCachePolicy();
