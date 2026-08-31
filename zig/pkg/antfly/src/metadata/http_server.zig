@@ -2315,6 +2315,7 @@ const ParsedRuntimeIndexStatus = struct {
 
 const ParsedRuntimeEmbeddingActivityStatus = struct {
     epoch: ?u64 = null,
+    sample_sequence: ?u64 = null,
     phase: ?metadata_table_manager.RuntimeEmbeddingActivityStatusReport.Phase = null,
     chunks_created: ?u64 = null,
     embedding_batches_completed: ?u64 = null,
@@ -2495,6 +2496,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
     const Parsed = struct {
         store_id: ?u64 = null,
         embedding_activity_protocol_version: ?u16 = null,
+        embedding_activity_sequence: ?u64 = null,
         reporter_incarnation: ?u64 = null,
         status_generation: ?u64 = null,
         artifact_sources_protocol_version: ?u16 = null,
@@ -2517,9 +2519,10 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.status_generation orelse 0,
     )) return error.InvalidStoreReporterFence;
-    if (!metadata_table_manager.embeddingActivityProtocolValid(
+    if (!metadata_table_manager.embeddingActivityReportValid(
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.embedding_activity_protocol_version orelse 0,
+        parsed.value.embedding_activity_sequence orelse 0,
     )) return error.InvalidStoreReporterFence;
     if (!metadata_table_manager.artifactSourcesProtocolValid(
         parsed.value.reporter_incarnation orelse 0,
@@ -2529,11 +2532,16 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
     errdefer metadata_table_manager.freeGroupStatuses(alloc, group_statuses);
     const runtime_statuses = try cloneParsedRuntimeGroupStatuses(alloc, parsed.value.runtime_statuses orelse &.{});
     errdefer metadata_table_manager.freeRuntimeGroupStatusReports(alloc, runtime_statuses);
+    if (!metadata_table_manager.embeddingActivitySamplesValid(
+        parsed.value.embedding_activity_protocol_version orelse 0,
+        runtime_statuses,
+    )) return error.InvalidStoreReporterFence;
     const store_id = parsed.value.store_id orelse default_store_id orelse return error.MissingStoreID;
     if (store_id == 0) return error.InvalidNodeID;
     return .{
         .store_id = store_id,
         .embedding_activity_protocol_version = parsed.value.embedding_activity_protocol_version orelse 0,
+        .embedding_activity_sequence = parsed.value.embedding_activity_sequence orelse 0,
         .reporter_incarnation = parsed.value.reporter_incarnation orelse 0,
         .status_generation = parsed.value.status_generation orelse 0,
         .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
@@ -2723,6 +2731,7 @@ fn cloneParsedRuntimeIndexStatus(
         .embedding_activity_observed = parsed.embedding_activity_observed orelse false,
         .embedding_activity = if (parsed.embedding_activity) |activity| .{
             .epoch = activity.epoch orelse 0,
+            .sample_sequence = activity.sample_sequence orelse 0,
             .phase = activity.phase orelse .idle,
             .chunks_created = activity.chunks_created orelse 0,
             .embedding_batches_completed = activity.embedding_batches_completed orelse 0,
@@ -2740,7 +2749,7 @@ fn cloneParsedRuntimeIndexStatus(
 test "metadata status JSON preserves compact managed repair admission state" {
     const alloc = std.testing.allocator;
     const report = try parseStoreStatusReport(alloc,
-        \\{"store_id":20,"reporter_incarnation":77,"embedding_activity_protocol_version":1,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","publication_target_count":2500,"publication_target_ready":true,"embedding_activity_observed":true,"embedding_activity":{"epoch":7,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
+        \\{"store_id":20,"reporter_incarnation":77,"embedding_activity_protocol_version":2,"embedding_activity_sequence":3,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","publication_target_count":2500,"publication_target_ready":true,"embedding_activity_observed":true,"embedding_activity":{"epoch":7,"sample_sequence":2,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
     );
     defer freeStoreStatusReport(alloc, report);
 
@@ -2753,6 +2762,7 @@ test "metadata status JSON preserves compact managed repair admission state" {
     try std.testing.expectEqual(@as(u64, 2500), indexes[0].publication_target_count);
     try std.testing.expect(indexes[0].embedding_activity_observed);
     try std.testing.expectEqual(@as(u64, 7), indexes[0].embedding_activity.epoch);
+    try std.testing.expectEqual(@as(u64, 2), indexes[0].embedding_activity.sample_sequence);
     try std.testing.expectEqual(@as(u64, 8), indexes[0].embedding_activity.embeddings_computed);
     try std.testing.expectEqual(metadata_table_manager.RuntimeEmbeddingActivityStatusReport.Phase.waiting_retry, indexes[0].embedding_activity.phase);
     // Proof without a repair lifecycle is not actionable and must not survive

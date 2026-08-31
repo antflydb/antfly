@@ -2175,6 +2175,9 @@ pub const EmbeddingActivityPhase = enum {
 
 pub const EmbeddingActivityStats = struct {
     epoch: u64 = 0,
+    // Monotonic within `epoch` and incremented for every phase/counter change.
+    // This orders volatile samples independently from durable status snapshots.
+    sample_sequence: u64 = 0,
     // Internal incarnation fence. API encoders omit internal fence fields.
     index_generation: u64 = 0,
     // Internal ownership fence. A failed supervised provider batch records

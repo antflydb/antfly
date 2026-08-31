@@ -2941,7 +2941,9 @@ const CachedSplitKey = union(enum) {
 };
 
 const StoreStatusHeartbeatCache = struct {
+    valid: bool = false,
     embedding_activity_protocol_version: u16 = 0,
+    embedding_activity_sequence: u64 = 0,
     reporter_incarnation: u64 = 0,
     status_generation: u64 = 0,
     artifact_sources_protocol_version: u16 = 0,
@@ -4035,6 +4037,48 @@ test "data runtime heartbeat cache cannot regress to an older full report" {
     try std.testing.expectEqual(@as(u64, 200), server.store_status_heartbeat_cache.capacity_bytes);
 }
 
+test "data runtime activity-only snapshots reuse the durable status generation" {
+    var cached_indexes = [_]antfly.metadata.table_manager.RuntimeIndexStatusReport{.{
+        .name = "semantic",
+        .kind = "dense_vector",
+        .doc_count = 10,
+        .coverage_generation = 7,
+        .coverage_config_hash = 9,
+        .embedding_activity_observed = true,
+        .embedding_activity = .{ .epoch = 3, .sample_sequence = 4, .embeddings_computed = 10 },
+    }};
+    var cached_runtime = [_]antfly.metadata.table_manager.RuntimeGroupStatusReport{.{
+        .group_id = 2,
+        .indexes = cached_indexes[0..],
+    }};
+    var observed_indexes = cached_indexes;
+    observed_indexes[0].embedding_activity.sample_sequence = 5;
+    observed_indexes[0].embedding_activity.embeddings_computed = 20;
+    var observed_runtime = cached_runtime;
+    observed_runtime[0].indexes = observed_indexes[0..];
+
+    var server: DataServer = undefined;
+    server.store_status_cache_mutex = .unlocked;
+    server.store_status_generation = .init(20);
+    server.store_status_heartbeat_cache = .{
+        .valid = true,
+        .reporter_incarnation = 4,
+        .status_generation = 10,
+        .runtime_statuses = cached_runtime[0..],
+    };
+    const candidate: antfly.metadata.table_manager.StoreStatusReport = .{
+        .store_id = 7,
+        .reporter_incarnation = 4,
+        .runtime_statuses = observed_runtime[0..],
+    };
+
+    try std.testing.expectEqual(@as(u64, 10), server.durableGenerationForStoreStatus(candidate));
+    try std.testing.expectEqual(@as(u64, 20), server.store_status_generation.load(.monotonic));
+    observed_indexes[0].doc_count += 1;
+    try std.testing.expectEqual(@as(u64, 20), server.durableGenerationForStoreStatus(candidate));
+    try std.testing.expectEqual(@as(u64, 21), server.store_status_generation.load(.monotonic));
+}
+
 test "idle cached runtime status stays fresh only for the published root generation" {
     const fresh = runtime_status.LocalTableRuntimeStatus{
         .group_id = 7,
@@ -4786,6 +4830,7 @@ pub const DataServer = struct {
     store_status_ticks: std.atomic.Value(usize) = .init(0),
     store_status_dirty: std.atomic.Value(bool) = .init(true),
     embedding_activity_status_dirty: std.atomic.Value(bool) = .init(false),
+    embedding_activity_report_sequence: std.atomic.Value(u64) = .init(1),
     last_embedding_activity_report_at_ms: u64 = 0,
     store_capacity_probe_failures: std.atomic.Value(u64) = .init(0),
     last_store_status_report_at_ms: u64 = 0,
@@ -11570,7 +11615,6 @@ pub const DataServer = struct {
         errdefer self.store_status_dirty.store(true, .release);
         const claimed_activity = self.embedding_activity_status_dirty.swap(false, .acq_rel);
         errdefer if (claimed_activity) self.embedding_activity_status_dirty.store(true, .release);
-        const status_generation = self.store_status_generation.fetchAdd(1, .monotonic);
         var snapshot = try remote_metadata.fetchSnapshot();
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
         const reporter_incarnation = try self.reporterIncarnation();
@@ -11658,11 +11702,11 @@ pub const DataServer = struct {
 
         const capacity = self.observeStoreCapacityForStatus();
 
-        const report: antfly.metadata.table_manager.StoreStatusReport = .{
+        const candidate_report: antfly.metadata.table_manager.StoreStatusReport = .{
             .store_id = registration.store_id,
             .embedding_activity_protocol_version = embedding_activity_protocol_version,
+            .embedding_activity_sequence = self.embedding_activity_report_sequence.fetchAdd(1, .monotonic),
             .reporter_incarnation = reporter_incarnation,
-            .status_generation = status_generation,
             .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .live = true,
             .health_class = "healthy",
@@ -11670,6 +11714,27 @@ pub const DataServer = struct {
             .available_bytes = capacity.available_bytes,
             .group_statuses = group_statuses,
             .runtime_statuses = runtime_statuses,
+        };
+        const status_generation = self.durableGenerationForStoreStatus(candidate_report);
+
+        const report: antfly.metadata.table_manager.StoreStatusReport = .{
+            .store_id = candidate_report.store_id,
+            .embedding_activity_protocol_version = candidate_report.embedding_activity_protocol_version,
+            .embedding_activity_sequence = candidate_report.embedding_activity_sequence,
+            .reporter_incarnation = candidate_report.reporter_incarnation,
+            .status_generation = status_generation,
+            .artifact_sources_protocol_version = candidate_report.artifact_sources_protocol_version,
+            .live = candidate_report.live,
+            .health_class = candidate_report.health_class,
+            .capacity_bytes = candidate_report.capacity_bytes,
+            .available_bytes = candidate_report.available_bytes,
+            .lease_pressure = candidate_report.lease_pressure,
+            .read_load = candidate_report.read_load,
+            .write_load = candidate_report.write_load,
+            .active_backfills = candidate_report.active_backfills,
+            .backfill_progress_millis = candidate_report.backfill_progress_millis,
+            .group_statuses = candidate_report.group_statuses,
+            .runtime_statuses = candidate_report.runtime_statuses,
         };
         // Collection performs DB I/O outside the status-cache locks. If a
         // placement or Raft ownership transition raced that work, do not let
@@ -11700,6 +11765,44 @@ pub const DataServer = struct {
             .capacity_bytes = self.store_status_heartbeat_cache.capacity_bytes,
             .available_bytes = self.store_status_heartbeat_cache.available_bytes,
         };
+    }
+
+    fn durableGenerationForStoreStatus(
+        self: *DataServer,
+        candidate: antfly.metadata.table_manager.StoreStatusReport,
+    ) u64 {
+        lockAtomic(&self.store_status_cache_mutex);
+        const cache = &self.store_status_heartbeat_cache;
+        if (cache.valid and
+            cache.reporter_incarnation == candidate.reporter_incarnation)
+        {
+            const previous: antfly.metadata.table_manager.StoreStatusReport = .{
+                .store_id = candidate.store_id,
+                .embedding_activity_protocol_version = cache.embedding_activity_protocol_version,
+                .embedding_activity_sequence = cache.embedding_activity_sequence,
+                .reporter_incarnation = cache.reporter_incarnation,
+                .status_generation = cache.status_generation,
+                .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
+                .live = cache.live,
+                .health_class = cache.health_class,
+                .capacity_bytes = cache.capacity_bytes,
+                .available_bytes = cache.available_bytes,
+                .lease_pressure = cache.lease_pressure,
+                .read_load = cache.read_load,
+                .write_load = cache.write_load,
+                .active_backfills = cache.active_backfills,
+                .backfill_progress_millis = cache.backfill_progress_millis,
+                .group_statuses = cache.group_statuses,
+                .runtime_statuses = cache.runtime_statuses,
+            };
+            if (antfly.metadata.store_observer.reportsDurablyEqual(previous, candidate)) {
+                const generation = cache.status_generation;
+                self.store_status_cache_mutex.unlock();
+                return generation;
+            }
+        }
+        self.store_status_cache_mutex.unlock();
+        return self.store_status_generation.fetchAdd(1, .monotonic);
     }
 
     fn observeStoreCapacityForStatus(self: *DataServer) StoreCapacitySnapshot {
@@ -12043,10 +12146,23 @@ pub const DataServer = struct {
         lockAtomic(&self.store_status_cache_mutex);
         defer self.store_status_cache_mutex.unlock();
         const cache = &self.store_status_heartbeat_cache;
-        if (cache.group_statuses.len == 0 and cache.runtime_statuses.len == 0) return null;
+        if (!cache.valid) return null;
+        const runtime_statuses = try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, cache.runtime_statuses);
+        errdefer if (runtime_statuses.len > 0)
+            antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
+        for (runtime_statuses) |*group_runtime_status| {
+            for (group_runtime_status.indexes) |*index_status| {
+                index_status.embedding_activity_observed = false;
+                index_status.embedding_activity = .{};
+            }
+        }
         return .{
             .store_id = store_id,
             .embedding_activity_protocol_version = cache.embedding_activity_protocol_version,
+            // A cached heartbeat is a durable liveness refresh, not a new
+            // activity observation. Keep the owner sequence for diagnostics,
+            // but strip observation validity below before sending it.
+            .embedding_activity_sequence = cache.embedding_activity_sequence,
             .reporter_incarnation = cache.reporter_incarnation,
             .status_generation = cache.status_generation,
             .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
@@ -12060,7 +12176,7 @@ pub const DataServer = struct {
             .active_backfills = cache.active_backfills,
             .backfill_progress_millis = cache.backfill_progress_millis,
             .group_statuses = try antfly.metadata.table_manager.cloneGroupStatuses(self.alloc, cache.group_statuses),
-            .runtime_statuses = try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, cache.runtime_statuses),
+            .runtime_statuses = runtime_statuses,
         };
     }
 
@@ -12077,7 +12193,9 @@ pub const DataServer = struct {
         errdefer if (runtime_statuses.len > 0)
             antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
         var next: StoreStatusHeartbeatCache = .{
+            .valid = true,
             .embedding_activity_protocol_version = report.embedding_activity_protocol_version,
+            .embedding_activity_sequence = report.embedding_activity_sequence,
             .reporter_incarnation = report.reporter_incarnation,
             .status_generation = report.status_generation,
             .artifact_sources_protocol_version = report.artifact_sources_protocol_version,
@@ -16947,6 +17065,7 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .embedding_activity_observed = index.embedding_activity_observed,
         .embedding_activity = .{
             .epoch = index.embedding_activity.epoch,
+            .sample_sequence = index.embedding_activity.sample_sequence,
             .phase = switch (index.embedding_activity.effectivePhase()) {
                 .idle => .idle,
                 .preparing => .preparing,
@@ -16976,6 +17095,7 @@ test "data runtime report preserves compact managed repair admission state" {
         .embedding_activity_observed = true,
         .embedding_activity = .{
             .epoch = 7,
+            .sample_sequence = 2,
             .chunks_created = 9,
             .embedding_batches_completed = 2,
             .embeddings_computed = 8,
@@ -16997,7 +17117,7 @@ test "data runtime report preserves compact managed repair admission state" {
     defer alloc.free(encoded);
     try ant_json.testing.expectSubsetJsonText(
         alloc,
-        "{\"publication_target_count\":2500,\"publication_target_ready\":true,\"embedding_activity_observed\":true,\"embedding_activity\":{\"epoch\":7,\"phase\":\"waiting_retry\",\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
+        "{\"publication_target_count\":2500,\"publication_target_ready\":true,\"embedding_activity_observed\":true,\"embedding_activity\":{\"epoch\":7,\"sample_sequence\":2,\"phase\":\"waiting_retry\",\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
         encoded,
     );
 }

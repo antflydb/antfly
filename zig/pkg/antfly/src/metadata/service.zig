@@ -75,123 +75,179 @@ const embedding_activity_ttl_ns: u64 = 90 * std.time.ns_per_s;
 const embedding_activity_protocol_version = metadata_table_manager.embedding_activity_protocol_version;
 
 const EmbeddingActivityCache = struct {
+    const shard_count = 16;
+    const max_entries_per_shard = 8 * 1024;
+    const max_owner_fences_per_shard = 8 * 1024;
+
     const OwnerFence = struct {
-        store_id: u64,
         reporter_incarnation: u64,
         status_generation: u64,
+        activity_sequence: u64,
     };
 
-    const Entry = struct {
+    const ActivityKey = struct {
         store_id: u64,
         reporter_incarnation: u64,
         group_id: u64,
         coverage_generation: u64,
         coverage_config_hash: u64,
-        index_name: []u8,
-        index_kind: []u8,
-        activity: metadata_table_manager.RuntimeEmbeddingActivityStatusReport,
-        observed_at_ns: u64,
+        index_name: []const u8,
+        index_kind: []const u8,
+    };
 
-        fn deinit(self: Entry, alloc: std.mem.Allocator) void {
-            alloc.free(self.index_name);
-            alloc.free(self.index_kind);
+    const ActivityKeyContext = struct {
+        pub fn hash(_: @This(), key: ActivityKey) u64 {
+            var hasher = std.hash.Wyhash.init(0x414e_5446_4c59_4143);
+            hasher.update(std.mem.asBytes(&key.store_id));
+            hasher.update(std.mem.asBytes(&key.reporter_incarnation));
+            hasher.update(std.mem.asBytes(&key.group_id));
+            hasher.update(std.mem.asBytes(&key.coverage_generation));
+            hasher.update(std.mem.asBytes(&key.coverage_config_hash));
+            hasher.update(key.index_name);
+            hasher.update("\x00");
+            hasher.update(key.index_kind);
+            return hasher.final();
+        }
+
+        pub fn eql(_: @This(), lhs: ActivityKey, rhs: ActivityKey) bool {
+            return lhs.store_id == rhs.store_id and
+                lhs.reporter_incarnation == rhs.reporter_incarnation and
+                lhs.group_id == rhs.group_id and
+                lhs.coverage_generation == rhs.coverage_generation and
+                lhs.coverage_config_hash == rhs.coverage_config_hash and
+                std.mem.eql(u8, lhs.index_name, rhs.index_name) and
+                std.mem.eql(u8, lhs.index_kind, rhs.index_kind);
         }
     };
 
-    mutex: std.Io.Mutex = .init,
-    /// Retained for the lifetime of the current StoreRecord incarnation, even
-    /// after activity expires. Durable status intentionally does not advance
-    /// for activity-only reports, so this is the authority that rejects a
-    /// delayed heartbeat from regressing the ephemeral projection.
-    owner_fences: std.ArrayListUnmanaged(OwnerFence) = .empty,
-    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    const Entry = struct {
+        activity: metadata_table_manager.RuntimeEmbeddingActivityStatusReport,
+        observed_at_ns: u64,
+    };
+
+    const EntryMap = std.HashMapUnmanaged(ActivityKey, Entry, ActivityKeyContext, 80);
+    const KeySet = std.HashMapUnmanaged(ActivityKey, void, ActivityKeyContext, 80);
+
+    const Shard = struct {
+        mutex: std.Io.Mutex = .init,
+        owner_fences: std.AutoHashMapUnmanaged(u64, OwnerFence) = .empty,
+        entries: EntryMap = .empty,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            var entries = self.entries.iterator();
+            while (entries.next()) |entry| {
+                alloc.free(@constCast(entry.key_ptr.index_name));
+                alloc.free(@constCast(entry.key_ptr.index_kind));
+            }
+            self.entries.deinit(alloc);
+            self.owner_fences.deinit(alloc);
+            self.* = .{};
+        }
+    };
+
+    shards: [shard_count]Shard = [_]Shard{.{}} ** shard_count,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        for (self.entries.items) |entry| entry.deinit(alloc);
-        self.entries.deinit(alloc);
-        self.owner_fences.deinit(alloc);
+        for (&self.shards) |*shard| shard.deinit(alloc);
         self.* = .{};
     }
 
+    fn shardIndex(store_id: u64) usize {
+        return @intCast(store_id % shard_count);
+    }
+
+    fn shardForStore(self: *@This(), store_id: u64) *Shard {
+        return &self.shards[shardIndex(store_id)];
+    }
+
     fn activityAvailable(index_status: metadata_table_manager.RuntimeIndexStatusReport) bool {
-        return index_status.embedding_activity_observed and index_status.embedding_activity.epoch != 0;
+        return index_status.embedding_activity_observed and
+            index_status.embedding_activity.epoch != 0 and
+            index_status.embedding_activity.sample_sequence != 0;
     }
 
-    fn removeStoreAssumeLocked(self: *@This(), alloc: std.mem.Allocator, store_id: u64) void {
-        var i: usize = self.entries.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (self.entries.items[i].store_id != store_id) continue;
-            const removed = self.entries.swapRemove(i);
-            removed.deinit(alloc);
+    fn removeEntryAssumeLocked(shard: *Shard, alloc: std.mem.Allocator, key: ActivityKey) void {
+        const removed = shard.entries.fetchRemove(key) orelse return;
+        alloc.free(@constCast(removed.key.index_name));
+        alloc.free(@constCast(removed.key.index_kind));
+    }
+
+    fn removeStoreAssumeLocked(shard: *Shard, alloc: std.mem.Allocator, store_id: u64) void {
+        var entries = shard.entries.iterator();
+        while (entries.next()) |entry| {
+            if (entry.key_ptr.store_id != store_id) continue;
+            const key = entry.key_ptr.*;
+            shard.entries.removeByPtr(entry.key_ptr);
+            alloc.free(@constCast(key.index_name));
+            alloc.free(@constCast(key.index_kind));
         }
     }
 
-    fn ownerFenceIndexAssumeLocked(self: *const @This(), store_id: u64) ?usize {
-        for (self.owner_fences.items, 0..) |fence, index| {
-            if (fence.store_id == store_id) return index;
+    fn expireAssumeLocked(shard: *Shard, alloc: std.mem.Allocator, now_ns: u64) void {
+        var entries = shard.entries.iterator();
+        while (entries.next()) |entry| {
+            if (now_ns -| entry.value_ptr.observed_at_ns < embedding_activity_ttl_ns) continue;
+            const key = entry.key_ptr.*;
+            shard.entries.removeByPtr(entry.key_ptr);
+            alloc.free(@constCast(key.index_name));
+            alloc.free(@constCast(key.index_kind));
         }
-        return null;
     }
 
-    fn entryMatchesIndex(
-        entry: Entry,
-        reporter_incarnation: u64,
-        group_id: u64,
-        index_status: metadata_table_manager.RuntimeIndexStatusReport,
-    ) bool {
-        return entry.reporter_incarnation == reporter_incarnation and
-            entry.group_id == group_id and
-            entry.coverage_generation == index_status.coverage_generation and
-            entry.coverage_config_hash == index_status.coverage_config_hash and
-            std.mem.eql(u8, entry.index_name, index_status.name) and
-            std.mem.eql(u8, entry.index_kind, index_status.kind);
-    }
-
-    fn entryIndexAssumeLocked(
-        self: *const @This(),
+    fn keyForIndex(
         store_id: u64,
         reporter_incarnation: u64,
         group_id: u64,
         index_status: metadata_table_manager.RuntimeIndexStatusReport,
-    ) ?usize {
-        for (self.entries.items, 0..) |entry, i| {
-            if (entry.store_id == store_id and
-                entryMatchesIndex(entry, reporter_incarnation, group_id, index_status)) return i;
-        }
-        return null;
+    ) ActivityKey {
+        return .{
+            .store_id = store_id,
+            .reporter_incarnation = reporter_incarnation,
+            .group_id = group_id,
+            .coverage_generation = index_status.coverage_generation,
+            .coverage_config_hash = index_status.coverage_config_hash,
+            .index_name = index_status.name,
+            .index_kind = index_status.kind,
+        };
     }
 
     fn mergeObservedActivitiesAssumeLocked(
-        self: *@This(),
+        shard: *Shard,
         alloc: std.mem.Allocator,
         report: metadata_table_manager.StoreStatusReport,
+        admitted: *const KeySet,
         now_ns: u64,
     ) !void {
         for (report.runtime_statuses) |runtime_status| {
             for (runtime_status.indexes) |index_status| {
                 if (!index_status.embedding_activity_observed) continue;
-                if (self.entryIndexAssumeLocked(
+                const key = keyForIndex(
                     report.store_id,
                     report.reporter_incarnation,
                     runtime_status.group_id,
                     index_status,
-                )) |entry_index| {
-                    if (!activityAvailable(index_status)) {
-                        const removed = self.entries.swapRemove(entry_index);
-                        removed.deinit(alloc);
-                        continue;
-                    }
-                    self.entries.items[entry_index].activity = index_status.embedding_activity;
-                    self.entries.items[entry_index].observed_at_ns = now_ns;
+                );
+                // Volatile telemetry cannot manufacture catalog identities or
+                // consume the bounded cache with unknown groups/indexes.
+                if (!admitted.contains(key)) continue;
+                if (!activityAvailable(index_status)) {
+                    removeEntryAssumeLocked(shard, alloc, key);
                     continue;
                 }
-                if (!activityAvailable(index_status)) continue;
+                if (shard.entries.getPtr(key)) |entry| {
+                    const incoming = index_status.embedding_activity;
+                    if (incoming.epoch == entry.activity.epoch and
+                        incoming.sample_sequence < entry.activity.sample_sequence) continue;
+                    entry.activity = incoming;
+                    entry.observed_at_ns = now_ns;
+                    continue;
+                }
+                if (shard.entries.count() >= max_entries_per_shard) continue;
                 const index_name = try alloc.dupe(u8, index_status.name);
                 errdefer alloc.free(index_name);
                 const index_kind = try alloc.dupe(u8, index_status.kind);
                 errdefer alloc.free(index_kind);
-                try self.entries.append(alloc, .{
+                const owned_key: ActivityKey = .{
                     .store_id = report.store_id,
                     .reporter_incarnation = report.reporter_incarnation,
                     .group_id = runtime_status.group_id,
@@ -199,66 +255,8 @@ const EmbeddingActivityCache = struct {
                     .coverage_config_hash = index_status.coverage_config_hash,
                     .index_name = index_name,
                     .index_kind = index_kind,
-                    .activity = index_status.embedding_activity,
-                    .observed_at_ns = now_ns,
-                });
-            }
-        }
-    }
-
-    fn reconcileNewStoreSnapshotAssumeLocked(
-        self: *@This(),
-        alloc: std.mem.Allocator,
-        report: metadata_table_manager.StoreStatusReport,
-        now_ns: u64,
-    ) !void {
-        // Reports are best-effort observations, not complete activity
-        // snapshots. Merge only fields the owner explicitly observed. Entries
-        // for omitted, dropped, or recreated indexes remain TTL-bounded and
-        // cannot project because overlay rechecks the exact durable identity.
-        try self.mergeObservedActivitiesAssumeLocked(alloc, report, now_ns);
-    }
-
-    fn refreshSameGenerationActivitiesAssumeLocked(
-        self: *@This(),
-        alloc: std.mem.Allocator,
-        report: metadata_table_manager.StoreStatusReport,
-        now_ns: u64,
-    ) !void {
-        for (report.runtime_statuses) |runtime_status| {
-            for (runtime_status.indexes) |index_status| {
-                if (!index_status.embedding_activity_observed) continue;
-                if (self.entryIndexAssumeLocked(
-                    report.store_id,
-                    report.reporter_incarnation,
-                    runtime_status.group_id,
-                    index_status,
-                )) |entry_index| {
-                    if (index_status.embedding_activity.epoch == 0) {
-                        const removed = self.entries.swapRemove(entry_index);
-                        removed.deinit(alloc);
-                        continue;
-                    }
-                    // Same-generation reports are replayable. Refresh liveness
-                    // but do not let a reordered payload regress monotonic
-                    // counters.
-                    if (self.entries.items[entry_index].activity.epoch == index_status.embedding_activity.epoch)
-                        self.entries.items[entry_index].observed_at_ns = now_ns;
-                    continue;
-                }
-                if (index_status.embedding_activity.epoch == 0) continue;
-                const index_name = try alloc.dupe(u8, index_status.name);
-                errdefer alloc.free(index_name);
-                const index_kind = try alloc.dupe(u8, index_status.kind);
-                errdefer alloc.free(index_kind);
-                try self.entries.append(alloc, .{
-                    .store_id = report.store_id,
-                    .reporter_incarnation = report.reporter_incarnation,
-                    .group_id = runtime_status.group_id,
-                    .coverage_generation = index_status.coverage_generation,
-                    .coverage_config_hash = index_status.coverage_config_hash,
-                    .index_name = index_name,
-                    .index_kind = index_kind,
+                };
+                try shard.entries.putNoClobber(alloc, owned_key, .{
                     .activity = index_status.embedding_activity,
                     .observed_at_ns = now_ns,
                 });
@@ -273,41 +271,55 @@ const EmbeddingActivityCache = struct {
         reports: []const metadata_table_manager.StoreStatusReport,
         now_ns: u64,
     ) !void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+        var expired_shards = [_]bool{false} ** shard_count;
         for (reports) |report| {
             if (report.embedding_activity_protocol_version != embedding_activity_protocol_version) continue;
-            if (report.reporter_incarnation == 0) continue;
+            if (report.reporter_incarnation == 0 or report.embedding_activity_sequence == 0) continue;
             const store_index = metadata_store_observer.findStoreIndex(projected, report.store_id) orelse continue;
             const store = projected[store_index];
             if (report.reporter_incarnation != store.reporter_incarnation or
                 report.status_generation < store.status_generation) continue;
 
-            if (self.ownerFenceIndexAssumeLocked(report.store_id)) |fence_index| {
-                const fence = &self.owner_fences.items[fence_index];
-                if (fence.reporter_incarnation == report.reporter_incarnation) {
-                    if (report.status_generation < fence.status_generation) continue;
-                    if (report.status_generation == fence.status_generation) {
-                        try self.refreshSameGenerationActivitiesAssumeLocked(alloc, report, now_ns);
-                        continue;
-                    }
-                } else {
-                    self.removeStoreAssumeLocked(alloc, report.store_id);
+            var admitted = KeySet.empty;
+            defer admitted.deinit(alloc);
+            for (store.runtime_statuses) |runtime_status| {
+                for (runtime_status.indexes) |index_status| {
+                    try admitted.put(alloc, keyForIndex(
+                        store.store_id,
+                        store.reporter_incarnation,
+                        runtime_status.group_id,
+                        index_status,
+                    ), {});
                 }
-                fence.* = .{
-                    .store_id = report.store_id,
-                    .reporter_incarnation = report.reporter_incarnation,
-                    .status_generation = report.status_generation,
-                };
-            } else {
-                try self.owner_fences.append(alloc, .{
-                    .store_id = report.store_id,
-                    .reporter_incarnation = report.reporter_incarnation,
-                    .status_generation = report.status_generation,
-                });
             }
 
-            try self.reconcileNewStoreSnapshotAssumeLocked(alloc, report, now_ns);
+            const shard = self.shardForStore(report.store_id);
+            shard.mutex.lockUncancelable(std.Options.debug_io);
+            defer shard.mutex.unlock(std.Options.debug_io);
+            const shard_index = shardIndex(report.store_id);
+            if (!expired_shards[shard_index]) {
+                expireAssumeLocked(shard, alloc, now_ns);
+                expired_shards[shard_index] = true;
+            }
+            if (!shard.owner_fences.contains(report.store_id) and
+                shard.owner_fences.count() >= max_owner_fences_per_shard) continue;
+            const fence_entry = try shard.owner_fences.getOrPut(alloc, report.store_id);
+            if (fence_entry.found_existing) {
+                const fence = fence_entry.value_ptr;
+                if (fence.reporter_incarnation == report.reporter_incarnation) {
+                    if (report.status_generation < fence.status_generation) continue;
+                    if (report.status_generation > fence.status_generation) {
+                        fence.status_generation = report.status_generation;
+                    }
+                    if (report.embedding_activity_sequence <= fence.activity_sequence) continue;
+                } else removeStoreAssumeLocked(shard, alloc, report.store_id);
+            }
+            fence_entry.value_ptr.* = .{
+                .reporter_incarnation = report.reporter_incarnation,
+                .status_generation = report.status_generation,
+                .activity_sequence = report.embedding_activity_sequence,
+            };
+            try mergeObservedActivitiesAssumeLocked(shard, alloc, report, &admitted, now_ns);
         }
     }
 
@@ -317,44 +329,70 @@ const EmbeddingActivityCache = struct {
         stores: []metadata_table_manager.StoreRecord,
         now_ns: u64,
     ) void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
-        var fence_index: usize = self.owner_fences.items.len;
-        while (fence_index > 0) {
-            fence_index -= 1;
-            const fence = self.owner_fences.items[fence_index];
-            const live = for (stores) |store| {
-                if (store.store_id == fence.store_id and
-                    store.reporter_incarnation == fence.reporter_incarnation) break true;
-            } else false;
-            if (live) continue;
-            _ = self.owner_fences.swapRemove(fence_index);
-            self.removeStoreAssumeLocked(cache_alloc, fence.store_id);
+        // Pruning is best-effort observability housekeeping. Build one sorted
+        // live-store set outside shard locks; allocation pressure may defer the
+        // cleanup but never fail a status read.
+        const maybe_live_store_ids = cache_alloc.alloc(u64, stores.len) catch null;
+        defer if (maybe_live_store_ids) |ids| cache_alloc.free(ids);
+        if (maybe_live_store_ids) |ids| {
+            for (stores, 0..) |store, i| ids[i] = store.store_id;
+            std.sort.pdq(u64, ids, {}, std.sort.asc(u64));
         }
-        var i: usize = self.entries.items.len;
-        while (i > 0) {
-            i -= 1;
-            const entry = self.entries.items[i];
-            if (now_ns -| entry.observed_at_ns < embedding_activity_ttl_ns) continue;
-            const removed = self.entries.swapRemove(i);
-            removed.deinit(cache_alloc);
-        }
-        for (stores) |*store| {
-            for (self.entries.items) |entry| {
-                if (entry.store_id != store.store_id or
-                    entry.reporter_incarnation != store.reporter_incarnation) continue;
+        for (&self.shards, 0..) |*shard, shard_index| {
+            shard.mutex.lockUncancelable(std.Options.debug_io);
+            defer shard.mutex.unlock(std.Options.debug_io);
+            if (maybe_live_store_ids) |live_store_ids| {
+                var fences = shard.owner_fences.iterator();
+                while (fences.next()) |fence| {
+                    if (std.sort.binarySearch(
+                        u64,
+                        live_store_ids,
+                        fence.key_ptr.*,
+                        struct {
+                            fn compare(key: u64, value: u64) std.math.Order {
+                                return std.math.order(key, value);
+                            }
+                        }.compare,
+                    ) != null) continue;
+                    const retired_store_id = fence.key_ptr.*;
+                    removeStoreAssumeLocked(shard, cache_alloc, retired_store_id);
+                    shard.owner_fences.removeByPtr(fence.key_ptr);
+                }
+            }
+            expireAssumeLocked(shard, cache_alloc, now_ns);
+            for (stores) |*store| {
+                if (shardIndex(store.store_id) != shard_index) continue;
+                const fence = shard.owner_fences.get(store.store_id) orelse continue;
+                if (fence.reporter_incarnation != store.reporter_incarnation) {
+                    removeStoreAssumeLocked(shard, cache_alloc, store.store_id);
+                    _ = shard.owner_fences.remove(store.store_id);
+                    continue;
+                }
                 for (store.runtime_statuses) |*runtime_status| {
-                    if (runtime_status.group_id != entry.group_id) continue;
                     for (runtime_status.indexes) |*index_status| {
-                        if (!std.mem.eql(u8, index_status.name, entry.index_name) or
-                            !std.mem.eql(u8, index_status.kind, entry.index_kind) or
-                            index_status.coverage_generation != entry.coverage_generation or
-                            index_status.coverage_config_hash != entry.coverage_config_hash) continue;
+                        const key = keyForIndex(
+                            store.store_id,
+                            store.reporter_incarnation,
+                            runtime_status.group_id,
+                            index_status.*,
+                        );
+                        const entry = shard.entries.get(key) orelse continue;
+                        index_status.embedding_activity_observed = true;
                         index_status.embedding_activity = entry.activity;
                     }
                 }
             }
         }
+    }
+
+    fn entryCount(self: *@This()) usize {
+        var total: usize = 0;
+        for (&self.shards) |*shard| {
+            shard.mutex.lockUncancelable(std.Options.debug_io);
+            total += shard.entries.count();
+            shard.mutex.unlock(std.Options.debug_io);
+        }
+        return total;
     }
 };
 
@@ -7779,6 +7817,7 @@ test "metadata service activity cache is versioned TTL-bound and incarnation sco
     observed_indexes[0].embedding_activity_observed = true;
     observed_indexes[0].embedding_activity = .{
         .epoch = 77,
+        .sample_sequence = 1,
         .phase = .embedding,
         .embeddings_computed = 12,
         .active_batch_size = 4,
@@ -7788,6 +7827,7 @@ test "metadata service activity cache is versioned TTL-bound and incarnation sco
     const report = metadata_table_manager.StoreStatusReport{
         .store_id = 3,
         .embedding_activity_protocol_version = embedding_activity_protocol_version,
+        .embedding_activity_sequence = 1,
         .reporter_incarnation = 0x1234,
         .status_generation = 6,
         .runtime_statuses = observed_runtime[0..],
@@ -7796,6 +7836,20 @@ test "metadata service activity cache is versioned TTL-bound and incarnation sco
     var cache: EmbeddingActivityCache = .{};
     defer cache.deinit(alloc);
     try cache.update(alloc, &.{committed}, &.{report}, 100);
+    try std.testing.expectEqual(@as(usize, 1), cache.entryCount());
+
+    // A valid owner report cannot populate telemetry for a catalog identity
+    // that is absent from the accepted durable projection.
+    var unknown_indexes = observed_indexes;
+    unknown_indexes[0].name = "unknown";
+    unknown_indexes[0].embedding_activity.sample_sequence = 2;
+    var unknown_runtime = observed_runtime;
+    unknown_runtime[0].indexes = unknown_indexes[0..];
+    var unknown_report = report;
+    unknown_report.embedding_activity_sequence = 2;
+    unknown_report.runtime_statuses = unknown_runtime[0..];
+    try cache.update(alloc, &.{committed}, &.{unknown_report}, 100);
+    try std.testing.expectEqual(@as(usize, 1), cache.entryCount());
 
     var current = [_]metadata_table_manager.StoreRecord{try metadata_table_manager.cloneStore(alloc, committed)};
     defer metadata_table_manager.freeStore(alloc, current[0]);
@@ -7819,6 +7873,7 @@ test "metadata service activity cache is versioned TTL-bound and incarnation sco
     // cache's own sequence fence must reject reordered observations.
     var stale_report = report;
     stale_report.status_generation = report.status_generation - 1;
+    stale_report.embedding_activity_sequence = report.embedding_activity_sequence + 1;
     var stale_indexes = observed_indexes;
     stale_indexes[0].embedding_activity.embeddings_computed = 999;
     var stale_runtime = observed_runtime;
@@ -7835,10 +7890,12 @@ test "metadata service activity cache is versioned TTL-bound and incarnation sco
     cache.overlay(alloc, &current, 104);
     try std.testing.expectEqual(@as(u64, 0), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
 
-    // An idempotent periodic heartbeat refreshes liveness without permitting
-    // same-generation data to rewrite the snapshot.
+    // A new owner sample refreshes liveness; an idempotent replay cannot.
     current[0].runtime_statuses[0].indexes[0].coverage_generation = 7;
-    try cache.update(alloc, &.{committed}, &.{report}, 100 + embedding_activity_ttl_ns - 1);
+    var refreshed_report = report;
+    refreshed_report.embedding_activity_sequence += 2;
+    refreshed_report.runtime_statuses[0].indexes[0].embedding_activity.sample_sequence += 1;
+    try cache.update(alloc, &.{committed}, &.{refreshed_report}, 100 + embedding_activity_ttl_ns - 1);
     cache.overlay(alloc, &current, 100 + embedding_activity_ttl_ns + 1);
     try std.testing.expectEqual(@as(u64, 77), current[0].runtime_statuses[0].indexes[0].embedding_activity.epoch);
 
@@ -7879,6 +7936,7 @@ test "metadata service activity cache distinguishes observation gaps from observ
     active_indexes[0].embedding_activity_observed = true;
     active_indexes[0].embedding_activity = .{
         .epoch = 77,
+        .sample_sequence = 1,
         .phase = .embedding,
         .embeddings_computed = 12,
     };
@@ -7887,6 +7945,7 @@ test "metadata service activity cache distinguishes observation gaps from observ
     const active_report = metadata_table_manager.StoreStatusReport{
         .store_id = 3,
         .embedding_activity_protocol_version = embedding_activity_protocol_version,
+        .embedding_activity_sequence = 1,
         .reporter_incarnation = 0x1234,
         .status_generation = 6,
         .runtime_statuses = active_runtime[0..],
@@ -7902,6 +7961,7 @@ test "metadata service activity cache distinguishes observation gaps from observ
     unavailable_runtime[0].indexes = committed_indexes[0..];
     var unavailable_report = active_report;
     unavailable_report.status_generation = 7;
+    unavailable_report.embedding_activity_sequence = 2;
     unavailable_report.runtime_statuses = unavailable_runtime[0..];
     try cache.update(alloc, &.{committed}, &.{unavailable_report}, 120);
 
@@ -7917,14 +7977,17 @@ test "metadata service activity cache distinguishes observation gaps from observ
     // telemetry immediately and remains distinguishable from unavailable.
     var resumed_report = active_report;
     resumed_report.status_generation = 8;
+    resumed_report.embedding_activity_sequence = 3;
     try cache.update(alloc, &.{committed}, &.{resumed_report}, 200 + embedding_activity_ttl_ns);
     var idle_indexes = active_indexes;
     idle_indexes[0].embedding_activity.phase = .idle;
+    idle_indexes[0].embedding_activity.sample_sequence = 2;
     idle_indexes[0].embedding_activity.active_batch_size = 0;
     var idle_runtime = committed_runtime;
     idle_runtime[0].indexes = idle_indexes[0..];
     var idle_report = active_report;
     idle_report.status_generation = 9;
+    idle_report.embedding_activity_sequence = 4;
     idle_report.runtime_statuses = idle_runtime[0..];
     try cache.update(alloc, &.{committed}, &.{idle_report}, 201 + embedding_activity_ttl_ns);
     cache.overlay(alloc, &current, 202 + embedding_activity_ttl_ns);
@@ -8811,9 +8874,14 @@ fn reportStoreStatusesWithProjected(
             report.reporter_incarnation,
             report.status_generation,
         )) return error.InvalidStoreReporterFence;
-        if (!metadata_table_manager.embeddingActivityProtocolValid(
+        if (!metadata_table_manager.embeddingActivityReportValid(
             report.reporter_incarnation,
             report.embedding_activity_protocol_version,
+            report.embedding_activity_sequence,
+        )) return error.InvalidStoreReporterFence;
+        if (!metadata_table_manager.embeddingActivitySamplesValid(
+            report.embedding_activity_protocol_version,
+            report.runtime_statuses,
         )) return error.InvalidStoreReporterFence;
         const index = metadata_store_observer.findStoreIndex(projected, report.store_id) orelse return error.UnknownStore;
         if (!metadata_store_observer.observationChangesRecordWithRepairStatus(
@@ -8850,12 +8918,17 @@ fn reportStoreStatusesWithProjected(
     // that its leader never accepted. Counter-only reports still reach this
     // point without producing a Raft proposal.
     if (comptime @hasField(@TypeOf(service.*), "embedding_activity_cache")) {
-        try service.embedding_activity_cache.update(
+        service.embedding_activity_cache.update(
             service.alloc,
             projected,
             reports,
             platform_time.monotonicNs(),
-        );
+        ) catch |err| {
+            // Telemetry is deliberately best-effort. Durable status has
+            // already been accepted and must never fail because this bounded
+            // volatile cache is under memory pressure.
+            std.log.warn("embedding activity cache update skipped err={s}", .{@errorName(err)});
+        };
     }
     return applied;
 }

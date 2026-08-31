@@ -533,12 +533,18 @@ fn embeddingActivityEpoch(runtime_epoch: u64, index_generation: u64, index_name:
     return if (epoch == 0) 1 else epoch;
 }
 
+fn advanceEmbeddingActivitySample(activity: *types.EmbeddingActivityStats) void {
+    activity.sample_sequence +|= 1;
+    if (activity.sample_sequence == 0) activity.sample_sequence = 1;
+}
+
 fn indexEmbeddingActivityPtrAssumeLocked(runtime: *EnrichmentRuntime, index_name: []const u8) ?*types.EmbeddingActivityStats {
     const index_generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse 0;
     if (runtime.index_embedding_activity.getPtr(index_name)) |activity| {
         if (activity.index_generation != index_generation) {
             activity.* = .{
                 .epoch = embeddingActivityEpoch(runtime.activity_epoch, index_generation, index_name),
+                .sample_sequence = 1,
                 .index_generation = index_generation,
             };
         }
@@ -554,6 +560,7 @@ fn indexEmbeddingActivityPtrAssumeLocked(runtime: *EnrichmentRuntime, index_name
     } else {
         result.value_ptr.* = .{
             .epoch = embeddingActivityEpoch(runtime.activity_epoch, index_generation, index_name),
+            .sample_sequence = 1,
             .index_generation = index_generation,
         };
     }
@@ -578,6 +585,7 @@ fn noteIndexEmbedBatchStartedAssumeLocked(
             activity.retrying = false;
             activity.retry_fingerprint = runtime.active_failure_fingerprint;
         }
+        advanceEmbeddingActivitySample(activity);
     }
 }
 
@@ -593,12 +601,14 @@ fn noteIndexEmbedBatchFinishedAssumeLocked(
         const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
         activity.active_batch_size -|= @intCast(items);
         if (!success) {
+            advanceEmbeddingActivitySample(activity);
             continue;
         }
         if (owner == .supervised_replay) activity.retry_fingerprint = 0;
         activity.embedding_batches_completed +|= 1;
         activity.embeddings_computed +|= @intCast(items);
         activity.last_progress_at_ms = @max(activity.last_progress_at_ms, completed_at_ms);
+        advanceEmbeddingActivitySample(activity);
     }
 }
 
@@ -606,16 +616,21 @@ fn markScheduledIndexEmbeddingRetryAssumeLocked(runtime: *EnrichmentRuntime) voi
     if (runtime.active_failure_fingerprint == 0) return;
     var iter = runtime.index_embedding_activity.valueIterator();
     while (iter.next()) |activity| {
-        if (activity.retry_fingerprint == runtime.active_failure_fingerprint)
+        if (activity.retry_fingerprint == runtime.active_failure_fingerprint and !activity.retrying) {
             activity.retrying = true;
+            advanceEmbeddingActivitySample(activity);
+        }
     }
 }
 
 fn clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime: *EnrichmentRuntime) void {
     var iter = runtime.index_embedding_activity.valueIterator();
     while (iter.next()) |activity| {
-        activity.retrying = false;
-        activity.retry_fingerprint = 0;
+        if (activity.retrying or activity.retry_fingerprint != 0) {
+            activity.retrying = false;
+            activity.retry_fingerprint = 0;
+            advanceEmbeddingActivitySample(activity);
+        }
     }
 }
 
@@ -623,6 +638,7 @@ fn noteIndexPreparationStartedAssumeLocked(runtime: *EnrichmentRuntime, index_na
     for (index_names) |index_name| {
         const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
         activity.active_preparations +|= 1;
+        advanceEmbeddingActivitySample(activity);
     }
 }
 
@@ -631,6 +647,7 @@ fn noteIndexPreparationFinishedAssumeLocked(runtime: *EnrichmentRuntime, index_n
         const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
         activity.active_preparations -|= 1;
         activity.chunks_created +|= @intCast(chunks_created);
+        advanceEmbeddingActivitySample(activity);
     }
 }
 
@@ -670,6 +687,7 @@ fn updateIndexPublishing(runtime: *EnrichmentRuntime, index_names: []const []con
         for (index_names) |index_name| {
             const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
             if (started) activity.active_publications +|= 1 else activity.active_publications -|= 1;
+            advanceEmbeddingActivitySample(activity);
         }
     } else if (runtime.io_impl) |io_impl| {
         const io = io_impl.io();
@@ -677,12 +695,14 @@ fn updateIndexPublishing(runtime: *EnrichmentRuntime, index_names: []const []con
         for (index_names) |index_name| {
             const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
             if (started) activity.active_publications +|= 1 else activity.active_publications -|= 1;
+            advanceEmbeddingActivitySample(activity);
         }
         runtime.mutex.unlock(io);
     } else {
         for (index_names) |index_name| {
             const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
             if (started) activity.active_publications +|= 1 else activity.active_publications -|= 1;
+            advanceEmbeddingActivitySample(activity);
         }
     }
     runtime.notifyActivityHook();
@@ -2443,9 +2463,20 @@ fn requestHasChunking(request: enrichment_types.GeneratedEnrichmentRequest) bool
     return request.chunk_size > 0 or request.chunker_json.len > 0;
 }
 
+/// Embedding requests use `artifact_name` as an explicit chunk-source
+/// identity. Source ownership must not be inferred from local chunker knobs:
+/// materialized producers can intentionally emit zero chunks and may not carry
+/// an inline chunk size at all.
+fn requestHasChunkSource(request: enrichment_types.GeneratedEnrichmentRequest) bool {
+    return switch (request.kind) {
+        .dense_embedding, .sparse_embedding => request.artifact_name.len > 0,
+        .asset, .chunk_text => false,
+    };
+}
+
 fn requestCanBatchPlainDense(request: enrichment_types.GeneratedEnrichmentRequest) bool {
     return request.kind == .dense_embedding and
-        !requestHasChunking(request) and
+        !requestHasChunkSource(request) and
         request.source_template.len == 0;
 }
 
@@ -3005,10 +3036,12 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         const index_generation = self.index_manager.coverageGenerationForIndex(index_name) orelse 0;
         const activity = self.index_embedding_activity.get(index_name) orelse return .{
             .epoch = embeddingActivityEpoch(self.activity_epoch, index_generation, index_name),
+            .sample_sequence = 1,
             .index_generation = index_generation,
         };
         if (activity.index_generation != index_generation) return .{
             .epoch = embeddingActivityEpoch(self.activity_epoch, index_generation, index_name),
+            .sample_sequence = 1,
             .index_generation = index_generation,
         };
         return activity;
@@ -3625,10 +3658,12 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         const index_generation = self.index_manager.coverageGenerationForIndex(index_name) orelse 0;
         const activity = self.index_embedding_activity.get(index_name) orelse return .{
             .epoch = embeddingActivityEpoch(self.activity_epoch, index_generation, index_name),
+            .sample_sequence = 1,
             .index_generation = index_generation,
         };
         if (activity.index_generation != index_generation) return .{
             .epoch = embeddingActivityEpoch(self.activity_epoch, index_generation, index_name),
+            .sample_sequence = 1,
             .index_generation = index_generation,
         };
         return activity;
@@ -4186,7 +4221,7 @@ fn failureIdentityForRequest(request: enrichment_types.GeneratedEnrichmentReques
             .asset, .chunk_text => requestArtifactName(request),
         },
         .source_artifact_name = switch (request.kind) {
-            .dense_embedding, .sparse_embedding => if (requestHasChunking(request)) requestArtifactName(request) else "",
+            .dense_embedding, .sparse_embedding => if (requestHasChunkSource(request)) request.artifact_name else "",
             .asset, .chunk_text => "",
         },
         .doc_key = request.doc_key,
@@ -4258,7 +4293,7 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
                     .asset, .chunk_text => requestArtifactName(request),
                 },
                 .source_artifact_name = switch (request.kind) {
-                    .dense_embedding, .sparse_embedding => if (requestHasChunking(request)) requestArtifactName(request) else "",
+                    .dense_embedding, .sparse_embedding => if (requestHasChunkSource(request)) request.artifact_name else "",
                     .asset, .chunk_text => "",
                 },
                 .doc_key = request.doc_key,
@@ -4952,7 +4987,7 @@ fn processPendingDocumentGroup(
             try deferred_plain_dense.append(runtime.alloc, request);
             continue;
         }
-        if (request.kind == .dense_embedding and requestHasChunking(request)) {
+        if (request.kind == .dense_embedding and requestHasChunkSource(request)) {
             try deferred_chunked_dense.append(runtime.alloc, request);
             continue;
         }
@@ -10398,7 +10433,7 @@ fn processDenseEmbedding(
         runtime.alloc.free(consumer_indexes);
     }
     if (consumer_indexes.len == 0) return;
-    if ((request.chunk_size > 0 or request.chunker_json.len > 0) and chunk_artifact_name.len > 0) {
+    if (requestHasChunkSource(request)) {
         var source_set = try chunkEmbeddingSourceSetForRequest(runtime, request, chunk_artifact_name, chunk_cache);
         defer source_set.deinit(runtime.alloc);
 
@@ -10538,7 +10573,7 @@ fn processSparseEmbedding(
     if (consumer_indexes.len == 0) return;
 
     const chunk_artifact_name = requestArtifactName(request);
-    if ((request.chunk_size > 0 or request.chunker_json.len > 0) and chunk_artifact_name.len > 0) {
+    if (requestHasChunkSource(request)) {
         if (requestUsesMaterializedChunkArtifact(runtime, chunk_artifact_name)) {
             try processMaterializedChunkSparseRequest(runtime, request, chunk_artifact_name, embedding_artifact_name, sparse_embedder, consumer_indexes, window);
             return;
@@ -11877,17 +11912,17 @@ fn documentExtractionManifestHasLastError(alloc: Allocator, manifest_json: []con
     return parsed.value.object.get("last_error") != null;
 }
 
-fn documentExtractionEmptyCoverageOutcome(alloc: Allocator, manifest_json: []const u8) !CoverageOutcome {
+pub fn documentExtractionEmptyCoverageIsTerminalFailure(alloc: Allocator, manifest_json: []const u8) !bool {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidDocumentExtractionManifest;
     const object = parsed.value.object;
-    if (object.get("last_error") != null) return .terminal_failed;
+    if (object.get("last_error") != null) return true;
     if (object.get("merge_status")) |value| {
-        if (value == .string and std.mem.eql(u8, value.string, "failed")) return .terminal_failed;
+        if (value == .string and std.mem.eql(u8, value.string, "failed")) return true;
     }
     if (object.get("route_type")) |value| {
-        if (value == .string and std.mem.eql(u8, value.string, "error")) return .terminal_failed;
+        if (value == .string and std.mem.eql(u8, value.string, "error")) return true;
     }
     const chunk_count = try jsonObjectU64(object, "chunk_count");
     const ocr_failed_count = try jsonObjectU64(object, "ocr_failed_count");
@@ -11895,8 +11930,14 @@ fn documentExtractionEmptyCoverageOutcome(alloc: Allocator, manifest_json: []con
         if (value == .array) value.array.items.len else 0
     else
         0;
-    if (chunk_count == 0 and (ocr_failed_count > 0 or failed_pages > 0)) return .terminal_failed;
-    return .skipped;
+    return chunk_count == 0 and (ocr_failed_count > 0 or failed_pages > 0);
+}
+
+fn documentExtractionEmptyCoverageOutcome(alloc: Allocator, manifest_json: []const u8) !CoverageOutcome {
+    return if (try documentExtractionEmptyCoverageIsTerminalFailure(alloc, manifest_json))
+        .terminal_failed
+    else
+        .skipped;
 }
 
 fn queueCoverageOutcomeForRequest(

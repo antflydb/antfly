@@ -15,7 +15,7 @@
 const std = @import("std");
 
 pub const artifact_sources_protocol_version: u16 = 1;
-pub const embedding_activity_protocol_version: u16 = 1;
+pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
@@ -671,9 +671,12 @@ pub fn voterSetFingerprint(node_ids: []const u64, required_node_id: ?u64) VoterS
 pub const StoreStatusReport = struct {
     store_id: u64,
     /// Version of the volatile owner-activity projection carried by this
-    /// heartbeat. Zero means absent/legacy; version 1 is the current schema.
+    /// heartbeat. Zero means absent/legacy; version 2 is the current schema.
     /// This is intentionally not copied into StoreRecord or Raft state.
     embedding_activity_protocol_version: u16 = 0,
+    /// Monotonic volatile report order within `reporter_incarnation`. This is
+    /// independent from `status_generation` and never reaches StoreRecord.
+    embedding_activity_sequence: u64 = 0,
     /// Must match the incarnation established by store registration. Zero is
     /// reserved for rolling-upgrade compatibility with legacy reporters.
     reporter_incarnation: u64 = 0,
@@ -700,8 +703,40 @@ pub fn reporterFenceValid(reporter_incarnation: u64, status_generation: u64) boo
 }
 
 pub fn embeddingActivityProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
-    return protocol_version <= embedding_activity_protocol_version and
+    return (protocol_version == 0 or protocol_version == embedding_activity_protocol_version) and
         (protocol_version == 0 or reporter_incarnation != 0);
+}
+
+/// Sequenced activity is all-or-nothing: legacy reports omit both fields,
+/// while the current protocol requires a process incarnation and report order.
+pub fn embeddingActivityReportValid(
+    reporter_incarnation: u64,
+    protocol_version: u16,
+    activity_sequence: u64,
+) bool {
+    if (!embeddingActivityProtocolValid(reporter_incarnation, protocol_version)) return false;
+    return if (protocol_version == 0)
+        activity_sequence == 0
+    else
+        activity_sequence != 0;
+}
+
+/// Activity observation validity is explicit per index. Legacy reports cannot
+/// smuggle volatile samples into the current cache, and current observations
+/// must carry both incarnation and sample ordering fences.
+pub fn embeddingActivitySamplesValid(
+    protocol_version: u16,
+    runtime_statuses: []const RuntimeGroupStatusReport,
+) bool {
+    for (runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (!index_status.embedding_activity_observed) continue;
+            if (protocol_version != embedding_activity_protocol_version or
+                index_status.embedding_activity.epoch == 0 or
+                index_status.embedding_activity.sample_sequence == 0) return false;
+        }
+    }
+    return true;
 }
 
 pub fn artifactSourcesProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
@@ -739,7 +774,22 @@ test "embedding activity protocol requires an incarnation fence" {
     try std.testing.expect(embeddingActivityProtocolValid(0, 0));
     try std.testing.expect(!embeddingActivityProtocolValid(0, embedding_activity_protocol_version));
     try std.testing.expect(embeddingActivityProtocolValid(7, embedding_activity_protocol_version));
+    try std.testing.expect(!embeddingActivityProtocolValid(7, embedding_activity_protocol_version - 1));
     try std.testing.expect(!embeddingActivityProtocolValid(7, embedding_activity_protocol_version + 1));
+    try std.testing.expect(embeddingActivityReportValid(0, 0, 0));
+    try std.testing.expect(!embeddingActivityReportValid(7, 0, 1));
+    try std.testing.expect(!embeddingActivityReportValid(7, embedding_activity_protocol_version, 0));
+    try std.testing.expect(embeddingActivityReportValid(7, embedding_activity_protocol_version, 1));
+
+    var indexes = [_]RuntimeIndexStatusReport{.{
+        .embedding_activity_observed = true,
+        .embedding_activity = .{ .epoch = 3, .sample_sequence = 4 },
+    }};
+    const groups = [_]RuntimeGroupStatusReport{.{ .indexes = indexes[0..] }};
+    try std.testing.expect(embeddingActivitySamplesValid(embedding_activity_protocol_version, &groups));
+    try std.testing.expect(!embeddingActivitySamplesValid(0, &groups));
+    indexes[0].embedding_activity.sample_sequence = 0;
+    try std.testing.expect(!embeddingActivitySamplesValid(embedding_activity_protocol_version, &groups));
 }
 
 pub const RuntimeEnrichmentStatusReport = struct {
@@ -893,6 +943,9 @@ pub const RuntimeEmbeddingActivityStatusReport = struct {
     };
 
     epoch: u64 = 0,
+    /// Monotonic sample order within `epoch`. Activity-only heartbeats reuse the
+    /// durable store generation and are ordered exclusively by this sequence.
+    sample_sequence: u64 = 0,
     phase: Phase = .idle,
     chunks_created: u64 = 0,
     embedding_batches_completed: u64 = 0,

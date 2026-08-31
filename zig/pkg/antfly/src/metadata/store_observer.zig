@@ -418,6 +418,30 @@ fn runtimeStatusesEqual(
     return true;
 }
 
+/// Compare the durable projection carried by two reports. Volatile embedding
+/// activity, its protocol version, and the report generation itself are
+/// intentionally excluded; callers use this result to decide whether a new
+/// durable generation is warranted.
+pub fn reportsDurablyEqual(
+    lhs: table_manager.StoreStatusReport,
+    rhs: table_manager.StoreStatusReport,
+) bool {
+    return lhs.store_id == rhs.store_id and
+        lhs.reporter_incarnation == rhs.reporter_incarnation and
+        lhs.artifact_sources_protocol_version == rhs.artifact_sources_protocol_version and
+        lhs.live == rhs.live and
+        std.mem.eql(u8, lhs.health_class, rhs.health_class) and
+        lhs.capacity_bytes == rhs.capacity_bytes and
+        lhs.available_bytes == rhs.available_bytes and
+        lhs.lease_pressure == rhs.lease_pressure and
+        lhs.read_load == rhs.read_load and
+        lhs.write_load == rhs.write_load and
+        lhs.active_backfills == rhs.active_backfills and
+        lhs.backfill_progress_millis == rhs.backfill_progress_millis and
+        groupStatusesEqual(lhs.group_statuses, rhs.group_statuses) and
+        runtimeStatusesEqual(lhs.runtime_statuses, rhs.runtime_statuses, true);
+}
+
 fn runtimeStatusEqual(
     lhs: table_manager.RuntimeGroupStatusReport,
     rhs: table_manager.RuntimeGroupStatusReport,
@@ -483,7 +507,10 @@ fn runtimeStatusEqual(
 
 fn stripVolatileEmbeddingActivity(statuses: []table_manager.RuntimeGroupStatusReport) void {
     for (statuses) |*status| {
-        for (status.indexes) |*index| index.embedding_activity = .{};
+        for (status.indexes) |*index| {
+            index.embedding_activity_observed = false;
+            index.embedding_activity = .{};
+        }
     }
 }
 
@@ -792,6 +819,51 @@ test "store observer can ignore unactivated repair fields without hiding other c
     try std.testing.expect(!observationChangesRecordWithRepairStatus(existing, observation, false));
     observed_indexes[0].doc_count += 1;
     try std.testing.expect(observationChangesRecordWithRepairStatus(existing, observation, false));
+}
+
+test "store observer durable report equality excludes only volatile activity" {
+    var previous_indexes = [_]table_manager.RuntimeIndexStatusReport{.{
+        .name = "semantic",
+        .kind = "dense_vector",
+        .doc_count = 12,
+        .coverage_generation = 7,
+        .coverage_config_hash = 9,
+        .embedding_activity_observed = true,
+        .embedding_activity = .{
+            .epoch = 3,
+            .sample_sequence = 4,
+            .phase = .embedding,
+            .embeddings_computed = 10,
+        },
+    }};
+    var current_indexes = previous_indexes;
+    current_indexes[0].embedding_activity.sample_sequence = 5;
+    current_indexes[0].embedding_activity.embeddings_computed = 20;
+    var previous_runtime = [_]table_manager.RuntimeGroupStatusReport{.{
+        .group_id = 2,
+        .indexes = previous_indexes[0..],
+    }};
+    var current_runtime = previous_runtime;
+    current_runtime[0].indexes = current_indexes[0..];
+    const previous: table_manager.StoreStatusReport = .{
+        .store_id = 3,
+        .reporter_incarnation = 4,
+        .status_generation = 10,
+        .embedding_activity_protocol_version = table_manager.embedding_activity_protocol_version,
+        .embedding_activity_sequence = 8,
+        .runtime_statuses = previous_runtime[0..],
+    };
+    var current = previous;
+    current.status_generation = 11;
+    current.embedding_activity_sequence = 9;
+    current.runtime_statuses = current_runtime[0..];
+
+    try std.testing.expect(reportsDurablyEqual(previous, current));
+    current_indexes[0].embedding_activity_observed = false;
+    current_indexes[0].embedding_activity = .{};
+    try std.testing.expect(reportsDurablyEqual(previous, current));
+    current_indexes[0].doc_count += 1;
+    try std.testing.expect(!reportsDurablyEqual(previous, current));
 }
 
 test "store observer fences repair transitions by registered reporter incarnation and generation" {

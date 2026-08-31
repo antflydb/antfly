@@ -7592,6 +7592,20 @@ pub const DB = struct {
             &owned_store_keys,
             &owned_store_values,
         );
+        // Synchronous enrichment is the producer for every request it consumes.
+        // Commit its terminal coverage decisions in the same backend batch as
+        // the source document, artifacts, and replay append. This makes
+        // `.full_index` an exact coverage fence and leaves asynchronous replay
+        // responsible only for requests retained in generated_enrichment_refs.
+        try appendPrecomputedCoverageOutcomeMutations(
+            self.alloc,
+            self.core.store,
+            self.core.index_manager,
+            precomputed_generated.coverage_outcomes,
+            &store_writes,
+            &owned_store_keys,
+            &owned_store_values,
+        );
         try store_writes.appendSlice(self.alloc, opts.extra_store_writes);
         try delete_keys.appendSlice(self.alloc, identity_visibility_deletes.items);
 
@@ -25626,6 +25640,17 @@ pub const DB = struct {
         runtime_stats.ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else runtime_stats.ttl_cleanup;
         runtime_stats.transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else runtime_stats.transaction_recovery;
 
+        // `runtime_stats` is frequently a retained query-only snapshot. Revoke
+        // the prior observation before attempting lifecycle access so lock
+        // contention cannot turn an old sample into a fresh heartbeat. Absence
+        // is explicitly unavailable; an observed idle sample still carries a
+        // nonzero epoch and sample sequence.
+        for (runtime_stats.indexes) |*item| {
+            if (item.kind != .dense_vector and item.kind != .sparse_vector) continue;
+            item.embedding_activity_observed = false;
+            item.embedding_activity = .{};
+        }
+
         // Runtime-only diagnostics are optional status-plane detail and may run
         // under apply. Skip the overlay during lifecycle transitions.
         if (self.async_context.enrichment_lifecycle_mutex.tryLock()) {
@@ -36490,11 +36515,15 @@ fn collectChunkEmbeddingSourcesFromWrites(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
     writes: []const types.BatchWrite,
+    doc_key: []const u8,
     artifact_name: []const u8,
     source_field: []const u8,
 ) !void {
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", artifact_name);
+    defer alloc.free(prefix);
     for (writes) |write| {
-        if (!internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
+        if (!std.mem.startsWith(u8, write.key, prefix) or
+            !internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
         if (containsChunkEmbeddingSource(out.items, write.key)) continue;
         const text = (try chunkPayloadTextAlloc(alloc, write.value, source_field)) orelse continue;
         errdefer alloc.free(text);
@@ -36562,7 +36591,7 @@ fn chunkEmbeddingSourcesForRequest(
     }
     if (sources.items.len > 0) return try sources.toOwnedSlice(alloc);
 
-    try collectChunkEmbeddingSourcesFromWrites(alloc, &sources, artifact_writes, artifact_name, request.source_field);
+    try collectChunkEmbeddingSourcesFromWrites(alloc, &sources, artifact_writes, request.doc_key, artifact_name, request.source_field);
     try collectChunkEmbeddingSourcesFromStore(alloc, db, &sources, request.doc_key, artifact_name, request.source_field);
     return try sources.toOwnedSlice(alloc);
 }
@@ -36867,6 +36896,8 @@ fn computeDenseMaterializedChunkRequestImpl(
     consumer_indexes: []const []const u8,
 ) !void {
     const artifact_name = requestArtifactName(request);
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
+    defer alloc.free(prefix);
     var pending_writes = if (skip_unchanged_artifacts)
         try PendingArtifactWriteIndex.init(alloc, artifact_writes.items)
     else
@@ -36886,7 +36917,8 @@ fn computeDenseMaterializedChunkRequestImpl(
     defer pending_chunk_keys.deinit(alloc);
 
     for (artifact_writes.items) |write| {
-        if (!internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
+        if (!std.mem.startsWith(u8, write.key, prefix) or
+            !internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
         if (pending_chunk_keys.contains(write.key)) continue;
         try pending_chunk_keys.put(alloc, write.key, {});
         _ = try appendMaterializedChunkSourceToBatch(alloc, &sources, &batch_source_bytes, write.key, write.value, request.source_field);
@@ -36898,8 +36930,6 @@ fn computeDenseMaterializedChunkRequestImpl(
     try flushGeneratedDenseChunkSourceBatch(alloc, db, runtime, dense_embedder, embedding_name, request, artifact_writes, dense_embeddings, &sources, consumer_indexes, skip_unchanged_artifacts, pending_lookup, appendForConsumers);
     batch_source_bytes = 0;
 
-    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
-    defer alloc.free(prefix);
     const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
     defer if (upper) |key| alloc.free(key);
     const upper_bound = if (upper) |key| key else "";
@@ -36940,8 +36970,8 @@ fn computeDenseRequestImpl(
     }
     if (consumer_indexes.len == 0) return;
 
-    if (requestHasChunking(request) and requestArtifactName(request).len > 0) {
-        if (requestUsesMaterializedChunkArtifact(db, requestArtifactName(request))) {
+    if (request.artifact_name.len > 0) {
+        if (requestUsesMaterializedChunkArtifact(db, request.artifact_name)) {
             try computeDenseMaterializedChunkRequestImpl(alloc, db, runtime, request, artifact_writes, dense_embeddings, skip_unchanged_artifacts, appendForConsumers, dense_embedder, embedding_name, consumer_indexes);
             return;
         }
@@ -37066,6 +37096,8 @@ fn computeSparseMaterializedChunkRequest(
     consumer_indexes: []const []const u8,
 ) !void {
     const artifact_name = requestArtifactName(request);
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
+    defer alloc.free(prefix);
     var pending_writes = try PendingArtifactWriteIndex.init(alloc, artifact_writes.items);
     defer pending_writes.deinit(alloc);
 
@@ -37081,7 +37113,8 @@ fn computeSparseMaterializedChunkRequest(
     defer pending_chunk_keys.deinit(alloc);
 
     for (artifact_writes.items) |write| {
-        if (!internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
+        if (!std.mem.startsWith(u8, write.key, prefix) or
+            !internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
         if (pending_chunk_keys.contains(write.key)) continue;
         try pending_chunk_keys.put(alloc, write.key, {});
         _ = try appendMaterializedChunkSourceToBatch(alloc, &sources, &batch_source_bytes, write.key, write.value, request.source_field);
@@ -37093,8 +37126,6 @@ fn computeSparseMaterializedChunkRequest(
     try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
     batch_source_bytes = 0;
 
-    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
-    defer alloc.free(prefix);
     const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
     defer if (upper) |key| alloc.free(key);
     const upper_bound = if (upper) |key| key else "";
@@ -37133,8 +37164,8 @@ fn computeSparseRequestDerived(
     }
     if (consumer_indexes.len == 0) return;
 
-    if (requestHasChunking(request) and requestArtifactName(request).len > 0) {
-        if (requestUsesMaterializedChunkArtifact(db, requestArtifactName(request))) {
+    if (request.artifact_name.len > 0) {
+        if (requestUsesMaterializedChunkArtifact(db, request.artifact_name)) {
             try computeSparseMaterializedChunkRequest(alloc, db, runtime, request, artifact_writes, sparse_embeddings, sparse_embedder, embedding_name, consumer_indexes);
             return;
         }
@@ -37280,6 +37311,122 @@ fn appendGeneratedEnrichmentRef(
     try out.append(alloc, ref);
 }
 
+const PrecomputedCoverageOutcome = struct {
+    index_name: []u8,
+    doc_key: []u8,
+    outcome: DerivedCoverageOutcome,
+
+    fn deinit(self: @This(), alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.doc_key);
+    }
+};
+
+const PrecomputedCoverageCandidate = struct {
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    produced: bool,
+
+    fn deinit(self: @This(), alloc: Allocator) void {
+        enrichment_types.freeGeneratedRequest(alloc, self.request);
+    }
+};
+
+fn appendPrecomputedCoverageCandidate(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(PrecomputedCoverageCandidate),
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    produced: bool,
+) !void {
+    const cloned = try enrichment_types.cloneGeneratedRequest(alloc, request);
+    errdefer enrichment_types.freeGeneratedRequest(alloc, cloned);
+    try out.append(alloc, .{ .request = cloned, .produced = produced });
+}
+
+fn appendPrecomputedEmbeddingCoverageOutcomes(
+    db: *DB,
+    out: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: []const types.BatchWrite,
+    produced: bool,
+) !bool {
+    const embedding_name = requestEmbeddingName(request);
+    const consumer_indexes = switch (request.kind) {
+        .dense_embedding => try db.core.index_manager.denseIndexesForEmbedding(
+            db.alloc,
+            embedding_name,
+            request.expected_dims,
+        ),
+        .sparse_embedding => try db.core.index_manager.sparseIndexesForEmbedding(db.alloc, embedding_name),
+        .asset, .chunk_text => return true,
+    };
+    defer {
+        for (consumer_indexes) |index_name| db.alloc.free(index_name);
+        db.alloc.free(consumer_indexes);
+    }
+
+    const outcome = try precomputedEmbeddingCoverageOutcome(db, request, artifact_writes, produced) orelse return false;
+    for (consumer_indexes) |index_name| {
+        const owned_index_name = try db.alloc.dupe(u8, index_name);
+        errdefer db.alloc.free(owned_index_name);
+        const owned_doc_key = try db.alloc.dupe(u8, request.doc_key);
+        errdefer db.alloc.free(owned_doc_key);
+        try out.append(db.alloc, .{
+            .index_name = owned_index_name,
+            .doc_key = owned_doc_key,
+            .outcome = outcome,
+        });
+    }
+    return true;
+}
+
+/// Synchronous precompute owns coverage only after it has an exact terminal
+/// result. A missing materialized source is still replay work unless its
+/// upstream manifest proves intentional no-output or terminal failure.
+fn precomputedEmbeddingCoverageOutcome(
+    db: *DB,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: []const types.BatchWrite,
+    produced: bool,
+) !?DerivedCoverageOutcome {
+    if (produced) return .produced;
+    const chunk_artifact_name = request.artifact_name;
+    if (chunk_artifact_name.len == 0 or
+        !requestUsesMaterializedChunkArtifact(db, chunk_artifact_name)) return .skipped;
+    const chunk_cfg = db.core.index_manager.getEnrichment(.chunk, chunk_artifact_name) orelse return null;
+    if (chunk_cfg.source_artifact_name.len == 0) return .skipped;
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(
+        db.alloc,
+        request.doc_key,
+        "asset",
+        chunk_cfg.source_artifact_name,
+    );
+    defer db.alloc.free(manifest_key);
+    var manifest: ?[]const u8 = null;
+    var owned_manifest: ?[]u8 = null;
+    defer if (owned_manifest) |value| db.alloc.free(value);
+    var i = artifact_writes.len;
+    while (i > 0) {
+        i -= 1;
+        const write = artifact_writes[i];
+        if (std.mem.eql(u8, write.key, manifest_key)) {
+            manifest = write.value;
+            break;
+        }
+    }
+    if (manifest == null) {
+        owned_manifest = db.core.store.get(db.alloc, manifest_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        manifest = owned_manifest.?;
+    }
+    return if (try enrichment_runtime_mod.documentExtractionEmptyCoverageIsTerminalFailure(db.alloc, manifest.?))
+        .terminal_failed
+    else
+        .skipped;
+}
+
 fn prepareGeneratedEnrichments(
     self: *DB,
     req: types.BatchRequest,
@@ -37325,6 +37472,16 @@ fn prepareGeneratedEnrichments(
     errdefer {
         for (planned.items) |request| enrichment_types.freeGeneratedRef(self.alloc, request);
         planned.deinit(self.alloc);
+    }
+    var coverage_outcomes = std.ArrayListUnmanaged(PrecomputedCoverageOutcome).empty;
+    errdefer {
+        for (coverage_outcomes.items) |outcome| outcome.deinit(self.alloc);
+        coverage_outcomes.deinit(self.alloc);
+    }
+    var coverage_candidates = std.ArrayListUnmanaged(PrecomputedCoverageCandidate).empty;
+    defer {
+        for (coverage_candidates.items) |candidate| candidate.deinit(self.alloc);
+        coverage_candidates.deinit(self.alloc);
     }
     var deferred_asset_producer_items = std.ArrayListUnmanaged(PrecomputeAssetProducerBatchItem).empty;
     defer {
@@ -37414,19 +37571,56 @@ fn prepareGeneratedEnrichments(
                     &documents,
                     &chunk_cache,
                 ),
-                .dense_embedding => computeDenseRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &dense_embeddings, &chunk_cache) catch |err| switch (err) {
-                    error.MissingDenseEmbedder => try appendGeneratedEnrichmentRef(self.alloc, &planned, request),
-                    else => return err,
+                .dense_embedding => {
+                    const before = dense_embeddings.items.len;
+                    computeDenseRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &dense_embeddings, &chunk_cache) catch |err| switch (err) {
+                        error.MissingDenseEmbedder => {
+                            try appendGeneratedEnrichmentRef(self.alloc, &planned, request);
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    try appendPrecomputedCoverageCandidate(
+                        self.alloc,
+                        &coverage_candidates,
+                        request,
+                        dense_embeddings.items.len > before,
+                    );
                 },
-                .sparse_embedding => computeSparseRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &sparse_embeddings, &chunk_cache) catch |err| switch (err) {
-                    error.MissingSparseEmbedder => try appendGeneratedEnrichmentRef(self.alloc, &planned, request),
-                    else => return err,
+                .sparse_embedding => {
+                    const before = sparse_embeddings.items.len;
+                    computeSparseRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &sparse_embeddings, &chunk_cache) catch |err| switch (err) {
+                        error.MissingSparseEmbedder => {
+                            try appendGeneratedEnrichmentRef(self.alloc, &planned, request);
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    try appendPrecomputedCoverageCandidate(
+                        self.alloc,
+                        &coverage_candidates,
+                        request,
+                        sparse_embeddings.items.len > before,
+                    );
                 },
             }
         }
     }
 
     try flushPrecomputeAssetProducerBatch(self.alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents);
+
+    // Resolve coverage only after every deferred producer has contributed its
+    // manifest. This keeps terminal outcomes in the same primary commit while
+    // preserving genuinely unresolved requests for replay.
+    for (coverage_candidates.items) |candidate| {
+        if (!try appendPrecomputedEmbeddingCoverageOutcomes(
+            self,
+            &coverage_outcomes,
+            candidate.request,
+            artifact_writes.items,
+            candidate.produced,
+        )) try appendGeneratedEnrichmentRef(self.alloc, &planned, candidate.request);
+    }
 
     var result = PrecomputedGeneratedBatch{};
     errdefer result.deinit(self.alloc);
@@ -37436,6 +37630,7 @@ fn prepareGeneratedEnrichments(
     result.dense_embeddings = try dense_embeddings.toOwnedSlice(self.alloc);
     result.sparse_embeddings = try sparse_embeddings.toOwnedSlice(self.alloc);
     result.generated_enrichment_refs = try planned.toOwnedSlice(self.alloc);
+    result.coverage_outcomes = try coverage_outcomes.toOwnedSlice(self.alloc);
     return result;
 }
 
@@ -37534,6 +37729,7 @@ const PrecomputedGeneratedBatch = struct {
     dense_embeddings: []const derived_types.DerivedDenseEmbeddingWrite = &.{},
     sparse_embeddings: []const derived_types.DerivedSparseEmbeddingWrite = &.{},
     generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
+    coverage_outcomes: []PrecomputedCoverageOutcome = &.{},
 
     fn deinit(self: *PrecomputedGeneratedBatch, alloc: Allocator) void {
         for (self.artifact_writes) |write| {
@@ -37551,6 +37747,8 @@ const PrecomputedGeneratedBatch = struct {
             .generated_enrichment_refs = self.generated_enrichment_refs,
         };
         derived_types.deinitDerivedBatch(alloc, &derived_batch);
+        for (self.coverage_outcomes) |outcome| outcome.deinit(alloc);
+        if (self.coverage_outcomes.len > 0) alloc.free(self.coverage_outcomes);
         self.* = undefined;
     }
 };
@@ -42726,6 +42924,121 @@ const DerivedCoverageDocOutcome = struct {
     doc_key: []const u8,
     outcome: DerivedCoverageOutcome,
 };
+
+fn precomputedCoverageOutcomePriority(outcome: DerivedCoverageOutcome) u8 {
+    return switch (outcome) {
+        .skipped => 0,
+        .produced => 1,
+        .terminal_failed => 2,
+    };
+}
+
+/// Add producer-owned terminal coverage mutations to an already serialized
+/// primary commit. Keys and encoded counter values are retained in the caller's
+/// ownership lists until the backend batch completes.
+fn appendPrecomputedCoverageOutcomeMutations(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    outcomes: []const PrecomputedCoverageOutcome,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    owned_values: *std.ArrayListUnmanaged([]u8),
+) !void {
+    if (outcomes.len == 0) return;
+
+    // Group once so commit preparation stays O(number of outcomes), even when
+    // one batch feeds many indexes. Keys borrow from `outcomes` for this call.
+    var grouped = std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(DerivedCoverageOutcome)).empty;
+    defer {
+        var values = grouped.valueIterator();
+        while (values.next()) |value| value.deinit(alloc);
+        grouped.deinit(alloc);
+    }
+    for (outcomes) |candidate| {
+        const group = try grouped.getOrPut(alloc, candidate.index_name);
+        if (!group.found_existing) group.value_ptr.* = .empty;
+        const entry = try group.value_ptr.getOrPut(alloc, candidate.doc_key);
+        if (!entry.found_existing or
+            precomputedCoverageOutcomePriority(candidate.outcome) > precomputedCoverageOutcomePriority(entry.value_ptr.*))
+        {
+            entry.value_ptr.* = candidate.outcome;
+        }
+    }
+
+    var groups = grouped.iterator();
+    while (groups.next()) |group| {
+        const index_name = group.key_ptr.*;
+        const generation = index_manager.coverageGenerationForIndex(index_name) orelse continue;
+        // Multiple generated requests may feed one index for the same source
+        // document. The strongest exact terminal result wins deterministically.
+        const final_outcomes = group.value_ptr;
+
+        const tags = std.meta.tags(DerivedCoverageOutcome);
+        var counter_counts: [tags.len]u64 = undefined;
+        inline for (tags, 0..) |outcome, i| {
+            counter_counts[i] = try derivedCoverageOutcomeCounterValueForStore(
+                alloc,
+                store,
+                index_name,
+                generation,
+                @tagName(outcome),
+            );
+        }
+
+        var changed = false;
+        var outcome_it = final_outcomes.iterator();
+        while (outcome_it.next()) |entry| {
+            const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(
+                alloc,
+                index_name,
+                generation,
+                entry.key_ptr.*,
+            );
+            errdefer alloc.free(marker_key);
+            const existing = store.get(alloc, marker_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            const existing_outcome: ?DerivedCoverageOutcome = if (existing) |value| blk: {
+                defer alloc.free(value);
+                break :blk std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse
+                    return error.InvalidDerivedCoverageOutcome;
+            } else null;
+            const target = entry.value_ptr.*;
+            if (existing_outcome != null and existing_outcome.? == target) {
+                alloc.free(marker_key);
+                continue;
+            }
+            if (existing_outcome) |previous| {
+                const previous_index = @intFromEnum(previous);
+                if (counter_counts[previous_index] == 0) return error.InvalidDerivedCoverageCounter;
+                counter_counts[previous_index] -= 1;
+            }
+            counter_counts[@intFromEnum(target)] +|= 1;
+            try owned_keys.append(alloc, marker_key);
+            try writes.append(alloc, .{ .key = marker_key, .value = @tagName(target) });
+            changed = true;
+        }
+        if (!changed) continue;
+
+        inline for (tags, 0..) |outcome, i| {
+            const counter_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(
+                alloc,
+                index_name,
+                generation,
+                @tagName(outcome),
+            );
+            errdefer alloc.free(counter_key);
+            const counter_value = try alloc.alloc(u8, @sizeOf(u64));
+            errdefer alloc.free(counter_value);
+            std.mem.writeInt(u64, counter_value[0..8], counter_counts[i], .little);
+            try owned_keys.append(alloc, counter_key);
+            try owned_values.append(alloc, counter_value);
+            try writes.append(alloc, .{ .key = counter_key, .value = counter_value });
+        }
+    }
+}
 
 fn setDerivedCoverageOutcomes(
     alloc: Allocator,
@@ -53391,8 +53704,7 @@ test "db runtime-only status overlay preserves a resident enrichment worker" {
 
     // Lifecycle contention is explicitly unavailable, not an idle activity
     // sample that may erase the metadata cache's last exact-owner heartbeat.
-    indexes[0].embedding_activity_observed = false;
-    indexes[0].embedding_activity = .{};
+    // Leave the successful sample intact to prove the overlay revokes it.
     lockAtomicWithBackoff(&db.async_context.enrichment_lifecycle_mutex);
     db.overlayRuntimeStatusRuntimeBestEffort(&recovered);
     db.async_context.enrichment_lifecycle_mutex.unlock();

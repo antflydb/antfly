@@ -4452,6 +4452,7 @@ pub fn build(b: *std.Build) void {
         "data runtime treats metadata leadership churn as retryable bootstrap failure",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "data runtime heartbeat cache cannot regress to an older full report",
+        "data runtime activity-only snapshots reuse the durable status generation",
         "idle cached runtime status stays fresh only for the published root generation",
         "runtime status disk usage cache is scoped to one root generation",
         "runtime status disk scan retries across a reallocation fence and group invalidation remains scoped",

@@ -184,17 +184,29 @@ reduced independently of its counters, so an active batch on one shard cannot
 mask a retry owned by another. Counters sum, timestamps take the maximum, and
 rates require a stable epoch.
 
-Activity heartbeat protocol v1 is separate from durable runtime status. Data
-nodes coalesce counter updates to at most once per second while reporting phase
-edges promptly. The metadata leader keeps matching store/index-incarnation
-observations for 90 seconds, spanning three 30-second idle-heartbeat intervals.
-An independent incarnation/generation fence rejects reordered activity-only
-reports even though they intentionally do not advance durable Raft state;
+Activity heartbeat protocol v2 is separate from durable runtime status. Each
+owner report and each per-index sample has its own monotonic sequence, while
+durable status generation advances only when a durable fact changes. Data nodes
+coalesce counter updates to at most once per second while reporting phase edges
+promptly. The metadata leader keeps matching store/index-incarnation
+observations for 90 seconds. A cached liveness heartbeat carries no activity
+observation and therefore cannot refresh that TTL. Independent report and
+sample fences reject reordered activity-only reports even though they
+intentionally do not advance durable Raft state;
 leadership changes still make activity temporarily unavailable without changing
 readiness. Shared enrichment
 producers may fan one completed batch out to every exact consumer index, but
 activity from an unrelated index, table, or stale incarnation must never be
 attributed to the requested index.
+
+Coverage decisions are committed by the component that owns the terminal
+result. Synchronous precompute records its produced/skipped/failed decision in
+the same primary transaction as the document and artifacts. For a materialized
+source chain, absence is not terminal: precompute consumes the work only when
+the upstream manifest proves intentional no-output or permanent failure;
+otherwise the request remains durable replay debt. This prevents an unfinished
+upstream producer from being projected as `skipped` and makes `full_index` an
+exact coverage fence.
 
 The durable runtime-status codec has two negotiated profiles, not a numeric
 feature ladder. It reads and writes the exact v12 profile released by v0.2.0,
