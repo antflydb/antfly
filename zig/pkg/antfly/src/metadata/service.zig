@@ -226,6 +226,74 @@ fn applyReconciliationPlanAndWaitAppliedWithContextImpl(
     };
 }
 
+/// Node lifecycle endpoints are externally observable control-plane writes.
+/// Do not acknowledge one until the exact locally admitted Raft entry applies;
+/// a leadership change, cancellation, or timeout after receipt assignment is
+/// necessarily ambiguous and must never be exposed as safe to replay.
+fn proposeNodeLifecycleAndWaitApplied(
+    service: anytype,
+    command: metadata_storage.TransitionCommand,
+) !void {
+    const receipt = try service.proposeTransitionCommandWithReceipt(command);
+    service.waitForTransitionApplied(receipt) catch |err| {
+        std.log.warn(
+            "metadata node lifecycle mutation outcome became ambiguous after admission term={} index={} err={s}",
+            .{ receipt.term, receipt.index, @errorName(err) },
+        );
+        return error.MetadataMutationOutcomeUnknown;
+    };
+}
+
+test "metadata service node lifecycle proposal distinguishes rejection from ambiguous apply" {
+    const FakeService = struct {
+        proposal_error: ?anyerror = null,
+        wait_error: ?anyerror = null,
+        wait_calls: usize = 0,
+
+        fn proposeTransitionCommandWithReceipt(
+            self: *@This(),
+            _: metadata_storage.TransitionCommand,
+        ) !MetadataProposalReceipt {
+            if (self.proposal_error) |err| return err;
+            return .{ .term = 7, .index = 19 };
+        }
+
+        fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
+            try std.testing.expectEqual(@as(u64, 7), receipt.term);
+            try std.testing.expectEqual(@as(u64, 19), receipt.index);
+            self.wait_calls += 1;
+            if (self.wait_error) |err| return err;
+        }
+    };
+
+    var rejected = FakeService{ .proposal_error = error.NotLeader };
+    try std.testing.expectError(
+        error.NotLeader,
+        proposeNodeLifecycleAndWaitApplied(
+            &rejected,
+            .{ .request_node_shutdown = .{ .node_id = 9 } },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), rejected.wait_calls);
+
+    var ambiguous = FakeService{ .wait_error = error.NotLeader };
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        proposeNodeLifecycleAndWaitApplied(
+            &ambiguous,
+            .{ .cancel_node_shutdown = .{ .node_id = 9 } },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), ambiguous.wait_calls);
+
+    var committed = FakeService{};
+    try proposeNodeLifecycleAndWaitApplied(
+        &committed,
+        .{ .finalize_node_shutdown = .{ .node_id = 9 } },
+    );
+    try std.testing.expectEqual(@as(usize, 1), committed.wait_calls);
+}
+
 test "metadata reconciliation plan uses one terminal receipt for ordered apply" {
     const FakeStore = struct {
         fn getTableTransitionFence(
@@ -3437,19 +3505,19 @@ pub const MetadataService = struct {
     pub fn requestNodeShutdown(self: *MetadataService, node_id: u64) !void {
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
-        try self.proposeTransitionCommand(.{ .request_node_shutdown = .{ .node_id = node_id } });
+        try proposeNodeLifecycleAndWaitApplied(self, .{ .request_node_shutdown = .{ .node_id = node_id } });
     }
 
     pub fn cancelNodeShutdown(self: *MetadataService, node_id: u64) !void {
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
-        try self.proposeTransitionCommand(.{ .cancel_node_shutdown = .{ .node_id = node_id } });
+        try proposeNodeLifecycleAndWaitApplied(self, .{ .cancel_node_shutdown = .{ .node_id = node_id } });
     }
 
     pub fn finalizeNodeShutdown(self: *MetadataService, node_id: u64) !void {
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
-        try self.proposeTransitionCommand(.{ .finalize_node_shutdown = .{ .node_id = node_id } });
+        try proposeNodeLifecycleAndWaitApplied(self, .{ .finalize_node_shutdown = .{ .node_id = node_id } });
     }
 
     pub fn removeNode(self: *MetadataService, node_id: u64) !void {
@@ -5695,19 +5763,19 @@ pub const MetadataHttpService = struct {
     pub fn requestNodeShutdown(self: *MetadataHttpService, node_id: u64) !void {
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
-        try self.proposeTransitionCommand(.{ .request_node_shutdown = .{ .node_id = node_id } });
+        try proposeNodeLifecycleAndWaitApplied(self, .{ .request_node_shutdown = .{ .node_id = node_id } });
     }
 
     pub fn cancelNodeShutdown(self: *MetadataHttpService, node_id: u64) !void {
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
-        try self.proposeTransitionCommand(.{ .cancel_node_shutdown = .{ .node_id = node_id } });
+        try proposeNodeLifecycleAndWaitApplied(self, .{ .cancel_node_shutdown = .{ .node_id = node_id } });
     }
 
     pub fn finalizeNodeShutdown(self: *MetadataHttpService, node_id: u64) !void {
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
-        try self.proposeTransitionCommand(.{ .finalize_node_shutdown = .{ .node_id = node_id } });
+        try proposeNodeLifecycleAndWaitApplied(self, .{ .finalize_node_shutdown = .{ .node_id = node_id } });
     }
 
     pub fn removeNode(self: *MetadataHttpService, node_id: u64) !void {

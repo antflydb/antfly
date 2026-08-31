@@ -5406,7 +5406,6 @@ pub fn build(b: *std.Build) void {
         "api http server rejects restore before persistence without an asynchronous worker",
         "configured api http server attaches durable restore job persistence",
         "restore job list paginates after authorization filtering",
-        "restore metadata intent topology accepts interrupted prefixes and rejects foreign ranges",
         "restore job list bounds authorization scans with an empty continuation page",
         "api http server backs up and restores a table through public routes",
         "api http server cluster overwrite restores from read-only repository without dropping live table",
