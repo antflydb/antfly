@@ -84,6 +84,10 @@ const StoreStatusReportKind = enum { none, heartbeat, full };
 const metadata_head_cache_ttl_ms: u64 = std.time.ms_per_s;
 const metadata_snapshot_cache_ttl_ms: u64 = std.time.ms_per_s;
 const remote_metadata_http_executor_pool_size: usize = 4;
+// Ordinary catalog callbacks do not carry a request context through their ABI.
+// Give them the same finite envelope as linearizable metadata reads so cache
+// generation churn can retry without either escaping early or waiting forever.
+const remote_metadata_snapshot_timeout_ns: u64 = 12 * std.time.ns_per_s;
 const remote_metadata_linearizable_snapshot_timeout_ns: u64 = 12 * std.time.ns_per_s;
 const remote_metadata_linearizable_snapshot_capability_retry_ns: u64 = 5 * std.time.ns_per_s;
 const provision_head_poll_startup_interval_ms: u64 = std.time.ms_per_s;
@@ -3863,6 +3867,7 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         error.ConnectionRefused,
         error.BrokenPipe,
         error.EndOfStream,
+        error.Timeout,
         error.UnexpectedHttpStatus,
         error.NotListening,
         error.NotLeader,
@@ -3930,6 +3935,7 @@ test "data runtime treats transient metadata failures as retryable bootstrap fai
     try std.testing.expect(isRetryableMetadataBootstrapError(error.ProposalDropped));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.LeaderTransferInProgress));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.ConnectionRefused));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.Timeout));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.StoreRegistrationNotVisible));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataSnapshotHeadMismatch));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataIncarnationUnavailable));
@@ -15339,7 +15345,7 @@ fn appendOwnedPeerRouteUpsert(
 const RemoteMetadataSource = struct {
     const TestFaults = if (@import("builtin").is_test) struct {
         fetch_head_error: ?anyerror = null,
-        fetch_head_mismatch_once: bool = false,
+        fetch_head_mismatches_remaining: usize = 0,
         force_snapshot_cache_miss: bool = false,
     } else struct {};
 
@@ -15592,8 +15598,8 @@ const RemoteMetadataSource = struct {
         lockAtomic(&self.cache_mutex);
         const observed_fence_generation = self.snapshot_fence_generation;
         if (@import("builtin").is_test) {
-            if (self.test_faults.fetch_head_mismatch_once) {
-                self.test_faults.fetch_head_mismatch_once = false;
+            if (self.test_faults.fetch_head_mismatches_remaining > 0) {
+                self.test_faults.fetch_head_mismatches_remaining -= 1;
                 self.cache_mutex.unlock();
                 return error.MetadataSnapshotHeadMismatch;
             }
@@ -15670,12 +15676,14 @@ const RemoteMetadataSource = struct {
     }
 
     fn fetchSnapshot(self: *RemoteMetadataSource) !antfly.metadata_api.AdminSnapshot {
-        return try self.fetchSnapshotWithBudget(null);
+        return try self.fetchSnapshotWithBudget(.{
+            .deadline_ns = platform_time.monotonicNs() +| remote_metadata_snapshot_timeout_ns,
+        });
     }
 
     fn fetchSnapshotWithBudget(
         self: *RemoteMetadataSource,
-        budget: ?antfly.metadata_http_client.RequestBudget,
+        budget: antfly.metadata_http_client.RequestBudget,
     ) !antfly.metadata_api.AdminSnapshot {
         try ensureBudgetActive(budget);
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
@@ -15694,17 +15702,20 @@ const RemoteMetadataSource = struct {
         }
         self.cache_mutex.unlock();
 
-        for (0..2) |attempt| {
+        // A generation mismatch means a concurrent mutation superseded this
+        // read. Keep the fence fail-closed and restart the whole head/snapshot
+        // pair until one generation wins or the caller's shared budget ends.
+        while (true) {
+            try ensureBudgetActive(budget);
             const head = self.fetchHeadWithBudget(budget) catch |err| {
-                if (err == error.MetadataSnapshotHeadMismatch and attempt == 0) continue;
+                if (err == error.MetadataSnapshotHeadMismatch) continue;
                 return err;
             };
             return self.fetchSnapshotForHeadWithBudget(head, budget) catch |err| {
-                if (err == error.MetadataSnapshotHeadMismatch and attempt == 0) continue;
+                if (err == error.MetadataSnapshotHeadMismatch) continue;
                 return err;
             };
         }
-        unreachable;
     }
 
     fn cachedSnapshot(self: *RemoteMetadataSource) !?antfly.metadata_api.AdminSnapshot {
@@ -30855,7 +30866,7 @@ test "remote metadata source retains mutation authority across cache invalidatio
     try std.testing.expectEqual(@as(usize, 1), source.metadataReadApiIndexForAttempt(0));
 }
 
-test "remote metadata source retries one fenced snapshot generation" {
+test "remote metadata source retries fenced snapshot generations until success" {
     var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
     defer backend_runtime.deinit();
     var source = try RemoteMetadataSource.init(
@@ -30881,13 +30892,32 @@ test "remote metadata source retries one fenced snapshot generation" {
     source.cached_snapshot_at_ms = now_ms;
     source.cached_head_at_ms = now_ms;
     source.test_faults.force_snapshot_cache_miss = true;
-    source.test_faults.fetch_head_mismatch_once = true;
+    source.test_faults.fetch_head_mismatches_remaining = 3;
 
     var fetched = try source.fetchSnapshot();
     defer freeAdminSnapshotOwned(std.testing.allocator, &fetched);
 
     try std.testing.expectEqual(@as(u64, 9), fetched.status.metadata_group_id);
-    try std.testing.expect(!source.test_faults.fetch_head_mismatch_once);
+    try std.testing.expectEqual(@as(usize, 0), source.test_faults.fetch_head_mismatches_remaining);
+}
+
+test "remote metadata source bounds repeated fenced snapshot generations" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    source.test_faults.fetch_head_mismatches_remaining = std.math.maxInt(usize);
+    try std.testing.expectError(
+        error.Timeout,
+        source.fetchSnapshotWithBudget(.{
+            .deadline_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_ms,
+        }),
+    );
 }
 
 test "remote metadata source installs fenced snapshot without comparing epoch domains" {
