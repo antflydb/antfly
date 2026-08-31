@@ -15,6 +15,7 @@
 //! Owned JSON response passed across table runtime callback boundaries.
 
 const std = @import("std");
+const graph_wire_envelope = @import("graph_wire_envelope.zig");
 
 pub const QueryResponse = struct {
     /// Internal group-query response header used to carry the storage snapshot
@@ -23,6 +24,9 @@ pub const QueryResponse = struct {
 
     json: []u8,
     identity_read_generation: ?u64 = null,
+    /// Dialect admitted at the public graph boundary. This is transport
+    /// metadata only: graph execution and storage always use the canonical IR.
+    graph_dialect: ?graph_wire_envelope.Dialect = null,
 
     pub fn deinit(self: *QueryResponse, alloc: std.mem.Allocator) void {
         alloc.free(self.json);

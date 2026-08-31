@@ -12,4 +12,133 @@ pub const SortField = struct {
     field: []const u8,
     /// Sort direction. true = descending, false = ascending.
     desc: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "field", "field", false },
+        .{ "desc", "desc", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("field");
+        try jw.write(self.field);
+        if (self.desc) |value| {
+            try jw.objectField("desc");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
+
+/// Parse an OpenAPI object without materializing a second JSON tree while
+/// rejecting explicit null for optional properties whose schemas are non-nullable.
+fn openApiParseObject(
+    comptime T: type,
+    comptime openapi_fields: anytype,
+    allocator: std.mem.Allocator,
+    source: anytype,
+    options: std.json.ParseOptions,
+) !T {
+    @setEvalBranchQuota(100_000);
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (openapi_fields.len != struct_info.fields.len) @compileError("OpenAPI object field descriptors must match the generated struct");
+    if (.object_begin != try source.next()) return error.UnexpectedToken;
+
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    while (true) {
+        var name_token: ?std.json.Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+        const field_name = switch (name_token.?) {
+            inline .string, .allocated_string => |slice| slice,
+            .object_end => break,
+            else => return error.UnexpectedToken,
+        };
+
+        inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field[0], field_name)) {
+                openApiFreeAllocatedToken(allocator, name_token.?);
+                name_token = null;
+                if (openapi_field[2] and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
+                if (fields_seen[i]) {
+                    switch (options.duplicate_field_behavior) {
+                        .use_first => {
+                            _ = try std.json.innerParse(field.type, allocator, source, options);
+                            break;
+                        },
+                        .@"error" => return error.DuplicateField,
+                        .use_last => {},
+                    }
+                }
+                @field(result, field.name) = try std.json.innerParse(field.type, allocator, source, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else {
+            openApiFreeAllocatedToken(allocator, name_token.?);
+            if (options.ignore_unknown_fields) try source.skipValue() else return error.UnknownField;
+        }
+    }
+    try openApiFillDefaultStructValues(T, openapi_fields, &result, &fields_seen);
+    return result;
+}
+
+fn openApiParseObjectFromValue(
+    comptime T: type,
+    comptime openapi_fields: anytype,
+    allocator: std.mem.Allocator,
+    source: std.json.Value,
+    options: std.json.ParseOptions,
+) !T {
+    @setEvalBranchQuota(100_000);
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (openapi_fields.len != struct_info.fields.len) @compileError("OpenAPI object field descriptors must match the generated struct");
+    if (source != .object) return error.UnexpectedToken;
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    var it = source.object.iterator();
+    while (it.next()) |entry| {
+        const field_name = entry.key_ptr.*;
+        inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field[0], field_name)) {
+                if (openapi_field[2] and entry.value_ptr.* == .null) return error.UnexpectedToken;
+                @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else if (!options.ignore_unknown_fields) return error.UnknownField;
+    }
+    try openApiFillDefaultStructValues(T, openapi_fields, &result, &fields_seen);
+    return result;
+}
+
+fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: anytype, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+    @setEvalBranchQuota(100_000);
+    inline for (@typeInfo(T).@"struct".fields, openapi_fields, 0..) |field, openapi_field, i| {
+        if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+        if (!fields_seen[i]) {
+            if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
+        }
+    }
+}
+
+fn openApiFreeAllocatedToken(allocator: std.mem.Allocator, token: std.json.Token) void {
+    switch (token) {
+        .allocated_number, .allocated_string => |slice| allocator.free(slice),
+        else => {},
+    }
+}
