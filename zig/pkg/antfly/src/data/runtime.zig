@@ -15199,6 +15199,26 @@ fn catalogRoutingAttemptDeadline(now_ns: u64, deadline_ns: u64, attempts_remaini
     return now_ns +| @max(@as(u64, 1), (deadline_ns - now_ns) / divisor);
 }
 
+fn isCatalogRoutingTimeout(err: anyerror) bool {
+    return switch (err) {
+        error.CatalogRoutingSnapshotTimeout,
+        error.Timeout,
+        error.DeadlineExceeded,
+        error.Cancelled,
+        error.Canceled,
+        => true,
+        else => false,
+    };
+}
+
+fn normalizeCatalogRoutingSnapshotError(err: anyerror) anyerror {
+    return if (isCatalogRoutingTimeout(err)) error.CatalogRoutingSnapshotTimeout else err;
+}
+
+fn ensureCatalogRoutingDeadline(deadline_ns: u64) !void {
+    if (platform_time.monotonicNs() >= deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+}
+
 fn legacyCatalogRoutingOptimisticDeadline(now_ns: u64, deadline_ns: u64, probe_interval_ns: u64) u64 {
     if (now_ns >= deadline_ns) return deadline_ns;
     const remaining_ns = deadline_ns - now_ns;
@@ -15231,20 +15251,29 @@ fn routeQueryForWire(
     };
 }
 
-fn cloneRoutePlanFromWire(
+fn cloneRoutePlanFromWireUntil(
     alloc: std.mem.Allocator,
     plan: antfly.metadata_api.CatalogRoutePlan,
+    deadline_ns: u64,
 ) !antfly.public_api.table_catalog.CatalogRoutePlan {
+    try ensureCatalogRoutingDeadline(deadline_ns);
     const groups = try alloc.alloc(antfly.public_api.table_catalog.CatalogGroupRoute, plan.groups.len);
-    for (plan.groups, groups) |source_group, *target_group| target_group.* = .{
-        .group_id = source_group.group_id,
-        .range_id = source_group.range_id,
-        .identity_namespace = .{
-            .table_id = source_group.identity_namespace.table_id,
-            .shard_id = source_group.identity_namespace.shard_id,
-            .range_id = source_group.identity_namespace.range_id,
-        },
-    };
+    errdefer alloc.free(groups);
+    for (plan.groups, groups, 0..) |source_group, *target_group, index| {
+        // This is a primitive copy, so checking once per bounded batch
+        // preserves prompt cancellation without a clock read per route.
+        if (index % 64 == 0) try ensureCatalogRoutingDeadline(deadline_ns);
+        target_group.* = .{
+            .group_id = source_group.group_id,
+            .range_id = source_group.range_id,
+            .identity_namespace = .{
+                .table_id = source_group.identity_namespace.table_id,
+                .shard_id = source_group.identity_namespace.shard_id,
+                .range_id = source_group.identity_namespace.range_id,
+            },
+        };
+    }
+    try ensureCatalogRoutingDeadline(deadline_ns);
     return .{
         .metadata_group_id = plan.metadata_group_id,
         .metadata_incarnation = plan.metadata_incarnation,
@@ -16379,7 +16408,7 @@ const RemoteMetadataSource = struct {
             const scratch = arena.allocator();
             var metadata_client = self.metadataClient(scratch);
             const protocol = self.routingProtocolForEndpoint(index, &metadata_client, attempt_budget) catch |err| {
-                last_err = err;
+                last_err = normalizeCatalogRoutingSnapshotError(err);
                 continue;
             };
             const snapshot = switch (protocol) {
@@ -16400,7 +16429,7 @@ const RemoteMetadataSource = struct {
                                 attempt_budget,
                                 linearizable,
                             ) catch |legacy_err| {
-                                if (legacy_err == error.Timeout or legacy_err == error.DeadlineExceeded or legacy_err == error.Cancelled) {
+                                if (isCatalogRoutingTimeout(legacy_err)) {
                                     last_err = error.CatalogRoutingSnapshotTimeout;
                                     continue;
                                 }
@@ -16408,7 +16437,7 @@ const RemoteMetadataSource = struct {
                                 continue;
                             };
                         }
-                        if (err == error.Timeout or err == error.DeadlineExceeded or err == error.Cancelled) {
+                        if (isCatalogRoutingTimeout(err)) {
                             last_err = error.CatalogRoutingSnapshotTimeout;
                             continue;
                         }
@@ -16435,7 +16464,7 @@ const RemoteMetadataSource = struct {
                         attempt_budget,
                         linearizable,
                     ) catch |err| {
-                        if (err == error.Timeout or err == error.DeadlineExceeded or err == error.Cancelled) {
+                        if (isCatalogRoutingTimeout(err)) {
                             last_err = error.CatalogRoutingSnapshotTimeout;
                             continue;
                         }
@@ -16682,8 +16711,17 @@ const RemoteMetadataSource = struct {
                 .found => {
                     const plan = parsed.value.plan orelse return error.InvalidCatalogRouteResponse;
                     try self.acceptMetadataIdentity(plan.metadata_group_id, plan.metadata_incarnation);
+                    var owned_plan = cloneRoutePlanFromWireUntil(alloc, plan, deadline_ns) catch |err| switch (err) {
+                        error.CatalogRoutingSnapshotTimeout => return .timed_out,
+                        else => return err,
+                    };
+                    errdefer owned_plan.deinit(alloc);
                     self.noteMetadataReadSuccess(index);
-                    return .{ .found = try cloneRoutePlanFromWire(alloc, plan) };
+                    if (platform_time.monotonicNs() >= deadline_ns) {
+                        owned_plan.deinit(alloc);
+                        return .timed_out;
+                    }
+                    return .{ .found = owned_plan };
                 },
                 .not_found => {
                     try self.acceptMetadataIdentity(
@@ -16691,6 +16729,7 @@ const RemoteMetadataSource = struct {
                         parsed.value.token.metadata_incarnation,
                     );
                     self.noteMetadataReadSuccess(index);
+                    if (platform_time.monotonicNs() >= deadline_ns) return .timed_out;
                     return .publication_not_observed;
                 },
                 .timed_out, .authority_changed => {
@@ -32359,6 +32398,55 @@ test "remote routing never publishes a cache entry after its deadline" {
     defer source.cache_mutex.unlock();
     try std.testing.expect(source.cached_routing_snapshot == published);
     try std.testing.expectEqual(@as(u64, 9), source.cached_routing_snapshot.?.snapshot.catalog_revision);
+}
+
+test "remote routing normalizes every timeout class at the source boundary" {
+    try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Timeout) == error.CatalogRoutingSnapshotTimeout);
+    try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.DeadlineExceeded) == error.CatalogRoutingSnapshotTimeout);
+    try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Cancelled) == error.CatalogRoutingSnapshotTimeout);
+    try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Canceled) == error.CatalogRoutingSnapshotTimeout);
+    try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.CatalogRoutingSnapshotTimeout) == error.CatalogRoutingSnapshotTimeout);
+    try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.NotLeader) == error.NotLeader);
+}
+
+test "remote await route plan cloning preserves its absolute deadline" {
+    var groups = [_]antfly.metadata_api.CatalogGroupRoute{
+        .{
+            .group_id = 7001,
+            .range_id = 71,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 71 },
+        },
+        .{
+            .group_id = 7002,
+            .range_id = 72,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 72 },
+        },
+    };
+    const wire_plan = antfly.metadata_api.CatalogRoutePlan{
+        .metadata_group_id = 91,
+        .metadata_incarnation = null,
+        .catalog_revision = 12,
+        .table_id = 7,
+        .topology_epoch = 8,
+        .groups = groups[0..],
+    };
+
+    var cloned = try cloneRoutePlanFromWireUntil(
+        std.testing.allocator,
+        wire_plan,
+        platform_time.monotonicNs() + std.time.ns_per_s,
+    );
+    defer cloned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), cloned.groups.len);
+    try std.testing.expectEqual(@as(u64, 7002), cloned.groups[1].group_id);
+    try std.testing.expectError(
+        error.CatalogRoutingSnapshotTimeout,
+        cloneRoutePlanFromWireUntil(
+            std.testing.allocator,
+            wire_plan,
+            platform_time.monotonicNs(),
+        ),
+    );
 }
 
 test "remote metadata catalog source provides compact routing" {
