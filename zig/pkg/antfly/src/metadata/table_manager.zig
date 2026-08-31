@@ -294,6 +294,55 @@ pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
         );
 }
 
+/// Restore publication is monotonic: immediately after the catalog publishes
+/// an active restore intent, a data node may complete it and clear the
+/// transient restore fields. Admission retries and post-commit verification
+/// must therefore accept either the exact published record or that one valid
+/// successor state. All topology and document-identity fields remain exact,
+/// and the completion fingerprint proves which restore cleared the intent.
+pub fn rangeMatchesRestorePublication(
+    projected: RangeRecord,
+    expected: RangeRecord,
+) bool {
+    if (rangeRecordsEqual(projected, expected)) return true;
+
+    if (expected.restore_backup_id.len == 0 or
+        expected.restore_artifact_backup_id.len == 0 or
+        expected.restore_location.len == 0)
+    {
+        return false;
+    }
+    if (projected.restore_backup_id.len != 0 or
+        projected.restore_artifact_backup_id.len != 0 or
+        projected.restore_location.len != 0 or
+        projected.restore_snapshot_path.len != 0 or
+        projected.restore_connection.len != 0 or
+        projected.restore_artifact_size_bytes != 0 or
+        projected.restore_artifact_sha256.len != 0 or
+        projected.restore_native_manifest_size_bytes != 0 or
+        projected.restore_native_manifest_sha256.len != 0)
+    {
+        return false;
+    }
+
+    return projected.group_id == expected.group_id and
+        projected.range_id == expected.range_id and
+        projected.table_id == expected.table_id and
+        std.mem.eql(u8, projected.start_key, expected.start_key) and
+        ((projected.end_key == null and expected.end_key == null) or
+            (projected.end_key != null and expected.end_key != null and
+                std.mem.eql(u8, projected.end_key.?, expected.end_key.?))) and
+        projected.doc_identity_shard_id == expected.doc_identity_shard_id and
+        projected.doc_identity_range_id == expected.doc_identity_range_id and
+        projected.split_attempt_epoch == expected.split_attempt_epoch and
+        rangeRestoreCompletionMatches(
+            projected,
+            expected.restore_backup_id,
+            expected.restore_artifact_backup_id,
+            expected.restore_location,
+        );
+}
+
 pub const node_lifecycle_active = "active";
 pub const node_lifecycle_draining = "draining";
 pub const node_lifecycle_finalizing = "finalizing";
@@ -937,6 +986,16 @@ pub const RestoreProgressRecord = struct {
     phase: []const u8 = "",
     last_error: []const u8 = "",
     updated_at_ms: u64 = 0,
+};
+
+/// Stable key for one node's durable restore-repair observation. Keeping the
+/// delete contract separate from the full record prevents stale callers from
+/// accidentally re-publishing artifact state while cleaning up completed
+/// restore intents.
+pub const RestoreProgressIdentity = struct {
+    table_id: u64,
+    node_id: u64,
+    group_id: u64,
 };
 
 pub const ReplicationSourceStatusRecord = struct {

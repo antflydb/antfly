@@ -379,6 +379,22 @@ pub const MetadataHttpClient = struct {
         try self.requestWithBody(base_uri, .POST, routes.Routes.internal_schema_progress, body, error.InvalidSchemaProgressRequest, null, null);
     }
 
+    pub fn upsertRestoreProgress(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        body: []const u8,
+    ) !void {
+        try self.requestWithBody(base_uri, .POST, routes.Routes.internal_restore_progress, body, error.InvalidRestoreProgressRequest, null, null);
+    }
+
+    pub fn removeRestoreProgress(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        body: []const u8,
+    ) !void {
+        try self.requestWithBody(base_uri, .POST, routes.Routes.internal_restore_progress_remove, body, error.InvalidRestoreProgressRequest, null, null);
+    }
+
     pub fn restoreExtensions(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -740,7 +756,26 @@ pub const MetadataHttpClient = struct {
             routes.Routes.internal_table_restore_suffix,
         });
         defer self.alloc.free(path);
-        try self.requestWithBody(base_uri, .POST, path, body, error.InvalidBackupRequest, null, error.TableAlreadyExists);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+        var resp = try self.executeWithRetry(.{
+            .method = .POST,
+            .uri = uri,
+            .body = body,
+            .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
+        });
+        defer resp.deinit(self.alloc);
+        if (resp.status == 409) {
+            if (responseHeader(resp, routes.Routes.table_mutation_error_header)) |value| {
+                if (std.mem.eql(u8, value, routes.Routes.table_restore_error_transition_active))
+                    return error.TableTransitionActive;
+                if (std.mem.eql(u8, value, routes.Routes.table_restore_error_already_exists))
+                    return error.TableAlreadyExists;
+            }
+            return error.MetadataMutationOutcomeUnknown;
+        }
+        try mapResponseStatus(resp, error.InvalidBackupRequest, null, null);
     }
 
     pub fn createIndex(

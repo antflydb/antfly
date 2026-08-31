@@ -248,15 +248,22 @@ fn repairPreparedRestoreUntilComplete(
     const io = io_scope.io();
     var state = (try db_mod.DB.readRestoreStateForPathWithIo(alloc, io, prepared.path())) orelse return;
     defer state.deinit(alloc);
+    const open_options = try preparedRestoreOpenOptionsForRepair(prepared, restore, options);
+    var restored = try db_mod.DB.open(alloc, prepared.path(), open_options);
+    defer restored.close();
+    // Backup artifacts contain the source replica's applied-entry fence. A
+    // restored generation is admitted into a distinct Raft history even when
+    // metadata intentionally preserves the logical group id, so publishing
+    // that fence would make the first destination entry look conflicting (or
+    // already applied). Clear it on the isolated candidate before either
+    // portable deferred repair or native inline repair can publish the root.
+    try restored.clearRaftAppliedEntry();
     // Legacy/portable repair may require table-managed provider wiring and is
     // completed by the provisioning restore job. Native selective repair is
     // self-contained and must finish before this lower-level bootstrap can
     // publish the candidate.
     if (!std.mem.eql(u8, state.phase, "repair_indexes")) return;
 
-    const open_options = try preparedRestoreOpenOptionsForRepair(prepared, restore, options);
-    var restored = try db_mod.DB.open(alloc, prepared.path(), open_options);
-    defer restored.close();
     var repair_cancellation = db_mod.types.RepairCancellation{ .token = restore.cancellation };
     while (try restored.restoreRuntimeRepairNeeded()) {
         try restore.cancellation.check();

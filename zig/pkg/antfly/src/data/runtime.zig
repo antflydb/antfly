@@ -12248,8 +12248,13 @@ pub const DataServer = struct {
         for (local_intents) |intent| {
             const group_id = intent.record.group_id;
             if (findRangeByGroupId(snapshot.ranges, group_id) != null) continue;
-            const range = findRangeByGroupId(provisioning_ranges, group_id) orelse
-                return error.MissingProvisioningRange;
+            // Drop publication intentionally removes the table/range catalog
+            // before placement retirement converges. Such a range-less intent
+            // is existing retirement debt, not an unpublished split
+            // destination, and its already-present storage must not be
+            // reprovisioned. Only an active split contributes a synthetic
+            // provisioning range.
+            const range = findRangeByGroupId(provisioning_ranges, group_id) orelse continue;
             const table = findTableById(snapshot.tables, range.table_id) orelse
                 return error.MissingProvisioningTable;
             var activity = write_source.tryBeginGroupRefreshActivity(table.name, group_id) orelse
@@ -13371,21 +13376,30 @@ pub const DataServer = struct {
             for (local_group_ids) |group_id| {
                 const range = findRangeByGroupId(snapshot.ranges, group_id) orelse continue;
                 if (range.table_id != table.table_id) continue;
-                switch (startupCatchUpGroupDisposition(
-                    snapshot.stores,
-                    snapshot.placement_intents,
-                    snapshot.merged_group_statuses,
-                    registration,
-                    self.group_leadership_source,
-                    group_id,
-                )) {
-                    .attempt => {},
-                    .skip_nonlocal => continue,
-                    .retry_unknown => {
-                        stats.debt_remaining = true;
-                        stats.unparked_debt_remaining = true;
-                        continue;
-                    },
+                // Restore imports a distinct physical generation into every
+                // placement, and metadata does not complete the range intent
+                // until every placement reports its local runtime repair
+                // proof. Unlike ordinary replay/index maintenance, this work
+                // therefore cannot be restricted to the current Raft leader.
+                // Keeping the exception scoped to a live restore identity
+                // preserves single-leader admission for all steady-state debt.
+                if (range.restore_backup_id.len == 0 or range.restore_location.len == 0) {
+                    switch (startupCatchUpGroupDisposition(
+                        snapshot.stores,
+                        snapshot.placement_intents,
+                        snapshot.merged_group_statuses,
+                        registration,
+                        self.group_leadership_source,
+                        group_id,
+                    )) {
+                        .attempt => {},
+                        .skip_nonlocal => continue,
+                        .retry_unknown => {
+                            stats.debt_remaining = true;
+                            stats.unparked_debt_remaining = true;
+                            continue;
+                        },
+                    }
                 }
 
                 const db_path = antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, group_id) catch |err| {
@@ -15115,6 +15129,32 @@ pub const DataServer = struct {
             self.provisioned_startup_catch_up_dirty.store(true, .release);
             return;
         }
+        if (try self.localRestoreRepairPending(provisioning_ranges, local_group_ids)) {
+            // Reconciliation owns importing an absent restore generation;
+            // startup catch-up owns the bounded repair phases after that
+            // generation is published. Re-entering reconciliation while the
+            // durable marker is pending only contends on the same generation
+            // transition and can starve repair indefinitely.
+            self.last_provision_metadata_epoch = head.metadata_epoch;
+            self.last_provision_fingerprint = null;
+            self.provisioned_root_refresh_dirty.store(true, .release);
+            self.provisioned_startup_catch_up_dirty.store(true, .release);
+            return;
+        }
+
+        // Separate data processes own the durable restore markers. Metadata
+        // cannot discover those files through its own replica root, so report
+        // exact per-placement completion before allowing the catalog intent
+        // to clear. Suppress equivalent records to avoid a proposal/epoch
+        // feedback loop on every reconciliation pass.
+        try self.reportLocalRestoreProgress(
+            head.metadata_group_id,
+            registration.node_id,
+            local_group_ids,
+            snapshot.tables,
+            provisioning_ranges,
+            snapshot.restore_progresses,
+        );
 
         var indexes_pending: usize = 0;
         const fingerprint = blk: {
@@ -15193,6 +15233,30 @@ pub const DataServer = struct {
         return self.provisioned_startup_catch_up_active.load(.acquire);
     }
 
+    fn localRestoreRepairPending(
+        self: *DataServer,
+        ranges: []const antfly.metadata.table_manager.RangeRecord,
+        local_group_ids: []const u64,
+    ) !bool {
+        const runtime = try self.ensureBackendRuntime();
+        const io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        for (local_group_ids) |group_id| {
+            const range = findRangeByGroupId(ranges, group_id) orelse continue;
+            if (range.restore_backup_id.len == 0 or range.restore_location.len == 0) continue;
+            const pending = pending: {
+                const path = try antfly.metadata.groupDbPathFromReplicaRoot(
+                    self.alloc,
+                    self.write_source.replica_root_dir,
+                    group_id,
+                );
+                defer self.alloc.free(path);
+                break :pending try antfly.db.DB.restoreRuntimeRepairNeededForPathWithIo(self.alloc, io, path);
+            };
+            if (pending) return true;
+        }
+        return false;
+    }
+
     fn reportLocalSchemaProgress(
         self: *DataServer,
         metadata_group_id: u64,
@@ -15223,6 +15287,64 @@ pub const DataServer = struct {
 
         for (local_progress) |record| {
             try remote_metadata.upsertSchemaProgress(record);
+        }
+    }
+
+    fn reportLocalRestoreProgress(
+        self: *DataServer,
+        metadata_group_id: u64,
+        local_node_id: u64,
+        local_group_ids: []const u64,
+        tables: []const antfly.metadata.table_manager.TableRecord,
+        ranges: []const antfly.metadata.table_manager.RangeRecord,
+        projected: []const antfly.metadata.table_manager.RestoreProgressRecord,
+    ) !void {
+        const remote_metadata = self.remote_metadata orelse return;
+        const runtime = try self.ensureBackendRuntime();
+        const local = try antfly.metadata.table_provisioner.collectLocalRestoreProgressUsingIo(
+            self.alloc,
+            runtime.io(),
+            self.write_source.replica_root_dir,
+            metadata_group_id,
+            local_node_id,
+            local_group_ids,
+            tables,
+            ranges,
+        );
+        defer {
+            for (local) |record| antfly.metadata.table_manager.freeRestoreProgress(self.alloc, record);
+            self.alloc.free(local);
+        }
+
+        for (local) |record| {
+            var unchanged = false;
+            for (projected) |existing| {
+                if (existing.table_id != record.table_id or existing.node_id != record.node_id or
+                    existing.group_id != record.group_id) continue;
+                unchanged = restoreProgressEquivalent(existing, record);
+                break;
+            }
+            if (!unchanged) try remote_metadata.upsertRestoreProgress(record);
+        }
+
+        // Once metadata clears a restore intent, the durable local marker is
+        // intentionally absent from the next collection. Retire the former
+        // observation as well; otherwise completed distributed restores leak
+        // one replicated progress row per placement forever.
+        for (projected) |existing| {
+            if (existing.node_id != local_node_id) continue;
+            var present = false;
+            for (local) |record| {
+                if (record.table_id != existing.table_id or record.node_id != existing.node_id or
+                    record.group_id != existing.group_id) continue;
+                present = true;
+                break;
+            }
+            if (!present) try remote_metadata.removeRestoreProgress(.{
+                .table_id = existing.table_id,
+                .node_id = existing.node_id,
+                .group_id = existing.group_id,
+            });
         }
     }
 
@@ -16942,7 +17064,46 @@ const RemoteMetadataSource = struct {
             }
         }.call, body);
     }
+
+    fn upsertRestoreProgress(self: *RemoteMetadataSource, record: antfly.metadata.table_manager.RestoreProgressRecord) !void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const body = try stringifyJsonAlloc(arena.allocator(), record);
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: []const u8) !void {
+                try client.upsertRestoreProgress(base_uri, ctx);
+            }
+        }.call, body);
+    }
+
+    fn removeRestoreProgress(self: *RemoteMetadataSource, identity: antfly.metadata.table_manager.RestoreProgressIdentity) !void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const body = try stringifyJsonAlloc(arena.allocator(), identity);
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: []const u8) !void {
+                try client.removeRestoreProgress(base_uri, ctx);
+            }
+        }.call, body);
+    }
 };
+
+fn restoreProgressEquivalent(
+    left: antfly.metadata.table_manager.RestoreProgressRecord,
+    right: antfly.metadata.table_manager.RestoreProgressRecord,
+) bool {
+    return std.mem.eql(u8, left.backup_id, right.backup_id) and
+        std.mem.eql(u8, left.artifact_backup_id, right.artifact_backup_id) and
+        std.mem.eql(u8, left.location, right.location) and
+        std.mem.eql(u8, left.snapshot_path, right.snapshot_path) and
+        std.mem.eql(u8, left.artifact_sha256, right.artifact_sha256) and
+        left.native_manifest_size_bytes == right.native_manifest_size_bytes and
+        std.mem.eql(u8, left.native_manifest_sha256, right.native_manifest_sha256) and
+        left.primary_restored == right.primary_restored and
+        left.runtime_repair_complete == right.runtime_repair_complete and
+        std.mem.eql(u8, left.phase, right.phase) and
+        std.mem.eql(u8, left.last_error, right.last_error);
+}
 
 fn remoteTableLifecycleMatches(
     snapshot: *const antfly.metadata_api.AdminSnapshot,

@@ -51,6 +51,32 @@ fn unlockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
 
 pub const DropResult = topology_protocol.DropResult;
 
+fn deriveRestoreDestinationRanges(
+    alloc: std.mem.Allocator,
+    table: metadata_table_manager.TableRecord,
+    source_ranges: []const metadata_table_manager.RangeRecord,
+    incarnation_generation: u64,
+) ![]metadata_table_manager.RangeRecord {
+    const destination = try alloc.alloc(metadata_table_manager.RangeRecord, source_ranges.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (destination[0..initialized]) |record|
+            metadata_table_manager.freeRange(alloc, record);
+        alloc.free(destination);
+    }
+    for (source_ranges, 0..) |source, index| {
+        destination[index] = try metadata_table_manager.cloneRange(alloc, source);
+        initialized += 1;
+        destination[index].group_id = try tables_api.deriveInitialRangeGroupIdForGeneration(
+            table.name,
+            @intCast(index),
+            @intCast(source_ranges.len),
+            incarnation_generation,
+        );
+    }
+    return destination;
+}
+
 pub fn create(
     svc: anytype,
     alloc: std.mem.Allocator,
@@ -127,10 +153,10 @@ pub fn create(
     catalog_locked = false;
 }
 
-/// Atomically publishes a backup manifest's exact table/range topology. The
-/// admission snapshot accepts an exact retry or a compatible prefix from the
-/// former multi-entry restore workflow, but rejects every conflicting row
-/// before the tag-50 command is proposed.
+/// Atomically publishes a backup manifest as one fresh physical table
+/// incarnation. Admission accepts only an absent destination or an exact retry
+/// of this generation; every conflicting row is rejected before the tag-50
+/// command is proposed.
 pub fn restore(
     svc: anytype,
     alloc: std.mem.Allocator,
@@ -163,18 +189,37 @@ pub fn restore(
     try request.ensureActive();
     try svc.ensureLinearizableReadWithContext(request);
     try svc.validateTableTopologyProtocolReadinessWithContext(request, protocol_readiness);
-    const transition_generation = try svc.captureTableRestoreGeneration(
+    const admission = try svc.captureTableRestoreAdmission(
+        alloc,
+        table,
+    );
+    const destination_ranges = try deriveRestoreDestinationRanges(
         alloc,
         table,
         ranges,
+        admission.incarnation_generation,
     );
+    defer {
+        for (destination_ranges) |record| metadata_table_manager.freeRange(alloc, record);
+        alloc.free(destination_ranges);
+    }
+
+    // A retry after an acknowledged or ambiguous commit observes the advanced
+    // fence. Re-derive the preceding incarnation and require an exact catalog
+    // projection instead of appending another no-op Raft entry.
+    if (admission.already_applied) {
+        try svc.verifyTableCreateProjection(alloc, table, destination_ranges);
+        unlockTableCatalogMutation(svc, table.name);
+        catalog_locked = false;
+        return;
+    }
 
     try request.ensureActive();
     const receipt = svc.proposeTransitionCommandWithReceipt(.{
         .apply_table_topology = .{ .create = .{
-            .expected_transition_generation = transition_generation,
+            .expected_transition_generation = admission.expected_transition_generation,
             .table = table,
-            .ranges = ranges,
+            .ranges = destination_ranges,
         } },
     }) catch |err| {
         if (metadata_authority.isMutationNotAdmittedError(err)) return error.NotLeader;
@@ -182,7 +227,7 @@ pub fn restore(
     };
     svc.waitForTransitionAppliedWithContext(receipt, request) catch |err|
         return afterAdmission(err);
-    svc.verifyTableCreateProjection(alloc, table, ranges) catch |err| switch (err) {
+    svc.verifyTableCreateProjection(alloc, table, destination_ranges) catch |err| switch (err) {
         error.TableAlreadyExists => return err,
         else => return afterAdmission(err),
     };

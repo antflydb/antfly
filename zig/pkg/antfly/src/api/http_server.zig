@@ -7573,6 +7573,12 @@ pub const ApiHttpServer = struct {
         if (forwarded_shards) |shards| {
             defer freeBackupShards(self.alloc, shards);
             try writer_lease.ensureOwned();
+            for (shards) |shard| {
+                std.log.debug(
+                    "fenced backup shard captured group_id={d} start={s} end={s} path={s} bytes={d}",
+                    .{ shard.group_id, shard.start_key, shard.end_key orelse "<unbounded>", shard.snapshot_path, shard.artifact_size_bytes },
+                );
+            }
             var manifest = try backups_api.createManifest(self.alloc, backup_id, format, table, shards);
             defer manifest.deinit(self.alloc);
             cleanup_safe.* = false;
@@ -7659,6 +7665,103 @@ pub const ApiHttpServer = struct {
             };
             return err;
         };
+    }
+
+    /// Captures exactly one fenced storage group for an authenticated internal
+    /// coordinator. The caller owns the table-level reservation and is the
+    /// only process allowed to publish the canonical manifest.
+    pub fn executeInternalTableBackupShard(
+        self: *ApiHttpServer,
+        group_id: u64,
+        table_name: []const u8,
+        artifact_backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        fence: backups_api.TableBackupFence,
+        backup_location: *backups_api.BackupLocation,
+    ) ![]backups_api.ShardSnapshot {
+        const io = self.sharedApiIo() orelse return error.BackupStorageUnavailable;
+        const writer_not_after = fence.writer_not_after_unix_ns orelse
+            return error.InvalidBackupFence;
+        const ensure_writer_active = struct {
+            fn call(active_io: std.Io, deadline: u64) !void {
+                const now: u64 = @intCast(std.Io.Timestamp.now(active_io, .real).toNanoseconds());
+                if (now >= deadline) return error.BackupAttemptLeaseLost;
+            }
+        }.call;
+        // The persisted not-after timestamp fences delayed delivery: a shard
+        // that did not begin before this point must never create artifacts.
+        // Once admitted, participate in the coordinator's same-owner durable
+        // lease so a long snapshot remains valid and stale-attempt cleanup
+        // cannot race an in-flight upload after the coordinator disconnects.
+        try ensure_writer_active(io, writer_not_after);
+        var writer_lease: TableBackupWriterLeaseHeartbeat = .{
+            .alloc = self.alloc,
+            .io = io,
+            .location = backup_location,
+            .artifact_backup_id = artifact_backup_id,
+            .expires_at_unix_ns = .init(writer_not_after),
+        };
+        try writer_lease.ensureOwned();
+        var writer_lease_future = std.Io.async(
+            io,
+            TableBackupWriterLeaseHeartbeat.run,
+            .{&writer_lease},
+        );
+        defer {
+            writer_lease.stop_event.set(io);
+            writer_lease_future.await(io);
+        }
+
+        const local_backup_root = switch (backup_location.*) {
+            .file => |value| value,
+            .remote => try self.createBackupStagingRoot(artifact_backup_id),
+        };
+        defer switch (backup_location.*) {
+            .file => {},
+            .remote => self.destroyBackupStagingRoot(local_backup_root),
+        };
+
+        const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
+        const maybe_shards = try table_writes_source.backupTable(self.alloc, table_name, .{
+            .backup_root = local_backup_root,
+            .backup_id = artifact_backup_id,
+            .format = format,
+            .io = io,
+            .fence = fence,
+            .target_group_id = group_id,
+        });
+        const shards = maybe_shards orelse return error.TableNotFound;
+        errdefer freeBackupShards(self.alloc, shards);
+        if (shards.len != 1 or shards[0].group_id != group_id)
+            return error.CatalogChanged;
+        try writer_lease.ensureOwned();
+
+        if (switch (backup_location.*) {
+            .remote => true,
+            .file => false,
+        }) {
+            const shard = shards[0];
+            const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
+            defer self.alloc.free(snapshot_root);
+            switch (format) {
+                .portable => try backups_api.copyFileToLocation(
+                    self.alloc,
+                    backup_location,
+                    shard.snapshot_path,
+                    snapshot_root,
+                    "application/vnd.antfly.backup",
+                ),
+                .native => try backups_api.copyDirectoryToLocation(
+                    self.alloc,
+                    backup_location,
+                    artifact_backup_id,
+                    shard.group_id,
+                    snapshot_root,
+                ),
+            }
+        }
+        try writer_lease.ensureOwned();
+        return shards;
     }
 
     fn cleanupClusterBackupAttempt(

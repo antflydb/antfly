@@ -6315,6 +6315,9 @@ pub const BoundTableWriteSource = struct {
     ) !?[]backups_api.ShardSnapshot {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        if (plan.target_group_id) |group_id| {
+            if (group_id != 0) return error.NotFound;
+        }
         if (plan.cancellation.isCancelled()) return error.Canceled;
         const db = try self.activeDb();
         if (plan.format == .portable) {
@@ -6382,7 +6385,7 @@ pub const BoundTableWriteSource = struct {
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        try backups_api.validateRestorableManifestLayout(plan.manifest);
+        try backups_api.validateSingleRangeRestoreManifestLayout(plan.manifest);
         try backups_api.validateRestoreManifest(alloc, plan.manifest, plan.manifest.backup_id);
         if (plan.reconcile_only) return error.RestoreIdentityMismatch;
         const db = try self.activeDb();
@@ -18370,12 +18373,22 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?[]backups_api.ShardSnapshot {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (plan.cancellation.isCancelled()) return error.Canceled;
-        const group_id = (try resolveFencedBackupGroup(self.catalog, table_name, plan.fence)) orelse return null;
+        const group_id = (try resolveFencedBackupGroup(
+            self.catalog,
+            table_name,
+            plan.fence,
+            plan.target_group_id,
+        )) orelse return null;
         self.beginGroupOperation(table_name, group_id);
         defer {
             self.endGroupOperation(table_name, group_id);
         }
-        const guarded_group_id = (try resolveFencedBackupGroup(self.catalog, table_name, plan.fence)) orelse return error.CatalogChanged;
+        const guarded_group_id = (try resolveFencedBackupGroup(
+            self.catalog,
+            table_name,
+            plan.fence,
+            plan.target_group_id,
+        )) orelse return error.CatalogChanged;
         if (guarded_group_id != group_id) return error.CatalogChanged;
 
         if (self.localWriteOwnerSource()) |owner| return try owner.backupTable(alloc, table_name, plan);
@@ -18575,7 +18588,7 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.restoreTableReserved(alloc, table_name, plan);
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        try backups_api.validateRestorableManifestLayout(plan.manifest);
+        try backups_api.validateSingleRangeRestoreManifestLayout(plan.manifest);
         try backups_api.validateRestoreManifest(alloc, plan.manifest, plan.manifest.backup_id);
         if (plan.reconcile_only and plan.replace_existing) return error.InvalidBackupRequest;
         const restore_io = plan.io orelse self.table_activity_threaded.io();
@@ -20958,13 +20971,13 @@ test "backup storage resolution rejects a reused table name from another incarna
     var admitted = try catalog.iface().adminSnapshot();
     const fence = backups_api.tableBackupFence(&admitted, &admitted.tables[0]);
     catalog.iface().freeAdminSnapshot(&admitted);
-    try std.testing.expectEqual(@as(?u64, 7001), try resolveFencedBackupGroup(catalog.iface(), "docs", fence));
+    try std.testing.expectEqual(@as(?u64, 7001), try resolveFencedBackupGroup(catalog.iface(), "docs", fence, null));
 
     catalog.metadata_incarnation = "fedcba9876543210fedcba9876543210".*;
-    try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence));
+    try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence, null));
     catalog.metadata_incarnation = "0123456789abcdef0123456789abcdef".*;
     catalog.table_id = 8;
-    try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence));
+    try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence, null));
 }
 
 pub const HostedProvisionedTableWriteSource = struct {
@@ -21857,6 +21870,70 @@ pub const HostedProvisionedTableWriteSource = struct {
         return error.UnsupportedOperation;
     }
 
+    fn fetchHostedBackupRangeFromRoute(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        route: table_router.GroupRoute,
+        range: FencedBackupRange,
+        table_name: []const u8,
+        body: []const u8,
+        fence: backups_api.TableBackupFence,
+    ) !backups_api.ShardSnapshot {
+        const group_id = range.group_id;
+        switch (route) {
+            .local => return error.UnsupportedOperation,
+            .remote => |remote| {
+                var client = self.httpClient(alloc);
+                var response = try client.fetchBackupShardFenced(remote.base_uri, group_id, table_name, body, fence);
+                defer response.deinit(alloc);
+                var parsed = try std.json.parseFromSlice(
+                    struct { shards: []backups_api.ShardSnapshot },
+                    alloc,
+                    response.body,
+                    .{ .allocate = .alloc_always },
+                );
+                defer parsed.deinit();
+                if (parsed.value.shards.len != 1 or parsed.value.shards[0].group_id != group_id)
+                    return error.CatalogChanged;
+                const owned = try cloneShardSnapshots(alloc, parsed.value.shards);
+                defer alloc.free(owned);
+                var shard = owned[0];
+                errdefer shard.deinit(alloc);
+                const catalog_start = try alloc.dupe(u8, range.start_key);
+                errdefer alloc.free(catalog_start);
+                const catalog_end = if (range.end_key) |value| try alloc.dupe(u8, value) else null;
+                errdefer if (catalog_end) |value| alloc.free(value);
+                alloc.free(@constCast(shard.start_key));
+                if (shard.end_key) |value| alloc.free(@constCast(value));
+                shard.start_key = catalog_start;
+                shard.end_key = catalog_end;
+                shard.range_id = range.range_id;
+                // Initial catalog rows encode the historical identity as zero
+                // and resolve it through the physical group. The fenced range
+                // snapshot has already materialized that effective namespace
+                // for the portable manifest.
+                shard.doc_identity_shard_id = range.doc_identity_shard_id;
+                shard.doc_identity_range_id = range.doc_identity_range_id;
+                shard.split_attempt_epoch = range.split_attempt_epoch;
+                return shard;
+            },
+        }
+    }
+
+    fn fetchHostedBackupRange(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        range: FencedBackupRange,
+        table_name: []const u8,
+        body: []const u8,
+        fence: backups_api.TableBackupFence,
+    ) !backups_api.ShardSnapshot {
+        const resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, range.group_id, .prefer_leader);
+        var route = resolved_route orelse return error.GroupLeaderUnavailable;
+        defer route.deinit(alloc);
+        return self.fetchHostedBackupRangeFromRoute(alloc, route, range, table_name, body, fence);
+    }
+
     fn backupTableToLocation(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -21869,26 +21946,139 @@ pub const HostedProvisionedTableWriteSource = struct {
         location_ptr: *anyopaque,
     ) !?[]backups_api.ShardSnapshot {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const location: *backups_api.BackupLocation = @ptrCast(@alignCast(location_ptr));
-        const group_id = (try resolveFencedBackupGroup(self.catalog, table_name, fence)) orelse return null;
-        const resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
-        var route = resolved_route orelse return null;
-        defer route.deinit(alloc);
-        switch (route) {
-            .local => return error.UnsupportedOperation,
-            .remote => |remote| {
-                const body = try forwardedTableBackupRequestAlloc(alloc, backup_id, location_uri, connection, format);
-                defer alloc.free(body);
+        _ = location_ptr;
+        const ranges = (try resolveFencedBackupRangesAlloc(alloc, self.catalog, table_name, fence)) orelse return null;
+        defer freeFencedBackupRanges(alloc, ranges);
+        const body = try forwardedTableBackupRequestAlloc(alloc, backup_id, location_uri, connection, format);
+        defer alloc.free(body);
 
-                var client = self.httpClient(alloc);
-                var response = try client.fetchBackupTableFenced(remote.base_uri, table_name, body, fence);
-                response.deinit(alloc);
-
-                var manifest = try backups_api.readManifestFromLocation(alloc, location, backup_id);
-                defer manifest.deinit(alloc);
-                return try cloneShardSnapshots(alloc, manifest.shards);
-            },
+        const shards = try alloc.alloc(backups_api.ShardSnapshot, ranges.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (shards[0..initialized]) |shard| shard.deinit(alloc);
+            alloc.free(shards);
         }
+        const io_impl = if (self.backend_runtime) |runtime| runtime.apiIoImpl() else null;
+        if (io_impl == null or ranges.len <= 1) {
+            for (ranges, 0..) |range, i| {
+                shards[i] = try self.fetchHostedBackupRange(alloc, range, table_name, body, fence);
+                initialized += 1;
+            }
+        } else {
+            // Route discovery may itself use the shared metadata HTTP client.
+            // Resolve every route before borrowing API-runtime fibers; doing
+            // this inside a fiber can recursively wait on the same bounded I/O
+            // scheduler and deadlock the fanout.
+            const routes = try alloc.alloc(table_router.GroupRoute, ranges.len);
+            var routes_initialized: usize = 0;
+            defer {
+                for (routes[0..routes_initialized]) |*route| route.deinit(alloc);
+                alloc.free(routes);
+            }
+            for (ranges, 0..) |range, i| {
+                routes[i] = (try table_router.resolveGroupRoute(
+                    alloc,
+                    self.catalog,
+                    self.router,
+                    range.group_id,
+                    .prefer_leader,
+                )) orelse return error.GroupLeaderUnavailable;
+                routes_initialized += 1;
+            }
+
+            const Slot = struct {
+                arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+                shard: ?backups_api.ShardSnapshot = null,
+                err: ?anyerror = null,
+
+                fn deinit(slot: *@This()) void {
+                    slot.arena.deinit();
+                    slot.* = undefined;
+                }
+            };
+            const Fiber = struct {
+                fn run(
+                    hosted_source: *HostedProvisionedTableWriteSource,
+                    slot: *Slot,
+                    route: table_router.GroupRoute,
+                    range: FencedBackupRange,
+                    table_name_inner: []const u8,
+                    body_inner: []const u8,
+                    fence_inner: backups_api.TableBackupFence,
+                ) void {
+                    slot.shard = hosted_source.fetchHostedBackupRangeFromRoute(
+                        slot.arena.allocator(),
+                        route,
+                        range,
+                        table_name_inner,
+                        body_inner,
+                        fence_inner,
+                    ) catch |err| {
+                        slot.err = err;
+                        return;
+                    };
+                }
+            };
+
+            const async_limit = @intFromEnum(io_impl.?.async_limit);
+            const scheduler_width = if (async_limit == 0)
+                @as(usize, 1)
+            else if (async_limit == std.math.maxInt(usize))
+                ranges.len
+            else
+                @min(ranges.len, async_limit);
+            const width = @max(@as(usize, 1), @min(scheduler_width, @as(usize, 4)));
+            // Reuse one independently owned arena per concurrent operation.
+            // This bounds retained HTTP parsing memory by fanout width rather
+            // than total range count, while the final snapshots continue to
+            // use the caller's allocator and lifetime.
+            const slots = try alloc.alloc(Slot, width);
+            var active_slots: usize = 0;
+            defer {
+                for (slots[0..active_slots]) |*slot| slot.deinit();
+                alloc.free(slots);
+            }
+            var start: usize = 0;
+            while (start < ranges.len) : (start += width) {
+                const end = @min(start + width, ranges.len);
+                const batch_len = end - start;
+                std.debug.assert(active_slots == 0);
+                for (slots[0..batch_len]) |*slot| slot.* = .{};
+                active_slots = batch_len;
+
+                var group: std.Io.Group = .init;
+                for (ranges[start..end], routes[start..end], slots[0..batch_len]) |range, route, *slot| {
+                    group.async(io_impl.?.io(), Fiber.run, .{ self, slot, route, range, table_name, body, fence });
+                }
+                // Each fiber captures its operation error in its own slot, so
+                // await only owns scheduler completion. Finish the entire
+                // bounded batch before returning to keep borrowed arguments
+                // and route storage alive.
+                try group.await(io_impl.?.io());
+                for (slots[0..batch_len]) |slot| if (slot.err) |err| return err;
+
+                // Clone in catalog order on the request thread before
+                // releasing the batch arenas. This preserves deterministic
+                // output and allocator ownership without retaining completed
+                // HTTP responses across later batches.
+                for (slots[0..batch_len], 0..) |slot, i| {
+                    const remote_shard = slot.shard orelse return error.BackupFailed;
+                    const owned = try cloneShardSnapshots(alloc, &.{remote_shard});
+                    shards[start + i] = owned[0];
+                    alloc.free(owned);
+                    initialized += 1;
+                }
+                for (slots[0..active_slots]) |*slot| slot.deinit();
+                active_slots = 0;
+            }
+        }
+        std.mem.sort(backups_api.ShardSnapshot, shards, {}, struct {
+            fn lessThan(_: void, lhs: backups_api.ShardSnapshot, rhs: backups_api.ShardSnapshot) bool {
+                const order = std.mem.order(u8, lhs.start_key, rhs.start_key);
+                return order == .lt or (order == .eq and lhs.group_id < rhs.group_id);
+            }
+        }.lessThan);
+        return shards;
     }
 
     fn restoreTable(
@@ -28320,8 +28510,9 @@ const SchemaValidationWriteState = struct {
     }
 };
 
-fn portableBackupShardRelPath(alloc: std.mem.Allocator, backup_id: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}.afb", .{backup_id});
+fn portableBackupShardRelPath(alloc: std.mem.Allocator, backup_id: []const u8, group_id: u64) ![]u8 {
+    if (group_id == 0) return try std.fmt.allocPrint(alloc, "{s}.afb", .{backup_id});
+    return try std.fmt.allocPrint(alloc, "{s}/groups/{d}.afb", .{ backup_id, group_id });
 }
 
 fn exportPortableBackupShard(
@@ -28332,7 +28523,7 @@ fn exportPortableBackupShard(
     group_id: u64,
     shared_io: ?std.Io,
 ) ![]backups_api.ShardSnapshot {
-    const rel_path = try portableBackupShardRelPath(alloc, backup_id);
+    const rel_path = try portableBackupShardRelPath(alloc, backup_id, group_id);
     errdefer alloc.free(rel_path);
 
     const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, rel_path });
@@ -28429,6 +28620,10 @@ fn cloneShardSnapshots(
     for (shards, 0..) |shard, i| {
         out[i] = .{
             .group_id = shard.group_id,
+            .range_id = shard.range_id,
+            .doc_identity_shard_id = shard.doc_identity_shard_id,
+            .doc_identity_range_id = shard.doc_identity_range_id,
+            .split_attempt_epoch = shard.split_attempt_epoch,
             .start_key = try alloc.dupe(u8, shard.start_key),
             .end_key = if (shard.end_key) |value| try alloc.dupe(u8, value) else null,
             .snapshot_path = try alloc.dupe(u8, shard.snapshot_path),
@@ -28598,7 +28793,75 @@ fn loadTableManagedMetadata(
     };
 }
 
-/// Resolves the single storage group while checking the complete table
+/// Resolves every storage group while checking the complete table incarnation
+/// carried by backup admission. The returned group IDs are owned by `alloc`.
+const FencedBackupRange = struct {
+    group_id: u64,
+    range_id: u64,
+    doc_identity_shard_id: u64,
+    doc_identity_range_id: u64,
+    split_attempt_epoch: u64,
+    start_key: []u8,
+    end_key: ?[]u8,
+};
+
+fn freeFencedBackupRanges(alloc: std.mem.Allocator, ranges: []const FencedBackupRange) void {
+    for (ranges) |range| {
+        alloc.free(range.start_key);
+        if (range.end_key) |value| alloc.free(value);
+    }
+    alloc.free(@constCast(ranges));
+}
+
+fn resolveFencedBackupRangesAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    expected_fence: backups_api.TableBackupFence,
+) !?[]FencedBackupRange {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    const resolution = metadata_api.catalogTableTopologyResolution(table.table_id, snapshot.ranges);
+    const actual = backups_api.tableBackupFenceWithTopology(&snapshot, table, resolution.topology);
+    if (!expected_fence.matches(actual)) return error.CatalogChanged;
+    if (resolution.topology.range_count == 0) return null;
+
+    const ranges = try alloc.alloc(FencedBackupRange, @intCast(resolution.topology.range_count));
+    var initialized: usize = 0;
+    errdefer {
+        for (ranges[0..initialized]) |range| {
+            alloc.free(range.start_key);
+            if (range.end_key) |value| alloc.free(value);
+        }
+        alloc.free(ranges);
+    }
+    var index: usize = 0;
+    for (snapshot.ranges) |range| {
+        if (range.table_id != table.table_id) continue;
+        ranges[index] = .{
+            .group_id = range.group_id,
+            .range_id = if (range.range_id == 0) range.group_id else range.range_id,
+            .doc_identity_shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
+            .doc_identity_range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
+            .split_attempt_epoch = range.split_attempt_epoch,
+            .start_key = try alloc.dupe(u8, range.start_key),
+            .end_key = if (range.end_key) |value| try alloc.dupe(u8, value) else null,
+        };
+        initialized += 1;
+        index += 1;
+    }
+    if (index != ranges.len) return error.CatalogChanged;
+    std.mem.sort(FencedBackupRange, ranges, {}, struct {
+        fn lessThan(_: void, lhs: FencedBackupRange, rhs: FencedBackupRange) bool {
+            const order = std.mem.order(u8, lhs.start_key, rhs.start_key);
+            return order == .lt or (order == .eq and lhs.group_id < rhs.group_id);
+        }
+    }.lessThan);
+    return ranges;
+}
+
+/// Resolves one storage group while checking the complete table
 /// incarnation carried by backup admission. Callers repeat this after taking
 /// their structural-operation guard so catalog replacement cannot redirect a
 /// snapshot by reusing the same table name.
@@ -28606,6 +28869,7 @@ fn resolveFencedBackupGroup(
     catalog: table_catalog.CatalogSource,
     table_name: []const u8,
     expected_fence: ?backups_api.TableBackupFence,
+    target_group_id: ?u64,
 ) !?u64 {
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
@@ -28617,6 +28881,13 @@ fn resolveFencedBackupGroup(
     }
 
     if (resolution.topology.range_count == 0) return null;
+    if (target_group_id) |expected_group_id| {
+        for (snapshot.ranges) |range| {
+            if (range.table_id == table.table_id and range.group_id == expected_group_id)
+                return expected_group_id;
+        }
+        return error.CatalogChanged;
+    }
     if (resolution.topology.range_count != 1) return error.UnsupportedMultiRangeTable;
     return resolution.single_group_id orelse error.CatalogChanged;
 }

@@ -3479,21 +3479,19 @@ pub const MetadataService = struct {
         return error.InvalidDerivedCatalogIndex;
     }
 
-    pub fn captureTableRestoreGeneration(
+    pub fn captureTableRestoreAdmission(
         self: *MetadataService,
         alloc: std.mem.Allocator,
         expected_table: metadata_table_manager.TableRecord,
-        expected_ranges: []const metadata_table_manager.RangeRecord,
-    ) !u64 {
+    ) !metadata_storage.raft_apply_store.TableRestoreAdmission {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         var attempt: u8 = 0;
         while (attempt < 2) : (attempt += 1) {
             if (attempt == 0) try store.ensureDerivedCatalogIndexes(self.metadata_group_id) else try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
-            return store.captureTableRestoreGeneration(
+            return store.captureTableRestoreAdmission(
                 alloc,
                 self.metadata_group_id,
                 expected_table,
-                expected_ranges,
             ) catch |err| switch (err) {
                 error.InvalidDerivedCatalogIndex => continue,
                 else => return err,
@@ -8009,21 +8007,19 @@ pub const MetadataHttpService = struct {
         return error.InvalidDerivedCatalogIndex;
     }
 
-    pub fn captureTableRestoreGeneration(
+    pub fn captureTableRestoreAdmission(
         self: *MetadataHttpService,
         alloc: std.mem.Allocator,
         expected_table: metadata_table_manager.TableRecord,
-        expected_ranges: []const metadata_table_manager.RangeRecord,
-    ) !u64 {
+    ) !metadata_storage.raft_apply_store.TableRestoreAdmission {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         var attempt: u8 = 0;
         while (attempt < 2) : (attempt += 1) {
             if (attempt == 0) try store.ensureDerivedCatalogIndexes(self.metadata_group_id) else try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
-            return store.captureTableRestoreGeneration(
+            return store.captureTableRestoreAdmission(
                 alloc,
                 self.metadata_group_id,
                 expected_table,
-                expected_ranges,
             ) catch |err| switch (err) {
                 error.InvalidDerivedCatalogIndex => continue,
                 else => return err,
@@ -9893,7 +9889,11 @@ fn syncLocalRestoreProgress(
     for (projected_progress) |record| {
         if (record.node_id != local_node_id) continue;
         const local = findRestoreProgress(local_progress, record.table_id, record.node_id, record.group_id);
-        if (local != null and restoreProgressEquivalent(local.?, record)) continue;
+        // A same-key local record may have just replaced stale projected
+        // content above. Presence, rather than equality with the pre-mutation
+        // snapshot, decides deletion; otherwise an update is immediately
+        // followed by a remove in the same synchronization pass.
+        if (local != null) continue;
         try service.removeRestoreProgress(record.table_id, record.node_id, record.group_id);
     }
 }
@@ -9910,6 +9910,47 @@ fn restoreProgressEquivalent(a: metadata_table_manager.RestoreProgressRecord, b:
         a.runtime_repair_complete == b.runtime_repair_complete and
         std.mem.eql(u8, a.phase, b.phase) and
         std.mem.eql(u8, a.last_error, b.last_error);
+}
+
+test "restore progress synchronization replaces stale content without deleting the replacement" {
+    const FakeService = struct {
+        upserts: usize = 0,
+        removals: usize = 0,
+
+        fn upsertRestoreProgress(self: *@This(), _: metadata_table_manager.RestoreProgressRecord) !void {
+            self.upserts += 1;
+        }
+
+        fn removeRestoreProgress(self: *@This(), _: u64, _: u64, _: u64) !void {
+            self.removals += 1;
+        }
+    };
+
+    const stale = metadata_table_manager.RestoreProgressRecord{
+        .table_id = 7,
+        .node_id = 4,
+        .group_id = 70,
+        .backup_id = "daily",
+        .phase = "runtime_repair",
+    };
+    const complete = metadata_table_manager.RestoreProgressRecord{
+        .table_id = 7,
+        .node_id = 4,
+        .group_id = 70,
+        .backup_id = "daily",
+        .primary_restored = true,
+        .runtime_repair_complete = true,
+        .phase = "complete",
+    };
+
+    var service = FakeService{};
+    try syncLocalRestoreProgress(&service, 4, &.{complete}, &.{stale});
+    try std.testing.expectEqual(@as(usize, 1), service.upserts);
+    try std.testing.expectEqual(@as(usize, 0), service.removals);
+
+    try syncLocalRestoreProgress(&service, 4, &.{}, &.{complete});
+    try std.testing.expectEqual(@as(usize, 1), service.upserts);
+    try std.testing.expectEqual(@as(usize, 1), service.removals);
 }
 
 fn cloneSplitRuntimeObservationsForMerge(

@@ -1284,6 +1284,25 @@ pub fn deriveInitialRangesForGeneration(
     return out;
 }
 
+/// Returns the physical Raft group for one initial table range incarnation.
+/// Restore preserves the backup's logical range/document identity, but must
+/// allocate physical groups exactly as a normal create would for the current
+/// catalog generation. Reusing an artifact's source group would also reuse
+/// the destination node's persisted Raft apply history after delete/recreate.
+pub fn deriveInitialRangeGroupIdForGeneration(
+    table_name: []const u8,
+    shard_index: u32,
+    shard_count: u32,
+    transition_generation: u64,
+) !u64 {
+    if (shard_count == 0 or shard_count > max_table_initial_ranges or shard_index >= shard_count)
+        return error.InvalidCreateTableRequest;
+    return if (shard_count == 1)
+        deriveDataGroupIdForGeneration(table_name, 0x47525031, transition_generation)
+    else
+        deriveShardGroupIdForGeneration(table_name, shard_index, transition_generation);
+}
+
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     return try schema_mod.parseSchemaUpdateRequest(alloc, body);
 }
@@ -4849,6 +4868,29 @@ test "table recreation derives incarnation-specific data groups" {
         try std.testing.expect(old_range.group_id != new_range.group_id);
         try std.testing.expectEqual(new_range.group_id, replay_range.group_id);
     }
+}
+
+test "restore group derivation matches create and validates its shard coordinate" {
+    const table = deriveTableRecord("docs", .{ .num_shards = 4 });
+    const ranges = try deriveInitialRangesForGeneration(std.testing.allocator, table, 9);
+    defer {
+        for (ranges) |record| metadata_table_manager.freeRange(std.testing.allocator, record);
+        std.testing.allocator.free(ranges);
+    }
+    for (ranges, 0..) |range, index| {
+        try std.testing.expectEqual(
+            range.group_id,
+            try deriveInitialRangeGroupIdForGeneration("docs", @intCast(index), 4, 9),
+        );
+    }
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        deriveInitialRangeGroupIdForGeneration("docs", 4, 4, 9),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        deriveInitialRangeGroupIdForGeneration("docs", 0, 0, 9),
+    );
 }
 
 test "create table parser rejects zero shards" {

@@ -101,6 +101,12 @@ pub fn tableDefinitionDigest(
 
 pub const ShardSnapshot = struct {
     group_id: u64,
+    /// Logical range identity is distinct from the physical Raft group after
+    /// split/merge operations. Zero is the legacy encoding for `group_id`.
+    range_id: u64 = 0,
+    doc_identity_shard_id: u64 = 0,
+    doc_identity_range_id: u64 = 0,
+    split_attempt_epoch: u64 = 0,
     start_key: []const u8,
     end_key: ?[]const u8 = null,
     snapshot_path: []const u8,
@@ -168,6 +174,10 @@ pub const TableBackupPlan = struct {
     format: BackupFormat = .native,
     io: ?std.Io = null,
     fence: ?TableBackupFence = null,
+    /// Internal storage-owner dispatch may pin capture to one exact Raft
+    /// group. Public/coordinator callers leave this null and resolve the full
+    /// fenced table topology before fan-out.
+    target_group_id: ?u64 = null,
     /// Borrowed cooperative cancellation for capture, hashing, and local
     /// materialization. Durable publication still reports ambiguity according
     /// to the backup protocol once its commit point has been crossed.

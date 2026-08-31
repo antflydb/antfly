@@ -483,6 +483,10 @@ pub const RestorePublicationHook = backup_contract.RestorePublicationHook;
 
 pub fn validateRestorableManifestLayout(manifest: *const TableBackupManifest) !void {
     if (manifest.shards.len == 0) return error.UnsupportedBackupFormat;
+}
+
+pub fn validateSingleRangeRestoreManifestLayout(manifest: *const TableBackupManifest) !void {
+    try validateRestorableManifestLayout(manifest);
     if (manifest.shards.len != 1) return error.UnsupportedMultiRangeTable;
 }
 
@@ -2368,6 +2372,10 @@ pub fn createManifest(
     for (shards, 0..) |shard, i| {
         owned_shards[i] = .{
             .group_id = shard.group_id,
+            .range_id = shard.range_id,
+            .doc_identity_shard_id = shard.doc_identity_shard_id,
+            .doc_identity_range_id = shard.doc_identity_range_id,
+            .split_attempt_epoch = shard.split_attempt_epoch,
             .start_key = try alloc.dupe(u8, shard.start_key),
             .end_key = if (shard.end_key) |value| try alloc.dupe(u8, value) else null,
             .snapshot_path = try alloc.dupe(u8, shard.snapshot_path),
@@ -6908,18 +6916,36 @@ fn cleanupTableBackupAttemptAtLocationWithRootBudget(
                     object_budget,
                 );
             }
-            const artifact_path = switch (format) {
-                .native => try alloc.dupe(u8, artifact_backup_id),
-                .portable => try std.fmt.allocPrint(alloc, "{s}.afb", .{artifact_backup_id}),
-            };
-            defer alloc.free(artifact_path);
-            try deletePathDurablyFromBackupRootWithBudget(
-                alloc,
-                io,
-                backup_dir,
-                artifact_path,
-                object_budget,
-            );
+            switch (format) {
+                .native => try deletePathDurablyFromBackupRootWithBudget(
+                    alloc,
+                    io,
+                    backup_dir,
+                    artifact_backup_id,
+                    object_budget,
+                ),
+                .portable => {
+                    // Legacy/standalone portable backups use one sibling file;
+                    // provisioned multi-range backups use a directory of
+                    // per-group files. Reclaim both shapes idempotently.
+                    const legacy_artifact_path = try std.fmt.allocPrint(alloc, "{s}.afb", .{artifact_backup_id});
+                    defer alloc.free(legacy_artifact_path);
+                    try deletePathDurablyFromBackupRootWithBudget(
+                        alloc,
+                        io,
+                        backup_dir,
+                        legacy_artifact_path,
+                        object_budget,
+                    );
+                    try deletePathDurablyFromBackupRootWithBudget(
+                        alloc,
+                        io,
+                        backup_dir,
+                        artifact_backup_id,
+                        object_budget,
+                    );
+                },
+            }
             if (delete_logical_reservation) {
                 const reservation_path = try reservationPath(alloc, "", backup_id, false);
                 defer alloc.free(reservation_path);
@@ -6960,6 +6986,7 @@ fn cleanupTableBackupAttemptAtLocationWithRootBudget(
                     const artifact_suffix = try std.fmt.allocPrint(alloc, "{s}.afb", .{artifact_backup_id});
                     defer alloc.free(artifact_suffix);
                     try store.deleteSuffixBudgeted(alloc, artifact_suffix, object_budget);
+                    try store.deletePrefix(alloc, artifact_backup_id, object_budget);
                 },
             }
             if (delete_logical_reservation) {
@@ -10958,7 +10985,11 @@ fn deriveRestoreRange(
     errdefer alloc.free(restore_native_manifest_sha256);
     return .{
         .group_id = shard.group_id,
+        .range_id = if (shard.range_id == 0) shard.group_id else shard.range_id,
         .table_id = table_id,
+        .doc_identity_shard_id = shard.doc_identity_shard_id,
+        .doc_identity_range_id = shard.doc_identity_range_id,
+        .split_attempt_epoch = shard.split_attempt_epoch,
         .start_key = start_key,
         .end_key = end_key,
         .restore_backup_id = owned_backup_id,
@@ -11744,6 +11775,10 @@ fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupManif
     for (manifest.shards, 0..) |shard, i| {
         shards[i] = .{
             .group_id = shard.group_id,
+            .range_id = shard.range_id,
+            .doc_identity_shard_id = shard.doc_identity_shard_id,
+            .doc_identity_range_id = shard.doc_identity_range_id,
+            .split_attempt_epoch = shard.split_attempt_epoch,
             .start_key = try alloc.dupe(u8, shard.start_key),
             .end_key = if (shard.end_key) |value| try alloc.dupe(u8, value) else null,
             .snapshot_path = try alloc.dupe(u8, shard.snapshot_path),

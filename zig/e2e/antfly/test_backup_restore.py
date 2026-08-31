@@ -290,7 +290,7 @@ def _is_metadata_not_leader_response(response: requests.Response) -> bool:
     return response.headers.get("X-Antfly-Metadata-Not-Leader", "").lower() == "true"
 
 
-class MultiMetadataBackupCluster:
+class ThreeByThreeBackupCluster:
     def __init__(self, binary: str):
         self.binary = binary
         self.host = "127.0.0.1"
@@ -312,9 +312,14 @@ class MultiMetadataBackupCluster:
                 antfly_public_api_url(url, root=ANTFLY_PUBLIC_API_ROOT)
                 for url in self.metadata_admin_urls
             ]
-            self.data_port, self.data_raft_port = self.port_reservations.reserve_many(2)
-            self.data_url = f"http://{self.host}:{self.data_port}"
-            self.data_api_url = antfly_public_api_url(self.data_url, binary=binary)
+            self.data_ports = list(self.port_reservations.reserve_many(3))
+            self.data_raft_ports = list(self.port_reservations.reserve_many(3))
+            self.data_urls = [
+                f"http://{self.host}:{port}" for port in self.data_ports
+            ]
+            self.data_api_urls = [
+                antfly_public_api_url(url, binary=binary) for url in self.data_urls
+            ]
 
             self.config_path = self.root / "antfly-metadata-cluster.json"
             self._write_config()
@@ -325,11 +330,15 @@ class MultiMetadataBackupCluster:
             self.metadata_log_files = [
                 setup.enter_context(path.open("w")) for path in self.metadata_log_paths
             ]
-            self.data_log_path = self.root / "data.log"
-            self.data_log_file = setup.enter_context(self.data_log_path.open("w"))
+            self.data_log_paths = [
+                self.root / f"data-{node_id}.log" for node_id in range(4, 7)
+            ]
+            self.data_log_files = [
+                setup.enter_context(path.open("w")) for path in self.data_log_paths
+            ]
 
             self.metadata_procs: list[subprocess.Popen[str]] = []
-            self.data_proc: subprocess.Popen[str] | None = None
+            self.data_procs: list[subprocess.Popen[str]] = []
             setup.pop_all()
 
         try:
@@ -363,8 +372,8 @@ class MultiMetadataBackupCluster:
                             "external_io": {"protocol": "filesystem", "root": "/"},
                         }
                     },
-                    "replication_factor": 1,
-                    "default_shards_per_table": 1,
+                    "replication_factor": 3,
+                    "default_shards_per_table": 3,
                 }
             ),
             encoding="utf-8",
@@ -402,7 +411,8 @@ class MultiMetadataBackupCluster:
             str(self.root / f"metadata-{node_id}-snapshots"),
         ]
 
-    def _data_command(self) -> list[str]:
+    def _data_command(self, index: int) -> list[str]:
+        node_id = index + 4
         command = [
             self.binary,
             "data",
@@ -411,15 +421,15 @@ class MultiMetadataBackupCluster:
             "--api-host",
             self.host,
             "--api-port",
-            str(self.data_port),
+            str(self.data_ports[index]),
             "--raft-host",
             self.host,
             "--raft-port",
-            str(self.data_raft_port),
+            str(self.data_raft_ports[index]),
             "--node-id",
-            "4",
+            str(node_id),
             "--store-id",
-            "4",
+            str(node_id),
             "--store-role",
             "data",
             "--health",
@@ -429,13 +439,13 @@ class MultiMetadataBackupCluster:
             "--control-tick-ms",
             "5",
             "--data-dir",
-            str(self.root / "data"),
+            str(self.root / f"data-{node_id}"),
             "--replica-root-dir",
-            str(self.root / "data-replicas"),
+            str(self.root / f"data-{node_id}-replicas"),
             "--replica-catalog-path",
-            str(self.root / "data-catalog.txt"),
+            str(self.root / f"data-{node_id}-catalog.txt"),
             "--snapshot-root-dir",
-            str(self.root / "data-snapshots"),
+            str(self.root / f"data-{node_id}-snapshots"),
         ]
         for url in self.metadata_admin_urls:
             command.extend(["--metadata-api", url])
@@ -466,30 +476,234 @@ class MultiMetadataBackupCluster:
                 f"metadata cluster did not elect a leader\n{self.debug_logs()}"
             )
 
-        data_command = self._data_command()
-        self.data_proc = self.port_reservations.handoff_to(
-            (self.data_port, self.data_raft_port),
-            lambda: subprocess.Popen(
-                data_command,
-                stdout=self.data_log_file,
-                stderr=subprocess.STDOUT,
-                cwd=REPO_ROOT,
-            ),
-        )
-        if not wait_for_server(self.data_api_url, timeout=30.0):
+        for i, data_api_url in enumerate(self.data_api_urls):
+            data_command = self._data_command(i)
+            proc = self.port_reservations.handoff_to(
+                (self.data_ports[i], self.data_raft_ports[i]),
+                lambda command=data_command, log_file=self.data_log_files[i]: subprocess.Popen(
+                    command,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    cwd=REPO_ROOT,
+                ),
+            )
+            self.data_procs.append(proc)
+            if not wait_for_server(data_api_url, timeout=30.0):
+                raise RuntimeError(
+                    f"data server failed to start at {data_api_url}\n{self.debug_logs()}"
+                )
+
+        if not wait_until(
+            self.all_data_nodes_registered,
+            timeout_s=60.0,
+            interval_s=0.5,
+        ):
             raise RuntimeError(
-                f"data server failed to start at {self.data_api_url}\n{self.debug_logs()}"
+                "data nodes did not register on every metadata node\n"
+                f"{self.debug_logs()}"
+            )
+
+    def metadata_snapshot(self, index: int) -> dict:
+        response = requests.get(
+            f"{self.metadata_admin_urls[index]}/metadata/v1/admin/snapshot",
+            timeout=10,
+        )
+        return _check_response(response)
+
+    def all_data_nodes_registered(self) -> bool:
+        self.assert_processes_alive()
+        expected_node_ids = set(range(4, 7))
+        try:
+            snapshots = [
+                self.metadata_snapshot(index)
+                for index in range(len(self.metadata_admin_urls))
+            ]
+        except (AssertionError, requests.RequestException, ValueError):
+            return False
+        for snapshot in snapshots:
+            registered = {
+                int(store.get("node_id", 0))
+                for store in snapshot.get("stores", [])
+                if isinstance(store, dict)
+            }
+            if not expected_node_ids.issubset(registered):
+                return False
+        return True
+
+    def table_is_fully_replicated(self, table_name: str) -> bool:
+        self.assert_processes_alive()
+        expected_node_ids = set(range(4, 7))
+        try:
+            snapshots = [
+                self.metadata_snapshot(index)
+                for index in range(len(self.metadata_admin_urls))
+            ]
+        except (AssertionError, requests.RequestException, ValueError):
+            return False
+
+        for snapshot in snapshots:
+            table_id = next(
+                (
+                    int(table.get("table_id", 0))
+                    for table in snapshot.get("tables", [])
+                    if isinstance(table, dict) and table.get("name") == table_name
+                ),
+                None,
+            )
+            if table_id is None:
+                return False
+            group_ids = {
+                int(record.get("group_id", 0))
+                for record in snapshot.get("ranges", [])
+                if isinstance(record, dict)
+                and int(record.get("table_id", 0)) == table_id
+            }
+            if len(group_ids) != 3:
+                return False
+
+            placed_nodes_by_group = {group_id: set() for group_id in group_ids}
+            for intent in snapshot.get("placement_intents", []):
+                if not isinstance(intent, dict) or not isinstance(
+                    intent.get("record"), dict
+                ):
+                    continue
+                record = intent["record"]
+                group_id = int(record.get("group_id", 0))
+                if group_id in placed_nodes_by_group:
+                    placed_nodes_by_group[group_id].add(
+                        int(record.get("local_node_id", 0))
+                    )
+            if any(
+                placed_nodes != expected_node_ids
+                for placed_nodes in placed_nodes_by_group.values()
+            ):
+                return False
+
+            statuses = {
+                int(status.get("group_id", 0)): status
+                for status in snapshot.get("merged_group_statuses", [])
+                if isinstance(status, dict)
+                and int(status.get("group_id", 0)) in group_ids
+            }
+            if set(statuses) != group_ids:
+                return False
+            if any(
+                status.get("leader_known") is not True
+                or status.get("voter_count_known") is not True
+                or int(status.get("voter_count", 0)) != 3
+                or int(status.get("healthy_voter_reports", 0)) < 3
+                for status in statuses.values()
+            ):
+                return False
+        return True
+
+    def table_topology(self, table_name: str) -> tuple[int, set[int]] | None:
+        try:
+            snapshot = self.metadata_snapshot(0)
+        except (AssertionError, requests.RequestException, ValueError):
+            return None
+        table_id = next(
+            (
+                int(table.get("table_id", 0))
+                for table in snapshot.get("tables", [])
+                if isinstance(table, dict) and table.get("name") == table_name
+            ),
+            None,
+        )
+        if table_id is None:
+            return None
+        group_ids = {
+            int(record.get("group_id", 0))
+            for record in snapshot.get("ranges", [])
+            if isinstance(record, dict)
+            and int(record.get("table_id", 0)) == table_id
+        }
+        return table_id, group_ids
+
+    def restore_progress_cleared(self, table_name: str) -> bool:
+        self.assert_processes_alive()
+        try:
+            snapshots = [
+                self.metadata_snapshot(index)
+                for index in range(len(self.metadata_admin_urls))
+            ]
+        except (AssertionError, requests.RequestException, ValueError):
+            return False
+        for snapshot in snapshots:
+            table_id = next(
+                (
+                    int(table.get("table_id", 0))
+                    for table in snapshot.get("tables", [])
+                    if isinstance(table, dict) and table.get("name") == table_name
+                ),
+                None,
+            )
+            if table_id is None:
+                return False
+            if any(
+                isinstance(record, dict)
+                and int(record.get("table_id", 0)) == table_id
+                for record in snapshot.get("restore_progresses", [])
+            ):
+                return False
+        return True
+
+    def table_absent_on_all_metadata_nodes(
+        self, table_name: str, table_id: int, group_ids: set[int]
+    ) -> bool:
+        self.assert_processes_alive()
+        try:
+            snapshots = [
+                self.metadata_snapshot(index)
+                for index in range(len(self.metadata_admin_urls))
+            ]
+        except (AssertionError, requests.RequestException, ValueError):
+            return False
+        return all(
+            not any(
+                isinstance(table, dict) and table.get("name") == table_name
+                for table in snapshot.get("tables", [])
+            )
+            and not any(
+                isinstance(record, dict)
+                and (
+                    int(record.get("table_id", 0)) == table_id
+                    or int(record.get("group_id", 0)) in group_ids
+                )
+                for record in snapshot.get("ranges", [])
+            )
+            for snapshot in snapshots
+        )
+
+    def assert_processes_alive(self) -> None:
+        exited = [
+            f"metadata-{index}: exit={proc.poll()}"
+            for index, proc in enumerate(self.metadata_procs, start=1)
+            if proc.poll() is not None
+        ]
+        exited.extend(
+            f"data-{index}: exit={proc.poll()}"
+            for index, proc in enumerate(self.data_procs, start=4)
+            if proc.poll() is not None
+        )
+        if exited:
+            raise AssertionError(
+                f"cluster process exited: {', '.join(exited)}\n{self.debug_logs()}"
             )
 
     def debug_logs(self) -> str:
         for handle in self.metadata_log_files:
             handle.flush()
-        self.data_log_file.flush()
+        for handle in self.data_log_files:
+            handle.flush()
         parts = [
             f"[metadata-{i + 1}]\n{_read_log_tail(path)}"
             for i, path in enumerate(self.metadata_log_paths)
         ]
-        parts.append(f"[data]\n{_read_log_tail(self.data_log_path)}")
+        parts.extend(
+            f"[data-{i + 4}]\n{_read_log_tail(path)}"
+            for i, path in enumerate(self.data_log_paths)
+        )
         return "\n".join(parts)
 
     def metadata_statuses(self, *, request_timeout_s: float = 1.0) -> list[dict | None]:
@@ -575,14 +789,15 @@ class MultiMetadataBackupCluster:
 
     def stop(self) -> None:
         self.port_reservations.close()
-        if self.data_proc is not None and self.data_proc.poll() is None:
-            self.data_proc.send_signal(signal.SIGTERM)
-            try:
-                self.data_proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.data_proc.kill()
-                self.data_proc.wait()
-        self.data_proc = None
+        for proc in reversed(self.data_procs):
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+        self.data_procs = []
 
         for proc in reversed(self.metadata_procs):
             if proc.poll() is None:
@@ -594,7 +809,7 @@ class MultiMetadataBackupCluster:
                     proc.wait()
         self.metadata_procs = []
 
-        for handle in [self.data_log_file, *self.metadata_log_files]:
+        for handle in [*self.data_log_files, *self.metadata_log_files]:
             if not handle.closed:
                 handle.close()
         if not maybe_preserve_tempdir(self.tempdir):
@@ -602,15 +817,15 @@ class MultiMetadataBackupCluster:
 
 
 @pytest.fixture
-def multi_metadata_backup_cluster() -> MultiMetadataBackupCluster:
+def three_by_three_backup_cluster() -> ThreeByThreeBackupCluster:
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     resolved = Path(binary)
     if resolved.name != "antfly":
-        pytest.skip("multi-metadata backup e2e requires the antfly binary")
+        pytest.skip("3x3 backup e2e requires the antfly binary")
     if not resolved.exists():
         pytest.skip(f"antfly binary not built: {resolved}")
 
-    cluster = MultiMetadataBackupCluster(str(resolved))
+    cluster = ThreeByThreeBackupCluster(str(resolved))
     try:
         yield cluster
     finally:
@@ -976,43 +1191,67 @@ def test_cluster_backup_restore_round_trip(backup_api):
             assert restored_doc["title"] == expected_title
 
 
-def test_cluster_backup_through_metadata_leader_public_api(
-    multi_metadata_backup_cluster: MultiMetadataBackupCluster,
+def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
+    three_by_three_backup_cluster: ThreeByThreeBackupCluster,
 ) -> None:
-    cluster = multi_metadata_backup_cluster
+    cluster = three_by_three_backup_cluster
     table_name = f"metadata_leader_backup_{time.time_ns()}"
     backup_id = f"metadata-leader-backup-{time.time_ns()}"
     session = requests.Session()
     session.headers["Content-Type"] = "application/json"
     session.headers["Connection"] = "close"
 
-    created = _check_response(
+    data_api_url = cluster.data_api_urls[0]
+    _check_response(
         session.post(
-            f"{cluster.data_api_url}/tables/{table_name}",
-            json={"num_shards": 1, "description": "metadata leader backup docs"},
+            f"{data_api_url}/tables/{table_name}",
+            json={"num_shards": 3, "description": "3x3 backup and restore docs"},
             timeout=30,
         )
     )
-    assert created["name"] == table_name
 
+    assert wait_until(
+        lambda: cluster.table_is_fully_replicated(table_name) or None,
+        timeout_s=90.0,
+        interval_s=0.5,
+    ), f"table did not reach 3x3 replication before backup\n{cluster.debug_logs()}"
+
+    source_docs = {
+        "0:backup": {
+            "title": "Three by Three Alpha",
+            "content": "low range backup and restore coverage",
+        },
+        "m:backup": {
+            "title": "Three by Three Middle",
+            "content": "middle range backup and restore coverage",
+        },
+        "z:backup": {
+            "title": "Three by Three Omega",
+            "content": "high range backup and restore coverage",
+        },
+    }
     batch = _check_response(
         session.post(
-            f"{cluster.data_api_url}/tables/{table_name}/batch",
-            json={
-                "inserts": {
-                    "doc:1": {
-                        "title": "Leader Backup",
-                        "content": "cluster backup requests are routed to metadata leaders",
-                    }
-                }
-            },
+            f"{data_api_url}/tables/{table_name}/batch",
+            json={"inserts": source_docs, "sync_level": "write"},
             timeout=30,
         )
     )
-    assert batch["inserted"] == 1
+    assert batch["inserted"] == len(source_docs)
     assert wait_until(
-        lambda: _lookup_doc_from_url(
-            session, cluster.data_api_url, table_name, "doc:1"
+        lambda: (
+            True
+            if all(
+                (
+                    doc := _lookup_doc_from_url(
+                        session, data_api_url, table_name, key
+                    )
+                )
+                is not None
+                and doc.get("title") == expected["title"]
+                for key, expected in source_docs.items()
+            )
+            else None
         ),
         timeout_s=30.0,
         interval_s=0.5,
@@ -1033,7 +1272,7 @@ def test_cluster_backup_through_metadata_leader_public_api(
                     "connection": BACKUP_CONNECTION,
                     "table_names": [table_name],
                 },
-                timeout=120,
+                timeout=30,
             )
             if _is_metadata_not_leader_response(response):
                 last_response = response
@@ -1050,6 +1289,147 @@ def test_cluster_backup_through_metadata_leader_public_api(
             f"backup={backup}\n{cluster.debug_logs()}"
         )
         assert [table["name"] for table in backup["tables"]] == [table_name]
+        table_manifests = [
+            path
+            for path in Path(backup_dir).glob("*-metadata.json")
+            if not path.name.endswith("-cluster-metadata.json")
+        ]
+        assert len(table_manifests) == 1
+        table_manifest = json.loads(table_manifests[0].read_text(encoding="utf-8"))
+        assert len(table_manifest["shards"]) == 3
+        assert len(
+            {int(shard["group_id"]) for shard in table_manifest["shards"]}
+        ) == 3
+        assert all(
+            (Path(backup_dir) / shard["snapshot_path"]).is_file()
+            for shard in table_manifest["shards"]
+        )
+
+        original_topology = cluster.table_topology(table_name)
+        assert original_topology is not None
+        original_table_id, original_group_ids = original_topology
+        assert len(original_group_ids) == 3
+
+        deleted = session.delete(f"{data_api_url}/tables/{table_name}", timeout=30)
+        deleted.raise_for_status()
+        assert deleted.status_code == 204
+        assert wait_until(
+            lambda: cluster.table_absent_on_all_metadata_nodes(
+                table_name, original_table_id, original_group_ids
+            )
+            or None,
+            timeout_s=30.0,
+            interval_s=0.5,
+        ), f"table remained in metadata after delete\n{cluster.debug_logs()}"
+
+        restore_response = None
+        restore_coordinator_url = None
+        last_response = None
+        restore_payload = {
+            "backup_id": backup_id,
+            "location": _file_location(backup_dir),
+            "connection": BACKUP_CONNECTION,
+            "restore_mode": "fail_if_exists",
+        }
+        for _ in range(3):
+            leader_public_url = cluster.metadata_leader_public_url(timeout_s=30.0)
+            response = session.post(
+                f"{leader_public_url}/restore",
+                json=restore_payload,
+                timeout=30,
+            )
+            if _is_metadata_not_leader_response(response):
+                last_response = response
+                continue
+            restore_response = response
+            restore_coordinator_url = leader_public_url
+            break
+        assert restore_response is not None, (
+            "metadata leader stayed unavailable for restore after retries; "
+            f"last_response={last_response.text if last_response is not None else None}\n"
+            f"{cluster.debug_logs()}"
+        )
+        assert restore_coordinator_url is not None
+        assert restore_response.status_code == 202, restore_response.text
+        accepted = _check_response(restore_response)
+        job_id = accepted.get("job_id")
+        assert isinstance(job_id, str) and job_id
+
+        def terminal_restore() -> dict | None:
+            cluster.assert_processes_alive()
+            candidate_urls = [
+                restore_coordinator_url,
+                *(
+                    url
+                    for url in cluster.metadata_public_urls
+                    if url != restore_coordinator_url
+                ),
+            ]
+            for api_url in candidate_urls:
+                try:
+                    response = session.get(
+                        f"{api_url}/restore/jobs/{job_id}", timeout=1
+                    )
+                except requests.RequestException:
+                    continue
+                if response.status_code == 503:
+                    continue
+                job = _check_response(response)
+                return (
+                    job
+                    if job.get("phase") in {"succeeded", "failed", "cancelled"}
+                    else None
+                )
+            return None
+
+        restore_job = wait_until(
+            terminal_restore, timeout_s=120.0, interval_s=0.1
+        )
+        assert restore_job is not None, (
+            f"restore job {job_id} did not finish\n{cluster.debug_logs()}"
+        )
+        assert restore_job["phase"] == "succeeded", (
+            f"restore={restore_job}\n{cluster.debug_logs()}"
+        )
+        restore = restore_job["result"]
+        assert restore["status"] == "completed"
+        assert restore["committed_table_count"] == 1
+        assert restore["failed_table_count"] == 0
+
+        assert wait_until(
+            lambda: cluster.table_is_fully_replicated(table_name) or None,
+            timeout_s=90.0,
+            interval_s=0.5,
+        ), f"restored table did not converge to 3x3 replication\n{cluster.debug_logs()}"
+        restored_topology = cluster.table_topology(table_name)
+        assert restored_topology is not None
+        restored_table_id, restored_group_ids = restored_topology
+        assert restored_table_id == original_table_id
+        assert len(restored_group_ids) == 3
+        assert restored_group_ids.isdisjoint(original_group_ids), (
+            "restore reused source physical Raft groups instead of allocating "
+            f"a fresh incarnation: source={original_group_ids}, restored={restored_group_ids}"
+        )
+
+        def restored_docs_visible_from_every_data_node() -> bool | None:
+            for api_url in cluster.data_api_urls:
+                for key, expected in source_docs.items():
+                    doc = _lookup_doc_from_url(session, api_url, table_name, key)
+                    if doc is None or doc.get("title") != expected["title"]:
+                        return None
+            return True
+
+        assert wait_until(
+            restored_docs_visible_from_every_data_node,
+            timeout_s=60.0,
+            interval_s=0.5,
+        ), f"restored documents were not readable through every data node\n{cluster.debug_logs()}"
+
+        assert wait_until(
+            lambda: cluster.restore_progress_cleared(table_name) or None,
+            timeout_s=30.0,
+            interval_s=0.25,
+        ), f"completed restore progress was not retired\n{cluster.debug_logs()}"
 
 
 @pytest.mark.objectstore_integration

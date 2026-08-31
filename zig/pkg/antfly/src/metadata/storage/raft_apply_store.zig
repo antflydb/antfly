@@ -102,6 +102,16 @@ pub const TableTransitionFence = struct {
     }
 };
 
+pub const TableRestoreAdmission = struct {
+    /// Fence value the create command must compare at apply time.
+    expected_transition_generation: u64,
+    /// Stable generation used to derive this incarnation's physical groups.
+    /// After a successful create the fence advances, so exact retries use the
+    /// predecessor generation rather than accidentally deriving new groups.
+    incarnation_generation: u64,
+    already_applied: bool,
+};
+
 pub const TableDropProjection = struct {
     table: metadata.TableRecord,
     fence: TableTransitionFence,
@@ -882,22 +892,14 @@ test "table topology create rejects ranges orphaned by an interrupted legacy dro
     });
 
     const legacy_fence = try store.getTableTransitionFence(metadata_group_id, table.table_id);
-    const missing_range = metadata.RangeRecord{
-        .group_id = 302,
-        .range_id = 302,
-        .table_id = table.table_id,
-        .start_key = "doc:m",
-    };
     try store.ensureDerivedCatalogIndexes(metadata_group_id);
-    try std.testing.expectEqual(
-        legacy_fence.generation,
-        try store.captureTableRestoreGeneration(
-            std.testing.allocator,
-            metadata_group_id,
-            table,
-            &.{ range, missing_range },
-        ),
+    const legacy_admission = try store.captureTableRestoreAdmission(
+        std.testing.allocator,
+        metadata_group_id,
+        table,
     );
+    try std.testing.expectEqual(legacy_fence.generation, legacy_admission.expected_transition_generation);
+    try std.testing.expect(legacy_admission.already_applied);
     const legacy_remove = try encodeTransitionCommand(std.testing.allocator, .{ .remove_table = .{
         .table_id = table.table_id,
         .expected_transition_generation = legacy_fence.generation,
@@ -998,15 +1000,14 @@ test "table topology mutation atomically creates and drops catalog ranges" {
     const create_fence = try store.getTableTransitionFence(metadata_group_id, table.table_id);
     try std.testing.expectEqual(@as(u64, 1), create_fence.generation);
     try store.ensureDerivedCatalogIndexes(metadata_group_id);
-    try std.testing.expectEqual(
-        create_fence.generation,
-        try store.captureTableRestoreGeneration(
-            std.testing.allocator,
-            metadata_group_id,
-            table,
-            &ranges,
-        ),
+    const restore_admission = try store.captureTableRestoreAdmission(
+        std.testing.allocator,
+        metadata_group_id,
+        table,
     );
+    try std.testing.expectEqual(create_fence.generation, restore_admission.expected_transition_generation);
+    try std.testing.expectEqual(@as(u64, 0), restore_admission.incarnation_generation);
+    try std.testing.expect(restore_admission.already_applied);
     try store.verifyTableCreateProjectionExact(
         std.testing.allocator,
         metadata_group_id,
@@ -2510,18 +2511,18 @@ pub const RaftApplyStore = struct {
         return fence.generation;
     }
 
-    /// Captures a restore admission from one catalog revision. Unlike an
-    /// ordinary create, restore retries may encounter an exact table or a
-    /// prefix published by the former multi-entry workflow. Only an exact
-    /// prefix is admissible; unrelated rows or reused data-group IDs fail
-    /// before Raft admission.
-    pub fn captureTableRestoreGeneration(
+    /// Captures the generation used to derive destination physical groups.
+    /// Artifact group IDs identify sources only; publishing them as the new
+    /// Raft groups would collide with apply history retained after a drop.
+    /// Existing table rows are admitted only as possible exact retries; the
+    /// caller derives the prior incarnation's groups and verifies the complete
+    /// projection before returning success.
+    pub fn captureTableRestoreAdmission(
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,
         group_id: u64,
         expected_table: metadata.TableRecord,
-        expected_ranges: []const metadata.RangeRecord,
-    ) !u64 {
+    ) !TableRestoreAdmission {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
 
@@ -2534,7 +2535,10 @@ pub const RaftApplyStore = struct {
             return error.InvalidDerivedCatalogIndex;
 
         const fence = try self.loadTableTransitionFenceTxn(&txn, group_id, expected_table.table_id);
-        if (fence.active()) return error.TableTransitionActive;
+        if (fence.active()) {
+            std.log.warn("restore admission waiting for active topology transition table={s} table_id={d} active_count={d}", .{ expected_table.name, expected_table.table_id, fence.active_count });
+            return error.TableTransitionActive;
+        }
         const indexed_range_group_ids = try self.indexedTableRangeIdsTxn(
             alloc,
             &txn,
@@ -2550,15 +2554,6 @@ pub const RaftApplyStore = struct {
             fence.membership(expected_table.table_id),
         )) return error.InvalidDerivedCatalogIndex;
 
-        var expected_by_group = std.AutoHashMapUnmanaged(u64, metadata.RangeRecord).empty;
-        defer expected_by_group.deinit(alloc);
-        try expected_by_group.ensureTotalCapacity(alloc, @intCast(expected_ranges.len));
-        for (expected_ranges) |record| {
-            if (record.table_id != expected_table.table_id or expected_by_group.contains(record.group_id))
-                return error.InvalidTableTopologyMutation;
-            expected_by_group.putAssumeCapacity(record.group_id, record);
-        }
-
         var table_key_buf: [160]u8 = undefined;
         const table_key = try tableKeyForGroup(&table_key_buf, group_id, expected_table.table_id);
         const encoded_table = txn.get(table_key) catch |err| switch (err) {
@@ -2568,45 +2563,25 @@ pub const RaftApplyStore = struct {
         if (encoded_table) |encoded| {
             const existing = try decodeTableRecord(alloc, encoded);
             defer metadata_table_manager.freeTable(alloc, existing);
-            if (!metadata_table_manager.tableDefinitionsEqual(existing, expected_table))
+            if (!metadata_table_manager.tableDefinitionsEqual(existing, expected_table)) {
+                std.log.warn("restore admission rejected conflicting table definition table={s} table_id={d}", .{ expected_table.name, expected_table.table_id });
                 return error.TableAlreadyExists;
+            }
+            if (fence.generation == 0) return error.InvalidTableTransitionFence;
+            return .{
+                .expected_transition_generation = fence.generation,
+                .incarnation_generation = fence.generation - 1,
+                .already_applied = true,
+            };
         } else if (indexed_range_group_ids.len != 0 or fence.range_membership.count != 0) {
+            std.log.warn("restore admission waiting for dropped topology cleanup table={s} table_id={d} indexed_ranges={d} fenced_ranges={d}", .{ expected_table.name, expected_table.table_id, indexed_range_group_ids.len, fence.range_membership.count });
             return error.TableTransitionActive;
         }
-
-        // Existing table-scoped rows must be an exact subset of the manifest.
-        for (indexed_range_group_ids) |range_group_id| {
-            const expected = expected_by_group.get(range_group_id) orelse
-                return error.TableAlreadyExists;
-            var range_key_buf: [160]u8 = undefined;
-            const encoded = txn.get(try rangeKeyForGroup(&range_key_buf, group_id, range_group_id)) catch |err| switch (err) {
-                error.NotFound => return error.InvalidDerivedCatalogIndex,
-                else => return err,
-            };
-            const existing = try decodeRangeRecord(alloc, encoded);
-            defer metadata_table_manager.freeRange(alloc, existing);
-            if (!metadata_table_manager.rangeRecordsEqual(existing, expected))
-                return error.TableAlreadyExists;
-            _ = expected_by_group.remove(range_group_id);
-        }
-
-        // Only manifest rows absent from the table-keyed index need another
-        // primary lookup. This keeps exact restore retries to one range read
-        // per shard while still rejecting IDs owned by another table.
-        for (expected_ranges) |expected| {
-            if (!expected_by_group.contains(expected.group_id)) continue;
-            var range_key_buf: [160]u8 = undefined;
-            const encoded = txn.get(try rangeKeyForGroup(&range_key_buf, group_id, expected.group_id)) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return err,
-            };
-            if (encoded_table == null) return error.TableAlreadyExists;
-            const existing = try decodeRangeRecord(alloc, encoded);
-            defer metadata_table_manager.freeRange(alloc, existing);
-            if (!metadata_table_manager.rangeRecordsEqual(existing, expected))
-                return error.TableAlreadyExists;
-        }
-        return fence.generation;
+        return .{
+            .expected_transition_generation = fence.generation,
+            .incarnation_generation = fence.generation,
+            .already_applied = false,
+        };
     }
 
     /// Verifies the complete table-scoped projection from one revision. A
@@ -2678,7 +2653,7 @@ pub const RaftApplyStore = struct {
             };
             const projected = try decodeRangeRecord(alloc, encoded);
             defer metadata_table_manager.freeRange(alloc, projected);
-            if (!metadata_table_manager.rangeRecordsEqual(projected, expected))
+            if (!metadata_table_manager.rangeMatchesRestorePublication(projected, expected))
                 return error.TableAlreadyExists;
         }
     }
@@ -11951,6 +11926,110 @@ test "metadata raft apply store projects table and range records from committed 
     try std.testing.expectEqualStrings(
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ranges[0].restore_artifact_sha256,
+    );
+}
+
+test "restore admission and verification accept ranges that completed immediately after publication" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/metadata-restore-publication-race",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root);
+
+    const metadata_group_id: u64 = 41;
+    const table = metadata.TableRecord{ .table_id = 42, .name = "docs", .min_ranges = 2 };
+    const ranges = [_]metadata.RangeRecord{
+        .{
+            .group_id = 4201,
+            .range_id = 4201,
+            .table_id = table.table_id,
+            .start_key = "",
+            .end_key = "m",
+            .restore_backup_id = "nightly",
+            .restore_artifact_backup_id = "nightly-artifacts",
+            .restore_location = "file:///backups/nightly",
+            .restore_snapshot_path = "nightly/groups/4201.afb",
+            .restore_connection = "local-filesystem",
+            .restore_artifact_size_bytes = 101,
+            .restore_artifact_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        },
+        .{
+            .group_id = 4202,
+            .range_id = 4202,
+            .table_id = table.table_id,
+            .start_key = "m",
+            .end_key = null,
+            .restore_backup_id = "nightly",
+            .restore_artifact_backup_id = "nightly-artifacts",
+            .restore_location = "file:///backups/nightly",
+            .restore_snapshot_path = "nightly/groups/4202.afb",
+            .restore_connection = "local-filesystem",
+            .restore_artifact_size_bytes = 202,
+            .restore_artifact_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        },
+    };
+
+    const create_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_table_topology = .{ .create = .{
+            .expected_transition_generation = 0,
+            .table = table,
+            .ranges = &ranges,
+        } },
+    });
+    defer std.testing.allocator.free(create_cmd);
+    const complete_first_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .complete_restore_range = metadata_table_manager.restoreIntentIdentity(ranges[0]),
+    });
+    defer std.testing.allocator.free(complete_first_cmd);
+    const complete_second_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .complete_restore_range = metadata_table_manager.restoreIntentIdentity(ranges[1]),
+    });
+    defer std.testing.allocator.free(complete_second_cmd);
+    const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = create_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = complete_first_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = complete_second_cmd },
+    });
+    defer std.testing.allocator.free(entries);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 3,
+        .entries_bytes = entries,
+    });
+    try store.ensureDerivedCatalogIndexes(metadata_group_id);
+
+    const fence = try store.getTableTransitionFence(metadata_group_id, table.table_id);
+    const restore_admission = try store.captureTableRestoreAdmission(
+        std.testing.allocator,
+        metadata_group_id,
+        table,
+    );
+    try std.testing.expectEqual(fence.generation, restore_admission.expected_transition_generation);
+    try std.testing.expect(restore_admission.already_applied);
+    try store.verifyTableCreateProjectionExact(
+        std.testing.allocator,
+        metadata_group_id,
+        table,
+        &ranges,
+    );
+
+    var conflicting_ranges = ranges;
+    conflicting_ranges[1].restore_location = "file:///backups/other";
+    try std.testing.expectError(
+        error.TableAlreadyExists,
+        store.verifyTableCreateProjectionExact(
+            std.testing.allocator,
+            metadata_group_id,
+            table,
+            &conflicting_ranges,
+        ),
     );
 }
 

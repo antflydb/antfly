@@ -575,6 +575,7 @@ pub const AntflyApiHandler = struct {
         try server.post(group_prefix ++ routes.shard_ops_observe_merge_suffix, httpx.Handler.bind(self, internalObserveMerge));
         try server.post(group_prefix ++ routes.shard_ops_execute_suffix, httpx.Handler.bind(self, internalExecuteTransition));
         try server.post(table_prefix ++ routes.batch_suffix, httpx.Handler.bind(self, internalGroupBatch));
+        try server.post(table_prefix ++ routes.backup_shard_suffix, httpx.Handler.bind(self, internalGroupBackupShard));
         try server.post(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
         try server.post(table_prefix ++ routes.query_suffix, httpx.Handler.bind(self, internalGroupQuery));
         try server.post(table_prefix ++ routes.query_preflight_suffix, httpx.Handler.bind(self, internalGroupQueryPreflight));
@@ -1407,6 +1408,60 @@ pub const AntflyApiHandler = struct {
         ) catch |err| return internalGroupErrorResponse(ctx, err);
         defer if (median_key) |value| ctx.allocator.free(value);
         return ctx.json(.{ .median_key = median_key });
+    }
+
+    fn internalGroupBackupShard(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse
+            return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse
+            return textResponse(ctx, 400, "invalid backup shard request");
+        const expected_fence = backups_api.parseTableBackupFenceHeaderValuesWithDeadline(
+            ctx.header(backups_api.backup_fence_metadata_group_id_header),
+            ctx.header(backups_api.backup_fence_metadata_incarnation_header),
+            ctx.header(backups_api.backup_fence_table_id_header),
+            ctx.header(backups_api.backup_fence_definition_header),
+            ctx.header(backups_api.backup_fence_topology_count_header),
+            ctx.header(backups_api.backup_fence_topology_header),
+            ctx.header(backups_api.backup_writer_not_after_header),
+        ) catch return textResponse(ctx, 400, "invalid backup fence");
+        const fence = expected_fence orelse return textResponse(ctx, 400, "backup fence required");
+        var parsed = backups_api.parseBackupRequest(ctx.allocator, body) catch
+            return textResponse(ctx, 400, "invalid backup shard request");
+        defer parsed.deinit();
+        backups_api.validateBackupId(parsed.value.backup_id) catch
+            return textResponse(ctx, 400, "invalid backup id");
+        const format = backups_api.parseBackupFormat(parsed.value.format) catch
+            return textResponse(ctx, 400, "unsupported backup format");
+        var location = backups_api.openBackupLocationWithOptions(ctx.allocator, parsed.value.location, .{
+            .secret_store = self.api_server.cfg.secret_store,
+            .node_config = self.api_server.cfg.node_config,
+            .connection = parsed.value.connection,
+            .required_capability = "backup.write",
+            .io = self.api_server.sharedApiIo(),
+        }) catch return textResponse(ctx, 400, "invalid backup location");
+        defer location.deinit(ctx.allocator);
+
+        const shards = self.api_server.executeInternalTableBackupShard(
+            params.group_id,
+            params.table_name,
+            parsed.value.backup_id,
+            format,
+            fence,
+            &location,
+        ) catch |err| return switch (err) {
+            error.TableNotFound, error.NotFound => textResponse(ctx, 404, "not found"),
+            error.CatalogChanged => textResponse(ctx, 409, "table catalog changed"),
+            error.BackupAttemptLeaseLost, error.InvalidBackupFence => textResponse(ctx, 409, "backup writer lease lost"),
+            error.UnsupportedBackupFormat => textResponse(ctx, 400, "unsupported backup format"),
+            error.BackupOutcomeAmbiguous => textResponse(ctx, 500, "backup outcome ambiguous"),
+            else => textResponse(ctx, 500, "internal server error"),
+        };
+        defer {
+            for (shards) |shard| shard.deinit(self.api_server.alloc);
+            self.api_server.alloc.free(shards);
+        }
+        return ctx.json(.{ .shards = shards });
     }
 
     fn internalGroupLookup(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

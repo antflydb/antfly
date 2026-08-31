@@ -204,11 +204,28 @@ pub const ReplicatedPersistence = extern struct {
         delete_many: *const fn (ptr: *anyopaque, keys: []const []const u8, leadership_term: u64) anyerror!void,
     };
 
+    pub const LocalAdapterOptions = struct {
+        /// Production adapters retain the private callback error in server
+        /// logs while returning only the stable public fallback. Hermetic
+        /// fault-injection adapters may disable that side effect so the strict
+        /// test runner does not mistake an asserted failure for an unhandled
+        /// production error.
+        log_private_failures: bool = true,
+    };
+
     pub fn fromLocal(ptr: *anyopaque, comptime local: LocalVTable) ReplicatedPersistence {
-        return .{ .ptr = ptr, .vtable = &LocalAdapter(local).vtable };
+        return fromLocalWithOptions(ptr, local, .{});
     }
 
-    fn LocalAdapter(comptime local: LocalVTable) type {
+    pub fn fromLocalWithOptions(
+        ptr: *anyopaque,
+        comptime local: LocalVTable,
+        comptime options: LocalAdapterOptions,
+    ) ReplicatedPersistence {
+        return .{ .ptr = ptr, .vtable = &LocalAdapter(local, options).vtable };
+    }
+
+    fn LocalAdapter(comptime local: LocalVTable, comptime options: LocalAdapterOptions) type {
         return struct {
             const Self = @This();
 
@@ -221,7 +238,7 @@ pub const ReplicatedPersistence = extern struct {
             };
 
             fn fail(comptime operation: []const u8, err: anyerror) runtime_error_abi.Status {
-                if (!runtime_error_abi.errorHasStableDetail(err)) {
+                if (options.log_private_failures and !runtime_error_abi.errorHasStableDetail(err)) {
                     std.log.err("replicated restore persistence callback failed operation={s} err={s}", .{ operation, @errorName(err) });
                 }
                 return runtime_error_abi.statusFromErrorWithFallback(
@@ -2230,13 +2247,13 @@ const TestReplicatedPersistence = struct {
     }
 
     fn persistence(self: *TestReplicatedPersistence) ReplicatedPersistence {
-        return ReplicatedPersistence.fromLocal(self, .{
+        return ReplicatedPersistence.fromLocalWithOptions(self, .{
             .load = load,
             .get = get,
             .put = put,
             .delete = delete,
             .delete_many = deleteMany,
-        });
+        }, .{ .log_private_failures = false });
     }
 
     fn load(ptr: *anyopaque, alloc: std.mem.Allocator) ![]ReplicatedPersistence.OwnedRow {

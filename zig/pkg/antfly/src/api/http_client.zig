@@ -560,6 +560,76 @@ pub const ApiHttpClient = struct {
         return self.fetchBackupTableWithHeaders(base_uri, table_name, body, &headers, &delivery_tracker);
     }
 
+    pub fn fetchBackupShardFenced(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        fence: backup_contract.TableBackupFence,
+    ) !TablesResponse {
+        var metadata_group_id_buffer: [20]u8 = undefined;
+        const metadata_group_id = try std.fmt.bufPrint(&metadata_group_id_buffer, "{d}", .{fence.metadata_group_id});
+        var table_id_buffer: [20]u8 = undefined;
+        const table_id = try std.fmt.bufPrint(&table_id_buffer, "{d}", .{fence.table_id});
+        var topology_count_buffer: [20]u8 = undefined;
+        const topology_count = try std.fmt.bufPrint(&topology_count_buffer, "{d}", .{fence.topology_range_count});
+        const definition_digest = std.fmt.bytesToHex(fence.definition_digest, .lower);
+        const topology_digest = std.fmt.bytesToHex(fence.topology_digest, .lower);
+        var writer_not_after_buffer: [20]u8 = undefined;
+        const writer_not_after = try std.fmt.bufPrint(
+            &writer_not_after_buffer,
+            "{d}",
+            .{fence.writer_not_after_unix_ns orelse return error.InvalidBackupFence},
+        );
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = backup_contract.backup_fence_metadata_group_id_header, .value = metadata_group_id },
+            .{ .name = backup_contract.backup_fence_metadata_incarnation_header, .value = &fence.metadata_incarnation },
+            .{ .name = backup_contract.backup_fence_table_id_header, .value = table_id },
+            .{ .name = backup_contract.backup_fence_definition_header, .value = &definition_digest },
+            .{ .name = backup_contract.backup_fence_topology_count_header, .value = topology_count },
+            .{ .name = backup_contract.backup_fence_topology_header, .value = &topology_digest },
+            .{ .name = backup_contract.backup_writer_not_after_header, .value = writer_not_after },
+        };
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.backup_shard_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{
+            routes.Routes.internal_groups_prefix,
+            group_id,
+            suffix,
+        });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+
+        var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+        var resp = self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .headers = &headers,
+            .content_type = "application/json",
+            .body = body,
+            .delivery_tracker = &delivery_tracker,
+        }) catch |err| {
+            const delivery = delivery_tracker.load();
+            if (delivery != .not_sent and !(delivery == .unknown and err == error.ConnectionRefused))
+                return error.BackupOutcomeAmbiguous;
+            return err;
+        };
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            200 => .{ .body = try self.alloc.dupe(u8, resp.body) },
+            404 => error.NotFound,
+            409 => error.CatalogChanged,
+            408, 504 => error.BackupOutcomeAmbiguous,
+            else => error.UnexpectedHttpStatus,
+        };
+    }
+
     fn fetchBackupTableWithHeaders(
         self: *ApiHttpClient,
         base_uri: []const u8,
