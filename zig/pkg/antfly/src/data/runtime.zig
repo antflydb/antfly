@@ -5027,9 +5027,6 @@ pub const DataServer = struct {
     owned_incoming_graph_route_store: ?antfly.storage_backend_erased.Store = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     ha_cfg: DataServerHAConfig = .{},
-    /// Immutable startup role used by lock-free ingress policy snapshots.
-    /// Mutable HA context fields remain protected by `ha_state_mutex`.
-    ha_ingress_started_as_standby: bool = false,
     ha_state_mutex: std.atomic.Mutex = .unlocked,
     /// Global primary mutation/capture ordering point. All DB/catalog writers
     /// share this instance through their HA mirror configuration.
@@ -5295,7 +5292,6 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
-            .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
@@ -5337,7 +5333,6 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
-            .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
@@ -5379,7 +5374,6 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
-            .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
@@ -5444,7 +5438,6 @@ pub const DataServer = struct {
         api_server_cfg.backend_runtime = self.backend_runtime;
         api_server_cfg.resource_manager = &self.provisioned_storage.resource_manager;
         self.configureHAPublicGateState();
-        api_server_cfg.ha_mutation_policy_source = self.haMutationPolicySource();
         self.attachHaExecutors(&api_server_cfg);
         if (self.query_io_impl == null) {
             self.query_io_impl = std.Io.Threaded.init(self.alloc, .{
@@ -5975,32 +5968,6 @@ pub const DataServer = struct {
             .state = &self.ha_public_gate_state,
         } };
         return null;
-    }
-
-    fn haMutationPolicySource(self: *const DataServer) antfly.public_api.http_server.HAMutationPolicySource {
-        return .{
-            .ptr = self,
-            .snapshot_fn = haMutationPolicySnapshotCallback,
-        };
-    }
-
-    fn haMutationPolicySnapshotCallback(ptr: *const anyopaque) antfly.public_api.http_server.HAMutationPolicySnapshot {
-        const self: *const DataServer = @ptrCast(@alignCast(ptr));
-        const configured = antfly.public_api.http_server.HAMutationPolicySnapshot{
-            .failover_safe_mutations_only = self.api_server_cfg.ha_failover_safe_mutations_only,
-            .remote_apply_mutations_enabled = self.api_server_cfg.ha_remote_apply_mutations_enabled,
-        };
-        if (!configured.failover_safe_mutations_only) return configured;
-
-        // A node started as a standby must remain fail-closed until promotion
-        // has atomically opened its promoted Primary and published that role.
-        // Once promoted it is the sole authority for the new timeline; its
-        // next continuous-HA topology is established by a fresh seed and
-        // runtime configuration rather than the obsolete standby role.
-        if (self.ha_ingress_started_as_standby and self.ha_public_gate_state.currentRole() == .primary) {
-            return .{};
-        }
-        return configured;
     }
 
     fn haPrimaryMirror(self: *DataServer) ?antfly.db.HAAsyncEffectMirror {
@@ -15253,7 +15220,6 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
             .ha_cfg = cfg.ha,
-            .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
@@ -30086,6 +30052,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
         .api_server_cfg = .{
             .admin_bearer_token = "runtime-secret-token",
             .ha_failover_safe_mutations_only = true,
+            .ha_remote_apply_mutations_enabled = true,
         },
         .ha = .{
             .admin_context = .{
@@ -30107,6 +30074,7 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     const public_read_gate_before = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
     const public_write_gate_before = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
     try std.testing.expect(server.http_server.?.haMutationPolicy().failover_safe_mutations_only);
+    try std.testing.expect(server.http_server.?.haMutationPolicy().remote_apply_mutations_enabled);
     try std.testing.expectError(error.HAReadRequiresPrimary, public_read_gate_before.check(.stale));
     try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, public_write_gate_before.check());
 
@@ -30128,13 +30096,27 @@ test "data server HA state change synchronously adopts promotion and rewires liv
     try std.testing.expect(server.ha_admin_server.?.auth.state_mutex == &server.ha_state_mutex);
     try std.testing.expect(server.ha_admin_server.?.auth.primary_fence_barrier == &server.ha_mutation_barrier);
     try std.testing.expect(server.ha_internal_server.?.state_mutex == &server.ha_state_mutex);
-    try std.testing.expect(!server.http_server.?.haMutationPolicy().failover_safe_mutations_only);
+    // Promotion changes authority, not durability coverage. This process is
+    // still participating in continuous HA, so local-only mutations must
+    // remain rejected while RemoteApply-backed document writes stay enabled.
+    try std.testing.expect(server.http_server.?.haMutationPolicy().failover_safe_mutations_only);
+    try std.testing.expect(server.http_server.?.haMutationPolicy().remote_apply_mutations_enabled);
     const public_read_gate_after = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
     const public_write_gate_after = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
     try std.testing.expect(std.meta.eql(public_read_gate_before, public_read_gate_after));
     try std.testing.expect(std.meta.eql(public_write_gate_before, public_write_gate_after));
     try public_read_gate_before.check(.stale);
     try public_write_gate_before.check();
+
+    var backup = try executeApiHttpxTestRequest(&server.http_server.?, .{
+        .method = .POST,
+        .uri = "/backup",
+        .body = "{}",
+    });
+    defer backup.deinit(server.http_server.?.alloc);
+    try std.testing.expectEqual(@as(u16, 503), backup.status);
+    try std.testing.expect(std.mem.indexOf(u8, backup.body, "\"code\":\"ha_mutation_not_replicated\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, backup.body, "\"surface\":\"backup\"") != null);
 
     var write_check = try executeApiHttpxTestRequest(&server.http_server.?, .{
         .method = .POST,
