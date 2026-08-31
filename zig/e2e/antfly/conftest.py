@@ -342,12 +342,21 @@ def _canonical_index_readiness(status: dict[str, Any]) -> dict[str, Any] | None:
         raise IndexReadinessProtocolError(
             "status.readiness.pending_reasons must be an array of strings"
         )
-    for field in ("published_revision", "target_revision"):
-        value = readiness.get(field)
+    published_revision = readiness.get("published_revision")
+    target_revision = readiness.get("target_revision")
+    for field, value in (
+        ("published_revision", published_revision),
+        ("target_revision", target_revision),
+    ):
         if value is not None and type(value) is not int:
             raise IndexReadinessProtocolError(
                 f"status.readiness.{field} must be an integer when present"
             )
+    if (published_revision is None) != (target_revision is None):
+        raise IndexReadinessProtocolError(
+            "status.readiness.published_revision and target_revision "
+            "must be provided together"
+        )
     return readiness
 
 
@@ -372,11 +381,11 @@ def ready_index_status(
             return None
         published_revision = readiness.get("published_revision")
         target_revision = readiness.get("target_revision")
-        if (
-            type(published_revision) is not int
-            or type(target_revision) is not int
-            or published_revision < target_revision
-        ):
+        # Revision receipts are optional for immutable serverless artifacts
+        # that do not expose a replay domain. When a receipt is present, the
+        # parser above guarantees a complete integer pair and readiness must
+        # still fail closed until the published revision reaches its target.
+        if published_revision is not None and published_revision < target_revision:
             return None
     elif "backfill_state" in status and status.get("backfill_state") != "ready":
         # Compatibility for older servers that predate canonical readiness.

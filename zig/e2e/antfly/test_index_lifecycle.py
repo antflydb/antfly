@@ -231,6 +231,14 @@ def test_ready_index_status_requires_current_coverage_observation():
     }
     assert ready_index_status(canonical_ready) is canonical_ready["status"]
 
+    canonical_without_receipt = json.loads(json.dumps(canonical_ready))
+    canonical_without_receipt["status"]["readiness"].pop("published_revision")
+    canonical_without_receipt["status"]["readiness"].pop("target_revision")
+    assert (
+        ready_index_status(canonical_without_receipt)
+        is canonical_without_receipt["status"]
+    )
+
     for state, queryable in (
         ("pending", False),
         ("queryable_partial", True),
@@ -264,6 +272,12 @@ def test_ready_index_status_requires_current_coverage_observation():
         invalid = json.loads(json.dumps(canonical_ready))
         invalid["status"]["readiness"][field] = value
         with pytest.raises(IndexReadinessProtocolError, match=field):
+            ready_index_status(invalid)
+
+    for missing_field in ("published_revision", "target_revision"):
+        invalid = json.loads(json.dumps(canonical_ready))
+        invalid["status"]["readiness"].pop(missing_field)
+        with pytest.raises(IndexReadinessProtocolError, match="provided together"):
             ready_index_status(invalid)
 
     stale_incarnation = json.loads(json.dumps(ready_status))
@@ -2551,12 +2565,9 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
         reason=f"serverless republish did not reach head version {target_head_version}",
     )
 
-    semantic_b = serverless_api.get_index(table_name, "semantic_b")
-    sparse_a = serverless_api.get_index(table_name, "sparse_a")
-    sparse_b = serverless_api.get_index(table_name, "sparse_b")
-    assert ready_index_status(semantic_b) is not None
-    assert ready_index_status(sparse_a) is not None
-    assert ready_index_status(sparse_b) is not None
+    serverless_api.wait_index_ready(table_name, "semantic_b")
+    serverless_api.wait_index_ready(table_name, "sparse_a")
+    serverless_api.wait_index_ready(table_name, "sparse_b")
 
 
 def test_serverless_same_name_dense_index_update_republishes_head(serverless_api):
@@ -2684,7 +2695,7 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
 
     detail = serverless_api.get_index(table_name, "semantic_idx")
     assert detail["status"]["head_publication_action"] == "rebuild"
-    assert ready_index_status(detail) is not None
+    serverless_api.wait_index_ready(table_name, "semantic_idx")
 
 
 def test_serverless_build_status_reports_head_actions_for_text_only_updates(
@@ -2942,5 +2953,5 @@ def test_serverless_schema_migration_republishes_versioned_full_text_indexes(
     next_index = serverless_api.get_index(table_name, "full_text_index_v1")
     assert active_index["status"]["head_publication_action"] == "reuse"
     assert next_index["status"]["head_publication_action"] == "rebuild"
-    assert ready_index_status(active_index) is not None
-    assert ready_index_status(next_index) is not None
+    serverless_api.wait_index_ready(table_name, "full_text_index_v0")
+    serverless_api.wait_index_ready(table_name, "full_text_index_v1")
