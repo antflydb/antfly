@@ -4400,7 +4400,17 @@ pub const HostedProvisionedTableReadSource = struct {
         defer if (owned_headers) |value| alloc.free(value);
         var route_deadline_buf: [10]u8 = undefined;
         if (internalGroupIdFromUri(request.uri)) |group_id| {
-            if (self.catalog.vtable.route_fence) |resolve| {
+            // Join job-state polling imports coordinator state only; it does
+            // not open table storage. Keep this exception ahead of route
+            // resolution so recovery can contact a retired/handoff owner that
+            // is intentionally absent from the current routing projection.
+            const opens_table_storage = !isJoinJobStateRequest(request);
+            if (opens_table_storage) {
+                const resolve = self.catalog.vtable.route_fence orelse {
+                    // Every first-party storage read must carry the route
+                    // selected by its coordinator.
+                    return error.CatalogRouteFenceRequired;
+                };
                 const fence = (try resolve(self.catalog.ptr, group_id)) orelse return error.CatalogRouteFenceRequired;
                 encoded_fence = try std.json.Stringify.valueAlloc(alloc, fence, .{});
                 const headers = try alloc.alloc(http_common.RequestHeader, request.headers.len + 2);
@@ -4418,11 +4428,6 @@ pub const HostedProvisionedTableReadSource = struct {
                 };
                 owned_headers = headers;
                 routed_request.headers = headers;
-            } else if (!std.mem.endsWith(u8, request.uri, http_routes.Routes.join_job_state_suffix)) {
-                // Every first-party storage read must carry the route selected
-                // by its coordinator. Only join job-state polling is scoped to
-                // a group without opening table storage.
-                return error.CatalogRouteFenceRequired;
             }
         }
         var response = try client.executeRequest(routed_request);
@@ -4447,6 +4452,12 @@ pub const HostedProvisionedTableReadSource = struct {
         while (end < uri.len and std.ascii.isDigit(uri[end])) : (end += 1) {}
         if (end == start) return null;
         return std.fmt.parseUnsigned(u64, uri[start..end], 10) catch null;
+    }
+
+    fn isJoinJobStateRequest(request: http_common.HttpRequest) bool {
+        if (request.method != .POST) return false;
+        const uri = std.Uri.parse(request.uri) catch return false;
+        return http_routes.Routes.matchGroupJoinJobState(uri.path.percent_encoded) != null;
     }
 
     pub fn withGroupVisibleRootGeneration(self: *HostedProvisionedTableReadSource, generation_source: ?GroupVisibleRootGenerationSource) *HostedProvisionedTableReadSource {
@@ -28068,6 +28079,102 @@ test "routed internal reads require an explicit peer fence acknowledgement" {
     var response = try HostedProvisionedTableReadSource.executeInternalRequest(&hosted, std.testing.allocator, request);
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), response.status);
+}
+
+test "join job-state polling bypasses storage route fencing without weakening storage reads" {
+    const State = struct {
+        route_fence_calls: usize = 0,
+        execute_calls: usize = 0,
+
+        fn routeFence(ptr: *anyopaque, _: u64) !?metadata_api.CatalogRouteFence {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.route_fence_calls += 1;
+            return null;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminSnapshot;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn catalog(self: *@This()) table_catalog.CatalogSource {
+            return .{ .ptr = self, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .route_fence = routeFence,
+            } };
+        }
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.execute_calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, http_routes.Routes.join_job_state_suffix));
+            for (req.headers) |header| {
+                try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, metadata_api.catalog_route_fence_header));
+            }
+            return .{
+                .status = 200,
+                .headers = try alloc.alloc(http_common.Header, 0),
+                .body = try alloc.dupe(u8, "{}"),
+            };
+        }
+    };
+
+    var state = State{};
+    var hosted = HostedProvisionedTableReadSource{
+        .replica_root_dir = "",
+        .catalog = state.catalog(),
+        .requester = undefined,
+        .router = undefined,
+        .executor = state.executor(),
+    };
+    const job_state_request = http_common.HttpRequest{
+        .method = .POST,
+        .uri = "http://peer.test/internal/v1/groups/7001/tables/docs/join-job-state",
+    };
+    var response = try HostedProvisionedTableReadSource.executeInternalRequest(
+        &hosted,
+        std.testing.allocator,
+        job_state_request,
+    );
+    response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), state.route_fence_calls);
+    try std.testing.expectEqual(@as(usize, 1), state.execute_calls);
+
+    const storage_request = http_common.HttpRequest{
+        .method = .GET,
+        .uri = "http://peer.test/internal/v1/groups/7001/tables/docs/documents/doc:a",
+    };
+    try std.testing.expectError(
+        error.CatalogRouteFenceRequired,
+        HostedProvisionedTableReadSource.executeInternalRequest(
+            &hosted,
+            std.testing.allocator,
+            storage_request,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.route_fence_calls);
+    try std.testing.expectEqual(@as(usize, 1), state.execute_calls);
+
+    const suffix_collision_request = http_common.HttpRequest{
+        .method = .POST,
+        .uri = "http://peer.test/internal/v1/groups/7001/tables/docs/documents/doc:a/join-job-state",
+    };
+    try std.testing.expectError(
+        error.CatalogRouteFenceRequired,
+        HostedProvisionedTableReadSource.executeInternalRequest(
+            &hosted,
+            std.testing.allocator,
+            suffix_collision_request,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 2), state.route_fence_calls);
+    try std.testing.expectEqual(@as(usize, 1), state.execute_calls);
 }
 
 test "graph coordinator base request avoids an implicit retrieval scan" {
