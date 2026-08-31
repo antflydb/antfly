@@ -703,8 +703,10 @@ fn renderPageContentRgbaInBoxAlloc(
     shape_runs: []const reader.ShapeRun,
     cancellation: reader.CancellationProbe,
 ) !RawPageCanvas {
-    return try renderPageContentRgbaInBoxAllocWithBudget(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null);
+    return try renderPageContentRgbaInBoxAllocWithBudget(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null, .opaque_white);
 }
+
+const CanvasBackground = enum { opaque_white, transparent };
 
 fn renderPageContentRgbaInBoxAllocWithBudget(
     alloc: Allocator,
@@ -716,6 +718,7 @@ fn renderPageContentRgbaInBoxAllocWithBudget(
     shape_runs: []const reader.ShapeRun,
     cancellation: reader.CancellationProbe,
     shared_bilevel_sample_budget: ?*BilevelSampleBudget,
+    background: CanvasBackground,
 ) !RawPageCanvas {
     try cancellation.check();
     const page_w = @max(1.0, page_box.max_x - page_box.min_x);
@@ -733,7 +736,7 @@ fn renderPageContentRgbaInBoxAllocWithBudget(
 
     const rgba = try alloc.alloc(u8, rgba_len);
     errdefer alloc.free(rgba);
-    @memset(rgba, 0xff);
+    @memset(rgba, if (background == .opaque_white) 0xff else 0x00);
     var local_bilevel_sample_budget = BilevelSampleBudget.init(pixel_count);
     const bilevel_sample_budget = shared_bilevel_sample_budget orelse &local_bilevel_sample_budget;
     try renderGroupChildrenAlloc(alloc, rgba, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, &plan, 0, false, cancellation, bilevel_sample_budget);
@@ -971,6 +974,12 @@ fn drawImageRunCancelable(
                 const sy = @min(run.height - 1, @as(u32, @intFromFloat(@floor((1.0 - v) * @as(f64, @floatFromInt(run.height))))));
                 const src = (@as(usize, sy) * @as(usize, run.width) + @as(usize, sx)) * 4;
                 sample = .{ run.rgba[src], run.rgba[src + 1], run.rgba[src + 2], run.rgba[src + 3] };
+            }
+            if (run.stencil_color) |color| {
+                sample[0] = color[0];
+                sample[1] = color[1];
+                sample[2] = color[2];
+                sample[3] = @intCast((@as(u16, sample[3]) * @as(u16, color[3]) + 127) / 255);
             }
             sample[3] = @intCast((@as(u16, sample[3]) * @as(u16, run.alpha) + 127) / 255);
             blendPixelMode(canvas, dst, sample, run.blend_mode);
@@ -1469,20 +1478,9 @@ fn drawPatternRun(
     return try drawPatternRunCancelable(alloc, canvas, canvas_w, canvas_h, min_x, max_y, run, .{}, null);
 }
 
-fn drawPatternRunCancelable(
-    alloc: Allocator,
-    canvas: []u8,
-    canvas_w: usize,
-    canvas_h: usize,
-    min_x: f64,
-    max_y: f64,
-    run: reader.PatternRun,
-    cancellation: reader.CancellationProbe,
-    bilevel_sample_budget: ?*BilevelSampleBudget,
-) anyerror!void {
-    const ShapeKind = @FieldType(reader.ShapeRun, "kind");
-    const bounds = shapeRunBounds(.{
-        .kind = if (run.kind == .fill) ShapeKind.fill else ShapeKind.stroke,
+fn patternTargetShape(run: reader.PatternRun) reader.ShapeRun {
+    return .{
+        .kind = if (run.kind == .fill) .fill else .stroke,
         .paint_order = run.paint_order,
         .blend_mode = run.blend_mode,
         .group_id = run.group_id,
@@ -1503,7 +1501,99 @@ fn drawPatternRunCancelable(
         .clip_fill_rule = run.clip_fill_rule,
         .points = run.points,
         .subpath_starts = run.subpath_starts,
-    });
+    };
+}
+
+const ImageAlphaSampler = struct {
+    run: reader.ImageRun,
+    inv_a: f64,
+    inv_b: f64,
+    inv_c: f64,
+    inv_d: f64,
+    coverage_minify: bool,
+    cancellation: BilevelCancellationPoller,
+
+    fn init(run: reader.ImageRun, cancellation: reader.CancellationProbe) ?ImageAlphaSampler {
+        const det = run.a * run.d - run.b * run.c;
+        if (@abs(det) < 0.000001) return null;
+        const projected_width = @sqrt(run.a * run.a + run.b * run.b);
+        const projected_height = @sqrt(run.c * run.c + run.d * run.d);
+        return .{
+            .run = run,
+            .inv_a = run.d / det,
+            .inv_b = -run.b / det,
+            .inv_c = -run.c / det,
+            .inv_d = run.a / det,
+            .coverage_minify = run.ocr_coverage_minify and run.bilevel and
+                (@as(f64, @floatFromInt(run.width)) > projected_width or
+                    @as(f64, @floatFromInt(run.height)) > projected_height),
+            .cancellation = BilevelCancellationPoller.init(cancellation),
+        };
+    }
+
+    fn alphaAt(self: *ImageAlphaSampler, world_x: f64, world_y: f64, bilevel_sample_budget: ?*BilevelSampleBudget) !u8 {
+        const dx = world_x - self.run.e;
+        const dy = world_y - self.run.f;
+        const u = self.inv_a * dx + self.inv_c * dy;
+        const v = self.inv_b * dx + self.inv_d * dy;
+        if (!finite(u) or !finite(v) or u < 0 or u > 1 or v < 0 or v > 1) return 0;
+        if (self.coverage_minify) {
+            const sample = try coveragePreservingBilevelSample(
+                self.run,
+                world_x,
+                world_y,
+                self.inv_a,
+                self.inv_b,
+                self.inv_c,
+                self.inv_d,
+                &self.cancellation,
+                bilevel_sample_budget,
+            );
+            return sample[3];
+        }
+        if (self.run.interpolate) return bilinearImageSample(self.run, u, 1.0 - v)[3];
+        const sx = @min(self.run.width - 1, @as(u32, @intFromFloat(@floor(u * @as(f64, @floatFromInt(self.run.width))))));
+        const sy = @min(self.run.height - 1, @as(u32, @intFromFloat(@floor((1.0 - v) * @as(f64, @floatFromInt(self.run.height))))));
+        return self.run.rgba[(@as(usize, sy) * @as(usize, self.run.width) + @as(usize, sx)) * 4 + 3];
+    }
+};
+
+fn patternTargetAlpha(
+    run: reader.PatternRun,
+    mask_sampler: *?ImageAlphaSampler,
+    world_x: f64,
+    world_y: f64,
+    bilevel_sample_budget: ?*BilevelSampleBudget,
+) !u8 {
+    if (mask_sampler.*) |*sampler| return try sampler.alphaAt(world_x, world_y, bilevel_sample_budget);
+    const shape = patternTargetShape(run);
+    const hit = if (run.kind == .fill)
+        pointInShape(world_x, world_y, shape)
+    else
+        pointInStrokeShape(world_x, world_y, shape);
+    return if (hit) 0xff else 0;
+}
+
+fn drawPatternRunCancelable(
+    alloc: Allocator,
+    canvas: []u8,
+    canvas_w: usize,
+    canvas_h: usize,
+    min_x: f64,
+    max_y: f64,
+    run: reader.PatternRun,
+    cancellation: reader.CancellationProbe,
+    bilevel_sample_budget: ?*BilevelSampleBudget,
+) anyerror!void {
+    var mask_sampler = if (run.stencil_mask) |mask| ImageAlphaSampler.init(mask, cancellation) else null;
+    if (run.stencil_mask != null and mask_sampler == null) return;
+    const bounds: reader.PageBox = if (run.stencil_mask) |mask| blk: {
+        const value = imageRunBounds(mask);
+        break :blk .{ .min_x = value.min_x, .min_y = value.min_y, .max_x = value.max_x, .max_y = value.max_y };
+    } else blk: {
+        const value = shapeRunBounds(patternTargetShape(run));
+        break :blk .{ .min_x = value.min_x, .min_y = value.min_y, .max_x = value.max_x, .max_y = value.max_y };
+    };
     const x0 = floorToCanvas(bounds.min_x - min_x, canvas_w);
     const x1 = ceilToCanvas(bounds.max_x - min_x, canvas_w);
     const y0 = floorToCanvas(max_y - bounds.max_y, canvas_h);
@@ -1520,49 +1610,15 @@ fn drawPatternRunCancelable(
                 const world_x = min_x + (@as(f64, @floatFromInt(px)) + 0.5);
                 const world_y = max_y - (@as(f64, @floatFromInt(py)) + 0.5);
                 if (has_clip and !pointPassesClip(world_x, world_y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
-                const target_hit = if (run.kind == .fill)
-                    pointInShape(world_x, world_y, .{
-                        .kind = .fill,
-                        .color = .{ 0, 0, 0, 0 },
-                        .stroke_width = 0,
-                        .closed = true,
-                        .fill_rule = run.fill_rule,
-                        .points = run.points,
-                        .subpath_starts = run.subpath_starts,
-                    })
-                else blk: {
-                    const tmp: reader.ShapeRun = .{
-                        .kind = .stroke,
-                        .paint_order = run.paint_order,
-                        .blend_mode = run.blend_mode,
-                        .group_id = run.group_id,
-                        .group_parent_id = run.group_parent_id,
-                        .group_isolated = run.group_isolated,
-                        .group_knockout = run.group_knockout,
-                        .fill_rule = run.fill_rule,
-                        .line_cap = run.line_cap,
-                        .line_join = run.line_join,
-                        .miter_limit = run.miter_limit,
-                        .dash_array = run.dash_array,
-                        .dash_phase = run.dash_phase,
-                        .color = .{ 0, 0, 0, 0 },
-                        .stroke_width = run.stroke_width,
-                        .closed = run.closed,
-                        .clip_box = run.clip_box,
-                        .clip_points = run.clip_points,
-                        .clip_fill_rule = run.clip_fill_rule,
-                        .points = run.points,
-                        .subpath_starts = run.subpath_starts,
-                    };
-                    break :blk pointInStrokeShape(world_x, world_y, tmp);
-                };
-                if (!target_hit) continue;
+                const target_alpha = try patternTargetAlpha(run, &mask_sampler, world_x, world_y, bilevel_sample_budget);
+                if (target_alpha == 0) continue;
                 const t_opt = switch (shading.kind) {
                     .axial => axialShadingT(world_x, world_y, shading),
                     .radial => radialShadingT(world_x, world_y, shading),
                 };
                 const t = t_opt orelse continue;
-                const color = lerpColor(shading.c0, shading.c1, t);
+                var color = lerpColor(shading.c0, shading.c1, t);
+                color[3] = @intCast((@as(u16, color[3]) * @as(u16, target_alpha) + 127) / 255);
                 blendPixelMode(canvas, (py * canvas_w + px) * 4, color, run.blend_mode);
             }
         }
@@ -1586,43 +1642,8 @@ fn drawPatternRunCancelable(
             const world_x = min_x + (@as(f64, @floatFromInt(px)) + 0.5);
             const world_y = max_y - (@as(f64, @floatFromInt(py)) + 0.5);
             if (has_clip and !pointPassesClip(world_x, world_y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
-            const target_hit = if (run.kind == .fill)
-                pointInShape(world_x, world_y, .{
-                    .kind = .fill,
-                    .color = .{ 0, 0, 0, 0 },
-                    .stroke_width = 0,
-                    .closed = true,
-                    .fill_rule = run.fill_rule,
-                    .points = run.points,
-                    .subpath_starts = run.subpath_starts,
-                })
-            else blk: {
-                const tmp: reader.ShapeRun = .{
-                    .kind = .stroke,
-                    .paint_order = run.paint_order,
-                    .blend_mode = run.blend_mode,
-                    .group_id = run.group_id,
-                    .group_parent_id = run.group_parent_id,
-                    .group_isolated = run.group_isolated,
-                    .group_knockout = run.group_knockout,
-                    .fill_rule = run.fill_rule,
-                    .line_cap = run.line_cap,
-                    .line_join = run.line_join,
-                    .miter_limit = run.miter_limit,
-                    .dash_array = run.dash_array,
-                    .dash_phase = run.dash_phase,
-                    .color = .{ 0, 0, 0, 0 },
-                    .stroke_width = run.stroke_width,
-                    .closed = run.closed,
-                    .clip_box = run.clip_box,
-                    .clip_points = run.clip_points,
-                    .clip_fill_rule = run.clip_fill_rule,
-                    .points = run.points,
-                    .subpath_starts = run.subpath_starts,
-                };
-                break :blk pointInStrokeShape(world_x, world_y, tmp);
-            };
-            if (!target_hit) continue;
+            const target_alpha = try patternTargetAlpha(run, &mask_sampler, world_x, world_y, bilevel_sample_budget);
+            if (target_alpha == 0) continue;
 
             const dx = world_x - run.pattern_matrix.e;
             const dy = world_y - run.pattern_matrix.f;
@@ -1648,6 +1669,7 @@ fn drawPatternRunCancelable(
                     @intCast((@as(u16, base_color[3]) * @as(u16, color[3]) + 127) / 255),
                 };
             }
+            color[3] = @intCast((@as(u16, color[3]) * @as(u16, target_alpha) + 127) / 255);
             blendPixelMode(canvas, (py * canvas_w + px) * 4, color, run.blend_mode);
         }
     }
@@ -1675,6 +1697,7 @@ fn renderPatternTileCanvasAlloc(
         run.tile_shape_runs,
         cancellation,
         bilevel_sample_budget,
+        .transparent,
     );
     return .{ .rgba = raw.rgba, .width = raw.width, .height = raw.height };
 }
@@ -2369,6 +2392,9 @@ fn blendPixelMode(canvas: []u8, dst: usize, src: [4]u8, mode: reader.BlendMode) 
         return;
     }
 
+    // Normal source-over is the overwhelmingly common path. Keep its compact
+    // integer formulation so transparency correctness does not add work to
+    // ordinary antialiased text, vectors, and images.
     if (mode == .normal) {
         const da = @as(u32, canvas[dst + 3]);
         const inv_sa = 255 - sa;
@@ -2383,14 +2409,36 @@ fn blendPixelMode(canvas: []u8, dst: usize, src: [4]u8, mode: reader.BlendMode) 
         return;
     }
 
-    const blended_r = blendChannel(mode, src[0], canvas[dst + 0]);
-    const blended_g = blendChannel(mode, src[1], canvas[dst + 1]);
-    const blended_b = blendChannel(mode, src[2], canvas[dst + 2]);
-    const inv_sa = 255 - sa;
-    canvas[dst + 0] = @intCast((@as(u32, blended_r) * sa + @as(u32, canvas[dst + 0]) * inv_sa + 127) / 255);
-    canvas[dst + 1] = @intCast((@as(u32, blended_g) * sa + @as(u32, canvas[dst + 1]) * inv_sa + 127) / 255);
-    canvas[dst + 2] = @intCast((@as(u32, blended_b) * sa + @as(u32, canvas[dst + 2]) * inv_sa + 127) / 255);
-    canvas[dst + 3] = 0xff;
+    const da = @as(u64, canvas[dst + 3]);
+    if (da == 0) {
+        canvas[dst + 0] = src[0];
+        canvas[dst + 1] = src[1];
+        canvas[dst + 2] = src[2];
+        canvas[dst + 3] = src[3];
+        return;
+    }
+    if (da == 255) {
+        const inv_sa = 255 - sa;
+        inline for (0..3) |channel| {
+            const blended = blendChannel(mode, src[channel], canvas[dst + channel]);
+            canvas[dst + channel] = @intCast((@as(u32, blended) * sa + @as(u32, canvas[dst + channel]) * inv_sa + 127) / 255);
+        }
+        canvas[dst + 3] = 0xff;
+        return;
+    }
+    const sa64 = @as(u64, sa);
+    const out_alpha_numerator = sa64 * 255 + da * (255 - sa64);
+    if (out_alpha_numerator == 0) return;
+    inline for (0..3) |channel| {
+        const source = @as(u64, src[channel]);
+        const backdrop = @as(u64, canvas[dst + channel]);
+        const blended = @as(u64, blendChannel(mode, src[channel], canvas[dst + channel]));
+        const color_numerator = source * sa64 * (255 - da) +
+            backdrop * da * (255 - sa64) +
+            blended * sa64 * da;
+        canvas[dst + channel] = @intCast((color_numerator + out_alpha_numerator / 2) / out_alpha_numerator);
+    }
+    canvas[dst + 3] = @intCast((out_alpha_numerator + 127) / 255);
 }
 
 fn compositeGroupCanvas(canvas: []u8, group_canvas: []const u8) void {
@@ -2588,6 +2636,18 @@ test "blend pixel mode screen combines source and backdrop" {
     var canvas = [_]u8{ 0xff, 0x00, 0x00, 0xff };
     blendPixelMode(&canvas, 0, .{ 0x00, 0x00, 0xff, 0xff }, .screen);
     try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 0xff, 0xff }, &canvas);
+}
+
+test "blend modes preserve source color over a transparent backdrop" {
+    var canvas = [_]u8{0} ** 4;
+    blendPixelMode(&canvas, 0, .{ 0x30, 0x60, 0x90, 0x80 }, .multiply);
+    try std.testing.expectEqualSlices(u8, &.{ 0x30, 0x60, 0x90, 0x80 }, &canvas);
+}
+
+test "blend modes compose partially transparent source and backdrop" {
+    var canvas = [_]u8{ 0x80, 0x80, 0x80, 0x80 };
+    blendPixelMode(&canvas, 0, .{ 0x80, 0x80, 0x80, 0x80 }, .multiply);
+    try std.testing.expectEqualSlices(u8, &.{ 0x6b, 0x6b, 0x6b, 0xc0 }, &canvas);
 }
 
 test "blend pixel mode normal opaque replaces backdrop" {
@@ -3619,6 +3679,30 @@ test "image minification honors explicit interpolation policy" {
     try std.testing.expectEqual(@as(u8, 0xff), filtered[3]);
 }
 
+test "image mask stencil paints decoded coverage with its occurrence color" {
+    var rgba = [_]u8{ 0, 0, 0, 0xff };
+    const run: reader.ImageRun = .{
+        .rgba = &rgba,
+        .width = 1,
+        .height = 1,
+        .stencil_color = .{ 51, 102, 153, 255 },
+        .a = 1,
+        .b = 0,
+        .c = 0,
+        .d = 1,
+        .e = 0,
+        .f = 0,
+        .x = 0,
+        .y = 0,
+        .draw_width = 1,
+        .draw_height = 1,
+    };
+
+    var canvas = [_]u8{0xff} ** 4;
+    drawImageRun(&canvas, 1, 1, 0, 0, 1, run);
+    try std.testing.expectEqualSlices(u8, &.{ 51, 102, 153, 255 }, &canvas);
+}
+
 test "OCR bilevel minification preserves source ink coverage" {
     var rgba = [_]u8{
         0x00, 0x00, 0x00, 0xff,
@@ -3653,6 +3737,52 @@ test "OCR bilevel minification preserves source ink coverage" {
     try std.testing.expectEqual(ocr_canvas[0], ocr_canvas[1]);
     try std.testing.expectEqual(ocr_canvas[0], ocr_canvas[2]);
     try std.testing.expectEqual(@as(u8, 0xff), ocr_canvas[3]);
+}
+
+test "OCR pattern stencil minification preserves sparse mask coverage" {
+    const alloc = std.testing.allocator;
+    var tile_points = [_][2]f64{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
+    var tile_shapes = [_]reader.ShapeRun{.{
+        .kind = .fill,
+        .color = .{ 0xff, 0, 0, 0xff },
+        .stroke_width = 1,
+        .closed = true,
+        .points = &tile_points,
+    }};
+    var mask_rgba = [_]u8{0} ** (8 * 4);
+    mask_rgba[0..4].* = .{ 0xff, 0xff, 0xff, 0xff };
+    const run: reader.PatternRun = .{
+        .kind = .fill,
+        .points = &.{},
+        .stencil_mask = .{
+            .rgba = &mask_rgba,
+            .width = 8,
+            .height = 1,
+            .bilevel = true,
+            .ocr_coverage_minify = true,
+            .a = 1,
+            .b = 0,
+            .c = 0,
+            .d = 1,
+            .e = 0,
+            .f = 0,
+            .x = 0,
+            .y = 0,
+            .draw_width = 1,
+            .draw_height = 1,
+        },
+        .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
+        .pattern_x_step = 1,
+        .pattern_y_step = 1,
+        .tile_shape_runs = &tile_shapes,
+    };
+
+    var canvas = [_]u8{0xff} ** 4;
+    try drawPatternRun(alloc, &canvas, 1, 1, 0, 1, run);
+    try std.testing.expectEqual(@as(u8, 0xff), canvas[0]);
+    try std.testing.expect(canvas[1] >= 222 and canvas[1] <= 224);
+    try std.testing.expectEqual(canvas[1], canvas[2]);
+    try std.testing.expectEqual(@as(u8, 0xff), canvas[3]);
 }
 
 test "OCR bilevel area filter retains thin rules beyond four-to-one minification" {
@@ -3942,19 +4072,63 @@ test "draw pattern run tiles colored cell content" {
     };
 
     var canvas: [8 * 4 * 4]u8 = undefined;
-    @memset(&canvas, 0xff);
+    for (0..canvas.len / 4) |pixel| canvas[pixel * 4 ..][0..4].* = .{ 0x00, 0x00, 0xff, 0xff };
     try drawPatternRun(alloc, &canvas, 8, 4, 0, 4, run);
 
     const left_red = ((2 * 8) + 1) * 4;
     const right_red = ((2 * 8) + 5) * 4;
-    const white_gap = ((2 * 8) + 3) * 4;
+    const transparent_gap = ((2 * 8) + 3) * 4;
     try std.testing.expectEqual(@as(u8, 0xff), canvas[left_red + 0]);
     try std.testing.expectEqual(@as(u8, 0x00), canvas[left_red + 1]);
     try std.testing.expectEqual(@as(u8, 0xff), canvas[right_red + 0]);
     try std.testing.expectEqual(@as(u8, 0x00), canvas[right_red + 1]);
-    try std.testing.expectEqual(@as(u8, 0xff), canvas[white_gap + 0]);
-    try std.testing.expectEqual(@as(u8, 0xff), canvas[white_gap + 1]);
-    try std.testing.expectEqual(@as(u8, 0xff), canvas[white_gap + 2]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0xff, 0xff }, canvas[transparent_gap .. transparent_gap + 4]);
+}
+
+test "draw pattern run clips paint through image stencil coverage" {
+    const alloc = std.testing.allocator;
+    var tile_points = [_][2]f64{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
+    var tile_shapes = [_]reader.ShapeRun{.{
+        .kind = .fill,
+        .color = .{ 0xff, 0x00, 0x00, 0xff },
+        .stroke_width = 1,
+        .closed = true,
+        .points = &tile_points,
+    }};
+    var mask_rgba = [_]u8{
+        0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0x00,
+    };
+    const run: reader.PatternRun = .{
+        .kind = .fill,
+        .points = &.{},
+        .stencil_mask = .{
+            .rgba = &mask_rgba,
+            .width = 2,
+            .height = 1,
+            .a = 4,
+            .b = 0,
+            .c = 0,
+            .d = 2,
+            .e = 0,
+            .f = 0,
+            .x = 0,
+            .y = 0,
+            .draw_width = 4,
+            .draw_height = 2,
+        },
+        .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
+        .pattern_x_step = 1,
+        .pattern_y_step = 1,
+        .tile_shape_runs = &tile_shapes,
+    };
+
+    var canvas: [4 * 2 * 4]u8 = undefined;
+    for (0..canvas.len / 4) |pixel| canvas[pixel * 4 ..][0..4].* = .{ 0x00, 0x00, 0xff, 0xff };
+    try drawPatternRun(alloc, &canvas, 4, 2, 0, 2, run);
+
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 0x00, 0xff }, canvas[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0xff, 0xff }, canvas[12..16]);
 }
 
 test "draw pattern run recolors uncolored cell content" {
@@ -3989,8 +4163,76 @@ test "draw pattern run recolors uncolored cell content" {
     try drawPatternRun(alloc, &canvas, 4, 4, 0, 4, run);
 
     const green_px = ((2 * 4) + 1) * 4;
-    try std.testing.expectEqual(@as(u8, 0x00), canvas[green_px + 0]);
+    const transparent_gap = ((2 * 4) + 3) * 4;
+    try std.testing.expect(canvas[green_px + 0] >= 0x7f and canvas[green_px + 0] <= 0x80);
     try std.testing.expect(canvas[green_px + 1] > 0x80);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff }, canvas[transparent_gap .. transparent_gap + 4]);
+}
+
+test "reader and renderer preserve uncolored tiling pattern cell geometry" {
+    const alloc = std.testing.allocator;
+    const pattern_content = "0 0 5 10 re\nf\n";
+    const page_content = "/CS1 cs\n0 1 0 /P1 scn\n0 0 20 20 re\nf\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /ColorSpace << /CS1 [/Pattern /DeviceRGB] >> /Pattern << /P1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
+        try std.fmt.allocPrint(
+            alloc,
+            "5 0 obj\n<< /Type /Pattern /PatternType 1 /PaintType 2 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10 /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+            .{ pattern_content.len, pattern_content },
+        ),
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[4]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |obj_src, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, obj_src);
+    }
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 6\n0000000000 65535 f \n");
+    for (offsets) |off| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{off});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 6 /Root 1 0 R >>\n");
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
+
+    var parsed = try reader.Reader.init(alloc, sample);
+    defer parsed.deinit();
+    var runs = try parsed.extractPageRenderRunsAlloc(1);
+    defer runs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), runs.shape_runs.len);
+    try std.testing.expectEqual(@as(usize, 1), runs.pattern_runs.len);
+    try std.testing.expectEqual(@as(usize, 1), runs.pattern_runs[0].tile_shape_runs.len);
+    const raw = try renderPageContentRgbaInBoxAlloc(
+        alloc,
+        runs.page_box,
+        runs.text_runs,
+        runs.image_runs,
+        runs.shading_runs,
+        runs.pattern_runs,
+        runs.shape_runs,
+        .{},
+    );
+    defer alloc.free(raw.rgba);
+
+    var green_pixels: usize = 0;
+    for (0..raw.width * raw.height) |pixel| {
+        const offset = pixel * 4;
+        if (raw.rgba[offset] < 0x40 and raw.rgba[offset + 1] > 0xc0 and raw.rgba[offset + 2] < 0x40)
+            green_pixels += 1;
+    }
+    try std.testing.expect(green_pixels > 0);
+    try std.testing.expect(green_pixels < raw.width * raw.height);
 }
 
 test "nonzero glyph paths preserve counter contours" {

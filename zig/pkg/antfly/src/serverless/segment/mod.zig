@@ -26,6 +26,8 @@ pub const SidecarManifest = sidecar_manifest.Manifest;
 pub const freeEntries = types.freeEntries;
 pub const encodeAlloc = codec.encodeAlloc;
 pub const decodeAlloc = codec.decodeAlloc;
+pub const header_len = codec.header_len;
+pub const decodeHeader = codec.decodeHeader;
 pub const sidecarBindingFromSnapshot = source_binding.bindingFromSnapshot;
 pub const validateSidecarBatchAgainstBinding = source_binding.validateBatchAgainstBinding;
 pub const validateSidecarBatchSnapshotAgainstBinding = source_binding.validateBatchSnapshotAgainstBinding;
@@ -49,6 +51,8 @@ test "serverless segment module compiles" {
     _ = source_binding;
     _ = sidecar_manifest;
     _ = Entry;
+    _ = header_len;
+    _ = decodeHeader;
     _ = SidecarSourceBinding;
     _ = SidecarDeclaredArtifact;
     _ = SidecarManifest;
