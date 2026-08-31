@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -44,8 +44,8 @@ class EmbeddingsIndexStats:
             exceed source coverage.
         publication (DenseVectorPublicationStatus | Unset): Exact dense-vector publication cardinality for the observed
             index incarnation.
-        activity (EmbeddingIndexActivity | Unset): Volatile index-incarnation activity. It explains motion but never
-            participates in readiness.
+        activity (EmbeddingIndexActivity | None | Unset): Fresh owner-reported activity, or null when no heartbeat for
+            this index incarnation is available.
         error (str | Unset): Error message if stats could not be retrieved
         total_indexed (int | Unset): Number of vectors/documents in the index
         disk_usage (int | Unset): Size of the index in bytes
@@ -128,7 +128,7 @@ class EmbeddingsIndexStats:
     source_coverage: EmbeddingSourceCoverageStatus | Unset = UNSET
     searchable_vectors: int | Unset = UNSET
     publication: DenseVectorPublicationStatus | Unset = UNSET
-    activity: EmbeddingIndexActivity | Unset = UNSET
+    activity: EmbeddingIndexActivity | None | Unset = UNSET
     error: str | Unset = UNSET
     total_indexed: int | Unset = UNSET
     disk_usage: int | Unset = UNSET
@@ -190,6 +190,8 @@ class EmbeddingsIndexStats:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.embedding_index_activity import EmbeddingIndexActivity
+
         index_type = self.index_type.value
 
         readiness: dict[str, Any] | Unset = UNSET
@@ -216,9 +218,13 @@ class EmbeddingsIndexStats:
         if not isinstance(self.publication, Unset):
             publication = self.publication.to_dict()
 
-        activity: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.activity, Unset):
+        activity: dict[str, Any] | None | Unset
+        if isinstance(self.activity, Unset):
+            activity = UNSET
+        elif isinstance(self.activity, EmbeddingIndexActivity):
             activity = self.activity.to_dict()
+        else:
+            activity = self.activity
 
         error = self.error
 
@@ -551,12 +557,22 @@ class EmbeddingsIndexStats:
         else:
             publication = DenseVectorPublicationStatus.from_dict(_publication)
 
-        _activity = d.pop("activity", UNSET)
-        activity: EmbeddingIndexActivity | Unset
-        if isinstance(_activity, Unset):
-            activity = UNSET
-        else:
-            activity = EmbeddingIndexActivity.from_dict(_activity)
+        def _parse_activity(data: object) -> EmbeddingIndexActivity | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                activity_type_1 = EmbeddingIndexActivity.from_dict(data)
+
+                return activity_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(EmbeddingIndexActivity | None | Unset, data)
+
+        activity = _parse_activity(d.pop("activity", UNSET))
 
         error = d.pop("error", UNSET)
 
