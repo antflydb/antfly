@@ -410,6 +410,8 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
                     create.ranges.len > topology_protocol.max_initial_ranges or
                     create.ranges.len != @as(usize, create.table.min_ranges))
                     return error.InvalidTableTopologyMutation;
+                metadata_table_manager.validateCompleteKeyspaceRanges(create.ranges) catch
+                    return error.InvalidTableTopologyMutation;
                 for (create.ranges) |record| {
                     try group_ids.requireDataGroupId(record.group_id);
                     if (record.table_id != create.table.table_id)
@@ -692,6 +694,23 @@ test "transition command validation rejects metadata group ids in data group fie
     for (commands) |command| {
         try std.testing.expectError(error.ReservedGroupId, validateTransitionCommandDataGroupIds(command));
     }
+}
+
+test "atomic table topology apply rejects incomplete keyspace coverage" {
+    const incomplete = TransitionCommand{ .apply_table_topology = .{ .create = .{
+        .expected_transition_generation = 0,
+        .table = .{ .table_id = 1, .name = "docs" },
+        .ranges = &.{.{
+            .group_id = 7001,
+            .table_id = 1,
+            .start_key = "m",
+            .end_key = null,
+        }},
+    } } };
+    try std.testing.expectError(
+        error.InvalidTableTopologyMutation,
+        validateTransitionCommandDataGroupIds(incomplete),
+    );
 }
 
 test "table topology mutation compact drop wire contract remains bounded beyond legacy range limits" {
@@ -12478,15 +12497,22 @@ test "atomic table topology lifecycle notifications stay constant at the initial
     const range_count: usize = topology_protocol.max_initial_ranges;
     const ranges = try std.testing.allocator.alloc(metadata.RangeRecord, range_count);
     defer std.testing.allocator.free(ranges);
+    const range_key_storage = try std.testing.allocator.alloc([8]u8, range_count);
+    defer std.testing.allocator.free(range_key_storage);
     for (ranges, 0..) |*record, offset| {
         const range_group_id = 10_000 + @as(u64, @intCast(offset));
         record.* = .{
             .group_id = range_group_id,
             .range_id = range_group_id,
             .table_id = 77,
-            .start_key = "",
+            .start_key = if (offset == 0)
+                ""
+            else
+                try std.fmt.bufPrint(&range_key_storage[offset], "{x:0>4}", .{offset}),
         };
     }
+    for (ranges[0 .. ranges.len - 1], ranges[1..]) |*record, next|
+        record.end_key = next.start_key;
     const table: metadata.TableRecord = .{
         .table_id = 77,
         .name = "docs",

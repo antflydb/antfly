@@ -89,6 +89,66 @@ pub const TableMigrationState = topology_records.TableMigrationState;
 pub const TableIndexCatalog = topology_records.TableIndexCatalog;
 pub const RangeRecord = topology_records.RangeRecord;
 
+/// Canonical ordering for every complete table keyspace projection. Keeping
+/// this in the metadata domain lets backup admission, restore planning, and
+/// Raft apply enforce exactly the same bytewise routing contract.
+pub fn sortKeyspaceRanges(comptime Range: type, ranges: []Range) void {
+    std.mem.sort(Range, ranges, {}, struct {
+        fn lessThan(_: void, lhs: Range, rhs: Range) bool {
+            return std.mem.order(u8, lhs.start_key, rhs.start_key) == .lt;
+        }
+    }.lessThan);
+}
+
+/// Validate a sorted, gap-free, non-overlapping partition of the complete
+/// byte-string keyspace. The empty start and open final end are routing
+/// sentinels, not optional decoration: omitting either would publish a table
+/// for which some document keys have no owner.
+pub fn validateCompleteKeyspaceRanges(ranges: anytype) !void {
+    if (ranges.len == 0 or ranges[0].start_key.len != 0 or
+        ranges[ranges.len - 1].end_key != null)
+        return error.InvalidRangeTopology;
+
+    for (ranges, 0..) |range, index| {
+        if (range.end_key) |end_key| {
+            if (end_key.len == 0 or std.mem.order(u8, range.start_key, end_key) != .lt)
+                return error.InvalidRangeTopology;
+        } else if (index != ranges.len - 1) {
+            return error.InvalidRangeTopology;
+        }
+        if (index > 0) {
+            const previous_end = ranges[index - 1].end_key orelse
+                return error.InvalidRangeTopology;
+            if (!std.mem.eql(u8, previous_end, range.start_key))
+                return error.InvalidRangeTopology;
+        }
+    }
+}
+
+test "complete keyspace range validation requires both routing sentinels" {
+    const complete = [_]RangeRecord{
+        .{ .group_id = 7001, .table_id = 1, .start_key = "", .end_key = "m" },
+        .{ .group_id = 7002, .table_id = 1, .start_key = "m", .end_key = null },
+    };
+    try validateCompleteKeyspaceRanges(&complete);
+
+    const missing_leading = [_]RangeRecord{
+        .{ .group_id = 7001, .table_id = 1, .start_key = "a", .end_key = null },
+    };
+    try std.testing.expectError(
+        error.InvalidRangeTopology,
+        validateCompleteKeyspaceRanges(&missing_leading),
+    );
+
+    const missing_trailing = [_]RangeRecord{
+        .{ .group_id = 7001, .table_id = 1, .start_key = "", .end_key = "z" },
+    };
+    try std.testing.expectError(
+        error.InvalidRangeTopology,
+        validateCompleteKeyspaceRanges(&missing_trailing),
+    );
+}
+
 pub const RestoreCompletionFingerprint = topology_records.RestoreCompletionFingerprint;
 pub const empty_restore_completion_fingerprint =
     topology_records.empty_restore_completion_fingerprint;
@@ -996,6 +1056,18 @@ pub const RestoreProgressIdentity = struct {
     table_id: u64,
     node_id: u64,
     group_id: u64,
+};
+
+/// Keep one reconciliation page comfortably below both the metadata request
+/// and Raft proposal byte ceilings while amortizing network and consensus
+/// overhead across a useful amount of work. The byte limit remains the final
+/// authority because diagnostic strings and storage paths are variable-sized.
+pub const max_restore_progress_sync_records: usize = 128;
+pub const max_restore_progress_sync_body_bytes: usize = 1024 * 1024;
+
+pub const RestoreProgressSync = struct {
+    upserts: []const RestoreProgressRecord = &.{},
+    removals: []const RestoreProgressIdentity = &.{},
 };
 
 pub const ReplicationSourceStatusRecord = struct {

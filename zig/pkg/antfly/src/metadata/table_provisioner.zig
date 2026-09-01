@@ -3078,7 +3078,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
         },
         &.{.{
             .group_id = 2001,
-            .start_key = "doc:a",
+            .start_key = "",
             .end_key = null,
             .snapshot_path = "snap1/groups/2001",
             .artifact_size_bytes = artifact_integrity.size_bytes,
@@ -3106,7 +3106,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
         &.{.{
             .group_id = 2001,
             .table_id = 7,
-            .start_key = "doc:a",
+            .start_key = "",
             .end_key = null,
             .restore_backup_id = "snap1",
             .restore_artifact_backup_id = "snap1",
@@ -3267,7 +3267,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
         },
         &.{.{
             .group_id = 2001,
-            .start_key = "doc:a",
+            .start_key = "",
             .end_key = null,
             .snapshot_path = "snap1/groups/2001",
             .artifact_size_bytes = artifact_integrity.size_bytes,
@@ -3296,7 +3296,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
         &.{.{
             .group_id = 2001,
             .table_id = 7,
-            .start_key = "doc:a",
+            .start_key = "",
             .end_key = null,
             .range_id = 2001,
             .restore_backup_id = "snap1",

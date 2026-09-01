@@ -395,6 +395,16 @@ pub const MetadataHttpClient = struct {
         try self.requestWithBody(base_uri, .POST, routes.Routes.internal_restore_progress_remove, body, error.InvalidRestoreProgressRequest, null, null);
     }
 
+    pub fn syncRestoreProgress(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        body: []const u8,
+    ) !void {
+        if (body.len > metadata_table_manager.max_restore_progress_sync_body_bytes)
+            return error.RestoreProgressSyncRequestTooLarge;
+        try self.requestWithBody(base_uri, .POST, routes.Routes.internal_restore_progress_sync, body, error.InvalidRestoreProgressRequest, null, null);
+    }
+
     pub fn restoreExtensions(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -1253,6 +1263,56 @@ test "metadata http client uses the reallocation route and maps upgrade gating" 
         error.ReallocationProtocolUpgradeRequired,
         client.triggerReallocate("http://127.0.0.1:9000"),
     );
+}
+
+test "metadata http client sends bounded restore progress synchronization pages" {
+    const RecordingExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(
+                u8,
+                req.uri,
+                routes.Routes.internal_restore_progress_sync,
+            ));
+            try ant_json.testing.expectEqualJsonText(
+                alloc,
+                "{\"upserts\":[],\"removals\":[{\"table_id\":1,\"node_id\":2,\"group_id\":7001}]}",
+                req.body,
+            );
+            return .{
+                .status = 202,
+                .content_type = try alloc.dupe(u8, "text/plain"),
+                .body = try alloc.dupe(u8, "accepted"),
+            };
+        }
+    };
+
+    var executor = RecordingExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try client.syncRestoreProgress(
+        "http://127.0.0.1:9000",
+        "{\"upserts\":[],\"removals\":[{\"table_id\":1,\"node_id\":2,\"group_id\":7001}]}",
+    );
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+
+    const oversized = try std.testing.allocator.alloc(
+        u8,
+        metadata_table_manager.max_restore_progress_sync_body_bytes + 1,
+    );
+    defer std.testing.allocator.free(oversized);
+    try std.testing.expectError(
+        error.RestoreProgressSyncRequestTooLarge,
+        client.syncRestoreProgress("http://127.0.0.1:9000", oversized),
+    );
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
 }
 
 test "metadata http client does not replay reallocation after ambiguous transport failures" {

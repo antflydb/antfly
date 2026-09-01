@@ -2652,18 +2652,9 @@ fn validateManifestShards(
 
     const ordered = try alloc.dupe(ShardSnapshot, manifest.shards);
     defer alloc.free(ordered);
-    std.mem.sort(ShardSnapshot, ordered, {}, struct {
-        fn lessThan(_: void, lhs: ShardSnapshot, rhs: ShardSnapshot) bool {
-            const start_order = std.mem.order(u8, lhs.start_key, rhs.start_key);
-            if (start_order != .eq) return start_order == .lt;
-            return lhs.group_id < rhs.group_id;
-        }
-    }.lessThan);
-    for (ordered[0 .. ordered.len - 1], ordered[1..]) |left, right| {
-        const left_end = left.end_key orelse return error.InvalidBackupRangeTopology;
-        if (!std.mem.eql(u8, left_end, right.start_key))
-            return error.InvalidBackupRangeTopology;
-    }
+    metadata_table_manager.sortKeyspaceRanges(ShardSnapshot, ordered);
+    metadata_table_manager.validateCompleteKeyspaceRanges(ordered) catch
+        return error.InvalidBackupRangeTopology;
 }
 
 pub fn validateRestoreManifest(
@@ -10934,13 +10925,19 @@ pub fn deriveRestoreRanges(
     if (manifest.shards.len == 0) return error.UnsupportedBackupFormat;
     if (connection.len == 0 or connection.len > 256) return error.InvalidBackupRequest;
     try validateBackupId(artifact_backup_id);
-    const ranges = try alloc.alloc(metadata_table_manager.RangeRecord, manifest.shards.len);
+    const ordered_shards = try alloc.dupe(ShardSnapshot, manifest.shards);
+    defer alloc.free(ordered_shards);
+    metadata_table_manager.sortKeyspaceRanges(ShardSnapshot, ordered_shards);
+    metadata_table_manager.validateCompleteKeyspaceRanges(ordered_shards) catch
+        return error.InvalidBackupRangeTopology;
+
+    const ranges = try alloc.alloc(metadata_table_manager.RangeRecord, ordered_shards.len);
     var initialized: usize = 0;
     errdefer {
         for (ranges[0..initialized]) |record| metadata_table_manager.freeRange(alloc, record);
         alloc.free(ranges);
     }
-    for (manifest.shards, 0..) |shard, i| {
+    for (ordered_shards, 0..) |shard, i| {
         if (!group_ids.isDataGroupId(shard.group_id)) return error.UnsupportedBackupFormat;
         ranges[i] = try deriveRestoreRange(
             alloc,
@@ -17947,6 +17944,31 @@ test "backup manifest validation rejects ambiguous or unbound artifacts" {
         },
     };
     manifest.shards = &gapped_ranges;
+    try std.testing.expectError(
+        error.InvalidBackupRangeTopology,
+        validateTableManifest(std.testing.allocator, &manifest, "snap"),
+    );
+
+    const missing_leading_range = [_]ShardSnapshot{.{
+        .group_id = 7,
+        .start_key = "m",
+        .snapshot_path = "generation/groups/7",
+        .artifact_sha256 = valid_hash,
+    }};
+    manifest.shards = &missing_leading_range;
+    try std.testing.expectError(
+        error.InvalidBackupRangeTopology,
+        validateTableManifest(std.testing.allocator, &manifest, "snap"),
+    );
+
+    const missing_trailing_range = [_]ShardSnapshot{.{
+        .group_id = 7,
+        .start_key = "",
+        .end_key = "m",
+        .snapshot_path = "generation/groups/7",
+        .artifact_sha256 = valid_hash,
+    }};
+    manifest.shards = &missing_trailing_range;
     try std.testing.expectError(
         error.InvalidBackupRangeTopology,
         validateTableManifest(std.testing.allocator, &manifest, "snap"),

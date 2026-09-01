@@ -15,6 +15,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const fs_paths = @import("../common/fs_paths.zig");
+const common_group_ids = @import("../common/group_ids.zig");
 const common_secrets = @import("../common/secrets.zig");
 const metadata_mod = @import("domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
@@ -1672,6 +1673,198 @@ fn prepareEncodedTransitionBatch(
         };
     }
     return .{ .entries = try entries.toOwnedSlice(service.alloc) };
+}
+
+fn restoreProgressIdentityEqual(
+    lhs: metadata_table_manager.RestoreProgressIdentity,
+    rhs: metadata_table_manager.RestoreProgressIdentity,
+) bool {
+    return lhs.table_id == rhs.table_id and lhs.node_id == rhs.node_id and
+        lhs.group_id == rhs.group_id;
+}
+
+fn restoreProgressRecordIdentity(
+    record: metadata_table_manager.RestoreProgressRecord,
+) metadata_table_manager.RestoreProgressIdentity {
+    return .{
+        .table_id = record.table_id,
+        .node_id = record.node_id,
+        .group_id = record.group_id,
+    };
+}
+
+/// Admit one bounded reconciliation page as a contiguous Raft batch and wait
+/// for its terminal receipt. Every operation is idempotent, so an ambiguous
+/// transport outcome is safe for a data node to retry without changing the
+/// resulting projection.
+fn syncRestoreProgressBatch(
+    service: anytype,
+    sync: metadata_table_manager.RestoreProgressSync,
+) !void {
+    const total = std.math.add(usize, sync.upserts.len, sync.removals.len) catch
+        return error.InvalidRestoreProgressRequest;
+    if (total == 0 or total > metadata_table_manager.max_restore_progress_sync_records)
+        return error.InvalidRestoreProgressRequest;
+
+    for (sync.upserts, 0..) |record, index| {
+        const identity = restoreProgressRecordIdentity(record);
+        if (identity.table_id == 0 or identity.node_id == 0)
+            return error.InvalidRestoreProgressRequest;
+        common_group_ids.requireDataGroupId(identity.group_id) catch
+            return error.InvalidRestoreProgressRequest;
+        for (sync.upserts[0..index]) |previous| {
+            if (restoreProgressIdentityEqual(identity, restoreProgressRecordIdentity(previous)))
+                return error.InvalidRestoreProgressRequest;
+        }
+        for (sync.removals) |removal| {
+            if (restoreProgressIdentityEqual(identity, removal))
+                return error.InvalidRestoreProgressRequest;
+        }
+    }
+    for (sync.removals, 0..) |identity, index| {
+        if (identity.table_id == 0 or identity.node_id == 0)
+            return error.InvalidRestoreProgressRequest;
+        common_group_ids.requireDataGroupId(identity.group_id) catch
+            return error.InvalidRestoreProgressRequest;
+        for (sync.removals[0..index]) |previous| {
+            if (restoreProgressIdentityEqual(identity, previous))
+                return error.InvalidRestoreProgressRequest;
+        }
+    }
+
+    const commands = try service.alloc.alloc(metadata_storage.TransitionCommand, total);
+    defer service.alloc.free(commands);
+    var command_index: usize = 0;
+    for (sync.upserts) |record| {
+        commands[command_index] = .{ .upsert_restore_progress = record };
+        command_index += 1;
+    }
+    for (sync.removals) |identity| {
+        commands[command_index] = .{ .remove_restore_progress = .{
+            .table_id = identity.table_id,
+            .node_id = identity.node_id,
+            .group_id = identity.group_id,
+        } };
+        command_index += 1;
+    }
+
+    const receipt = try service.proposeTransitionCommandsWithReceipt(commands);
+    service.waitForTransitionApplied(receipt) catch |err| {
+        // The final entry may have committed before leadership or local
+        // visibility changed. Never attach a false non-admission proof to an
+        // accepted batch; the idempotent reporter will safely converge on its
+        // next reconciliation round.
+        std.log.warn(
+            "restore progress synchronization outcome became ambiguous after admission err={s}",
+            .{@errorName(err)},
+        );
+        return error.MetadataMutationOutcomeUnknown;
+    };
+}
+
+test "metadata service synchronizes restore progress as one bounded proposal batch" {
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+        proposed: usize = 0,
+        waited: bool = false,
+
+        fn proposeTransitionCommandsWithReceipt(
+            self: *@This(),
+            commands: []const metadata_storage.TransitionCommand,
+        ) !MetadataProposalReceipt {
+            self.proposed = commands.len;
+            try std.testing.expect(commands[0] == .upsert_restore_progress);
+            try std.testing.expect(commands[1] == .remove_restore_progress);
+            return .{ .term = 2, .index = 8 };
+        }
+
+        fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
+            try std.testing.expectEqual(@as(u64, 2), receipt.term);
+            try std.testing.expectEqual(@as(u64, 8), receipt.index);
+            self.waited = true;
+        }
+    };
+    var service = FakeService{ .alloc = std.testing.allocator };
+    try syncRestoreProgressBatch(&service, .{
+        .upserts = &.{.{
+            .table_id = 1,
+            .node_id = 2,
+            .group_id = 7001,
+            .backup_id = "backup",
+        }},
+        .removals = &.{.{ .table_id = 1, .node_id = 2, .group_id = 7002 }},
+    });
+    try std.testing.expectEqual(@as(usize, 2), service.proposed);
+    try std.testing.expect(service.waited);
+}
+
+test "metadata service rejects conflicting restore progress batch identities" {
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+
+        fn proposeTransitionCommandsWithReceipt(
+            _: *@This(),
+            _: []const metadata_storage.TransitionCommand,
+        ) !MetadataProposalReceipt {
+            return error.UnexpectedProposal;
+        }
+
+        fn waitForTransitionApplied(_: *@This(), _: MetadataProposalReceipt) !void {
+            return error.UnexpectedProposal;
+        }
+    };
+    var service = FakeService{ .alloc = std.testing.allocator };
+    try std.testing.expectError(
+        error.InvalidRestoreProgressRequest,
+        syncRestoreProgressBatch(&service, .{
+            .upserts = &.{.{
+                .table_id = 1,
+                .node_id = 2,
+                .group_id = 7001,
+                .backup_id = "backup",
+            }},
+            .removals = &.{.{ .table_id = 1, .node_id = 2, .group_id = 7001 }},
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidRestoreProgressRequest,
+        syncRestoreProgressBatch(&service, .{
+            .removals = &.{.{
+                .table_id = 1,
+                .node_id = 2,
+                .group_id = common_group_ids.main_metadata_group_id,
+            }},
+        }),
+    );
+}
+
+test "metadata restore progress batch never reports non-admission after receipt" {
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+
+        fn proposeTransitionCommandsWithReceipt(
+            _: *@This(),
+            _: []const metadata_storage.TransitionCommand,
+        ) !MetadataProposalReceipt {
+            return .{ .term = 2, .index = 8 };
+        }
+
+        fn waitForTransitionApplied(_: *@This(), _: MetadataProposalReceipt) !void {
+            return error.NotLeader;
+        }
+    };
+    var service = FakeService{ .alloc = std.testing.allocator };
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        syncRestoreProgressBatch(&service, .{
+            .upserts = &.{.{
+                .table_id = 1,
+                .node_id = 2,
+                .group_id = 7001,
+                .backup_id = "backup",
+            }},
+        }),
+    );
 }
 
 test "metadata service catalog reconciliation batch admits compact plans beyond the former count ceiling" {
@@ -3803,6 +3996,13 @@ pub const MetadataService = struct {
             .node_id = node_id,
             .group_id = group_id,
         } });
+    }
+
+    pub fn syncRestoreProgress(
+        self: *MetadataService,
+        sync: metadata_table_manager.RestoreProgressSync,
+    ) !void {
+        try syncRestoreProgressBatch(self, sync);
     }
 
     pub fn upsertReplicationSourceStatus(self: *MetadataService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
@@ -6318,6 +6518,13 @@ pub const MetadataHttpService = struct {
             .node_id = node_id,
             .group_id = group_id,
         } });
+    }
+
+    pub fn syncRestoreProgress(
+        self: *MetadataHttpService,
+        sync: metadata_table_manager.RestoreProgressSync,
+    ) !void {
+        try syncRestoreProgressBatch(self, sync);
     }
 
     pub fn upsertReplicationSourceStatus(self: *MetadataHttpService, record: metadata_table_manager.ReplicationSourceStatusRecord) !void {

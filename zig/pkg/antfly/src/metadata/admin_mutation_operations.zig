@@ -25,6 +25,7 @@ pub const Source = struct {
         upsert_schema_progress: *const fn (*anyopaque, std.mem.Allocator, metadata_table_manager.SchemaProgressRecord) anyerror!void,
         upsert_restore_progress: *const fn (*anyopaque, std.mem.Allocator, metadata_table_manager.RestoreProgressRecord) anyerror!void,
         remove_restore_progress: *const fn (*anyopaque, std.mem.Allocator, metadata_table_manager.RestoreProgressIdentity) anyerror!void,
+        sync_restore_progress: *const fn (*anyopaque, std.mem.Allocator, metadata_table_manager.RestoreProgressSync) anyerror!void,
     };
 };
 
@@ -92,6 +93,16 @@ pub const Operations = struct {
         try request.ensureActive();
         try self.source.vtable.remove_restore_progress(self.source.ptr, alloc, identity);
     }
+
+    pub fn syncRestoreProgress(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        sync: metadata_table_manager.RestoreProgressSync,
+    ) !void {
+        try request.ensureActive();
+        try self.source.vtable.sync_restore_progress(self.source.ptr, alloc, sync);
+    }
 };
 
 test "metadata admin mutations reject canceled work before reaching their source" {
@@ -138,6 +149,11 @@ test "metadata admin mutations reject canceled work before reaching their source
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
         }
+
+        fn syncRestoreProgress(ptr: *anyopaque, _: std.mem.Allocator, _: metadata_table_manager.RestoreProgressSync) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
     };
 
     var source = FakeSource{};
@@ -151,6 +167,7 @@ test "metadata admin mutations reject canceled work before reaching their source
             .upsert_schema_progress = FakeSource.upsertSchemaProgress,
             .upsert_restore_progress = FakeSource.upsertRestoreProgress,
             .remove_restore_progress = FakeSource.removeRestoreProgress,
+            .sync_restore_progress = FakeSource.syncRestoreProgress,
         },
     } };
     var canceled = std.atomic.Value(bool).init(true);

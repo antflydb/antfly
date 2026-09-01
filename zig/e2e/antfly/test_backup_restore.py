@@ -1221,7 +1221,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
             "title": "Three by Three Alpha",
             "content": "low range backup and restore coverage",
         },
-        "m:backup": {
+        "8:backup": {
             "title": "Three by Three Middle",
             "content": "middle range backup and restore coverage",
         },
@@ -1300,6 +1300,22 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         assert len(
             {int(shard["group_id"]) for shard in table_manifest["shards"]}
         ) == 3
+        routed_source_groups = set()
+        for key in source_docs:
+            matching_shards = [
+                shard
+                for shard in table_manifest["shards"]
+                if key >= shard["start_key"]
+                and (shard.get("end_key") is None or key < shard["end_key"])
+            ]
+            assert len(matching_shards) == 1, (
+                f"source key {key!r} did not resolve to exactly one backup shard: "
+                f"{matching_shards!r}"
+            )
+            routed_source_groups.add(int(matching_shards[0]["group_id"]))
+        assert len(routed_source_groups) == len(source_docs), (
+            "3x3 acceptance documents must exercise a non-empty payload in every shard"
+        )
         assert all(
             (Path(backup_dir) / shard["snapshot_path"]).is_file()
             for shard in table_manifest["shards"]

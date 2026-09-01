@@ -169,6 +169,8 @@ pub fn restore(
         ranges.len == 0 or ranges.len > topology_protocol.max_initial_ranges or
         ranges.len != @as(usize, table.min_ranges))
         return error.InvalidTableTopologyMutation;
+    metadata_table_manager.validateCompleteKeyspaceRanges(ranges) catch
+        return error.InvalidTableTopologyMutation;
     var unique_groups = std.AutoHashMapUnmanaged(u64, void).empty;
     defer unique_groups.deinit(alloc);
     try unique_groups.ensureTotalCapacity(alloc, @intCast(ranges.len));

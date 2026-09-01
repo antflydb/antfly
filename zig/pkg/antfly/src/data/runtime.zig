@@ -15316,35 +15316,33 @@ pub const DataServer = struct {
             self.alloc.free(local);
         }
 
-        for (local) |record| {
-            var unchanged = false;
-            for (projected) |existing| {
-                if (existing.table_id != record.table_id or existing.node_id != record.node_id or
-                    existing.group_id != record.group_id) continue;
-                unchanged = restoreProgressEquivalent(existing, record);
-                break;
-            }
-            if (!unchanged) try remote_metadata.upsertRestoreProgress(record);
-        }
+        var sync = try deriveRestoreProgressSync(
+            self.alloc,
+            local_node_id,
+            local,
+            projected,
+        );
+        defer sync.deinit(self.alloc);
 
-        // Once metadata clears a restore intent, the durable local marker is
-        // intentionally absent from the next collection. Retire the former
-        // observation as well; otherwise completed distributed restores leak
-        // one replicated progress row per placement forever.
-        for (projected) |existing| {
-            if (existing.node_id != local_node_id) continue;
-            var present = false;
-            for (local) |record| {
-                if (record.table_id != existing.table_id or record.node_id != existing.node_id or
-                    record.group_id != existing.group_id) continue;
-                present = true;
-                break;
-            }
-            if (!present) try remote_metadata.removeRestoreProgress(.{
-                .table_id = existing.table_id,
-                .node_id = existing.node_id,
-                .group_id = existing.group_id,
-            });
+        var upsert_offset: usize = 0;
+        var removal_offset: usize = 0;
+        while (upsert_offset < sync.upserts.len or removal_offset < sync.removals.len) {
+            const upsert_count = @min(
+                sync.upserts.len - upsert_offset,
+                antfly.metadata.table_manager.max_restore_progress_sync_records,
+            );
+            const removal_capacity = antfly.metadata.table_manager.max_restore_progress_sync_records -
+                upsert_count;
+            const removal_count = @min(
+                sync.removals.len - removal_offset,
+                removal_capacity,
+            );
+            try remote_metadata.syncRestoreProgress(
+                sync.upserts[upsert_offset .. upsert_offset + upsert_count],
+                sync.removals[removal_offset .. removal_offset + removal_count],
+            );
+            upsert_offset += upsert_count;
+            removal_offset += removal_count;
         }
     }
 
@@ -17086,7 +17084,133 @@ const RemoteMetadataSource = struct {
             }
         }.call, body);
     }
+
+    fn syncRestoreProgress(
+        self: *RemoteMetadataSource,
+        upserts: []const antfly.metadata.table_manager.RestoreProgressRecord,
+        removals: []const antfly.metadata.table_manager.RestoreProgressIdentity,
+    ) !void {
+        const total = std.math.add(usize, upserts.len, removals.len) catch
+            return error.RestoreProgressSyncRequestTooLarge;
+        if (total == 0) return;
+        if (total > antfly.metadata.table_manager.max_restore_progress_sync_records) {
+            const first_count = antfly.metadata.table_manager.max_restore_progress_sync_records;
+            const first_upsert_count = @min(upserts.len, first_count);
+            const first_removal_count = first_count - first_upsert_count;
+            try self.syncRestoreProgress(
+                upserts[0..first_upsert_count],
+                removals[0..first_removal_count],
+            );
+            return self.syncRestoreProgress(
+                upserts[first_upsert_count..],
+                removals[first_removal_count..],
+            );
+        }
+
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const body = try stringifyJsonAlloc(arena.allocator(), antfly.metadata.table_manager.RestoreProgressSync{
+            .upserts = upserts,
+            .removals = removals,
+        });
+        if (body.len > antfly.metadata.table_manager.max_restore_progress_sync_body_bytes) {
+            if (total == 1) return error.RestoreProgressSyncRequestTooLarge;
+            const first_count = total / 2;
+            const first_upsert_count = @min(upserts.len, first_count);
+            const first_removal_count = first_count - first_upsert_count;
+            try self.syncRestoreProgress(
+                upserts[0..first_upsert_count],
+                removals[0..first_removal_count],
+            );
+            return self.syncRestoreProgress(
+                upserts[first_upsert_count..],
+                removals[first_removal_count..],
+            );
+        }
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: []const u8) !void {
+                try client.syncRestoreProgress(base_uri, ctx);
+            }
+        }.call, body);
+    }
 };
+
+const OwnedRestoreProgressSync = struct {
+    upserts: []antfly.metadata.table_manager.RestoreProgressRecord,
+    removals: []antfly.metadata.table_manager.RestoreProgressIdentity,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.upserts);
+        alloc.free(self.removals);
+        self.* = undefined;
+    }
+};
+
+fn restoreProgressIdentity(
+    record: antfly.metadata.table_manager.RestoreProgressRecord,
+) antfly.metadata.table_manager.RestoreProgressIdentity {
+    return .{
+        .table_id = record.table_id,
+        .node_id = record.node_id,
+        .group_id = record.group_id,
+    };
+}
+
+fn deriveRestoreProgressSync(
+    alloc: std.mem.Allocator,
+    local_node_id: u64,
+    local: []const antfly.metadata.table_manager.RestoreProgressRecord,
+    projected: []const antfly.metadata.table_manager.RestoreProgressRecord,
+) !OwnedRestoreProgressSync {
+    const Identity = antfly.metadata.table_manager.RestoreProgressIdentity;
+    var projected_by_identity = std.AutoHashMapUnmanaged(Identity, usize).empty;
+    defer projected_by_identity.deinit(alloc);
+    var projected_local_count: usize = 0;
+    for (projected) |record| {
+        if (record.node_id == local_node_id) projected_local_count += 1;
+    }
+    try projected_by_identity.ensureTotalCapacity(alloc, @intCast(projected_local_count));
+    for (projected, 0..) |record, index| {
+        if (record.node_id != local_node_id) continue;
+        const entry = projected_by_identity.getOrPutAssumeCapacity(restoreProgressIdentity(record));
+        if (entry.found_existing) return error.InvalidRestoreProgressProjection;
+        entry.value_ptr.* = index;
+    }
+
+    var local_identities = std.AutoHashMapUnmanaged(Identity, void).empty;
+    defer local_identities.deinit(alloc);
+    try local_identities.ensureTotalCapacity(alloc, @intCast(local.len));
+    var upserts = std.ArrayListUnmanaged(antfly.metadata.table_manager.RestoreProgressRecord).empty;
+    errdefer upserts.deinit(alloc);
+    try upserts.ensureTotalCapacity(alloc, local.len);
+    for (local) |record| {
+        const identity = restoreProgressIdentity(record);
+        const entry = local_identities.getOrPutAssumeCapacity(identity);
+        if (entry.found_existing) return error.InvalidRestoreProgressProjection;
+        const unchanged = if (projected_by_identity.get(identity)) |index|
+            restoreProgressEquivalent(projected[index], record)
+        else
+            false;
+        if (!unchanged) upserts.appendAssumeCapacity(record);
+    }
+
+    // Once metadata clears a restore intent, the durable local marker is
+    // intentionally absent from the next collection. Retire the former
+    // observation as well; otherwise completed distributed restores leak one
+    // replicated progress row per placement forever.
+    var removals = std.ArrayListUnmanaged(Identity).empty;
+    errdefer removals.deinit(alloc);
+    try removals.ensureTotalCapacity(alloc, projected_by_identity.count());
+    for (projected) |record| {
+        if (record.node_id != local_node_id) continue;
+        const identity = restoreProgressIdentity(record);
+        if (!local_identities.contains(identity)) removals.appendAssumeCapacity(identity);
+    }
+    const owned_upserts = try upserts.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_upserts);
+    const owned_removals = try removals.toOwnedSlice(alloc);
+    return .{ .upserts = owned_upserts, .removals = owned_removals };
+}
 
 fn restoreProgressEquivalent(
     left: antfly.metadata.table_manager.RestoreProgressRecord,
@@ -17103,6 +17227,44 @@ fn restoreProgressEquivalent(
         left.runtime_repair_complete == right.runtime_repair_complete and
         std.mem.eql(u8, left.phase, right.phase) and
         std.mem.eql(u8, left.last_error, right.last_error);
+}
+
+test "restore progress synchronization derives linear-time exact delta" {
+    const Record = antfly.metadata.table_manager.RestoreProgressRecord;
+    const projected = [_]Record{
+        .{ .table_id = 1, .node_id = 9, .group_id = 7001, .backup_id = "b", .phase = "ready", .updated_at_ms = 1 },
+        .{ .table_id = 1, .node_id = 9, .group_id = 7002, .backup_id = "b", .phase = "restoring" },
+        .{ .table_id = 1, .node_id = 9, .group_id = 7003, .backup_id = "b", .phase = "ready" },
+        .{ .table_id = 1, .node_id = 10, .group_id = 7004, .backup_id = "b", .phase = "ready" },
+    };
+    const local = [_]Record{
+        .{ .table_id = 1, .node_id = 9, .group_id = 7001, .backup_id = "b", .phase = "ready", .updated_at_ms = 99 },
+        .{ .table_id = 1, .node_id = 9, .group_id = 7002, .backup_id = "b", .phase = "ready" },
+    };
+    var sync = try deriveRestoreProgressSync(
+        std.testing.allocator,
+        9,
+        &local,
+        &projected,
+    );
+    defer sync.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), sync.upserts.len);
+    try std.testing.expectEqual(@as(u64, 7002), sync.upserts[0].group_id);
+    try std.testing.expectEqual(@as(usize, 1), sync.removals.len);
+    try std.testing.expectEqual(@as(u64, 7003), sync.removals[0].group_id);
+}
+
+test "restore progress synchronization rejects duplicate projection identities" {
+    const Record = antfly.metadata.table_manager.RestoreProgressRecord;
+    const projected = [_]Record{
+        .{ .table_id = 1, .node_id = 9, .group_id = 7001, .backup_id = "b" },
+        .{ .table_id = 1, .node_id = 9, .group_id = 7001, .backup_id = "b" },
+    };
+    try std.testing.expectError(
+        error.InvalidRestoreProgressProjection,
+        deriveRestoreProgressSync(std.testing.allocator, 9, &.{}, &projected),
+    );
 }
 
 fn remoteTableLifecycleMatches(

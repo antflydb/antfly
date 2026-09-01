@@ -141,6 +141,7 @@ pub const AdminSource = struct {
         upsert_schema_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.SchemaProgressRecord) anyerror!void = null,
         upsert_restore_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.RestoreProgressRecord) anyerror!void = null,
         remove_restore_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, identity: metadata_table_manager.RestoreProgressIdentity) anyerror!void = null,
+        sync_restore_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, sync: metadata_table_manager.RestoreProgressSync) anyerror!void = null,
         trigger_reallocate: ?*const fn (ptr: *anyopaque) anyerror!void = null,
         request_split: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: SplitRequest) anyerror!void = null,
         request_merge: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: MergeRequest) anyerror!void = null,
@@ -360,6 +361,11 @@ pub const AdminSource = struct {
         return try fn_ptr(self.ptr, alloc, identity);
     }
 
+    pub fn syncRestoreProgress(self: AdminSource, alloc: std.mem.Allocator, sync: metadata_table_manager.RestoreProgressSync) !void {
+        const fn_ptr = self.vtable.sync_restore_progress orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, sync);
+    }
+
     pub fn triggerReallocate(self: AdminSource) !void {
         const fn_ptr = self.vtable.trigger_reallocate orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr);
@@ -463,6 +469,7 @@ pub const AdminSource = struct {
                 .upsert_schema_progress = metadataServiceUpsertSchemaProgress,
                 .upsert_restore_progress = metadataServiceUpsertRestoreProgress,
                 .remove_restore_progress = metadataServiceRemoveRestoreProgress,
+                .sync_restore_progress = metadataServiceSyncRestoreProgress,
                 .trigger_reallocate = metadataServiceTriggerReallocate,
                 .request_split = metadataServiceRequestSplit,
                 .request_merge = metadataServiceRequestMerge,
@@ -517,6 +524,7 @@ pub const AdminSource = struct {
                 .upsert_schema_progress = metadataHttpServiceUpsertSchemaProgress,
                 .upsert_restore_progress = metadataHttpServiceUpsertRestoreProgress,
                 .remove_restore_progress = metadataHttpServiceRemoveRestoreProgress,
+                .sync_restore_progress = metadataHttpServiceSyncRestoreProgress,
                 .trigger_reallocate = metadataHttpServiceTriggerReallocate,
                 .request_split = metadataHttpServiceRequestSplit,
                 .request_merge = metadataHttpServiceRequestMerge,
@@ -810,6 +818,11 @@ pub const AdminSource = struct {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         try svc.removeRestoreProgress(identity.table_id, identity.node_id, identity.group_id);
         try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceSyncRestoreProgress(ptr: *anyopaque, _: std.mem.Allocator, sync: metadata_table_manager.RestoreProgressSync) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.syncRestoreProgress(sync);
     }
 
     fn metadataServiceTriggerReallocate(ptr: *anyopaque) !void {
@@ -1205,6 +1218,11 @@ pub const AdminSource = struct {
         try flushMetadataHttpServiceMutation(svc);
     }
 
+    fn metadataHttpServiceSyncRestoreProgress(ptr: *anyopaque, _: std.mem.Allocator, sync: metadata_table_manager.RestoreProgressSync) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.syncRestoreProgress(sync);
+    }
+
     fn metadataHttpServiceTriggerReallocate(ptr: *anyopaque) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         try svc.requestReallocation(platform_clock.Clock.real().nowRealtimeMs());
@@ -1386,6 +1404,11 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_reallocate, httpx.Handler.bind(self, metadataTriggerReallocate));
         try server.post(routes.Routes.internal_schema_progress, httpx.Handler.bind(self, metadataUpsertSchemaProgress));
         try server.post(routes.Routes.internal_restore_progress, httpx.Handler.bind(self, metadataUpsertRestoreProgress));
+        try server.postWithBodyLimit(
+            routes.Routes.internal_restore_progress_sync,
+            metadata_table_manager.max_restore_progress_sync_body_bytes,
+            httpx.Handler.bind(self, metadataSyncRestoreProgress),
+        );
         try server.post(routes.Routes.internal_restore_progress_remove, httpx.Handler.bind(self, metadataRemoveRestoreProgress));
         try server.post(routes.Routes.internal_extension_restore, httpx.Handler.bind(self, metadataRestoreExtensions));
         const extension_path = routes.Routes.internal_extensions_prefix ++ ":extension_name";
@@ -1624,6 +1647,7 @@ pub const MetadataHttpServer = struct {
                 .upsert_schema_progress = upsertSchemaProgressOperation,
                 .upsert_restore_progress = upsertRestoreProgressOperation,
                 .remove_restore_progress = removeRestoreProgressOperation,
+                .sync_restore_progress = syncRestoreProgressOperation,
             },
         } };
     }
@@ -1666,8 +1690,15 @@ pub const MetadataHttpServer = struct {
         return self.source.removeRestoreProgress(alloc, identity);
     }
 
+    fn syncRestoreProgressOperation(ptr: *anyopaque, alloc: std.mem.Allocator, sync: metadata_table_manager.RestoreProgressSync) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.syncRestoreProgress(alloc, sync);
+    }
+
     fn metadataMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         if (err == error.UnsupportedOperation) return ctx.status(405).text("unsupported operation");
+        if (err == error.InvalidRestoreProgressRequest)
+            return ctx.status(400).text("invalid restore progress request");
         if (err == error.ReallocationProtocolUpgradeRequired)
             return ctx.status(503).text("metadata voter upgrade required");
         if (err == error.TableTopologyProtocolUpgradeRequired) {
@@ -1787,6 +1818,16 @@ pub const MetadataHttpServer = struct {
             return ctx.status(400).text("invalid restore progress removal request");
         defer parsed.deinit();
         self.mutationOperations().removeRestoreProgress(ctx.allocator, requestContext(ctx), parsed.value) catch |err|
+            return metadataMutationError(ctx, err);
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataSyncRestoreProgress(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse "";
+        var parsed = std.json.parseFromSlice(metadata_table_manager.RestoreProgressSync, ctx.allocator, body, .{}) catch
+            return ctx.status(400).text("invalid restore progress sync request");
+        defer parsed.deinit();
+        self.mutationOperations().syncRestoreProgress(ctx.allocator, requestContext(ctx), parsed.value) catch |err|
             return metadataMutationError(ctx, err);
         return ctx.status(202).text("accepted");
     }
