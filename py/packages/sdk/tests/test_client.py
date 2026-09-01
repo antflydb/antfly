@@ -26,8 +26,19 @@ from antfly import (  # noqa: E402
 )
 from antfly.client import normalize_base_url  # noqa: E402
 from antfly.client_generated.models.batch_request import BatchRequest  # noqa: E402
+from antfly.client_generated.models.graph_document_fuzzy_filter import (  # noqa: E402
+    GraphDocumentFuzzyFilter,
+)
+from antfly.client_generated.models.graph_document_numeric_range_filter import (  # noqa: E402
+    GraphDocumentNumericRangeFilter,
+)
+from antfly.client_generated.models.graph_document_term_filter import (  # noqa: E402
+    GraphDocumentTermFilter,
+)
 from antfly.client_generated.models.graph_index_stats import GraphIndexStats  # noqa: E402
 from antfly.client_generated.models.graph_index_stats_index_type import GraphIndexStatsIndexType  # noqa: E402
+from antfly.client_generated.models.graph_match_node import GraphMatchNode  # noqa: E402
+from antfly.client_generated.models.graph_match_query import GraphMatchQuery  # noqa: E402
 from antfly.client_generated.models.graph_metric_build_page_status import GraphMetricBuildPageStatus  # noqa: E402
 from antfly.client_generated.models.graph_metric_build_page_status_range_kind import (
     GraphMetricBuildPageStatusRangeKind,  # noqa: E402
@@ -38,17 +49,6 @@ from antfly.client_generated.models.graph_metric_query_metric_freshness import (
 )
 from antfly.client_generated.models.graph_metric_runtime_stats import GraphMetricRuntimeStats  # noqa: E402
 from antfly.client_generated.models.graph_metric_runtime_stats_role import GraphMetricRuntimeStatsRole  # noqa: E402
-from antfly.client_generated.models.graph_document_fuzzy_filter import (  # noqa: E402
-    GraphDocumentFuzzyFilter,
-)
-from antfly.client_generated.models.graph_document_numeric_range_filter import (  # noqa: E402
-    GraphDocumentNumericRangeFilter,
-)
-from antfly.client_generated.models.graph_document_term_filter import (  # noqa: E402
-    GraphDocumentTermFilter,
-)
-from antfly.client_generated.models.graph_match_node import GraphMatchNode  # noqa: E402
-from antfly.client_generated.models.graph_match_query import GraphMatchQuery  # noqa: E402
 from antfly.client_generated.models.inference_chat_message import InferenceChatMessage  # noqa: E402
 from antfly.client_generated.models.inference_generate_request import InferenceGenerateRequest  # noqa: E402
 from antfly.client_generated.models.inference_role import InferenceRole  # noqa: E402

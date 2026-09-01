@@ -119,7 +119,8 @@ test "lake graph segment decode observes cancellation inside adjacency scans" {
     defer alloc.free(payload);
     @memcpy(payload[0..4], wire_magic);
     std.mem.writeInt(u16, payload[4..6], wire_version, .little);
-    std.mem.writeInt(u32, payload[6..10], adjacency_count, .little);
+    std.mem.writeInt(u32, payload[6..10], 0, .little);
+    std.mem.writeInt(u32, payload[10..14], adjacency_count, .little);
     @memset(payload[header_len..], 0);
 
     const State = struct {

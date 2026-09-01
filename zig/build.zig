@@ -3022,6 +3022,16 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_api_restore_jobs_tests = addFilteredTestRunArtifact(b, api_restore_jobs_tests);
+    expectExactErrorLogs(
+        run_api_restore_jobs_tests,
+        "replicated restore persistence maps private callback errors to stable unavailability",
+        "2",
+    );
+    expectExactErrorLogs(
+        run_api_restore_jobs_tests,
+        "restore dispatch recovery retains worker ownership when begin fails",
+        "1",
+    );
     const lib_api_restore_jobs_test_step = b.step("lib-api-restore-jobs-test", "Run durable restore job store tests");
     lib_api_restore_jobs_test_step.dependOn(&run_api_restore_jobs_tests.step);
 
