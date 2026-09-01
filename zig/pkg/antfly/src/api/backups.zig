@@ -254,6 +254,10 @@ pub const backup_fence_definition_header = backup_contract.backup_fence_definiti
 pub const backup_fence_topology_count_header = backup_contract.backup_fence_topology_count_header;
 pub const backup_fence_topology_header = backup_contract.backup_fence_topology_header;
 pub const backup_writer_not_after_header = backup_contract.backup_writer_not_after_header;
+pub const backup_remaining_ms_header = backup_contract.backup_remaining_ms_header;
+pub const max_backup_server_budget_ms = backup_contract.max_backup_server_budget_ms;
+pub const backup_outcome_header = backup_contract.backup_outcome_header;
+pub const backup_outcome_stopped_v1 = backup_contract.backup_outcome_stopped_v1;
 pub const catalog_changed_message = backup_contract.catalog_changed_message;
 pub const backup_outcome_ambiguous_message = backup_contract.backup_outcome_ambiguous_message;
 

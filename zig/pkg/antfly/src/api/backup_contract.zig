@@ -19,6 +19,13 @@ pub const backup_fence_definition_header = "X-Antfly-Backup-Definition-SHA256";
 pub const backup_fence_topology_count_header = "X-Antfly-Backup-Topology-Count";
 pub const backup_fence_topology_header = "X-Antfly-Backup-Topology-SHA256";
 pub const backup_writer_not_after_header = "X-Antfly-Backup-Writer-Not-After-Unix-Ns";
+/// Relative storage-owner execution budget. The coordinator retains a small
+/// response reserve and never sends its process-local monotonic timestamp.
+pub const backup_remaining_ms_header = "X-Antfly-Backup-Remaining-Ms";
+pub const backup_server_response_reserve_ms: u32 = 250;
+pub const max_backup_server_budget_ms: u32 = 24 * 60 * 60 * 1_000;
+pub const backup_outcome_header = "X-Antfly-Backup-Outcome";
+pub const backup_outcome_stopped_v1 = "stopped-v1";
 pub const catalog_changed_message = "table changed during backup admission";
 pub const backup_outcome_ambiguous_message = "backup outcome is ambiguous; inspect the backup id before retrying";
 

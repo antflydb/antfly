@@ -306,6 +306,7 @@ pub const AntflyApiHandler = struct {
         self.api_server.recordHandledRequest();
         establishInternalTxnPreDecisionDeadline(ctx);
         establishInternalTxnStatusDeadline(ctx);
+        establishInternalBackupDeadline(ctx);
         establishCatalogRouteFenceDeadline(ctx);
         return next.call(ctx) catch |err| mapIngressError(ctx, err);
     }
@@ -348,6 +349,24 @@ pub const AntflyApiHandler = struct {
             return;
         };
         if (budget_ms == 0 or budget_ms > distributed_txn_contract.max_status_server_budget_ms) {
+            ctx.application_deadline_invalid = true;
+            return;
+        }
+        ctx.application_deadline_ns = platform_time.monotonicNs() +|
+            @as(u64, budget_ms) *| std.time.ns_per_ms;
+    }
+
+    fn establishInternalBackupDeadline(ctx: *httpx.Context) void {
+        if (ctx.application_deadline_ns != null or ctx.application_deadline_invalid) return;
+        const path = ctx.request.uri.path;
+        if (!std.mem.startsWith(u8, path, routes.internal_groups_prefix) or
+            !std.mem.endsWith(u8, path, routes.backup_shard_suffix)) return;
+        const raw = ctx.header(backups_api.backup_remaining_ms_header) orelse return;
+        const budget_ms = std.fmt.parseUnsigned(u32, raw, 10) catch {
+            ctx.application_deadline_invalid = true;
+            return;
+        };
+        if (budget_ms == 0 or budget_ms > backups_api.max_backup_server_budget_ms) {
             ctx.application_deadline_invalid = true;
             return;
         }
@@ -1506,6 +1525,14 @@ pub const AntflyApiHandler = struct {
             error.BackupAttemptLeaseLost, error.InvalidBackupFence => textResponse(ctx, 409, "backup writer lease lost"),
             error.UnsupportedBackupFormat => textResponse(ctx, 400, "unsupported backup format"),
             error.BackupOutcomeAmbiguous => textResponse(ctx, 500, "backup outcome ambiguous"),
+            error.Canceled, error.Cancelled => blk: {
+                try ctx.setHeader(backups_api.backup_outcome_header, backups_api.backup_outcome_stopped_v1);
+                break :blk textResponse(ctx, 408, "backup canceled");
+            },
+            error.Timeout, error.DeadlineExceeded => blk: {
+                try ctx.setHeader(backups_api.backup_outcome_header, backups_api.backup_outcome_stopped_v1);
+                break :blk textResponse(ctx, 504, "backup deadline exceeded");
+            },
             else => textResponse(ctx, 500, "internal server error"),
         };
         defer {
@@ -6586,6 +6613,22 @@ test "internal transaction ingress establishes and validates pre-decision deadli
     AntflyApiHandler.establishInternalTxnStatusDeadline(&invalid_status_ctx);
     try std.testing.expect(invalid_status_ctx.application_deadline_ns == null);
     try std.testing.expect(invalid_status_ctx.application_deadline_invalid);
+
+    var backup_request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        "http://127.0.0.1/internal/v1/groups/7/tables/docs/backup-shard",
+    );
+    defer backup_request.deinit();
+    try backup_request.setHeader(backups_api.backup_remaining_ms_header, "250");
+    var backup_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &backup_request);
+    defer backup_ctx.deinit();
+    const backup_before_ns = platform_time.monotonicNs();
+    AntflyApiHandler.establishInternalBackupDeadline(&backup_ctx);
+    const backup_after_ns = platform_time.monotonicNs();
+    const backup_deadline_ns = backup_ctx.application_deadline_ns.?;
+    try std.testing.expect(backup_deadline_ns >= backup_before_ns + budget_ms * std.time.ns_per_ms);
+    try std.testing.expect(backup_deadline_ns <= backup_after_ns + budget_ms * std.time.ns_per_ms);
 }
 
 test "HA mutation middleware fails closed for unregistered HTTP methods" {

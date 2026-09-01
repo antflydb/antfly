@@ -864,6 +864,9 @@ pub const ApiHttpServerConfig = struct {
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     /// Node-local inference request admission capacity. Zero is unlimited.
     inference_max_concurrent_requests: u32 = common_config.default_inference_max_concurrent_requests,
+    /// End-to-end ceiling for one table or cluster backup. This is distinct
+    /// from the longer durable writer fence used for safe cleanup.
+    backup_operation_timeout_ms: u64 = common_config.default_backup_operation_timeout_ms,
     /// Per-request graph execution ceilings owned by the operator. These are
     /// never populated from the public graph-query DSL.
     graph_execution_limits: @import("../graph/work_budget.zig").Limits = .{},
@@ -7395,6 +7398,7 @@ pub const ApiHttpServer = struct {
         backup_id: []const u8,
         format: backups_api.BackupFormat,
         connection: []const u8,
+        request: api_operation.RequestContext,
     ) !void {
         const artifact_backup_id = try self.backupGenerationIdAlloc();
         defer self.alloc.free(artifact_backup_id);
@@ -7410,6 +7414,7 @@ pub const ApiHttpServer = struct {
             format,
             connection,
             .logical_create,
+            request,
         );
     }
 
@@ -7446,6 +7451,7 @@ pub const ApiHttpServer = struct {
         format: backups_api.BackupFormat,
         connection: []const u8,
         writer_lease_role: TableBackupWriterLeaseRole,
+        request: api_operation.RequestContext,
     ) !void {
         if (!std.mem.eql(u8, table.name, table_name)) return error.TableNotFound;
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
@@ -7607,7 +7613,7 @@ pub const ApiHttpServer = struct {
             writer_lease_future.await(io);
         };
         var cleanup_safe = true;
-        self.executeReservedTableBackup(io, table, writer_fence, table_name, backup_location, location_uri, backup_id, artifact_backup_id, format, connection, &writer_lease_heartbeat, &cleanup_safe) catch |err| {
+        self.executeReservedTableBackup(io, table, writer_fence, table_name, backup_location, location_uri, backup_id, artifact_backup_id, format, connection, request, &writer_lease_heartbeat, &cleanup_safe) catch |err| {
             writer_lease_heartbeat.stop_event.set(io);
             writer_lease_future.await(io);
             writer_lease_future_running = false;
@@ -7662,11 +7668,27 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn boundedBackupRequest(
+        self: *const ApiHttpServer,
+        request: api_operation.RequestContext,
+    ) api_operation.RequestContext {
+        var bounded = request;
+        const configured_duration_ns = @max(
+            @as(u64, 1),
+            self.cfg.backup_operation_timeout_ms,
+        ) *| std.time.ns_per_ms;
+        const configured_deadline_ns = platform_time.monotonicNs() +| configured_duration_ns;
+        bounded.deadline_ns = if (request.deadline_ns) |deadline_ns|
+            @min(deadline_ns, configured_deadline_ns)
+        else
+            configured_deadline_ns;
+        return bounded;
+    }
+
     fn backupOperationControl(
         io: std.Io,
         fence: backups_api.TableBackupFence,
-        cancellation: CancellationToken,
-        request_deadline_ns: ?u64,
+        request: api_operation.RequestContext,
     ) !backups_api.BackupOperationControl {
         const writer_not_after = fence.writer_not_after_unix_ns orelse
             return error.InvalidBackupFence;
@@ -7674,11 +7696,11 @@ pub const ApiHttpServer = struct {
         if (now_unix_ns >= writer_not_after) return error.BackupAttemptLeaseLost;
         const lease_deadline_ns = platform_time.monotonicNs() +| (writer_not_after - now_unix_ns);
         return .{
-            .deadline_ns = if (request_deadline_ns) |deadline_ns|
+            .deadline_ns = if (request.deadline_ns) |deadline_ns|
                 @min(deadline_ns, lease_deadline_ns)
             else
                 lease_deadline_ns,
-            .cancellation = cancellation,
+            .cancellation = request.cancellation,
         };
     }
 
@@ -7694,11 +7716,12 @@ pub const ApiHttpServer = struct {
         artifact_backup_id: []const u8,
         format: backups_api.BackupFormat,
         connection: []const u8,
+        request: api_operation.RequestContext,
         writer_lease: *TableBackupWriterLeaseHeartbeat,
         cleanup_safe: *bool,
     ) !void {
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
-        var operation_control = try backupOperationControl(io, fence, .none, null);
+        var operation_control = try backupOperationControl(io, fence, request);
         const forwarded_shards = table_writes_source.backupTableToLocation(self.alloc, table_name, artifact_backup_id, format, fence, location_uri, connection, backup_location, operation_control) catch |err| {
             if (err == error.BackupOutcomeAmbiguous) cleanup_safe.* = false;
             return err;
@@ -7830,7 +7853,8 @@ pub const ApiHttpServer = struct {
         // lease so a long snapshot remains valid and stale-attempt cleanup
         // cannot race an in-flight upload after the coordinator disconnects.
         try ensure_writer_active(io, writer_not_after);
-        var operation_control = try backupOperationControl(io, fence, request.cancellation, request.deadline_ns);
+        const bounded_request = self.boundedBackupRequest(request);
+        var operation_control = try backupOperationControl(io, fence, bounded_request);
         var writer_lease: TableBackupWriterLeaseHeartbeat = .{
             .alloc = self.alloc,
             .io = io,
@@ -10535,10 +10559,11 @@ pub const ApiHttpServer = struct {
         request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        try ensureTableOperationActive(request);
+        const operation_request = self.boundedBackupRequest(request);
+        try ensureTableOperationActive(operation_request);
         var admitted_fence: backups_api.TableBackupFence = undefined;
         var table = table: {
-            var authoritative_snapshot = (self.source.linearizableSnapshot(request) catch |err| {
+            var authoritative_snapshot = (self.source.linearizableSnapshot(operation_request) catch |err| {
                 if (err == error.Canceled or err == error.Cancelled) return error.Canceled;
                 if (err == error.DeadlineExceeded) return error.DeadlineExceeded;
                 std.log.warn("table backup metadata read barrier failed phase=admission class={s}", .{@errorName(err)});
@@ -10562,10 +10587,11 @@ pub const ApiHttpServer = struct {
             null;
         defer if (fallback_io) |*owned| owned.deinit();
         const io = self.sharedApiIo() orelse fallback_io.?.io();
-        // This is the last safe cancellation point: once backup publication
-        // starts, returning cancellation could invite an unsafe replay after
-        // an ambiguous durable outcome.
-        try ensureTableOperationActive(request);
+        // Establish admission before publication. Cancellation remains safe
+        // afterward because the operation control drains in-flight work and
+        // the reservation rollback path converts uncertain delivery into an
+        // explicitly ambiguous outcome.
+        try ensureTableOperationActive(operation_request);
         // A forwarded storage-owner hop must preserve the coordinator's
         // generation ID. Generating another ID here would leave cleanup unable
         // to address the actual payload after a failed or ambiguous transport.
@@ -10589,8 +10615,9 @@ pub const ApiHttpServer = struct {
                 // create the lease; current coordinators carry metadata
                 // identity and require adoption of their delivery fence.
                 if (forwarded_fence.hasMetadataIdentity()) .adopt else .legacy_forwarded_create,
+                operation_request,
             );
-        } else self.backupOwnedTable(io, &table, admitted_fence, table_name, location, location_uri, backup_id, format, connection);
+        } else self.backupOwnedTable(io, &table, admitted_fence, table_name, location, location_uri, backup_id, format, connection, operation_request);
         backup_result catch |err| switch (err) {
             error.NotLeader,
             error.ProposalDropped,
@@ -10603,6 +10630,8 @@ pub const ApiHttpServer = struct {
             error.BackupAlreadyExists => return error.BackupAlreadyExists,
             error.BackupOutcomeAmbiguous => return error.BackupOutcomeAmbiguous,
             error.BackupAttemptLeaseLost => return error.BackupOutcomeAmbiguous,
+            error.Canceled, error.Cancelled => return error.Canceled,
+            error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -11668,7 +11697,8 @@ pub const ApiHttpServer = struct {
         request: api_operation.RequestContext,
     ) cluster_api_http.ClusterApi.ExecuteBackupError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        request.ensureActive() catch |err| switch (err) {
+        const operation_request = self.boundedBackupRequest(request);
+        operation_request.ensureActive() catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
             else => return error.InternalFailure,
@@ -11683,7 +11713,7 @@ pub const ApiHttpServer = struct {
         var trace: ClusterBackupExecutionTrace = .{};
         errdefer |err| trace.logFailure(err);
 
-        var authoritative_snapshot = (self.source.linearizableSnapshot(request) catch |err| {
+        var authoritative_snapshot = (self.source.linearizableSnapshot(operation_request) catch |err| {
             if (err == error.Canceled or err == error.Cancelled) return error.Canceled;
             if (err == error.DeadlineExceeded) return error.DeadlineExceeded;
             if (metadata_authority.isRetryableError(err)) return error.NotLeader;
@@ -11694,7 +11724,7 @@ pub const ApiHttpServer = struct {
             return error.MetadataCapabilityUnavailable;
         };
         defer self.source.freeAdminSnapshot(&authoritative_snapshot);
-        request.ensureActive() catch |err| switch (err) {
+        operation_request.ensureActive() catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
             else => return error.InternalFailure,
@@ -11784,7 +11814,7 @@ pub const ApiHttpServer = struct {
         // Cancellation is safe through this point because no durable backup
         // state exists. Once the marker is published, preserve the existing
         // ambiguous-outcome invariant and let cleanup own failure handling.
-        request.ensureActive() catch |err| switch (err) {
+        operation_request.ensureActive() catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
             else => return error.InternalFailure,
@@ -11924,6 +11954,7 @@ pub const ApiHttpServer = struct {
                 req.format,
                 connection,
                 .logical_create,
+                operation_request,
             ) catch |err| {
                 if (err == error.BackupOutcomeAmbiguous) {
                     // The forwarded owner may still be completing work after a
@@ -11960,6 +11991,8 @@ pub const ApiHttpServer = struct {
                     error.BackupManifestTooLarge => backups_api.manifest_too_large_message,
                     error.CatalogChanged => backups_api.catalog_changed_message,
                     error.BackupOutcomeAmbiguous => backups_api.backup_outcome_ambiguous_message,
+                    error.Canceled, error.Cancelled => return error.Canceled,
+                    error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
                     else => blk: {
                         std.log.warn("cluster backup table snapshot failed table={s} class={s}", .{
                             table_name,
@@ -38028,6 +38061,7 @@ test "table backup retry preserves the retained ambiguous generation" {
             .portable,
             "backups",
             .logical_create,
+            .{},
         ),
     );
     const retained = (try backups_api.tableBackupAttemptArtifactIdAlloc(
@@ -38143,6 +38177,7 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         .portable,
         "backups",
         .logical_create,
+        .{},
     );
     try std.testing.expect(!try backups_api.renewTableBackupWriterLeaseAtLocation(
         alloc,
@@ -38164,6 +38199,7 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         .portable,
         "backups",
         .legacy_forwarded_create,
+        .{},
     );
     try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(
         alloc,
@@ -38194,6 +38230,7 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         .portable,
         "backups",
         .adopt,
+        .{},
     );
     try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(
         alloc,

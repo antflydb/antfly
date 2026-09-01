@@ -21557,7 +21557,7 @@ test "backup storage resolution rejects a reused table name from another incarna
     try std.testing.expectError(error.CatalogChanged, resolveFencedBackupGroup(catalog.iface(), "docs", fence, null));
 }
 
-fn selectHostedBackupFanoutError(result_slots: anytype, workers: anytype) ?anyerror {
+fn selectHostedBackupFanoutError(result_slots: anytype, workers: anytype, await_err: ?anyerror) ?anyerror {
     // A may-have-committed sibling must dominate a deterministic pre-send
     // failure, otherwise the coordinator could delete an attempt whose remote
     // publisher is still authoritative.
@@ -21566,7 +21566,7 @@ fn selectHostedBackupFanoutError(result_slots: anytype, workers: anytype) ?anyer
     };
     for (result_slots) |slot| if (slot.err) |err| return err;
     for (workers) |worker| if (worker.err) |err| return err;
-    return null;
+    return await_err;
 }
 
 test "hosted backup fanout makes ambiguous publication dominate ordered failures" {
@@ -21578,7 +21578,17 @@ test "hosted backup fanout makes ambiguous publication dominate ordered failures
     const workers = [_]Slot{.{ .err = error.Canceled }};
     try std.testing.expectEqual(
         error.BackupOutcomeAmbiguous,
-        selectHostedBackupFanoutError(&slots, &workers).?,
+        selectHostedBackupFanoutError(&slots, &workers, error.Canceled).?,
+    );
+}
+
+test "hosted backup fanout reports drain failure after worker outcomes" {
+    const Slot = struct { err: ?anyerror = null };
+    const slots = [_]Slot{.{}};
+    const workers = [_]Slot{.{}};
+    try std.testing.expectEqual(
+        error.Canceled,
+        selectHostedBackupFanoutError(&slots, &workers, error.Canceled).?,
     );
 }
 
@@ -22683,11 +22693,14 @@ pub const HostedProvisionedTableWriteSource = struct {
             // Always drain the bounded worker set before borrowed routing and
             // request state leaves scope. The first failure stops admission;
             // in-flight requests observe the shared cancellation token.
-            try group.await(io_impl.?.io());
+            var await_err: ?anyerror = null;
+            group.await(io_impl.?.io()) catch |err| {
+                await_err = err;
+            };
             // Ambiguity dominates deterministic ordering: a lower-index
             // pre-send failure must never authorize cleanup when a sibling
             // may already have published its shard after transport delivery.
-            if (selectHostedBackupFanoutError(result_slots, workers)) |err| return err;
+            if (selectHostedBackupFanoutError(result_slots, workers, await_err)) |err| return err;
 
             // Clone in catalog order on the request thread. Workers allocate
             // only their compact returned manifests from the page allocator,

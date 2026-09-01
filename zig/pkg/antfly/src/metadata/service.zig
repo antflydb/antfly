@@ -84,6 +84,31 @@ const runtime_status_protocol_probe_min_backoff_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_max_backoff_ns: u64 = 60 * std.time.ns_per_s;
 const table_catalog_mutation_lane_count: usize = 64;
 
+fn listActiveRestoreRangesRepairing(
+    alloc: std.mem.Allocator,
+    store: *metadata_storage.RaftApplyStore,
+    metadata_group_id: u64,
+) ![]metadata_table_manager.RangeRecord {
+    // The steady-state control-loop read must remain read-only. Repair is
+    // exceptional: first refresh a missing/stale marker, then force a rebuild
+    // only if the indexed rows still fail their consistency check.
+    var repair_attempt: u8 = 0;
+    while (true) {
+        return store.listActiveRestoreRanges(alloc, metadata_group_id) catch |err| switch (err) {
+            error.InvalidDerivedCatalogIndex => {
+                switch (repair_attempt) {
+                    0 => try store.ensureDerivedCatalogIndexes(metadata_group_id),
+                    1 => try store.rebuildDerivedCatalogIndexes(metadata_group_id),
+                    else => return err,
+                }
+                repair_attempt += 1;
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
 pub const AdminSnapshotFence = struct {
     metadata_group_id: u64,
     metadata_incarnation: ?metadata_api.MetadataClusterIncarnation,
@@ -4892,15 +4917,7 @@ pub const MetadataService = struct {
 
     pub fn listProjectedActiveRestoreRanges(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        var attempt: u8 = 0;
-        while (attempt < 2) : (attempt += 1) {
-            if (attempt == 0) try store.ensureDerivedCatalogIndexes(self.metadata_group_id) else try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
-            return store.listActiveRestoreRanges(alloc, self.metadata_group_id) catch |err| switch (err) {
-                error.InvalidDerivedCatalogIndex => continue,
-                else => return err,
-            };
-        }
-        return error.InvalidDerivedCatalogIndex;
+        return try listActiveRestoreRangesRepairing(alloc, store, self.metadata_group_id);
     }
 
     pub fn freeProjectedRanges(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
@@ -8664,15 +8681,7 @@ pub const MetadataHttpService = struct {
 
     pub fn listProjectedActiveRestoreRanges(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        var attempt: u8 = 0;
-        while (attempt < 2) : (attempt += 1) {
-            if (attempt == 0) try store.ensureDerivedCatalogIndexes(self.metadata_group_id) else try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
-            return store.listActiveRestoreRanges(alloc, self.metadata_group_id) catch |err| switch (err) {
-                error.InvalidDerivedCatalogIndex => continue,
-                else => return err,
-            };
-        }
-        return error.InvalidDerivedCatalogIndex;
+        return try listActiveRestoreRangesRepairing(alloc, store, self.metadata_group_id);
     }
 
     pub fn freeProjectedRanges(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
