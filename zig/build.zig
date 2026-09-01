@@ -4605,6 +4605,7 @@ pub fn build(b: *std.Build) void {
         "remote metadata source bounds unsupported linearizable snapshot probes",
         "remote metadata source shares backend runtime io across a bounded executor pool",
         "data runtime treats transient metadata failures as retryable bootstrap failures",
+        "data runtime retries incomplete split provisioning projections",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "data runtime heartbeat cache cannot regress to an older full report",
         "idle cached runtime status stays fresh only for the published root generation",
