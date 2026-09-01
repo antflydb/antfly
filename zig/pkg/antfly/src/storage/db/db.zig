@@ -57037,6 +57037,7 @@ test "db searches fail fast without joining portable activation recovery" {
 }
 
 test "db portable resolver activation stops partial startup before retry reload" {
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
     const alloc = std.testing.allocator;
     var source_buf: [256]u8 = undefined;
     const source_path = tempPath(&source_buf);
