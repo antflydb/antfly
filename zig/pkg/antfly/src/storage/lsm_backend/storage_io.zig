@@ -148,6 +148,27 @@ pub const AtomicWriteCacheIntent = enum {
     cold_sequential,
 };
 
+/// Keep the public storage hint independent of Zig's OS-specific constant
+/// containers. POSIX_FADV is a namespace of integer constants rather than an
+/// enum on Linux, and fadvise accepts the platform ABI's integer value.
+fn linuxWriteCacheAdvice(intent: AtomicWriteCacheIntent) usize {
+    return switch (intent) {
+        .normal => std.os.linux.POSIX_FADV.NORMAL,
+        .cold_sequential => std.os.linux.POSIX_FADV.SEQUENTIAL,
+    };
+}
+
+test "Linux write cache advice preserves the fadvise ABI" {
+    try std.testing.expectEqual(
+        @as(usize, std.os.linux.POSIX_FADV.NORMAL),
+        linuxWriteCacheAdvice(.normal),
+    );
+    try std.testing.expectEqual(
+        @as(usize, std.os.linux.POSIX_FADV.SEQUENTIAL),
+        linuxWriteCacheAdvice(.cold_sequential),
+    );
+}
+
 /// A file lease for one-pass maintenance reads. Native implementations use a
 /// descriptor distinct from the shared foreground FD cache, so cache policy
 /// cannot leak across concurrent query reads.
@@ -3224,11 +3245,7 @@ const NativeAtomicWriteSink = struct {
                 _ = std.posix.system.fcntl(self.fd, std.posix.F.NODIRECT, enabled);
             },
             .linux => {
-                const advice: std.os.linux.POSIX_FADV = if (intent == .cold_sequential)
-                    std.os.linux.POSIX_FADV.SEQUENTIAL
-                else
-                    std.os.linux.POSIX_FADV.NORMAL;
-                _ = std.os.linux.fadvise(self.fd, 0, 0, advice);
+                _ = std.os.linux.fadvise(self.fd, 0, 0, linuxWriteCacheAdvice(intent));
             },
             else => {},
         }
