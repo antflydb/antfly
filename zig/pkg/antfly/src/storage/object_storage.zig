@@ -28,6 +28,7 @@ pub const GetOptions = objectstore.GetOptions;
 pub const CancellationToken = objectstore.CancellationToken;
 pub const DeleteOptions = objectstore.DeleteOptions;
 pub const ListOptions = objectstore.ListOptions;
+pub const ListObjectVersionsOptions = objectstore.ListObjectVersionsOptions;
 pub const ByteRange = objectstore.ByteRange;
 pub const PutResult = objectstore.PutResult;
 pub const GetResult = objectstore.GetResult;
@@ -35,6 +36,8 @@ pub const ObjectPart = objectstore.ObjectPart;
 pub const ObjectAttributes = objectstore.ObjectAttributes;
 pub const ListEntry = objectstore.ListEntry;
 pub const ListResult = objectstore.ListResult;
+pub const ObjectVersionEntry = objectstore.ObjectVersionEntry;
+pub const ListObjectVersionsResult = objectstore.ListObjectVersionsResult;
 
 pub const FilesystemObjectStorage = objectstore.FilesystemClient;
 pub const MemoryObjectStorage = objectstore.MemoryClient;

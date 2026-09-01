@@ -526,6 +526,8 @@ pub const MetadataProjectionKind = enum(u32) {
     placement_version_fences = 28,
     /// Tables and ranges captured from one committed storage snapshot.
     catalog_projection = 29,
+    /// Durable metadata authority and applied catalog revision.
+    catalog_cursor = 30,
 };
 
 pub const MetadataProjectionRequest = extern struct {
@@ -1084,12 +1086,14 @@ pub const MaintenanceAction = enum(u32) {
     lsm_step = 2,
     lsm_step_best_effort = 3,
     dense_posting_idle = 4,
+    prepare_ha_seed_snapshot = 5,
 };
 
 pub const MaintenanceRequest = extern struct {
     version: u32 = abi_version,
     action: u32 = @intFromEnum(MaintenanceAction.inspect),
     table_name: BorrowedBytes = .{},
+    deadline_ns: u64 = 0,
 };
 
 pub const MaintenanceResult = extern struct {

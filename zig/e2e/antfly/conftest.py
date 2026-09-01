@@ -326,7 +326,8 @@ def ready_index_status(
         return None
     if status.get("rebuilding", status.get("backfill_active", False)):
         return None
-    if status.get("backfill_state") == "failed":
+    backfill_state = status.get("backfill_state")
+    if backfill_state is not None and backfill_state != "ready":
         return None
     if isinstance(status.get("repair"), dict):
         return None
@@ -1538,10 +1539,15 @@ class OpenAiEmbeddingServer:
     @staticmethod
     def _vector_for_text(text: str) -> list[float]:
         lowered = text.lower()
-        if "alpha" in lowered or "concept" in lowered:
+        # Keep named concepts distinct even when both inputs contain the
+        # generic word "concept".  Returning the alpha vector for
+        # "beta concept" makes ranking a nondeterministic exact tie.
+        if "alpha" in lowered:
             return [1.0, 0.0, 0.0]
         if "beta" in lowered:
             return [0.0, 1.0, 0.0]
+        if "concept" in lowered:
+            return [1.0, 0.0, 0.0]
         if "retrieval" in lowered or "semantic" in lowered:
             return [0.8, 0.2, 0.0]
         return [0.0, 0.0, 1.0]

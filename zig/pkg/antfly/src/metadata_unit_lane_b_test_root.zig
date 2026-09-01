@@ -5,6 +5,7 @@
 // the License at https://www.antfly.io/licensing/ELv2-license.
 
 const service = @import("metadata/service.zig");
+const catalog_projection_reader = @import("metadata/catalog_projection_reader.zig");
 const admin_read_operations = @import("metadata/admin_read_operations.zig");
 const admin_mutation_operations = @import("metadata/admin_mutation_operations.zig");
 const extension_operations = @import("metadata/extension_operations.zig");
@@ -27,6 +28,7 @@ const replication_backfill = @import("metadata/replication_backfill.zig");
 
 test {
     _ = service;
+    _ = catalog_projection_reader;
     _ = admin_read_operations;
     _ = admin_mutation_operations;
     _ = extension_operations;

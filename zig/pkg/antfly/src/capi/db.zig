@@ -2991,6 +2991,11 @@ pub fn metadataApplyStoreProjection(
             defer handle.store.freeRanges(alloc, value.ranges);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
+        .catalog_cursor => blk: {
+            const value = handle.store.captureCatalogCursor(request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .table => blk: {
             const value = handle.store.getTable(alloc, request.group_id, request.arg0) catch |err|
                 break :blk storageOwnerStatusFromError(err);
@@ -5928,10 +5933,15 @@ pub fn storageOwnerMaintenance(
             out_result.dense_steps = @intCast(steps);
             out_result.progressed = @intFromBool(steps != 0);
         },
+        .prepare_ha_seed_snapshot => {
+            if (request.deadline_ns == 0) return .invalid_argument;
+            handle.db.prepareHASeedSnapshot(request.deadline_ns) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
     }
 
     out_result.maintenance_score = switch (action) {
-        .inspect, .lsm_step => @max(
+        .inspect, .lsm_step, .prepare_ha_seed_snapshot => @max(
             handle.db.lsmMaintenanceScore(),
             handle.db.lsmMaintenanceDebtHint(),
         ),

@@ -58,10 +58,8 @@ pub const MaintenanceStats = struct {
     bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
 };
 
-pub const CatalogProjectionSnapshot = struct {
-    tables: []metadata.TableRecord,
-    ranges: []metadata.RangeRecord,
-};
+pub const CatalogProjectionSnapshot = contract.CatalogProjectionSnapshot;
+pub const CatalogCursor = contract.CatalogCursor;
 
 const ListenerRegistration = struct {
     projection: ?ProjectionListener = null,
@@ -321,6 +319,13 @@ pub const RaftApplyStore = struct {
             error.Timeout => error.CatalogRoutingSnapshotTimeout,
             else => err,
         };
+    }
+
+    pub fn captureCatalogCursor(self: *RaftApplyStore, group_id: u64) !CatalogCursor {
+        return try self.projection(CatalogCursor, .{
+            .kind = .catalog_cursor,
+            .group_id = group_id,
+        });
     }
 
     pub fn freeTables(_: *RaftApplyStore, alloc: std.mem.Allocator, values: []metadata.TableRecord) void {

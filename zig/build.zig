@@ -1858,6 +1858,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const pdf_standard_fonts_mod = b.createModule(.{
+        .root_source_file = b.path("pdf_standard_fonts.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
         .target = target,
@@ -1865,6 +1870,7 @@ pub fn build(b: *std.Build) void {
     });
     pdf_mod.addImport("antfly_image", image_mod);
     pdf_mod.addImport("antfly_font", font_mod);
+    pdf_mod.addImport("pdf_standard_fonts", pdf_standard_fonts_mod);
     if (target.result.os.tag == .macos) {
         addMacosSdkPaths(b, pdf_mod, target);
         pdf_mod.linkFramework("CoreFoundation", .{});
@@ -1880,6 +1886,11 @@ pub fn build(b: *std.Build) void {
         .target = wasm_target,
         .optimize = optimize,
     });
+    const wasm_pdf_standard_fonts_mod = b.createModule(.{
+        .root_source_file = b.path("pdf_standard_fonts.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
     const wasm_font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
         .target = wasm_target,
@@ -1887,6 +1898,7 @@ pub fn build(b: *std.Build) void {
     });
     wasm_pdf_mod.addImport("antfly_image", wasm_image_mod);
     wasm_pdf_mod.addImport("antfly_font", wasm_font_mod);
+    wasm_pdf_mod.addImport("pdf_standard_fonts", wasm_pdf_standard_fonts_mod);
 
     const sentencepiece_proto_mod = addLocalSentencePieceProtoModule(b, protobuf_dep);
     const inference_jinja_mod = b.createModule(.{
@@ -3210,6 +3222,7 @@ pub fn build(b: *std.Build) void {
     });
     pdf_test_mod.addImport("antfly_image", image_mod);
     pdf_test_mod.addImport("antfly_font", font_mod);
+    pdf_test_mod.addImport("pdf_standard_fonts", pdf_standard_fonts_mod);
     if (target.result.os.tag == .macos) {
         addMacosSdkPaths(b, pdf_test_mod, target);
         pdf_test_mod.linkFramework("CoreFoundation", .{});
@@ -3276,8 +3289,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    const pdf_bench_standard_fonts_mod = b.createModule(.{
+        .root_source_file = b.path("pdf_standard_fonts.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
     pdf_bench_pdf_mod.addImport("antfly_image", pdf_bench_image_mod);
     pdf_bench_pdf_mod.addImport("antfly_font", pdf_bench_font_mod);
+    pdf_bench_pdf_mod.addImport("pdf_standard_fonts", pdf_bench_standard_fonts_mod);
     if (target.result.os.tag == .macos) {
         addMacosSdkPaths(b, pdf_bench_pdf_mod, target);
         pdf_bench_pdf_mod.linkFramework("CoreFoundation", .{});
@@ -3733,6 +3752,18 @@ pub fn build(b: *std.Build) void {
         "compact index repair status keeps corrupt terminal state actionable",
         "data runtime report preserves compact managed repair admission state",
         "metadata status JSON preserves compact managed repair admission state",
+        "catalog sources without compact routing fail closed",
+        "span routing uses compact catalog snapshot when available",
+        "span routing confirms eventual misses with a linearizable compact snapshot",
+        "route resolver confirms a table-present range miss linearly",
+        "eventual span routing distinguishes snapshot timeout",
+        "await route observes delayed publication without a polling sleep",
+        "await route distinguishes persistent absence from capture timeout",
+        "await route reports an expired pre-capture deadline as timed out",
+        "route projection preserves order and remains bounded after capture",
+        "pinned fanout rejects mismatched fence identity",
+        "metadata routing server converts relative budget to local deadline",
+        "metadata routing change client forwards an authority-scoped long poll",
         "remote runtime status reports replay debt separately from active catch-up",
         "table storage status sums complete fresh shard disk usage",
         "metadata.table status encoder honors storage status overrides",
@@ -4135,6 +4166,7 @@ pub fn build(b: *std.Build) void {
         "api http server create table with local writes waits for projected presence without lifecycle",
         "api http server create index installs exact visible config and defers lagging projection",
         "status source reports an absent linearizable read capability without failing",
+        "status source rejects every partial routing capability",
         "table read source distinguishes unavailable physical capability observation",
         "generated route policy inventory is unique and describes wire modes",
         "linked API dispatch preserves kernel-owned ingress policy",
@@ -4672,9 +4704,18 @@ pub fn build(b: *std.Build) void {
         "remote metadata source installs fenced snapshot without comparing epoch domains",
         "remote metadata source rejects fenced snapshot across mutation invalidation",
         "remote metadata source treats superseded concurrent fenced snapshot as success",
+        "remote metadata source retries fenced snapshot generations until success",
+        "remote metadata source bounds repeated fenced snapshot generations",
         "remote metadata source bounds unsupported linearizable snapshot probes",
         "remote metadata source shares backend runtime io across a bounded executor pool",
-        "data runtime treats metadata leadership churn as retryable bootstrap failure",
+        "remote routing cache entries retain immutable snapshots outside the cache lock",
+        "remote routing never publishes a cache entry after its deadline",
+        "remote routing normalizes every timeout class at the source boundary",
+        "remote await route plan cloning preserves its absolute deadline",
+        "remote metadata catalog source provides compact routing",
+        "remote metadata routing negotiation upgrades the N-1 adapter",
+        "data runtime treats transient metadata failures as retryable bootstrap failures",
+        "data runtime retries incomplete split provisioning projections",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "data runtime heartbeat cache cannot regress to an older full report",
         "idle cached runtime status stays fresh only for the published root generation",
@@ -4713,6 +4754,7 @@ pub fn build(b: *std.Build) void {
         "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",
         "internal batch forwarding headers are all-or-none and strictly parsed",
         "metadata http client shares deadline and cancellation across retries",
+        "metadata capability client distinguishes advertised routing from N-1 absence",
         "data server wires configured HA executors into API server",
         "data server mirrors managed primary writes into HA replication log",
         "data server fail-closed sync policy rejects primary writes before local commit",
@@ -4728,6 +4770,8 @@ pub fn build(b: *std.Build) void {
         "data server resumes HA standby replication from durable progress after restart",
         "data runtime records and backs off HA standby replication round failures",
         "data runtime HA replication HTTP budget covers base64 apply envelope",
+        "data runtime HA apply window remains bounded for control-plane liveness",
+        "data runtime HA apply window does not report caught up with pending or deferred WAL",
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
     };
@@ -6194,6 +6238,9 @@ pub fn build(b: *std.Build) void {
             "hosted participant attempt deadline preserves the server outcome window",
             "hosted participant rediscovery retries only pre-decision leader unavailability",
             "distributed txn coordinator aborts only participants that may have begun",
+            "DistributedEntitySink atomic promotion batch prefers stateless batch commit",
+            "DistributedEntitySink batch commit remains compatible with transaction-only sources",
+            "DistributedEntitySink atomic mode fails closed when unsupported",
             "api http client preserves retryable group transaction unavailability",
             "internal transaction operations preserve pre-decision leader unavailability",
         },
@@ -6210,6 +6257,7 @@ pub fn build(b: *std.Build) void {
             "provisioned batch keeps routing and delegates one group-local physical write",
             "provisioned native storage metrics bypass an empty busy write cache",
             "provisioned table write source rejects stale doc identity namespace before write",
+            "writer identity resolution rejects stale eventual routes",
             "replicated split destination seeds inherited doc identity before range publication",
             "internal batch parser rejects mixed split transition commands",
             "internal batch parser requires source acknowledgements to be metadata-only",
@@ -6269,6 +6317,7 @@ pub fn build(b: *std.Build) void {
             "write cache structural local mutation finishes auto bulk before reuse",
             "write cache local mutation preempts stale startup writer",
             "hosted runtime status prefers live writer over stale hosted snapshot",
+            "HA seed preflight drains writer released after promotion cache clear before capture freeze",
             "runtime status collection leaves active stale write lease live",
             "resident DB lease adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
@@ -6356,6 +6405,8 @@ pub fn build(b: *std.Build) void {
             "encode query request preserves hierarchy unit navigation contract",
             "hierarchy navigation hydration validates the planned unit fingerprint",
             "hosted hierarchy navigation routes projection-safe hydration and advances cursors",
+            "routed internal reads require an explicit peer fence acknowledgement",
+            "routing sessions reserve authoritative snapshots for cross-table plans",
             "encode query request preserves unit grouping ancestor projections",
             "parseRemoteSearchResult preserves grouped hierarchy matches",
             "remote query returns the shard-selected identity generation",
@@ -6398,6 +6449,11 @@ pub fn build(b: *std.Build) void {
             "provisioned auxiliary reads publish resident databases outside read admission",
             "provisioned graph hydrate completes consistency before resident read admission",
             "provisioned consistency read reroutes after topology changes before admission",
+            "route-pinned catalog prevents a stale admin namespace from replacing routing identity",
+            "routing session validates a pinned selection against current topology",
+            "routing topology epoch fences identity-only changes",
+            "authoritative write routing pins keys and identity in one compact snapshot",
+            "catalog route fence dispatch is strict and fail closed",
             "provisioned stale read admits before routing without a redundant catalog validation",
             "distributed graph source read rejects topology change before aggregation",
             "hosted cross-range graph query expands explicit local start keys",
@@ -6613,6 +6669,7 @@ pub fn build(b: *std.Build) void {
             "native backup reclaims a crash marker before snapshot root creation",
             "native backup never reclaims an old attempt with a live lease",
             "provisioned create succeeds when post-commit runtime status is fenced",
+            "provisioned create retries a retired cache lease before structural publication",
             "provisioned create reuses a generation opened by startup reconciliation",
             "provisioned owner clone snapshot preserves retired runtime counters",
             "provisioned create installs managed enrichment despite a matching stale fingerprint",
@@ -6625,6 +6682,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table restore retry repairs exact incomplete restore state through active writer",
             "provisioned table restore preparation blocks writes and competing structural mutation",
             "provisioned table restore preparation blocks writes while allowing reads",
+            "resident group write releases queued reads before remote completion",
             "provisioned table transition activity excludes writers but preserves reads",
             "provisioned table transition waiter queues ahead of later writers",
             "provisioned table transition waiter queues ahead of later readers",
@@ -6727,6 +6785,7 @@ pub fn build(b: *std.Build) void {
             "forwarded write sources use the local writer owner dirty lifecycle",
             "HA ownership transition invalidates cached visibility and dirty identities",
             "HA ownership transition serializes with active writer cache mutation",
+            "HA seed request admission drains accepted writes and closes the preflight race",
             "startup cache clear retires dirty identity without a serving owner",
             "dirty auto bulk writer publishes runtime status without closing the cached writer",
             "split transition auto bulk publication retries while a writer lease is active",
@@ -6757,6 +6816,20 @@ pub fn build(b: *std.Build) void {
     run_api_table_writes_production_regression_unit_tests.step.dependOn(&run_public_api_parity_aggregate_tests.step);
     const api_table_writes_production_regression_step = b.step("api-table-writes-production-regression-test", "Run focused restore and writer-cache lifecycle regressions");
     api_table_writes_production_regression_step.dependOn(&run_api_table_writes_production_regression_tests.step);
+    const api_create_structural_retry_tests = b.addTest(.{
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{"provisioned create retries a retired cache lease before structural publication"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_api_create_structural_retry_tests = addFilteredTestRunArtifact(b, api_create_structural_retry_tests);
+    const api_create_structural_retry_step = b.step(
+        "api-create-structural-retry-test",
+        "Run the isolated create structural-publication cache race regression",
+    );
+    api_create_structural_retry_step.dependOn(&run_api_create_structural_retry_tests.step);
     const api_table_writes_restore_repeat_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
@@ -6966,6 +7039,7 @@ pub fn build(b: *std.Build) void {
         "table provisioner accepts target schema index when retained read index has inflated doc count",
         "table provisioner runtime schema progress requires authoritative O(1) identity coverage",
         "catalog table topology is order independent and detects range mutation",
+        "metadata route wire conversion preserves its absolute deadline",
         "metadata http server serves status and filtered admin routes",
         "metadata admin linearizable snapshot propagates request context",
         "metadata linearizable snapshot fences and frees one owned response",
@@ -7467,6 +7541,7 @@ pub fn build(b: *std.Build) void {
             "standalone runtime parses experimental flag",
             "standalone runtime antfarm path guards keep api routes reserved",
             "standalone startup checkpoint readiness requires applied and safe-read progress",
+            "standalone activated seed bootstraps exact standby checkpoint and rejects older progress",
             "parse cli accepts config path",
             "parse cli accepts secret store path",
             "parse cli accepts ARD identity flags",
@@ -7474,6 +7549,7 @@ pub fn build(b: *std.Build) void {
             "parse cli preserves registry variants and recognizes explicit preload backends",
             "parse cli accepts HA primary runtime flags",
             "parse cli accepts HA primary sync policy flags",
+            "promoted HA primary retains exact predecessor startup provenance",
             "parse cli accepts HA standby runtime flags",
             "standalone HA standby replication flags require upstream and slot",
             "standalone HA string classifier distinguishes missing padded and valid values",
@@ -7511,10 +7587,13 @@ pub fn build(b: *std.Build) void {
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
             "standalone metadata advertises a linearizable owned snapshot",
+            "standalone routing watch does not report absence after one probe",
+            "standalone metadata catalog source provides compact routing",
             "standalone metadata rejects corrupt catalog without double-freeing owned paths",
             "standalone metadata finalizes schema migration from resident runtime evidence",
             "standalone metadata finalizes schema migration through split shard adapter fallback",
             "standalone unified server lifecycle propagates startup failure",
+            "runtime lease watchdog publishes active self-fenced proof from exact expired lease",
             "runtime lease watchdog fetch and validation failures publish no bootstrap capability",
             "runtime lease watchdog retains a bounded Kubernetes response budget",
             "runtime lease watchdog prefers a DNS-verified Kubernetes API host and retains the injected port",
@@ -8591,6 +8670,7 @@ pub fn build(b: *std.Build) void {
         &.{"metadata.reconciler."},
         &.{
             "metadata.service.",
+            "metadata.catalog_projection_reader.",
             "metadata.admin_read_operations.",
             "metadata.admin_mutation_operations.",
             "metadata.extension_operations.",
@@ -10816,7 +10896,9 @@ pub fn build(b: *std.Build) void {
                 .max_rss = switch (unit) {
                     // macOS framework codegen has a materially higher peak
                     // than Linux, even for the contract-only API unit.
-                    .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 7) * 1024 * 1024 * 1024,
+                    // Main's integrated HA routing work raised the clean Linux
+                    // API-kernel peak above the former 7 GiB reservation.
+                    .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
                     .cli => 3 * 1024 * 1024 * 1024,
                     // Linux measurements for the split physical graph peaked
                     // just under 10 GiB. Darwin's framework-heavy ReleaseFast

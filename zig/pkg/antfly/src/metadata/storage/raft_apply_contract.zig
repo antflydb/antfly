@@ -16,6 +16,9 @@
 //! owner and its opaque client. Keep backend types and implementation tests out
 //! of this module so consumers do not regain the physical storage graph.
 
+const metadata = @import("../domain.zig");
+const metadata_incarnation = @import("../incarnation.zig");
+
 pub const AppliedMetadataBatch = struct {
     commit_index: u64,
     entries_bytes: []const u8,
@@ -30,7 +33,20 @@ pub const TableTransitionFence = struct {
     }
 };
 
+pub const CatalogProjectionSnapshot = struct {
+    metadata_incarnation: ?metadata_incarnation.MetadataClusterIncarnation,
+    catalog_revision: u64,
+    tables: []metadata.TableRecord,
+    ranges: []metadata.RangeRecord,
+};
+
+pub const CatalogCursor = struct {
+    metadata_incarnation: ?metadata_incarnation.MetadataClusterIncarnation,
+    revision: u64,
+};
+
 pub const ProjectionSignalKind = enum {
+    metadata_incarnation,
     table,
     range,
     store,

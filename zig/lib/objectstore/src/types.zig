@@ -170,6 +170,30 @@ pub const ListOptions = struct {
     max_keys: u32 = 1000,
 };
 
+/// One immutable entry returned by a provider's object-version inventory.
+/// Delete markers are entries too and must be deleted by version ID when a
+/// caller needs to prove that a versioned prefix is physically empty.
+pub const ObjectVersionEntry = struct {
+    key: []u8,
+    version_id: []u8,
+    is_delete_marker: bool,
+
+    pub fn deinit(self: *ObjectVersionEntry, alloc: Allocator) void {
+        alloc.free(self.key);
+        alloc.free(self.version_id);
+        self.* = undefined;
+    }
+};
+
+pub const ListObjectVersionsOptions = struct {
+    prefix: []const u8 = "",
+    /// S3-style pagination is a tuple. `version_id_marker` is invalid without
+    /// `key_marker`; a key marker alone is permitted by the provider API.
+    key_marker: ?[]const u8 = null,
+    version_id_marker: ?[]const u8 = null,
+    max_keys: u32 = 1000,
+};
+
 pub const ByteRange = struct {
     offset: u64,
     length: ?u64 = null,
@@ -249,6 +273,21 @@ pub const ListResult = struct {
         for (self.common_prefixes) |prefix| alloc.free(prefix);
         alloc.free(self.common_prefixes);
         if (self.next_continuation_token) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const ListObjectVersionsResult = struct {
+    entries: []ObjectVersionEntry,
+    is_truncated: bool,
+    next_key_marker: ?[]u8 = null,
+    next_version_id_marker: ?[]u8 = null,
+
+    pub fn deinit(self: *ListObjectVersionsResult, alloc: Allocator) void {
+        for (self.entries) |*entry| entry.deinit(alloc);
+        alloc.free(self.entries);
+        if (self.next_key_marker) |value| alloc.free(value);
+        if (self.next_version_id_marker) |value| alloc.free(value);
         self.* = undefined;
     }
 };

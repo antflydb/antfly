@@ -1796,6 +1796,45 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     };
 }
 
+/// Clone only fields that participate in table/range routing. Keeping the
+/// established wire record during the rolling upgrade lets older peers decode
+/// the response, while schema, index, restore, and placement payloads no
+/// longer scale the routing hot path.
+pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
+    const name = try alloc.dupe(u8, record.name);
+    errdefer alloc.free(name);
+    const description = try alloc.dupe(u8, "");
+    errdefer alloc.free(description);
+    const schema_json = try alloc.dupe(u8, "");
+    errdefer alloc.free(schema_json);
+    const read_schema_json = try alloc.dupe(u8, "");
+    errdefer alloc.free(read_schema_json);
+    const indexes_json = try alloc.dupe(u8, "");
+    errdefer alloc.free(indexes_json);
+    const replication_sources_json = try alloc.dupe(u8, "");
+    errdefer alloc.free(replication_sources_json);
+    const placement_role = try alloc.dupe(u8, "");
+    errdefer alloc.free(placement_role);
+    const restore_backup_id = try alloc.dupe(u8, "");
+    errdefer alloc.free(restore_backup_id);
+    const restore_location = try alloc.dupe(u8, "");
+    errdefer alloc.free(restore_location);
+    return .{
+        .table_id = record.table_id,
+        .name = name,
+        .description = description,
+        .schema_json = schema_json,
+        .read_schema_json = read_schema_json,
+        .indexes_json = indexes_json,
+        .replication_sources_json = replication_sources_json,
+        .placement_role = placement_role,
+        .restore_backup_id = restore_backup_id,
+        .restore_location = restore_location,
+        .desired_replica_count = 0,
+        .min_ranges = 0,
+    };
+}
+
 pub fn freeTable(alloc: std.mem.Allocator, record: TableRecord) void {
     alloc.free(record.name);
     alloc.free(record.description);
@@ -1849,6 +1888,43 @@ pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
     };
 }
 
+pub fn cloneRoutingRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
+    const start_key = try alloc.dupe(u8, record.start_key);
+    errdefer alloc.free(start_key);
+    const end_key = try cloneOwnedOptional(alloc, record.end_key);
+    errdefer freeOwnedOptional(alloc, end_key);
+    const restore_backup_id = try alloc.dupe(u8, "");
+    errdefer alloc.free(restore_backup_id);
+    const restore_artifact_backup_id = try alloc.dupe(u8, "");
+    errdefer alloc.free(restore_artifact_backup_id);
+    const restore_location = try alloc.dupe(u8, "");
+    errdefer alloc.free(restore_location);
+    const restore_snapshot_path = try alloc.dupe(u8, "");
+    errdefer alloc.free(restore_snapshot_path);
+    const restore_connection = try alloc.dupe(u8, "");
+    errdefer alloc.free(restore_connection);
+    const restore_artifact_sha256 = try alloc.dupe(u8, "");
+    errdefer alloc.free(restore_artifact_sha256);
+    const restore_native_manifest_sha256 = try alloc.dupe(u8, "");
+    errdefer alloc.free(restore_native_manifest_sha256);
+    return .{
+        .group_id = record.group_id,
+        .range_id = if (record.range_id == 0) record.group_id else record.range_id,
+        .table_id = record.table_id,
+        .start_key = start_key,
+        .end_key = end_key,
+        .doc_identity_shard_id = record.doc_identity_shard_id,
+        .doc_identity_range_id = record.doc_identity_range_id,
+        .restore_backup_id = restore_backup_id,
+        .restore_artifact_backup_id = restore_artifact_backup_id,
+        .restore_location = restore_location,
+        .restore_snapshot_path = restore_snapshot_path,
+        .restore_connection = restore_connection,
+        .restore_artifact_sha256 = restore_artifact_sha256,
+        .restore_native_manifest_sha256 = restore_native_manifest_sha256,
+    };
+}
+
 pub fn rangeDocIdentityShardId(record: RangeRecord) u64 {
     return if (record.doc_identity_shard_id == 0) record.group_id else record.doc_identity_shard_id;
 }
@@ -1876,6 +1952,36 @@ pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
     alloc.free(record.restore_connection);
     alloc.free(record.restore_artifact_sha256);
     alloc.free(record.restore_native_manifest_sha256);
+}
+
+test "routing clones exclude operational and schema payloads" {
+    const table = try cloneRoutingTable(std.testing.allocator, .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "large schema",
+        .indexes_json = "large indexes",
+        .restore_location = "s3://private/restore",
+    });
+    defer freeTable(std.testing.allocator, table);
+    try std.testing.expectEqualStrings("docs", table.name);
+    try std.testing.expectEqual(@as(usize, 0), table.schema_json.len);
+    try std.testing.expectEqual(@as(usize, 0), table.indexes_json.len);
+    try std.testing.expectEqual(@as(usize, 0), table.restore_location.len);
+
+    const range = try cloneRoutingRange(std.testing.allocator, .{
+        .group_id = 7001,
+        .range_id = 71,
+        .table_id = 7,
+        .start_key = "a",
+        .end_key = "z",
+        .doc_identity_shard_id = 17,
+        .doc_identity_range_id = 71,
+        .restore_snapshot_path = "/secret/snapshot",
+    });
+    defer freeRange(std.testing.allocator, range);
+    try std.testing.expectEqual(@as(u64, 17), range.doc_identity_shard_id);
+    try std.testing.expectEqualStrings("a", range.start_key);
+    try std.testing.expectEqual(@as(usize, 0), range.restore_snapshot_path.len);
 }
 
 pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRecord) !RestoreProgressRecord {

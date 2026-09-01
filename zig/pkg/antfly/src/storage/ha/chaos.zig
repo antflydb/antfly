@@ -615,6 +615,7 @@ test "storage.ha chaos network partition requires fence before standby promotion
         .promoted_node_id = "standby-a",
         .new_timeline_id = 2,
         .new_epoch = 2,
+        .generation = 1,
         .required_lsn = 2,
         .observed_lsn = standby.currentProgress().applied_lsn,
         .force = true,

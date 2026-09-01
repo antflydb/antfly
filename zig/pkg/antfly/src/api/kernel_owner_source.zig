@@ -282,18 +282,30 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .scan = unsupportedTopLevelScan,
                 .query = unsupportedTopLevelQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
+                .preflight_query_group_local_routed = preflightQueryGroupLocalRouted,
                 .lookup_group_local = lookupGroupLocal,
+                .lookup_group_local_routed = lookupGroupLocalRouted,
                 .scan_group_local = scanGroupLocal,
+                .scan_group_local_routed = scanGroupLocalRouted,
                 .query_group_local = queryGroupLocal,
+                .query_group_local_routed = queryGroupLocalRouted,
                 .search_result_group_local = searchResultGroupLocal,
+                .search_result_group_local_routed = searchResultGroupLocalRouted,
                 .text_stats_group_local = textStatsGroupLocal,
+                .text_stats_group_local_routed = textStatsGroupLocalRouted,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
+                .algebraic_partials_group_local_routed = algebraicPartialsGroupLocalRouted,
                 .graph_expand_group_local = graphExpandGroupLocal,
+                .graph_expand_group_local_routed = graphExpandGroupLocalRouted,
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
+                .graph_hydrate_group_local_routed = graphHydrateGroupLocalRouted,
                 .graph_edges_group_local = graphEdgesGroupLocal,
+                .graph_edges_group_local_routed = graphEdgesGroupLocalRouted,
                 .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
                 .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
+                .document_artifact_manifest_group_local_routed = documentArtifactManifestGroupLocalRouted,
                 .document_artifact_manifests_group_local = documentArtifactManifestsGroupLocal,
+                .document_artifact_manifests_group_local_routed = documentArtifactManifestsGroupLocalRouted,
             },
         };
     }
@@ -324,6 +336,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .local_runtime_statuses = localRuntimeStatuses,
                 .text_memory_attribution_stats_best_effort = textMemoryAttributionStatsBestEffort,
                 .preflight_write_admission_group_local = preflightWriteAdmissionGroupLocal,
+                .prepare_ha_seed_snapshot_group_local = prepareHASeedSnapshotGroupLocal,
                 .find_median_key_group_local = findMedianKeyGroupLocal,
                 .reconcile_table_group_local = reconcileTableGroupLocal,
                 .reconcile_table_group_local_transient = reconcileTableGroupLocalTransient,
@@ -585,6 +598,19 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         try self.retireGroupAndWait(group_id, table_name);
+        return {};
+    }
+
+    fn prepareHASeedSnapshotGroupLocal(
+        ptr: *anyopaque,
+        group_id: u64,
+        table_name: []const u8,
+        deadline_ns: u64,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = (try self.acquireIfPresent(group_id, table_name)) orelse return {};
+        defer lease.deinit();
+        try lease.owner().prepareHASeedSnapshot(table_name, deadline_ns);
         return {};
     }
 
@@ -1978,6 +2004,197 @@ pub const ProvisionedKernelOwnerSource = struct {
         _: db_types.BatchRequest,
     ) !?void {
         return error.UnsupportedStorageKernelTopLevelOperation;
+    }
+
+    fn validateRoutedRead(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+    ) !void {
+        try fence.validate();
+        if (fence.route.group_id != group_id) return error.TopologyChanged;
+        try fence.admission_cancellation.check();
+        try table_catalog.validateCatalogRouteFenceUntil(
+            alloc,
+            self.catalog,
+            table_name,
+            fence,
+            fence.admission_deadline_ns,
+        );
+        try fence.admission_cancellation.check();
+    }
+
+    fn lookupGroupLocalRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        key: []const u8,
+        opts: db_types.LookupOptions,
+        consistency: read_gate.ReadConsistency,
+    ) !?table_read_source.LookupResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try lookupGroupLocal(ptr, alloc, group_id, table_name, key, opts, consistency);
+    }
+
+    fn scanGroupLocalRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_types.ScanOptions,
+        consistency: read_gate.ReadConsistency,
+    ) !?table_read_source.ScanResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try scanGroupLocal(ptr, alloc, group_id, table_name, from_key, to_key, opts, consistency);
+    }
+
+    fn documentArtifactManifestGroupLocalRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: read_gate.ReadConsistency,
+    ) !?db_types.DocumentArtifactManifest {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try documentArtifactManifestGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name, consistency);
+    }
+
+    fn documentArtifactManifestsGroupLocalRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        consistency: read_gate.ReadConsistency,
+    ) !?db_types.DocumentArtifactManifestList {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try documentArtifactManifestsGroupLocal(ptr, alloc, group_id, table_name, doc_key, consistency);
+    }
+
+    fn preflightQueryGroupLocalRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_types.SearchRequest,
+        consistency: read_gate.ReadConsistency,
+        max_work: u32,
+    ) !?runtime_preflight.RuntimePreflightSummary {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try preflightQueryGroupLocal(ptr, alloc, group_id, table_name, req, consistency, max_work);
+    }
+
+    fn queryGroupLocalRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_types.SearchRequest,
+        consistency: read_gate.ReadConsistency,
+    ) !?query_response.QueryResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try queryGroupLocal(ptr, alloc, group_id, table_name, req, consistency);
+    }
+
+    fn searchResultGroupLocalRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_types.SearchRequest,
+        consistency: read_gate.ReadConsistency,
+    ) !?db_types.SearchResult {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try searchResultGroupLocal(ptr, alloc, group_id, table_name, req, consistency);
+    }
+
+    fn textStatsGroupLocalRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?query_response.QueryResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try textStatsGroupLocal(ptr, alloc, group_id, table_name, body);
+    }
+
+    fn algebraicPartialsGroupLocalRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?query_response.QueryResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try algebraicPartialsGroupLocal(ptr, alloc, group_id, table_name, body);
+    }
+
+    fn graphExpandGroupLocalRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_graph.GraphExpandRequest,
+        consistency: read_gate.ReadConsistency,
+    ) !?distributed_graph.GraphExpandResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try graphExpandGroupLocal(ptr, alloc, group_id, table_name, req, consistency);
+    }
+
+    fn graphHydrateGroupLocalRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_graph.GraphHydrateRequest,
+        consistency: read_gate.ReadConsistency,
+    ) !?distributed_graph.GraphHydrateResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try graphHydrateGroupLocal(ptr, alloc, group_id, table_name, req, consistency);
+    }
+
+    fn graphEdgesGroupLocalRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_graph.GraphEdgesRequest,
+        consistency: read_gate.ReadConsistency,
+    ) !?distributed_graph.GraphEdgesResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try graphEdgesGroupLocal(ptr, alloc, group_id, table_name, req, consistency);
     }
 
     fn lookupGroupLocal(
