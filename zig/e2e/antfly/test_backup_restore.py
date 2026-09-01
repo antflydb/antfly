@@ -344,7 +344,7 @@ class ThreeByThreeBackupCluster:
         try:
             self._start()
         except BaseException:
-            self.stop()
+            self.stop(test_failed=True)
             raise
 
     def _write_config(self) -> None:
@@ -787,7 +787,7 @@ class ThreeByThreeBackupCluster:
             raise AssertionError(f"metadata leader unavailable\n{self.debug_logs()}")
         return self.metadata_public_urls[leader_index]
 
-    def stop(self) -> None:
+    def stop(self, *, test_failed: bool = False) -> None:
         self.port_reservations.close()
         for proc in reversed(self.data_procs):
             if proc.poll() is None:
@@ -812,12 +812,14 @@ class ThreeByThreeBackupCluster:
         for handle in [*self.data_log_files, *self.metadata_log_files]:
             if not handle.closed:
                 handle.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
 
 @pytest.fixture
-def three_by_three_backup_cluster() -> ThreeByThreeBackupCluster:
+def three_by_three_backup_cluster(
+    request: pytest.FixtureRequest,
+) -> ThreeByThreeBackupCluster:
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     resolved = Path(binary)
     if resolved.name != "antfly":
@@ -829,7 +831,8 @@ def three_by_three_backup_cluster() -> ThreeByThreeBackupCluster:
     try:
         yield cluster
     finally:
-        cluster.stop()
+        report = getattr(request.node, "rep_call", None)
+        cluster.stop(test_failed=bool(report and report.failed))
 
 
 def test_table_backup_restore_round_trip(backup_api):
