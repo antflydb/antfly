@@ -3834,6 +3834,24 @@ v2, the posting segment store is retained because it is the index authority;
 only the compatibility HBC LSM is retired. Future API cleanup should use
 `native_posting_store` for v2 and reserve `sidecar` for the optional v1 mirror.
 
+### Review hardening: rollback capability is capture-local
+
+The follow-up review found that mutation-store mode and rollback authority are
+not equivalent. An authorized bootstrap or repair candidate can select native
+mode before its first complete immutable generation exists. During that window
+mutations still reach the compatibility LSM, and cancellation has no native
+base to restore. Skipping the inverse rollback merely because native mode was
+selected could therefore retain a phantom derived vector after the primary
+mapping transaction failed.
+
+Rollback now asks whether the active capture actually owns a pinned immutable
+base. A base-owning capture restores that generation in constant time; a
+base-less candidate and a v1 mirror perform the real LSM inverse. Tests cover
+all three states. Native-store enablement also returns a runtime authorization
+error instead of relying on `std.debug.assert`, preserving the authority fence
+in production `ReleaseFast` builds without adding work to mutation or query
+hot loops.
+
 ## Next checks
 
 1. Narrow broad persisted L0 source ranges with adaptive, workload-independent

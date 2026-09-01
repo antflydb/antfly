@@ -7853,14 +7853,29 @@ pub const HBCIndex = struct {
     /// Routes query-facing HBC mutations through the committed posting WAL
     /// once an immutable base generation is available. Bootstrap and rebuild
     /// still use the general store until the first complete checkpoint exists.
-    pub fn enableNativePostingMutationStore(self: *HBCIndex) void {
-        std.debug.assert(self.experimental_posting_authority_transition_permitted or
-            self.experimental_posting_wal_authoritative.load(.acquire));
+    pub fn enableNativePostingMutationStore(self: *HBCIndex) !void {
+        // This is a durable authority boundary, not merely a debug-build
+        // precondition. Production ReleaseFast binaries must fail closed if a
+        // future caller attempts to route a live v1 index away from its LSM.
+        if (!self.experimental_posting_authority_transition_permitted and
+            !self.experimental_posting_wal_authoritative.load(.acquire))
+        {
+            return error.PostingWalAuthorityTransitionNotPermitted;
+        }
         self.experimental_posting_mutation_store_mode = .native_wal;
     }
 
     pub fn nativePostingMutationStoreEnabled(self: *const HBCIndex) bool {
         return self.experimental_posting_mutation_store_mode == .native_wal;
+    }
+
+    /// Whether cancellation of the current capture can restore an immutable
+    /// pre-mutation generation. Native mode alone is insufficient: bootstrap
+    /// and repair candidates intentionally continue through the compatibility
+    /// LSM until their first complete generation exists.
+    pub fn experimentalPostingCaptureOwnsRollbackBase(self: *const HBCIndex) bool {
+        return self.experimental_posting_capture_enabled and
+            self.experimental_posting_mutation_base_generation != null;
     }
 
     pub fn setExperimentalPostingAuthorityTransitionPermitted(self: *HBCIndex, permitted: bool) void {
@@ -19856,7 +19871,7 @@ test "posting WAL mutations provide read your writes without derived LSM persist
         try idx.insertWithMetadata(1, &[_]f32{ 1.0, 0.0 }, "doc:1");
         try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
         idx.setExperimentalPostingAuthorityTransitionPermitted(true);
-        idx.enableNativePostingMutationStore();
+        try idx.enableNativePostingMutationStore();
 
         var pinned_before_mutation = try idx.beginReadTxn();
         try idx.beginExperimentalPostingMutationCapture();
@@ -19964,7 +19979,7 @@ test "posting WAL mutation capture aborts without publishing partial state" {
     try idx.insertWithMetadata(1, &[_]f32{ 1.0, 0.0 }, "doc:1");
     try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
     idx.setExperimentalPostingAuthorityTransitionPermitted(true);
-    idx.enableNativePostingMutationStore();
+    try idx.enableNativePostingMutationStore();
 
     var store_before = try idx.openExperimentalPostingStore();
     const committed_bytes_before = store_before.wal_committed_bytes;
@@ -20062,7 +20077,7 @@ test "authoritative external-vector HBC detaches legacy LSM and reopens native f
         }}, .{ .skip_vector_store = true });
         try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
         idx.setExperimentalPostingAuthorityTransitionPermitted(true);
-        idx.enableNativePostingMutationStore();
+        try idx.enableNativePostingMutationStore();
 
         try idx.beginExperimentalPostingMutationCapture();
         try idx.batchInsertWithMetadataOptions(&.{.{
@@ -20174,6 +20189,11 @@ test "stable generation finalization bootstraps capture-free rebuild into native
                 .make_authoritative = true,
             }),
         );
+        try std.testing.expectError(
+            error.PostingWalAuthorityTransitionNotPermitted,
+            idx.enableNativePostingMutationStore(),
+        );
+        try std.testing.expect(!idx.nativePostingMutationStoreEnabled());
         try std.testing.expect(!idx.experimentalPostingWalAuthoritative());
         idx.setExperimentalPostingAuthorityTransitionPermitted(true);
         try idx.finalizeExperimentalPostingGenerationAtAppliedSequence(7, .{
@@ -20240,7 +20260,7 @@ test "posting WAL capture can begin inside a streaming replay session" {
         try idx.insertWithMetadata(1, &[_]f32{ 1.0, 0.0 }, "doc:1");
         try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
         idx.setExperimentalPostingAuthorityTransitionPermitted(true);
-        idx.enableNativePostingMutationStore();
+        try idx.enableNativePostingMutationStore();
 
         // A long-lived replay session can already be open when the next
         // independently durable source window begins. This ordering used to
@@ -20448,7 +20468,7 @@ test "managed posting capture exports coalesced exact vector mutations" {
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 0.0 }, inserted[0].vector);
     try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
     idx.setExperimentalPostingAuthorityTransitionPermitted(true);
-    idx.enableNativePostingMutationStore();
+    try idx.enableNativePostingMutationStore();
 
     // A replacement is represented once and the final upsert wins over its
     // internal delete. A pure delete recovers metadata from the pinned native

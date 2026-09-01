@@ -15922,7 +15922,7 @@ pub const IndexManager = struct {
                 if (index.experimentalPostingWalAuthoritative() or
                     (densePostingWalMutationStoreEnabled() and native_mutation_store_permitted))
                 {
-                    index.enableNativePostingMutationStore();
+                    try index.enableNativePostingMutationStore();
                 }
                 const apply_mutex = try self.allocIndexApplyMutex();
                 var apply_mutex_owned = true;
@@ -20485,18 +20485,15 @@ pub const IndexManager = struct {
 
     fn rollbackPendingDenseVectors(self: *IndexManager, entry: *DenseIndex, pending: []const PendingDenseVectorMapping) void {
         if (pending.len == 0) return;
-        // A native source-sequence capture owns the complete pre-mutation
-        // generation, including during a private candidate build before its
-        // irreversible authority marker is published. Its caller's error path
-        // cancels that capture, restores metadata/search state, and clears the
-        // affected caches in constant time. Performing maintained HBC deletes
-        // here first is both redundant and dangerous: the inverse would join
-        // the transaction it is meant to abort, and can also recompute a
-        // centroid and reload external vectors. A legacy mirrored capture has
-        // no pinned rollback base, so the inverse LSM rollback remains required.
-        if (entry.index.experimentalPostingMutationCaptureActive() and
-            (entry.index.nativePostingMutationStoreEnabled() or
-                entry.index.experimentalPostingWalAuthoritative())) return;
+        // A capture with a pinned immutable base owns exact rollback, including
+        // during a private candidate build before its irreversible authority
+        // marker is published. Native mode by itself is not enough: bootstrap
+        // and repair candidates deliberately keep using the compatibility LSM
+        // until their first complete generation exists. Performing maintained
+        // HBC deletes only when no base was pinned prevents the inverse from
+        // joining the transaction it is meant to abort without skipping the
+        // real LSM rollback for a base-less candidate.
+        if (entry.index.experimentalPostingCaptureOwnsRollbackBase()) return;
         const vector_ids = self.alloc.alloc(u64, pending.len) catch return;
         defer self.alloc.free(vector_ids);
         for (pending, 0..) |mapping, i| vector_ids[i] = mapping.vector_id;
@@ -34351,6 +34348,39 @@ test "dense mapping commit failure rolls back inserted HBC vectors" {
     defer if (metadata) |value| alloc.free(value);
     try std.testing.expect(metadata == null);
 
+    // Native mode is selected before an online candidate has necessarily
+    // published its first immutable base. Such a capture still mutates the
+    // compatibility LSM and therefore must retain the real inverse rollback.
+    entry.index.setExperimentalPostingAuthorityTransitionPermitted(true);
+    try entry.index.enableNativePostingMutationStore();
+    try entry.index.beginExperimentalPostingMutationCapture();
+    try std.testing.expect(!entry.index.experimentalPostingCaptureOwnsRollbackBase());
+    try entry.index.batchInsertWithMetadata(&.{
+        .{
+            .vector_id = 2,
+            .vector = &[_]f32{ 3.0, 2.0, 1.0 },
+            .metadata = "doc:base-less-candidate",
+        },
+    });
+    shared = .{};
+    try std.testing.expectError(
+        error.CommitFailed,
+        manager.persistDenseVectorMappingsWithRollback(
+            MockStore{ .shared = &shared },
+            entry,
+            "dv_v1",
+            &.{.{
+                .doc_key = "doc:base-less-candidate",
+                .vector_id = 2,
+            }},
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 0), entry.index.stats().active_count);
+    entry.index.cancelExperimentalPostingMutationCapture();
+    const base_less_metadata = try entry.index.getMetadata(2);
+    defer if (base_less_metadata) |value| alloc.free(value);
+    try std.testing.expect(base_less_metadata == null);
+
     // Once the native posting capture owns rollback, a mapping failure must
     // not execute the maintained inverse-delete path. The captured generation
     // remains visible to the apply owner until it cancels, then restoration is
@@ -34364,9 +34394,8 @@ test "dense mapping commit failure rolls back inserted HBC vectors" {
         },
     });
     try entry.index.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
-    entry.index.setExperimentalPostingAuthorityTransitionPermitted(true);
-    entry.index.enableNativePostingMutationStore();
     try entry.index.beginExperimentalPostingMutationCapture();
+    try std.testing.expect(entry.index.experimentalPostingCaptureOwnsRollbackBase());
     try entry.index.batchInsertWithMetadata(&.{
         .{
             .vector_id = 2,
@@ -37036,7 +37065,7 @@ test "authoritative posting capture starts inside an existing replay session" {
     // environment remaining set in every future process.
     _ = try entry.index.publishExperimentalPostingCheckpoint(0);
     entry.index.experimental_posting_wal_authoritative.store(true, .release);
-    entry.index.enableNativePostingMutationStore();
+    try entry.index.enableNativePostingMutationStore();
 
     // A source window may not mistake an independently owned maintenance
     // capture for its own transaction boundary.
