@@ -87,6 +87,7 @@ pub const Error = error{
     CudaUnavailable,
     CudaSymbolMissing,
     CudaDriverError,
+    CudaHostAllocationFailed,
     CudaKernelUnavailable,
     NoCudaDevices,
     InvalidCudaState,

@@ -395,7 +395,7 @@ fn maybePrepareCudaGemmaDecoderOverrides(
     decode_context: ?*const DecodeContext,
     trace_sink: ?*ActivationTraceSink,
 ) !Layer0DecoderOverrides {
-    if (cb.kind() != .cuda or config.family != .gemma or config.usesMoe()) return overrides;
+    if (cb.kind() != .cuda or config.family != .gemma) return overrides;
     if (!cudaPreparedDecoderSlotsEnabled() or trace_sink != null) return overrides;
     if (!layer0DecoderOverridesEmpty(overrides)) return overrides;
 
@@ -6513,6 +6513,18 @@ fn a4bHighMemoryFeatureEnabled(
     return a4b_feature_flags.highMemoryFeatureEnabled(enable_name, disable_name);
 }
 
+fn a4bParallelFfnFusionEnabled(
+    cb: *const ComputeBackend,
+    comptime metal_enable_name: [*:0]const u8,
+    comptime metal_disable_name: [*:0]const u8,
+) bool {
+    return switch (cb.kind()) {
+        .metal => a4bHighMemoryFeatureEnabled(metal_enable_name, metal_disable_name),
+        .cuda => true,
+        else => false,
+    };
+}
+
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     if (comptime is_freestanding) return null;
     return platform.env.getenvUsize(name);
@@ -8409,7 +8421,8 @@ fn moeFeedForwardInner(
     // Move Gemma's positive 1/sqrt(hidden) factor through the bias-free router
     // projection and apply it inside route selection. This preserves routing
     // math while avoiding a separate device multiply in the framed decode path.
-    const defer_router_hidden_scale = config.family == .gemma and cb.kind() == .metal;
+    const defer_router_hidden_scale = config.family == .gemma and
+        (cb.kind() == .metal or cb.kind() == .cuda);
     const router_logit_scale: f32 = if (defer_router_hidden_scale)
         1.0 / @sqrt(@as(f32, @floatFromInt(hidden_size)))
     else
@@ -9569,11 +9582,11 @@ fn applyGemmaParallelFfnPreNorms(
     hidden: CT,
     layer: usize,
 ) !?ops.RmsNormTripleResult {
-    if (cb.kind() != .metal or
-        !a4bHighMemoryFeatureEnabled(
-            "TERMITE_METAL_ENABLE_A4B_PARALLEL_FFN_NORMS",
-            "TERMITE_METAL_DISABLE_A4B_PARALLEL_FFN_NORMS",
-        )) return null;
+    if (!a4bParallelFfnFusionEnabled(
+        cb,
+        "TERMITE_METAL_ENABLE_A4B_PARALLEL_FFN_NORMS",
+        "TERMITE_METAL_DISABLE_A4B_PARALLEL_FFN_NORMS",
+    )) return null;
 
     var shared_primary_buf: [256]u8 = undefined;
     var shared_fallback_buf: [256]u8 = undefined;
@@ -9656,11 +9669,11 @@ fn applyGemmaParallelFfnPostResidual(
     residual: CT,
     layer: usize,
 ) !?CT {
-    if (cb.kind() != .metal or
-        !a4bHighMemoryFeatureEnabled(
-            "TERMITE_METAL_ENABLE_A4B_PARALLEL_FFN_POST_FUSION",
-            "TERMITE_METAL_DISABLE_A4B_PARALLEL_FFN_POST_FUSION",
-        )) return null;
+    if (!a4bParallelFfnFusionEnabled(
+        cb,
+        "TERMITE_METAL_ENABLE_A4B_PARALLEL_FFN_POST_FUSION",
+        "TERMITE_METAL_DISABLE_A4B_PARALLEL_FFN_POST_FUSION",
+    )) return null;
 
     var shared_primary_buf: [256]u8 = undefined;
     var shared_fallback_buf: [256]u8 = undefined;

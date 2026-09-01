@@ -251,6 +251,9 @@ const generated_embed_default_batch_bytes: usize = 256 * 1024;
 const generated_ocr_default_batch_items: usize = 4;
 const generated_ocr_default_batch_max_items: usize = 8;
 const generated_ocr_default_batch_bytes: usize = 64 * 1024 * 1024;
+const maximum_ocr_inline_png_bytes: usize = 8 * 1024 * 1024;
+const minimum_ocr_inline_render_dimension: u32 = 512;
+const maximum_ocr_inline_render_attempts: u8 = 4;
 const transient_embed_retry_max_attempts: u32 = 6;
 const transient_embed_retry_base_sleep_ns: u64 = 250 * std.time.ns_per_ms;
 const transient_embed_retry_max_sleep_ns: u64 = 5 * std.time.ns_per_s;
@@ -493,6 +496,37 @@ const GeneratedTextBatchPolicy = struct {
     max_items: usize,
     max_bytes: usize,
 };
+
+fn ocrInlinePngBudget(batch_bytes: usize, config_bytes: usize) usize {
+    const available = batch_bytes -| config_bytes;
+    // The PNG remains live while base64 parts and the provider request body
+    // are materialized. Reserve four input bytes per PNG byte for those two
+    // 4/3 expansions, JSON framing, and allocator growth.
+    return @max(@as(usize, 1), @min(maximum_ocr_inline_png_bytes, available / 4));
+}
+
+fn nextOcrInlineRenderDimension(current: u32, encoded_bytes: usize, byte_budget: usize) u32 {
+    if (current <= minimum_ocr_inline_render_dimension) return current;
+    if (encoded_bytes == 0 or byte_budget >= encoded_bytes)
+        return @max(minimum_ocr_inline_render_dimension, current - current / 4);
+    // PNG size is approximately proportional to pixel area. Use the observed
+    // result to jump near the budget with 10% headroom, while guaranteeing at
+    // least the old 25% reduction so retries always make material progress.
+    const ratio = @as(f64, @floatFromInt(byte_budget)) / @as(f64, @floatFromInt(encoded_bytes));
+    const scale = @min(0.75, @sqrt(ratio) * 0.90);
+    const estimated: u32 = @intFromFloat(@floor(@as(f64, @floatFromInt(current)) * scale));
+    return @max(minimum_ocr_inline_render_dimension, @min(current - 1, estimated));
+}
+
+test "OCR inline PNG budget reserves transient request copies" {
+    try std.testing.expectEqual(maximum_ocr_inline_png_bytes, ocrInlinePngBudget(64 * 1024 * 1024, 1024));
+    try std.testing.expectEqual(@as(usize, 1024), ocrInlinePngBudget(8192, 4096));
+    try std.testing.expectEqual(@as(usize, 1), ocrInlinePngBudget(1, 1));
+    try std.testing.expectEqual(@as(u32, 1843), nextOcrInlineRenderDimension(4096, 32 * 1024 * 1024, 8 * 1024 * 1024));
+    try std.testing.expectEqual(@as(u32, 3072), nextOcrInlineRenderDimension(4096, 9, 8));
+    try std.testing.expectEqual(minimum_ocr_inline_render_dimension, nextOcrInlineRenderDimension(600, 32, 8));
+    try std.testing.expectEqual(minimum_ocr_inline_render_dimension, nextOcrInlineRenderDimension(minimum_ocr_inline_render_dimension, 32, 8));
+}
 
 fn requestGeneratedTextBatchPolicy(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) GeneratedTextBatchPolicy {
     const operator_max_items = generatedOcrBatchMaxItems();
@@ -6370,19 +6404,44 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             units[idx].ocr_attempted = true;
             if (std.mem.eql(u8, route_type, "pdf")) {
                 units[idx].ocr_render_dpi = config.ocr_render_dpi;
-                // Parsing and each page render receive independent wall-clock
-                // budgets. Batch/provider latency between pages must not make
-                // the next native render inherit an already-expired deadline.
+                // Parsing and each page receive independent wall-clock
+                // budgets. All size retries for one page share that deadline,
+                // preventing oversized output from multiplying the timeout.
                 pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
                 pdf_session.?.setCancellationProbe(pdf_render_deadline.?.probe());
                 const render_started_ns = runtime.config.clock.nowRealtimeNs();
-                const rendered_page = pdf_session.?.renderPagePngAdaptiveAlloc(working_alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
-                    logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, null, null, null, null, render_started_ns, @errorName(err));
-                    if (!shouldIsolateOcrPageRenderFailure(err)) return err;
-                    try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "render");
-                    try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, err);
-                    continue;
-                };
+                const inline_png_budget = ocrInlinePngBudget(batch_policy.max_bytes, config_json.len);
+                var render_max_dimension = config.ocr_max_rendered_dimension;
+                var maybe_rendered_page: ?document_extraction_mod.RenderedPdfPage = null;
+                var render_attempts: u8 = 0;
+                render_loop: while (true) {
+                    render_attempts += 1;
+                    const dimension_pixels = @as(u64, render_max_dimension) * @as(u64, render_max_dimension);
+                    const render_max_pixels = @min(config.ocr_max_rendered_pixels, dimension_pixels);
+                    const candidate = pdf_session.?.renderPagePngAdaptiveAlloc(working_alloc, unit.page_number orelse 1, config.ocr_render_dpi, render_max_pixels, render_max_dimension) catch |err| {
+                        logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, null, null, null, null, render_started_ns, @errorName(err));
+                        if (!shouldIsolateOcrPageRenderFailure(err)) return err;
+                        try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "render");
+                        try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, err);
+                        break :render_loop;
+                    };
+                    if (candidate.png.len <= inline_png_budget) {
+                        maybe_rendered_page = candidate;
+                        break :render_loop;
+                    }
+                    if (render_max_dimension <= minimum_ocr_inline_render_dimension or
+                        render_attempts >= maximum_ocr_inline_render_attempts)
+                    {
+                        working_alloc.free(candidate.png);
+                        try setRuntimeGeneratedUnitFailureStage(alloc, &units[idx], kind, "request");
+                        try markRuntimeGeneratedUnitTextFailure(alloc, &units[idx], method, kind, error.GeneratedTextRequestTooLarge);
+                        break :render_loop;
+                    }
+                    const candidate_bytes = candidate.png.len;
+                    working_alloc.free(candidate.png);
+                    render_max_dimension = nextOcrInlineRenderDimension(render_max_dimension, candidate_bytes, inline_png_budget);
+                }
+                const rendered_page = maybe_rendered_page orelse continue;
                 units[idx].ocr_effective_render_dpi = rendered_page.effective_dpi;
                 units[idx].ocr_rendered_width = rendered_page.width;
                 units[idx].ocr_rendered_height = rendered_page.height;
