@@ -3225,6 +3225,7 @@ test "catching up observation preserves same-incarnation published visibility" {
     var previous_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = @constCast("semantic_idx"),
         .kind = .dense_vector,
+        .serving_snapshot_ready = true,
         .doc_count = 2,
         .node_count = 1,
         .coverage_produced_count = 2,
@@ -3267,6 +3268,7 @@ test "catching up observation preserves same-incarnation published visibility" {
     try std.testing.expectEqual(@as(u64, 1), incoming.stats.indexes[0].node_count);
     try std.testing.expect(incoming.stats.indexes[0].coverage_identity_ready);
     try std.testing.expect(incoming.stats.indexes[0].runtime_observation_serviceable);
+    try std.testing.expect(incoming.stats.indexes[0].serving_snapshot_ready);
     try std.testing.expect(incoming.stats.indexes[0].coverage_summary_ready);
     try std.testing.expectEqual(@as(u64, 2), incoming.stats.indexes[0].coverage_produced_count);
 }
@@ -3393,6 +3395,7 @@ test "empty embeddings incarnation preserves serviceability during catch up" {
     var previous_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = @constCast("semantic_idx"),
         .kind = .dense_vector,
+        .serving_snapshot_ready = true,
         .coverage_config_hash = 77,
         .coverage_generation = 42,
         .coverage_identity_ready = true,
@@ -3420,6 +3423,7 @@ test "empty embeddings incarnation preserves serviceability during catch up" {
 
     preserveArtifactVisibilityOnReplayRegression(previous, &incoming, null);
     try std.testing.expect(incoming.stats.indexes[0].runtime_observation_serviceable);
+    try std.testing.expect(incoming.stats.indexes[0].serving_snapshot_ready);
     try std.testing.expect(incoming.stats.indexes[0].coverage_identity_ready);
     try std.testing.expect(incoming.stats.indexes[0].coverage_summary_ready);
 }
@@ -3465,6 +3469,7 @@ test "all-skipped embeddings incarnation preserves logical publication during ca
     var previous_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = @constCast("semantic_idx"),
         .kind = .dense_vector,
+        .serving_snapshot_ready = true,
         .coverage_skipped_count = 2,
         .coverage_config_hash = 77,
         .coverage_generation = 42,
@@ -3493,6 +3498,7 @@ test "all-skipped embeddings incarnation preserves logical publication during ca
 
     preserveArtifactVisibilityOnReplayRegression(previous, &incoming, null);
     try std.testing.expect(incoming.stats.indexes[0].runtime_observation_serviceable);
+    try std.testing.expect(incoming.stats.indexes[0].serving_snapshot_ready);
     try std.testing.expectEqual(@as(u64, 2), incoming.stats.indexes[0].coverage_skipped_count);
     try std.testing.expect(incoming.stats.indexes[0].coverage_summary_ready);
 }
