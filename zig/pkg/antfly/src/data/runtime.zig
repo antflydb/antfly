@@ -7056,13 +7056,13 @@ pub const DataServer = struct {
     pub fn quiesceExternalProviderUsersWithDeadline(
         self: *DataServer,
         deadline: antfly.common.runtime_lifecycle.ShutdownDeadline,
-    ) void {
+    ) !void {
         if (self.external_provider_users_quiesced) return;
         self.quiesceBackgroundWorkWithDeadline(deadline);
         self.write_source.quiesce();
         if (self.data_raft_apply) |apply_sm| apply_sm.write_source.quiesce();
         self.provisioned_storage.detachWriteSourceRuntimeHooks();
-        self.provisioned_storage.quiesceExternalProviderUsers();
+        try self.provisioned_storage.quiesceExternalProviderUsers();
         self.external_provider_users_quiesced = true;
     }
 
@@ -7078,7 +7078,10 @@ pub const DataServer = struct {
         self: *DataServer,
         deadline: antfly.common.runtime_lifecycle.ShutdownDeadline,
     ) void {
-        self.quiesceExternalProviderUsersWithDeadline(deadline);
+        self.quiesceExternalProviderUsersWithDeadline(deadline) catch |err| {
+            std.log.err("data server provider shutdown barrier failed err={s}", .{@errorName(err)});
+            @panic("data server provider shutdown barrier failed");
+        };
         if (self.ha_admin_server) |*server| server.deinit();
         if (self.ha_promoted_primary) |*primary| primary.close();
         if (self.ha_standby_replication_http_executor) |*executor| executor.deinit();

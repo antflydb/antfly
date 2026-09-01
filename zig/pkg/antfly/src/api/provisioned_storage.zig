@@ -323,11 +323,11 @@ pub const ProvisionedGroupStorage = struct {
     /// destroyed. Sources and request runtimes must already be quiescent, so
     /// no new cache lease can appear while this barrier holds the shared state
     /// mutex. The cache containers remain valid for the ordinary final deinit.
-    pub fn quiesceExternalProviderUsers(self: *ProvisionedGroupStorage) void {
+    pub fn quiesceExternalProviderUsers(self: *ProvisionedGroupStorage) !void {
         lockAtomic(&self.write_cache_state_mutex);
         defer self.write_cache_state_mutex.unlock();
-        self.startup_write_cache.closeAllDbsLocked();
-        self.write_cache.closeAllDbsLocked();
+        try self.startup_write_cache.closeAllDbsLocked();
+        try self.write_cache.closeAllDbsLocked();
     }
 
     /// Break every cache-to-source callback edge while both owners are still

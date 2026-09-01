@@ -2176,28 +2176,66 @@ pub const ProvisionedTableWriteCache = struct {
     /// source and HTTP work is quiescent, DB.close joins enrichment workers so
     /// an embedded provider can be destroyed without racing an in-flight call.
     /// The caller owns the shared cache state mutex when one is bound.
-    pub fn closeAllDbsLocked(self: *ProvisionedTableWriteCache) void {
+    ///
+    /// Detach the complete ownership set under the short lifecycle mutex, then
+    /// join workers outside it. A provider call may take seconds to cancel;
+    /// holding the lease mutex across that wait would turn a future callback or
+    /// lease release into a shutdown deadlock. Active leases are a violated
+    /// quiescence contract and must never be converted into use-after-free.
+    pub fn closeAllDbsLocked(self: *ProvisionedTableWriteCache) !void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+
         lockAtomic(&self.entry_lifecycle_mutex);
-        defer self.entry_lifecycle_mutex.unlock();
         for (self.entries.items) |entry| {
-            entry.deinit(self.alloc, self.backend_runtime);
-            self.alloc.destroy(entry);
+            if (entry.active_leases != 0) {
+                self.entry_lifecycle_mutex.unlock();
+                return error.ActiveDbLeases;
+            }
         }
-        self.entries.clearRetainingCapacity();
         for (self.retired_entries.items) |entry| {
-            entry.deinit(self.alloc, self.backend_runtime);
-            self.alloc.destroy(entry);
+            if (entry.active_leases != 0) {
+                self.entry_lifecycle_mutex.unlock();
+                return error.ActiveDbLeases;
+            }
         }
-        self.retired_entries.clearRetainingCapacity();
         for (self.closing_entries.items) |entry| {
+            if (entry.active_leases != 0) {
+                self.entry_lifecycle_mutex.unlock();
+                return error.ActiveDbLeases;
+            }
+        }
+
+        // Move the containers, not merely their slices. Close-time callbacks
+        // may touch the now-empty cache; retaining its old backing allocation
+        // would let an append overwrite the detached pointer list mid-drain.
+        var entries = self.entries;
+        var retired_entries = self.retired_entries;
+        var closing_entries = self.closing_entries;
+        self.entries = .empty;
+        self.retired_entries = .empty;
+        self.closing_entries = .empty;
+        self.entry_lifecycle_mutex.unlock();
+        defer entries.deinit(self.alloc);
+        defer retired_entries.deinit(self.alloc);
+        defer closing_entries.deinit(self.alloc);
+
+        for (entries.items) |entry| {
             entry.deinit(self.alloc, self.backend_runtime);
             self.alloc.destroy(entry);
         }
-        self.closing_entries.clearRetainingCapacity();
+        for (retired_entries.items) |entry| {
+            entry.deinit(self.alloc, self.backend_runtime);
+            self.alloc.destroy(entry);
+        }
+        for (closing_entries.items) |entry| {
+            entry.deinit(self.alloc, self.backend_runtime);
+            self.alloc.destroy(entry);
+        }
     }
 
     pub fn deinit(self: *ProvisionedTableWriteCache) void {
-        self.closeAllDbsLocked();
+        self.closeAllDbsLocked() catch @panic("writer cache deinitialized with active DB leases");
         self.entries.deinit(self.alloc);
         self.retired_entries.deinit(self.alloc);
         self.closing_entries.deinit(self.alloc);
@@ -11155,8 +11193,8 @@ pub const ProvisionedTableWriteSource = struct {
                 std.log.warn("managed startup restore recovery failed phase=repair_probe class={s}", .{@errorName(err)});
                 return err;
             };
-        const generated_runtime_required = if (configured_indexes) |summary|
-            summary.generated_runtime_required
+        const has_generated_producers = if (configured_indexes) |summary|
+            summary.has_generated_producers
         else
             false;
         // Restore repair intentionally uses a workerless exclusive owner. An
@@ -11170,9 +11208,8 @@ pub const ProvisionedTableWriteSource = struct {
             metadata.advance_index_repairs,
             restore_repair_needed,
             self.write_cache != null,
-            generated_runtime_required,
         );
-        const cold_open_uses_writer_cache = cold_open_plan.use_writer_cache;
+        var cold_open_uses_writer_cache = cold_open_plan.use_writer_cache;
         const startup_open_mode = cold_open_plan.mode;
         // A provisioned writer is the generation owner. Index repair leases
         // that owner instead of opening a second DB over the same path; cold
@@ -11187,7 +11224,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer if (cached_db) |*cached| cached.deinit(alloc);
         var uncached_db: ?db_mod.DB = null;
         var uncached_promotion_owner_state: ProvisionedTableWriteCache.PromotionOwnerState = .{};
-        const db = db_blk: {
+        var db = db_blk: {
             if (live_repair_guard) |guard| break :db_blk guard.db;
             if (startup_cache) |cache| {
                 cached_db = self.getOrOpenCachedDbModeWithMetadata(alloc, cache, path, group_id, table_name, startup_open_mode, null, null, .{
@@ -11281,6 +11318,60 @@ pub const ProvisionedTableWriteSource = struct {
             break :db_blk &uncached_db.?;
         };
         defer if (uncached_db) |*owned| owned.close();
+
+        // Configuration establishes capability, never ownership. Inspect the
+        // exact durable shard state with workers disabled, and promote only an
+        // interrupted generated pipeline into the resident writer cache. A
+        // clean generated shard remains a bounded startup inspection and is
+        // closed below instead of retaining one worker set per local shard.
+        if (!use_live_repair_cache and
+            !cold_open_uses_writer_cache and
+            has_generated_producers and
+            self.write_cache != null and
+            try managedDbNeedsResidentGeneratedRecovery(alloc, db))
+        {
+            std.debug.assert(cached_db != null and uncached_db == null);
+            cached_db.?.deinit(alloc);
+            cached_db = null;
+            try self.clearStartupWriteCache();
+
+            cached_db = self.getOrOpenCachedDbModeWithMetadata(
+                alloc,
+                self.write_cache.?,
+                path,
+                group_id,
+                table_name,
+                .default_async,
+                null,
+                null,
+                .{
+                    .indexes_json = indexes_json,
+                    .schema_json = metadata.schema_json,
+                    .identity_namespace = identity_namespace,
+                },
+            ) catch |err| {
+                if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
+                if (isTerminalStartupCatchUpOpenFailure(err)) {
+                    const terminal_status_published = try publishTerminalStartupCatchUpRuntimeStatus(
+                        self,
+                        alloc,
+                        table_name,
+                        group_id,
+                        opening_db_startup,
+                        configured_indexes,
+                        err,
+                    );
+                    return .{
+                        .had_debt = true,
+                        .terminal_degraded = true,
+                        .index_repair_pending = !terminal_status_published,
+                    };
+                }
+                return err;
+            };
+            cold_open_uses_writer_cache = true;
+            db = cached_db.?.db;
+        }
         _ = try db.runDueLsmObsoleteReclaimUntilIdle(startup_obsolete_reclaim_max_steps);
         var startup_status_active = true;
         defer if (startup_status_active) {
@@ -23004,40 +23095,33 @@ fn coldMaintenanceOpenPlan(
     advance_index_repairs: bool,
     restore_repair_needed: bool,
     writer_cache_available: bool,
-    generated_runtime_required: bool,
 ) ColdMaintenanceOpenPlan {
     if (restore_repair_needed) return .{ .mode = .restore_repair, .use_writer_cache = false };
-    // Generated provider work is not a bounded inspection: retries and later
-    // preparation windows need a resident producer after this quantum exits.
-    // Reuse the capacity-bounded writer cache so restart neither pins an
-    // unbounded set of DBs nor destroys the only worker capable of resuming
-    // the durable cursor. Plain structural/replay audits remain transient.
-    if ((advance_index_repairs or generated_runtime_required) and writer_cache_available) {
+    // An exact durable repair route has already selected this shard. Ordinary
+    // startup—including configured generated indexes—begins workerless and is
+    // promoted only after inspecting actual replay/coverage debt.
+    if (advance_index_repairs and writer_cache_available) {
         return .{ .mode = .default_async, .use_writer_cache = true };
     }
     return .{ .mode = .startup_catch_up, .use_writer_cache = false };
 }
 
-test "cold generated repair promotes a resident writer while inspection stays bounded" {
+test "cold repair ownership is resident while generated inspection stays bounded" {
     try std.testing.expectEqual(
         ColdMaintenanceOpenPlan{ .mode = .default_async, .use_writer_cache = true },
-        coldMaintenanceOpenPlan(true, false, true, false),
-    );
-    try std.testing.expectEqual(
-        ColdMaintenanceOpenPlan{ .mode = .default_async, .use_writer_cache = true },
-        coldMaintenanceOpenPlan(false, false, true, true),
+        coldMaintenanceOpenPlan(true, false, true),
     );
     try std.testing.expectEqual(
         ColdMaintenanceOpenPlan{ .mode = .startup_catch_up, .use_writer_cache = false },
-        coldMaintenanceOpenPlan(false, false, true, false),
+        coldMaintenanceOpenPlan(false, false, true),
+    );
+    try std.testing.expectEqual(
+        ColdMaintenanceOpenPlan{ .mode = .startup_catch_up, .use_writer_cache = false },
+        coldMaintenanceOpenPlan(false, false, false),
     );
     try std.testing.expectEqual(
         ColdMaintenanceOpenPlan{ .mode = .restore_repair, .use_writer_cache = false },
-        coldMaintenanceOpenPlan(true, true, true, true),
-    );
-    try std.testing.expectEqual(
-        ColdMaintenanceOpenPlan{ .mode = .startup_catch_up, .use_writer_cache = false },
-        coldMaintenanceOpenPlan(false, false, false, true),
+        coldMaintenanceOpenPlan(true, true, true),
     );
 }
 
@@ -24964,7 +25048,7 @@ const StartupConfiguredIndex = struct {
 
 const StartupConfiguredIndexes = struct {
     items: []StartupConfiguredIndex,
-    generated_runtime_required: bool = false,
+    has_generated_producers: bool = false,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.items) |*item| item.deinit(alloc);
@@ -25020,7 +25104,7 @@ fn parseStartupConfiguredIndexes(
     }
     @memset(items, .{});
     var initialized: usize = 0;
-    var generated_runtime_required = false;
+    var has_generated_producers = false;
 
     if (array_form) |value| {
         const array_items = switch (value) {
@@ -25038,14 +25122,14 @@ fn parseStartupConfiguredIndexes(
             };
             errdefer configured.deinit(alloc);
             try populateStartupAlgebraicCapability(alloc, &configured, item);
-            generated_runtime_required = generated_runtime_required or
+            has_generated_producers = has_generated_producers or
                 try jsonValueHasGeneratedEnrichment(alloc, item);
             items[initialized] = configured;
             initialized += 1;
         }
         return .{
             .items = items,
-            .generated_runtime_required = generated_runtime_required,
+            .has_generated_producers = has_generated_producers,
         };
     }
 
@@ -25058,14 +25142,14 @@ fn parseStartupConfiguredIndexes(
         };
         errdefer configured.deinit(alloc);
         try populateStartupAlgebraicCapability(alloc, &configured, entry.value_ptr.*);
-        generated_runtime_required = generated_runtime_required or
+        has_generated_producers = has_generated_producers or
             try jsonValueHasGeneratedEnrichment(alloc, entry.value_ptr.*);
         items[initialized] = configured;
         initialized += 1;
     }
     return .{
         .items = items,
-        .generated_runtime_required = generated_runtime_required,
+        .has_generated_producers = has_generated_producers,
     };
 }
 
@@ -25464,6 +25548,17 @@ fn managedDbNeedsGeneratedCoverageReplay(alloc: std.mem.Allocator, db: *db_mod.D
     if (!db.core.hasGeneratedEnrichmentTargets()) return false;
     const enrichment = db.pendingWorkStats().enrichment;
     if (enrichment.applied_sequence < enrichment.target_sequence) return false;
+    return try db.generatedCoverageReplayNeeded(alloc);
+}
+
+/// Exact cold-start admission for a long-lived generated owner. Configuration
+/// only proves that a producer exists; durable replay or missing source
+/// outcomes prove that the producer has work which must survive this bounded
+/// startup quantum.
+fn managedDbNeedsResidentGeneratedRecovery(alloc: std.mem.Allocator, db: *db_mod.DB) !bool {
+    if (!db.core.hasGeneratedEnrichmentTargets()) return false;
+    const enrichment = db.pendingWorkStats().enrichment;
+    if (enrichment.applied_sequence < enrichment.target_sequence) return true;
     return try db.generatedCoverageReplayNeeded(alloc);
 }
 
@@ -34438,14 +34533,151 @@ test "provider shutdown barrier closes cached dbs and remains idempotent" {
     try cache.seedCreatedDbLocked(&opened, 7001, 0, "docs", "{}", "{}");
     try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
 
-    cache.closeAllDbsLocked();
+    cache.entries.items[0].active_leases = 1;
+    try std.testing.expectError(error.ActiveDbLeases, cache.closeAllDbsLocked());
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    cache.entries.items[0].active_leases = 0;
+
+    try cache.closeAllDbsLocked();
     try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), cache.closing_entries.items.len);
 
     // Standalone explicitly executes this barrier before normal DataServer
     // teardown, whose cache deinit reaches it again.
-    cache.closeAllDbsLocked();
+    try cache.closeAllDbsLocked();
+}
+
+test "provider shutdown barrier joins an in-flight generated embedding call" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/provider-shutdown-active-embedding",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    const Provider = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        alive: std.atomic.Value(bool) = .init(true),
+        calls_after_close: std.atomic.Value(usize) = .init(0),
+
+        fn dense(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            _: []const u8,
+            texts: []const []const u8,
+        ) anyerror![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.alive.load(.acquire)) {
+                _ = self.calls_after_close.fetchAdd(1, .monotonic);
+                return error.ProviderClosed;
+            }
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) sleepNs(std.time.ns_per_ms);
+            if (!self.alive.load(.acquire)) {
+                _ = self.calls_after_close.fetchAdd(1, .monotonic);
+                return error.ProviderClosed;
+            }
+            const vectors = try allocator.alloc([]f32, texts.len);
+            errdefer allocator.free(vectors);
+            for (vectors, 0..) |*vector, i| {
+                vector.* = allocator.dupe(f32, &.{ 1, 0, 0 }) catch |err| {
+                    for (vectors[0..i]) |owned| allocator.free(owned);
+                    return err;
+                };
+            }
+            return vectors;
+        }
+
+        fn sparse(
+            _: *anyopaque,
+            allocator: std.mem.Allocator,
+            _: []const u8,
+            _: []const []const u8,
+        ) anyerror![]db_embedder.SparseEmbedding {
+            return try allocator.alloc(db_embedder.SparseEmbedding, 0);
+        }
+
+        fn interface(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = dense,
+                .embed_sparse_texts = sparse,
+            };
+        }
+    };
+
+    var provider = Provider{};
+    const indexes_json =
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"execution":{"embedding":{"batch_items":1}},"embedder":{"provider":"antfly","model":"test-model"}}}
+    ;
+    var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntfly(
+        alloc,
+        path,
+        indexes_json,
+        null,
+        null,
+        0,
+        null,
+        .default,
+        null,
+        provider.interface(),
+        null,
+        null,
+    );
+    defer if (opened) |*db| db.close();
+
+    var cache = ProvisionedTableWriteCache.init(alloc);
+    defer cache.deinit();
+    try cache.seedCreatedDbLocked(&opened, 7001, 0, "docs", indexes_json, "{}");
+    try cache.entries.items[0].db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    var attempts: usize = 0;
+    while (!provider.entered.load(.acquire) and attempts < 5_000) : (attempts += 1) {
+        sleepNs(std.time.ns_per_ms);
+    }
+    try std.testing.expect(provider.entered.load(.acquire));
+
+    const Close = struct {
+        cache: *ProvisionedTableWriteCache,
+        started: std.atomic.Value(bool) = .init(false),
+        returned: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.cache.closeAllDbsLocked() catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            self.returned.store(true, .release);
+        }
+    };
+    var close = Close{ .cache = &cache };
+    const thread = try std.Thread.spawn(.{}, Close.run, .{&close});
+    var thread_joined = false;
+    defer if (!thread_joined) {
+        provider.release.store(true, .release);
+        thread.join();
+    };
+    while (!close.started.load(.acquire)) std.atomic.spinLoopHint();
+    sleepNs(10 * std.time.ns_per_ms);
+    try std.testing.expect(!close.returned.load(.acquire));
+
+    provider.release.store(true, .release);
+    thread.join();
+    thread_joined = true;
+    try std.testing.expect(!close.failed.load(.acquire));
+    try std.testing.expect(close.returned.load(.acquire));
+    provider.alive.store(false, .release);
+    sleepNs(5 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 0), provider.calls_after_close.load(.acquire));
 }
 
 test "provisioned transition writer fences exact supplied table metadata" {
@@ -43034,6 +43266,107 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
     try std.testing.expect(!statuses.items[0].stats.async_indexing.startup.active);
     try std.testing.expectEqual(runtime_status.RuntimeStatusSource.live_writer_publish, statuses.items[0].metadata.source);
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, statuses.items[0].metadata.freshness);
+}
+
+test "clean generated startup inspection does not retain a resident writer" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/clean-generated-startup-inspection",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+    const indexes_json =
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}}
+    ;
+    const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
+    const Provider = struct {
+        fn dense(
+            _: *anyopaque,
+            allocator: std.mem.Allocator,
+            _: []const u8,
+            texts: []const []const u8,
+        ) anyerror![][]f32 {
+            const vectors = try allocator.alloc([]f32, texts.len);
+            errdefer allocator.free(vectors);
+            for (vectors, 0..) |*vector, i| {
+                vector.* = allocator.dupe(f32, &.{ 1, 0, 0 }) catch |err| {
+                    for (vectors[0..i]) |owned| allocator.free(owned);
+                    return err;
+                };
+            }
+            return vectors;
+        }
+
+        fn sparse(
+            _: *anyopaque,
+            allocator: std.mem.Allocator,
+            _: []const u8,
+            _: []const []const u8,
+        ) anyerror![]db_embedder.SparseEmbedding {
+            return try allocator.alloc(db_embedder.SparseEmbedding, 0);
+        }
+
+        fn interface(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = dense,
+                .embed_sparse_texts = sparse,
+            };
+        }
+    };
+    var provider = Provider{};
+
+    {
+        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+            alloc,
+            path,
+            indexes_json,
+            null,
+            null,
+            table_reads.backend_current_root_generation,
+            null,
+            .default,
+            null,
+            provider.interface(),
+            null,
+            null,
+            identity_namespace,
+        );
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+            .sync_level = .full_index,
+        });
+        try db.runUntilIdle();
+    }
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var startup_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_cache.deinit();
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    source.bindWriteCaches(&write_cache, &startup_cache);
+    source.runtime_status_cache = &snapshot_cache;
+    _ = source.withAntflyProvider(provider.interface());
+
+    const result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
+        .indexes_json = indexes_json,
+        .schema_json = "",
+        .identity_namespace = identity_namespace,
+    });
+    try std.testing.expect(!result.busy);
+    try std.testing.expect(!result.had_debt);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), startup_cache.entries.items.len);
 }
 
 test "busy startup open preserves fresh writer runtime status" {
