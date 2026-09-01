@@ -140,7 +140,7 @@ def main() -> int:
         fail("the quickstart recording must not wait for the complete-only ready state")
 
     for token in (
-        "NewAntflyClient(\"http://localhost:8080\", http.DefaultClient)",
+        "NewAntflyClient(\"http://127.0.0.1:8080\", http.DefaultClient)",
         "client.CreateTable(ctx",
         "client.Query(ctx",
         "client.RetrievalAgent(ctx",

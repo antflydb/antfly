@@ -1,5 +1,5 @@
 // Command quickstart is the compile-checked Go counterpart to the documentation
-// quickstart. It expects Antfly at http://localhost:8080 and the Wikipedia JSONL
+// quickstart. It expects Antfly at http://127.0.0.1:8080 and the Wikipedia JSONL
 // fixture to have been loaded by the shared CLI ingestion step.
 package main
 
@@ -15,7 +15,7 @@ import (
 
 func main() {
 	ctx := context.Background()
-	client, err := antfly.NewAntflyClient("http://localhost:8080", http.DefaultClient)
+	client, err := antfly.NewAntflyClient("http://127.0.0.1:8080", http.DefaultClient)
 	if err != nil {
 		log.Fatal(err)
 	}
