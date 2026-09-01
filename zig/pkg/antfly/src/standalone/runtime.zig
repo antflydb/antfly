@@ -2325,11 +2325,17 @@ pub fn runFromIterator(
         std.log.err("standalone startup failed step=register_node err={}", .{err});
         return err;
     };
-    data_server.requestProvisionedStartupCatchUpNow() catch |err| {
-        std.log.warn("standalone startup provisioned startup catch-up skipped err={}", .{err});
-    };
-    data_server.requestProvisionedCacheWarmup() catch |err| {
-        std.log.warn("standalone startup provisioned cache warmup skipped err={}", .{err});
+    // Warm the query owner before starting recovery. The warmup completion is
+    // the single handoff into provisioned startup catch-up; launching both
+    // workers concurrently lets catch-up win the gate while warmup exits as
+    // "already active", leaving neither a query owner nor a retry for the
+    // warmup. If warmup itself cannot be scheduled, retain availability by
+    // falling back to the durable catch-up owner directly.
+    data_server.requestProvisionedCacheWarmup() catch |warmup_err| {
+        std.log.warn("standalone startup provisioned cache warmup skipped err={}", .{warmup_err});
+        data_server.requestProvisionedStartupCatchUpNow() catch |catch_up_err| {
+            std.log.warn("standalone startup provisioned startup catch-up skipped err={}", .{catch_up_err});
+        };
     };
 
     // ---------------------------------------------------------------

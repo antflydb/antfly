@@ -71,7 +71,7 @@ const runtime_status_protocol_probe_max_backoff_ns: u64 = 60 * std.time.ns_per_s
 // The data owner sends clean idle heartbeats every 30 seconds. Keep telemetry
 // through two missed intervals plus scheduling jitter; leadership changes use
 // a new service-local cache and therefore still become unavailable promptly.
-const embedding_activity_ttl_ns: u64 = 90 * std.time.ns_per_s;
+const embedding_activity_ttl_ns: u64 = db_mod.types.embedding_activity_retention_ms * std.time.ns_per_ms;
 const embedding_activity_protocol_version = metadata_table_manager.embedding_activity_protocol_version;
 
 const EmbeddingActivityCache = struct {

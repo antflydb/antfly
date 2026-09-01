@@ -1115,6 +1115,164 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     assert complete["total_indexed"] == 100
 
 
+@pytest.mark.fresh_antfly_process
+def test_progressive_publication_remains_queryable_across_process_restart(
+    single_item_enrichment_batches,
+    stateful_api,
+    progressive_openai_embedder,
+):
+    """A durable intra-revision checkpoint remains serviceable on restart."""
+    _ = single_item_enrichment_batches
+    assert stateful_api.supports_restart
+    table_name = f"quickstart_restart_{__import__('time').time_ns()}"
+    index_name = "semantic_restart"
+    stateful_api.create_table(table_name, num_shards=1)
+    created = stateful_api.create_index(
+        table_name,
+        index_name,
+        {
+            "name": index_name,
+            "type": "embeddings",
+            "field": "body",
+            "dimension": 3,
+            "execution": {"embedding": {"batch_items": 1}},
+            "embedder": {
+                "provider": "openai",
+                "model": "text-embedding-3-small",
+                "url": progressive_openai_embedder.url,
+            },
+        },
+    )
+    assert_created_index(created, index_name, "embeddings")
+    initially_complete = wait_until(
+        lambda: (
+            current
+            if (current := stateful_api.get_index(table_name, index_name)["status"])
+            .get("milestones", {})
+            .get("complete", {})
+            .get("reached")
+            else None
+        ),
+        timeout_s=30.0,
+        interval_s=0.05,
+    )
+    assert initially_complete is not None
+
+    # One write revision deliberately spans more than one preparation window.
+    # The worker publishes the first window, persists its position within this
+    # revision, then remains throttled with later documents still outstanding.
+    progressive_openai_embedder.rate_limit_after_next_requests(
+        70, input_substring="restart publication document"
+    )
+    documents = {
+        f"doc:{i:03d}": {
+            "title": f"Restart {i}",
+            "body": (
+                f"alpha restart publication document {i}"
+                if i < 70
+                else f"beta restart publication document {i}"
+            ),
+        }
+        for i in range(100)
+    }
+
+    try:
+        written = stateful_api.batch_write(
+            table_name,
+            inserts=documents,
+            sync_level="write",
+        )
+        assert written["inserted"] == len(documents)
+
+        def queryable_partial() -> dict | None:
+            status = stateful_api.get_index(table_name, index_name)["status"]
+            milestones = status.get("milestones") or {}
+            queryable = milestones.get("queryable") or {}
+            complete = milestones.get("complete") or {}
+            if not queryable.get("reached") or complete.get("reached"):
+                return None
+            if int(status.get("searchable_vectors", 0)) <= 0:
+                return None
+            return status
+
+        before = wait_until(
+            queryable_partial,
+            timeout_s=30.0,
+            interval_s=0.05,
+        )
+        assert before is not None
+        incarnation = before["incarnation"]
+        searchable_vectors = before["searchable_vectors"]
+        assert 0 < searchable_vectors < len(documents)
+        assert before["source_coverage"]["pending"] > 0
+
+        stateful_api.restart_server()
+        restarted_at = __import__("time").monotonic()
+
+        def restored_queryability() -> dict | None:
+            status = stateful_api.get_index(table_name, index_name)["status"]
+            if status.get("incarnation") != incarnation:
+                return None
+            if not (status.get("milestones") or {}).get("queryable", {}).get(
+                "reached"
+            ):
+                return None
+            if int(status.get("searchable_vectors", 0)) < searchable_vectors:
+                return None
+            return status
+
+        after = wait_until(
+            restored_queryability,
+            timeout_s=8.0,
+            interval_s=0.05,
+        )
+        assert after is not None, __import__("json").dumps(
+            {
+                "index": stateful_api.get_index(table_name, index_name),
+                "logs": stateful_api.debug_logs(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        assert __import__("time").monotonic() - restarted_at < 8.0
+        assert after["milestones"]["queryable"]["blockers"] == []
+        assert after["source_coverage"]["pending"] > 0
+
+        query_started = __import__("time").monotonic()
+        result = stateful_api.query_table(
+            table_name,
+            {
+                "embeddings": {index_name: [1.0, 0.0, 0.0]},
+                "indexes": [index_name],
+                "limit": 5,
+            },
+        )
+        assert __import__("time").monotonic() - query_started < 5.0
+        hits = result["responses"][0]["hits"]["hits"]
+        assert hits
+        assert int(hits[0]["_id"].removeprefix("doc:")) < 70
+
+    finally:
+        progressive_openai_embedder.allow_rate_limited_requests()
+
+    complete = wait_until(
+        lambda: (
+            current
+            if (current := stateful_api.get_index(table_name, index_name)["status"])
+            .get("milestones", {})
+            .get("complete", {})
+            .get("reached")
+            else None
+        ),
+        timeout_s=120.0,
+        interval_s=0.1,
+    )
+    assert complete is not None
+    assert complete["milestones"]["complete"]["reached"] is True
+    assert complete["source_coverage"]["covered"] == len(documents)
+    assert complete["searchable_vectors"] == len(documents)
+
+
 @pytest.mark.slow
 def test_500_document_chunked_backfill_is_bounded_idempotent_and_allows_second_index(
     backup_api, openai_embedder

@@ -1544,6 +1544,7 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
         try:
             return ready_index_status(
                 backup_api.get_index(table_name, "social_predicates"),
+                until="complete",
                 require_query_fresh=True,
             )
         except requests.RequestException:

@@ -75,6 +75,7 @@ test {
     _ = native_backup;
     _ = root_identity;
 }
+
 const change_journal_mod = @import("derived/change_journal.zig");
 const ha_effects_mod = @import("../ha/effects.zig");
 const ha_commit_gate_mod = @import("../ha/commit_gate.zig");
@@ -1290,7 +1291,16 @@ const AsyncContext = struct {
     enrichment_desired_running: std.atomic.Value(bool) = .init(false),
     enrichment_restart_state: std.atomic.Value(u8) = .init(0),
     dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
-    target_advance_repair_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
+    target_advance_warning_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
+    /// Exact indexes whose replay watermark could not advance because the
+    /// physical dense generation did not match its durable artifact target.
+    /// The callback that discovers this runs without a stable DB owner, so it
+    /// records only a bounded process-local handoff. The DB-owned maintenance
+    /// pass immediately turns it into a durable rebuild cursor or generation
+    /// repair intent; a crash before that handoff simply rediscovers the same
+    /// debt from the durable counter on the next replay attempt.
+    target_advance_debt_mutex: std.atomic.Mutex = .unlocked,
+    target_advance_maintenance_pending: std.StringHashMapUnmanaged(TargetAdvanceMaintenanceDebt) = .empty,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
     text_merge_restart_state: std.atomic.Value(u8) = .init(0),
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
@@ -1310,10 +1320,18 @@ const AsyncContext = struct {
         var maintenance_it = self.dense_maintenance_last_ns.iterator();
         while (maintenance_it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
         self.dense_maintenance_last_ns.deinit(alloc);
-        var target_repair_it = self.target_advance_repair_last_ns.iterator();
+        var target_repair_it = self.target_advance_warning_last_ns.iterator();
         while (target_repair_it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
-        self.target_advance_repair_last_ns.deinit(alloc);
+        self.target_advance_warning_last_ns.deinit(alloc);
+        var target_pending_it = self.target_advance_maintenance_pending.keyIterator();
+        while (target_pending_it.next()) |key| alloc.free(@constCast(key.*));
+        self.target_advance_maintenance_pending.deinit(alloc);
     }
+};
+
+const TargetAdvanceMaintenanceDebt = struct {
+    config_hash: u64,
+    generation: u64,
 };
 
 fn checkArtifactRepairCancelled(options: types.ArtifactRepairRunOptions) !void {
@@ -3770,6 +3788,11 @@ const ShadowState = struct {
     range_end: []u8,
 };
 
+const EmbeddingActivityObservation = struct {
+    activity: types.EmbeddingActivityStats,
+    observed_at_ms: u64,
+};
+
 /// Restore owns one bounded parsed artifact at a time. Keeping it across
 /// durable page commits makes recovery linear in the artifact size during a
 /// normal run; after a crash the current artifact is parsed once again and
@@ -3863,6 +3886,13 @@ pub const DB = struct {
     nonvisible_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
     nonvisible_doc_set_cache_overflow: bool = false,
     nonvisible_doc_set_cache_entries: AtomicU64 = AtomicU64.init(0),
+    // Status snapshots are reconstructed from durable state on every poll, so
+    // volatile worker observations need an independently owned cache. Keeping
+    // it on the resident DB (rather than inside a returned DBStats value) lets
+    // a contended lifecycle sample retain the last exact-incarnation activity
+    // without turning that retained sample into a fresh cross-node heartbeat.
+    embedding_activity_cache_mutex: std.atomic.Mutex = .unlocked,
+    embedding_activity_cache: std.StringHashMapUnmanaged(EmbeddingActivityObservation) = .{},
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
     visibility_runtime_stats: VisibilityRuntimeStats = .{},
@@ -5299,6 +5329,14 @@ pub const DB = struct {
         self.nonvisible_doc_set_cache_entries.store(0, .monotonic);
     }
 
+    fn clearEmbeddingActivityCache(self: *DB) void {
+        lockAtomic(&self.embedding_activity_cache_mutex);
+        defer self.embedding_activity_cache_mutex.unlock();
+        var keys = self.embedding_activity_cache.keyIterator();
+        while (keys.next()) |key| self.alloc.free(key.*);
+        self.embedding_activity_cache.clearRetainingCapacity();
+    }
+
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
@@ -5318,6 +5356,8 @@ pub const DB = struct {
         self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
         self.clearLiveDocSetCache();
         self.clearNonVisibleDocSetCache();
+        self.clearEmbeddingActivityCache();
+        self.embedding_activity_cache.deinit(self.alloc);
         if (self.graph_restore_parse_cache) |*cache| cache.deinit(self.alloc);
         self.graph_restore_parse_cache = null;
         self.bulk_ingest_coalescer.deinit(self.alloc);
@@ -12006,13 +12046,6 @@ pub const DB = struct {
             return false;
         }
 
-        const cfg = self.core.index_manager.get(intent.index_name) orelse return false;
-        if (types.indexConfigHash(cfg.*) != intent.config_hash or
-            try types.indexPublicationPolicy(alloc, cfg.*) != .progressive)
-        {
-            return false;
-        }
-
         const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, intent.index_name);
         defer alloc.free(admission_key);
         const admission_raw = self.core.store.get(alloc, admission_key) catch |err| switch (err) {
@@ -12023,47 +12056,139 @@ pub const DB = struct {
         const marker = try decodeManagedIndexAdmissionMarker(admission_raw);
         if (marker.disposition != .managed_rebuild or marker.config_hash != intent.config_hash) return false;
 
-        if (self.core.index_manager.loadFailure(intent.index_name) != null) return false;
-        const checkpoint = try self.core.loadProjectionCheckpoint(alloc, intent.index_name);
-        if (checkpoint.status != .clean or checkpoint.config_hash != intent.config_hash or
-            checkpoint.applied_sequence <= @max(marker.replay_target_sequence, intent.target_sequence))
-        {
-            return false;
-        }
+        return try self.progressiveManagedGenerationIsQueryableAtLeast(
+            alloc,
+            intent.index_name,
+            intent.config_hash,
+            @max(marker.replay_target_sequence, intent.target_sequence),
+        );
+    }
 
-        const ownership = indexDerivedCoverageOwnership(alloc, cfg.*) orelse return false;
-        if (ownership == .external) return false;
-        const generation = self.core.index_manager.coverageGenerationForIndex(intent.index_name) orelse return false;
+    const ProgressiveGenerationQueryability = enum {
+        queryable,
+        index_missing,
+        unsupported_kind,
+        config_changed,
+        atomic_publication,
+        load_failed,
+        checkpoint_not_publishable,
+        checkpoint_config_changed,
+        checkpoint_behind,
+        coverage_identity_unavailable,
+        external_coverage,
+        coverage_incarnation_unavailable,
+        coverage_counter_unavailable,
+        no_published_sources,
+        physical_index_unavailable,
+        artifact_counter_unavailable,
+        artifact_count_mismatch,
+        empty_dense_publication,
+        empty_sparse_publication,
+    };
+
+    /// Durable O(1) proof for the currently published progressive generation.
+    /// This is deliberately independent of repair ownership: ordinary
+    /// ingestion retires its empty-table admission intent before later partial
+    /// publications exist, while restart still needs to distinguish a safe
+    /// checkpoint from projection reconstruction debt. Repair callers layer
+    /// their admission marker and minimum replay fence on top of this proof.
+    fn observeProgressiveManagedGenerationQueryabilityAtLeast(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        config_hash: u64,
+        minimum_replay_sequence: u64,
+    ) !ProgressiveGenerationQueryability {
+        const cfg = self.core.index_manager.get(index_name) orelse return .index_missing;
+        if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return .unsupported_kind;
+        if (types.indexConfigHash(cfg.*) != config_hash) return .config_changed;
+        if (try types.indexPublicationPolicy(alloc, cfg.*) != .progressive) return .atomic_publication;
+        if (self.core.index_manager.loadFailure(index_name) != null) return .load_failed;
+
+        const checkpoint = try self.core.loadProjectionCheckpoint(alloc, index_name);
+        if (checkpoint.status != .clean and checkpoint.status != .rebuilding) return .checkpoint_not_publishable;
+        if (checkpoint.config_hash != config_hash) return .checkpoint_config_changed;
+        if (checkpoint.applied_sequence < minimum_replay_sequence) return .checkpoint_behind;
+
+        const ownership = indexDerivedCoverageOwnership(alloc, cfg.*) orelse return .coverage_identity_unavailable;
+        if (ownership == .external) return .external_coverage;
+        const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse
+            return .coverage_incarnation_unavailable;
         const produced = (try loadDerivedCoverageOutcomeCounterFromStore(
             alloc,
             self.core.store,
-            intent.index_name,
+            index_name,
             generation,
             "produced",
-        )) orelse return false;
-        if (produced == 0) return false;
+        )) orelse return .coverage_counter_unavailable;
+        if (produced == 0) return .no_published_sources;
         return switch (cfg.kind) {
             .dense_vector => blk: {
-                const dense = self.core.index_manager.denseIndex(intent.index_name) orelse break :blk false;
+                const dense = self.core.index_manager.denseIndex(index_name) orelse break :blk .physical_index_unavailable;
                 const active_count = dense.index.stats().active_count;
-                const expected_active_count = if (try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, cfg.*))
-                    (try loadDenseArtifactTargetCounter(alloc, self.core.store, intent.index_name)) orelse break :blk false
-                else
-                    produced;
-                if (!denseCoverageMatchesTarget(active_count, expected_active_count)) break :blk false;
-                const posting_backlog = dense.index.postingBacklogStats() catch break :blk false;
-                break :blk !posting_backlog.needsRepair();
+                if (active_count == 0) break :blk .empty_dense_publication;
+                if (checkpoint.published_count) |certified_count| {
+                    // A publication certificate proves the loaded HBC state
+                    // is exactly the snapshot committed at this checkpoint.
+                    // The live artifact target may be ahead while enrichment
+                    // is preparing the next replay window; that is completion
+                    // debt, not a reason to revoke the last safe snapshot.
+                    if (active_count != certified_count) break :blk .artifact_count_mismatch;
+                } else {
+                    // v0.2/legacy checkpoints carry no physical certificate.
+                    // Preserve their conservative equality proof instead of
+                    // inferring safety from an unversioned cardinality.
+                    const expected_active_count = if (try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, cfg.*))
+                        (try loadDenseArtifactTargetCounter(alloc, self.core.store, index_name)) orelse break :blk .artifact_counter_unavailable
+                    else
+                        produced;
+                    if (!denseCoverageMatchesTarget(active_count, expected_active_count)) break :blk .artifact_count_mismatch;
+                }
+                // Dirty posting centroids/payloads are bounded optimization
+                // debt. HBC searches them exactly until the maintenance lane
+                // refreshes those caches, so neither query admission nor this
+                // O(1) startup proof may scan or quarantine them.
+                break :blk .queryable;
             },
             .sparse_vector => blk: {
-                const sparse = self.core.index_manager.sparseIndex(intent.index_name) orelse break :blk false;
+                const sparse = self.core.index_manager.sparseIndex(index_name) orelse break :blk .physical_index_unavailable;
                 // Sparse replay applies a whole derived batch transactionally
                 // before advancing the checkpoint. At least one live sparse
                 // document plus the cursor proof above is therefore enough to
                 // publish this generation without scanning the index.
-                break :blk sparse.index.stats().doc_count > 0;
+                break :blk if (sparse.index.stats().doc_count > 0) .queryable else .empty_sparse_publication;
             },
-            else => false,
+            else => .unsupported_kind,
         };
+    }
+
+    fn progressiveManagedGenerationIsQueryableAtLeast(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        config_hash: u64,
+        minimum_replay_sequence: u64,
+    ) !bool {
+        return try self.observeProgressiveManagedGenerationQueryabilityAtLeast(
+            alloc,
+            index_name,
+            config_hash,
+            minimum_replay_sequence,
+        ) == .queryable;
+    }
+
+    fn progressiveManagedGenerationIsQueryable(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+    ) !bool {
+        const cfg = self.core.index_manager.get(index_name) orelse return false;
+        return try self.progressiveManagedGenerationIsQueryableAtLeast(
+            alloc,
+            index_name,
+            types.indexConfigHash(cfg.*),
+            0,
+        );
     }
 
     /// Bounded proof used by structural reconciliation after a managed dense
@@ -12166,11 +12291,10 @@ pub const DB = struct {
                     (try loadDenseArtifactTargetCounter(alloc, self.core.store, index_name)) orelse break :blk false
                 else
                     produced;
-                // Cardinality can match while deferred centroid/payload
-                // maintenance is still queued. Require a structurally quiet
-                // HBC snapshot before retiring the durable repair gate.
-                const posting_backlog = dense.index.postingBacklogStats() catch break :blk false;
-                if (posting_backlog.needsRepair()) break :blk false;
+                // Posting cache freshness is intentionally absent here.
+                // Dirty postings remain exactly searchable and drain in the
+                // bounded maintenance lane; completion describes publication
+                // and source coverage, not physical optimization cleanliness.
                 break :blk denseCoverageMatchesTarget(dense.index.stats().active_count, expected_active_count);
             },
             .sparse_vector => blk: {
@@ -15165,6 +15289,31 @@ pub const DB = struct {
             if (self.enrichment_runtime) |runtime| {
                 const enrichment = runtime.stats();
                 if (enrichment.enabled and enrichment.applied_sequence < entry.intent.target_sequence) {
+                    // The source-discovery owner has durably queued all work;
+                    // provider execution and derived publication now own the
+                    // next progress edge. Park this exact intent instead of
+                    // polling it on every repair scheduler turn. Derived
+                    // publication wakes it immediately; the bounded fallback
+                    // audit covers terminal/skipped enrichment that produces
+                    // no index watermark edge.
+                    const observed_sequence = try self.managedIndexAppliedSequence(alloc, entry.intent.index_name);
+                    const wake_at_sequence = @max(entry.intent.target_sequence, observed_sequence +| 1);
+                    if (!self.deferIndexRepairForProgress(
+                        repair_id,
+                        entry.intent.revision,
+                        wake_at_sequence,
+                    )) {
+                        result.busy = true;
+                        return result;
+                    }
+                    const current_sequence = try self.managedIndexAppliedSequence(alloc, entry.intent.index_name);
+                    if (current_sequence >= wake_at_sequence) {
+                        _ = wakeIndexRepairForProgressContext(
+                            self.async_context,
+                            entry.intent.index_name,
+                            current_sequence,
+                        );
+                    }
                     result.deferred = true;
                     return result;
                 }
@@ -24026,7 +24175,44 @@ pub const DB = struct {
                 },
                 applied_sequence,
             );
+            // Progressive managed admission owns one canonical generation.
+            // The physical checkpoint can be clean while the separate durable
+            // generation intent remains open for corpus convergence, or it can
+            // be rebuilding while a safe partial publication is advancing.
+            // Neither state invalidates an atomically published HBC snapshot.
+            // When the durable admission marker, current config, exact
+            // generation-scoped publication certificate prove that snapshot
+            // queryable, preserve it and let the producer resume
+            // in place. A leftover replay cursor is cleanup metadata in this
+            // case, not authority to reconstruct the same artifacts on every
+            // restart and delay both queries and new embedding work.
+            const progressive_queryability = if (!watermark_regressed and
+                !generation_repair_pending and
+                !checkpoint_config_mismatch and
+                (projection_checkpoint.status == .clean or projection_checkpoint.status == .rebuilding))
+                try self.observeProgressiveManagedGenerationQueryabilityAtLeast(
+                    alloc,
+                    entry.config.name,
+                    config_hash,
+                    0,
+                )
+            else
+                null;
+            if (progressive_queryability == .queryable) {
+                if (persisted_resume) |buf| alloc.free(buf);
+                clearTargetAdvanceMaintenanceDebt(self.async_context, entry.config.name);
+                continue;
+            }
+            const target_advance_handoff = targetAdvanceMaintenanceDebtPending(
+                self.async_context,
+                entry.config.name,
+                .{
+                    .config_hash = config_hash,
+                    .generation = projection_checkpoint.generation,
+                },
+            );
             if (persisted_resume == null and
+                !target_advance_handoff and
                 !generation_repair_pending and
                 !checkpoint_config_mismatch and
                 applied_sequence < target_sequence and
@@ -24035,6 +24221,21 @@ pub const DB = struct {
             {
                 continue;
             }
+            std.log.info(
+                "dense startup artifact rebuild planned index={s} persisted_cursor={} target_advance_handoff={} generation_repair_pending={} watermark_regressed={} checkpoint_status={s} checkpoint_config_mismatch={} applied_sequence={} target_sequence={} progressive_publication={s}",
+                .{
+                    entry.config.name,
+                    persisted_resume != null,
+                    target_advance_handoff,
+                    generation_repair_pending,
+                    watermark_regressed,
+                    @tagName(projection_checkpoint.status),
+                    checkpoint_config_mismatch,
+                    applied_sequence,
+                    target_sequence,
+                    if (progressive_queryability) |value| @tagName(value) else "not_evaluated",
+                },
+            );
             const invalid_generation_error: ?[]const u8 = blk: {
                 if (generation_repair_pending) break :blk "dense_hbc_published_snapshot_incomplete";
                 if (checkpoint_config_mismatch) break :blk "dense_projection_config_mismatch";
@@ -24217,11 +24418,14 @@ pub const DB = struct {
                     if (rebuilt.yielded) return error.ShadowIndexCatchUpIncomplete;
                     outcome.made_progress = true;
                     outcome.dense_visibility_changed = true;
+                    clearTargetAdvanceMaintenanceDebt(self.async_context, entry.config.name);
                     continue;
                 },
                 else => return err,
             };
             outcome.made_progress = outcome.made_progress or repair_intent.made_progress;
+            // The durable generation intent is now the recovery authority.
+            clearTargetAdvanceMaintenanceDebt(self.async_context, entry.config.name);
         }
         for (plan.targets) |target| {
             const entry = &self.core.index_manager.dense_indexes.items[target.dense_index_idx];
@@ -24246,6 +24450,10 @@ pub const DB = struct {
                 try rebuild_state.restartWithIo(self.core.index_manager.checkpointIo());
                 outcome.made_progress = true;
             }
+            // The rebuilding checkpoint plus its generation-scoped cursor now
+            // survive process loss. Retire the process-local discovery edge
+            // only after both writes have succeeded.
+            clearTargetAdvanceMaintenanceDebt(self.async_context, entry.config.name);
         }
         return outcome;
     }
@@ -25395,11 +25603,14 @@ pub const DB = struct {
         // their physical artifact count can still be advancing.
         const active_generation_complete =
             self.managedAdmissionGenerationIsServiceable(alloc, intent) catch false;
+        // Queryability belongs to the last exact published snapshot, not the
+        // repair target. A progressive generation can safely serve while the
+        // intent's replay fence and the live artifact target continue to
+        // advance. This proof reads the durable projection certificate and
+        // exact loaded cardinality; mere physical installation is never
+        // sufficient.
         const active_generation_queryable =
-            self.managedAdmissionGenerationIsQueryable(alloc, intent) catch false;
-        const managed_admission = intent.trigger == .projection_generation_invalid and
-            intent.last_error != null and
-            std.mem.eql(u8, intent.last_error.?, managed_catalog_admission_rebuild_reason);
+            self.progressiveManagedGenerationIsQueryable(alloc, intent.index_name) catch false;
         const generation_installed = self.repairGenerationInstalled(intent);
         // The resident gate is version/incarnation fenced. Pair its decision
         // with physical presence so neither a missing slot nor a stale config
@@ -25423,8 +25634,7 @@ pub const DB = struct {
         }
         item.index_repair_active_generation_serviceable = active_generation_complete or
             active_generation_queryable or
-            admitted_serving_generation or
-            (managed_admission and resident_admission_open);
+            admitted_serving_generation;
         switch (intent.trigger) {
             .incomplete_bulk_publish,
             .root_generation_rebuild,
@@ -25975,6 +26185,89 @@ pub const DB = struct {
         return enrichment_status;
     }
 
+    fn isEmbeddingActivityIndex(item: types.DBIndexStats) bool {
+        return item.kind == .dense_vector or item.kind == .sparse_vector;
+    }
+
+    fn statusContainsEmbeddingActivityIndex(indexes: []const types.DBIndexStats, name: []const u8) bool {
+        for (indexes) |item| {
+            if (isEmbeddingActivityIndex(item) and std.mem.eql(u8, item.name, name)) return true;
+        }
+        return false;
+    }
+
+    fn cacheObservedEmbeddingActivity(
+        self: *DB,
+        indexes: []types.DBIndexStats,
+        runtime: *enrichment_runtime_mod.EnrichmentRuntime,
+        now_ms: u64,
+    ) void {
+        lockAtomic(&self.embedding_activity_cache_mutex);
+        defer self.embedding_activity_cache_mutex.unlock();
+
+        for (indexes) |*item| {
+            if (!isEmbeddingActivityIndex(item.*)) continue;
+            const activity = runtime.indexEmbeddingActivity(item.name);
+            item.embedding_activity_observed = true;
+            item.embedding_activity_sample_fresh = true;
+            item.embedding_activity = activity;
+
+            if (self.embedding_activity_cache.getPtr(item.name)) |cached| {
+                cached.* = .{ .activity = activity, .observed_at_ms = now_ms };
+                continue;
+            }
+            const owned_name = self.alloc.dupe(u8, item.name) catch continue;
+            self.embedding_activity_cache.putNoClobber(
+                self.alloc,
+                owned_name,
+                .{ .activity = activity, .observed_at_ms = now_ms },
+            ) catch {
+                self.alloc.free(owned_name);
+                continue;
+            };
+        }
+
+        // Successful lifecycle access is authoritative for the current index
+        // set. Prune removed names so repeated DDL cannot grow telemetry state.
+        var entries = self.embedding_activity_cache.iterator();
+        while (entries.next()) |entry| {
+            if (statusContainsEmbeddingActivityIndex(indexes, entry.key_ptr.*)) continue;
+            const owned_name = entry.key_ptr.*;
+            self.embedding_activity_cache.removeByPtr(entry.key_ptr);
+            self.alloc.free(owned_name);
+        }
+    }
+
+    fn retainCachedEmbeddingActivity(self: *DB, indexes: []types.DBIndexStats, now_ms: u64) void {
+        lockAtomic(&self.embedding_activity_cache_mutex);
+        defer self.embedding_activity_cache_mutex.unlock();
+
+        for (indexes) |*item| {
+            if (!isEmbeddingActivityIndex(item.*)) continue;
+            item.embedding_activity_observed = false;
+            item.embedding_activity_sample_fresh = false;
+            item.embedding_activity = .{};
+
+            const cached = self.embedding_activity_cache.get(item.name) orelse continue;
+            const identity_matches = cached.activity.index_generation == item.coverage_generation;
+            const receipt_fresh = cached.observed_at_ms != 0 and
+                now_ms -| cached.observed_at_ms < types.embedding_activity_retention_ms;
+            if (cached.activity.epoch != 0 and
+                cached.activity.sample_sequence != 0 and
+                identity_matches and
+                receipt_fresh)
+            {
+                item.embedding_activity_observed = true;
+                item.embedding_activity = cached.activity;
+                continue;
+            }
+
+            if (self.embedding_activity_cache.fetchRemove(item.name)) |removed| {
+                self.alloc.free(removed.key);
+            }
+        }
+    }
+
     /// Refresh readiness-neutral worker diagnostics on a retained status
     /// snapshot. Publication lifecycle is deliberately excluded: a lock-free
     /// observation may add activity, but it cannot prove that the artifact
@@ -25987,33 +26280,38 @@ pub const DB = struct {
         runtime_stats.ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else runtime_stats.ttl_cleanup;
         runtime_stats.transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else runtime_stats.transaction_recovery;
 
-        // `runtime_stats` is frequently a retained query-only snapshot. Revoke
-        // the prior observation before attempting lifecycle access so lock
-        // contention cannot turn an old sample into a fresh heartbeat. Absence
-        // is explicitly unavailable; an observed idle sample still carries a
-        // nonzero epoch and sample sequence.
-        for (runtime_stats.indexes) |*item| {
-            if (item.kind != .dense_vector and item.kind != .sparse_vector) continue;
-            item.embedding_activity_observed = false;
-            item.embedding_activity = .{};
-        }
-
         // Runtime-only diagnostics are optional status-plane detail and may run
-        // under apply. Skip the overlay during lifecycle transitions.
+        // under apply. A contended sample is not evidence that the owner went
+        // away: retain the last incarnation-matched receipt until the shared
+        // heartbeat TTL expires. A successfully observed absent runtime does
+        // clear immediately because it is an authoritative lifecycle edge.
+        const now_ms = monotonicTimeNs() / std.time.ns_per_ms;
+        for (runtime_stats.indexes) |*item| item.embedding_activity_sample_fresh = false;
         if (self.async_context.enrichment_lifecycle_mutex.tryLock()) {
             defer self.async_context.enrichment_lifecycle_mutex.unlock();
             if (self.async_context.enrichment_runtime) |runtime| {
                 for (runtime_stats.indexes) |*item| {
                     item.enrichment_failed = item.enrichment_failed or runtime.indexHasIsolatedFailure(item.name);
-                    if (item.kind == .dense_vector or item.kind == .sparse_vector) {
-                        item.embedding_activity_observed = true;
-                        item.embedding_activity = runtime.indexEmbeddingActivity(item.name);
-                    }
                     for (item.source_replay) |*source| {
                         source.failed = source.failed or runtime.indexSourceHasIsolatedFailure(item.name, source.artifact_name);
                     }
                 }
+                self.cacheObservedEmbeddingActivity(runtime_stats.indexes, runtime, now_ms);
+                return;
             }
+            clearEmbeddingActivityObservations(runtime_stats.indexes);
+            self.clearEmbeddingActivityCache();
+            return;
+        }
+        self.retainCachedEmbeddingActivity(runtime_stats.indexes, now_ms);
+    }
+
+    fn clearEmbeddingActivityObservations(indexes: []types.DBIndexStats) void {
+        for (indexes) |*item| {
+            if (item.kind != .dense_vector and item.kind != .sparse_vector) continue;
+            item.embedding_activity_observed = false;
+            item.embedding_activity_sample_fresh = false;
+            item.embedding_activity = .{};
         }
     }
 
@@ -26264,9 +26562,13 @@ pub const DB = struct {
                 .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
             };
         }
-        defer self.core.unlockApplyShared();
-
-        return try self.statsLocked(alloc);
+        var result = self.statsLocked(alloc) catch |err| {
+            self.core.unlockApplyShared();
+            return err;
+        };
+        self.core.unlockApplyShared();
+        self.overlayRuntimeStatusRuntimeBestEffort(&result);
+        return result;
     }
 
     pub fn runtimeStatusStatsConsistent(self: *DB, alloc: Allocator) !types.DBStats {
@@ -26275,9 +26577,13 @@ pub const DB = struct {
         }
 
         lockApplyShared(self);
-        defer self.core.unlockApplyShared();
-
-        return try self.statsLocked(alloc);
+        var result = self.statsLocked(alloc) catch |err| {
+            self.core.unlockApplyShared();
+            return err;
+        };
+        self.core.unlockApplyShared();
+        self.overlayRuntimeStatusRuntimeBestEffort(&result);
+        return result;
     }
 
     pub fn runtimeStatusStatsConsistentIfAvailable(self: *DB, alloc: Allocator) !?types.DBStats {
@@ -26286,9 +26592,13 @@ pub const DB = struct {
         }
 
         if (!self.core.tryLockApplyShared()) return null;
-        defer self.core.unlockApplyShared();
-
-        return try self.statsLocked(alloc);
+        var result = self.statsLocked(alloc) catch |err| {
+            self.core.unlockApplyShared();
+            return err;
+        };
+        self.core.unlockApplyShared();
+        self.overlayRuntimeStatusRuntimeBestEffort(&result);
+        return result;
     }
 
     fn applyCachedIdentityVisibilitySummary(identity_stats: *doc_identity.Stats, summary: ?doc_identity.VisibilitySummary) void {
@@ -27422,6 +27732,92 @@ pub const DB = struct {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         return try self.scanPrimaryDocCount(self.core.byteRange());
+    }
+
+    /// Cheap startup audit for the crash window where generated replay has no
+    /// remaining watermark debt but the current index incarnation still lacks
+    /// terminal outcomes for source documents. This deliberately avoids both
+    /// the full stats path and a primary corpus scan. Current writers maintain
+    /// the range cardinality transactionally; a missing cardinality (for
+    /// example, an older restored corpus) is conservatively handed to the
+    /// paged recovery owner instead of delaying availability to reconstruct it.
+    fn generatedCoverageRecoveryConfigsAlloc(self: *DB, alloc: Allocator) ![]types.IndexConfig {
+        if (!self.core.hasGeneratedEnrichmentTargets()) return try alloc.alloc(types.IndexConfig, 0);
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+
+        const primary_doc_count = try range_cardinality.load(alloc, self.core.store);
+        if (primary_doc_count != null and primary_doc_count.? == 0)
+            return try alloc.alloc(types.IndexConfig, 0);
+        const managed_indexes = try self.core.managedIndexes(alloc);
+        defer {
+            for (managed_indexes) |index_ref| alloc.free(@constCast(index_ref.name));
+            alloc.free(managed_indexes);
+        }
+        var configs = std.ArrayListUnmanaged(types.IndexConfig).empty;
+        errdefer {
+            for (configs.items) |*cfg| cfg.deinit(alloc);
+            configs.deinit(alloc);
+        }
+        for (managed_indexes) |index_ref| {
+            if (!try self.core.indexRequiresEnrichmentReplay(index_ref.name)) continue;
+            const cfg = self.core.index_manager.get(index_ref.name) orelse continue;
+            var item = types.DBIndexStats{ .name = index_ref.name, .kind = index_ref.kind };
+            initializeDerivedCoverageIdentity(cfg.*, &item);
+            if (item.coverage_identity_ready) {
+                try self.populateDerivedCoverageCounts(
+                    index_ref.name,
+                    item.coverage_generation,
+                    item.coverage_config_hash,
+                    &item,
+                );
+            }
+            const settled = item.coverage_produced_count +|
+                item.coverage_skipped_count +|
+                item.coverage_terminal_failed_count;
+            if (primary_doc_count) |source_total| {
+                if (item.coverage_identity_ready and item.coverage_summary_ready and settled >= source_total) continue;
+            }
+            try configs.append(alloc, try types.IndexConfig.clone(alloc, cfg.*));
+        }
+        return try configs.toOwnedSlice(alloc);
+    }
+
+    pub fn generatedCoverageReplayNeeded(self: *DB, alloc: Allocator) !bool {
+        const configs = try self.generatedCoverageRecoveryConfigsAlloc(alloc);
+        defer {
+            for (configs) |*cfg| cfg.deinit(alloc);
+            alloc.free(configs);
+        }
+        return configs.len != 0;
+    }
+
+    /// Converts an idle-watermark/source-coverage mismatch into the existing
+    /// durable, bounded generation-repair state machine. Source discovery is
+    /// paged at 128 documents per owner quantum and crash-resumes from its
+    /// fenced cursor; the currently published partial generation remains
+    /// serviceable until the replacement is atomically activated.
+    pub fn ensureGeneratedCoverageRecoveryIntents(self: *DB, alloc: Allocator) !usize {
+        const configs = try self.generatedCoverageRecoveryConfigsAlloc(alloc);
+        defer {
+            for (configs) |*cfg| cfg.deinit(alloc);
+            alloc.free(configs);
+        }
+        var ensured: usize = 0;
+        for (configs) |cfg| {
+            _ = try self.createGenerationRepairIntentAtTarget(
+                alloc,
+                cfg,
+                .replay_artifact_unavailable,
+                0,
+                0,
+                "generated_source_coverage_incomplete_after_replay",
+                null,
+                .pending,
+            );
+            ensured += 1;
+        }
+        return ensured;
     }
 
     pub fn scan(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !types.ScanResult {
@@ -41448,17 +41844,47 @@ fn noteDenseCatchUpMaintenanceRun(ctx: *AsyncContext, index_name: []const u8, no
     gop.value_ptr.* = now_ns;
 }
 
-fn shouldRunTargetAdvanceRepair(ctx: *AsyncContext, index_name: []const u8, now_ns: u64) bool {
+fn shouldLogTargetAdvanceDebt(ctx: *AsyncContext, index_name: []const u8, now_ns: u64) bool {
     const cooldown_ns = denseCatchUpMaintenanceCooldownNs();
     if (cooldown_ns == 0) return true;
-    const last_ns = ctx.target_advance_repair_last_ns.get(index_name) orelse return true;
+    const last_ns = ctx.target_advance_warning_last_ns.get(index_name) orelse return true;
     return now_ns -| last_ns >= cooldown_ns;
 }
 
-fn noteTargetAdvanceRepairRun(ctx: *AsyncContext, index_name: []const u8, now_ns: u64) !void {
-    const gop = try ctx.target_advance_repair_last_ns.getOrPut(ctx.alloc, index_name);
+fn noteTargetAdvanceDebtLogged(ctx: *AsyncContext, index_name: []const u8, now_ns: u64) !void {
+    const gop = try ctx.target_advance_warning_last_ns.getOrPut(ctx.alloc, index_name);
     if (!gop.found_existing) gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
     gop.value_ptr.* = now_ns;
+}
+
+fn recordTargetAdvanceMaintenanceDebt(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    debt: TargetAdvanceMaintenanceDebt,
+) !void {
+    lockAtomic(&ctx.target_advance_debt_mutex);
+    defer ctx.target_advance_debt_mutex.unlock();
+    const gop = try ctx.target_advance_maintenance_pending.getOrPut(ctx.alloc, index_name);
+    if (!gop.found_existing) gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
+    gop.value_ptr.* = debt;
+}
+
+fn targetAdvanceMaintenanceDebtPending(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    identity: TargetAdvanceMaintenanceDebt,
+) bool {
+    lockAtomic(&ctx.target_advance_debt_mutex);
+    defer ctx.target_advance_debt_mutex.unlock();
+    const debt = ctx.target_advance_maintenance_pending.get(index_name) orelse return false;
+    return debt.config_hash == identity.config_hash and debt.generation == identity.generation;
+}
+
+fn clearTargetAdvanceMaintenanceDebt(ctx: *AsyncContext, index_name: []const u8) void {
+    lockAtomic(&ctx.target_advance_debt_mutex);
+    defer ctx.target_advance_debt_mutex.unlock();
+    const entry = ctx.target_advance_maintenance_pending.fetchRemove(index_name) orelse return;
+    ctx.alloc.free(@constCast(entry.key));
 }
 
 test "async context dense catch-up session tracking suppresses local bulk sessions" {
@@ -41702,7 +42128,7 @@ test "dense catch-up maintenance cooldown skips light repeated maintenance" {
     try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs()));
 }
 
-test "target advance repair cooldown skips repeated repair attempts" {
+test "target advance debt logging is rate limited without doing repair work" {
     var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
     var ctx = AsyncContext{
         .alloc = std.testing.allocator,
@@ -41713,10 +42139,33 @@ test "target advance repair cooldown skips repeated repair attempts" {
     defer ctx.deinit(std.testing.allocator);
 
     const now_ns = std.time.ns_per_s;
-    try std.testing.expect(shouldRunTargetAdvanceRepair(&ctx, "idx", now_ns));
-    try noteTargetAdvanceRepairRun(&ctx, "idx", now_ns);
-    try std.testing.expect(!shouldRunTargetAdvanceRepair(&ctx, "idx", now_ns + denseCatchUpMaintenanceCooldownNs() - 1));
-    try std.testing.expect(shouldRunTargetAdvanceRepair(&ctx, "idx", now_ns + denseCatchUpMaintenanceCooldownNs()));
+    try std.testing.expect(shouldLogTargetAdvanceDebt(&ctx, "idx", now_ns));
+    try noteTargetAdvanceDebtLogged(&ctx, "idx", now_ns);
+    try std.testing.expect(!shouldLogTargetAdvanceDebt(&ctx, "idx", now_ns + denseCatchUpMaintenanceCooldownNs() - 1));
+    try std.testing.expect(shouldLogTargetAdvanceDebt(&ctx, "idx", now_ns + denseCatchUpMaintenanceCooldownNs()));
+}
+
+test "target advance maintenance handoff is exact-incarnation scoped" {
+    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var ctx = AsyncContext{
+        .alloc = std.testing.allocator,
+        .store = undefined,
+        .index_manager = undefined,
+        .apply_mutex = &apply_mutex,
+    };
+    defer ctx.deinit(std.testing.allocator);
+
+    try recordTargetAdvanceMaintenanceDebt(&ctx, "idx", .{ .config_hash = 11, .generation = 7 });
+    try std.testing.expect(targetAdvanceMaintenanceDebtPending(&ctx, "idx", .{ .config_hash = 11, .generation = 7 }));
+    try std.testing.expect(!targetAdvanceMaintenanceDebtPending(&ctx, "idx", .{ .config_hash = 12, .generation = 7 }));
+    try std.testing.expect(!targetAdvanceMaintenanceDebtPending(&ctx, "idx", .{ .config_hash = 11, .generation = 8 }));
+
+    // A same-name recreation replaces, rather than inherits, the old edge.
+    try recordTargetAdvanceMaintenanceDebt(&ctx, "idx", .{ .config_hash = 12, .generation = 1 });
+    try std.testing.expect(!targetAdvanceMaintenanceDebtPending(&ctx, "idx", .{ .config_hash = 11, .generation = 7 }));
+    try std.testing.expect(targetAdvanceMaintenanceDebtPending(&ctx, "idx", .{ .config_hash = 12, .generation = 1 }));
+    clearTargetAdvanceMaintenanceDebt(&ctx, "idx");
+    try std.testing.expect(!targetAdvanceMaintenanceDebtPending(&ctx, "idx", .{ .config_hash = 12, .generation = 1 }));
 }
 
 fn readEnvUsize(name: [:0]const u8, default_value: usize) usize {
@@ -43056,7 +43505,7 @@ fn saveAppliedSequencesBatchContext(
 
 fn appliedSequenceUpdatesWithConfigHashes(
     alloc: Allocator,
-    index_manager: *const index_manager_mod.IndexManager,
+    index_manager: *index_manager_mod.IndexManager,
     updates: []const apply_state.AppliedSequenceUpdate,
 ) ![]apply_state.AppliedSequenceUpdate {
     const enriched = try alloc.alloc(apply_state.AppliedSequenceUpdate, updates.len);
@@ -43065,6 +43514,11 @@ fn appliedSequenceUpdatesWithConfigHashes(
         if (enriched[i].config_hash == 0) {
             if (index_manager.get(update.index_name)) |cfg| {
                 enriched[i].config_hash = types.indexConfigHash(cfg.*);
+            }
+        }
+        if (enriched[i].published_count == null) {
+            if (index_manager.denseIndex(update.index_name)) |entry| {
+                enriched[i].published_count = entry.index.stats().active_count;
             }
         }
     }
@@ -43082,6 +43536,7 @@ fn saveDenseProjectionMetadataForAppliedSequenceUpdates(
             .status = current.status,
             .generation = if (update.generation != 0) update.generation else current.generation,
             .config_hash = if (update.config_hash != 0) update.config_hash else current.config_hash,
+            .published_count = update.published_count,
         });
     }
 }
@@ -50764,32 +51219,36 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
     const active_count = entry.index.stats().active_count;
     if (denseCoverageMatchesTarget(active_count, expected_doc_count)) return true;
 
+    // The derived executor has no stable DB pointer: DB.open returns its
+    // wrapper by value, while this AsyncContext is independently allocated and
+    // stable. Record an exact-name handoff here and let the DB-owned
+    // maintenance lane persist the appropriate cursor/intent after open.
+    const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(index_ref.name);
+    try recordTargetAdvanceMaintenanceDebt(ctx, index_ref.name, .{
+        .config_hash = types.indexConfigHash(entry.config),
+        .generation = if (checkpoint) |value| value.generation else 0,
+    });
+
     const now_ns = monotonicTimeNs();
-    if (!shouldRunTargetAdvanceRepair(ctx, index_ref.name, now_ns)) return false;
-    try noteTargetAdvanceRepairRun(ctx, index_ref.name, now_ns);
-
-    std.log.warn(
-        "dense replay target advance blocked by coverage mismatch index={s} indexed={} expected_docs={}",
-        .{ index_ref.name, active_count, expected_doc_count },
-    );
-
-    // Replaying artifacts can fill a deficit, but it cannot delete a vector
-    // whose source artifact no longer exists. Leave surplus reconstruction to
-    // the rebuild planner: it owns the reset lifecycle and invalidates any
-    // persisted scan cursor. Closing the active HBC handle from this ordinary
-    // replay path would race published searches despite the apply fence.
-    if (active_count > expected_doc_count) {
-        return false;
-    }
-    _ = rebuildDenseIndexForTargetCoverageContext(ctx, index_ref.name, 2048) catch |err| {
+    if (shouldLogTargetAdvanceDebt(ctx, index_ref.name, now_ns)) {
+        try noteTargetAdvanceDebtLogged(ctx, index_ref.name, now_ns);
         std.log.warn(
-            "dense replay target advance repair deferred index={s} err={s}",
-            .{ index_ref.name, @errorName(err) },
+            "dense replay target advance deferred to artifact maintenance index={s} indexed={} expected_docs={}",
+            .{ index_ref.name, active_count, expected_doc_count },
         );
-        return false;
-    };
-    const repaired_entry = ctx.index_manager.denseIndex(index_ref.name) orelse return true;
-    return denseCoverageMatchesTarget(repaired_entry.index.stats().active_count, expected_doc_count);
+    }
+
+    // This callback is a watermark proof on the replay hot path. It must stay
+    // bounded and side-effect free with respect to index contents: rebuilding
+    // here used to make DB.open synchronously scan and reconstruct every
+    // embedding artifact before the serving owner could publish status.
+    //
+    // A deficit is resumable in-place publication work, owned by
+    // runDenseArtifactRebuildMaintenanceWithProgress and its durable cursor.
+    // A surplus is unsafe reset-class debt, owned by the durable shadow-
+    // generation repair planner. Both owners publish progress and retain the
+    // exact generation fences; neither belongs in target validation.
+    return false;
 }
 
 fn denseIndexIsArtifactBacked(entry: anytype) bool {
@@ -51614,6 +52073,7 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
         .status = .clean,
         .generation = checkpoint.generation +| 1,
         .config_hash = checkpoint.config_hash,
+        .published_count = entry.index.stats().active_count,
     };
     try ctx.index_manager.saveDenseProjectionCheckpointMetadata(index_name, clean_checkpoint);
     try apply_state.saveProjectionCheckpointWithSidecar(
@@ -54334,23 +54794,78 @@ test "db runtime-only status overlay preserves a resident enrichment worker" {
         ,
     });
 
+    // Every fresh status constructor applies the runtime-only overlay after it
+    // releases the index apply lock. Otherwise callers that do not start from
+    // a cached snapshot lose per-index activity even while the worker is live.
+    const consistent = try db.runtimeStatusStatsConsistent(alloc);
+    defer types.freeDBStats(alloc, consistent);
+    try std.testing.expectEqual(@as(usize, 1), consistent.indexes.len);
+    try std.testing.expect(consistent.indexes[0].embedding_activity_observed);
+    try std.testing.expect(consistent.indexes[0].embedding_activity_sample_fresh);
+    try std.testing.expect(consistent.indexes[0].embedding_activity.epoch != 0);
+
     // Model a durable/query-only recovery snapshot. A resident writer overlay
     // must replace its absent producer diagnostics immediately rather than
     // waiting for the periodic full status refresh.
+    const coverage_generation = db.core.index_manager.coverageGenerationForIndex("semantic") orelse 0;
     var indexes = [_]types.DBIndexStats{.{
         .name = "semantic",
         .kind = .dense_vector,
+        .coverage_generation = coverage_generation,
     }};
     var recovered: types.DBStats = .{ .indexes = indexes[0..] };
     db.overlayRuntimeStatusRuntimeBestEffort(&recovered);
     try std.testing.expect(recovered.enrichment.enabled);
     try std.testing.expect(recovered.enrichment.worker_started);
     try std.testing.expect(indexes[0].embedding_activity_observed);
+    try std.testing.expect(indexes[0].embedding_activity_sample_fresh);
     try std.testing.expect(indexes[0].embedding_activity.epoch != 0);
 
-    // Lifecycle contention is explicitly unavailable, not an idle activity
-    // sample that may erase the metadata cache's last exact-owner heartbeat.
-    // Leave the successful sample intact to prove the overlay revokes it.
+    // A lifecycle lock miss is an observation gap, not evidence that the
+    // worker disappeared. Preserve the exact last owner sample within the
+    // shared heartbeat TTL even though the durable status projection is
+    // reconstructed for the next poll.
+    const observed_epoch = indexes[0].embedding_activity.epoch;
+    const observed_sequence = indexes[0].embedding_activity.sample_sequence;
+    indexes[0] = .{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .coverage_generation = coverage_generation,
+    };
+    lockAtomicWithBackoff(&db.async_context.enrichment_lifecycle_mutex);
+    db.overlayRuntimeStatusRuntimeBestEffort(&recovered);
+    db.async_context.enrichment_lifecycle_mutex.unlock();
+    try std.testing.expect(indexes[0].embedding_activity_observed);
+    try std.testing.expect(!indexes[0].embedding_activity_sample_fresh);
+    try std.testing.expectEqual(observed_epoch, indexes[0].embedding_activity.epoch);
+    try std.testing.expectEqual(observed_sequence, indexes[0].embedding_activity.sample_sequence);
+
+    // A stale receipt cannot survive indefinitely if the owner is wedged or
+    // gone while lifecycle access remains contended.
+    lockAtomic(&db.embedding_activity_cache_mutex);
+    const cached = db.embedding_activity_cache.getPtr("semantic") orelse return error.TestUnexpectedResult;
+    cached.observed_at_ms -|= types.embedding_activity_retention_ms;
+    db.embedding_activity_cache_mutex.unlock();
+    indexes[0] = .{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .coverage_generation = coverage_generation,
+    };
+    lockAtomicWithBackoff(&db.async_context.enrichment_lifecycle_mutex);
+    db.overlayRuntimeStatusRuntimeBestEffort(&recovered);
+    db.async_context.enrichment_lifecycle_mutex.unlock();
+    try std.testing.expect(!indexes[0].embedding_activity_observed);
+    try std.testing.expect(!indexes[0].embedding_activity_sample_fresh);
+    try std.testing.expectEqual(@as(u64, 0), indexes[0].embedding_activity.epoch);
+
+    // A new incarnation under the same index name must never inherit the old
+    // worker's retained activity.
+    db.overlayRuntimeStatusRuntimeBestEffort(&recovered);
+    indexes[0] = .{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .coverage_generation = coverage_generation +% 1,
+    };
     lockAtomicWithBackoff(&db.async_context.enrichment_lifecycle_mutex);
     db.overlayRuntimeStatusRuntimeBestEffort(&recovered);
     db.async_context.enrichment_lifecycle_mutex.unlock();
@@ -68721,7 +69236,7 @@ test "db managed dense enrichment remains searchable after transient rate limits
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var gated = GateDenseEmbedder{};
+    var gated = GateDenseEmbedder{ .allowed_successes = .init(std.math.maxInt(usize)) };
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
@@ -70292,7 +70807,7 @@ test "db recreated managed dense index converges replay and irrelevant resolver 
     try std.testing.expect(calls_before_recreate > 0);
     try std.testing.expectEqual(@as(u64, 3), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 
-    try noteTargetAdvanceRepairRun(db.async_context, "dv_v1", monotonicTimeNs());
+    try noteTargetAdvanceDebtLogged(db.async_context, "dv_v1", monotonicTimeNs());
     try std.testing.expect(try db.deleteIndex("dv_v1"));
     db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
     try db.addIndex(config);
@@ -77849,7 +78364,7 @@ test "db stats report projection checkpoint replay tail per index hint" {
     try std.testing.expect(status_dense_seen);
 }
 
-test "db catch-up rebuilds dense coverage before vacuous target advance" {
+test "db catch-up hands dense coverage debt to resumable maintenance" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -77903,6 +78418,24 @@ test "db catch-up rebuilds dense coverage before vacuous target advance" {
     try db.catchUpPendingDerivedReplay();
 
     {
+        const deferred = try db.listDerivedReplayDebt(alloc);
+        defer {
+            for (deferred) |*status| status.deinit(alloc);
+            alloc.free(deferred);
+        }
+        try std.testing.expectEqual(@as(usize, 1), deferred.len);
+        try std.testing.expectEqual(@as(u64, 0), deferred[0].applied_sequence);
+        try std.testing.expectEqual(target_sequence, deferred[0].target_sequence);
+        try std.testing.expect(deferred[0].catch_up_required);
+    }
+    // Target validation must never rebuild the HBC on the replay/open path.
+    // The exact-name handoff makes the ordinary bounded maintenance owner
+    // discover the deficit and persist its resumable cursor instead.
+    try std.testing.expect(try db.denseArtifactRebuildMaintenanceNeeded(alloc));
+    try std.testing.expect(try db.runDenseArtifactRebuildMaintenanceWithProgress(alloc, null, null));
+    try db.catchUpPendingDerivedReplay();
+
+    {
         const after = try db.listDerivedReplayDebt(alloc);
         defer {
             for (after) |*status| status.deinit(alloc);
@@ -77925,6 +78458,47 @@ test "db catch-up rebuilds dense coverage before vacuous target advance" {
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "idle generated coverage gap becomes durable paged recovery debt" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+
+    // A pre-cardinality corpus must not force startup to scan every source
+    // document. Unknown cardinality conservatively seeds the same bounded,
+    // resumable recovery intent.
+    try db.core.store.delete(&internal_keys.range_document_count_key);
+
+    // Model the post-watermark crash window: no runnable enrichment owner is
+    // attached, while the current generation still has zero terminal source
+    // outcomes for one durable primary document.
+    try std.testing.expect(try db.generatedCoverageReplayNeeded(alloc));
+    try std.testing.expectEqual(@as(usize, 1), try db.ensureGeneratedCoverageRecoveryIntents(alloc));
+    const repair_id = (try db.indexRepairIdForIndex(alloc, "semantic")) orelse return error.TestUnexpectedResult;
+    var entry = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Trigger.replay_artifact_unavailable, entry.intent.trigger);
+    try std.testing.expectEqual(index_repair_state.SourceReplayState.pending, entry.intent.source_replay_state);
+    try std.testing.expectEqual(index_repair_state.Phase.detected, entry.intent.phase);
+    try std.testing.expect(!db.core.index_manager.repairUnavailable("semantic"));
 }
 
 test "db catch-up defers artifact dense target advance without durable counter" {
@@ -83178,6 +83752,41 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
     try std.testing.expectEqual(@as(u64, document_count), seeded.intent.source_replay_reprocessed);
     try std.testing.expectEqual(index_repair_state.SourceReplayState.complete, seeded.intent.source_replay_state);
     try std.testing.expect(seeded.intent.target_sequence > first_page_target);
+
+    // With source discovery complete, provider/publication progress owns the
+    // next edge. The repair must leave the immediate scheduler heap instead
+    // of hot-polling while enrichment catches up.
+    try reopened.ensureIndexRepairSchedulerDirectory(alloc);
+    const waiting = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+    try std.testing.expect(waiting.deferred);
+    try std.testing.expect(!waiting.attempted);
+    const summary = try reopened.indexRepairIntentSummary(alloc);
+    switch (summary.wake) {
+        .at_realtime_ms => |deadline| try std.testing.expect(deadline > currentTimeNs() / std.time.ns_per_ms),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+/// Drive only the bounded source-discovery phase owned by managed admission,
+/// then let the ordinary enrichment runtime publish those durable requests.
+/// Tests use this boundary instead of `runUntilIdle()` alone: admission is
+/// intentionally O(1), so maintenance—not DDL—owns the existing-corpus scan.
+fn drainManagedAdmissionSourceReplayForTest(db: *DB, alloc: Allocator, repair_id: u128) !void {
+    for (0..1024) |_| {
+        var entry = try db.loadIndexRepairEntryById(alloc, repair_id);
+        const state = entry.intent.source_replay_state;
+        entry.deinit(alloc);
+        if (state != .pending) {
+            try db.runUntilIdle();
+            return;
+        }
+        const advanced = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+        try std.testing.expect(advanced.attempted);
+        try std.testing.expect(advanced.deferred);
+        try std.testing.expect(!advanced.repaired);
+        try std.testing.expect(!advanced.terminal);
+    }
+    return error.TestExpectedEqual;
 }
 
 test "db managed repair scheduler defers canonical worker until shadow activation" {
@@ -83213,7 +83822,7 @@ test "db managed repair scheduler defers canonical worker until shadow activatio
     db.optional_runtime_workers_enabled = false;
 
     try std.testing.expect(db.executor.appliedSequence(cfg.name) == null);
-    try db.runEnrichmentUntil(db.core.nextDerivedSequence());
+    try drainManagedAdmissionSourceReplayForTest(&db, alloc, repair_id);
     try std.testing.expect(db.executor.appliedSequence(cfg.name) == null);
     try std.testing.expectEqual(
         @as(u64, 1),
@@ -83663,11 +84272,15 @@ test "db progressive managed admission serves a checkpointed partial generation"
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    // Keep exactly one published vector available while the rest of the
+    // producer queue is retryable. That makes the partial-generation proof
+    // deterministic without disabling the canonical index worker whose
+    // applied sequence is part of the publication certificate.
+    var gated = GateDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
-        .enrichment = .{ .dense_embedder = deterministic.interface() },
+        .enrichment = .{ .dense_embedder = gated.interface() },
     });
     defer db.close();
     try db.batch(.{
@@ -83685,8 +84298,6 @@ test "db progressive managed admission serves a checkpointed partial generation"
         .coverage_generation = 45,
     };
     const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
-    var repair = try db.loadIndexRepairEntryById(alloc, repair_id);
-    defer repair.deinit(alloc);
     try std.testing.expect(db.executor.appliedSequence(cfg.name) != null);
     try std.testing.expectEqual(admission_fence, try db.core.loadAppliedSequence(alloc, cfg.name));
     try std.testing.expectError(error.IndexRebuilding, db.search(alloc, .{
@@ -83698,7 +84309,18 @@ test "db progressive managed admission serves a checkpointed partial generation"
     // Publish the first admission seed, then grow the source corpus without a
     // full-index wait. The active generation remains a safe one-document
     // checkpoint while coverage becomes 1/3.
-    try db.runUntilIdle();
+    try drainManagedAdmissionSourceReplayForTest(&db, alloc, repair_id);
+    // The canonical worker was required to mint the real publication
+    // certificate above. Pause it after that boundary so this unit test can
+    // advance the artifact target and corrupt/restore the certificate one
+    // transition at a time; process-level worker concurrency is covered by the
+    // standalone restart regression.
+    db.executor.removeWorker(cfg.name);
+    db.start_index_workers = false;
+    // Freeze provider progress only after the admission seed is completely
+    // certified. New writes can now advance durable producer debt, but cannot
+    // race the exact one-vector snapshot asserted below.
+    gated.allowed_successes.store(gated.snapshot().successful_requests, .release);
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:b", .value = "{\"body\":\"beta\"}" },
@@ -83706,6 +84328,8 @@ test "db progressive managed admission serves a checkpointed partial generation"
         },
         .sync_level = .write,
     });
+    var repair = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer repair.deinit(alloc);
     try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
     try std.testing.expect(!try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent));
     const partial_stats = try db.stats(alloc);
@@ -83722,15 +84346,17 @@ test "db progressive managed admission serves a checkpointed partial generation"
 
     // The next producer batch can publish its artifact target before the HBC
     // reaches the matching visibility boundary. Reproduce that short window:
-    // readiness must honor the already-published incarnation instead of
-    // flipping from queryable back to rebuilding.
+    // the durable publication certificate must keep the last exact HBC
+    // snapshot queryable while the live target advances.
     const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, cfg.name);
     defer alloc.free(counter_key);
     const target_before = (try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, cfg.name)).?;
+    const certified_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try std.testing.expectEqual(@as(?u64, target_before), certified_checkpoint.published_count);
     var advanced_target: [8]u8 = undefined;
     std.mem.writeInt(u64, &advanced_target, target_before + 1, .little);
     try db.core.store.put(counter_key, &advanced_target);
-    try std.testing.expect(!try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
+    try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
     const in_flight_stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, in_flight_stats);
     for (in_flight_stats.indexes) |index_stats| {
@@ -83738,6 +84364,20 @@ test "db progressive managed admission serves a checkpointed partial generation"
         try std.testing.expect(index_stats.index_repair_active_generation_serviceable);
     }
     try db.failIfIndexQuarantined(cfg.name);
+
+    // The certificate is not a blanket cardinality bypass: if the loaded
+    // physical snapshot no longer matches the exact published count, fail
+    // closed even though source coverage and the live target look healthy.
+    try db.core.saveProjectionCheckpoint(cfg.name, .{
+        .applied_sequence = certified_checkpoint.applied_sequence,
+        .status = certified_checkpoint.status,
+        .generation = certified_checkpoint.generation,
+        .config_hash = certified_checkpoint.config_hash,
+        .published_count = target_before + 1,
+    });
+    try std.testing.expect(!try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
+    try db.core.saveProjectionCheckpoint(cfg.name, certified_checkpoint);
+    try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
     var restored_target: [8]u8 = undefined;
     std.mem.writeInt(u64, &restored_target, target_before, .little);
     try db.core.store.put(counter_key, &restored_target);
@@ -83750,6 +84390,24 @@ test "db progressive managed admission serves a checkpointed partial generation"
     defer partial.deinit();
     try std.testing.expectEqual(@as(u32, 1), partial.total_hits);
     try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+
+    // Lazy centroid/payload refresh is performance maintenance, not index
+    // reconstruction. Persist a dirty posting before the restart proof: the
+    // certified generation must stay queryable and the startup planner must
+    // not turn this debt into a repair admission gate.
+    {
+        const entry = db.core.denseIndex(cfg.name) orelse return error.IndexNotFound;
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        var root = try entry.index.loadNode(&txn, entry.index.metadata.root_node);
+        defer root.deinit(alloc);
+        try root.ensureUnbacked(alloc);
+        root.posting_state.noteMembersChanged(root.members.len);
+        try entry.index.saveNode(&txn, &root);
+        try entry.index.finishWriteTxn(&txn);
+        entry.index.invalidateNodeCache(root.id);
+        try std.testing.expect((try entry.index.postingBacklogStats()).hasMaintenanceDebt());
+    }
 
     // A queryable progressive intent remains durable while its worker
     // converges, but it must not consume the bounded scheduler's only repair
@@ -83776,16 +84434,57 @@ test "db progressive managed admission serves a checkpointed partial generation"
         try std.testing.expect(damaged_repair.intent.attempt_count != 0);
     }
 
+    // Corpus convergence, physical projection health, and safe publication are
+    // separate state machines. A crash can leave a replay cursor after the
+    // physical checkpoint was already committed clean. That cursor is not
+    // authority to replay the same artifacts over a serviceable publication.
+    const rebuild_state_path = try db.denseIndexRebuildStatePathAlloc(alloc, cfg.name);
+    defer alloc.free(rebuild_state_path);
+    const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_state_path);
+    try rebuild_state.update("stale-completed-cursor");
+    const partial_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, partial_checkpoint.status);
+    try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
+    var clean_restart_plan = try db.collectDenseArtifactRebuildPlan(alloc);
+    defer clean_restart_plan.deinit(alloc);
+    for (clean_restart_plan.targets) |target| {
+        const planned = db.core.index_manager.dense_indexes.items[target.dense_index_idx].config.name;
+        try std.testing.expect(!std.mem.eql(u8, planned, cfg.name));
+    }
+    try std.testing.expect(!(try db.denseArtifactRebuildMaintenanceNeeded(alloc)));
+
+    // Preserve the incomplete lifecycle marker too: a rebuilding checkpoint
+    // can describe ongoing convergence without revoking the exact published
+    // generation proved above.
+    try db.core.saveProjectionCheckpoint(cfg.name, .{
+        .applied_sequence = partial_checkpoint.applied_sequence,
+        .status = .rebuilding,
+        .generation = partial_checkpoint.generation,
+        .config_hash = partial_checkpoint.config_hash,
+        .published_count = partial_checkpoint.published_count,
+    });
+    try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
+    var restart_plan = try db.collectDenseArtifactRebuildPlan(alloc);
+    defer restart_plan.deinit(alloc);
+    for (restart_plan.targets) |target| {
+        const planned = db.core.index_manager.dense_indexes.items[target.dense_index_idx].config.name;
+        try std.testing.expect(!std.mem.eql(u8, planned, cfg.name));
+    }
+
     // The durable checkpoint and repair ownership are sufficient to restore
     // the same partial generation as queryable after a process restart.
     db.close();
     db = try DB.open(alloc, std.mem.span(path), .{
         .start_optional_runtime_workers = false,
         .ttl_cleanup = .{ .enabled = false },
-        .enrichment = .{ .dense_embedder = deterministic.interface() },
+        .enrichment = .{ .dense_embedder = gated.interface() },
     });
     try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
     try std.testing.expect(!try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent));
+    {
+        const entry = db.core.denseIndex(cfg.name) orelse return error.IndexNotFound;
+        try std.testing.expect((try entry.index.postingBacklogStats()).hasMaintenanceDebt());
+    }
     var restarted_partial = try db.search(alloc, .{
         .index_name = cfg.name,
         .query = .{ .dense_knn = .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 3 } },
@@ -83795,7 +84494,12 @@ test "db progressive managed admission serves a checkpointed partial generation"
     try std.testing.expectEqual(@as(u32, 1), restarted_partial.total_hits);
     try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
 
+    gated.allowAll();
     try db.runUntilIdle();
+    {
+        const entry = db.core.denseIndex(cfg.name) orelse return error.IndexNotFound;
+        try std.testing.expect(!(try entry.index.postingBacklogStats()).hasMaintenanceDebt());
+    }
     try std.testing.expect(try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent));
     const shared_enrichment = db.enrichment_runtime orelse return error.TestUnexpectedResult;
     const enrichment_before_unrelated_work = shared_enrichment.stats();
@@ -83805,6 +84509,22 @@ test "db progressive managed admission serves a checkpointed partial generation"
     const completed = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
     try std.testing.expect(completed.repaired);
     try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+
+    // Once empty-table admission has retired its repair intent, ordinary
+    // writes can make source coverage incomplete again while the last
+    // progressive publication remains safe. Restart preservation must use the
+    // publication proof itself, not depend on the temporary admission record.
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:d", .value = "{\"body\":\"delta\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expect(try db.progressiveManagedGenerationIsQueryable(alloc, cfg.name));
+    var post_admission_restart_plan = try db.collectDenseArtifactRebuildPlan(alloc);
+    defer post_admission_restart_plan.deinit(alloc);
+    for (post_admission_restart_plan.targets) |target| {
+        const planned = db.core.index_manager.dense_indexes.items[target.dense_index_idx].config.name;
+        try std.testing.expect(!std.mem.eql(u8, planned, cfg.name));
+    }
 }
 
 test "db progressive managed sparse admission serves a checkpointed partial generation" {
@@ -83835,8 +84555,6 @@ test "db progressive managed sparse admission serves a checkpointed partial gene
         .coverage_generation = 46,
     };
     const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
-    var repair = try db.loadIndexRepairEntryById(alloc, repair_id);
-    defer repair.deinit(alloc);
     try std.testing.expectEqual(admission_fence, try db.core.loadAppliedSequence(alloc, cfg.name));
 
     var query = try deterministic.interface().embedSparse(alloc, cfg.name, "alpha concept");
@@ -83847,7 +84565,7 @@ test "db progressive managed sparse admission serves a checkpointed partial gene
         .limit = 3,
     }));
 
-    try db.runUntilIdle();
+    try drainManagedAdmissionSourceReplayForTest(&db, alloc, repair_id);
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:b", .value = "{\"body\":\"beta concept\"}" },
@@ -83855,6 +84573,8 @@ test "db progressive managed sparse admission serves a checkpointed partial gene
         },
         .sync_level = .write,
     });
+    var repair = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer repair.deinit(alloc);
     try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
     try std.testing.expect(!try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent));
     try db.failIfIndexQuarantined(cfg.name);
@@ -83927,7 +84647,7 @@ test "db completed partial managed admission serves and retires redundant repair
         .coverage_generation = 42,
     };
     const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
-    try db.runUntilIdle();
+    try drainManagedAdmissionSourceReplayForTest(&db, alloc, repair_id);
 
     const active = db.core.index_manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 1), active.index.stats().active_count);
@@ -83996,7 +84716,7 @@ test "db completed chunked managed admission uses physical artifact count" {
         .coverage_generation = 43,
     };
     const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
-    try db.runUntilIdle();
+    try drainManagedAdmissionSourceReplayForTest(&db, alloc, repair_id);
 
     const active = db.core.index_manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
     const physical_count = active.index.stats().active_count;

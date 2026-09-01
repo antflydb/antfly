@@ -852,7 +852,31 @@ pub const DBCore = struct {
 
     pub fn loadProjectionCheckpoint(self: *DBCore, alloc: Allocator, index_name: []const u8) !apply_state.ProjectionCheckpoint {
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
-            if (dense_checkpoint.config_hash != 0) return dense_checkpoint;
+            if (dense_checkpoint.config_hash != 0) {
+                // HBC metadata is the authority for the physical generation.
+                // The sidecar can additionally carry a publication
+                // certificate introduced after the HBC v2 layout. Merge it
+                // only when every generation identity field agrees; a stale
+                // or legacy sidecar simply falls back to the conservative
+                // pre-certificate proof.
+                var checkpoint = dense_checkpoint;
+                const sidecar = apply_state.loadProjectionCheckpointWithSidecar(
+                    alloc,
+                    self.index_manager.checkpointIo(),
+                    self.store,
+                    self.applied_sequence_checkpoint_path,
+                    index_name,
+                ) catch null;
+                if (sidecar) |candidate| {
+                    if (candidate.applied_sequence == checkpoint.applied_sequence and
+                        candidate.generation == checkpoint.generation and
+                        candidate.config_hash == checkpoint.config_hash)
+                    {
+                        checkpoint.published_count = candidate.published_count;
+                    }
+                }
+                return checkpoint;
+            }
         }
         return apply_state.loadProjectionCheckpointWithSidecar(
             alloc,
@@ -880,11 +904,16 @@ pub const DBCore = struct {
         else
             0;
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |checkpoint| {
+            const published_count = if (self.index_manager.denseIndex(index_name)) |entry|
+                entry.index.stats().active_count
+            else
+                null;
             try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, .{
                 .applied_sequence = sequence,
                 .status = checkpoint.status,
                 .generation = checkpoint.generation,
                 .config_hash = if (config_hash != 0) config_hash else checkpoint.config_hash,
+                .published_count = published_count,
             });
             try self.index_manager.checkpointLsmWalForManagedIndex(.{
                 .name = index_name,
@@ -905,6 +934,10 @@ pub const DBCore = struct {
                 .index_name = index_name,
                 .sequence = sequence,
                 .config_hash = config_hash,
+                .published_count = if (self.index_manager.denseIndex(index_name)) |entry|
+                    entry.index.stats().active_count
+                else
+                    null,
             },
         );
     }
@@ -917,6 +950,13 @@ pub const DBCore = struct {
             }
         }
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name) != null) {
+            if (checkpoint_with_identity.published_count == null and
+                (checkpoint_with_identity.status == .clean or checkpoint_with_identity.status == .rebuilding))
+            {
+                if (self.index_manager.denseIndex(index_name)) |entry| {
+                    checkpoint_with_identity.published_count = entry.index.stats().active_count;
+                }
+            }
             try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, checkpoint_with_identity);
             try self.index_manager.checkpointLsmWalForManagedIndex(.{
                 .name = index_name,

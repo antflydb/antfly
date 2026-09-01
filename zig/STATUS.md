@@ -196,10 +196,14 @@ metadata leader retains matching store, group, index, generation, and config
 identities in a bounded, sharded TTL cache. Report order and per-index sample
 order are fenced separately from durable status generation, so activity-only
 updates do not create Raft writes. Cached liveness heartbeats deliberately omit
-the observation bit and cannot extend activity freshness. Activity expires to
-unavailable across missed owner observations or leader changes. Status must
-never infer work from coverage debt, and activity must never authorize a query
-or lifecycle transition.
+the observation bit and cannot extend activity freshness. Local best-effort
+snapshot contention retains the last incarnation-matched sample under the same
+TTL instead of treating one missed lock as owner disappearance. Retained local
+samples remain visible to standalone clients but are not forwarded as fresh
+heartbeats, so repeated polling cannot extend another hop's TTL. An observed
+owner/incarnation replacement clears immediately; otherwise activity expires to
+unavailable after the TTL or a leader change. Status must never infer work from
+coverage debt, and activity must never authorize a query or lifecycle transition.
 
 ### Data Model
 
@@ -376,6 +380,13 @@ timestamps, or a worker appearing idle. Conversely, a process restart may reset
 activity and its epoch without changing durable coverage or the queryable
 publication. This keeps status useful for UX while preserving fail-closed
 admission and bounded request-path performance.
+
+For progressive dense indexes, restart queryability is certified by the exact
+published physical count at the checkpoint's sequence and incarnation. A newer
+artifact target describes work after that safe publication and does not revoke
+it. Lazy posting centroid or quantized-payload debt is diagnostic maintenance,
+not repair state: queries use the exact fallback while bounded background work
+refreshes those caches. Structural generation faults remain repair blockers.
 
 Wait clients select `queryable` or `complete` explicitly. For current responses,
 the selected milestone and its blockers are authoritative; generic lifecycle,

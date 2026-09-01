@@ -11141,11 +11141,34 @@ pub const ProvisionedTableWriteSource = struct {
                 std.log.warn("managed startup restore recovery failed phase=repair_probe class={s}", .{@errorName(err)});
                 return err;
             };
-        const startup_open_mode: ManagedDbOpenMode = if (restore_repair_needed) .restore_repair else .startup_catch_up;
+        const generated_runtime_required = if (configured_indexes) |summary|
+            summary.generated_runtime_required
+        else
+            false;
+        // Restore repair intentionally uses a workerless exclusive owner. An
+        // ordinary cold index repair, however, can enqueue generated provider
+        // work whose lifetime spans many bounded repair quanta. Promote that
+        // owner into the normal writer cache so enrichment and derived workers
+        // remain resident, publish activity, and wake the exact parked intent.
+        // Reopening a short-lived startup DB here would durably queue work and
+        // then immediately destroy its only producer.
+        const cold_open_plan = coldMaintenanceOpenPlan(
+            metadata.advance_index_repairs,
+            restore_repair_needed,
+            self.write_cache != null,
+            generated_runtime_required,
+        );
+        const cold_open_uses_writer_cache = cold_open_plan.use_writer_cache;
+        const startup_open_mode = cold_open_plan.mode;
         // A provisioned writer is the generation owner. Index repair leases
         // that owner instead of opening a second DB over the same path; cold
-        // startup recovery retains its dedicated short-lived cache.
-        const startup_cache = if (use_live_repair_cache) null else self.startup_write_cache;
+        // startup inspection retains its dedicated short-lived cache.
+        const startup_cache = if (use_live_repair_cache)
+            null
+        else if (cold_open_uses_writer_cache)
+            self.write_cache
+        else
+            self.startup_write_cache;
         var cached_db: ?ProvisionedTableWriteCache.CachedDb = null;
         defer if (cached_db) |*cached| cached.deinit(alloc);
         var uncached_db: ?db_mod.DB = null;
@@ -11268,8 +11291,10 @@ pub const ProvisionedTableWriteSource = struct {
             db,
             configured_indexes,
         ));
+        const managed_owner_is_live_writer = use_live_repair_cache or cold_open_uses_writer_cache;
+        const repair_uses_live_writer = metadata.advance_index_repairs and managed_owner_is_live_writer;
         var live_broad_recovery = false;
-        if (metadata.advance_index_repairs and use_live_repair_cache) {
+        if (repair_uses_live_writer) {
             live_broad_recovery = try managedDbHasBroadCatchUpDebt(alloc, db);
             if (live_broad_recovery) {
                 // Broad recovery must exclude readers, but the live repair
@@ -11298,10 +11323,10 @@ pub const ProvisionedTableWriteSource = struct {
             table_name,
             db,
             metadata.advance_index_repairs,
-            if (use_live_repair_cache) .live_writer else .isolated,
+            if (managed_owner_is_live_writer) .live_writer else .isolated,
             if (live_broad_recovery)
                 .broad_debt_only
-            else if (metadata.advance_index_repairs and use_live_repair_cache)
+            else if (repair_uses_live_writer)
                 .index_repair_only
             else
                 .all_debt,
@@ -22950,6 +22975,52 @@ const ManagedDbOpenMode = enum {
     status_only,
 };
 
+const ColdMaintenanceOpenPlan = struct {
+    mode: ManagedDbOpenMode,
+    use_writer_cache: bool,
+};
+
+fn coldMaintenanceOpenPlan(
+    advance_index_repairs: bool,
+    restore_repair_needed: bool,
+    writer_cache_available: bool,
+    generated_runtime_required: bool,
+) ColdMaintenanceOpenPlan {
+    if (restore_repair_needed) return .{ .mode = .restore_repair, .use_writer_cache = false };
+    // Generated provider work is not a bounded inspection: retries and later
+    // preparation windows need a resident producer after this quantum exits.
+    // Reuse the capacity-bounded writer cache so restart neither pins an
+    // unbounded set of DBs nor destroys the only worker capable of resuming
+    // the durable cursor. Plain structural/replay audits remain transient.
+    if ((advance_index_repairs or generated_runtime_required) and writer_cache_available) {
+        return .{ .mode = .default_async, .use_writer_cache = true };
+    }
+    return .{ .mode = .startup_catch_up, .use_writer_cache = false };
+}
+
+test "cold generated repair promotes a resident writer while inspection stays bounded" {
+    try std.testing.expectEqual(
+        ColdMaintenanceOpenPlan{ .mode = .default_async, .use_writer_cache = true },
+        coldMaintenanceOpenPlan(true, false, true, false),
+    );
+    try std.testing.expectEqual(
+        ColdMaintenanceOpenPlan{ .mode = .default_async, .use_writer_cache = true },
+        coldMaintenanceOpenPlan(false, false, true, true),
+    );
+    try std.testing.expectEqual(
+        ColdMaintenanceOpenPlan{ .mode = .startup_catch_up, .use_writer_cache = false },
+        coldMaintenanceOpenPlan(false, false, true, false),
+    );
+    try std.testing.expectEqual(
+        ColdMaintenanceOpenPlan{ .mode = .restore_repair, .use_writer_cache = false },
+        coldMaintenanceOpenPlan(true, true, true, true),
+    );
+    try std.testing.expectEqual(
+        ColdMaintenanceOpenPlan{ .mode = .startup_catch_up, .use_writer_cache = false },
+        coldMaintenanceOpenPlan(false, false, false, true),
+    );
+}
+
 fn managedDbOpenModeDrainsResolverBackfill(mode: ManagedDbOpenMode) bool {
     // default_async is the Raft apply path. Resolver/promotion catch-up can
     // issue cross-shard writes whose completion requires future Raft applies,
@@ -23788,6 +23859,21 @@ fn indexesJsonHasGeneratedEnrichment(alloc: std.mem.Allocator, indexes_json: []c
 fn jsonValueHasGeneratedEnrichment(alloc: std.mem.Allocator, value: std.json.Value) anyerror!bool {
     switch (value) {
         .object => |object| {
+            // Public embeddings configs are themselves the durable declaration
+            // of a generated producer. Translation into the internal
+            // `generator` form happens only while opening the DB, so startup
+            // ownership planning must recognize the public form directly.
+            // `external: true` is the explicit inverse: callers own vectors and
+            // no resident enrichment runtime is required.
+            if (object.get("type")) |index_type| {
+                if (index_type == .string and std.mem.eql(u8, index_type.string, "embeddings")) {
+                    const external = if (object.get("external")) |external_value|
+                        external_value == .bool and external_value.bool
+                    else
+                        false;
+                    if (!external) return true;
+                }
+            }
             if (object.get("kind")) |kind| {
                 if (kind == .string and (std.mem.eql(u8, kind.string, "asset") or std.mem.eql(u8, kind.string, "chunk"))) return true;
             }
@@ -23935,6 +24021,16 @@ test "provisioning detects generated embedding chunkers inside index metadata" {
         \\  "config_json":"{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunker\":{\"provider\":\"antfly\",\"model\":\"fixed-bert-tokenizer\",\"store_chunks\":false}}}"
         \\}]
     ));
+}
+
+test "provisioning distinguishes managed and external public embeddings" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try indexesJsonHasGeneratedEnrichment(alloc,
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small"}}}
+    ));
+    try std.testing.expect(!(try indexesJsonHasGeneratedEnrichment(alloc,
+        \\{"semantic_idx":{"type":"embeddings","external":true,"dimension":3}}
+    )));
 }
 
 test "bound table write source locally deletes artifact enrichment" {
@@ -24848,6 +24944,7 @@ const StartupConfiguredIndex = struct {
 
 const StartupConfiguredIndexes = struct {
     items: []StartupConfiguredIndex,
+    generated_runtime_required: bool = false,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.items) |*item| item.deinit(alloc);
@@ -24903,6 +25000,7 @@ fn parseStartupConfiguredIndexes(
     }
     @memset(items, .{});
     var initialized: usize = 0;
+    var generated_runtime_required = false;
 
     if (array_form) |value| {
         const array_items = switch (value) {
@@ -24920,10 +25018,15 @@ fn parseStartupConfiguredIndexes(
             };
             errdefer configured.deinit(alloc);
             try populateStartupAlgebraicCapability(alloc, &configured, item);
+            generated_runtime_required = generated_runtime_required or
+                try jsonValueHasGeneratedEnrichment(alloc, item);
             items[initialized] = configured;
             initialized += 1;
         }
-        return .{ .items = items };
+        return .{
+            .items = items,
+            .generated_runtime_required = generated_runtime_required,
+        };
     }
 
     var it = object.iterator();
@@ -24935,10 +25038,15 @@ fn parseStartupConfiguredIndexes(
         };
         errdefer configured.deinit(alloc);
         try populateStartupAlgebraicCapability(alloc, &configured, entry.value_ptr.*);
+        generated_runtime_required = generated_runtime_required or
+            try jsonValueHasGeneratedEnrichment(alloc, entry.value_ptr.*);
         items[initialized] = configured;
         initialized += 1;
     }
-    return .{ .items = items };
+    return .{
+        .items = items,
+        .generated_runtime_required = generated_runtime_required,
+    };
 }
 
 fn startupAlgebraicField(value: std.json.Value, field: []const u8) ?std.json.Value {
@@ -25318,6 +25426,53 @@ const ManagedCatchUpMode = enum {
     index_repair_prerequisite,
 };
 
+/// Detects the crash window where generated-enrichment replay reached its
+/// durable watermark but source outcomes for the current index incarnation
+/// did not. Ordinary replay debt remains the cheaper authority while it is
+/// present; this audit runs only at an otherwise-idle startup boundary and
+/// uses generation-scoped coverage counters rather than physical vector
+/// cardinality (which is not comparable for chunked indexes).
+fn generatedIndexCoverageNeedsReplay(item: db_mod.types.DBIndexStats, primary_doc_count: u64) bool {
+    if (!item.coverage_identity_ready or !item.coverage_summary_ready) return true;
+    const settled = item.coverage_produced_count +|
+        item.coverage_skipped_count +|
+        item.coverage_terminal_failed_count;
+    return settled < primary_doc_count;
+}
+
+fn managedDbNeedsGeneratedCoverageReplay(alloc: std.mem.Allocator, db: *db_mod.DB) !bool {
+    if (!db.core.hasGeneratedEnrichmentTargets()) return false;
+    const enrichment = db.pendingWorkStats().enrichment;
+    if (enrichment.applied_sequence < enrichment.target_sequence) return false;
+    return try db.generatedCoverageReplayNeeded(alloc);
+}
+
+test "startup generated coverage replay uses terminal source outcomes rather than vectors" {
+    const base = db_mod.types.DBIndexStats{
+        .name = "semantic",
+        .kind = .dense_vector,
+        // Chunked publication can have many vectors per covered source. This
+        // deliberately exceeds the corpus and must not mask missing outcomes.
+        .doc_count = 42_000,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .coverage_produced_count = 228,
+        .coverage_skipped_count = 0,
+        .coverage_terminal_failed_count = 0,
+    };
+    try std.testing.expect(generatedIndexCoverageNeedsReplay(base, 10_000));
+
+    var settled = base;
+    settled.coverage_produced_count = 9_000;
+    settled.coverage_skipped_count = 900;
+    settled.coverage_terminal_failed_count = 100;
+    try std.testing.expect(!generatedIndexCoverageNeedsReplay(settled, 10_000));
+
+    var unknown_identity = settled;
+    unknown_identity.coverage_identity_ready = false;
+    try std.testing.expect(generatedIndexCoverageNeedsReplay(unknown_identity, 10_000));
+}
+
 fn managedDbHasBroadCatchUpDebt(alloc: std.mem.Allocator, db: *db_mod.DB) !bool {
     const replay_debt = try db.listDerivedReplayDebt(alloc);
     defer {
@@ -25331,6 +25486,7 @@ fn managedDbHasBroadCatchUpDebt(alloc: std.mem.Allocator, db: *db_mod.DB) !bool 
     if (pending_work.repair_metadata_rebuild_pending) return true;
     const enrichment = pending_work.enrichment;
     if (enrichment.enabled and enrichment.applied_sequence < enrichment.target_sequence) return true;
+    if (try managedDbNeedsGeneratedCoverageReplay(alloc, db)) return true;
     if (try db.restoreRuntimeRepairNeeded()) return true;
     return try db.denseArtifactRebuildMaintenanceNeeded(alloc);
 }
@@ -25347,6 +25503,31 @@ fn catchUpManagedDb(
     index_repair_options: db_mod.types.ArtifactRepairRunOptions,
 ) !ProvisionedTableWriteSource.StartupCatchUpResult {
     const max_startup_catch_up_replay_passes: usize = 16;
+    const runs_broad_debt = mode == .all_debt or mode == .broad_debt_only;
+
+    // A process can stop after the generated-replay watermark advances but
+    // before every source document publishes a terminal outcome. Re-arm only
+    // at an otherwise-idle watermark by installing exact durable repair debt.
+    // Its owner pages source discovery and provider work after startup; never
+    // scan the corpus on this availability path.
+    var generated_coverage_replay_needed = false;
+    if (runs_broad_debt and try managedDbNeedsGeneratedCoverageReplay(alloc, db)) {
+        generated_coverage_replay_needed = true;
+        // This publication precedes durable repair-intent seeding and is
+        // therefore an owner boundary, not a disposable heartbeat. Serialize it against the
+        // concurrent status refresher so a placeholder cannot win the fence
+        // and leave operators blind for the duration of recovery seeding.
+        try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhaseMode(
+            source,
+            alloc,
+            table_name,
+            group_id,
+            .startup_catch_up,
+            .consistent,
+            db,
+        ));
+        _ = try db.ensureGeneratedCoverageRecoveryIntents(alloc);
+    }
 
     const before = db.listDerivedReplayDebt(alloc) catch |err| {
         std.log.warn("managed startup catch-up list debt failed table={s} err={}", .{ table_name, err });
@@ -25357,10 +25538,12 @@ fn catchUpManagedDb(
         alloc.free(before);
     }
 
-    var had_debt = false;
+    var had_debt = generated_coverage_replay_needed;
+    var derived_replay_debt = false;
     for (before) |status| {
         if (!status.catch_up_required) continue;
         had_debt = true;
+        derived_replay_debt = true;
         break;
     }
     const pending_work_before = db.pendingWorkStats();
@@ -25466,7 +25649,6 @@ fn catchUpManagedDb(
         if (owner == .isolated) source.invalidateWriteCacheForTable(table_name);
         source.clearDirtyWriteTable(table_name);
     };
-    const runs_broad_debt = mode == .all_debt or mode == .broad_debt_only;
     if (runs_broad_debt and repair_metadata_rebuild_pending) {
         progress_ctx.phase = .artifact_rebuild;
         try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
@@ -25506,7 +25688,7 @@ fn catchUpManagedDb(
         // phase-marker-only quanta.
         try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
         std.log.info("managed restore repair step complete group_id={d} repaired={}", .{ group_id, repaired_restore_runtime });
-    } else if (runs_broad_debt and had_debt) {
+    } else if (runs_broad_debt and derived_replay_debt) {
         var pass: usize = 0;
         var last_debt_signature = try startupReplayDebtSignature(alloc, db);
         while (pass < max_startup_catch_up_replay_passes) : (pass += 1) {

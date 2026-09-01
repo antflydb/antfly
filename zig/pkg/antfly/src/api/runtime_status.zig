@@ -1809,6 +1809,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .coverage_generation = item.coverage_generation,
             .coverage_identity_ready = item.coverage_identity_ready,
             .embedding_activity_observed = item.embedding_activity_observed,
+            .embedding_activity_sample_fresh = item.embedding_activity_sample_fresh,
             .embedding_activity = item.embedding_activity,
             .backfill_active = item.backfill_active,
             .backfill_progress = item.backfill_progress,
@@ -2124,6 +2125,7 @@ test "table runtime snapshot cache clones stored status" {
         .coverage_generation = 0x5678,
         .coverage_identity_ready = true,
         .embedding_activity_observed = true,
+        .embedding_activity_sample_fresh = true,
         .embedding_activity = .{ .epoch = 13, .embeddings_computed = 17, .active_batch_size = 3 },
         .backfill_active = true,
         .backfill_progress = 0.5,
@@ -2254,6 +2256,7 @@ test "table runtime snapshot cache clones stored status" {
     try std.testing.expectEqual(@as(u64, 0x5678), cloned.items[0].stats.indexes[0].coverage_generation);
     try std.testing.expect(cloned.items[0].stats.indexes[0].coverage_identity_ready);
     try std.testing.expect(cloned.items[0].stats.indexes[0].embedding_activity_observed);
+    try std.testing.expect(cloned.items[0].stats.indexes[0].embedding_activity_sample_fresh);
     try std.testing.expectEqual(@as(u64, 13), cloned.items[0].stats.indexes[0].embedding_activity.epoch);
     try std.testing.expectEqual(@as(u64, 17), cloned.items[0].stats.indexes[0].embedding_activity.embeddings_computed);
     try std.testing.expectEqual(@as(u64, 3), cloned.items[0].stats.indexes[0].embedding_activity.active_batch_size);

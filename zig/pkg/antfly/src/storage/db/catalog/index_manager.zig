@@ -5647,7 +5647,7 @@ pub const IndexManager = struct {
                 total_steps += @intCast(link_repair.repaired());
             }
             const backlog = try entry.index.postingBacklogStats();
-            if (!backlog.needsRepair()) continue;
+            if (!backlog.hasMaintenanceDebt()) continue;
 
             const result = try entry.index.repairDirtyPostingsWithOptions(.{
                 .max_postings = options.max_postings_per_index,

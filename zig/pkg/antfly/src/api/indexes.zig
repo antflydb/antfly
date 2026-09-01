@@ -3431,6 +3431,9 @@ test "index status aggregation preserves actionable repair diagnostics for the r
         .coverage_generation = 42,
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_generation = 42,
+        .projection_checkpoint_config_hash = 99,
         .index_repair_status = .failed,
         .index_repair_action_required = true,
         .index_repair_last_error = "activation_manifest_missing",
@@ -3501,6 +3504,8 @@ test "complete partial embeddings coverage is ready after active generation proo
         .catch_up_target_sequence = 11,
         .projection_checkpoint_status = "clean",
         .projection_checkpoint_applied_sequence = 7,
+        .projection_checkpoint_generation = 42,
+        .projection_checkpoint_config_hash = 99,
         .backfill_active = true,
         .backfill_progress = 1.0,
         .repair_degraded = true,
@@ -3558,6 +3563,9 @@ test "actionable repair remains visible while retained generation stays queryabl
         .coverage_generation = 42,
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_generation = 42,
+        .projection_checkpoint_config_hash = 99,
         .index_repair_status = .failed,
         .index_repair_action_required = true,
         .index_repair_last_error = "activation_manifest_missing",
@@ -3632,15 +3640,20 @@ test "progressive embeddings readiness exposes a queryable partial generation" {
         .doc_count = 1,
         .node_count = 1,
         .root_node = 1,
-        .coverage_produced_count = 1,
+        // Publication remains independently useful when a crash loses the
+        // source-outcome ledger before it records this published member.
+        .coverage_produced_count = 0,
         .coverage_generation = 42,
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
         .replay_applied_sequence = 7,
         .replay_target_sequence = 11,
         .replay_catch_up_required = true,
         .projection_checkpoint_status = "clean",
         .projection_checkpoint_applied_sequence = 7,
+        .projection_checkpoint_generation = 42,
+        .projection_checkpoint_config_hash = 99,
         .backfill_active = true,
         .backfill_progress = 0.5,
         .index_repair_status = .rebuilding,
@@ -3672,7 +3685,7 @@ test "progressive embeddings readiness exposes a queryable partial generation" {
     );
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"incarnation\":\"g-000000000000002a\"},\"coverage\":{\"source_total\":2,\"covered\":1,\"complete\":false}}",
+        "{\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"incarnation\":\"g-000000000000002a\"},\"coverage\":{\"source_total\":2,\"covered\":0,\"complete\":false}}",
         encoded.items,
     );
 }
@@ -3689,6 +3702,8 @@ test "serviceable empty embeddings generation remains pending until first publis
         .replay_catch_up_required = true,
         .projection_checkpoint_status = "clean",
         .projection_checkpoint_applied_sequence = 7,
+        .projection_checkpoint_generation = 42,
+        .projection_checkpoint_config_hash = 99,
         .backfill_active = true,
         .index_repair_status = .rebuilding,
         .index_repair_active_generation_serviceable = true,
@@ -3724,13 +3739,71 @@ test "serviceable empty embeddings generation remains pending until first publis
     );
 }
 
+test "published embeddings snapshot remains queryable while completion checkpoint rebuilds" {
+    const item = db_mod.types.DBIndexStats{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        // HBC exposes only its atomically published search snapshot here. The
+        // projection completion checkpoint may remain rebuilding while source
+        // generation continues, without revoking that last safe snapshot.
+        .doc_count = 440,
+        .node_count = 10,
+        .root_node = 8,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .replay_applied_sequence = 125,
+        .replay_target_sequence = 125,
+        .projection_checkpoint_status = "rebuilding",
+        .projection_checkpoint_applied_sequence = 125,
+        .projection_checkpoint_generation = 42,
+        .projection_checkpoint_config_hash = 99,
+        .backfill_active = true,
+        .index_repair_status = .rebuilding,
+        .index_repair_active_generation_serviceable = true,
+    };
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        item,
+        10_000,
+        .strict,
+        false,
+        42,
+        99,
+        .{},
+        .{ .enabled = true },
+        null,
+        null,
+        .{},
+        .{ .source = .live_writer_publish, .freshness = .fresh },
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"searchable_vectors\":440,\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false},\"milestones\":{\"queryable\":{\"reached\":true,\"blockers\":[]}}}",
+        encoded.items,
+    );
+}
+
 test "stale in-place status preserves an incarnation-scoped serviceability proof" {
     var indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "semantic_idx",
         .kind = .dense_vector,
+        .doc_count = 2,
+        .node_count = 1,
+        .root_node = 1,
         .coverage_generation = 42,
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_generation = 42,
+        .projection_checkpoint_config_hash = 99,
+        .publication_target_count = 2,
         .publication_target_ready = true,
         .index_repair_status = .rebuilding,
         .index_repair_active_generation_serviceable = true,
@@ -3796,6 +3869,10 @@ test "identity-proven embeddings stay current during sibling startup catch-up" {
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
         .coverage_summary_ready = true,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_applied_sequence = 7,
+        .projection_checkpoint_generation = 42,
+        .projection_checkpoint_config_hash = 99,
     }};
     const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 7,
@@ -3890,6 +3967,10 @@ test "opening embeddings observation cannot publish cached queryability" {
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
         .coverage_summary_ready = true,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_applied_sequence = 7,
+        .projection_checkpoint_generation = 42,
+        .projection_checkpoint_config_hash = 99,
     }};
     const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 7,
@@ -4069,6 +4150,10 @@ test "repair-free embeddings aggregate retains live dense catch-up" {
         .coverage_config_hash = 99,
         .coverage_identity_ready = true,
         .coverage_summary_ready = true,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_applied_sequence = 7,
+        .projection_checkpoint_generation = 42,
+        .projection_checkpoint_config_hash = 99,
     }};
     const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 7,
@@ -4810,6 +4895,10 @@ test "chunked dense completion follows the physical publication target" {
         .coverage_summary_ready = true,
         .replay_applied_sequence = 500,
         .replay_target_sequence = 500,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_applied_sequence = 500,
+        .projection_checkpoint_generation = 42,
+        .projection_checkpoint_config_hash = 99,
     };
     var pending = std.ArrayListUnmanaged(u8).empty;
     defer pending.deinit(std.testing.allocator);
@@ -5690,24 +5779,34 @@ fn appendIndexReadinessStatus(
     const pending = !failed and (!observation_fresh or !topology_complete or !incarnation_current or !sources_complete or
         backfill_active or repair_blocks_complete or replay_catch_up_required or catch_up_active or
         publication_pending or coverage_pending);
-    const published_member_visible = index_type == .embeddings and repair_state == null and
-        if (@hasField(Item, "doc_count")) item.doc_count > 0 else false;
-    const publication_outcome_observed = embeddings_coverage_policy == .external or
-        (if (@hasField(Item, "coverage_produced_count")) item.coverage_produced_count > 0 else false);
-    // Progressive readiness and coverage are one public observation. Requiring
-    // both a query-visible member and a produced coverage outcome prevents a
-    // response from claiming queryable_partial while reporting covered=0.
-    // External indexes do not own managed coverage outcomes and are gated only
-    // by the query-visible member proof.
-    const published_generation_has_results = published_member_visible and publication_outcome_observed;
+    const published_member_visible = index_type == .embeddings and
+        (if (@hasField(Item, "doc_count")) item.doc_count > 0 else false);
+    // Publication and source coverage answer different questions. The dense
+    // adapter's doc_count is its atomically published search snapshot, while
+    // durable source outcomes prove whether generation work is complete. A
+    // crash may preserve the former while losing the latter, so coverage=0
+    // must not hide a safely published partial generation. Incarnation,
+    // topology, and repair serviceability fences below prevent an interrupted
+    // or stale generation from being admitted.
+    const published_generation_has_results = published_member_visible;
     const stale_generation_serviceable = active_generation_serviceable and incarnation_current and
         if (@hasField(Item, "repair_observation_count") and @hasField(Item, "expected_group_count"))
             item.expected_group_count > 0 and item.repair_observation_count == item.expected_group_count
         else
             true;
+    // A repair lifecycle's serviceability bit proves that an existing active
+    // generation may remain mounted; it does not prove that the generation
+    // contains any published result. Dense indexes therefore need both the
+    // current-generation publication evidence above and a valid serving
+    // lifecycle. This keeps an already-published partial generation online,
+    // while a crash before the first checkpoint remains honestly pending.
+    const partial_generation_serviceable = if (index_type == .embeddings)
+        published_generation_has_results and
+            (repair_state == null or active_generation_serviceable)
+    else
+        active_generation_serviceable;
     const queryable_partial = !serving_failed and (pending or failed) and
-        (active_generation_serviceable or
-            (index_type == .embeddings and published_generation_has_results)) and
+        partial_generation_serviceable and
         ((observation_fresh and topology_complete and incarnation_current) or
             stale_generation_serviceable);
     const readiness_state = if (failed)
@@ -5754,7 +5853,7 @@ fn appendIndexReadinessStatus(
         if (!topology_complete) try appendBlocker(alloc, out, "shard_observation", &queryable_blocker_emitted);
         if (!incarnation_current) try appendBlocker(alloc, out, "incarnation", &queryable_blocker_emitted);
         if (repair_blocks_queryable) try appendBlocker(alloc, out, "repair", &queryable_blocker_emitted);
-        if (!active_generation_serviceable and !published_generation_has_results) {
+        if (!partial_generation_serviceable) {
             if (coverage_pending) try appendBlocker(alloc, out, "source_coverage", &queryable_blocker_emitted);
             if (!sources_complete or publication_pending or replay_catch_up_required or catch_up_active or backfill_active)
                 try appendBlocker(alloc, out, "publication", &queryable_blocker_emitted);

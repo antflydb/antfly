@@ -76,7 +76,10 @@ pub const PostingBacklogStats = struct {
     max_mutation_version: u64 = 0,
     skipped_missing: u64 = 0,
 
-    pub fn needsRepair(self: PostingBacklogStats) bool {
+    /// Dirty centroid and payload caches remain exactly searchable: readers
+    /// fall back to member scoring/recomputation until bounded maintenance
+    /// refreshes them. This is optimization debt, not structural corruption.
+    pub fn hasMaintenanceDebt(self: PostingBacklogStats) bool {
         return self.dirty_postings != 0;
     }
 

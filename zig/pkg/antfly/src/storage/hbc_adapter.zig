@@ -15265,7 +15265,7 @@ test "posting backlog stats report lazy dirty leaves with std Io writer" {
     try idx.insert(2, &[_]f32{ 3.0, 0.0 });
 
     const stats = try idx.postingBacklogStats();
-    try std.testing.expect(stats.needsRepair());
+    try std.testing.expect(stats.hasMaintenanceDebt());
     try std.testing.expectEqual(@as(u64, 1), stats.dirty_postings);
     try std.testing.expectEqual(@as(u64, 1), stats.centroid_dirty_postings);
     try std.testing.expectEqual(@as(u64, 0), stats.payload_dirty_postings);
@@ -15337,7 +15337,7 @@ test "auto posting maintenance repairs bounded lazy backlog before commit" {
     try idx.insert(2, &[_]f32{ 3.0, 0.0 });
 
     const stats = try idx.postingBacklogStats();
-    try std.testing.expect(!stats.needsRepair());
+    try std.testing.expect(!stats.hasMaintenanceDebt());
     try std.testing.expectEqual(@as(u64, 0), stats.dirty_postings);
 
     {

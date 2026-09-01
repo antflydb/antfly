@@ -240,6 +240,12 @@ pub const scope_name = "generated";
 const writer_locked_retry_count: usize = 1000;
 const writer_locked_retry_sleep_ns: u64 = 100_000;
 const generated_replay_default_window_items: usize = 2048;
+/// Bound source preparation independently from the larger derived-record
+/// publication window. Preparing an entire corpus before the first provider
+/// batch delays queryability after restart and retains one request plan and
+/// chunk set per document. This window still spans several provider batches,
+/// preserving throughput while producing an early durable partial generation.
+const generated_preparation_default_window_items: usize = 64;
 const generated_embed_default_batch_items: usize = 8;
 const generated_embed_default_batch_bytes: usize = 256 * 1024;
 const generated_ocr_default_batch_items: usize = 4;
@@ -397,6 +403,42 @@ fn generatedReplayWindowItems() usize {
     if (raw.len == 0) return generated_replay_default_window_items;
     const parsed = std.fmt.parseUnsigned(usize, raw, 10) catch return generated_replay_default_window_items;
     return @max(@as(usize, 1), parsed);
+}
+
+fn generatedPreparationWindowItems() usize {
+    if (comptime builtin.os.tag == .freestanding) return generated_preparation_default_window_items;
+    const raw = getenv("ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS") orelse return generated_preparation_default_window_items;
+    if (raw.len == 0) return generated_preparation_default_window_items;
+    const parsed = std.fmt.parseUnsigned(usize, raw, 10) catch return generated_preparation_default_window_items;
+    return @max(@as(usize, 1), parsed);
+}
+
+fn deferredGeneratedWorkShouldFlush(
+    plain_dense_count: usize,
+    chunked_dense_count: usize,
+    asset_count: usize,
+    max_items: usize,
+) bool {
+    return plain_dense_count +| chunked_dense_count +| asset_count >= max_items;
+}
+
+test "enrichment generated preparation window bounds time to first publication" {
+    try std.testing.expect(!deferredGeneratedWorkShouldFlush(31, 31, 1, 64));
+    try std.testing.expect(deferredGeneratedWorkShouldFlush(31, 31, 2, 64));
+    try std.testing.expect(deferredGeneratedWorkShouldFlush(std.math.maxInt(usize), 1, 0, 64));
+}
+
+test "enrichment replay cursor is sequence and document ordered" {
+    const cursor = enrichment_state.ReplayCursor{
+        .base_applied_sequence = 10,
+        .sequence = 12,
+        .doc_key = @constCast("doc:m"),
+    };
+    try std.testing.expect(replayCursorCoversGroup(cursor, 10, .{ .sequence = 11, .doc_key = "doc:z" }));
+    try std.testing.expect(replayCursorCoversGroup(cursor, 10, .{ .sequence = 12, .doc_key = "doc:m" }));
+    try std.testing.expect(!replayCursorCoversGroup(cursor, 10, .{ .sequence = 12, .doc_key = "doc:n" }));
+    try std.testing.expect(!replayCursorCoversGroup(cursor, 10, .{ .sequence = 13, .doc_key = "doc:a" }));
+    try std.testing.expect(!replayCursorCoversGroup(cursor, 9, .{ .sequence = 11, .doc_key = "doc:a" }));
 }
 
 fn generatedEmbedBatchItems() usize {
@@ -643,10 +685,14 @@ fn noteIndexPreparationStartedAssumeLocked(runtime: *EnrichmentRuntime, index_na
 }
 
 fn noteIndexPreparationFinishedAssumeLocked(runtime: *EnrichmentRuntime, index_names: []const []const u8, chunks_created: usize) void {
+    const completed_at_ms = if (chunks_created == 0) 0 else runtime.config.clock.nowRealtimeMs();
     for (index_names) |index_name| {
         const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
         activity.active_preparations -|= 1;
         activity.chunks_created +|= @intCast(chunks_created);
+        if (chunks_created != 0) {
+            activity.last_progress_at_ms = @max(activity.last_progress_at_ms, completed_at_ms);
+        }
         advanceEmbeddingActivitySample(activity);
     }
 }
@@ -1378,7 +1424,8 @@ fn sameRequestFailureIdentity(
         std.mem.eql(u8, requestEmbeddingName(lhs), requestEmbeddingName(rhs));
 }
 
-fn batchFailureFingerprint(items: anytype) u64 {
+fn batchFailureFingerprint(comptime Item: type, items: []const Item) u64 {
+    comptime std.debug.assert(@typeInfo(Item) == .@"struct");
     var hasher = std.hash.Wyhash.init(0x616e74666c795f62);
     var count_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &count_bytes, items.len, .little);
@@ -2365,15 +2412,15 @@ const AssetProducerBatchItem = struct {
 };
 
 fn assetProducerBatchFailureFingerprint(items: []const AssetProducerBatchItem) u64 {
-    return batchFailureFingerprint(items);
+    return batchFailureFingerprint(AssetProducerBatchItem, items);
 }
 
 fn plainDenseBatchFailureFingerprint(items: []const PlainDenseBatchItem) u64 {
-    return batchFailureFingerprint(items);
+    return batchFailureFingerprint(PlainDenseBatchItem, items);
 }
 
 fn chunkedDenseBatchFailureFingerprint(items: []const ChunkedDenseWindowItem) u64 {
-    return batchFailureFingerprint(items);
+    return batchFailureFingerprint(ChunkedDenseWindowItem, items);
 }
 
 test "enrichment batch retry identity covers every work item" {
@@ -2417,11 +2464,18 @@ test "enrichment batch retry identity covers every work item" {
     const changed = [_]TestItem{ first, replacement };
     const changed_content = [_]TestItem{ first, changed_materialization };
     const reordered = [_]TestItem{ second, first };
-    try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(&changed));
-    try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(&changed_content));
-    try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(&.{ first, changed_input }));
-    try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(&reordered));
-    try std.testing.expect(batchFailureFingerprint(&original) != batchFailureFingerprint(original[0..1]));
+    const changed_input_items = [_]TestItem{ first, changed_input };
+    const original_slice: []const TestItem = &original;
+    const changed_slice: []const TestItem = &changed;
+    const changed_content_slice: []const TestItem = &changed_content;
+    const changed_input_slice: []const TestItem = &changed_input_items;
+    const reordered_slice: []const TestItem = &reordered;
+    const shortened_slice: []const TestItem = original_slice.ptr[0..1];
+    try std.testing.expect(batchFailureFingerprint(TestItem, original_slice) != batchFailureFingerprint(TestItem, changed_slice));
+    try std.testing.expect(batchFailureFingerprint(TestItem, original_slice) != batchFailureFingerprint(TestItem, changed_content_slice));
+    try std.testing.expect(batchFailureFingerprint(TestItem, original_slice) != batchFailureFingerprint(TestItem, changed_input_slice));
+    try std.testing.expect(batchFailureFingerprint(TestItem, original_slice) != batchFailureFingerprint(TestItem, reordered_slice));
+    try std.testing.expect(batchFailureFingerprint(TestItem, original_slice) != batchFailureFingerprint(TestItem, shortened_slice));
 }
 
 fn freePlainDenseBatchItems(alloc: Allocator, items: []PlainDenseBatchItem) void {
@@ -2463,6 +2517,22 @@ fn freeRequestPlanCache(alloc: Allocator, cache: *std.ArrayListUnmanaged(Request
         enrichment_types.deinitGeneratedRequests(alloc, entry.requests);
     }
     cache.deinit(alloc);
+}
+
+fn clearWorkerChunkCache(alloc: Allocator, cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry)) void {
+    for (cache.items) |entry| {
+        alloc.free(entry.key);
+        chunker_mod.freeChunks(alloc, entry.chunks);
+    }
+    cache.clearRetainingCapacity();
+}
+
+fn clearRequestPlanCache(alloc: Allocator, cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry)) void {
+    for (cache.items) |entry| {
+        alloc.free(entry.doc_key);
+        enrichment_types.deinitGeneratedRequests(alloc, entry.requests);
+    }
+    cache.clearRetainingCapacity();
 }
 
 fn requestHasChunking(request: enrichment_types.GeneratedEnrichmentRequest) bool {
@@ -2809,6 +2879,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             try saveAppliedSequenceWithRetry(self, scope_name, next_applied);
             self.applied_sequence = next_applied;
         }
+        try clearReplayCursorWithRetry(self);
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         self.retrying = false;
@@ -2906,6 +2977,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.notifySequence(sequence);
         const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.replay_source, self.applied_sequence);
         defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
+        var replay_cursor = try loadReplayCursorForPass(self, self.applied_sequence);
+        defer if (replay_cursor) |*cursor| cursor.deinit(self.alloc);
 
         var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
         defer freeWorkerChunkCache(self.alloc, &chunk_cache);
@@ -2923,23 +2996,33 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         var window = GeneratedReplayWindow{ .alloc = self.alloc };
         defer window.deinit();
         const max_window_items = generatedReplayWindowItems();
+        const max_preparation_items = generatedPreparationWindowItems();
         var processed_request_count: u64 = 0;
 
         var max_seen = self.applied_sequence;
+        var last_processed: ?enrichment_worker.PendingDocumentGroup = null;
         for (pending) |group| {
             try guard.check();
             max_seen = @max(max_seen, group.sequence);
+            if (replayCursorCoversGroup(replay_cursor, self.applied_sequence, group)) continue;
             try processPendingDocumentGroup(self, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count, guard);
-            if (window.itemCount() >= max_window_items) try flushGeneratedReplayWindow(self, &window);
+            last_processed = group;
+            if (deferredGeneratedWorkShouldFlush(
+                deferred_plain_dense.items.len,
+                deferred_chunked_dense.items.len,
+                deferred_assets.items.len,
+                max_preparation_items,
+            )) {
+                try flushDeferredGeneratedWork(self, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window);
+                try saveReplayCursorForGroup(self, self.applied_sequence, group);
+            } else if (window.itemCount() >= max_window_items) {
+                try flushGeneratedReplayWindow(self, &window);
+                try saveReplayCursorForGroup(self, self.applied_sequence, group);
+            }
         }
         try guard.check();
-        try flushAssetProducerBatch(self, &deferred_assets, &window);
-        try guard.check();
-        try processPlainDenseWindow(self, deferred_plain_dense.items, &window);
-        try guard.check();
-        try processChunkedDenseWindow(self, deferred_chunked_dense.items, &chunk_cache, &window);
-        try guard.check();
-        try flushGeneratedReplayWindow(self, &window);
+        try flushDeferredGeneratedWork(self, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window);
+        if (last_processed) |group| try saveReplayCursorForGroup(self, self.applied_sequence, group);
         if (pending.len == 0) {
             max_seen = sequence;
         }
@@ -2949,6 +3032,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.retry_error_has_request_identity = false;
             try saveAppliedSequenceWithRetry(self, scope_name, max_seen);
             self.applied_sequence = max_seen;
+            try clearReplayCursorWithRetry(self);
             self.processed_requests += processed_request_count;
             self.retrying = false;
             clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
@@ -2971,6 +3055,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         }
         try saveAppliedSequenceWithRetry(self, scope_name, sequence);
         self.applied_sequence = sequence;
+        try clearReplayCursorWithRetry(self);
         self.target_sequence = @max(self.target_sequence, sequence);
         self.consecutive_retry_count = 0;
         self.next_retry_at_ms = 0;
@@ -3321,6 +3406,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         if (next_applied != current_applied) {
             try saveAppliedSequenceWithRetry(self, scope_name, next_applied);
         }
+        try clearReplayCursorWithRetry(self);
         // Persist retry retirement even when resume keeps the same applied
         // checkpoint; otherwise restart reloads stale failure counters.
         try saveRuntimeStatusWithRetry(self, scope_name, status);
@@ -3575,6 +3661,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         if (changed) {
             try saveAppliedSequenceWithRetry(self, scope_name, sequence);
         }
+        try clearReplayCursorWithRetry(self);
         try saveRuntimeStatusWithRetry(self, scope_name, status);
         self.notifyStatusHook();
     }
@@ -4852,6 +4939,8 @@ fn runForegroundCatchUpPassOwned(
 
     const pending = try enrichment_worker.collectPendingDocumentGroups(runtime.alloc, runtime.replay_source, runtime.applied_sequence);
     defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, pending);
+    var replay_cursor = try loadReplayCursorForPass(runtime, runtime.applied_sequence);
+    defer if (replay_cursor) |*cursor| cursor.deinit(runtime.alloc);
     try guard.check();
 
     var processed_request_count: u64 = 0;
@@ -4875,13 +4964,16 @@ fn runForegroundCatchUpPassOwned(
         var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
         defer window.deinit();
         const max_window_items = generatedReplayWindowItems();
+        const max_preparation_items = generatedPreparationWindowItems();
 
         processed_request_count = 0;
         max_seen = runtime.applied_sequence;
+        var last_processed: ?enrichment_worker.PendingDocumentGroup = null;
 
         for (pending) |group| {
             try guard.check();
             max_seen = @max(max_seen, group.sequence);
+            if (replayCursorCoversGroup(replay_cursor, runtime.applied_sequence, group)) continue;
             processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count, guard) catch |err| {
                 if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
                 // The embedder already performed its bounded inline retry
@@ -4890,31 +4982,35 @@ fn runForegroundCatchUpPassOwned(
                 // replay window without backoff.
                 return err;
             };
-            flushGeneratedReplayWindowIfNeeded(runtime, &window, max_window_items) catch |err| {
-                if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-                return err;
-            };
+            last_processed = group;
+            if (deferredGeneratedWorkShouldFlush(
+                deferred_plain_dense.items.len,
+                deferred_chunked_dense.items.len,
+                deferred_assets.items.len,
+                max_preparation_items,
+            )) {
+                flushDeferredGeneratedWork(runtime, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window) catch |err| {
+                    if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
+                    return err;
+                };
+                try saveReplayCursorForGroup(runtime, runtime.applied_sequence, group);
+            } else {
+                const publish_window = window.itemCount() >= max_window_items;
+                flushGeneratedReplayWindowIfNeeded(runtime, &window, max_window_items) catch |err| {
+                    if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
+                    return err;
+                };
+                if (publish_window) {
+                    try saveReplayCursorForGroup(runtime, runtime.applied_sequence, group);
+                }
+            }
         }
         try guard.check();
-        flushAssetProducerBatch(runtime, &deferred_assets, &window) catch |err| {
+        flushDeferredGeneratedWork(runtime, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
             return err;
         };
-        try guard.check();
-        processPlainDenseWindow(runtime, deferred_plain_dense.items, &window) catch |err| {
-            if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            return err;
-        };
-        try guard.check();
-        processChunkedDenseWindow(runtime, deferred_chunked_dense.items, &chunk_cache, &window) catch |err| {
-            if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            return err;
-        };
-        try guard.check();
-        flushGeneratedReplayWindow(runtime, &window) catch |err| {
-            if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            return err;
-        };
+        if (last_processed) |group| try saveReplayCursorForGroup(runtime, runtime.applied_sequence, group);
         break;
     }
     if (pending.len == 0) {
@@ -4924,6 +5020,7 @@ fn runForegroundCatchUpPassOwned(
     if (max_seen > runtime.applied_sequence) {
         setActiveFailureFingerprint(runtime, 0);
         try saveAppliedSequenceWithRetry(runtime, scope_name, max_seen);
+        try clearReplayCursorWithRetry(runtime);
         var status: enrichment_state.RuntimeStatus = .{};
         runtime.mutex.lockUncancelable(io);
         runtime.applied_sequence = max_seen;
@@ -5018,6 +5115,29 @@ fn processPendingDocumentGroup(
             },
         }
     }
+}
+
+/// Finish one bounded preparation quantum and publish all output before
+/// inspecting more source documents. Request and chunk caches own the strings
+/// borrowed by the deferred queues, so they are cleared only after every queue
+/// has completed and the derived window is durable.
+fn flushDeferredGeneratedWork(
+    runtime: *EnrichmentRuntime,
+    chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
+    request_plan_cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry),
+    deferred_plain_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+    deferred_chunked_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+    deferred_assets: *std.ArrayListUnmanaged(AssetProducerBatchItem),
+    window: *GeneratedReplayWindow,
+) !void {
+    try flushAssetProducerBatch(runtime, deferred_assets, window);
+    try processPlainDenseWindow(runtime, deferred_plain_dense.items, window);
+    deferred_plain_dense.clearRetainingCapacity();
+    try processChunkedDenseWindow(runtime, deferred_chunked_dense.items, chunk_cache, window);
+    deferred_chunked_dense.clearRetainingCapacity();
+    try flushGeneratedReplayWindow(runtime, window);
+    clearWorkerChunkCache(runtime.alloc, chunk_cache);
+    clearRequestPlanCache(runtime.alloc, request_plan_cache);
 }
 
 fn processAsset(
@@ -13252,6 +13372,87 @@ fn saveAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, 
         checkpoint.status = runtimeProjectionStatus(runtime.retrying, runtime.worker_failed);
         checkpoint.config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
         enrichment_state.saveProjectionCheckpoint(runtime.store, scope, checkpoint) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+}
+
+fn loadReplayCursorForPass(
+    runtime: *EnrichmentRuntime,
+    applied_sequence: u64,
+) !?enrichment_state.ReplayCursor {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        const loaded = enrichment_state.loadReplayCursor(runtime.alloc, runtime.store, scope_name) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            error.InvalidEnrichmentState => {
+                // A cursor is only an optimization. Corruption must never
+                // fabricate progress or strand the worker; discard it and
+                // replay idempotently from the authoritative applied fence.
+                std.log.warn("discarding corrupt enrichment replay cursor", .{});
+                try clearReplayCursorWithRetry(runtime);
+                return null;
+            },
+            else => return err,
+        };
+        if (loaded) |cursor| {
+            if (cursor.base_applied_sequence == applied_sequence) return cursor;
+            var stale = cursor;
+            stale.deinit(runtime.alloc);
+            try clearReplayCursorWithRetry(runtime);
+        }
+        return null;
+    }
+}
+
+fn replayCursorCoversGroup(
+    cursor: ?enrichment_state.ReplayCursor,
+    applied_sequence: u64,
+    group: enrichment_worker.PendingDocumentGroup,
+) bool {
+    const value = cursor orelse return false;
+    if (value.base_applied_sequence != applied_sequence) return false;
+    if (group.sequence != value.sequence) return group.sequence < value.sequence;
+    return std.mem.order(u8, group.doc_key, value.doc_key) != .gt;
+}
+
+fn saveReplayCursorForGroup(
+    runtime: *EnrichmentRuntime,
+    applied_sequence: u64,
+    group: enrichment_worker.PendingDocumentGroup,
+) !void {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        enrichment_state.saveReplayCursor(runtime.store, scope_name, .{
+            .base_applied_sequence = applied_sequence,
+            .sequence = group.sequence,
+            .doc_key = @constCast(group.doc_key),
+        }) catch |err| switch (err) {
+            error.WriterLocked => {
+                if (attempt >= writer_locked_retry_count) return err;
+                backoffWriterLockRetry();
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+}
+
+fn clearReplayCursorWithRetry(runtime: *EnrichmentRuntime) !void {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        enrichment_state.clearReplayCursor(runtime.store, scope_name) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();

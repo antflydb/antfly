@@ -2265,6 +2265,11 @@ pub const EmbeddingActivityPhase = enum {
     waiting_retry,
 };
 
+/// Owner activity is emitted every 30 seconds while idle. Retain two missed
+/// heartbeats plus scheduling jitter so a contended best-effort status read
+/// does not turn a live worker into `unavailable`.
+pub const embedding_activity_retention_ms: u64 = 90 * std.time.ms_per_s;
+
 pub const EmbeddingActivityStats = struct {
     epoch: u64 = 0,
     // Monotonic within `epoch` and incremented for every phase/counter change.
@@ -2290,7 +2295,6 @@ pub const EmbeddingActivityStats = struct {
     active_batch_size: u64 = 0,
     retrying: bool = false,
     last_progress_at_ms: u64 = 0,
-
     pub fn effectivePhase(self: @This()) EmbeddingActivityPhase {
         if (self.reported_phase) |phase| return phase;
         if (self.retrying) return .waiting_retry;
@@ -3066,10 +3070,14 @@ pub const DBIndexStats = struct {
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
-    // True only when this status pass observed the enrichment owner while its
-    // lifecycle was stable. False is an observation gap, not idle.
-    // This is volatile status-plane metadata, not part of the public API.
+    // True when this pass directly observed the owner or retains its last
+    // unexpired exact-incarnation sample. False is unavailable, not idle.
+    // This controls local projection only.
     embedding_activity_observed: bool = false,
+    // True only for a direct owner sample accepted during this status pass.
+    // Wire adapters use this bit so locally retained activity cannot refresh
+    // the next hop's TTL indefinitely. This is not part of the public API.
+    embedding_activity_sample_fresh: bool = false,
     embedding_activity: EmbeddingActivityStats = .{},
     // Stable across shard-local marker generations for the same stored config.
     coverage_config_hash: u64 = 0,

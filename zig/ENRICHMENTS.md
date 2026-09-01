@@ -126,6 +126,33 @@ code and applies bounded replay windows through a shared derived-index policy.
 Dense keeps its HBC-specific begin/finish implementation, but bounded catch-up
 scheduling is no longer dense-only.
 
+Generated replay also bounds source preparation separately from its larger
+derived-record window. By default it prepares at most 64 deferred provider
+requests, executes full provider batches, publishes that partial output
+durably, and releases the request/chunk caches before inspecting more source
+documents. `ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS` can tune this quantum.
+The separate bound keeps provider batching efficient while making memory and
+time to the first queryable publication independent of corpus size. On restart,
+a clean partial publication remains searchable from its incarnation-scoped
+physical publication certificate; the live artifact target may already be
+ahead without invalidating that last safe snapshot. An interrupted unpublished
+window is replayed idempotently and exposes fresh preparation activity rather
+than blocking startup on a corpus or posting-tree scan.
+
+Each durably published preparation window also advances a replay cursor keyed
+by `(base applied sequence, source sequence, document key)`. The base fence
+prevents a cursor from crossing a rewind or later replay epoch. On restart the
+worker resumes after the exact last published document instead of replaying the
+beginning of a large ingestion batch; a missing, stale, or corrupt cursor is
+discarded and safely repeats work from the authoritative applied sequence.
+
+Lazy HBC posting centroid and quantized-payload freshness is a separate,
+bounded maintenance concern. Dirty posting caches remain exactly searchable by
+falling back to member scoring/recomputation and drain through the background
+maintenance lane. They must be observable in diagnostics, but must not become
+readiness blockers, startup rebuild intents, or repair admission gates. Actual
+generation corruption and incomplete physical publication remain fail-closed.
+
 It also separates dense bulk-session deferral from non-dense executor progress.
 When an external dense bulk session is open, weak sync levels defer dense worker
 notification but still wake full-text, sparse, graph, and enrichment-derived
@@ -193,7 +220,12 @@ observations for 90 seconds. A cached liveness heartbeat carries no activity
 observation and therefore cannot refresh that TTL. Independent report and
 sample fences reject reordered activity-only reports even though they
 intentionally do not advance durable Raft state;
-leadership changes still make activity temporarily unavailable without changing
+the local DB status adapter applies the same retention rule, so one contended
+best-effort sample cannot erase a fresh owner observation in standalone mode.
+Retained local samples are not forwarded as fresh observations and therefore
+cannot extend the metadata cache's TTL.
+An authoritative owner/incarnation change clears immediately, and leadership
+changes still make activity temporarily unavailable without changing
 readiness. Shared enrichment
 producers may fan one completed batch out to every exact consumer index, but
 activity from an unrelated index, table, or stale incarnation must never be
@@ -833,7 +865,8 @@ The production shape is a per-table checkpoint file beside the table store:
 - maintain the latest watermarks in memory for live status and sync waits
 - coalesce pending updates by index name
 - periodically or forcefully write a complete checkpoint file containing only
-  the latest sequence per derived consumer
+  the latest sequence, incarnation/config identity, lifecycle status, and any
+  physical publication certificate per derived consumer
 - write to a temp file, fsync the file, then atomically rename it over the old
   checkpoint
 - on open, read the checkpoint file and fall back to the legacy LSM metadata row
@@ -848,8 +881,10 @@ O(number of documents, vectors, postings, or LSM tables).
 
 The checkpoint file must remain outside the index durability contract. It may
 only advance after the owning index has durably published the corresponding
-state. Losing the latest checkpoint can increase restart replay; it must never
-cause replay to skip unpublished index work.
+state. A physical certificate is valid only at that exact sequence and
+incarnation; advancing either without a replacement certificate clears it.
+Losing the latest checkpoint can increase restart replay; it must never cause
+replay to skip unpublished index work.
 
 Stronger sync levels still wait for derived visibility through the derived
 runtime, but the index kind remains responsible for making its own state

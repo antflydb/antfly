@@ -3928,8 +3928,15 @@ pub const ApiHttpServer = struct {
                 .replay_applied_sequence = index.replay_applied_sequence,
                 .replay_target_sequence = index.replay_target_sequence,
                 .replay_catch_up_required = index.replay_catch_up_required,
+                // Metadata already applied its incarnation-scoped TTL cache
+                // before producing this report. Preserve the observation bit
+                // and ordering token together; dropping either makes the API
+                // alternate between valid activity and `unavailable` as it
+                // switches between local-writer and projected-store status.
+                .embedding_activity_observed = index.embedding_activity_observed,
                 .embedding_activity = .{
                     .epoch = index.embedding_activity.epoch,
+                    .sample_sequence = index.embedding_activity.sample_sequence,
                     .reported_phase = switch (index.embedding_activity.phase) {
                         .idle => .idle,
                         .preparing => .preparing,
@@ -34929,6 +34936,13 @@ test "remote runtime status reports replay debt separately from active catch-up"
             .replay_catch_up_required = true,
             .repair_status = .waiting,
             .repair_active_generation_serviceable = false,
+            .embedding_activity_observed = true,
+            .embedding_activity = .{
+                .epoch = 7,
+                .sample_sequence = 11,
+                .phase = .preparing,
+                .chunks_created = 123,
+            },
         }})[0..]),
     };
 
@@ -34950,6 +34964,11 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(@as(u64, 2), index.coverage_terminal_failed_count);
     try std.testing.expectEqual(@as(u64, 0x1234), index.coverage_config_hash);
     try std.testing.expect(index.coverage_summary_ready);
+    try std.testing.expect(index.embedding_activity_observed);
+    try std.testing.expectEqual(@as(u64, 7), index.embedding_activity.epoch);
+    try std.testing.expectEqual(@as(u64, 11), index.embedding_activity.sample_sequence);
+    try std.testing.expectEqual(db_mod.types.EmbeddingActivityPhase.preparing, index.embedding_activity.effectivePhase());
+    try std.testing.expectEqual(@as(u64, 123), index.embedding_activity.chunks_created);
     try std.testing.expectEqual(@as(u64, 40), status.stats.source_doc_count);
     try std.testing.expectEqual(@as(u64, 1), status.stats.doc_identity.namespace_table_id);
     try std.testing.expectEqual(@as(u64, 10), status.stats.doc_identity.namespace_shard_id);

@@ -58,7 +58,7 @@ brew services start antfly
 ```
 
 <Callout type="info">
-Standalone mode starts metadata, data nodes, and Antfly inference in a single process — ideal for local development. You can also access the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080` to manage tables, run queries, and monitor your cluster.
+Standalone mode starts metadata, data nodes, and Antfly inference in a single process — ideal for local development. You can also access the [web dashboard](/docs/guides/dashboard) at `http://127.0.0.1:8080` to manage tables, run queries, and monitor your cluster. The numeric loopback address matches standalone's secure default bind on systems where `localhost` resolves to IPv6 first.
 </Callout>
 
 The 8 GiB inference host budget lets the later all-local RAG example use the
@@ -71,11 +71,11 @@ Before starting the longer semantic workflow, verify that storage and full-text
 search work with one document:
 
 ```bash
-curl -fsS -X POST http://localhost:8080/db/v1/tables/hello \
+curl -fsS -X POST http://127.0.0.1:8080/db/v1/tables/hello \
   -H "Content-Type: application/json" \
   -d '{}'
 
-curl -fsS -X POST http://localhost:8080/db/v1/tables/hello/batch \
+curl -fsS -X POST http://127.0.0.1:8080/db/v1/tables/hello/batch \
   -H "Content-Type: application/json" \
   -d '{"inserts":{"first":{"title":"Hello","body":"Antfly is ready."}},"sync_level":"full_text"}'
 
@@ -100,6 +100,11 @@ antfly inference list
 
 If the running standalone process does not detect the newly installed model,
 restart it once before creating the embeddings index.
+
+Once the embeddings index reaches `queryable`, Antfly durably preserves that
+published snapshot across later restarts while the remaining embeddings resume
+in the background. `complete` still means all source outcomes and the final
+vector publication have settled.
 
 ## Download Sample Data
 
@@ -152,7 +157,7 @@ antfly table create --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/tables/wikipedia \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/wikipedia \
   -H "Content-Type: application/json" \
   -d '{
     "indexes": {
@@ -181,7 +186,7 @@ curl -X POST http://localhost:8080/db/v1/tables/wikipedia \
 import { AntflyClient } from '@antfly/sdk';
 
 const client = new AntflyClient({
-  baseUrl: 'http://localhost:8080',
+  baseUrl: 'http://127.0.0.1:8080',
 });
 
 await client.tables.create('wikipedia', {
@@ -207,7 +212,7 @@ await client.tables.create('wikipedia', {
 ```python
 from antfly import AntflyClient
 
-client = AntflyClient(base_url='http://localhost:8080')
+client = AntflyClient(base_url='http://127.0.0.1:8080')
 
 client.create_table(
     name='wikipedia',
@@ -242,7 +247,7 @@ import (
 )
 
 ctx := context.Background()
-client, err := antfly.NewAntflyClient("http://localhost:8080", http.DefaultClient)
+client, err := antfly.NewAntflyClient("http://127.0.0.1:8080", http.DefaultClient)
 if err != nil {
 	log.Fatal(err)
 }
@@ -277,7 +282,7 @@ if err != nil { log.Fatal(err) }
 use antfly_sdk::Client;
 use serde_json::json;
 
-let client = Client::new("http://localhost:8080");
+let client = Client::new("http://127.0.0.1:8080");
 
 client.create_table("wikipedia", &json!({
     "indexes": {
@@ -368,7 +373,9 @@ work. Activity explains current speed but never changes readiness.
 Its phase is reported by the worker that owns preparation, embedding,
 publication, or retry work; incomplete coverage alone never implies
 `embedding`. If the metadata leader has not received a fresh owner heartbeat,
-`activity` is `null` and the CLI reports activity as unavailable.
+`activity` is `null` and the CLI reports activity as unavailable. A transient
+status-sampling miss retains the last matching owner sample for up to 90 seconds,
+so normal lifecycle contention does not make progress flicker.
 `queryable_partial` means the active generation is safe to query but incomplete;
 `ready` means coverage is complete.
 </Callout>
@@ -376,7 +383,7 @@ publication, or retry work; incomplete coverage alone never implies
 ## Search
 
 <Callout type="info">
-You can run these queries using the CLI (shown below) or the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080`.
+You can run these queries using the CLI (shown below) or the [web dashboard](/docs/guides/dashboard) at `http://127.0.0.1:8080`.
 </Callout>
 
 ### Full-Text Search
@@ -404,7 +411,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/query \
+curl -X POST http://127.0.0.1:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -514,7 +521,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/query \
+curl -X POST http://127.0.0.1:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -644,7 +651,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/query \
+curl -X POST http://127.0.0.1:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -799,7 +806,7 @@ antfly index create --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/tables/wikipedia/indexes/thumbnail \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/wikipedia/indexes/thumbnail \
   -H "Content-Type: application/json" \
   -d '{
     "type": "embeddings",
@@ -935,7 +942,7 @@ antfly query --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/query \
+curl -X POST http://127.0.0.1:8080/db/v1/query \
   -H "Content-Type: application/json" \
   -d '{
     "table": "wikipedia",
@@ -1064,7 +1071,7 @@ antfly agents retrieval --table wikipedia \
 
   <TabsContent value="curl">
 ```bash
-curl -X POST http://localhost:8080/db/v1/agents/retrieval \
+curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
   -H "Content-Type: application/json" \
   -d '{
     "queries": [{
@@ -1409,7 +1416,7 @@ brew services stop antfly
 
 ## Next Steps
 
-1. **[Explore the Dashboard](/docs/guides/dashboard)** — Manage tables, run queries, and monitor your cluster at `http://localhost:8080`
+1. **[Explore the Dashboard](/docs/guides/dashboard)** — Manage tables, run queries, and monitor your cluster at `http://127.0.0.1:8080`
 2. **[Image Search with CLIP](/docs/examples/image-search)** — Build a full image search application
 3. **[Browse Models](/inference)** — Discover available embedding, reranking, and generation models with `antfly inference list --remote`
 4. **[SDKs](/docs/sdks)** — Build applications with Go, TypeScript, Python, or Rust
