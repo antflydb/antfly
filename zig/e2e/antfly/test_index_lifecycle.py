@@ -283,13 +283,13 @@ def test_ready_index_status_uses_current_milestones_and_v020_fallback():
     assert ready_index_status(rebuilding, until="complete") is None
 
     for backfill_state in ("running", "retrying", "degraded", "failed"):
-        incomplete = json.loads(json.dumps(ready_status))
+        incomplete = json.loads(json.dumps(legacy_ready))
         incomplete["status"]["backfill_state"] = backfill_state
-        assert ready_index_status(incomplete) is None
+        assert ready_index_status(incomplete, until="complete") is None
 
-    complete = json.loads(json.dumps(ready_status))
+    complete = json.loads(json.dumps(legacy_ready))
     complete["status"]["backfill_state"] = "ready"
-    assert ready_index_status(complete) is complete["status"]
+    assert ready_index_status(complete, until="complete") is complete["status"]
 
     for field, value in (
         ("error", "load failed: UnsupportedVersion"),
