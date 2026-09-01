@@ -52554,6 +52554,9 @@ test "HA seed preflight drains writer released after promotion cache clear befor
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
