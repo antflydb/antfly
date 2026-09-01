@@ -926,8 +926,13 @@ pub fn routedGroupsSnapshotUntil(
             const fence = (try route_fence(catalog.ptr, group_id)) orelse return error.TopologyChanged;
             try fence.validate();
             if (fence.route.group_id != group_id) return error.TopologyChanged;
-            const identity = (try route_identity.?(catalog.ptr, table_name, group_id)) orelse
-                return error.TopologyChanged;
+            const identity = (route_identity.?(catalog.ptr, table_name, group_id) catch |err| switch (err) {
+                // A request-scoped catalog can reject a table name that is
+                // not bound to its pinned capability. Treat that exactly like
+                // any other stale topology observation so callers replan.
+                error.RouteIdentityNotPinned => return error.TopologyChanged,
+                else => return err,
+            }) orelse return error.TopologyChanged;
             if (!std.meta.eql(identity, fence.route.identity_namespace)) return error.TopologyChanged;
             if (first) |expected| {
                 if (fence.metadata_group_id != expected.metadata_group_id or
@@ -2278,7 +2283,7 @@ test "route projection preserves order and remains bounded after capture" {
 
 test "pinned fanout rejects mismatched fence identity" {
     const Source = struct {
-        mode: enum { valid, wrong_group, wrong_identity },
+        mode: enum { valid, wrong_group, wrong_identity, unbound_table },
 
         fn catalog(self: *@This()) CatalogSource {
             return .{ .ptr = self, .vtable = &.{
@@ -2301,6 +2306,7 @@ test "pinned fanout rejects mismatched fence identity" {
             group_id: u64,
         ) !?metadata_api.CatalogIdentityNamespace {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.mode == .unbound_table) return error.RouteIdentityNotPinned;
             if (!std.mem.eql(u8, table_name, "docs") or group_id != 7001) return null;
             return .{
                 .table_id = 7,
@@ -2347,6 +2353,18 @@ test "pinned fanout rejects mismatched fence identity" {
         routedGroupsSnapshotUntil(
             std.testing.allocator,
             wrong_identity.catalog(),
+            "docs",
+            &.{7001},
+            platform_time.monotonicNs() + std.time.ns_per_s,
+        ),
+    );
+
+    var unbound_table = Source{ .mode = .unbound_table };
+    try std.testing.expectError(
+        error.TopologyChanged,
+        routedGroupsSnapshotUntil(
+            std.testing.allocator,
+            unbound_table.catalog(),
             "docs",
             &.{7001},
             platform_time.monotonicNs() + std.time.ns_per_s,
