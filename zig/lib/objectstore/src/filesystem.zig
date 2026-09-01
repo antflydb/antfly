@@ -446,12 +446,14 @@ pub const FilesystemClient = struct {
         self.deinit();
     }
 
-    fn erasedBucketExists(ptr: *anyopaque, bucket: []const u8) !bool {
+    fn erasedBucketExists(ptr: *anyopaque, bucket: []const u8, opts: types.BucketOptions) !bool {
+        if (opts.cancellation) |token| try token.check();
         const self: *FilesystemClient = @ptrCast(@alignCast(ptr));
         return self.bucketExists(bucket);
     }
 
-    fn erasedMakeBucket(ptr: *anyopaque, bucket: []const u8) !void {
+    fn erasedMakeBucket(ptr: *anyopaque, bucket: []const u8, opts: types.BucketOptions) !void {
+        if (opts.cancellation) |token| try token.check();
         const self: *FilesystemClient = @ptrCast(@alignCast(ptr));
         try self.makeBucket(bucket);
     }

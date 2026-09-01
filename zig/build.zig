@@ -4294,7 +4294,7 @@ pub fn build(b: *std.Build) void {
             "replica catalog rejects invalid backup restore authority and integrity bindings",
             "restore binding pins the authenticated native generation manifest",
             "prepared native restore repair reuses target backend admission",
-            "backup restore bootstrap deduplicates exact content across source aliases while a reader is resident",
+            "backup restore bootstrap adopts an exact imported generation while repair holds a reader",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

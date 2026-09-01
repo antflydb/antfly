@@ -13786,7 +13786,7 @@ pub const DataServer = struct {
         if (self.provisioned_startup_catch_up_active.load(.acquire)) return stats;
 
         const registration = self.store_registration orelse return stats;
-        const snapshot_opt = self.adminSnapshotPreferCached() catch |err| {
+        const snapshot_opt = self.adminSnapshotForMaintenance() catch |err| {
             _ = self.provisioned_warmup_failed.fetchAdd(1, .monotonic);
             std.log.warn("provisioned cache warmup snapshot failed err={}", .{err});
             return stats;
@@ -13904,7 +13904,7 @@ pub const DataServer = struct {
             return stats;
         };
 
-        const snapshot_opt = self.adminSnapshotPreferCached() catch |err| {
+        const snapshot_opt = self.adminSnapshotForMaintenance() catch |err| {
             _ = self.provisioned_startup_catch_up_failed.fetchAdd(1, .monotonic);
             std.log.warn("provisioned startup catch-up snapshot failed err={}", .{err});
             return stats;
@@ -14532,8 +14532,16 @@ pub const DataServer = struct {
         if (found_pending or attempted or queue_pending) self.provisioned_index_repair_dirty.store(true, .release);
     }
 
-    fn adminSnapshotPreferCached(self: *DataServer) !?antfly.metadata_api.AdminSnapshot {
-        if (try self.status_source.cachedAdminSnapshot()) |snapshot| return snapshot;
+    fn adminSnapshotForMaintenance(self: *DataServer) !?antfly.metadata_api.AdminSnapshot {
+        if (self.remote_metadata) |remote| {
+            // Maintenance mutates local durable state and therefore cannot use
+            // a merely time-fresh catalog snapshot. Fence cache reuse with the
+            // current metadata head: unchanged heads remain allocation/network
+            // efficient, while restore/split/drop epochs become visible on the
+            // next control turn instead of waiting for the snapshot TTL.
+            const head = try remote.fetchHead();
+            return try remote.fetchSnapshotForHead(head);
+        }
         return try self.status_source.adminSnapshot();
     }
 
@@ -14546,7 +14554,7 @@ pub const DataServer = struct {
             return;
         }
 
-        const snapshot_opt = try self.adminSnapshotPreferCached();
+        const snapshot_opt = try self.adminSnapshotForMaintenance();
         var snapshot = snapshot_opt orelse return;
         defer self.status_source.freeAdminSnapshot(&snapshot);
 

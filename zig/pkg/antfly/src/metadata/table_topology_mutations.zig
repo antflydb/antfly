@@ -67,6 +67,15 @@ fn deriveRestoreDestinationRanges(
     for (source_ranges, 0..) |source, index| {
         destination[index] = try metadata_table_manager.cloneRange(alloc, source);
         initialized += 1;
+        // Legacy range records encode the document-identity namespace by
+        // leaving these fields zero and falling back to the physical group
+        // and range IDs. A restore intentionally creates fresh physical group
+        // IDs, so materialize the source namespace before changing group_id.
+        // Otherwise the restored DB retains the old namespace while metadata
+        // silently starts expecting the new group ID, permanently fencing the
+        // shard as DocIdentityNamespaceMismatch.
+        destination[index].doc_identity_shard_id = metadata_table_manager.rangeDocIdentityShardId(source);
+        destination[index].doc_identity_range_id = metadata_table_manager.rangeDocIdentityRangeId(source);
         destination[index].group_id = try tables_api.deriveInitialRangeGroupIdForGeneration(
             table.name,
             @intCast(index),
@@ -75,6 +84,29 @@ fn deriveRestoreDestinationRanges(
         );
     }
     return destination;
+}
+
+test "restore preserves implicit source document identity across a new physical incarnation" {
+    const alloc = std.testing.allocator;
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 17,
+        .name = "docs",
+    };
+    const source = [_]metadata_table_manager.RangeRecord{.{
+        .group_id = 7001,
+        .range_id = 7002,
+        .table_id = table.table_id,
+        .start_key = "",
+    }};
+    const destination = try deriveRestoreDestinationRanges(alloc, table, &source, 9);
+    defer {
+        for (destination) |record| metadata_table_manager.freeRange(alloc, record);
+        alloc.free(destination);
+    }
+
+    try std.testing.expect(destination[0].group_id != source[0].group_id);
+    try std.testing.expectEqual(source[0].group_id, destination[0].doc_identity_shard_id);
+    try std.testing.expectEqual(source[0].range_id, destination[0].doc_identity_range_id);
 }
 
 pub fn create(

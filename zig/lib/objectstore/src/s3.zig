@@ -18,6 +18,7 @@ const client_mod = @import("client.zig");
 const s3_compat = @import("s3_compat.zig");
 const test_support = @import("test_support.zig");
 const types = @import("types.zig");
+const transfer = @import("transfer.zig");
 
 const Allocator = std.mem.Allocator;
 const multipart_upload_threshold: u64 = 64 * 1024 * 1024;
@@ -25,7 +26,6 @@ const multipart_upload_min_part_bytes: u64 = 16 * 1024 * 1024;
 const multipart_upload_max_part_bytes: u64 = 512 * 1024 * 1024;
 const multipart_upload_part_alignment: u64 = 1024 * 1024;
 const max_multipart_parts: u64 = 10_000;
-
 pub const Scheme = s3_compat.Scheme;
 pub const AddressingStyle = s3_compat.AddressingStyle;
 pub const Credentials = s3_compat.Credentials;
@@ -599,6 +599,26 @@ test "s3 cancellation reaches active read and write transport requests" {
         }),
     );
     try std.testing.expectEqual(@as(usize, 3), state.calls);
+
+    signal.store(false, .release);
+    state.expected_method = .HEAD;
+    try std.testing.expectError(
+        error.Canceled,
+        client.bucketExistsWithOptions("bucket", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 4), state.calls);
+
+    signal.store(false, .release);
+    state.expected_method = .PUT;
+    try std.testing.expectError(
+        error.Canceled,
+        client.makeBucketWithOptions("bucket", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 5), state.calls);
 }
 
 pub const Client = struct {
@@ -608,6 +628,13 @@ pub const Client = struct {
     request_fn: RequestFn,
     owned_httpx: ?*HttpxTransport,
     owned_context_httpx: ?*ContextHttpxTransport,
+
+    fn operationIo(self: *const Client) ?std.Io {
+        if (self.cfg.io) |io| return io;
+        if (self.owned_httpx) |transport| return transport.client.io;
+        if (self.owned_context_httpx) |transport| return transport.io;
+        return null;
+    }
 
     pub fn init(alloc: Allocator, cfg: Config) !Client {
         const transport = try alloc.create(HttpxTransport);
@@ -678,11 +705,11 @@ pub const Client = struct {
         };
     }
 
-    fn bucketExists(self: *Client, bucket: []const u8) !bool {
+    fn bucketExists(self: *Client, bucket: []const u8, opts: types.BucketOptions) !bool {
         var target = try bucketTargetAlloc(self.alloc, self.cfg, bucket);
         defer target.deinit(self.alloc);
 
-        var response = try self.perform(.HEAD, target, &.{}, null, null);
+        var response = try self.performWithResponseLimitAndCancellation(.HEAD, target, &.{}, null, null, null, opts.cancellation);
         defer response.deinit(self.alloc);
         return switch (response.status) {
             200, 204 => true,
@@ -693,11 +720,11 @@ pub const Client = struct {
         };
     }
 
-    fn makeBucket(self: *Client, bucket: []const u8) !void {
+    fn makeBucket(self: *Client, bucket: []const u8, opts: types.BucketOptions) !void {
         var target = try bucketTargetAlloc(self.alloc, self.cfg, bucket);
         defer target.deinit(self.alloc);
 
-        var response = try self.perform(.PUT, target, &.{}, "", null);
+        var response = try self.performWithResponseLimitAndCancellation(.PUT, target, &.{}, "", null, null, opts.cancellation);
         defer response.deinit(self.alloc);
         switch (response.status) {
             200, 201 => return,
@@ -813,7 +840,18 @@ pub const Client = struct {
         defer alloc.free(upload_id);
 
         var completed = false;
-        defer if (!completed) self.abortMultipartUpload(bucket, key, upload_id) catch {};
+        defer if (!completed) {
+            var cleanup_deadline: ?transfer.CleanupDeadline = if (self.operationIo()) |cleanup_io|
+                transfer.CleanupDeadline.init(cleanup_io)
+            else
+                null;
+            self.abortMultipartUpload(
+                bucket,
+                key,
+                upload_id,
+                if (cleanup_deadline) |*deadline| deadline.token() else null,
+            ) catch {};
+        };
         var etags = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (etags.items) |etag| alloc.free(etag);
@@ -826,7 +864,8 @@ pub const Client = struct {
         while (offset < stat.size) : (part_number += 1) {
             if (opts.cancellation) |token| try token.check();
             const wanted: usize = @intCast(@min(stat.size - offset, buffer.len));
-            if (try source.readPositionalAll(io, buffer[0..wanted], offset) != wanted) return error.SourceFileChanged;
+            if (try transfer.readPositionalAllWithCancellation(source, io, buffer[0..wanted], offset, opts.cancellation) != wanted)
+                return error.SourceFileChanged;
             const current_stat = try source.stat(io);
             if (current_stat.size != stat.size or !std.meta.eql(current_stat.mtime, stat.mtime)) return error.SourceFileChanged;
             const part_number_text = try std.fmt.allocPrint(alloc, "{d}", .{part_number});
@@ -892,7 +931,13 @@ pub const Client = struct {
         };
     }
 
-    fn abortMultipartUpload(self: *Client, bucket: []const u8, key: []const u8, upload_id: []const u8) !void {
+    fn abortMultipartUpload(
+        self: *Client,
+        bucket: []const u8,
+        key: []const u8,
+        upload_id: []const u8,
+        cancellation: ?types.CancellationToken,
+    ) !void {
         var query = std.ArrayListUnmanaged(QueryPair).empty;
         errdefer deinitQueryList(self.alloc, &query);
         try appendQueryPair(self.alloc, &query, "uploadId", upload_id);
@@ -900,7 +945,15 @@ pub const Client = struct {
         defer freeQueryPairs(self.alloc, query_pairs);
         var target = try objectTargetAllocWithQuery(self.alloc, self.cfg, bucket, key, query_pairs);
         defer target.deinit(self.alloc);
-        var response = try self.perform(.DELETE, target, &.{}, null, null);
+        var response = try self.performWithResponseLimitAndCancellation(
+            .DELETE,
+            target,
+            &.{},
+            null,
+            null,
+            null,
+            cancellation,
+        );
         defer response.deinit(self.alloc);
         if (response.status != 200 and response.status != 204 and response.status != 404)
             return unexpectedStatusError(response.status);
@@ -1249,14 +1302,14 @@ pub const Client = struct {
         self.deinit();
     }
 
-    fn erasedBucketExists(ptr: *anyopaque, bucket: []const u8) !bool {
+    fn erasedBucketExists(ptr: *anyopaque, bucket: []const u8, opts: types.BucketOptions) !bool {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        return try self.bucketExists(bucket);
+        return try self.bucketExists(bucket, opts);
     }
 
-    fn erasedMakeBucket(ptr: *anyopaque, bucket: []const u8) !void {
+    fn erasedMakeBucket(ptr: *anyopaque, bucket: []const u8, opts: types.BucketOptions) !void {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        try self.makeBucket(bucket);
+        try self.makeBucket(bucket, opts);
     }
 
     fn erasedPutObject(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {

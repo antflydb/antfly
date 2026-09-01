@@ -134,6 +134,13 @@ pub const PutOptions = struct {
     cancellation: ?CancellationToken = null,
 };
 
+pub const BucketOptions = struct {
+    /// Borrowed for the duration of bucket discovery or creation. Remote
+    /// providers must attach it to the active transport, since provisioning is
+    /// part of the caller's operation budget rather than repository startup.
+    cancellation: ?CancellationToken = null,
+};
+
 pub const GetOptions = struct {
     version_id: ?[]const u8 = null,
     range: ?ByteRange = null,

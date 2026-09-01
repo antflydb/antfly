@@ -26,8 +26,8 @@ pub const Client = struct {
 
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
-        bucket_exists: *const fn (*anyopaque, []const u8) anyerror!bool,
-        make_bucket: *const fn (*anyopaque, []const u8) anyerror!void,
+        bucket_exists: *const fn (*anyopaque, []const u8, types.BucketOptions) anyerror!bool,
+        make_bucket: *const fn (*anyopaque, []const u8, types.BucketOptions) anyerror!void,
         put_object: *const fn (*anyopaque, Allocator, []const u8, []const u8, []const u8, types.PutOptions) anyerror!types.PutResult,
         put_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8, types.PutOptions) anyerror!types.PutResult = null,
         get_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8) anyerror!void = null,
@@ -48,11 +48,21 @@ pub const Client = struct {
     }
 
     pub fn bucketExists(self: *Client, bucket: []const u8) !bool {
-        return try self.vtable.bucket_exists(self.ptr, bucket);
+        return try self.bucketExistsWithOptions(bucket, .{});
+    }
+
+    pub fn bucketExistsWithOptions(self: *Client, bucket: []const u8, opts: types.BucketOptions) !bool {
+        if (opts.cancellation) |token| try token.check();
+        return try self.vtable.bucket_exists(self.ptr, bucket, opts);
     }
 
     pub fn makeBucket(self: *Client, bucket: []const u8) !void {
-        try self.vtable.make_bucket(self.ptr, bucket);
+        try self.makeBucketWithOptions(bucket, .{});
+    }
+
+    pub fn makeBucketWithOptions(self: *Client, bucket: []const u8, opts: types.BucketOptions) !void {
+        if (opts.cancellation) |token| try token.check();
+        try self.vtable.make_bucket(self.ptr, bucket, opts);
     }
 
     pub fn putObject(self: *Client, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {

@@ -28518,6 +28518,14 @@ fn catchUpManagedDb(
     index_repair_options: db_mod.types.ArtifactRepairRunOptions,
 ) !ProvisionedTableWriteSource.StartupCatchUpResult {
     const max_startup_catch_up_replay_passes: usize = 16;
+    // Restore repair is deliberately expressed as durable, restartable steps,
+    // but reopening a shard and waiting for the global maintenance scheduler
+    // between every cheap phase turns a small restore into seconds of control-
+    // plane latency. Drain consecutive successful steps while the existing DB
+    // lease is warm, with both step and wall-clock bounds so a large shard
+    // still yields fairly to foreground work.
+    const max_restore_repair_steps_per_pass: usize = 8;
+    const restore_repair_pass_budget_ns: u64 = 250 * std.time.ns_per_ms;
 
     const before = db.listDerivedReplayDebt(alloc) catch |err| {
         std.log.warn("managed startup catch-up list debt failed table={s} err={}", .{ table_name, err });
@@ -28650,33 +28658,43 @@ fn catchUpManagedDb(
         std.log.info("managed restore repair begin group_id={d}", .{group_id});
         progress_ctx.phase = .artifact_rebuild;
         try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
-        repaired_restore_runtime = db.repairRestoreRuntimeStateStepIfNeeded(alloc) catch |err| {
-            if (owner == .live_writer and isPendingRestoreRuntimeRepairError(err)) {
-                // A resident writer keeps its managed workers enabled. Some
-                // restore proof phases must wait for those workers rather than
-                // rebuilding the same coverage inline. Retain the exact route
-                // and yield this bounded quantum; never turn ordinary async
-                // convergence into an operator-visible repair failure.
-                std.log.info("managed restore repair waiting for resident worker convergence group_id={d} class={s}", .{ group_id, @errorName(err) });
-                // An unavailable index generation is not resolved by waiting
-                // for replay workers. The caller must release this exclusive
-                // phase and admit one bounded generation-repair quantum.
-                if (err == error.RestoreIndexAvailabilityIncomplete) return err;
-                return .{
-                    .had_debt = true,
-                    .busy = true,
-                    .index_repair_pending = advance_index_repairs,
-                };
-            }
-            std.log.warn("managed startup restore repair failed phase=execution class={s}", .{@errorName(err)});
-            return err;
-        };
-        made_progress = repaired_restore_runtime;
+        const repair_started_ns = platform_time.monotonicNs();
+        var repair_steps: usize = 0;
+        while (repair_steps < max_restore_repair_steps_per_pass) {
+            const repaired = db.repairRestoreRuntimeStateStepIfNeeded(alloc) catch |err| {
+                if (owner == .live_writer and isPendingRestoreRuntimeRepairError(err)) {
+                    // A resident writer keeps its managed workers enabled. Some
+                    // restore proof phases must wait for those workers rather than
+                    // rebuilding the same coverage inline. Retain the exact route
+                    // and yield this bounded quantum; never turn ordinary async
+                    // convergence into an operator-visible repair failure.
+                    std.log.info("managed restore repair waiting for resident worker convergence group_id={d} class={s}", .{ group_id, @errorName(err) });
+                    // An unavailable index generation is not resolved by waiting
+                    // for replay workers. The caller must release this exclusive
+                    // phase and admit one bounded generation-repair quantum.
+                    if (err == error.RestoreIndexAvailabilityIncomplete) return err;
+                    if (repaired_restore_runtime) break;
+                    return .{
+                        .had_debt = true,
+                        .busy = true,
+                        .index_repair_pending = advance_index_repairs,
+                    };
+                }
+                std.log.warn("managed startup restore repair failed phase=execution class={s}", .{@errorName(err)});
+                return err;
+            };
+            if (!repaired) break;
+            repaired_restore_runtime = true;
+            made_progress = true;
+            repair_steps += 1;
+            if (!try db.restoreRuntimeRepairNeeded()) break;
+            if (platform_time.monotonicNs() -| repair_started_ns >= restore_repair_pass_budget_ns) break;
+        }
         // Dense mutation phases retire their own HBC state inside DB repair.
         // Keep the resident writer's warm cache across watermark, graph, and
         // phase-marker-only quanta.
         try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
-        std.log.info("managed restore repair step complete group_id={d} repaired={}", .{ group_id, repaired_restore_runtime });
+        std.log.info("managed restore repair quantum complete group_id={d} repaired={} steps={d}", .{ group_id, repaired_restore_runtime, repair_steps });
     } else if (runs_broad_debt and had_debt) {
         var pass: usize = 0;
         var last_debt_signature = try startupReplayDebtSignature(alloc, db);

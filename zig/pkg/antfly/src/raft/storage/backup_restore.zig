@@ -206,6 +206,14 @@ pub fn applyRestoreSnapshotToPathWithOptions(
     restore: RestoreSource,
     options: RestoreOptions,
 ) !void {
+    // Provisioning and Raft admission may discover the same restore intent on
+    // adjacent control turns. Check the published generation under a read
+    // lease before requesting an exclusive transition: once the exact import
+    // identity is durable, the managed repair owner is allowed to keep that
+    // generation open while it advances restartable runtime-repair phases.
+    // Requiring repair completion here would make the idempotent caller fight
+    // that owner forever with GenerationTransitionActive.
+    if (try publishedRestoreAlreadyImported(alloc, path, group_id, restore)) return;
     var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntimeAndIo(
         path,
         restore.backend_runtime,
@@ -438,6 +446,22 @@ fn publishedRestoreAlreadyApplied(
         return false;
     defer generation_read.deinit();
     validateCommittedRestoreIdentity(alloc, path, group_id, restore) catch |err| switch (err) {
+        error.RestoreIdentityMismatch => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn publishedRestoreAlreadyImported(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !bool {
+    var generation_read = (try db_mod.generation_lifecycle.acquirePublishedGenerationRead(alloc, path)) orelse
+        return false;
+    defer generation_read.deinit();
+    validateImportedRestoreIdentity(alloc, path, group_id, restore) catch |err| switch (err) {
         error.RestoreIdentityMismatch => return false,
         else => return err,
     };
@@ -1283,7 +1307,7 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     try out.appendSlice(alloc, escaped);
 }
 
-test "backup restore bootstrap deduplicates exact content across source aliases while a reader is resident" {
+test "backup restore bootstrap adopts an exact imported generation while repair holds a reader" {
     const alloc = std.testing.allocator;
     const group_id: u64 = 1701;
     const artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1297,7 +1321,7 @@ test "backup restore bootstrap deduplicates exact content across source aliases 
     const marker_path = try std.fmt.allocPrint(alloc, "{s}/.restore-state", .{path});
     defer alloc.free(marker_path);
     try writeFile(marker_path,
-        \\{"format_version":1,"backup_id":"backup-1701","location":"s3://backup/antfly","artifact_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","snapshot_path":"backup-1701/groups/1701.afb","group_id":1701,"phase":"complete","primary_restored":true,"runtime_repair_complete":true,"last_error":""}
+        \\{"format_version":1,"backup_id":"backup-1701","location":"s3://backup/antfly","artifact_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","snapshot_path":"backup-1701/groups/1701.afb","group_id":1701,"phase":"rebuild_graph","primary_restored":true,"runtime_repair_complete":false,"last_error":""}
     );
 
     var resident_read = (try db_mod.generation_lifecycle.acquirePublishedGenerationRead(alloc, path)) orelse
