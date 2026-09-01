@@ -4701,6 +4701,8 @@ pub fn build(b: *std.Build) void {
         "data server resumes HA standby replication from durable progress after restart",
         "data runtime records and backs off HA standby replication round failures",
         "data runtime HA replication HTTP budget covers base64 apply envelope",
+        "data runtime HA apply window remains bounded for control-plane liveness",
+        "data runtime HA apply window does not report caught up with pending or deferred WAL",
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
     };
@@ -6241,6 +6243,7 @@ pub fn build(b: *std.Build) void {
             "write cache structural local mutation finishes auto bulk before reuse",
             "write cache local mutation preempts stale startup writer",
             "hosted runtime status prefers live writer over stale hosted snapshot",
+            "HA seed preflight drains writer released after promotion cache clear before capture freeze",
             "runtime status collection leaves active stale write lease live",
             "resident DB lease adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
@@ -6593,6 +6596,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table restore retry repairs exact incomplete restore state through active writer",
             "provisioned table restore preparation blocks writes and competing structural mutation",
             "provisioned table restore preparation blocks writes while allowing reads",
+            "resident group write releases queued reads before remote completion",
             "provisioned table transition activity excludes writers but preserves reads",
             "provisioned table transition waiter queues ahead of later writers",
             "provisioned table transition waiter queues ahead of later readers",
@@ -6697,6 +6701,7 @@ pub fn build(b: *std.Build) void {
             "forwarded write sources use the local writer owner dirty lifecycle",
             "HA ownership transition invalidates cached visibility and dirty identities",
             "HA ownership transition serializes with active writer cache mutation",
+            "HA seed request admission drains accepted writes and closes the preflight race",
             "startup cache clear retires dirty identity without a serving owner",
             "dirty auto bulk writer publishes runtime status without closing the cached writer",
             "split transition auto bulk publication retries while a writer lease is active",
@@ -7455,6 +7460,7 @@ pub fn build(b: *std.Build) void {
             "standalone runtime parses experimental flag",
             "standalone runtime antfarm path guards keep api routes reserved",
             "standalone startup checkpoint readiness requires applied and safe-read progress",
+            "standalone activated seed bootstraps exact standby checkpoint and rejects older progress",
             "parse cli accepts config path",
             "parse cli accepts secret store path",
             "parse cli accepts ARD identity flags",
@@ -7462,6 +7468,7 @@ pub fn build(b: *std.Build) void {
             "parse cli preserves registry variants and recognizes explicit preload backends",
             "parse cli accepts HA primary runtime flags",
             "parse cli accepts HA primary sync policy flags",
+            "promoted HA primary retains exact predecessor startup provenance",
             "parse cli accepts HA standby runtime flags",
             "standalone HA standby replication flags require upstream and slot",
             "standalone HA string classifier distinguishes missing padded and valid values",
@@ -7505,6 +7512,7 @@ pub fn build(b: *std.Build) void {
             "standalone metadata rejects corrupt catalog without double-freeing owned paths",
             "standalone metadata finalizes schema migration from resident runtime evidence",
             "standalone unified server lifecycle propagates startup failure",
+            "runtime lease watchdog publishes active self-fenced proof from exact expired lease",
             "runtime lease watchdog fetch and validation failures publish no bootstrap capability",
             "runtime lease watchdog retains a bounded Kubernetes response budget",
             "runtime lease watchdog prefers a DNS-verified Kubernetes API host and retains the injected port",
@@ -10742,16 +10750,25 @@ pub fn build(b: *std.Build) void {
                 // automatically schedules only the subset that fits.
                 // aarch64-macOS ReleaseFast codegen reached 9.95 GB with
                 // platform frameworks. Linux ARM64 reached 4.99 GB in the
-                // v0.2.1-rc0 release build, so reserve 6 GiB rather than
-                // forcing the scheduler to discard a completed 4 GiB claim.
-                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 6) * 1024 * 1024 * 1024,
-                // Before the serverless split, clean aarch64-macOS ReleaseFast
-                // storage codegen reached 17.42 GB (16.23 GiB). Keep the old
-                // conservative reservations until both release runners have
-                // measured the smaller storage-only closure.
-                .distributed => @as(usize, if (target.result.os.tag == .macos) 18 else 8) * 1024 * 1024 * 1024,
+                // v0.2.1-rc0 release build, while the integrated HA API kernel
+                // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
+                // build. Reserve 10 GiB so the scheduler serializes competing
+                // roots instead of discarding a successful production build.
+                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
+                // Clean aarch64-macOS ReleaseFast storage codegen reached
+                // 17.42 GB (16.23 GiB) with the platform frameworks enabled.
+                // A clean native aarch64-linux-musl production container build
+                // reached 19.89 GB (18.52 GiB) for the current production
+                // graph. Reserve 20 GiB on Linux so Zig's scheduler does
+                // not discard a successfully compiled production artifact.
+                // Use the same Linux-target claim for native and cross builds;
+                // the target artifact determines the dominant codegen shape.
+                .distributed => @as(usize, if (target.result.os.tag == .macos)
+                    18
+                else
+                    20) * 1024 * 1024 * 1024,
                 // This is deliberately a separate non-PIC product unit. The
-                // Its cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
+                // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
                 // the 10 GiB reservation keeps it serialized with the macOS
                 // storage kernel until both release runners confirm that.
                 .serverless => 10 * 1024 * 1024 * 1024,

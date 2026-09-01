@@ -46,6 +46,7 @@ const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const portable_backup = @import("../storage/portable_backup.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const ha_primary_mod = @import("../storage/ha/primary.zig");
+const ha_mutation_barrier_mod = @import("../storage/ha/mutation_barrier.zig");
 const ha_public_gate_state_mod = @import("../storage/ha/public_gate_state.zig");
 const storage_schema = @import("../storage/schema.zig");
 const table_catalog = @import("table_catalog.zig");
@@ -3253,6 +3254,22 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.active_leases != 0) continue;
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             return true;
+        }
+        return false;
+    }
+
+    fn hasRetiredOrClosingEntryForGroupTableAssumeLifecycleLocked(
+        self: *const ProvisionedTableWriteCache,
+        group_id: u64,
+        table_name: []const u8,
+    ) bool {
+        for (self.closing_entries.items) |entry| {
+            if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name))
+                return true;
+        }
+        for (self.retired_entries.items) |entry| {
+            if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name))
+                return true;
         }
         return false;
     }
@@ -6579,6 +6596,12 @@ pub const ProvisionedTableWriteSource = struct {
     table_activity_threaded: Io.Threaded,
     table_activity_mutex: Io.Mutex = .init,
     table_activity_ready: Io.Condition = .init,
+    // Protected by table_activity_mutex. Seed capture closes only new
+    // top-level write admission while admitted requests drain. This avoids
+    // holding table_activity_mutex across the HA mutation barrier: writers
+    // need that mutex to publish completion after releasing their shared
+    // mutation lease.
+    ha_seed_table_request_admission_closed: bool = false,
     write_coalesce_mutex: Io.Mutex = .init,
     write_coalesce_ready: Io.Condition = .init,
     write_coalesce_queues: std.ArrayListUnmanaged(WriteCoalesceQueue) = .empty,
@@ -7560,7 +7583,9 @@ pub const ProvisionedTableWriteSource = struct {
         for (self.active_table_activities.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.group_id == null) continue;
-            if (entry.operation_waiters > 0 or entry.transition_waiters > 0 or (entry.operation_active and !entry.operation_allows_reads)) return true;
+            if (entry.transition_waiters > 0 or
+                (entry.operation_active and !entry.operation_allows_reads) or
+                (!entry.operation_active and entry.operation_waiters > 0)) return true;
         }
         return false;
     }
@@ -7589,6 +7614,10 @@ pub const ProvisionedTableWriteSource = struct {
     fn beginTableRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         while (true) {
+            if (self.ha_seed_table_request_admission_closed) {
+                self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                continue;
+            }
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
                 if (entry.structural_active or entry.structural_waiters > 0 or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) {
@@ -7603,6 +7632,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn tryBeginTableRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
+        if (self.ha_seed_table_request_admission_closed) return false;
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
             if (entry.structural_active or entry.structural_waiters > 0 or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0) return false;
@@ -12304,7 +12334,54 @@ pub const ProvisionedTableWriteSource = struct {
         return false;
     }
 
-    /// Holds the table-activity admission mutex for the full HA snapshot.
+    /// Closes new top-level write admission and drains requests that already
+    /// passed the public HA gate. The reservation remains held through
+    /// preflight and capture, preventing a continuous workload from retiring
+    /// a cache owner in the gap before the exclusive mutation freeze.
+    pub const HASeedTableRequestAdmissionLease = struct {
+        source: *ProvisionedTableWriteSource,
+        active: bool = true,
+
+        pub fn release(self: *@This()) void {
+            if (!self.active) return;
+            const io = self.source.table_activity_threaded.io();
+            self.source.table_activity_mutex.lockUncancelable(io);
+            std.debug.assert(self.source.ha_seed_table_request_admission_closed);
+            self.source.ha_seed_table_request_admission_closed = false;
+            self.source.table_activity_ready.broadcast(io);
+            self.source.table_activity_mutex.unlock(io);
+            self.active = false;
+        }
+    };
+
+    pub fn acquireHASeedTableRequestAdmissionLease(self: *ProvisionedTableWriteSource) !HASeedTableRequestAdmissionLease {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        errdefer self.table_activity_mutex.unlock(io);
+        if (self.ha_seed_table_request_admission_closed)
+            return error.HASeedCaptureAlreadyInProgress;
+        self.ha_seed_table_request_admission_closed = true;
+        errdefer {
+            self.ha_seed_table_request_admission_closed = false;
+            self.table_activity_ready.broadcast(io);
+        }
+
+        while (true) {
+            var active = false;
+            for (self.active_table_activities.items) |activity| {
+                if (activity.table_request_active > 0) {
+                    active = true;
+                    break;
+                }
+            }
+            if (!active) break;
+            self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+        }
+        self.table_activity_mutex.unlock(io);
+        return .{ .source = self };
+    }
+
+    /// Holds the remaining table-activity admission mutex for the full HA snapshot.
     /// Existing activity fails closed; new structural/group operations cannot
     /// begin after the preflight while the global mutation barrier is held.
     pub const HASeedCaptureActivityLease = struct {
@@ -12381,6 +12458,64 @@ pub const ProvisionedTableWriteSource = struct {
             error.FileNotFound => return error.HASeedSnapshotReplicaMissing,
             else => return err,
         };
+
+        // Promotion retires the standby-era writer cache before publishing the
+        // new primary mirror. A lease that drains after that transition queues
+        // its DB for close, and a cold seed capture must participate in that
+        // lifecycle before opening the same persistent root. Opening an
+        // unmanaged DB here can otherwise race the queued owner forever: the
+        // LSM single-writer guard correctly rejects every operator retry, but
+        // no cache operation remains to perform the close.
+        //
+        // Serialize the cold open with both serving and startup caches. Pending
+        // closes must have been drained by prepareHASeedReplicaSnapshot before
+        // the runtime acquired its exclusive HA mutation barrier: DB.close()
+        // can itself need a shared mutation lease while retiring generated
+        // index state, so draining here would recursively deadlock the capture.
+        // If retirement raced the preflight, fail retryably and let the next
+        // preflight drain it outside the frozen interval.
+        //
+        // Keep the open locks through the snapshot so no cache path can publish
+        // a competing owner or expose a temporary mirror-free DB to background
+        // work. The cold DB intentionally retains the original null mirror;
+        // attaching the primary mirror would recursively wait on the barrier.
+        if (self.write_cache != null or self.startup_write_cache != null) {
+            var locks = WriteCacheTransitionLocks.init(self, true, true);
+            defer locks.deinit();
+            if (locks.first) |cache| {
+                if (cache.hasRetiredOrClosingEntryForGroupTableAssumeLifecycleLocked(group_id, table_name))
+                    return error.HASeedSnapshotRuntimeBusy;
+            }
+            if (locks.second) |cache| {
+                if (cache.hasRetiredOrClosingEntryForGroupTableAssumeLifecycleLocked(group_id, table_name))
+                    return error.HASeedSnapshotRuntimeBusy;
+            }
+            locks.releaseStateLocks();
+
+            var db = openManagedDbForTableGroupWithRuntimeAndHAWriteGate(
+                alloc,
+                path,
+                self.catalog,
+                table_name,
+                group_id,
+                self.backend_runtime,
+                self.ha_write_gate,
+                null,
+            ) catch |err| {
+                if (isTransientWriterOpenConflict(err))
+                    return error.HASeedSnapshotRuntimeBusy;
+                return err;
+            };
+            defer db.close();
+            return try captureHASeedDbSnapshot(
+                alloc,
+                &db,
+                path,
+                snapshot_token,
+                destination_root,
+            );
+        }
+
         var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(
             alloc,
             path,
@@ -12393,6 +12528,47 @@ pub const ProvisionedTableWriteSource = struct {
         );
         defer db.close();
         return try captureHASeedDbSnapshot(alloc, &db, path, snapshot_token, destination_root);
+    }
+
+    /// Drain a live writer before the runtime freezes the process-wide HA
+    /// mutation barrier. Cold replicas have no process-local maintenance debt;
+    /// they are opened and verified by the capture path after the freeze.
+    pub fn prepareHASeedReplicaSnapshot(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        deadline_ns: u64,
+    ) !void {
+        {
+            var probe = self.probeManagedWriterGroupBestEffort(table_name, group_id);
+            defer probe.deinit();
+            switch (probe) {
+                .unknown => return error.HASeedSnapshotRuntimeBusy,
+                .absent => {},
+                .leased => |*cached| cached.db.prepareHASeedSnapshot(deadline_ns) catch |err| switch (err) {
+                    error.EnrichmentWaitCanceled,
+                    error.EnrichmentWaitTimeout,
+                    error.EnrichmentRetryInProgress,
+                    => return error.HASeedSnapshotRuntimeBusy,
+                    else => return err,
+                },
+            }
+        }
+
+        // Promotion can retire a cache owner while an already-admitted request
+        // still holds its last lease. Releasing the probe above may be the
+        // event that queues that owner for close. Drain it now, while shared HA
+        // mutation admission remains available, never after capture freezes the
+        // process-wide barrier.
+        if (self.write_cache != null or self.startup_write_cache != null) {
+            var locks = WriteCacheTransitionLocks.init(self, true, true);
+            defer locks.deinit();
+            locks.releaseStateLocks();
+            if (locks.first) |cache|
+                cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
+            if (locks.second) |cache|
+                cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
+        }
     }
 
     fn captureHASeedDbSnapshot(
@@ -12412,7 +12588,14 @@ pub const ProvisionedTableWriteSource = struct {
         defer io_impl.deinit();
         Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
         defer Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
-        _ = try db.snapshot(snapshot_token);
+        const maintenance_deadline_ns = platform_time.monotonicNs() +| std.time.ns_per_s;
+        _ = db.snapshotHASeed(snapshot_token, maintenance_deadline_ns) catch |err| switch (err) {
+            error.EnrichmentWaitCanceled,
+            error.EnrichmentWaitTimeout,
+            error.EnrichmentRetryInProgress,
+            => return error.HASeedSnapshotRuntimeBusy,
+            else => return err,
+        };
         try backups_api.copyDirectoryRecursive(alloc, snapshot_root, destination_root);
     }
 
@@ -16424,6 +16607,15 @@ pub const ProvisionedTableWriteSource = struct {
             );
             defer cached.deinit(alloc);
             try validateProvisionedDbIdentityNamespaceExpected(group.identity_namespace, cached.db);
+            // Opening/adopting the resident writer must remain exclusive with
+            // reads: until this lease exists, a reader could fall back to a
+            // second DB owner for the same path. Once the authoritative writer
+            // is leased, however, DB's apply lock provides the required local
+            // mutation/read ordering. Downgrade group admission before the
+            // batch so a remote HA durability wait cannot turn a healthy
+            // promoted primary into a read outage. Structural transitions and
+            // later writers remain serialized by operation_active.
+            self.allowGroupOperationReads(table_name, group.group_id);
             try applyGroupBatchWithSchemaJson(alloc, cached.db, cached.schema_json, group, req, cancellation);
             cache.publishCachedLeaseGeneration(&cached, target_generation);
         } else {
@@ -34185,10 +34377,14 @@ test "failed full index enrichment does not make resident reads unavailable" {
     FakeEmbeddingProvider.rate_limited_count.store(0, .monotonic);
     FakeEmbeddingProvider.allow_first_success.store(false, .monotonic);
 
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
 
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
+    source.backend_runtime = backend_runtime.ptr();
     source.write_cache = &write_cache;
 
     _ = try source.source().batch(alloc, "stable", .{
@@ -36815,6 +37011,86 @@ test "provisioned table write source serializes same-table same-group operations
     try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
 }
 
+test "resident group write releases queued reads before remote completion" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const ReaderWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        started: std.atomic.Value(bool) = .init(false),
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            var read = self.source.readPreparation().beginRead("docs", .general).?;
+            defer read.deinit();
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+    const WriterWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.source.beginGroupOperation("docs", 7001);
+            defer self.source.endGroupOperation("docs", 7001);
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-resident-write-read-liveness", NoCatalog.iface());
+    source.beginGroupOperation("docs", 7001);
+    var operation_active = true;
+    defer if (operation_active) source.endGroupOperation("docs", 7001);
+
+    var queued_writer = WriterWorker{ .source = &source };
+    const writer_thread = try std.Thread.spawn(.{}, WriterWorker.run, .{&queued_writer});
+    defer {
+        queued_writer.release.store(true, .release);
+        writer_thread.join();
+    }
+    while (source.testingGroupOperationWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
+
+    var worker = ReaderWorker{ .source = &source };
+    const thread = try std.Thread.spawn(.{}, ReaderWorker.run, .{&worker});
+    defer {
+        worker.release.store(true, .release);
+        thread.join();
+    }
+
+    // The writer remains exclusive until it has leased the authoritative
+    // resident DB; a fallback reader must not open the same storage path.
+    while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
+    for (0..10_000) |_| std.atomic.spinLoopHint();
+    try std.testing.expect(!worker.entered.load(.acquire));
+
+    // Resident DB reads are safe once DB's local apply lock owns ordering.
+    // Keep the group operation active to model a synchronous HA wait. A
+    // queued writer must remain serialized without extending that read outage;
+    // after the active writer exits, writer preference blocks new admissions
+    // until the queued writer acquires the group.
+    source.allowGroupOperationReads("docs", 7001);
+    while (!worker.entered.load(.acquire)) std.atomic.spinLoopHint();
+    try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
+
+    worker.release.store(true, .release);
+    source.endGroupOperation("docs", 7001);
+    operation_active = false;
+    while (!queued_writer.entered.load(.acquire)) std.atomic.spinLoopHint();
+}
+
 test "provisioned table transition activity excludes writers but preserves reads" {
     const NoCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -37133,6 +37409,80 @@ test "provisioned table restore preparation blocks writes while allowing reads" 
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
     thread.join();
+}
+
+test "HA seed request admission drains accepted writes and closes the preflight race" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const RequestWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        entered: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.source.beginTableRequest("docs");
+            self.entered.store(true, .release);
+            self.source.endTableRequest("docs");
+        }
+    };
+
+    const CaptureWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        acquired: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var lease = self.source.acquireHASeedTableRequestAdmissionLease() catch return;
+            self.acquired.store(true, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+            lease.release();
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-ha-seed-request-admission", NoCatalog.iface());
+    defer source.deinit();
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+
+    // A held capture reservation keeps a later public writer outside the
+    // activity/cache lifecycle until preflight and snapshot finish.
+    var capture_lease = try source.acquireHASeedTableRequestAdmissionLease();
+    var request_worker = RequestWorker{ .source = &source };
+    const request_thread = try std.Thread.spawn(.{}, RequestWorker.run, .{&request_worker});
+    io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
+    try std.testing.expect(!request_worker.entered.load(.acquire));
+    capture_lease.release();
+    request_thread.join();
+    try std.testing.expect(request_worker.entered.load(.acquire));
+
+    // Closing admission while a request is already active waits without
+    // holding the mutex that request needs to publish its completion.
+    source.beginTableRequest("docs");
+    var capture_worker = CaptureWorker{ .source = &source };
+    const capture_thread = try std.Thread.spawn(.{}, CaptureWorker.run, .{&capture_worker});
+    io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
+    try std.testing.expect(!capture_worker.acquired.load(.acquire));
+    source.endTableRequest("docs");
+    while (!capture_worker.acquired.load(.acquire)) {
+        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    capture_worker.release.store(true, .release);
+    capture_thread.join();
 }
 
 test "provisioned table restore lifecycle reserves forwarded owner and caller sources" {
@@ -49465,6 +49815,217 @@ test "write cache adopts active just-created db across generation bump" {
     try std.testing.expect(write_cache.entries.items[0].allow_generation_adoption);
     try std.testing.expectEqual(@as(usize, 2), write_cache.entries.items[0].active_leases);
     try std.testing.expectEqual(misses_before, write_cache.miss_count.load(.monotonic));
+}
+
+test "HA seed preflight drains writer released after promotion cache clear before capture freeze" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/ha-seed-promoted-writer-root",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(path);
+    const startup_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7002);
+    defer alloc.free(startup_path);
+    const destination_root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/ha-seed-promoted-writer-capture",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(destination_root);
+    const startup_destination_root = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/ha-seed-promoted-startup-writer-capture",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(startup_destination_root);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = tables_api.default_indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{
+                        .group_id = 7001,
+                        .table_id = 7,
+                        .start_key = "",
+                        .end_key = "m",
+                    },
+                    .{
+                        .group_id = 7002,
+                        .table_id = 7,
+                        .start_key = "m",
+                        .end_key = null,
+                    },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var startup_write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.bindWriteCaches(&write_cache, &startup_write_cache);
+
+    var standby_writer = try source.getOrOpenCachedDbModeAtGeneration(
+        alloc,
+        &write_cache,
+        path,
+        7001,
+        0,
+        "docs",
+        .default_async,
+        null,
+        null,
+        null,
+        .{},
+    );
+    try standby_writer.db.batch(.{
+        .writes = &.{.{ .key = "doc:active", .value = "{\"title\":\"active cache\"}" }},
+        .timestamp_ns = 1,
+    });
+    var startup_standby_writer = try source.getOrOpenCachedDbModeAtGeneration(
+        alloc,
+        &startup_write_cache,
+        startup_path,
+        7002,
+        0,
+        "docs",
+        .startup_catch_up,
+        null,
+        null,
+        null,
+        .{},
+    );
+    try startup_standby_writer.db.batch(.{
+        .writes = &.{.{ .key = "doc:standby", .value = "{\"title\":\"startup cache\"}" }},
+        .timestamp_ns = 1,
+    });
+
+    // Model the promotion ordering: cache authority is retired while a
+    // request still owns its lease, and that lease reaches zero only after the
+    // transition's synchronous drain has returned.
+    try source.clearWriteCache();
+    try std.testing.expectEqual(@as(usize, 1), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), startup_write_cache.retired_entries.items.len);
+    standby_writer.deinit(alloc);
+    startup_standby_writer.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.closing_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), startup_write_cache.closing_entries.items.len);
+
+    const primary_log_path_raw = try std.fmt.allocPrint(alloc, "{s}/primary-log", .{replica_root_dir});
+    defer alloc.free(primary_log_path_raw);
+    const primary_log_path = try alloc.dupeZ(u8, primary_log_path_raw);
+    defer alloc.free(primary_log_path);
+    const primary_slots_path_raw = try std.fmt.allocPrint(alloc, "{s}/primary-slots", .{replica_root_dir});
+    defer alloc.free(primary_slots_path_raw);
+    const primary_slots_path = try alloc.dupeZ(u8, primary_slots_path_raw);
+    defer alloc.free(primary_slots_path);
+    var primary = try ha_primary_mod.Primary.open(alloc, primary_log_path.ptr, primary_slots_path.ptr, .{
+        .cluster_id = 700,
+        .shard_id = 1,
+        .table_id = 7,
+        .timeline_id = 2,
+        .epoch = 2,
+    }, .{});
+    defer primary.close();
+    var mutation_barrier: ha_mutation_barrier_mod.MutationBarrier = .{};
+    source.ha_async_mirror = .{
+        .primary = &primary,
+        .mutation_barrier = &mutation_barrier,
+    };
+    write_cache.ha_async_mirror = source.ha_async_mirror;
+    startup_write_cache.ha_async_mirror = source.ha_async_mirror;
+
+    // A frozen capture must never perform cache-owner destruction. In
+    // production that close can reacquire the barrier through generated-index
+    // retirement, recursively deadlocking this exclusive lease.
+    {
+        var premature_capture = mutation_barrier.acquireExclusive();
+        defer premature_capture.release();
+        try std.testing.expectError(
+            error.HASeedSnapshotRuntimeBusy,
+            source.captureHASeedReplicaSnapshot(
+                alloc,
+                "docs",
+                7001,
+                "premature-promoted-generation",
+                destination_root,
+            ),
+        );
+    }
+
+    try source.prepareHASeedReplicaSnapshot("docs", 7001, std.math.maxInt(u64));
+    try source.prepareHASeedReplicaSnapshot("docs", 7002, std.math.maxInt(u64));
+
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), startup_write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), startup_write_cache.closing_entries.items.len);
+
+    var capture_lease = mutation_barrier.acquireExclusive();
+    defer capture_lease.release();
+
+    try source.captureHASeedReplicaSnapshot(
+        alloc,
+        "docs",
+        7001,
+        "promoted-generation",
+        destination_root,
+    );
+    try source.captureHASeedReplicaSnapshot(
+        alloc,
+        "docs",
+        7002,
+        "promoted-startup-generation",
+        startup_destination_root,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), startup_write_cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), startup_write_cache.closing_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), startup_write_cache.entries.items.len);
+    var io_impl = Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const store_path = try std.fs.path.join(alloc, &.{ destination_root, "store.bin" });
+    defer alloc.free(store_path);
+    _ = try Io.Dir.cwd().statFile(io_impl.io(), store_path, .{ .follow_symlinks = false });
+    const startup_store_path = try std.fs.path.join(alloc, &.{ startup_destination_root, "store.bin" });
+    defer alloc.free(startup_store_path);
+    _ = try Io.Dir.cwd().statFile(io_impl.io(), startup_store_path, .{ .follow_symlinks = false });
 }
 
 test "runtime status collection leaves active stale write lease live" {

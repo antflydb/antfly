@@ -77,6 +77,46 @@ func TestHARuntimeLeaseEnvBindsExactAuthorityAndPersistentSentinel(t *testing.T)
 	}
 }
 
+func TestHARuntimeLeaseWatchdogConfiguresStandbyWithoutRenewal(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Spec.HighAvailability.Runtime.Role = "Standby"
+	cluster.Spec.HighAvailability.Admin.ExecutePlannedActions = false
+	if !haRuntimeLeaseWatchdogEnabled(cluster) {
+		t.Fatal("non-executing standby promotion candidate must observe the fencing Lease")
+	}
+	if haKubernetesLeaseRenewalEnabled(cluster) {
+		t.Fatal("standby promotion candidate must not renew primary authority")
+	}
+	if len(haRuntimeLeaseEnv(cluster)) == 0 {
+		t.Fatal("standby promotion candidate is missing its watchdog environment")
+	}
+
+	reconciler := testHAReconciler(t, cluster)
+	serviceAccountName, err := reconciler.reconcileHARuntimeLeaseRBAC(context.Background(), cluster)
+	if err != nil {
+		t.Fatalf("reconcile standby HA runtime Lease RBAC: %v", err)
+	}
+	if serviceAccountName != cluster.Name+"-ha-runtime" {
+		t.Fatalf("standby runtime service account = %q", serviceAccountName)
+	}
+	role := &rbacv1.Role{}
+	if err := reconciler.Get(context.Background(), client.ObjectKey{
+		Name: cluster.Name + haRuntimeLeaseRBACSuffix, Namespace: cluster.Namespace,
+	}, role); err != nil {
+		t.Fatalf("get standby runtime Lease Role: %v", err)
+	}
+	if len(role.Rules) != 1 || len(role.Rules[0].Verbs) != 2 ||
+		role.Rules[0].Verbs[0] != "get" || role.Rules[0].Verbs[1] != "watch" {
+		t.Fatalf("standby runtime Lease access is not read-only: %#v", role.Rules)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.Role = "Primary"
+	if haRuntimeLeaseWatchdogEnabled(cluster) || haKubernetesLeaseRenewalEnabled(cluster) ||
+		len(haRuntimeLeaseEnv(cluster)) != 0 {
+		t.Fatal("non-executing primary must not arm a watchdog that the controller cannot renew")
+	}
+}
+
 func TestReconcileHARuntimeLeaseRBACCleansOwnedResourcesWhenFailoverIsDisabled(t *testing.T) {
 	ctx := context.Background()
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()

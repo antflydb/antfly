@@ -31,6 +31,7 @@ pub const StatOptions = types.StatOptions;
 pub const CancellationToken = types.CancellationToken;
 pub const DeleteOptions = types.DeleteOptions;
 pub const ListOptions = types.ListOptions;
+pub const ListObjectVersionsOptions = types.ListObjectVersionsOptions;
 pub const ByteRange = types.ByteRange;
 pub const PutResult = types.PutResult;
 pub const GetResult = types.GetResult;
@@ -38,6 +39,8 @@ pub const ObjectPart = types.ObjectPart;
 pub const ObjectAttributes = types.ObjectAttributes;
 pub const ListEntry = types.ListEntry;
 pub const ListResult = types.ListResult;
+pub const ObjectVersionEntry = types.ObjectVersionEntry;
+pub const ListObjectVersionsResult = types.ListObjectVersionsResult;
 
 pub const Client = client.Client;
 pub const FilesystemClient = filesystem.FilesystemClient;
@@ -74,6 +77,7 @@ test "objectstore module compiles" {
     _ = CancellationToken;
     _ = DeleteOptions;
     _ = ListOptions;
+    _ = ListObjectVersionsOptions;
     _ = ByteRange;
     _ = PutResult;
     _ = GetResult;
@@ -81,6 +85,8 @@ test "objectstore module compiles" {
     _ = ObjectAttributes;
     _ = ListEntry;
     _ = ListResult;
+    _ = ObjectVersionEntry;
+    _ = ListObjectVersionsResult;
     _ = Client;
     _ = FilesystemClient;
     _ = MemoryClient;
