@@ -167,6 +167,9 @@ pub const StatOptions = struct {
 pub const DeleteOptions = struct {
     version_id: ?[]const u8 = null,
     if_match_etag: ?[]const u8 = null,
+    /// Borrowed for the duration of this operation. Remote providers interrupt
+    /// their active transport; local providers check before committing delete.
+    cancellation: ?CancellationToken = null,
 };
 
 pub const ListOptions = struct {
@@ -179,6 +182,10 @@ pub const ListOptions = struct {
     /// Opaque provider cursor. Mutually exclusive with `start_after`.
     continuation_token: ?[]const u8 = null,
     max_keys: u32 = 1000,
+    /// Borrowed for the duration of one listing page. Providers attach this
+    /// to remote transport and local implementations check it while walking
+    /// bounded candidates.
+    cancellation: ?CancellationToken = null,
 };
 
 /// One immutable entry returned by a provider's object-version inventory.

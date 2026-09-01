@@ -316,6 +316,7 @@ pub const FilesystemClient = struct {
     }
 
     fn deleteObject(self: *FilesystemClient, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
+        if (opts.cancellation) |token| try token.check();
         if (opts.version_id != null) return error.VersioningUnsupported;
         const object_path = try objectPathAlloc(self.alloc, self.root_dir, bucket, key);
         defer self.alloc.free(object_path);
@@ -327,10 +328,12 @@ pub const FilesystemClient = struct {
             if (meta.etag == null or !std.mem.eql(u8, meta.etag.?, expected)) return error.PreconditionFailed;
         }
 
+        if (opts.cancellation) |token| try token.check();
         try deleteFile(self.io, object_path);
     }
 
     fn listObjects(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
+        if (opts.cancellation) |token| try token.check();
         const root = try objectRootAlloc(alloc, self.root_dir, bucket);
         defer alloc.free(root);
         if (!fileExists(self.io, root)) {
@@ -365,6 +368,7 @@ pub const FilesystemClient = struct {
         defer retained.deinit(alloc);
         const continuation = opts.continuation_token orelse opts.start_after;
         while (try walker.next(self.io)) |entry| {
+            if (opts.cancellation) |token| try token.check();
             if (entry.kind != .file) continue;
             if (!std.mem.startsWith(u8, entry.path, opts.prefix)) continue;
             var candidate_name: []const u8 = entry.path;

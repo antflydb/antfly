@@ -663,7 +663,15 @@ pub const JsonApiClient = struct {
         defer headers.deinit(self.alloc);
         try appendConditionalHeaders(self.alloc, &headers, opts.if_match_etag, false);
 
-        var response = try self.perform(.DELETE, url, headers.items, null, null);
+        var response = try self.performWithResponseLimitAndCancellation(
+            .DELETE,
+            url,
+            headers.items,
+            null,
+            null,
+            null,
+            opts.cancellation,
+        );
         defer response.deinit(self.alloc);
 
         switch (response.status) {
@@ -678,7 +686,15 @@ pub const JsonApiClient = struct {
         const url = try objectListUrlAlloc(alloc, self.cfg, bucket, opts);
         defer alloc.free(url);
 
-        var response = try self.perform(.GET, url, &.{}, null, null);
+        var response = try self.performWithResponseLimitAndCancellation(
+            .GET,
+            url,
+            &.{},
+            null,
+            null,
+            null,
+            opts.cancellation,
+        );
         defer response.deinit(alloc);
 
         switch (response.status) {
@@ -1677,6 +1693,26 @@ test "gcs cancellation reaches active read and write requests" {
         }),
     );
     try std.testing.expectEqual(@as(usize, 5), state.calls);
+
+    signal.store(false, .release);
+    state.expected_method = .GET;
+    try std.testing.expectError(
+        error.Canceled,
+        client.listObjects("bucket", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 6), state.calls);
+
+    signal.store(false, .release);
+    state.expected_method = .DELETE;
+    try std.testing.expectError(
+        error.Canceled,
+        client.deleteObject("bucket", "object", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 7), state.calls);
 }
 
 test "json api client put object encodes upload url and returns etag" {

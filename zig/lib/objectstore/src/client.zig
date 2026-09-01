@@ -197,14 +197,20 @@ pub const Client = struct {
     }
 
     pub fn deleteObject(self: *Client, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
+        if (opts.cancellation) |token| try token.check();
         try self.vtable.delete_object(self.ptr, bucket, key, opts);
+        if (opts.cancellation) |token| try token.check();
     }
 
     pub fn listObjects(self: *Client, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
         if (opts.max_keys == 0) return error.InvalidPageSize;
         if (opts.max_keys > max_list_page_keys) return error.PageSizeTooLarge;
         if (opts.start_after != null and opts.continuation_token != null) return error.AmbiguousContinuation;
-        return try self.vtable.list_objects(self.ptr, self.allocator, bucket, opts);
+        if (opts.cancellation) |token| try token.check();
+        var result = try self.vtable.list_objects(self.ptr, self.allocator, bucket, opts);
+        errdefer result.deinit(self.allocator);
+        if (opts.cancellation) |token| try token.check();
+        return result;
     }
 
     pub fn listObjectVersions(self: *Client, bucket: []const u8, opts: types.ListObjectVersionsOptions) !types.ListObjectVersionsResult {

@@ -14542,6 +14542,10 @@ pub const DataServer = struct {
             const head = try remote.fetchHead();
             return try remote.fetchSnapshotForHead(head);
         }
+        // Embedded metadata shares the same process and invalidates this
+        // cache synchronously at mutation publication, so retaining the
+        // cached fast path does not weaken the maintenance fence.
+        if (try self.status_source.cachedAdminSnapshot()) |snapshot| return snapshot;
         return try self.status_source.adminSnapshot();
     }
 
@@ -15705,6 +15709,12 @@ pub const DataServer = struct {
             self.last_provision_metadata_epoch = head.metadata_epoch;
             self.last_provision_fingerprint = null;
             self.provisioned_root_refresh_dirty.store(true, .release);
+            // A previous discovery pass may have parked this group while the
+            // restore generation did not exist yet. Publication of an exact
+            // runtime-repair marker is a new durable wake edge: clear stale
+            // scheduler and per-group backoff so repair starts on this control
+            // turn instead of waiting behind unrelated pre-import history.
+            self.clearProvisionedStartupCatchUpBackoffs();
             self.provisioned_startup_catch_up_dirty.store(true, .release);
             return;
         }

@@ -3756,6 +3756,24 @@ pub const ApiHttpServer = struct {
     };
 
     const BackupAttemptCleanupWork = struct {
+        const max_attempts: usize = 4;
+        const deadline_ns: u64 = 30 * std.time.ns_per_s;
+
+        const Control = struct {
+            server: *ApiHttpServer,
+            deadline_ns: u64,
+
+            fn isCancelled(raw: *const anyopaque) bool {
+                const self: *const @This() = @ptrCast(@alignCast(raw));
+                return self.server.backup_maintenance_closing.load(.acquire) or
+                    platform_time.monotonicNs() >= self.deadline_ns;
+            }
+
+            fn token(self: *const @This()) api_operation.CancellationToken {
+                return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+            }
+        };
+
         const TableAction = enum {
             rollback,
             committed_state,
@@ -3778,10 +3796,11 @@ pub const ApiHttpServer = struct {
         connection: []u8,
         attempt: Attempt,
 
-        fn run(ptr: *anyopaque) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const io = self.server.sharedApiIo() orelse
-                return error.BackgroundRuntimeUnavailable;
+        fn runOnce(
+            self: *@This(),
+            io: std.Io,
+            cancellation: api_operation.CancellationToken,
+        ) anyerror!void {
             var location = try backups_api.openBackupLocationWithOptions(
                 self.server.owner_alloc,
                 self.location_uri,
@@ -3796,24 +3815,16 @@ pub const ApiHttpServer = struct {
             defer location.deinit(self.server.owner_alloc);
             switch (self.attempt) {
                 .table => |table| switch (table.action) {
-                    .rollback => {
-                        try backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
-                            self.server.owner_alloc,
-                            io,
-                            &location,
-                            table.backup_id,
-                            table.artifact_backup_id,
-                            table.format,
-                        );
-                        if (table.release_writer_lease) {
-                            _ = try backups_api.releaseTableBackupWriterLeaseAtLocation(
-                                self.server.owner_alloc,
-                                io,
-                                &location,
-                                table.artifact_backup_id,
-                            );
-                        }
-                    },
+                    .rollback => try backups_api.cleanupUnpublishedTableBackupAttemptAndWriterStateAtLocationWithCancellation(
+                        self.server.owner_alloc,
+                        io,
+                        &location,
+                        table.backup_id,
+                        table.artifact_backup_id,
+                        table.format,
+                        table.release_writer_lease,
+                        cancellation,
+                    ),
                     .committed_state => try backups_api.releaseCommittedTableBackupWriterStateAtLocation(
                         self.server.owner_alloc,
                         io,
@@ -3843,6 +3854,31 @@ pub const ApiHttpServer = struct {
                     error.FileNotFound => {},
                     else => return err,
                 },
+            }
+        }
+
+        fn run(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const io = self.server.sharedApiIo() orelse
+                return error.BackgroundRuntimeUnavailable;
+            const started_ns = platform_time.monotonicNs();
+            var control = Control{
+                .server = self.server,
+                .deadline_ns = started_ns +| deadline_ns,
+            };
+            var attempts: usize = 0;
+            var backoff_ms: i64 = 25;
+            while (true) {
+                self.runOnce(io, control.token()) catch |err| {
+                    attempts += 1;
+                    if (attempts == max_attempts or Control.isCancelled(&control))
+                        return err;
+                    std.log.warn("backup exact cleanup retrying attempt={d} class={s}", .{ attempts, @errorName(err) });
+                    try io.sleep(.fromMilliseconds(backoff_ms), .awake);
+                    backoff_ms = @min(backoff_ms * 2, 200);
+                    continue;
+                };
+                return;
             }
         }
 
@@ -7586,10 +7622,12 @@ pub const ApiHttpServer = struct {
         backup_id: []const u8,
         format: backups_api.BackupFormat,
         connection: []const u8,
+        receipt: *public_table_http.TableApi.BackupExecutionReceipt,
         request: api_operation.RequestContext,
     ) !void {
         const artifact_backup_id = try self.backupGenerationIdAlloc();
         defer self.alloc.free(artifact_backup_id);
+        receipt.recordArtifactBackupId(artifact_backup_id);
         return try self.backupOwnedTableWithArtifactId(
             io,
             table,
@@ -10886,6 +10924,7 @@ pub const ApiHttpServer = struct {
         location_uri: []const u8,
         connection: []const u8,
         location: *backups_api.BackupLocation,
+        receipt: *public_table_http.TableApi.BackupExecutionReceipt,
         request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
@@ -10926,6 +10965,7 @@ pub const ApiHttpServer = struct {
         // generation ID. Generating another ID here would leave cleanup unable
         // to address the actual payload after a failed or ambiguous transport.
         const backup_result = if (expected_fence) |forwarded_fence| blk: {
+            receipt.recordArtifactBackupId(backup_id);
             var storage_fence = admitted_fence;
             storage_fence.writer_not_after_unix_ns = forwarded_fence.writer_not_after_unix_ns;
             break :blk self.backupOwnedTableWithArtifactId(
@@ -10947,7 +10987,7 @@ pub const ApiHttpServer = struct {
                 if (forwarded_fence.hasMetadataIdentity()) .adopt else .legacy_forwarded_create,
                 operation_request,
             );
-        } else self.backupOwnedTable(io, &table, admitted_fence, table_name, location, location_uri, backup_id, format, connection, operation_request);
+        } else self.backupOwnedTable(io, &table, admitted_fence, table_name, location, location_uri, backup_id, format, connection, receipt, operation_request);
         backup_result catch |err| switch (err) {
             error.NotLeader,
             error.ProposalDropped,

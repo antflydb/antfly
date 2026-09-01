@@ -619,6 +619,26 @@ test "s3 cancellation reaches active read and write transport requests" {
         }),
     );
     try std.testing.expectEqual(@as(usize, 5), state.calls);
+
+    signal.store(false, .release);
+    state.expected_method = .GET;
+    try std.testing.expectError(
+        error.Canceled,
+        client.listObjects("bucket", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 6), state.calls);
+
+    signal.store(false, .release);
+    state.expected_method = .DELETE;
+    try std.testing.expectError(
+        error.Canceled,
+        client.deleteObject("bucket", "object", .{
+            .cancellation = types.CancellationToken.fromAtomic(&signal),
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 7), state.calls);
 }
 
 pub const Client = struct {
@@ -1129,7 +1149,15 @@ pub const Client = struct {
         const owned_if_match = try appendConditionalHeaders(self.alloc, &headers, opts.if_match_etag, false);
         defer if (owned_if_match) |value| self.alloc.free(value);
 
-        var response = try self.perform(.DELETE, target, headers.items, null, null);
+        var response = try self.performWithResponseLimitAndCancellation(
+            .DELETE,
+            target,
+            headers.items,
+            null,
+            null,
+            null,
+            opts.cancellation,
+        );
         defer response.deinit(self.alloc);
         switch (response.status) {
             200, 204 => return,
@@ -1145,7 +1173,15 @@ pub const Client = struct {
         var target = try bucketTargetAllocWithQuery(alloc, self.cfg, bucket, query);
         defer target.deinit(alloc);
 
-        var response = try self.perform(.GET, target, &.{}, null, null);
+        var response = try self.performWithResponseLimitAndCancellation(
+            .GET,
+            target,
+            &.{},
+            null,
+            null,
+            null,
+            opts.cancellation,
+        );
         defer response.deinit(alloc);
         switch (response.status) {
             200 => return try parseListResponse(alloc, response.body),
