@@ -2488,8 +2488,6 @@ pub const MetadataService = struct {
     local_replica_root_reconcile_permit_hook: ?LocalReplicaRootReconcilePermitHook = null,
     lifecycle_listener_mutex: std.Io.Mutex = .init,
     lifecycle_listener_registered: bool = false,
-    catalog_validation_mutex: std.Io.Mutex = .init,
-    catalog_validation_cache: CatalogValidationSnapshotCache = .{},
     embedding_activity_cache: EmbeddingActivityCache = .{},
     catalog_projection_reader: catalog_projection_reader.CatalogProjectionReader = .{},
     local_group_status_provider: ?LocalGroupStatusProvider = null,
@@ -2575,7 +2573,6 @@ pub const MetadataService = struct {
         // Projection listeners retain `self`; stop and drain their Raft apply
         // producer before releasing any callback-owned service state.
         self.raft.deinit();
-        self.catalog_validation_cache.deinit(self.alloc);
         self.embedding_activity_cache.deinit(self.alloc);
         self.catalog_projection_reader.deinit(self.alloc);
         self.store_status_backfill_marker_cache.deinit(self.alloc);
@@ -4381,8 +4378,6 @@ pub const MetadataHttpService = struct {
     local_replica_root_reconcile_permit_hook: ?LocalReplicaRootReconcilePermitHook = null,
     lifecycle_listener_mutex: std.Io.Mutex = .init,
     lifecycle_listener_registered: bool = false,
-    catalog_validation_mutex: std.Io.Mutex = .init,
-    catalog_validation_cache: CatalogValidationSnapshotCache = .{},
     embedding_activity_cache: EmbeddingActivityCache = .{},
     catalog_projection_reader: catalog_projection_reader.CatalogProjectionReader = .{},
     cdc_write_source_override: ?api_table_writes.TableWriteSource = null,
@@ -4499,7 +4494,6 @@ pub const MetadataHttpService = struct {
         // Projection listeners retain `self`; stop and drain their Raft apply
         // producer before releasing any callback-owned service state.
         self.raft.deinit();
-        self.catalog_validation_cache.deinit(self.alloc);
         self.embedding_activity_cache.deinit(self.alloc);
         self.catalog_projection_reader.deinit(self.alloc);
         self.projected_core_snapshot_cache.deinit(self.alloc);
