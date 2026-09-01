@@ -4128,6 +4128,59 @@ pub const HBCIndex = struct {
         };
     }
 
+    pub const NativeBackupGeneration = struct {
+        alloc: Allocator,
+        root_dir: []u8,
+        current_bytes: []u8,
+        segment_generations: []u64,
+        wal_generation: u64,
+        wal_committed_bytes: u64,
+
+        pub fn deinit(self: *NativeBackupGeneration) void {
+            self.alloc.free(self.root_dir);
+            self.alloc.free(self.current_bytes);
+            self.alloc.free(self.segment_generations);
+            self.* = undefined;
+        }
+    };
+
+    /// Captures the exact native posting manifest selected under the caller's
+    /// source/revision fence. Immutable segment bytes can be pinned by path;
+    /// the appendable WAL must be copied only through this committed prefix.
+    pub fn nativeBackupGeneration(
+        self: *HBCIndex,
+        alloc: Allocator,
+        expected_source_sequence: u64,
+    ) !?NativeBackupGeneration {
+        if (!self.experimentalPostingWalAuthoritative()) return null;
+        if (self.experimentalPostingMutationCaptureActive() or self.write_session_depth != 0)
+            return error.NativeBackupProjectionNotQuiescent;
+        var store = try self.openExperimentalPostingStore();
+        defer store.deinit();
+        if (store.covered_source_sequence != expected_source_sequence)
+            return error.NativeBackupProjectionNotQuiescent;
+        var checkpoint = store.checkpoint orelse return error.MissingPostingCheckpoint;
+        checkpoint.wal_committed_bytes = store.wal_committed_bytes;
+        checkpoint.covered_source_sequence = store.covered_source_sequence;
+        const encoded = checkpoint.encode();
+        const current_bytes = try alloc.dupe(u8, &encoded);
+        errdefer alloc.free(current_bytes);
+        const segment_generations = try alloc.alloc(u64, checkpoint.segmentCount());
+        errdefer alloc.free(segment_generations);
+        for (segment_generations, 0..) |*generation, index| {
+            generation.* = checkpoint.segment(index).generation;
+        }
+        const root_dir = try alloc.dupe(u8, store.root_dir);
+        return .{
+            .alloc = alloc,
+            .root_dir = root_dir,
+            .current_bytes = current_bytes,
+            .segment_generations = segment_generations,
+            .wal_generation = store.wal_generation,
+            .wal_committed_bytes = store.wal_committed_bytes,
+        };
+    }
+
     pub fn snapshotLsmNativeStorageStats(self: *const HBCIndex) ?lsm_backend.NativeStorageStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),

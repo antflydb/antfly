@@ -20,6 +20,7 @@ const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
 const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
 const native_artifact_sink = @import("../../native_artifact_sink.zig");
+const native_backup = @import("../native_backup.zig");
 const process_memory = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
@@ -49,6 +50,7 @@ const persistent_mod = @import("../../persistent.zig");
 const lsm_backend_mod = @import("../../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const vector_block_store_mod = @import("../../vector_block_store.zig");
+const posting_segment_store_mod = @import("../../posting_segment_store.zig");
 const vector_block_mod = @import("antfly_vectorindex").vector_block;
 const background_runtime_mod = @import("../../background_runtime.zig");
 const docstore_mod = @import("../../docstore.zig");
@@ -1251,6 +1253,7 @@ const SplitSide = enum {
 };
 
 pub const IndexManager = struct {
+    pub const dense_native_backup_backend_id = "hbc-native-v1";
     const max_retired_lsm_owner_stats: usize = 1024;
     const retired_lsm_owner_overflow_name = "__retired_owner_overflow__";
     alloc: Allocator,
@@ -6006,10 +6009,13 @@ pub const IndexManager = struct {
         for (self.algebraic_indexes.items) |*entry| try entry.index.sync(force);
     }
 
-    pub fn nativeBackupBackendId(self: *const IndexManager, kind: types.IndexKind) []const u8 {
+    pub fn nativeBackupBackendId(self: *IndexManager, name: []const u8, kind: types.IndexKind) []const u8 {
         return switch (kind) {
             .full_text => @tagName(self.text_main_backend),
-            .dense_vector => @tagName(self.dense_storage_backend),
+            .dense_vector => if (self.denseIndex(name)) |entry|
+                if (entry.index.experimentalPostingWalAuthoritative()) dense_native_backup_backend_id else @tagName(self.dense_storage_backend)
+            else
+                @tagName(self.dense_storage_backend),
             .sparse_vector => @tagName(self.sparse_backend),
             .graph => @tagName(self.graph_reverse_backend),
             // Algebraic indexes are materialized in the primary namespace and
@@ -6021,10 +6027,19 @@ pub const IndexManager = struct {
     /// Native backup is a physical-generation contract, not merely a codec
     /// label. Backends opt in only when a durable boundary can be converted to
     /// immutable files that remain stable after capture admission reopens.
-    pub fn nativeBackupSupportsImmutableCheckpoint(self: *const IndexManager, kind: types.IndexKind) bool {
+    pub fn nativeBackupSupportsImmutableCheckpoint(self: *IndexManager, name: []const u8, kind: types.IndexKind) bool {
         return switch (kind) {
             .full_text => self.text_main_backend == .lsm and nativeBackupStoragePublicationCompatible(self.text_lsm_storage),
-            .dense_vector => self.dense_storage_backend == .lsm and nativeBackupStoragePublicationCompatible(self.dense_lsm_storage),
+            .dense_vector => if (self.denseIndex(name)) |entry|
+                if (entry.index.experimentalPostingWalAuthoritative())
+                    // Native postings are the projection authority. Shared
+                    // vector blocks are optional acceleration and therefore
+                    // must not make an otherwise complete backup unsupported.
+                    nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)
+                else
+                    self.dense_storage_backend == .lsm and nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)
+            else
+                false,
             .sparse_vector => self.sparse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.sparse_lsm_storage),
             .graph => self.graph_reverse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.graph_lsm_storage),
             .algebraic => true,
@@ -6042,6 +6057,7 @@ pub const IndexManager = struct {
     pub const NativeBackupCheckpoints = struct {
         alloc: Allocator,
         artifacts: std.ArrayListUnmanaged(Artifact) = .empty,
+        native_files: ?native_backup.PinnedGeneratedArtifacts = null,
 
         const Artifact = struct {
             index_name: []u8,
@@ -6059,12 +6075,13 @@ pub const IndexManager = struct {
                 }
                 self.alloc.free(artifact.index_name);
             }
+            if (self.native_files) |*checkpoint| checkpoint.deinit();
             self.artifacts.deinit(self.alloc);
             self.* = undefined;
         }
 
         pub fn materialize(
-            self: *const NativeBackupCheckpoints,
+            self: *NativeBackupCheckpoints,
             io: std.Io,
             staging_root: []const u8,
             cancellation: CancellationToken,
@@ -6073,7 +6090,7 @@ pub const IndexManager = struct {
         }
 
         pub fn materializeWithSink(
-            self: *const NativeBackupCheckpoints,
+            self: *NativeBackupCheckpoints,
             io: std.Io,
             staging_root: []const u8,
             cancellation: CancellationToken,
@@ -6102,21 +6119,53 @@ pub const IndexManager = struct {
                 };
                 total = std.math.add(u64, total, copied) catch return error.FileTooBig;
             }
+            if (self.native_files) |*checkpoint| {
+                total = std.math.add(
+                    u64,
+                    total,
+                    try checkpoint.materializeWithSink(staging_root, cancellation, sink),
+                ) catch return error.FileTooBig;
+            }
             try fs_paths.syncDirPortable(io, indexes_root);
             return total;
         }
     };
 
+    fn retainNativeBackupAllocation(
+        self: *IndexManager,
+        owned: *std.ArrayListUnmanaged([]u8),
+        allocation: []u8,
+    ) ![]u8 {
+        errdefer self.alloc.free(allocation);
+        try owned.append(self.alloc, allocation);
+        return allocation;
+    }
+
     /// Pins the exact immutable generations owned by the opened index
-    /// backends. No directory walk or corpus-byte copy occurs here, so the
-    /// caller can release revision/mutation fences immediately afterwards.
-    pub fn pinNativeBackupCheckpoints(self: *IndexManager) !NativeBackupCheckpoints {
+    /// backends. No directory walk or immutable corpus-byte copy occurs here;
+    /// only bounded committed WAL prefixes are copied before the caller can
+    /// release revision/mutation fences.
+    pub fn pinNativeBackupCheckpoints(
+        self: *IndexManager,
+        io: std.Io,
+        native_pin_root: []const u8,
+        capture_target_sequence: u64,
+        cancellation: CancellationToken,
+    ) !NativeBackupCheckpoints {
         if (comptime builtin.os.tag == .freestanding) return error.Unsupported;
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
 
         var result = NativeBackupCheckpoints{ .alloc = self.alloc };
         errdefer result.deinit();
+        var native_specs = std.ArrayListUnmanaged(native_backup.ExplicitPinSpec).empty;
+        defer native_specs.deinit(self.alloc);
+        var native_owned = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (native_owned.items) |allocation| self.alloc.free(allocation);
+            native_owned.deinit(self.alloc);
+        }
+        var has_native_dense = false;
         for (self.text_indexes.items) |*entry| {
             try result.artifacts.ensureUnusedCapacity(self.alloc, 3);
             const main_name = try self.alloc.dupe(u8, entry.config.name);
@@ -6155,6 +6204,80 @@ pub const IndexManager = struct {
             }
         }
         for (self.dense_indexes.items) |*entry| {
+            if (try entry.index.nativeBackupGeneration(self.alloc, capture_target_sequence)) |generation_value| {
+                var generation = generation_value;
+                defer generation.deinit();
+                has_native_dense = true;
+                const current_relative = try self.retainNativeBackupAllocation(
+                    &native_owned,
+                    try std.fmt.allocPrint(self.alloc, "indexes/{s}/posting-segments/CURRENT", .{entry.config.name}),
+                );
+                const current_bytes = try self.retainNativeBackupAllocation(
+                    &native_owned,
+                    try self.alloc.dupe(u8, generation.current_bytes),
+                );
+                try native_specs.append(self.alloc, .{
+                    .relative_path = current_relative,
+                    .source = .{ .bytes = current_bytes },
+                });
+                const authority_relative = try self.retainNativeBackupAllocation(
+                    &native_owned,
+                    try std.fmt.allocPrint(self.alloc, "indexes/{s}/posting-segments/{s}", .{
+                        entry.config.name,
+                        posting_segment_store_mod.authority_name,
+                    }),
+                );
+                try native_specs.append(self.alloc, .{
+                    .relative_path = authority_relative,
+                    .source = .{ .bytes = posting_segment_store_mod.authority_value },
+                });
+                for (generation.segment_generations) |segment_generation| {
+                    const source = try self.retainNativeBackupAllocation(
+                        &native_owned,
+                        try posting_segment_store_mod.checkpointSegmentPathAlloc(
+                            self.alloc,
+                            generation.root_dir,
+                            segment_generation,
+                        ),
+                    );
+                    const relative = try self.retainNativeBackupAllocation(
+                        &native_owned,
+                        try std.fmt.allocPrint(
+                            self.alloc,
+                            "indexes/{s}/posting-segments/segment-{d}.afps",
+                            .{ entry.config.name, segment_generation },
+                        ),
+                    );
+                    try native_specs.append(self.alloc, .{
+                        .relative_path = relative,
+                        .source = .{ .immutable_file = source },
+                    });
+                }
+                const wal_source = try self.retainNativeBackupAllocation(
+                    &native_owned,
+                    try posting_segment_store_mod.checkpointWalPathAlloc(
+                        self.alloc,
+                        generation.root_dir,
+                        generation.wal_generation,
+                    ),
+                );
+                const wal_relative = try self.retainNativeBackupAllocation(
+                    &native_owned,
+                    try std.fmt.allocPrint(
+                        self.alloc,
+                        "indexes/{s}/posting-segments/wal-{d}.afpw",
+                        .{ entry.config.name, generation.wal_generation },
+                    ),
+                );
+                try native_specs.append(self.alloc, .{
+                    .relative_path = wal_relative,
+                    .source = .{ .committed_prefix = .{
+                        .path = wal_source,
+                        .bytes = generation.wal_committed_bytes,
+                    } },
+                });
+                continue;
+            }
             try result.artifacts.ensureUnusedCapacity(self.alloc, 1);
             const name = try self.alloc.dupe(u8, entry.config.name);
             const checkpoint = entry.index.pinNativeCheckpoint() catch |err| {
@@ -6162,6 +6285,77 @@ pub const IndexManager = struct {
                 return err;
             };
             result.artifacts.appendAssumeCapacity(.{ .index_name = name, .backend_root = "", .checkpoint = .{ .lsm = checkpoint } });
+        }
+        if (has_native_dense and nativeBackupStoragePublicationCompatible(self.vector_block_storage)) {
+            if (self.acquireVectorBlockGeneration()) |vector_generation| {
+                defer vector_generation.release();
+                const store = &vector_generation.opened.store;
+                if (store.manifest) |manifest_value| {
+                    if (store.covered_source_sequence == capture_target_sequence) {
+                        var manifest = manifest_value;
+                        manifest.wal_committed_bytes = store.wal_committed_bytes;
+                        manifest.covered_source_sequence = store.covered_source_sequence;
+                        const current_bytes = try self.retainNativeBackupAllocation(
+                            &native_owned,
+                            try manifest.encodeAlloc(self.alloc),
+                        );
+                        try native_specs.append(self.alloc, .{
+                            .relative_path = "indexes/vector-blocks/CURRENT",
+                            .source = .{ .bytes = current_bytes },
+                        });
+                        const root = try self.retainNativeBackupAllocation(
+                            &native_owned,
+                            try self.vectorBlockRootAlloc(),
+                        );
+                        for (manifest.segments) |segment| {
+                            const source = try self.retainNativeBackupAllocation(
+                                &native_owned,
+                                try vector_block_store_mod.checkpointBlockPathAlloc(
+                                    self.alloc,
+                                    root,
+                                    segment.generation,
+                                    segment.shard_id,
+                                ),
+                            );
+                            const relative = try self.retainNativeBackupAllocation(
+                                &native_owned,
+                                try std.fmt.allocPrint(
+                                    self.alloc,
+                                    "indexes/vector-blocks/block-{d}-{d}.afvb",
+                                    .{ segment.generation, segment.shard_id },
+                                ),
+                            );
+                            try native_specs.append(self.alloc, .{
+                                .relative_path = relative,
+                                .source = .{ .immutable_file = source },
+                            });
+                        }
+                        const wal_source = try self.retainNativeBackupAllocation(
+                            &native_owned,
+                            try vector_block_store_mod.checkpointWalPathAlloc(
+                                self.alloc,
+                                root,
+                                store.wal_generation,
+                            ),
+                        );
+                        const wal_relative = try self.retainNativeBackupAllocation(
+                            &native_owned,
+                            try std.fmt.allocPrint(
+                                self.alloc,
+                                "indexes/vector-blocks/wal-{d}.afvw",
+                                .{store.wal_generation},
+                            ),
+                        );
+                        try native_specs.append(self.alloc, .{
+                            .relative_path = wal_relative,
+                            .source = .{ .committed_prefix = .{
+                                .path = wal_source,
+                                .bytes = store.wal_committed_bytes,
+                            } },
+                        });
+                    }
+                }
+            }
         }
         for (self.sparse_indexes.items) |*entry| {
             try result.artifacts.ensureUnusedCapacity(self.alloc, 1);
@@ -6194,6 +6388,15 @@ pub const IndexManager = struct {
                 .backend_root = "reverse",
                 .checkpoint = .{ .lsm = checkpoints.reverse },
             });
+        }
+        if (native_specs.items.len != 0) {
+            result.native_files = try native_backup.pinExplicitArtifacts(
+                self.alloc,
+                io,
+                native_pin_root,
+                native_specs.items,
+                cancellation,
+            );
         }
         return result;
     }

@@ -27,6 +27,22 @@ const max_control_bytes = posting_wal.Checkpoint.encoded_len;
 const max_wal_bytes: usize = 512 * 1024 * 1024;
 const max_segment_bytes: usize = if (@sizeOf(usize) >= 8) 4 * 1024 * 1024 * 1024 else std.math.maxInt(usize);
 
+pub fn checkpointCurrentPathAlloc(alloc: Allocator, root_dir: []const u8) ![]u8 {
+    return try std.fs.path.join(alloc, &.{ root_dir, current_name });
+}
+
+pub fn checkpointSegmentPathAlloc(alloc: Allocator, root_dir: []const u8, generation: u64) ![]u8 {
+    const name = try std.fmt.allocPrint(alloc, "segment-{d}.afps", .{generation});
+    defer alloc.free(name);
+    return try std.fs.path.join(alloc, &.{ root_dir, name });
+}
+
+pub fn checkpointWalPathAlloc(alloc: Allocator, root_dir: []const u8, generation: u64) ![]u8 {
+    const name = try std.fmt.allocPrint(alloc, "wal-{d}.afpw", .{generation});
+    defer alloc.free(name);
+    return try std.fs.path.join(alloc, &.{ root_dir, name });
+}
+
 pub const RetainedSegment = union(enum) {
     heap: []u8,
     mapped: []align(std.heap.page_size_min) u8,
@@ -784,19 +800,15 @@ pub const Store = struct {
     }
 
     fn currentPathAlloc(self: *const Store) ![]u8 {
-        return try std.fs.path.join(self.alloc, &.{ self.root_dir, current_name });
+        return try checkpointCurrentPathAlloc(self.alloc, self.root_dir);
     }
 
     fn segmentPathAlloc(self: *const Store, generation: u64) ![]u8 {
-        const name = try std.fmt.allocPrint(self.alloc, "segment-{d}.afps", .{generation});
-        defer self.alloc.free(name);
-        return try std.fs.path.join(self.alloc, &.{ self.root_dir, name });
+        return try checkpointSegmentPathAlloc(self.alloc, self.root_dir, generation);
     }
 
     fn walPathAlloc(self: *const Store, generation: u64) ![]u8 {
-        const name = try std.fmt.allocPrint(self.alloc, "wal-{d}.afpw", .{generation});
-        defer self.alloc.free(name);
-        return try std.fs.path.join(self.alloc, &.{ self.root_dir, name });
+        return try checkpointWalPathAlloc(self.alloc, self.root_dir, generation);
     }
 };
 

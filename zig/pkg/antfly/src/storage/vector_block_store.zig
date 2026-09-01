@@ -49,6 +49,18 @@ const wal_checkpoint_bytes: usize = 64 * 1024 * 1024;
 const max_block_bytes: usize = if (@sizeOf(usize) >= 8) 8 * 1024 * 1024 * 1024 else std.math.maxInt(usize);
 var positional_read_test_nonce: std.atomic.Value(u64) = .init(0);
 
+pub fn checkpointBlockPathAlloc(alloc: Allocator, root_dir: []const u8, generation: u64, shard_id: u32) ![]u8 {
+    const name = try std.fmt.allocPrint(alloc, "block-{d}-{d}.afvb", .{ generation, shard_id });
+    defer alloc.free(name);
+    return try std.fs.path.join(alloc, &.{ root_dir, name });
+}
+
+pub fn checkpointWalPathAlloc(alloc: Allocator, root_dir: []const u8, generation: u64) ![]u8 {
+    const name = try std.fmt.allocPrint(alloc, "wal-{d}.afvw", .{generation});
+    defer alloc.free(name);
+    return try std.fs.path.join(alloc, &.{ root_dir, name });
+}
+
 pub const RetainedBlock = struct {
     shared: *Shared,
 
@@ -1118,15 +1130,11 @@ pub const Store = struct {
     }
 
     fn walPathAlloc(self: *const Store, generation: u64) ![]u8 {
-        const name = try std.fmt.allocPrint(self.alloc, "wal-{d}.afvw", .{generation});
-        defer self.alloc.free(name);
-        return try std.fs.path.join(self.alloc, &.{ self.root_dir, name });
+        return try checkpointWalPathAlloc(self.alloc, self.root_dir, generation);
     }
 
     fn blockPathAlloc(self: *const Store, generation: u64, shard_id: u32) ![]u8 {
-        const name = try std.fmt.allocPrint(self.alloc, "block-{d}-{d}.afvb", .{ generation, shard_id });
-        defer self.alloc.free(name);
-        return try std.fs.path.join(self.alloc, &.{ self.root_dir, name });
+        return try checkpointBlockPathAlloc(self.alloc, self.root_dir, generation, shard_id);
     }
 
     fn recoverWal(self: *const Store) !RecoveredWal {

@@ -3596,6 +3596,67 @@ so publication overhead must not be inferred from the total delta alone. The
 r124. Repeat runs on a controlled host remain necessary before assigning a
 precise throughput cost.
 
+### Native authority transactions and backup generations
+
+Post-merge review exposed two lifecycle gaps outside the timed query path. A
+derived replay window retired its streaming session before publishing the
+source-owned posting capture, allowing stable-tip maintenance to consume the
+handoff. Native-authoritative HBC indexes also still entered the legacy dense
+LSM checkpoint path during backup, which correctly returned `Unsupported`
+after the HBC generation had released that backend.
+
+The long-term shape makes both boundaries explicit. Replay now retains the
+opaque capture lease and the window's source sequence. Under one per-index
+apply fence it retires the streaming session, validates lease ownership, and
+publishes the capture at that sequence. A window that becomes mutation-empty
+after lifecycle filtering still advances its source boundary with an empty WAL
+transaction. Borrowers can append within an owner's transaction but still
+cannot publish or cancel it; stale epochs and index incarnations continue to
+fail closed.
+
+Native backup format V4 identifies HBC authority as `hbc-native-v1`. While the
+snapshot revision/mutation fence is held, it decodes each authoritative
+`CURRENT` and constructs an explicit inventory: immutable posting segments and
+vector blocks are hardlinked into a private pin generation, appendable WALs are
+copied only through their committed byte boundary, and synthetic control files
+carry the exact covered source sequence. Backup no longer walks a live HBC
+directory, retains a mutable inode, or asks a released LSM for a checkpoint.
+The fence cost is proportional to referenced file count plus the bounded WAL
+tails, not corpus bytes.
+
+Shared exact-vector blocks are now classified as rebuildable table-wide
+acceleration rather than projection authority. A missing or corrupt shared
+artifact discards the complete shared generation while preserving native
+posting authority and primary-vector fallback. Projection-local corruption
+continues to invalidate only that projection. This separates `queryable` from
+`native_accelerated` without treating absence of an authoritative generation
+as readiness.
+
+Focused qualification covers immutable-inode replacement after pinning, exact
+WAL-prefix capture, shared-acceleration corruption, concurrent writes across a
+snapshot, restore of a native posting generation without an embedder, and the
+deterministic derived-replay handoff. These changes do not alter candidate
+routing, SIMD scoring, rerank bounds, or serving file layout, so r124/r125
+remain the applicable query-path design measurements.
+
+Fresh r126 confirms that the transaction boundary does not regress the public
+50K lifecycle. Insert completed in 18.37 seconds and readiness in another
+11.72 seconds, 30.09 seconds total, versus r124's 31.34 seconds. Recall remained
+0.9861. QPS was 266.07/1031.50/1116.04/1064.82 at concurrency 1/10/20/30. The
+detailed profile reported client mean/p50/p95 of 4.76/4.49/5.06 ms and server
+mean/p50/p95 of 3.23/3.18/3.70 ms, with 23,725 approximate scores and 137.40
+exact completions/query. Cold/warm restart serial p95 was 4.6/4.2 ms.
+
+r126's sampled attributable demand was 557.3 MB and its post-phase physical-
+footprint ledger was 534.7 MB. Cache-inclusive live RSS reached 2.200 GB, above
+r124's 1.588 GB, while restart RSS was 335.1 MB. Because the native transaction
+change neither maps nor retains serving files and the lower demand ledger does
+not track the RSS increase, this single cache-inclusive high-water is recorded
+as file-cache/host variance rather than attributed to the fix. It should not be
+discarded: repeat controlled lifecycles remain the gate for a precise RSS
+claim. The load-time, recall, query-latency, and throughput acceptance gates all
+pass.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process

@@ -3498,6 +3498,12 @@ test "table provisioner reconcile does not replay pending derived batches" {
     defer reopened.close();
     const applied = try reopened.core.loadAppliedSequence(std.testing.allocator, "embed_idx");
     try std.testing.expect(applied > 0);
+    const dense = reopened.core.index_manager.denseIndex("embed_idx") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        @as(?u64, applied),
+        dense.index.experimentalPostingDurableAppliedSequence(),
+    );
 }
 
 test "table provisioner reports local schema progress once all local shards have the target full-text index" {

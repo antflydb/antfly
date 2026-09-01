@@ -29,11 +29,11 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-/// Current native-generation contract. Versions 1 and 2 existed only on the
+/// Current native-generation contract. Versions 1 through 3 existed only on the
 /// development branch and are deliberately not a compatibility surface.
 /// v0.2.0 native backups have no generation manifest and use the legacy repair
 /// path instead.
-pub const format_version: u32 = 3;
+pub const format_version: u32 = 4;
 pub const manifest_file_name = "native-generation.json";
 const indexes_directory_name = "indexes";
 const applied_checkpoint_file_name = "derived_apply.checkpoint";
@@ -79,6 +79,10 @@ pub const ArtifactRole = enum {
     legacy,
     primary,
     projection,
+    /// Table-wide exact-vector blocks are shared by every dense projection.
+    /// They are an acceleration plane: loss or corruption never invalidates
+    /// the independently complete posting generations or primary vectors.
+    shared_acceleration,
     metadata,
 };
 
@@ -118,6 +122,7 @@ pub const LoadedManifest = struct {
     alloc: Allocator,
     parsed: std.json.Parsed(Manifest),
     invalid_projections: std.ArrayListUnmanaged(InvalidProjection) = .empty,
+    shared_acceleration_invalid: bool = false,
 
     pub fn deinit(self: *LoadedManifest) void {
         for (self.invalid_projections.items) |invalid| self.alloc.free(invalid.name);
@@ -166,6 +171,14 @@ pub const LoadedManifest = struct {
             defer self.alloc.free(path);
             try std.Io.Dir.cwd().deleteTree(io, path);
         }
+        if (self.shared_acceleration_invalid) {
+            const path = try std.fmt.allocPrint(self.alloc, "{s}/{s}/vector-blocks", .{
+                destination_root,
+                indexes_directory_name,
+            });
+            defer self.alloc.free(path);
+            try std.Io.Dir.cwd().deleteTree(io, path);
+        }
         const indexes_path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ destination_root, indexes_directory_name });
         defer self.alloc.free(indexes_path);
         fs_paths.syncDirPortable(io, indexes_path) catch |err| switch (err) {
@@ -173,6 +186,23 @@ pub const LoadedManifest = struct {
             else => return err,
         };
     }
+};
+
+/// One exact native-generation artifact selected while the DB capture fence is
+/// held. Immutable files are hardlinked into a private pin tree; mutable WALs
+/// are copied only through their committed prefix; control records are emitted
+/// from the already-decoded manifest. Consequently no live appendable inode is
+/// retained after mutation admission reopens.
+pub const ExplicitPinSpec = struct {
+    relative_path: []const u8,
+    source: union(enum) {
+        immutable_file: []const u8,
+        committed_prefix: struct {
+            path: []const u8,
+            bytes: u64,
+        },
+        bytes: []const u8,
+    },
 };
 
 fn validateProjectionName(name: []const u8) !void {
@@ -396,6 +426,12 @@ fn finishPinnedArtifacts(
             return std.mem.order(u8, lhs.relative_path, rhs.relative_path) == .lt;
         }
     }.lessThan);
+    if (files.items.len > 1) {
+        for (files.items[1..], files.items[0 .. files.items.len - 1]) |current, previous| {
+            if (std.mem.eql(u8, current.relative_path, previous.relative_path))
+                return error.InvalidNativeBackupArtifactPath;
+        }
+    }
     const owned_pin_root = try alloc.dupe(u8, pin_root);
     errdefer alloc.free(owned_pin_root);
     const owned_files = try files.toOwnedSlice(alloc);
@@ -405,6 +441,57 @@ fn finishPinnedArtifacts(
         .pin_root = owned_pin_root,
         .files = owned_files,
     };
+}
+
+/// Pins a manifest-derived file inventory without walking a live projection
+/// directory. The operation is O(number of referenced immutable files + WAL
+/// tail bytes), independent of corpus bytes.
+pub fn pinExplicitArtifacts(
+    alloc: Allocator,
+    io: Io,
+    pin_root: []const u8,
+    specs: []const ExplicitPinSpec,
+    cancellation: CancellationToken,
+) !PinnedGeneratedArtifacts {
+    try ensureActive(cancellation);
+    try fs_paths.createDirPathPortable(io, pin_root);
+    errdefer std.Io.Dir.cwd().deleteTree(io, pin_root) catch {};
+    var files = std.ArrayListUnmanaged(PinnedArtifactFile).empty;
+    errdefer {
+        for (files.items) |*file| file.deinit(alloc);
+        files.deinit(alloc);
+    }
+    try files.ensureTotalCapacity(alloc, specs.len);
+    for (specs) |spec| {
+        try ensureActive(cancellation);
+        try validateRelativePath(spec.relative_path);
+        const relative = try alloc.dupe(u8, spec.relative_path);
+        errdefer alloc.free(relative);
+        const pinned_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ pin_root, relative });
+        errdefer alloc.free(pinned_path);
+        const stat = switch (spec.source) {
+            .immutable_file => |source| try pinArtifactFile(io, source, pinned_path),
+            .committed_prefix => |prefix| try pinArtifactPrefix(
+                io,
+                prefix.path,
+                pinned_path,
+                prefix.bytes,
+                cancellation,
+            ),
+            .bytes => |body| blk: {
+                if (std.fs.path.dirname(pinned_path)) |parent|
+                    try fs_paths.createDirPathPortable(io, parent);
+                _ = try writeFileDurable(io, pinned_path, body);
+                break :blk try statRegularFile(io, pinned_path);
+            },
+        };
+        files.appendAssumeCapacity(.{
+            .relative_path = relative,
+            .pinned_path = pinned_path,
+            .stat = stat,
+        });
+    }
+    return try finishPinnedArtifacts(alloc, io, pin_root, &files);
 }
 
 /// Pins only projection generations whose physical backend has an immutable
@@ -763,6 +850,7 @@ pub fn validateAndMaterializeWithCancellation(
         try ensureActive(cancellation);
         if (!isGeneratedArtifact(artifact.path)) continue;
         if (artifact.role == .projection and loaded.projectionInvalid(artifact.projection_name)) continue;
+        if (artifact.role == .shared_acceleration and loaded.shared_acceleration_invalid) continue;
         const source = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, artifact.path });
         defer alloc.free(source);
         const materialized_path = if (std.mem.startsWith(u8, artifact.path, primary_lsm_directory_name ++ "/"))
@@ -839,6 +927,10 @@ fn downgradeProjectionArtifactFailure(
     artifact: Artifact,
     reason: InvalidProjectionReason,
 ) !bool {
+    if (artifact.role == .shared_acceleration) {
+        loaded.shared_acceleration_invalid = true;
+        return true;
+    }
     if (artifact.role != .projection or artifact.projection_name.len == 0) {
         return false;
     }
@@ -857,7 +949,7 @@ fn validateArtifactOwnership(artifact: Artifact, projections: []const Projection
                 return error.InvalidNativeBackupManifest;
             }
         },
-        .primary, .metadata => if (artifact.projection_name.len != 0)
+        .primary, .shared_acceleration, .metadata => if (artifact.projection_name.len != 0)
             return error.InvalidNativeBackupManifest,
         .legacy => return error.InvalidNativeBackupManifest,
     }
@@ -1042,6 +1134,8 @@ fn artifactOwnership(path: []const u8, projections: []const Projection) !Artifac
         const separator = std.mem.indexOfScalar(u8, suffix, '/') orelse
             return error.InvalidNativeBackupArtifactPath;
         const index_name = suffix[0..separator];
+        if (std.mem.eql(u8, index_name, "vector-blocks"))
+            return .{ .role = .shared_acceleration };
         const projection_index = findProjectionIndex(projections, index_name) orelse
             return error.NativeBackupProjectionMismatch;
         return .{ .role = .projection, .projection_name = projections[projection_index].name };
@@ -1217,6 +1311,47 @@ fn pinArtifactFile(io: Io, source_path: []const u8, pinned_path: []const u8) !st
     return pinned;
 }
 
+fn pinArtifactPrefix(
+    io: Io,
+    source_path: []const u8,
+    pinned_path: []const u8,
+    prefix_bytes: u64,
+    cancellation: CancellationToken,
+) !std.Io.File.Stat {
+    if (std.fs.path.dirname(pinned_path)) |parent|
+        try fs_paths.createDirPathPortable(io, parent);
+    var source = if (std.fs.path.isAbsolute(source_path))
+        try std.Io.Dir.openFileAbsolute(io, source_path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, source_path, .{});
+    defer source.close(io);
+    const initial = try source.stat(io);
+    if (initial.kind != .file or initial.size < prefix_bytes) return error.SourceFileChanged;
+
+    var destination = try fs_paths.createFilePortable(io, pinned_path, .{ .truncate = true });
+    defer destination.close(io);
+    var writer_buffer: [64 * 1024]u8 = undefined;
+    var writer = destination.writer(io, &writer_buffer);
+    var buffer: [256 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < prefix_bytes) {
+        try ensureActive(cancellation);
+        const wanted: usize = @intCast(@min(prefix_bytes - offset, buffer.len));
+        const read = try source.readPositionalAll(io, buffer[0..wanted], offset);
+        if (read != wanted) return error.SourceFileChanged;
+        try writer.interface.writeAll(buffer[0..read]);
+        offset += read;
+    }
+    try writer.end();
+    const final = try source.stat(io);
+    if (final.size != initial.size or !std.meta.eql(final.mtime, initial.mtime))
+        return error.SourceFileChanged;
+    try destination.sync(io);
+    const parent = std.fs.path.dirname(pinned_path) orelse if (std.fs.path.isAbsolute(pinned_path)) "/" else ".";
+    try fs_paths.syncDirPortable(io, parent);
+    return try destination.stat(io);
+}
+
 fn statRegularFile(io: Io, path: []const u8) !std.Io.File.Stat {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
@@ -1292,6 +1427,114 @@ fn writeFileDurable(io: Io, path: []const u8, body: []const u8) !u64 {
     return body.len;
 }
 
+test "explicit native generation pin keeps immutable files and exact WAL prefix" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const segment = try std.fmt.allocPrint(alloc, "{s}/live/segment.afps", .{root});
+    defer alloc.free(segment);
+    const wal = try std.fmt.allocPrint(alloc, "{s}/live/wal.afpw", .{root});
+    defer alloc.free(wal);
+    const pin_root = try std.fmt.allocPrint(alloc, "{s}/pin", .{root});
+    defer alloc.free(pin_root);
+    const snapshot = try std.fmt.allocPrint(alloc, "{s}/snapshot", .{root});
+    defer alloc.free(snapshot);
+    try fs_paths.createDirPathPortable(std.testing.io, std.fs.path.dirname(segment).?);
+    _ = try writeFileDurable(std.testing.io, segment, "immutable-generation");
+    _ = try writeFileDurable(std.testing.io, wal, "committed-uncommitted-tail");
+
+    var pinned = try pinExplicitArtifacts(alloc, std.testing.io, pin_root, &.{
+        .{
+            .relative_path = "indexes/dense/posting-segments/CURRENT",
+            .source = .{ .bytes = "manifest" },
+        },
+        .{
+            .relative_path = "indexes/dense/posting-segments/segment-1.afps",
+            .source = .{ .immutable_file = segment },
+        },
+        .{
+            .relative_path = "indexes/dense/posting-segments/wal-1.afpw",
+            .source = .{ .committed_prefix = .{ .path = wal, .bytes = "committed".len } },
+        },
+    }, .none);
+    defer pinned.deinit();
+
+    // Atomic generation replacement may unlink and recreate the live path;
+    // the hardlinked immutable pin must retain the selected inode.
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, segment);
+    _ = try writeFileDurable(std.testing.io, segment, "replacement");
+    _ = try pinned.materialize(snapshot, .none);
+
+    const restored_segment = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/posting-segments/segment-1.afps", .{snapshot});
+    defer alloc.free(restored_segment);
+    const restored_wal = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/posting-segments/wal-1.afpw", .{snapshot});
+    defer alloc.free(restored_wal);
+    const segment_bytes = try readFileAlloc(alloc, std.testing.io, restored_segment, 64);
+    defer alloc.free(segment_bytes);
+    const wal_bytes = try readFileAlloc(alloc, std.testing.io, restored_wal, 64);
+    defer alloc.free(wal_bytes);
+    try std.testing.expectEqualStrings("immutable-generation", segment_bytes);
+    try std.testing.expectEqualStrings("committed", wal_bytes);
+}
+
+test "shared vector acceleration corruption preserves native posting authority" {
+    const alloc = std.testing.allocator;
+    var source_tmp = std.testing.tmpDir(.{});
+    defer source_tmp.cleanup();
+    var snapshot_tmp = std.testing.tmpDir(.{});
+    defer snapshot_tmp.cleanup();
+    var destination_tmp = std.testing.tmpDir(.{});
+    defer destination_tmp.cleanup();
+    const source = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{source_tmp.sub_path});
+    defer alloc.free(source);
+    const snapshot = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{snapshot_tmp.sub_path});
+    defer alloc.free(snapshot);
+    const destination = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{destination_tmp.sub_path});
+    defer alloc.free(destination);
+    const posting = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/posting-segments/CURRENT", .{source});
+    defer alloc.free(posting);
+    const vector_block = try std.fmt.allocPrint(alloc, "{s}/indexes/vector-blocks/block-1-0.afvb", .{source});
+    defer alloc.free(vector_block);
+    try fs_paths.createDirPathPortable(std.testing.io, std.fs.path.dirname(posting).?);
+    try fs_paths.createDirPathPortable(std.testing.io, std.fs.path.dirname(vector_block).?);
+    _ = try writeFileDurable(std.testing.io, posting, "posting-generation");
+    _ = try writeFileDurable(std.testing.io, vector_block, "vector-acceleration");
+    const store_file = try std.fmt.allocPrint(alloc, "{s}/store.bin", .{snapshot});
+    defer alloc.free(store_file);
+    _ = try writeFileDurable(std.testing.io, store_file, "primary");
+    _ = try capture(alloc, std.testing.io, source, snapshot, 9, &.{.{
+        .name = "dense",
+        .kind = "dense_vector",
+        .config_hash = 1,
+        .coverage_generation = 1,
+        .checkpoint_generation = 1,
+        .applied_sequence = 9,
+        .target_sequence = 9,
+        .artifact_format = "antfly-managed-index-tree",
+        .artifact_version = 1,
+        .backend_id = "hbc-native-v1",
+        .codec_version = 1,
+        .artifact_state = .complete,
+        .repair_reason = "",
+    }});
+    const snapshot_vector = try std.fmt.allocPrint(alloc, "{s}/indexes/vector-blocks/block-1-0.afvb", .{snapshot});
+    defer alloc.free(snapshot_vector);
+    _ = try writeFileDurable(std.testing.io, snapshot_vector, "corrupt");
+
+    var loaded = (try validateAndMaterialize(alloc, std.testing.io, snapshot, destination)).?;
+    defer loaded.deinit();
+    try std.testing.expect(loaded.shared_acceleration_invalid);
+    try std.testing.expect(!loaded.projectionInvalid("dense"));
+    const restored_posting = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/posting-segments/CURRENT", .{destination});
+    defer alloc.free(restored_posting);
+    const restored_vector = try std.fmt.allocPrint(alloc, "{s}/indexes/vector-blocks/block-1-0.afvb", .{destination});
+    defer alloc.free(restored_vector);
+    try std.testing.expect(try pathExists(std.testing.io, restored_posting));
+    try std.testing.expect(!try pathExists(std.testing.io, restored_vector));
+}
+
 test "native generation manifest captures validates and materializes generated artifacts" {
     const alloc = std.testing.allocator;
     var source_tmp = std.testing.tmpDir(.{});
@@ -1338,9 +1581,9 @@ test "native generation manifest captures validates and materializes generated a
     parsed_current.deinit();
     const unreleased = try alloc.dupe(u8, manifest_raw);
     defer alloc.free(unreleased);
-    const version_offset = std.mem.indexOf(u8, unreleased, "\"format_version\":3") orelse
+    const version_offset = std.mem.indexOf(u8, unreleased, "\"format_version\":4") orelse
         return error.TestUnexpectedResult;
-    unreleased[version_offset + "\"format_version\":".len] = '2';
+    unreleased[version_offset + "\"format_version\":".len] = '3';
     try std.testing.expectError(error.InvalidNativeBackupManifest, parseManifestBytes(alloc, unreleased));
     var loaded = (try validateAndMaterialize(alloc, std.testing.io, snapshot, destination)).?;
     defer loaded.deinit();

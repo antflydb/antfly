@@ -1916,12 +1916,14 @@ const ReplayApplyContext = struct {
     db: *DB,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     dense_capture_lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease = null,
+    dense_window_sequence: u64 = 0,
 };
 
 const ReplayApplyContextBatch = struct {
     batch: *const BatchExecutionContext,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     dense_capture_lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease = null,
+    dense_window_sequence: u64 = 0,
 };
 
 const TtlCleanupContext = struct {
@@ -18260,8 +18262,8 @@ pub const DB = struct {
             {
                 return error.NativeBackupProjectionNotQuiescent;
             }
-            const backend_id = self.core.index_manager.nativeBackupBackendId(cfg.kind);
-            const has_immutable_checkpoint = self.core.index_manager.nativeBackupSupportsImmutableCheckpoint(cfg.kind);
+            const backend_id = self.core.index_manager.nativeBackupBackendId(cfg.name, cfg.kind);
+            const has_immutable_checkpoint = self.core.index_manager.nativeBackupSupportsImmutableCheckpoint(cfg.name, cfg.kind);
             if (!has_immutable_checkpoint) {
                 std.log.err(
                     "native backup requires an immutable projection checkpoint index={s} kind={s} backend={s}",
@@ -18292,9 +18294,17 @@ pub const DB = struct {
         }.lessThan);
 
         // Ask each backend to retain its exact manifested generation. Pinning
-        // is bounded by backend/run metadata and does not walk or hardlink the
-        // corpus while revision and mutation fences remain held.
-        var generated_checkpoints = try self.core.index_manager.pinNativeBackupCheckpoints();
+        // is bounded by backend/run metadata: it hardlinks only manifest-named
+        // immutable files and copies bounded committed WAL tails without
+        // walking or reading corpus segments under the mutation fence.
+        const generated_native_pin_root = try std.fmt.allocPrint(self.alloc, "{s}/.generated-native-pin", .{staging_root});
+        defer self.alloc.free(generated_native_pin_root);
+        var generated_checkpoints = try self.core.index_manager.pinNativeBackupCheckpoints(
+            io,
+            generated_native_pin_root,
+            capture_target_sequence,
+            cancellation,
+        );
         defer generated_checkpoints.deinit();
         const generated_metadata_pin_root = try std.fmt.allocPrint(self.alloc, "{s}/.generated-metadata-pin", .{staging_root});
         defer self.alloc.free(generated_metadata_pin_root);
@@ -18968,7 +18978,15 @@ pub const DB = struct {
                 .graph => @tagName(opts.index_backends.graph_reverse_backend),
                 .algebraic => "primary",
             };
-            if (!std.mem.eql(u8, projection.backend_id, target_backend) or
+            const backend_compatible = std.mem.eql(u8, projection.backend_id, target_backend) or
+                (kind == .dense_vector and
+                    opts.index_backends.dense_storage_backend == .lsm and
+                    std.mem.eql(
+                        u8,
+                        projection.backend_id,
+                        index_manager_mod.IndexManager.dense_native_backup_backend_id,
+                    ));
+            if (!backend_compatible or
                 projection.codec_version != 1)
             {
                 try generation.invalidateProjection(projection.name, .backend_mismatch);
@@ -42971,7 +42989,13 @@ fn applyDerivedBatchToIndexReplayContext(
     batch: derived_types.DerivedBatch,
     index_ref: index_manager_mod.ManagedIndexRef,
 ) !bool {
-    const replay_ctx: *const ReplayApplyContextBatch = @ptrCast(@alignCast(ctx_ptr));
+    const replay_ctx: *ReplayApplyContextBatch = @ptrCast(@alignCast(ctx_ptr));
+    // A replay window may legitimately contain no mutations for this specific
+    // projection after lifecycle filtering. Its source boundary is still the
+    // batch sequence and must be published with the (possibly empty) capture.
+    if (index_ref.kind == .dense_vector) {
+        replay_ctx.dense_window_sequence = @max(replay_ctx.dense_window_sequence, batch.sequence);
+    }
     const ctx = replay_ctx.batch;
     if (!try batchAdvancesManagedIndexApplyStateForReplay(ctx.index_manager, batch, index_ref)) return false;
 
@@ -48921,6 +48945,11 @@ fn applyGraphDocClearsForIndex(ctx: *const AsyncContext, clears: []const derived
 
 fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !bool {
     const replay_ctx: *ReplayApplyContext = @ptrCast(@alignCast(ctx_ptr));
+    // Publish the replay window's source boundary even when lifecycle
+    // filtering proves there are no posting mutations to append.
+    if (index_ref.kind == .dense_vector) {
+        replay_ctx.dense_window_sequence = @max(replay_ctx.dense_window_sequence, batch.sequence);
+    }
     const self = replay_ctx.db;
     const resources = self.core.asyncResources();
     if (!try batchAdvancesManagedIndexApplyStateForReplay(resources.index_manager, batch, index_ref)) return false;
@@ -49013,6 +49042,7 @@ fn beginDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.M
     if (index_ref.kind != .dense_vector) return;
     const replay_ctx: *ReplayApplyContext = @ptrCast(@alignCast(ctx_ptr));
     const resources = replay_ctx.db.core.batchExecutionResources();
+    replay_ctx.dense_window_sequence = 0;
     // Capture ownership and the streaming-session lease are one lifecycle
     // transition. Serialize both against posting maintenance and foreground
     // apply; otherwise a maintenance capture can be observed here and finish
@@ -49042,6 +49072,7 @@ fn finishDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.
                 if (err != error.PostingWalCaptureSuperseded and err != error.ExperimentalPostingCaptureNotActive) return err;
             };
         replay_ctx.dense_capture_lease = null;
+        replay_ctx.dense_window_sequence = 0;
         resources.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
         return;
     }
@@ -49049,7 +49080,26 @@ fn finishDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.
         resources.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
     errdefer resources.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
-    try resources.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, denseCatchUpFinishOptions());
+    // Session retirement and source-capture publication are one transaction.
+    // Keeping the per-index apply fence across both operations prevents
+    // stable-tip or maintenance work from consuming the handoff between them.
+    {
+        var index_apply_guard = try resources.index_manager.lockManagedIndexApply(index_ref);
+        defer index_apply_guard.unlock();
+        try resources.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, denseCatchUpFinishOptions());
+        if (replay_ctx.dense_capture_lease) |lease| {
+            if (lease.ownsLifecycle()) {
+                if (replay_ctx.dense_window_sequence == 0) return error.InvalidDerivedApplyState;
+                try resources.index_manager.finishDensePostingSidecarCaptureLeaseByName(
+                    index_ref.name,
+                    lease,
+                    replay_ctx.dense_window_sequence,
+                );
+            }
+        }
+        replay_ctx.dense_capture_lease = null;
+        replay_ctx.dense_window_sequence = 0;
+    }
     try resources.index_manager.checkpointLsmWalForManagedIndex(index_ref);
     if (resources.index_manager.resource_manager) |manager| {
         manager.noteDenseReplayWindowResult(.{ .finish_ns = elapsedSince(finish_start_ns) });
@@ -49059,6 +49109,7 @@ fn finishDerivedCatchUpWindow(ctx_ptr: *anyopaque, index_ref: index_manager_mod.
 fn beginDerivedCatchUpWindowContext(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
     if (index_ref.kind != .dense_vector) return;
     const replay_ctx: *ReplayApplyContextBatch = @ptrCast(@alignCast(ctx_ptr));
+    replay_ctx.dense_window_sequence = 0;
     var index_apply_guard = try replay_ctx.batch.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
     const capture = try replay_ctx.batch.index_manager.beginDensePostingSidecarCaptureLeaseByNameWithOptions(
@@ -49082,6 +49133,7 @@ fn finishDerivedCatchUpWindowContext(ctx_ptr: *anyopaque, index_ref: index_manag
                 if (err != error.PostingWalCaptureSuperseded and err != error.ExperimentalPostingCaptureNotActive) return err;
             };
         replay_ctx.dense_capture_lease = null;
+        replay_ctx.dense_window_sequence = 0;
         replay_ctx.batch.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
         return;
     }
@@ -49089,7 +49141,23 @@ fn finishDerivedCatchUpWindowContext(ctx_ptr: *anyopaque, index_ref: index_manag
         replay_ctx.batch.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
     errdefer replay_ctx.batch.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
     const finish_start_ns = monotonicTimeNs();
-    try replay_ctx.batch.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, denseCatchUpFinishOptions());
+    {
+        var index_apply_guard = try replay_ctx.batch.index_manager.lockManagedIndexApply(index_ref);
+        defer index_apply_guard.unlock();
+        try replay_ctx.batch.index_manager.finishDenseStreamingReplaySessionByNameWithOptions(index_ref.name, denseCatchUpFinishOptions());
+        if (replay_ctx.dense_capture_lease) |lease| {
+            if (lease.ownsLifecycle()) {
+                if (replay_ctx.dense_window_sequence == 0) return error.InvalidDerivedApplyState;
+                try replay_ctx.batch.index_manager.finishDensePostingSidecarCaptureLeaseByName(
+                    index_ref.name,
+                    lease,
+                    replay_ctx.dense_window_sequence,
+                );
+            }
+        }
+        replay_ctx.dense_capture_lease = null;
+        replay_ctx.dense_window_sequence = 0;
+    }
     try replay_ctx.batch.index_manager.checkpointLsmWalForManagedIndex(index_ref);
     if (replay_ctx.batch.index_manager.resource_manager) |manager| {
         manager.noteDenseReplayWindowResult(.{ .finish_ns = elapsedSince(finish_start_ns) });
@@ -102207,6 +102275,49 @@ test "db native deferred restore preserves generated dense generation without em
             std.Io.Dir.cwd().deleteTree(cleanup_io.io(), snapshots) catch {};
         } else |_| {}
     }
+    const native_manifest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, native_backup.manifest_file_name });
+    defer alloc.free(native_manifest_path);
+    const native_manifest_raw = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        native_manifest_path,
+        alloc,
+        .limited(native_backup.max_manifest_bytes),
+    );
+    defer alloc.free(native_manifest_raw);
+    var native_manifest = try std.json.parseFromSlice(native_backup.Manifest, alloc, native_manifest_raw, .{});
+    defer native_manifest.deinit();
+    var saw_native_dense = false;
+    for (native_manifest.value.projections) |projection| {
+        if (!std.mem.eql(u8, projection.name, "semantic_idx")) continue;
+        try std.testing.expectEqualStrings(
+            index_manager_mod.IndexManager.dense_native_backup_backend_id,
+            projection.backend_id,
+        );
+        saw_native_dense = true;
+    }
+    try std.testing.expect(saw_native_dense);
+    const native_posting_current = try std.fmt.allocPrint(
+        alloc,
+        "{s}/indexes/semantic_idx/posting-segments/CURRENT",
+        .{snapshot_root},
+    );
+    defer alloc.free(native_posting_current);
+    try std.Io.Dir.accessAbsolute(std.testing.io, native_posting_current, .{});
+
+    // Exact-vector blocks are shared acceleration rather than posting
+    // authority. Simulate losing one after capture: restore must retain the
+    // native posting generation and serve exact results from primary vectors,
+    // even though this fixture intentionally has no embedder for rebuilding.
+    var removed_shared_acceleration = false;
+    for (native_manifest.value.artifacts) |artifact| {
+        if (artifact.role != .shared_acceleration or !std.mem.endsWith(u8, artifact.path, ".afvb")) continue;
+        const artifact_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, artifact.path });
+        defer alloc.free(artifact_path);
+        try std.Io.Dir.cwd().deleteFile(std.testing.io, artifact_path);
+        removed_shared_acceleration = true;
+        break;
+    }
+    try std.testing.expect(removed_shared_acceleration);
 
     var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(restore_path));
     defer transition.deinit();
