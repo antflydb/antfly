@@ -326,7 +326,8 @@ def ready_index_status(
         return None
     if status.get("rebuilding", status.get("backfill_active", False)):
         return None
-    if status.get("backfill_state") == "failed":
+    backfill_state = status.get("backfill_state")
+    if backfill_state is not None and backfill_state != "ready":
         return None
     if isinstance(status.get("repair"), dict):
         return None

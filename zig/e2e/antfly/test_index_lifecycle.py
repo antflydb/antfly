@@ -227,9 +227,17 @@ def test_ready_index_status_requires_current_coverage_observation():
     rebuilding["status"]["repair"] = {"state": "rebuilding", "action_required": False}
     assert ready_index_status(rebuilding) is None
 
+    for backfill_state in ("running", "retrying", "degraded", "failed"):
+        incomplete = json.loads(json.dumps(ready_status))
+        incomplete["status"]["backfill_state"] = backfill_state
+        assert ready_index_status(incomplete) is None
+
+    complete = json.loads(json.dumps(ready_status))
+    complete["status"]["backfill_state"] = "ready"
+    assert ready_index_status(complete) is complete["status"]
+
     for field, value in (
         ("error", "load failed: UnsupportedVersion"),
-        ("backfill_state", "failed"),
         ("repair_degraded", True),
         ("repair_summary_ready", False),
         ("repair_issue_count", 1),

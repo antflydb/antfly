@@ -62,6 +62,66 @@ const public_table_http = @import("public_table_http.zig");
 const runtime_status = @import("runtime_status.zig");
 const stored_destination_authorization = @import("stored_destination_authorization.zig");
 
+fn resolveCatalogGroupsEventually(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+    timeout_ns: u64,
+    poll_interval_ms: u64,
+) ![]u64 {
+    const deadline_ns = platform_time.monotonicNs() +| timeout_ns;
+    const budget = table_catalog.RoutingBudget.init(deadline_ns);
+    return switch (try table_catalog.resolveGroupsForSpanEventuallyUntil(
+        alloc,
+        catalog,
+        table_name,
+        from_key,
+        to_key,
+        deadline_ns,
+        poll_interval_ms,
+    )) {
+        .found => |plan_value| blk: {
+            var plan = plan_value;
+            defer plan.deinit(alloc);
+            break :blk try plan.groupIdsAllocUntil(alloc, budget);
+        },
+        .not_found => blk: {
+            try budget.checkpoint();
+            const group_ids = try alloc.alloc(u64, 0);
+            errdefer alloc.free(group_ids);
+            try budget.checkpoint();
+            break :blk group_ids;
+        },
+        .timed_out => error.CatalogRoutingSnapshotTimeout,
+    };
+}
+
+fn resolveCatalogRouteEventuallyUntil(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+    deadline_ns: u64,
+    poll_interval_ms: u64,
+) !?table_catalog.CatalogRoutePlan {
+    return switch (try table_catalog.resolveGroupsForSpanEventuallyUntil(
+        alloc,
+        catalog,
+        table_name,
+        from_key,
+        to_key,
+        deadline_ns,
+        poll_interval_ms,
+    )) {
+        .found => |plan| plan,
+        .not_found => null,
+        .timed_out => error.CatalogRoutingSnapshotTimeout,
+    };
+}
+
 fn nativeSnapshotAttemptTokenAlloc(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -79,6 +139,7 @@ const native_snapshot_attempt_marker_directory = ".native-backup-attempts";
 const native_snapshot_attempt_stale_ns: i128 = 24 * std.time.ns_per_hour;
 const native_snapshot_attempt_reclaim_limit: usize = 8;
 const native_snapshot_attempt_scan_limit: usize = 8192;
+const create_structural_publication_retry_limit: usize = 3;
 
 const NativeSnapshotAttemptMarker = struct {
     snapshot_token: []const u8,
@@ -740,6 +801,10 @@ fn startupCatchUpMonotonicMs() u64 {
     return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
 }
 const replicated_apply_writer_open_timeout_ns: u64 = 30 * std.time.ns_per_s;
+/// Public write admission must not wait forever behind catalog publication.
+/// Callers with a shorter transport deadline are canceled by the request
+/// context; this bound protects detached/internal callers as well.
+const write_routing_snapshot_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const replicated_apply_writer_open_retry_ns: u64 = 10 * std.time.ns_per_ms;
 const stateless_batch_max_attempts: u8 = 3;
 const stateless_batch_retry_base_ns: u64 = std.time.ns_per_ms;
@@ -869,6 +934,7 @@ var test_before_restore_repair_retry_sleep_hook: ?TestExecutionHook = null;
 var test_before_restore_repair_step_hook: ?TestRestoreRepairStepHook = null;
 var test_before_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_after_runtime_status_publish_hook: ?TestExecutionHook = null;
+var test_before_create_structural_publish_hook: ?TestExecutionHook = null;
 var test_before_post_create_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_before_startup_catch_up_replay_hook: ?TestStartupCatchUpReplayPassHook = null;
 var test_after_startup_catch_up_replay_pass_hook: ?TestStartupCatchUpReplayPassHook = null;
@@ -1000,6 +1066,12 @@ fn runTestAfterRuntimeStatusPublishHook() void {
 fn runTestBeforePostCreateRuntimeStatusPublishHook() void {
     if (comptime builtin.is_test) {
         if (test_before_post_create_runtime_status_publish_hook) |hook| hook.run(hook.ptr);
+    }
+}
+
+fn runTestBeforeCreateStructuralPublishHook() void {
+    if (comptime builtin.is_test) {
+        if (test_before_create_structural_publish_hook) |hook| hook.run(hook.ptr);
     }
 }
 
@@ -5045,6 +5117,17 @@ pub const RaftBatcher = struct {
             req: db_mod.types.BatchRequest,
             cancellation: db_mod.types.CancellationToken,
         ) anyerror!void = null,
+        /// First-party public mutations must carry the immutable catalog
+        /// capability used to select this group. Implementations validate it
+        /// at the mutation leader immediately before Raft proposal.
+        batch_group_routed_with_cancellation: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            fence: metadata_api.CatalogRouteFence,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+            cancellation: db_mod.types.CancellationToken,
+        ) anyerror!void = null,
         batch_group_local: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -5091,6 +5174,20 @@ pub const RaftBatcher = struct {
         const fn_ptr = self.vtable.batch_group_with_cancellation orelse
             return try self.batchGroup(alloc, group_id, table_name, req);
         return try fn_ptr(self.ptr, alloc, group_id, table_name, req, cancellation);
+    }
+
+    pub fn batchGroupRoutedWithCancellation(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        cancellation: db_mod.types.CancellationToken,
+    ) !void {
+        const fn_ptr = self.vtable.batch_group_routed_with_cancellation orelse
+            return error.CatalogRouteFenceUnsupported;
+        try fence.validate();
+        return try fn_ptr(self.ptr, alloc, fence, table_name, req, cancellation);
     }
 
     pub fn batchGroupLocal(
@@ -8822,6 +8919,54 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
+    /// A leader-side capability lease spanning route validation and Raft
+    /// proposal. Structural split/merge work uses the same table activity
+    /// gate, so either the mutation is admitted before cutover or it observes
+    /// the post-cutover projection and is rejected as `TopologyChanged`.
+    pub const RoutedWriteAdmission = struct {
+        source: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+
+        pub fn deinit(self: *@This()) void {
+            self.source.endTableRequest(self.table_name);
+            self.* = undefined;
+        }
+    };
+
+    pub fn acquireRoutedWriteAdmission(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        fence: metadata_api.CatalogRouteFence,
+        deadline_ns: u64,
+        cancellation: db_mod.types.CancellationToken,
+    ) !RoutedWriteAdmission {
+        try fence.validate();
+        const admission_deadline_ns = if (fence.admission_deadline_ns) |fence_deadline|
+            @min(deadline_ns, fence_deadline)
+        else
+            deadline_ns;
+        while (!self.tryBeginTableRequest(table_name)) {
+            try cancellation.check();
+            try fence.admission_cancellation.check();
+            if (platform_time.monotonicNs() >= admission_deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+            platform.clock.Clock.real().sleepMs(1);
+        }
+        errdefer self.endTableRequest(table_name);
+        try cancellation.check();
+        try fence.admission_cancellation.check();
+        try table_catalog.validateCatalogRouteFenceUntil(
+            alloc,
+            self.catalog,
+            table_name,
+            fence,
+            admission_deadline_ns,
+        );
+        try cancellation.check();
+        try fence.admission_cancellation.check();
+        return .{ .source = self, .table_name = table_name };
+    }
+
     fn tryBeginStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
@@ -9492,7 +9637,13 @@ pub const ProvisionedTableWriteSource = struct {
             };
             if (maybe_cached) |cached| {
                 self.local_db_mutex.unlock();
-                return cached;
+                var validated = cached;
+                errdefer validated.deinit(alloc);
+                try validateProvisionedDbIdentityNamespaceExpected(
+                    managed_open_options.identity_namespace_override,
+                    validated.db,
+                );
+                return validated;
             }
             self.local_db_mutex.unlock();
             return self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, null, managed_open_options) catch |err| {
@@ -9597,7 +9748,9 @@ pub const ProvisionedTableWriteSource = struct {
         cache.inference_api_url = self.inference_api_url;
         cache.remote_content = self.remote_content;
         self.syncRuntimeHooksToCache(cache);
-        const identity_namespace = if (preloaded_metadata) |metadata|
+        const identity_namespace = if (managed_open_options.identity_namespace_override) |namespace|
+            namespace
+        else if (preloaded_metadata) |metadata|
             metadata.identity_namespace
         else
             try loadTableIdentityNamespaceForGroup(cache.alloc, self.catalog, table_name, group_id);
@@ -9790,6 +9943,22 @@ pub const ProvisionedTableWriteSource = struct {
                 self.transactionRecoveryConfig();
             var retry_prepared_open = false;
             var opened: ?db_mod.DB = while (true) {
+                // The initial identity lookup happens before cold-open
+                // serialization. Revalidate after admission and immediately
+                // before the first storage side effect so a removed or
+                // reassigned group cannot seed a writer from a stale route.
+                if (preloaded_metadata == null and
+                    managed_open_options.identity_namespace_override == null)
+                {
+                    const admitted_identity = try loadTableIdentityNamespaceForGroup(
+                        cache.alloc,
+                        self.catalog,
+                        table_name,
+                        group_id,
+                    );
+                    if (!std.meta.eql(identity_namespace, admitted_identity))
+                        return error.TopologyChanged;
+                }
                 const open_result: anyerror!db_mod.DB = if (consumeTestWriterOpenPersistentDescriptorFailure())
                     error.PersistentDescriptorAdmissionExhausted
                 else if (prepared_open.?.indexes_json) |value|
@@ -15413,17 +15582,20 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.localWriteOwnerSource()) |owner| return try owner.createTable(alloc, table_name, req);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         std.log.info("provisioned create table local begin table={s}", .{table_name});
-        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        const routing_deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+        const routing_budget = table_catalog.RoutingBudget.init(routing_deadline_ns);
+        var route = (try resolveCatalogRouteEventuallyUntil(
             alloc,
             self.catalog,
             table_name,
             "",
             "",
-            5 * std.time.ns_per_s,
+            routing_deadline_ns,
             10,
-        );
+        )) orelse return null;
+        defer route.deinit(alloc);
+        const group_ids = try route.groupIdsAllocUntil(alloc, routing_budget);
         defer alloc.free(group_ids);
-        if (group_ids.len == 0) return null;
 
         const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
         const schema_json = tables_api.effectiveSchemaJson(req.schema_json);
@@ -15438,107 +15610,138 @@ pub const ProvisionedTableWriteSource = struct {
             self.beginLocalStructuralCachedDbMutation(table_name);
             errdefer self.abortLocalStructuralCachedDbMutation(table_name);
 
-            var cached_groups = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
-            defer {
-                for (cached_groups.items) |*cached| cached.deinit(alloc);
-                cached_groups.deinit(alloc);
-            }
-            try cached_groups.ensureTotalCapacity(alloc, group_ids.len);
-            const target_generations = try alloc.alloc(u64, group_ids.len);
-            defer alloc.free(target_generations);
-
-            for (group_ids, 0..) |group_id, group_index| {
-                std.log.info("provisioned create table local group begin table={s} group_id={d}", .{ table_name, group_id });
-                const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-                defer alloc.free(path);
-
-                const visible_generation = self.visibleRootGeneration(group_id);
-                {
-                    var cached = try self.getOrOpenCachedDbForLocalMutation(
-                        alloc,
-                        cache,
-                        path,
-                        group_id,
-                        visible_generation,
-                        table_name,
-                        false,
-                    );
-                    errdefer cached.deinit(alloc);
-                    const entry = cached.entry orelse return error.StaleCachedDbLease;
-                    if (entry.retired) return error.StaleCachedDbLease;
-                    target_generations[group_index] = entry.lsm_root_generation;
-                    try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
-                    try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
-                    // Catalog admission and local create can race an earlier
-                    // startup/status open of this generation. The entry
-                    // fingerprint is publication metadata, not proof that the
-                    // resident DB successfully installed the same producer
-                    // set: an adopted/opened writer can carry the new catalog
-                    // fingerprint while still owning the old (often empty)
-                    // runtime. Create is the authoritative, one-shot commit
-                    // boundary, so always install its requested runtime before
-                    // reconciling durable indexes. Publish the matching
-                    // fingerprint only after every group commits.
-                    try reconfigureManagedDbEnrichmentRuntime(
-                        alloc,
-                        cached.db,
-                        indexes_json,
-                        self.backend_runtime,
-                        self.antfly_provider,
-                        self.inference_api_url,
-                        self.secret_store,
-                        self.remote_content,
-                    );
-                    _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
-                        .drain_resolver_backfill = false,
-                        .embedding_options = .{
-                            .antfly_provider = self.antfly_provider,
-                            .inference_api_url = self.inference_api_url,
-                        },
-                        .source_table = table_name,
-                        .destination_authorizer = self.destination_authorizer,
-                    });
-                    cached_groups.appendAssumeCapacity(cached);
+            var structural_attempt: usize = 0;
+            cached_retry: while (true) {
+                structural_attempt += 1;
+                defer self.drainWriteCachePendingCloses();
+                var cached_groups = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
+                defer {
+                    for (cached_groups.items) |*cached| cached.deinit(alloc);
+                    cached_groups.deinit(alloc);
                 }
-                std.log.info("provisioned create table local group ready table={s} group_id={d}", .{ table_name, group_id });
-            }
+                try cached_groups.ensureTotalCapacity(alloc, group_ids.len);
+                const target_generations = try alloc.alloc(u64, group_ids.len);
+                defer alloc.free(target_generations);
 
-            var publication = try cache.prepareStructuralPublication(
-                table_name,
-                indexes_json,
-                schema_json,
-                cached_groups.items.len,
-            );
-            defer publication.deinit(cache.alloc);
-            lockAtomic(&self.local_db_mutex);
-            cache.publishStructuralMutationLocked(cached_groups.items, target_generations, &publication) catch |err| {
-                self.local_db_mutex.unlock();
-                return err;
-            };
-            self.local_db_mutex.unlock();
+                for (group_ids, 0..) |group_id, group_index| {
+                    std.log.info("provisioned create table local group begin table={s} group_id={d}", .{ table_name, group_id });
+                    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+                    defer alloc.free(path);
+                    const group_route = route.group(group_id) orelse return error.CatalogChanged;
+                    const identity_namespace = docIdentityNamespaceFromCatalog(group_route.identity_namespace);
 
-            self.finishLocalStructuralCachedDbMutation(table_name);
-            std.log.info("provisioned create table local notify table={s}", .{table_name});
-            self.notifyLocalChange(table_name, .structural);
-            // Structural publication is the create commit point. Runtime
-            // status is observational and may be fenced by the invalidation
-            // emitted above or by a concurrent refresh; it must never turn an
-            // already-committed create into an HTTP failure.
-            runTestBeforePostCreateRuntimeStatusPublishHook();
-            for (group_ids, cached_groups.items) |group_id, cached| {
-                publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| switch (err) {
-                    error.RuntimeStatusPublicationFenced => std.log.debug(
-                        "post-create runtime status publication deferred table={s} group_id={d} err={s}",
-                        .{ table_name, group_id, @errorName(err) },
-                    ),
-                    else => std.log.warn(
-                        "post-create runtime status publication failed after commit table={s} group_id={d} err={s}",
-                        .{ table_name, group_id, @errorName(err) },
-                    ),
+                    const visible_generation = self.visibleRootGeneration(group_id);
+                    {
+                        var cached = self.getOrOpenCachedDbForLocalMutationWithOptions(
+                            alloc,
+                            cache,
+                            path,
+                            group_id,
+                            visible_generation,
+                            table_name,
+                            false,
+                            .{ .identity_namespace_override = identity_namespace },
+                        ) catch |err| {
+                            if (err == error.LsmRootWriterAlreadyOpen) {
+                                if (structural_attempt < create_structural_publication_retry_limit) continue :cached_retry;
+                                return err;
+                            }
+                            return err;
+                        };
+                        errdefer cached.deinit(alloc);
+                        const entry = cached.entry orelse {
+                            if (structural_attempt < create_structural_publication_retry_limit) {
+                                cached.deinit(alloc);
+                                continue :cached_retry;
+                            }
+                            return error.TopologyChanged;
+                        };
+                        if (entry.retired) {
+                            if (structural_attempt < create_structural_publication_retry_limit) {
+                                cached.deinit(alloc);
+                                continue :cached_retry;
+                            }
+                            return error.TopologyChanged;
+                        }
+                        target_generations[group_index] = entry.lsm_root_generation;
+                        try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, cached.db);
+                        try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
+                        // Catalog admission and local create can race an earlier
+                        // startup/status open of this generation. The entry
+                        // fingerprint is publication metadata, not proof that the
+                        // resident DB successfully installed the same producer
+                        // set: an adopted/opened writer can carry the new catalog
+                        // fingerprint while still owning the old (often empty)
+                        // runtime. Create is the authoritative, one-shot commit
+                        // boundary, so always install its requested runtime before
+                        // reconciling durable indexes. Publish the matching
+                        // fingerprint only after every group commits.
+                        try reconfigureManagedDbEnrichmentRuntime(
+                            alloc,
+                            cached.db,
+                            indexes_json,
+                            self.backend_runtime,
+                            self.antfly_provider,
+                            self.inference_api_url,
+                            self.secret_store,
+                            self.remote_content,
+                        );
+                        _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
+                            .drain_resolver_backfill = false,
+                            .embedding_options = .{
+                                .antfly_provider = self.antfly_provider,
+                                .inference_api_url = self.inference_api_url,
+                            },
+                            .source_table = table_name,
+                            .destination_authorizer = self.destination_authorizer,
+                        });
+                        cached_groups.appendAssumeCapacity(cached);
+                    }
+                    std.log.info("provisioned create table local group ready table={s} group_id={d}", .{ table_name, group_id });
+                }
+
+                var publication = try cache.prepareStructuralPublication(
+                    table_name,
+                    indexes_json,
+                    schema_json,
+                    cached_groups.items.len,
+                );
+                defer publication.deinit(cache.alloc);
+                runTestBeforeCreateStructuralPublishHook();
+                lockAtomic(&self.local_db_mutex);
+                cache.publishStructuralMutationLocked(cached_groups.items, target_generations, &publication) catch |err| {
+                    self.local_db_mutex.unlock();
+                    if (err == error.StaleCachedDbLease) {
+                        if (structural_attempt < create_structural_publication_retry_limit) continue :cached_retry;
+                        return error.TopologyChanged;
+                    }
+                    return err;
                 };
+                self.local_db_mutex.unlock();
+
+                self.finishLocalStructuralCachedDbMutation(table_name);
+                std.log.info("provisioned create table local notify table={s}", .{table_name});
+                self.notifyLocalChange(table_name, .structural);
+                // Structural publication is the create commit point. Runtime
+                // status is observational and may be fenced by the invalidation
+                // emitted above or by a concurrent refresh; it must never turn an
+                // already-committed create into an HTTP failure.
+                runTestBeforePostCreateRuntimeStatusPublishHook();
+                for (group_ids, cached_groups.items) |group_id, cached| {
+                    publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db) catch |err| switch (err) {
+                        error.RuntimeStatusPublicationFenced => std.log.debug(
+                            "post-create runtime status publication deferred table={s} group_id={d} err={s}",
+                            .{ table_name, group_id, @errorName(err) },
+                        ),
+                        else => std.log.warn(
+                            "post-create runtime status publication failed after commit table={s} group_id={d} err={s}",
+                            .{ table_name, group_id, @errorName(err) },
+                        ),
+                    };
+                }
+                std.log.info("provisioned create table local done table={s}", .{table_name});
+                return {};
             }
-            std.log.info("provisioned create table local done table={s}", .{table_name});
-            return {};
         }
 
         self.beginLocalStructuralMutation(table_name);
@@ -15550,7 +15753,8 @@ pub const ProvisionedTableWriteSource = struct {
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
 
-            const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+            const group_route = route.group(group_id) orelse return error.CatalogChanged;
+            const identity_namespace = docIdentityNamespaceFromCatalog(group_route.identity_namespace);
             const lsm_root_generation = self.visibleRootGeneration(group_id);
             if (self.write_cache) |cache| {
                 if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
@@ -15624,7 +15828,7 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.updateSchema(alloc, table_name, schema_json);
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        const group_ids = try resolveCatalogGroupsEventually(
             alloc,
             self.catalog,
             table_name,
@@ -15732,7 +15936,7 @@ pub const ProvisionedTableWriteSource = struct {
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginLocalStructuralIndexCacheUpdate(table_name, index_name);
         errdefer self.abortLocalStructuralIndexCacheUpdate(table_name, index_name);
-        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        const group_ids = try resolveCatalogGroupsEventually(
             alloc,
             self.catalog,
             table_name,
@@ -15915,7 +16119,10 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn coalesceCompatibleEntry(first: *const WriteCoalesceEntry, candidate: *const WriteCoalesceEntry) bool {
-        return first.sync_level == candidate.sync_level and first.timestamp_ns == candidate.timestamp_ns;
+        return first.sync_level == candidate.sync_level and
+            first.timestamp_ns == candidate.timestamp_ns and
+            first.group.topology_epoch == candidate.group.topology_epoch and
+            std.meta.eql(first.group.identity_namespace, candidate.group.identity_namespace);
     }
 
     fn coalescedEntryBatchRequest(entry: *const WriteCoalesceEntry) db_mod.types.BatchRequest {
@@ -16108,7 +16315,23 @@ pub const ProvisionedTableWriteSource = struct {
             return;
         }
 
-        var merged = GroupBatch{ .group_id = group_id };
+        // Never combine waiters selected under different catalog authority or
+        // topology generations. Even though local apply validates durable DB
+        // identity, preserving the exact capability boundary keeps a future
+        // routed local admission check from being bypassed by coalescing.
+        for (entries[1..]) |entry| {
+            if (!std.meta.eql(entry.group.route_fence, entries[0].group.route_fence)) {
+                self.applyCoalescedEntriesIndividually(alloc, table_name, entries);
+                return;
+            }
+        }
+
+        var merged = GroupBatch{
+            .group_id = group_id,
+            .identity_namespace = entries[0].group.identity_namespace,
+            .topology_epoch = entries[0].group.topology_epoch,
+            .route_fence = entries[0].group.route_fence,
+        };
         merged.writes.ensureTotalCapacity(arena_alloc, totalCoalescedWrites(entries)) catch |err| {
             self.finishCoalescedEntries(entries, err);
             return;
@@ -16220,7 +16443,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer alloc.free(path);
         if (self.write_cache) |cache| {
             const target_generation = self.visibleRootGeneration(group.group_id);
-            var cached = try self.getOrOpenCachedDbForLocalMutation(
+            var cached = try self.getOrOpenCachedDbForLocalMutationWithOptions(
                 alloc,
                 cache,
                 path,
@@ -16228,8 +16451,10 @@ pub const ProvisionedTableWriteSource = struct {
                 target_generation,
                 table_name,
                 true,
+                .{ .identity_namespace_override = group.identity_namespace },
             );
             defer cached.deinit(alloc);
+            try validateProvisionedDbIdentityNamespaceExpected(group.identity_namespace, cached.db);
             // Opening/adopting the resident writer must remain exclusive with
             // reads: until this lease exists, a reader could fall back to a
             // second DB owner for the same path. Once the authoritative writer
@@ -16242,9 +16467,9 @@ pub const ProvisionedTableWriteSource = struct {
             try applyGroupBatchWithSchemaJson(alloc, cached.db, cached.schema_json, group, req, cancellation);
             cache.publishCachedLeaseGeneration(&cached, target_generation);
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group.group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGateAndIdentity(alloc, path, self.catalog, table_name, group.group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror, group.identity_namespace);
             defer db.close();
-            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group.group_id, &db);
+            try validateProvisionedDbIdentityNamespaceExpected(group.identity_namespace, &db);
             try applyGroupBatch(alloc, self.catalog, &db, table_name, group, req, cancellation);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group.group_id, &db);
         }
@@ -16289,33 +16514,36 @@ pub const ProvisionedTableWriteSource = struct {
             grouped.deinit(alloc);
         }
 
-        var snapshot = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&snapshot);
-        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
-        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
-        defer metadata_admin.freeRangeRefs(alloc, ranges);
-        if (ranges.len == 0) return null;
+        try cancellation.check();
+        var routing = (try table_catalog.tableRoutingSnapshotForWrite(
+            alloc,
+            self.catalog,
+            table_name,
+            platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+        )) orelse return null;
+        defer routing.deinit(alloc);
+        try cancellation.check();
 
         for (req.writes) |write| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, write.key) orelse return null;
-            const group = try ensureGroupBatch(alloc, &grouped, group_id);
+            const route = routing.resolveRouteForKey(write.key) orelse return null;
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, routing.fenceForRoute(route));
             try group.writes.append(alloc, write);
         }
         for (req.deletes) |key| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, key) orelse return null;
-            const group = try ensureGroupBatch(alloc, &grouped, group_id);
+            const route = routing.resolveRouteForKey(key) orelse return null;
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, routing.fenceForRoute(route));
             try group.deletes.append(alloc, key);
         }
         for (req.transforms) |transform| {
-            const group_id = table_catalog.resolveGroupForKeyFromRanges(ranges, transform.key) orelse return null;
-            const group = try ensureGroupBatch(alloc, &grouped, group_id);
+            const route = routing.resolveRouteForKey(transform.key) orelse return null;
+            const group = try ensureRoutedGroupBatch(alloc, &grouped, routing.fenceForRoute(route));
             try group.transforms.append(alloc, transform);
         }
 
         if (self.raft_batcher) |batcher| {
             var accepted_groups: usize = 0;
             for (grouped.items) |group| {
-                batcher.batchGroupWithCancellation(alloc, group.group_id, table_name, .{
+                batcher.batchGroupRoutedWithCancellation(alloc, group.route_fence orelse return error.CatalogRouteFenceRequired, table_name, .{
                     .writes = group.writes.items,
                     .deletes = group.deletes.items,
                     .transforms = group.transforms.items,
@@ -17027,38 +17255,39 @@ pub const ProvisionedTableWriteSource = struct {
         if (table_req.predicates.len != 0) return null;
         if (try tableCommitHasGraphProjectionTransform(table_req)) return null;
 
-        var snapshot = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&snapshot);
-        const table = tables_api.findTableByName(&snapshot, table_req.table_name) orelse return null;
-        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
-        defer metadata_admin.freeRangeRefs(alloc, ranges);
-        if (ranges.len == 0) return null;
+        var routing = (try table_catalog.tableRoutingSnapshotForWrite(
+            alloc,
+            self.catalog,
+            table_req.table_name,
+            platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+        )) orelse return null;
+        defer routing.deinit(alloc);
 
-        var group_id_opt: ?u64 = null;
+        var selected_route: ?table_catalog.CatalogGroupRoute = null;
         const resolveOpGroup = struct {
-            fn run(current: *?u64, range_refs: []const *const metadata_table_manager.RangeRecord, key: []const u8) !void {
-                const group_id = table_catalog.resolveGroupForKeyFromRanges(range_refs, key) orelse return error.NotFound;
+            fn run(current: *?table_catalog.CatalogGroupRoute, route_snapshot: *const table_catalog.AuthoritativeTableRoutingSnapshot, key: []const u8) !void {
+                const route = route_snapshot.resolveRouteForKey(key) orelse return error.NotFound;
                 if (current.*) |existing| {
-                    if (existing != group_id) return error.MultipleGroups;
+                    if (!std.meta.eql(existing, route)) return error.MultipleGroups;
                 } else {
-                    current.* = group_id;
+                    current.* = route;
                 }
             }
         }.run;
 
-        for (table_req.writes) |write| resolveOpGroup(&group_id_opt, ranges, write.key) catch |err| switch (err) {
+        for (table_req.writes) |write| resolveOpGroup(&selected_route, &routing, write.key) catch |err| switch (err) {
             error.MultipleGroups => return null,
             else => return err,
         };
-        for (table_req.deletes) |key| resolveOpGroup(&group_id_opt, ranges, key) catch |err| switch (err) {
+        for (table_req.deletes) |key| resolveOpGroup(&selected_route, &routing, key) catch |err| switch (err) {
             error.MultipleGroups => return null,
             else => return err,
         };
-        for (table_req.transforms) |transform| resolveOpGroup(&group_id_opt, ranges, transform.key) catch |err| switch (err) {
+        for (table_req.transforms) |transform| resolveOpGroup(&selected_route, &routing, transform.key) catch |err| switch (err) {
             error.MultipleGroups => return null,
             else => return err,
         };
-        const group_id = group_id_opt orelse return .{ .committed = .{ .participant_count = 0 } };
+        const route = selected_route orelse return .{ .committed = .{ .participant_count = 0 } };
 
         const batcher = self.raft_batcher orelse return null;
         const req: db_mod.types.BatchRequest = .{
@@ -17067,7 +17296,7 @@ pub const ProvisionedTableWriteSource = struct {
             .transforms = table_req.transforms,
             .sync_level = sync_level,
         };
-        batcher.batchGroupWithCancellation(alloc, group_id, table_req.table_name, req, cancellation) catch |err| switch (err) {
+        batcher.batchGroupRoutedWithCancellation(alloc, routing.fenceForRoute(route), table_req.table_name, req, cancellation) catch |err| switch (err) {
             error.IntentConflict, error.VersionConflict => return .{ .conflict = boundConflict(table_req, err) },
             else => return err,
         };
@@ -18085,7 +18314,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateReadCache(table_name);
         self.markWriteCacheDirty(table_name);
         self.local_db_mutex.unlock();
-        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        const group_ids = try resolveCatalogGroupsEventually(
             alloc,
             self.catalog,
             table_name,
@@ -18178,7 +18407,7 @@ pub const ProvisionedTableWriteSource = struct {
                 try mergeDocumentArtifactTableReprocessResult(alloc, &result, &failures, &shard_cursors, group_id, group_result);
             }
         } else {
-            const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+            const group_ids = try resolveCatalogGroupsEventually(
                 alloc,
                 self.catalog,
                 table_name,
@@ -18214,7 +18443,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
 
-        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        const group_ids = try resolveCatalogGroupsEventually(
             alloc,
             self.catalog,
             table_name,
@@ -18312,7 +18541,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
 
-        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        const group_ids = try resolveCatalogGroupsEventually(
             alloc,
             self.catalog,
             table_name,
@@ -18942,6 +19171,9 @@ test "backup storage resolution rejects a reused table name from another incarna
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -19367,7 +19599,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             alloc.free(loaded.schema_json);
         };
 
-        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        const group_ids = try resolveCatalogGroupsEventually(
             alloc,
             self.catalog,
             table_name,
@@ -20073,7 +20305,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        const group_ids = try resolveCatalogGroupsEventually(
             alloc,
             self.catalog,
             table_name,
@@ -20151,7 +20383,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             for (req.shard_cursors, ids) |cursor, *id| id.* = cursor.group_id orelse return error.InvalidArgument;
             break :blk ids;
         } else blk: {
-            break :blk try table_catalog.resolveGroupsForSpanEventually(
+            break :blk try resolveCatalogGroupsEventually(
                 alloc,
                 self.catalog,
                 table_name,
@@ -20214,7 +20446,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.ArtifactRepairListRequest,
     ) !?db_mod.types.ArtifactRepairListResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        const group_ids = try resolveCatalogGroupsEventually(
             alloc,
             self.catalog,
             table_name,
@@ -20321,7 +20553,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?db_mod.types.ArtifactRepairResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (options.cancelled()) return error.Canceled;
-        const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+        const group_ids = try resolveCatalogGroupsEventually(
             alloc,
             self.catalog,
             table_name,
@@ -20643,6 +20875,11 @@ test "prepared raft apply reclassifies every transient pre-mutation writer confl
 
 const GroupBatch = struct {
     group_id: u64,
+    /// Authority captured with the key-to-group decision. Local writer
+    /// acquisition consumes this capability instead of re-reading metadata.
+    identity_namespace: ?doc_identity.Namespace = null,
+    topology_epoch: u64 = 0,
+    route_fence: ?metadata_api.CatalogRouteFence = null,
     writes: std.ArrayListUnmanaged(db_mod.types.BatchWrite) = .empty,
     deletes: std.ArrayListUnmanaged([]const u8) = .empty,
     transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
@@ -20659,7 +20896,12 @@ fn cloneWriteCoalesceGroupBatch(
     alloc: std.mem.Allocator,
     group: GroupBatch,
 ) !GroupBatch {
-    var cloned = GroupBatch{ .group_id = group.group_id };
+    var cloned = GroupBatch{
+        .group_id = group.group_id,
+        .identity_namespace = group.identity_namespace,
+        .topology_epoch = group.topology_epoch,
+        .route_fence = group.route_fence,
+    };
     errdefer freeWriteCoalesceGroupBatch(alloc, &cloned);
 
     try cloned.writes.ensureTotalCapacity(alloc, group.writes.items.len);
@@ -20699,6 +20941,33 @@ fn ensureGroupBatch(
         if (group.group_id == group_id) return group;
     }
     try grouped.append(alloc, .{ .group_id = group_id });
+    return &grouped.items[grouped.items.len - 1];
+}
+
+fn ensureRoutedGroupBatch(
+    alloc: std.mem.Allocator,
+    grouped: *std.ArrayListUnmanaged(GroupBatch),
+    fence: metadata_api.CatalogRouteFence,
+) !*GroupBatch {
+    try fence.validate();
+    const route = fence.route;
+    const identity_namespace = docIdentityNamespaceFromCatalog(route.identity_namespace);
+    for (grouped.items) |*group| {
+        if (group.group_id != route.group_id) continue;
+        if (group.topology_epoch != fence.topology_epoch or
+            !std.meta.eql(group.route_fence, @as(?metadata_api.CatalogRouteFence, fence)) or
+            !std.meta.eql(group.identity_namespace, @as(?doc_identity.Namespace, identity_namespace)))
+        {
+            return error.TopologyChanged;
+        }
+        return group;
+    }
+    try grouped.append(alloc, .{
+        .group_id = route.group_id,
+        .identity_namespace = identity_namespace,
+        .topology_epoch = fence.topology_epoch,
+        .route_fence = fence,
+    });
     return &grouped.items[grouped.items.len - 1];
 }
 
@@ -21195,6 +21464,10 @@ test "raft single-group fast path excludes graph projection transforms only" {
             self.transforms = req.transforms.len;
         }
 
+        fn batchGroupRouted(ptr: *anyopaque, allocator: std.mem.Allocator, route_capability: metadata_api.CatalogRouteFence, table_name: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
+            return batchGroup(ptr, allocator, route_capability.route.group_id, table_name, req);
+        }
+
         fn batchGroupLocal(
             _: *anyopaque,
             _: std.mem.Allocator,
@@ -21213,6 +21486,7 @@ test "raft single-group fast path excludes graph projection transforms only" {
         .ptr = &capture,
         .vtable = &.{
             .batch_group = Capture.batchGroup,
+            .batch_group_routed_with_cancellation = Capture.batchGroupRouted,
             .batch_group_local = Capture.batchGroupLocal,
         },
     });
@@ -21251,6 +21525,9 @@ test "provisioned stateless batch retries definite aborts to the production boun
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -21297,6 +21574,10 @@ test "provisioned stateless batch retries definite aborts to the production boun
             }
         }
 
+        fn batchGroupRouted(ptr: *anyopaque, allocator: std.mem.Allocator, route_capability: metadata_api.CatalogRouteFence, table_name: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
+            return batchGroup(ptr, allocator, route_capability.route.group_id, table_name, req);
+        }
+
         fn batchGroupLocal(
             _: *anyopaque,
             _: std.mem.Allocator,
@@ -21315,6 +21596,7 @@ test "provisioned stateless batch retries definite aborts to the production boun
         .ptr = &batcher,
         .vtable = &.{
             .batch_group = Batcher.batchGroup,
+            .batch_group_routed_with_cancellation = Batcher.batchGroupRouted,
             .batch_group_local = Batcher.batchGroupLocal,
         },
     });
@@ -21627,7 +21909,31 @@ fn openManagedDbForTableGroupWithRuntimeAndHAWriteGate(
     ha_write_gate: ?db_mod.HAWriteGate,
     ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
 ) !db_mod.DB {
-    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime, ha_write_gate, ha_async_mirror);
+    return try openManagedDbForTableGroupWithRuntimeAndHAWriteGateAndIdentity(
+        alloc,
+        path,
+        catalog,
+        table_name,
+        group_id,
+        backend_runtime,
+        ha_write_gate,
+        ha_async_mirror,
+        null,
+    );
+}
+
+fn openManagedDbForTableGroupWithRuntimeAndHAWriteGateAndIdentity(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    ha_write_gate: ?db_mod.HAWriteGate,
+    ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
+    identity_namespace: ?doc_identity.Namespace,
+) !db_mod.DB {
+    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGateAndIdentity(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime, ha_write_gate, ha_async_mirror, identity_namespace);
 }
 
 fn openManagedDbForTableWithCache(
@@ -21695,8 +22001,41 @@ fn openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(
     ha_write_gate: ?db_mod.HAWriteGate,
     ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
 ) !db_mod.DB {
+    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGateAndIdentity(
+        alloc,
+        path,
+        catalog,
+        table_name,
+        group_id,
+        lsm_cache,
+        hbc_cache,
+        lsm_root_generation,
+        resource_manager,
+        backend_runtime,
+        ha_write_gate,
+        ha_async_mirror,
+        null,
+    );
+}
+
+fn openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGateAndIdentity(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    lsm_cache: ?*lsm_backend.Cache,
+    hbc_cache: ?*hbc_mod.Cache,
+    lsm_root_generation: u64,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    ha_write_gate: ?db_mod.HAWriteGate,
+    ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
+    identity_namespace_override: ?doc_identity.Namespace,
+) !db_mod.DB {
     const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default, ha_async_mirror);
-    const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
+    const identity_namespace = identity_namespace_override orelse
+        try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
     const indexes_json = (try loadTableIndexesJson(alloc, catalog, table_name)) orelse {
         var db = try db_mod.DB.open(alloc, path, .{
             .lsm_cache = lsm_cache,
@@ -21787,7 +22126,7 @@ fn reconcileLocalTableIndexes(
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     table_name: []const u8,
 ) !void {
-    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+    const group_ids = try resolveCatalogGroupsEventually(
         alloc,
         catalog,
         table_name,
@@ -21983,7 +22322,7 @@ fn reconcileCachedLocalTableIndexDrop(
         alloc.free(metadata.schema_json);
     }
 
-    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+    const group_ids = try resolveCatalogGroupsEventually(
         alloc,
         self.catalog,
         table_name,
@@ -22083,7 +22422,7 @@ fn putCachedLocalArtifactEnrichment(
         alloc.free(metadata.schema_json);
     }
 
-    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+    const group_ids = try resolveCatalogGroupsEventually(
         alloc,
         self.catalog,
         table_name,
@@ -22151,7 +22490,7 @@ fn dropCachedLocalArtifactEnrichment(
         alloc.free(metadata.schema_json);
     }
 
-    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+    const group_ids = try resolveCatalogGroupsEventually(
         alloc,
         self.catalog,
         table_name,
@@ -22274,7 +22613,7 @@ fn dropLocalTableIndex(
 ) !void {
     const indexes_json = (try loadTableIndexesJson(alloc, catalog, table_name)) orelse return error.TableNotFound;
     defer alloc.free(indexes_json);
-    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+    const group_ids = try resolveCatalogGroupsEventually(
         alloc,
         catalog,
         table_name,
@@ -22306,7 +22645,7 @@ fn putLocalArtifactEnrichment(
     artifact_name: []const u8,
     enrichment_json: []const u8,
 ) !void {
-    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+    const group_ids = try resolveCatalogGroupsEventually(
         alloc,
         catalog,
         table_name,
@@ -22336,7 +22675,7 @@ fn dropLocalArtifactEnrichment(
     table_name: []const u8,
     artifact_name: []const u8,
 ) !void {
-    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+    const group_ids = try resolveCatalogGroupsEventually(
         alloc,
         catalog,
         table_name,
@@ -22366,7 +22705,7 @@ fn replayManagedIndexForTableIfNeeded(
     table_name: []const u8,
     index_name: []const u8,
 ) !bool {
-    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+    const group_ids = try resolveCatalogGroupsEventually(
         alloc,
         catalog,
         table_name,
@@ -22965,7 +23304,7 @@ fn snapshotLocalTableRuntimeStatusesUncachedMode(
     table_name: []const u8,
     mode: ManagedDbOpenMode,
 ) !?runtime_status.LocalTableRuntimeStatuses {
-    const group_ids = try table_catalog.resolveGroupsForSpanEventually(
+    const group_ids = try resolveCatalogGroupsEventually(
         alloc,
         catalog,
         table_name,
@@ -23358,6 +23697,10 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
 }
 
 const ManagedDbOpenOptions = struct {
+    /// Identity captured with the route that selected the group. Supplying it
+    /// prevents a cache miss from performing a second, potentially older,
+    /// catalog read before creating the database.
+    identity_namespace_override: ?doc_identity.Namespace = null,
     drain_resolver_backfill: bool = true,
     source_table: []const u8 = "",
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
@@ -26556,21 +26899,92 @@ fn loadTableIdentityNamespaceForGroup(
     group_id: u64,
 ) !?doc_identity.Namespace {
     _ = alloc;
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
-    for (snapshot.ranges) |range| {
-        if (range.table_id != table.table_id or range.group_id != group_id) continue;
-        return tableIdentityNamespaceForRange(table.*, range);
+    // Writer identity is a correctness decision, never a cache hint. Capture
+    // it behind the compact linearizable barrier; eventual positives are only
+    // safe for tentative reads because a removed/reassigned group may still
+    // be present in a follower or TTL cache.
+    var snapshot = try (try catalog.routingSource()).linearizableSnapshot(
+        platform_time.monotonicNs() +| write_routing_snapshot_timeout_ns,
+    );
+    defer snapshot.deinit();
+    var table_id: ?u64 = null;
+    for (snapshot.value.tables) |table| {
+        if (std.mem.eql(u8, table.name, table_name)) {
+            table_id = table.table_id;
+            break;
+        }
     }
-    return null;
+    const expected_table_id = table_id orelse return error.TopologyChanged;
+    for (snapshot.value.ranges) |range| {
+        if (range.table_id != expected_table_id or range.group_id != group_id) continue;
+        return tableIdentityNamespaceForRangeId(expected_table_id, range);
+    }
+    return error.TopologyChanged;
 }
 
-fn tableIdentityNamespaceForRange(
-    table: metadata_table_manager.TableRecord,
-    range: metadata_table_manager.RangeRecord,
-) doc_identity.Namespace {
-    return tableIdentityNamespaceForRangeId(table.table_id, range);
+test "writer identity resolution rejects stale eventual routes" {
+    const State = struct {
+        eventual_calls: usize = 0,
+        linearizable_calls: usize = 0,
+
+        const tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
+        const stale_ranges = [_]metadata_table_manager.RangeRecord{.{ .table_id = 7, .group_id = 7001, .range_id = 71, .start_key = "" }};
+        const current_ranges = [_]metadata_table_manager.RangeRecord{.{ .table_id = 7, .group_id = 7002, .range_id = 72, .start_key = "" }};
+
+        fn source(self: *@This()) table_catalog.CatalogSource {
+            return .{ .ptr = self, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = eventualSnapshot,
+                .linearizable_routing_snapshot = linearizableSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
+            } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.AdminSnapshotUsedForRouting;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn eventualSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.eventual_calls += 1;
+            return .{ .tables = @constCast(tables[0..]), .ranges = @constCast(stale_ranges[0..]) };
+        }
+
+        fn linearizableSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.linearizable_calls += 1;
+            return .{ .tables = @constCast(tables[0..]), .ranges = @constCast(current_ranges[0..]) };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+    };
+
+    var state = State{};
+    try std.testing.expectError(
+        error.TopologyChanged,
+        loadTableIdentityNamespaceForGroup(std.testing.allocator, state.source(), "docs", 7001),
+    );
+    const current = (try loadTableIdentityNamespaceForGroup(
+        std.testing.allocator,
+        state.source(),
+        "docs",
+        7002,
+    )).?;
+    try std.testing.expectEqual(@as(u64, 7), current.table_id);
+    try std.testing.expectEqual(@as(u64, 72), current.range_id);
+    try std.testing.expectEqual(@as(usize, 0), state.eventual_calls);
+    try std.testing.expectEqual(@as(usize, 2), state.linearizable_calls);
+}
+
+fn docIdentityNamespaceFromCatalog(namespace: table_catalog.CatalogIdentityNamespace) doc_identity.Namespace {
+    return .{
+        .table_id = namespace.table_id,
+        .shard_id = namespace.shard_id,
+        .range_id = namespace.range_id,
+    };
 }
 
 fn tableIdentityNamespaceForRangeId(
@@ -27307,6 +27721,9 @@ test "provisioned table write source create table clears stale local group state
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -27382,6 +27799,9 @@ test "provisioned table write source seeds doc identity namespace from table ran
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -27445,6 +27865,9 @@ test "replicated split destination seeds inherited doc identity before range pub
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -27726,6 +28149,9 @@ test "provisioned table write source rejects stale doc identity namespace before
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -28200,6 +28626,9 @@ test "provisioned table write source backs up and restores a local table" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -28366,6 +28795,9 @@ test "provisioned table restore retry repairs exact incomplete restore state thr
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -28511,6 +28943,9 @@ test "provisioned restore repair source deinit cancels sleeping retry worker" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -28638,6 +29073,9 @@ test "provisioned restore repair worker retries transient step failures to compl
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -28739,6 +29177,9 @@ test "provisioned table write source backs up a portable local table" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -28866,6 +29307,9 @@ test "provisioned table restore rejects mismatched doc identity namespace" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -28936,6 +29380,9 @@ test "provisioned table write source backs up and restores full_text writes from
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29051,6 +29498,9 @@ test "provisioned table write source backs up and restores full_text writes from
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29116,6 +29566,9 @@ test "provisioned native backup restore repeats through shared read and write ow
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29157,6 +29610,9 @@ test "provisioned native backup restore repeats through shared read and write ow
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29399,6 +29855,9 @@ test "prepared writer open evicts an inactive sibling group before retrying desc
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29476,6 +29935,9 @@ test "prepared writer open reclaims descriptor capacity from startup cache" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29735,6 +30197,9 @@ test "provisioned read preparation invalidates readers without closing dirty wri
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29876,6 +30341,9 @@ test "auto bulk max-window request waits for idle finish" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -29973,6 +30441,9 @@ test "auto bulk background finish skips entries with active foreground leases" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30070,6 +30541,9 @@ test "auto bulk group writes release leases so idle finish can publish" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30186,6 +30660,9 @@ test "weak-sync group writes publish all docs after background dense catch-up" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30302,6 +30779,9 @@ test "dirty auto bulk writer publishes runtime status without closing the cached
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30470,6 +30950,9 @@ test "provisioned read preparation does not block on same-table batch after earl
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -30622,6 +31105,9 @@ test "provisioned txn commit reuses cached writer state" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -32111,6 +32597,9 @@ test "provisioned table write source routes batch writes across ranges" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -32286,6 +32775,9 @@ const ProvisionedWriteCoalesceTestCatalog = struct {
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
             },
         };
     }
@@ -32661,6 +33153,9 @@ test "provisioned table write source rejects writes that violate enforced docume
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -32734,6 +33229,9 @@ test "provisioned table write source drains managed dense enrichment before clos
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -32866,6 +33364,9 @@ test "structural reconcile reconfigures retained writer before managed dense wri
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -33053,6 +33554,9 @@ test "provisioned managed replay tails converge and publish without later traffi
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -33426,6 +33930,9 @@ test "failed full index enrichment does not make resident reads unavailable" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -33652,6 +34159,9 @@ test "provisioned table write source invalidates cached query db after managed d
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -33815,6 +34325,9 @@ test "provisioned table write source persists chunk artifacts when chunker enabl
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -33892,6 +34405,9 @@ test "provisioned table write source runtime status is best effort when local db
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -33946,6 +34462,9 @@ test "provisioned table write source cold status delegates to refresh owner" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -34011,6 +34530,9 @@ test "provisioned table write source runtime statuses reconcile empty embeddings
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -34082,6 +34604,9 @@ test "provisioned table write source runtime status repairs cold dense placehold
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -34181,6 +34706,9 @@ test "provisioned table write source recovers durable status without shared snap
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -34246,6 +34774,9 @@ test "provisioned writer cache starts DB workers after stable entry installation
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -34340,6 +34871,9 @@ test "provisioned table write cache retires stale db when index metadata changes
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -34412,6 +34946,9 @@ test "provisioned transition writer fences exact supplied table metadata" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -34597,6 +35134,9 @@ test "provisioned create index updates cached writer in place" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -34635,8 +35175,8 @@ test "provisioned create index updates cached writer in place" {
     const Fence = struct {
         cache: *runtime_status.TableRuntimeSnapshotCache,
         calls: usize = 0,
-        structural_calls: usize = 0,
-        publication_attempted_before_structural: bool = false,
+        reconciled_calls: usize = 0,
+        publication_attempted_before_reconciled: bool = false,
 
         fn run(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -34645,10 +35185,10 @@ test "provisioned create index updates cached writer in place" {
         }
 
         fn onChange(ptr: *anyopaque, _: []const u8, kind: ProvisionedTableWriteSource.LocalChangeKind) void {
-            if (kind != .structural) return;
+            if (kind != .runtime_reconciled) return;
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.structural_calls += 1;
-            self.publication_attempted_before_structural = self.calls != 0;
+            self.reconciled_calls += 1;
+            self.publication_attempted_before_reconciled = self.calls != 0;
         }
     };
     var fence = Fence{ .cache = &status_cache };
@@ -34665,8 +35205,8 @@ test "provisioned create index updates cached writer in place" {
     // concurrent invalidation can fence that observation without retrying or
     // rolling back the already-committed index admission.
     try std.testing.expectEqual(@as(usize, 1), fence.calls);
-    try std.testing.expectEqual(@as(usize, 1), fence.structural_calls);
-    try std.testing.expect(fence.publication_attempted_before_structural);
+    try std.testing.expectEqual(@as(usize, 1), fence.reconciled_calls);
+    try std.testing.expect(fence.publication_attempted_before_reconciled);
     source.publishWriteCacheRuntimeStatusesForTableBestEffort(alloc, "docs");
     var published_status = (try status_cache.snapshotGroupStatus(alloc, "docs", 7001)) orelse
         return error.TestUnexpectedResult;
@@ -34733,6 +35273,10 @@ test "provisioned create index updates cached writer in place" {
             state.last_timestamp_ns = req.timestamp_ns;
         }
 
+        fn batchGroupRouted(ptr: *anyopaque, allocator: std.mem.Allocator, route_capability: metadata_api.CatalogRouteFence, table_name: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
+            return batchGroup(ptr, allocator, route_capability.route.group_id, table_name, req);
+        }
+
         fn batchGroupLocal(
             ptr: *anyopaque,
             _: std.mem.Allocator,
@@ -34753,6 +35297,7 @@ test "provisioned create index updates cached writer in place" {
         .ptr = &raft_capture,
         .vtable = &.{
             .batch_group = RaftCapture.batchGroup,
+            .batch_group_routed_with_cancellation = RaftCapture.batchGroupRouted,
             .batch_group_local = RaftCapture.batchGroupLocal,
         },
     });
@@ -34797,6 +35342,9 @@ test "raft batch aggregation makes failures after an accepted group non-retryabl
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -34835,6 +35383,10 @@ test "raft batch aggregation makes failures after an accepted group non-retryabl
             self.accepted += 1;
         }
 
+        fn batchGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
+            return batchGroup(ptr, alloc, fence.route.group_id, table_name, req);
+        }
+
         fn batchGroupLocal(
             _: *anyopaque,
             _: std.mem.Allocator,
@@ -34856,6 +35408,7 @@ test "raft batch aggregation makes failures after an accepted group non-retryabl
         .ptr = &capture,
         .vtable = &.{
             .batch_group = Capture.batchGroup,
+            .batch_group_routed_with_cancellation = Capture.batchGroupRouted,
             .batch_group_local = Capture.batchGroupLocal,
         },
     });
@@ -34902,6 +35455,9 @@ test "provisioned table write source runtime status prefers shared snapshot cach
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -34935,6 +35491,9 @@ test "provisioned table write source runtime status prefers shared snapshot cach
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -34993,6 +35552,9 @@ test "provisioned table write source structural mutation invalidates shared runt
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -35035,6 +35597,9 @@ test "provisioned table write source runtime status falls back to shared snapsho
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -35100,6 +35665,9 @@ test "provisioned table write source cached runtime status does not fetch catalo
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -35169,6 +35737,9 @@ test "provisioned table write source runtime status recovers empty cache from st
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -35264,6 +35835,9 @@ test "provisioned table write source runtime status serves cached snapshot durin
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -35324,6 +35898,9 @@ test "provisioned table write source runtime status serves cached snapshot while
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -35383,6 +35960,9 @@ test "provisioned table write source runtime status still serves sibling groups 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -35458,6 +36038,9 @@ test "provisioned table write source runtime status filtering transfers owned st
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -35510,6 +36093,9 @@ test "provisioned table write source runtime status still serves unrelated table
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -35571,6 +36157,9 @@ test "provisioned table write source runtime status serves cached snapshot while
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -35631,6 +36220,9 @@ test "provisioned table write source runtime status serves cached snapshot while
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -35688,6 +36280,9 @@ test "provisioned table write source runtime status still serves clean sibling t
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -35765,6 +36360,9 @@ test "provisioned table write source runtime status serves shared snapshot cache
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -35823,6 +36421,9 @@ test "provisioned table write source serializes same-table same-group operations
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -36147,6 +36748,9 @@ test "provisioned table restore preparation blocks writes and competing structur
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -36177,6 +36781,9 @@ test "provisioned table restore preparation blocks writes while allowing reads" 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -36317,6 +36924,9 @@ test "provisioned table restore lifecycle reserves forwarded owner and caller so
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -36354,6 +36964,9 @@ test "provisioned startup catch-up enters through forwarded write owner" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -36393,6 +37006,9 @@ test "provisioned table write source structural activity waits for table request
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -36420,6 +37036,9 @@ test "provisioned table write source read request blocks group operation" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -36447,6 +37066,9 @@ test "provisioned table write source read request permits replicated apply activ
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -36475,6 +37097,9 @@ test "managed maintenance admission distinguishes status from data reads" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -36669,6 +37294,9 @@ test "managed index repair metadata mismatch hands off to structural reconciliat
             return .{ .ptr = undefined, .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
             } };
         }
 
@@ -36729,6 +37357,9 @@ test "provisioned table group operation waiter queues ahead of later readers" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -36925,6 +37556,9 @@ const StructuralReconcileTestCatalog = struct {
         return .{ .ptr = self, .vtable = &.{
             .admin_snapshot = adminSnapshot,
             .free_admin_snapshot = freeAdminSnapshot,
+            .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+            .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+            .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
             .requires_linearizable_publication_fence = true,
             .validate_table_publication = validateTablePublication,
         } };
@@ -36934,6 +37568,9 @@ const StructuralReconcileTestCatalog = struct {
         return .{ .ptr = self, .vtable = &.{
             .admin_snapshot = adminSnapshot,
             .free_admin_snapshot = freeAdminSnapshot,
+            .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+            .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+            .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
             .requires_linearizable_publication_fence = true,
         } };
     }
@@ -38034,6 +38671,9 @@ test "structural reconcile publishes durable index repair debt once per group" {
             return .{ .ptr = undefined, .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
             } };
         }
 
@@ -38454,6 +39094,9 @@ test "provisioned table write source group operation blocks read admission" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -38505,6 +39148,9 @@ test "provisioned schema reconcile keeps reads and status available" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -38541,6 +39187,9 @@ test "provisioned runtime status inspection remains available during structural 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -38567,6 +39216,9 @@ test "provisioned read admission enters through forwarded write owner" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -38598,6 +39250,9 @@ test "provisioned table write source keeps structural activity blocked until las
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -38631,6 +39286,9 @@ test "provisioned table write source allows different groups of same table to pr
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -38658,6 +39316,9 @@ test "provisioned table write source reports only same-group activity as busy" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -38687,6 +39348,9 @@ test "provisioned table write source managed writer probe is unknown while sourc
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -38715,6 +39379,9 @@ test "provisioned table write source metrics serve cached snapshot while write c
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -38817,6 +39484,9 @@ test "provisioned table write source runtime status serves cached snapshot when 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -38896,6 +39566,9 @@ test "provisioned table write source runtime status remains cache-only when dirt
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -38976,6 +39649,9 @@ test "provisioned table write source runtime status does not inspect read cache 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -39088,6 +39764,9 @@ test "provisioned table write source read cache overlay preserves live replay st
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -39205,6 +39884,9 @@ test "provisioned table write source restore repair completion retires cached ve
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -39513,6 +40195,9 @@ test "provisioned table write source path invalidation clears shared vector read
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -39614,6 +40299,9 @@ test "provisioned restore repair open rejects stale doc identity namespace" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -39683,6 +40371,9 @@ test "provisioned table write source visibility hook defers status sampling to r
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -39761,6 +40452,9 @@ test "provisioned table write source status visibility does not invalidate read 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -39825,6 +40519,9 @@ test "standby HA replay reconciles managed indexes without opening the public wr
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -39942,6 +40639,9 @@ test "cold replicated apply preserves declared full text projection across retai
                     .vtable = &.{
                         .admin_snapshot = adminSnapshot,
                         .free_admin_snapshot = freeAdminSnapshot,
+                        .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                        .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                        .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                     },
                 };
             }
@@ -40046,6 +40746,9 @@ test "provisioned replicated sync marks local runtime status dirty" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -40140,6 +40843,9 @@ test "provisioned table write source consistent visibility hook does not block o
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -40291,6 +40997,9 @@ test "provisioned table write source promotes synthetic placeholder when publish
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -40366,6 +41075,9 @@ test "runtime status publication rejects retired writer and authoritatively clea
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -40428,6 +41140,9 @@ test "provisioned table write source publishes replay debt from owner db handle"
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -40489,6 +41204,9 @@ test "provisioned runtime status overlays live writer replay target without repu
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -40625,6 +41343,9 @@ test "structural runtime observations publish as one table-epoch batch" {
             return .{ .ptr = undefined, .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
             } };
         }
 
@@ -40671,6 +41392,9 @@ test "structural repair publication advances the table lifecycle epoch" {
             return .{ .ptr = undefined, .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
             } };
         }
 
@@ -40730,6 +41454,9 @@ test "targeted repair publication preserves sibling authority fence" {
             return .{ .ptr = undefined, .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
             } };
         }
 
@@ -40818,6 +41545,9 @@ test "provisioned runtime status live replay overlay preserves cold dense visibi
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -40908,6 +41638,9 @@ test "provisioned runtime status live replay overlay clears ambiguous replay-onl
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -41000,6 +41733,9 @@ test "provisioned runtime status live replay overlay preserves non-replay backfi
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -41093,6 +41829,9 @@ test "provisioned table read source serves profiled dense query without runtime 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -41173,6 +41912,9 @@ test "hosted provisioned table read source serves profiled dense query after ext
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -41297,6 +42039,9 @@ test "provisioned table read source survives many external write-sync batches be
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -41331,6 +42076,9 @@ test "provisioned table read source survives many external write-sync batches be
                     .status = status,
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -41502,6 +42250,9 @@ test "provisioned table write source runtime status keeps cached snapshot while 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -41583,6 +42334,9 @@ test "provisioned table write source runtime status remains cache-only while bul
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -41667,6 +42421,9 @@ test "provisioned table write source runtime status does not lease writer during
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -41759,6 +42516,9 @@ test "split transition auto bulk publication retries while a writer lease is act
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -41846,6 +42606,9 @@ test "read preparation keeps write cache dirty while auto bulk ingest is active"
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -41912,6 +42675,9 @@ test "runtime status request does not finish expired auto bulk ingest" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -42032,6 +42798,9 @@ test "provisioned table write source startup snapshot preserves existing group s
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -42259,6 +43028,9 @@ test "runtime status snapshot with startup phase refreshes live table stats for 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -42342,6 +43114,9 @@ test "startup runtime status snapshot with live db refreshes table stats during 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -42400,6 +43175,9 @@ test "startup runtime status snapshot publishes live db when active cache is emp
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -42455,6 +43233,9 @@ test "best effort startup runtime status publishes live db when cache is empty" 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -42541,6 +43322,9 @@ test "runtime status snapshot with idle phase refreshes live stats after startup
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -42598,6 +43382,9 @@ test "idle startup runtime status publish is live when startup flag is still set
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -42655,6 +43442,9 @@ test "idle startup runtime status preserves live empty cached status" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -42694,6 +43484,9 @@ test "idle startup completion cannot downgrade a superseding live index status" 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -42762,6 +43555,9 @@ test "provisioned table write source startup snapshot builds synthetic status fr
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -42842,6 +43638,9 @@ test "provisioned table write source startup snapshot builds synthetic status fr
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -42907,6 +43706,9 @@ test "provisioned table write source maintenance probes are best effort when loc
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -43094,6 +43896,9 @@ test "managed startup catch-up uses provided indexes json without catalog fetch"
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -43156,6 +43961,9 @@ test "busy startup open preserves fresh writer runtime status" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -43242,6 +44050,9 @@ test "managed startup catch-up marks FileNotFound index open terminal degraded" 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -43381,6 +44192,9 @@ test "managed startup catch-up preserves restore repair debt while index load is
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -43485,6 +44299,9 @@ test "managed startup catch-up bypasses shared write cache" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -43550,6 +44367,9 @@ test "provisioned write cache close detaches promotion leadership callback befor
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -43627,6 +44447,9 @@ test "managed startup catch-up invalidates stale cached writer status after repl
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -43722,6 +44545,9 @@ test "live managed repair upgrades broad recovery alongside status before bounde
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -44017,6 +44843,9 @@ test "managed dense maintenance does not report delegated repair rediscovery as 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -44106,6 +44935,9 @@ test "managed catch-up reaches durable generation repair when dense replay needs
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -44229,6 +45061,9 @@ test "managed startup catch-up defers while shared writer cache owns the table" 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -44293,6 +45128,9 @@ test "managed startup catch-up defers while foreground writer state is dirty" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -44339,6 +45177,9 @@ test "write cache invalidation retires leased entry until release" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -44401,6 +45242,9 @@ test "write cache blocks same-root generation replacement while stale lease stay
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -44498,6 +45342,9 @@ test "write cache retirement is allocation-free after entry installation" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -44611,6 +45458,9 @@ test "provisioned group apply releases source mutex and retires readers opened d
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -44858,6 +45708,9 @@ test "provisioned table write source drop table does not hold local db mutex dur
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -44943,6 +45796,9 @@ test "provisioned table write source drop table waits for in-flight group batch 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -45059,6 +45915,9 @@ test "provisioned table write source drop table closes schema-bearing cached wri
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -45129,6 +45988,9 @@ test "provisioned table write source drop table waits for active read cache leas
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -45241,6 +46103,9 @@ test "provisioned table write source backup releases read cache exclusive before
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -45387,6 +46252,9 @@ test "provisioned table write source drop index does not hold local db mutex dur
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -45487,6 +46355,9 @@ test "provisioned table write source create table provisions local indexes and s
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -45578,6 +46449,117 @@ test "provisioned table write source create table provisions local indexes and s
     try std.testing.expectEqualStrings("title", enrichment.field);
 }
 
+test "provisioned create retries a retired cache lease before structural publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/create-structural-publication-race",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+
+    const Catalog = struct {
+        var tables = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = tables_api.default_indexes_json,
+            .placement_role = "data",
+        }};
+        var ranges = [_]metadata_table_manager.RangeRecord{.{
+            .group_id = 7001,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        }};
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = tables[0..],
+                .ranges = ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    const PublicationRace = struct {
+        source: *ProvisionedTableWriteSource,
+        calls: usize = 0,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) self.source.invalidateWriteCacheForTable("docs");
+        }
+    };
+    var publication_race = PublicationRace{ .source = &source };
+    {
+        const previous_hook = test_before_create_structural_publish_hook;
+        test_before_create_structural_publish_hook = .{ .ptr = &publication_race, .run = PublicationRace.run };
+        defer test_before_create_structural_publish_hook = previous_hook;
+        const handled = try source.source().createTable(alloc, "docs", .{});
+        try std.testing.expect(handled != null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), publication_race.calls);
+
+    {
+        lockAtomic(&source.local_db_mutex);
+        defer source.local_db_mutex.unlock();
+        try std.testing.expect(
+            write_cache.getLocked(7001, source.visibleRootGeneration(7001), "docs") != null,
+        );
+        try std.testing.expect(write_cache.tableMetadataLocked("docs") != null);
+    }
+
+    const PersistentRace = struct {
+        source: *ProvisionedTableWriteSource,
+        calls: usize = 0,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.source.invalidateWriteCacheForTable("docs");
+        }
+    };
+    var persistent_race = PersistentRace{ .source = &source };
+    {
+        const previous_hook = test_before_create_structural_publish_hook;
+        test_before_create_structural_publish_hook = .{ .ptr = &persistent_race, .run = PersistentRace.run };
+        defer test_before_create_structural_publish_hook = previous_hook;
+        try std.testing.expectError(
+            error.TopologyChanged,
+            source.source().createTable(alloc, "docs", .{}),
+        );
+    }
+    try std.testing.expectEqual(create_structural_publication_retry_limit, persistent_race.calls);
+}
+
 test "provisioned create succeeds when post-commit runtime status is fenced" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -45597,6 +46579,9 @@ test "provisioned create succeeds when post-commit runtime status is fenced" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -45680,6 +46665,9 @@ test "provisioned create reuses a generation opened by startup reconciliation" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -45853,6 +46841,9 @@ test "provisioned create installs managed enrichment despite a matching stale fi
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -46018,6 +47009,9 @@ test "provisioned table write source restore table does not hold local db mutex 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -46148,6 +47142,9 @@ test "provisioned table write source deinit drains restore repair work group" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -46201,6 +47198,9 @@ test "managed startup catch-up repairs external dense doc gaps from stored artif
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -46343,6 +47343,9 @@ test "managed startup catch-up advances counterless incomplete dense repair" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -46399,6 +47402,9 @@ test "managed startup catch-up defers while shared bulk ingest state is active" 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -46478,6 +47484,9 @@ test "managed startup catch-up ignores stale dirty bit after writer cache entry 
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -46546,6 +47555,9 @@ test "managed status-only cache open skips shared bulk ingest session state" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -46602,6 +47614,9 @@ test "writer cache bulk transition fences only its table" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -46672,6 +47687,9 @@ test "managed source status-only open bypasses shared writer cache entry" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -46739,6 +47757,9 @@ test "managed source status-only open drains stale pending close before retry" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -46801,6 +47822,9 @@ test "write cache HA gate clear drains inactive pending closes before returning"
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -46879,6 +47903,9 @@ test "write cache retires shared HA generation stale entries before reuse" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -46975,6 +48002,9 @@ test "hosted status-only open drains stale pending close before retry" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -47094,6 +48124,9 @@ const RaftSnapshotInstallTestCatalog = struct {
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 .validate_publication = validatePublication,
             },
         };
@@ -47260,6 +48293,9 @@ test "write cache prunes stale visible root generations instead of clearing curr
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -47331,6 +48367,9 @@ test "hosted write cache opens current visible root generation" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -47451,6 +48490,9 @@ test "hosted runtime status prefers live writer over stale hosted snapshot" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -47582,6 +48624,9 @@ test "write cache adopts just-created db across reconcile generation bump" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -47655,6 +48700,9 @@ test "write cache local mutation reuses live stale-generation writer" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -47728,6 +48776,9 @@ test "write cache structural local mutation finishes auto bulk before reuse" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -47803,6 +48854,9 @@ test "write cache local mutation preempts stale startup writer" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -47912,6 +48966,9 @@ test "write cache metadata refresh preserves inactive adoptable seed" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -47984,6 +49041,9 @@ test "write cache adopts active just-created db across generation bump" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -48269,6 +49329,9 @@ test "runtime status collection leaves active stale write lease live" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -48342,6 +49405,9 @@ test "resident DB lease adopts seeded write cache across visible generation bump
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -48558,6 +49624,9 @@ test "replica root reconcile seeds write cache across generation bump" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -48673,6 +49742,9 @@ test "replica root reconcile enqueues newly admitted managed full text repair" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -48760,6 +49832,9 @@ test "write cache transfers adoptable provisioned db to raft apply source" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -48838,6 +49913,9 @@ test "write cache retires adoptable seed when transfer allocators differ" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -48910,6 +49988,9 @@ test "provisioned leader admission rejects uncommitted writes under dense repair
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -48993,6 +50074,9 @@ test "median key lookup reuses startup writer instead of reopening its root" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }

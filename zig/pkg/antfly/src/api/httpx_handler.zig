@@ -262,7 +262,20 @@ pub const AntflyApiHandler = struct {
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         self.api_server.recordHandledRequest();
         establishInternalTxnPreDecisionDeadline(ctx);
+        establishCatalogRouteFenceDeadline(ctx);
         return next.call(ctx) catch |err| mapIngressError(ctx, err);
+    }
+
+    fn establishCatalogRouteFenceDeadline(ctx: *httpx.Context) void {
+        if (ctx.application_deadline_ns != null or ctx.application_deadline_invalid) return;
+        if (ctx.header(metadata_api.catalog_route_fence_header) == null) return;
+        const budget_ms = if (ctx.header(metadata_api.catalog_route_deadline_ms_header)) |raw|
+            std.fmt.parseUnsigned(u32, raw, 10) catch metadata_api.catalog_route_default_deadline_ms
+        else
+            metadata_api.catalog_route_default_deadline_ms;
+        const bounded_ms = @max(@as(u32, 1), @min(budget_ms, metadata_api.catalog_route_max_deadline_ms));
+        ctx.application_deadline_ns = platform_time.monotonicNs() +|
+            @as(u64, bounded_ms) *| std.time.ns_per_ms;
     }
 
     fn establishInternalTxnPreDecisionDeadline(ctx: *httpx.Context) void {
@@ -955,6 +968,19 @@ pub const AntflyApiHandler = struct {
     }
 
     fn operationContext(ctx: *httpx.Context, identity: ?AuthenticatedIdentity) operation_contract.RequestContext {
+        const catalog_route_fence_json = ctx.header(metadata_api.catalog_route_fence_header) orelse "";
+        if (catalog_route_fence_json.len != 0) {
+            // The operation layer validates the encoded fence before storage
+            // admission. Echoing the protocol only proves that this binary
+            // participates in that contract; callers still require a 2xx
+            // response before accepting the acknowledgement. If response
+            // header allocation fails, omitting the ack makes the coordinator
+            // fail closed with a retryable availability error.
+            ctx.setHeader(
+                metadata_api.catalog_route_fence_ack_header,
+                metadata_api.catalog_route_fence_ack_value,
+            ) catch {};
+        }
         return .{
             .cancellation = if (ctx.cancellation != null or ctx.cancellation_probe != null) .{
                 .ptr = ctx,
@@ -972,6 +998,7 @@ pub const AntflyApiHandler = struct {
                 .subject = authenticated.username,
             } else null,
             .destination_authorization_principal = http_server_mod.storedDestinationPrincipal(identity),
+            .catalog_route_fence_json = catalog_route_fence_json,
         };
     }
 
@@ -1034,8 +1061,14 @@ pub const AntflyApiHandler = struct {
             },
             error.MaintenanceJobIdExhausted => textResponse(ctx, 503, "maintenance job namespace exhausted; restart the server before submitting more maintenance work"),
             error.NotFound => textResponse(ctx, 404, "not found"),
-            error.Canceled => textResponse(ctx, 408, "request canceled"),
-            error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            error.Canceled => blk: {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
+                break :blk textResponse(ctx, 408, "request canceled");
+            },
+            error.DeadlineExceeded => blk: {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
+                break :blk textResponse(ctx, 504, "request deadline exceeded");
+            },
             error.Unavailable => textResponse(ctx, 503, "storage maintenance unavailable"),
             error.Unauthorized => unauthorizedResponse(ctx),
             error.Forbidden => textResponse(ctx, 403, "forbidden"),
@@ -1815,6 +1848,7 @@ pub const AntflyApiHandler = struct {
     fn internalCapabilities(_: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return ctx.json(.{
             .data_raft_batch_protocol_version = internal_batch_forwarding.raft_batch_protocol_version,
+            .catalog_route_fence_protocol_version = metadata_api.catalog_route_fence_protocol_current,
         });
     }
 
@@ -2091,6 +2125,10 @@ pub const AntflyApiHandler = struct {
             forwarding_context,
         ) catch |err| return switch (err) {
             error.InvalidArgument => textResponse(ctx, 400, "invalid batch request"),
+            error.TopologyChanged => blk: {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
+                break :blk textResponse(ctx, 409, "topology changed");
+            },
             error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
             error.EnrichmentWaitCanceled,
             error.EnrichmentWaitTimeout,

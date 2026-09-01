@@ -37,6 +37,7 @@ const backups_api = @import("../api/backups.zig");
 const http_route_helpers = @import("../api/http_route_helpers.zig");
 const indexes_api = @import("../api/indexes.zig");
 const tables_api = @import("../api/tables.zig");
+const api_table_catalog = @import("../api/table_catalog.zig");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const routes = @import("http_routes.zig");
@@ -84,6 +85,10 @@ pub const AdminSource = struct {
         runtime_topology: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataRuntimeTopology = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
+        routing_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = unsupportedRoutingSnapshot,
+        linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
+        free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
+        wait_for_routing_change: ?*const fn (ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, confirm_absence: bool) anyerror!metadata_api.CatalogRoutingChangeResult = null,
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
         validate_table_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) anyerror!bool = null,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
@@ -156,6 +161,29 @@ pub const AdminSource = struct {
 
     pub fn adminSnapshot(self: AdminSource) !metadata_api.AdminSnapshot {
         return try self.vtable.admin_snapshot(self.ptr);
+    }
+
+    pub fn routingSnapshot(self: AdminSource, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        return try self.vtable.routing_snapshot(self.ptr, deadline_ns);
+    }
+
+    pub fn linearizableRoutingSnapshot(self: AdminSource, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+        const capture = self.vtable.linearizable_routing_snapshot orelse return error.UnsupportedOperation;
+        return try capture(self.ptr, request);
+    }
+
+    pub fn freeRoutingSnapshot(self: AdminSource, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        self.vtable.free_routing_snapshot(self.ptr, snapshot);
+    }
+
+    pub fn waitForRoutingChange(
+        self: AdminSource,
+        observed_token: metadata_api.CatalogRoutingChangeToken,
+        deadline_ns: u64,
+        confirm_absence: bool,
+    ) !metadata_api.CatalogRoutingChangeResult {
+        const wait = self.vtable.wait_for_routing_change orelse return error.UnsupportedOperation;
+        return try wait(self.ptr, observed_token, deadline_ns, confirm_absence);
     }
 
     pub fn validatePublication(self: AdminSource, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -336,6 +364,10 @@ pub const AdminSource = struct {
                 .runtime_topology = metadataServiceRuntimeTopology,
                 .status = metadataServiceStatus,
                 .admin_snapshot = metadataServiceAdminSnapshot,
+                .routing_snapshot = metadataServiceRoutingSnapshot,
+                .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
+                .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
+                .wait_for_routing_change = metadataServiceWaitForRoutingChange,
                 .validate_publication = metadataServiceValidatePublication,
                 .validate_table_publication = metadataServiceValidateTablePublication,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
@@ -381,6 +413,10 @@ pub const AdminSource = struct {
                 .runtime_topology = metadataHttpServiceRuntimeTopology,
                 .status = metadataHttpServiceStatus,
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
+                .routing_snapshot = metadataHttpServiceRoutingSnapshot,
+                .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
+                .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
+                .wait_for_routing_change = metadataHttpServiceWaitForRoutingChange,
                 .validate_publication = metadataHttpServiceValidatePublication,
                 .validate_table_publication = metadataHttpServiceValidateTablePublication,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
@@ -414,6 +450,14 @@ pub const AdminSource = struct {
                 .record_json_response_allocation = metadataHttpServiceRecordJsonResponseAllocation,
             },
         };
+    }
+
+    fn unsupportedRoutingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        return error.CatalogRoutingUnavailable;
+    }
+
+    fn unsupportedFreeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {
+        unreachable;
     }
 
     fn metadataServiceHead(ptr: *anyopaque) !metadata_api.MetadataHead {
@@ -462,6 +506,26 @@ pub const AdminSource = struct {
     fn metadataServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         return try svc.adminSnapshot();
+    }
+
+    fn metadataServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        return try svc.catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn metadataServiceLinearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        return try service.linearizableCatalogRoutingSnapshot(service.MetadataService, svc, request);
+    }
+
+    fn metadataServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        svc.freeCatalogRoutingSnapshot(snapshot);
+    }
+
+    fn metadataServiceWaitForRoutingChange(ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, confirm_absence: bool) !metadata_api.CatalogRoutingChangeResult {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        return try svc.waitForCatalogRoutingChange(observed_token, deadline_ns, confirm_absence);
     }
 
     fn metadataServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
@@ -827,6 +891,26 @@ pub const AdminSource = struct {
         return try svc.adminSnapshot();
     }
 
+    fn metadataHttpServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try svc.catalogRoutingSnapshot(deadline_ns);
+    }
+
+    fn metadataHttpServiceLinearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try service.linearizableCatalogRoutingSnapshot(service.MetadataHttpService, svc, request);
+    }
+
+    fn metadataHttpServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        svc.freeCatalogRoutingSnapshot(snapshot);
+    }
+
+    fn metadataHttpServiceWaitForRoutingChange(ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, confirm_absence: bool) !metadata_api.CatalogRoutingChangeResult {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try svc.waitForCatalogRoutingChange(observed_token, deadline_ns, confirm_absence);
+    }
+
     fn metadataHttpServiceValidatePublication(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         // Followers use Raft's built-in ReadIndex forwarding and wait until
@@ -1142,7 +1226,54 @@ pub const AdminSource = struct {
     }
 };
 
+fn routeQueryFromWire(query: metadata_api.CatalogRouteQuery) api_table_catalog.RouteQuery {
+    return switch (query.selector) {
+        .table => .table,
+        .all_ranges => .all_ranges,
+        .key => .{ .key = query.key },
+        .span => .{ .span = .{ .from_key = query.from_key, .to_key = query.to_key } },
+        .group => .{ .group = query.group_id },
+    };
+}
+
+fn cloneRoutePlanForWireUntil(
+    alloc: std.mem.Allocator,
+    plan: api_table_catalog.CatalogRoutePlan,
+    deadline_ns: u64,
+) !metadata_api.CatalogRoutePlan {
+    const budget = api_table_catalog.RoutingBudget.init(deadline_ns);
+    try budget.checkpoint();
+    const groups = try alloc.alloc(metadata_api.CatalogGroupRoute, plan.groups.len);
+    errdefer alloc.free(groups);
+    for (plan.groups, groups, 0..) |source_group, *target_group, index| {
+        try budget.checkpointIndex(index);
+        target_group.* = .{
+            .group_id = source_group.group_id,
+            .range_id = source_group.range_id,
+            .identity_namespace = .{
+                .table_id = source_group.identity_namespace.table_id,
+                .shard_id = source_group.identity_namespace.shard_id,
+                .range_id = source_group.identity_namespace.range_id,
+            },
+        };
+    }
+    try budget.checkpoint();
+    return .{
+        .metadata_group_id = plan.metadata_group_id,
+        .metadata_incarnation = plan.metadata_incarnation,
+        .catalog_revision = plan.catalog_revision,
+        .table_id = plan.table_id,
+        .topology_epoch = plan.topology_epoch,
+        .groups = groups,
+    };
+}
+
 pub const MetadataHttpServer = struct {
+    /// Keep peer-supplied routing work bounded even when an older or malformed
+    /// caller omits a budget. This matches the metadata client's transport
+    /// timeout while still honoring any shorter ingress or forwarded budget.
+    const max_routing_request_budget_ms: u64 = 5_000;
+
     source: AdminSource,
     internal_service_auth_capability: ?[]const u8 = null,
 
@@ -1164,13 +1295,19 @@ pub const MetadataHttpServer = struct {
     pub fn registerRoutes(self: *MetadataHttpServer, server: *httpx.Server) !void {
         try server.get(routes.Routes.health, httpx.Handler.bind(self, metadataHealth));
         try server.get(routes.Routes.head, httpx.Handler.bind(self, metadataHead));
+        try server.get(routes.Routes.capabilities, httpx.Handler.bind(self, metadataCapabilities));
         // POST prevents intermediary GET caches from bypassing the read-index
         // barrier that gives this endpoint its meaning.
         try server.post(routes.Routes.internal_linearizable_head, httpx.Handler.bind(self, metadataLinearizableHead));
         try server.post(routes.Routes.internal_linearizable_snapshot, httpx.Handler.bind(self, metadataLinearizableSnapshot));
+        try server.post(routes.Routes.internal_linearizable_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableRoutingSnapshot));
+        try server.post(routes.Routes.internal_routing_change, httpx.Handler.bind(self, metadataRoutingChange));
+        try server.post(routes.Routes.internal_routing_authority, httpx.Handler.bind(self, metadataRoutingChange));
+        try server.post(routes.Routes.internal_await_route, httpx.Handler.bind(self, metadataAwaitRoute));
         try server.get(routes.Routes.runtime_topology, httpx.Handler.bind(self, metadataRuntimeTopology));
         try server.get(routes.Routes.status, httpx.Handler.bind(self, metadataStatus));
         try server.get(routes.Routes.admin_snapshot, httpx.Handler.bind(self, metadataSnapshot));
+        try server.get(routes.Routes.routing_snapshot, httpx.Handler.bind(self, metadataRoutingSnapshot));
         try server.get(routes.Routes.active_transitions, httpx.Handler.bind(self, metadataActiveTransitions));
         try server.get(
             routes.Routes.table_ranges_prefix ++ ":table_id" ++ routes.Routes.table_ranges_suffix,
@@ -1230,6 +1367,7 @@ pub const MetadataHttpServer = struct {
                 }.call,
             } else .none,
             .request_id = ctx.header("x-request-id") orelse "",
+            .deadline_ns = ctx.application_deadline_ns,
         };
     }
 
@@ -1283,6 +1421,133 @@ pub const MetadataHttpServer = struct {
         return response;
     }
 
+    const BudgetedRoutingSnapshotJson = struct {
+        const Failure = enum { canceled, timed_out };
+
+        snapshot: metadata_api.CatalogRoutingSnapshot,
+        ctx: *const httpx.Context,
+        failure: *?Failure,
+
+        fn checkpoint(self: @This()) error{WriteFailed}!void {
+            if (self.ctx.isCancellationRequested()) {
+                self.failure.* = .canceled;
+                return error.WriteFailed;
+            }
+            if (self.ctx.application_deadline_ns) |deadline_ns| {
+                if (platform_time.monotonicNs() >= deadline_ns) {
+                    self.failure.* = .timed_out;
+                    return error.WriteFailed;
+                }
+            }
+        }
+
+        fn checkpointIndex(self: @This(), index: usize) error{WriteFailed}!void {
+            if (index % 64 == 0) try self.checkpoint();
+        }
+
+        /// Keep materialized JSON responses interruptible without changing the
+        /// public wire schema. A checkpoint per fixed-size batch avoids a
+        /// clock read for every catalog record.
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            comptime {
+                const expected_fields = [_][]const u8{
+                    "metadata_group_id",
+                    "metadata_incarnation",
+                    "catalog_revision",
+                    "change_token",
+                    "tables",
+                    "ranges",
+                };
+                const actual_fields = std.meta.fields(metadata_api.CatalogRoutingSnapshot);
+                if (actual_fields.len != expected_fields.len) {
+                    @compileError("update budgeted routing snapshot serialization for the new wire field");
+                }
+                for (expected_fields, actual_fields) |expected, actual| {
+                    if (!std.mem.eql(u8, expected, actual.name)) {
+                        @compileError("budgeted routing snapshot serialization is out of sync with the wire type");
+                    }
+                }
+            }
+            try self.checkpoint();
+            try jw.beginObject();
+            try jw.objectField("metadata_group_id");
+            try jw.write(self.snapshot.metadata_group_id);
+            try jw.objectField("metadata_incarnation");
+            try jw.write(self.snapshot.metadata_incarnation);
+            try jw.objectField("catalog_revision");
+            try jw.write(self.snapshot.catalog_revision);
+            try jw.objectField("change_token");
+            try jw.write(self.snapshot.change_token);
+            try jw.objectField("tables");
+            try jw.beginArray();
+            for (self.snapshot.tables, 0..) |table, index| {
+                try self.checkpointIndex(index);
+                try jw.write(table);
+            }
+            try jw.endArray();
+            try jw.objectField("ranges");
+            try jw.beginArray();
+            for (self.snapshot.ranges, 0..) |range, index| {
+                try self.checkpointIndex(index);
+                try jw.write(range);
+            }
+            try jw.endArray();
+            try jw.endObject();
+            try self.checkpoint();
+        }
+    };
+
+    fn trackedRoutingSnapshotJsonUntil(
+        self: *MetadataHttpServer,
+        ctx: *httpx.Context,
+        snapshot: metadata_api.CatalogRoutingSnapshot,
+    ) !httpx.Response {
+        var failure: ?BudgetedRoutingSnapshotJson.Failure = null;
+        var response = ctx.json(BudgetedRoutingSnapshotJson{
+            .snapshot = snapshot,
+            .ctx = ctx,
+            .failure = &failure,
+        }) catch |err| {
+            if (failure) |cause| return metadataReadError(ctx, switch (cause) {
+                .canceled => error.Canceled,
+                .timed_out => error.CatalogRoutingSnapshotTimeout,
+            });
+            return err;
+        };
+        if (ctx.isCancellationRequested()) {
+            response.deinit();
+            return metadataReadError(ctx, error.Canceled);
+        }
+        if (ctx.application_deadline_ns) |deadline_ns| {
+            if (platform_time.monotonicNs() >= deadline_ns) {
+                response.deinit();
+                return metadataReadError(ctx, error.CatalogRoutingSnapshotTimeout);
+            }
+        }
+        self.source.recordJsonResponseAllocation(if (response.body) |body| body.len else 0);
+        return response;
+    }
+
+    /// Do not publish a successful or authoritative-negative route result if
+    /// response encoding consumed the remainder of the caller's budget.
+    fn trackedCatalogRouteResultUntil(
+        self: *MetadataHttpServer,
+        ctx: *httpx.Context,
+        value: metadata_api.CatalogRouteResolveResult,
+        deadline_ns: u64,
+    ) !httpx.Response {
+        var response = try ctx.json(value);
+        if (value.disposition == .timed_out or platform_time.monotonicNs() < deadline_ns) {
+            self.source.recordJsonResponseAllocation(if (response.body) |body| body.len else 0);
+            return response;
+        }
+        response.deinit();
+        return try self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{
+            .disposition = .timed_out,
+            .token = value.token,
+        });
+    }
+
     fn executeTypedHandlerForTest(
         self: *MetadataHttpServer,
         method: httpx.Method,
@@ -1325,7 +1590,9 @@ pub const MetadataHttpServer = struct {
             error.InvalidArgument => ctx.status(400).text("invalid path parameter"),
             error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
             error.Canceled => ctx.status(408).text("request canceled"),
-            error.DeadlineExceeded => ctx.status(504).text("request deadline exceeded"),
+            error.DeadlineExceeded,
+            error.CatalogRoutingSnapshotTimeout,
+            => ctx.status(504).text("request deadline exceeded"),
             else => err,
         };
     }
@@ -1338,6 +1605,10 @@ pub const MetadataHttpServer = struct {
     fn metadataHead(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const result = self.readOperations().head(requestContext(ctx)) catch |err| return metadataReadError(ctx, err);
         return self.trackedJson(ctx, result);
+    }
+
+    fn metadataCapabilities(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        return self.trackedJson(ctx, metadata_api.MetadataCapabilities{});
     }
 
     fn metadataLinearizableHead(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -1354,6 +1625,120 @@ pub const MetadataHttpServer = struct {
         defer operations.freeSnapshot(&result);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return self.trackedJson(ctx, result);
+    }
+
+    fn applyRoutingBudget(ctx: *httpx.Context) !void {
+        const now_ns = platform_time.monotonicNs();
+        var deadline_ns = now_ns +| max_routing_request_budget_ms * std.time.ns_per_ms;
+        if (ctx.application_deadline_ns) |ingress_deadline_ns| {
+            deadline_ns = @min(deadline_ns, ingress_deadline_ns);
+        }
+        if (ctx.header(routes.routing_remaining_ms_header)) |raw| {
+            const remaining_ms = std.fmt.parseUnsigned(u64, raw, 10) catch return error.InvalidArgument;
+            if (remaining_ms == 0) return error.CatalogRoutingSnapshotTimeout;
+            const bounded_remaining_ms: u64 = @min(remaining_ms, max_routing_request_budget_ms);
+            deadline_ns = @min(
+                deadline_ns,
+                now_ns +| bounded_remaining_ms * std.time.ns_per_ms,
+            );
+        }
+        if (now_ns >= deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+        ctx.application_deadline_ns = deadline_ns;
+    }
+
+    fn metadataLinearizableRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        var result = self.source.linearizableRoutingSnapshot(request) catch |err| return metadataReadError(ctx, err);
+        defer self.source.freeRoutingSnapshot(&result);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return self.trackedRoutingSnapshotJsonUntil(ctx, result);
+    }
+
+    fn metadataRoutingChange(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        const body = (try ctx.body()) orelse "";
+        const parsed = std.json.parseFromSlice(metadata_api.CatalogRoutingChangeRequest, ctx.allocator, body, .{}) catch
+            return ctx.status(400).text("invalid routing change request");
+        defer parsed.deinit();
+        const requested_deadline_ns = ctx.application_deadline_ns orelse return ctx.status(400).text("routing deadline required");
+        // A watch is only one failover probe. Never let a partitioned or stale
+        // replica consume the caller's complete routing deadline.
+        const deadline_ns = @min(
+            requested_deadline_ns,
+            platform_time.monotonicNs() +| 250 * std.time.ns_per_ms,
+        );
+        const result = self.source.waitForRoutingChange(parsed.value.observed_token, deadline_ns, parsed.value.confirm_absence) catch |err|
+            return metadataReadError(ctx, err);
+        return self.trackedJson(ctx, result);
+    }
+
+    fn metadataAwaitRoute(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        const body = (try ctx.body()) orelse "";
+        const parsed = std.json.parseFromSlice(metadata_api.CatalogRouteResolveRequest, ctx.allocator, body, .{}) catch
+            return ctx.status(400).text("invalid catalog route request");
+        defer parsed.deinit();
+        const deadline_ns = ctx.application_deadline_ns orelse return ctx.status(400).text("routing deadline required");
+        const query = routeQueryFromWire(parsed.value.query);
+
+        while (true) {
+            if (platform_time.monotonicNs() >= deadline_ns) {
+                return self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{ .disposition = .timed_out });
+            }
+            var snapshot = self.source.linearizableRoutingSnapshot(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+                error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{ .disposition = .timed_out }),
+                else => return metadataReadError(ctx, err),
+            };
+            const token = snapshot.change_token;
+            var local_plan = api_table_catalog.routePlanFromSnapshotUntil(
+                ctx.allocator,
+                snapshot,
+                parsed.value.query.table_name,
+                query,
+                deadline_ns,
+            ) catch |err| switch (err) {
+                error.CatalogRoutingSnapshotTimeout => {
+                    self.source.freeRoutingSnapshot(&snapshot);
+                    return self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{ .disposition = .timed_out });
+                },
+                else => {
+                    self.source.freeRoutingSnapshot(&snapshot);
+                    return metadataReadError(ctx, err);
+                },
+            };
+            self.source.freeRoutingSnapshot(&snapshot);
+            if (local_plan) |*plan| {
+                defer plan.deinit(ctx.allocator);
+                var wire_plan = cloneRoutePlanForWireUntil(ctx.allocator, plan.*, deadline_ns) catch |err| switch (err) {
+                    error.CatalogRoutingSnapshotTimeout => return self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{ .disposition = .timed_out, .token = token }),
+                    else => return metadataReadError(ctx, err),
+                };
+                defer wire_plan.deinit(ctx.allocator);
+                return self.trackedCatalogRouteResultUntil(ctx, metadata_api.CatalogRouteResolveResult{
+                    .disposition = .found,
+                    .token = token,
+                    .plan = wire_plan,
+                }, deadline_ns);
+            }
+
+            const change = self.source.waitForRoutingChange(token, deadline_ns, true) catch |err| switch (err) {
+                error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return self.trackedJson(ctx, metadata_api.CatalogRouteResolveResult{ .disposition = .timed_out, .token = token }),
+                else => return metadataReadError(ctx, err),
+            };
+            switch (change.effectiveDisposition()) {
+                .unchanged => return self.trackedCatalogRouteResultUntil(ctx, metadata_api.CatalogRouteResolveResult{
+                    .disposition = .not_found,
+                    .token = change.token,
+                }, deadline_ns),
+                .authority_changed => return self.trackedCatalogRouteResultUntil(ctx, metadata_api.CatalogRouteResolveResult{
+                    .disposition = .authority_changed,
+                    .token = change.token,
+                }, deadline_ns),
+                .advanced, .replica_behind => continue,
+            }
+        }
     }
 
     fn metadataRuntimeTopology(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -1377,6 +1762,16 @@ pub const MetadataHttpServer = struct {
         var result = operations.snapshot(requestContext(ctx)) catch |err| return metadataReadError(ctx, err);
         defer operations.freeSnapshot(&result);
         return self.trackedJson(ctx, result);
+    }
+
+    fn metadataRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        var result = self.source.routingSnapshot(request.deadline_ns) catch |err| return metadataReadError(ctx, err);
+        defer self.source.freeRoutingSnapshot(&result);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return self.trackedRoutingSnapshotJsonUntil(ctx, result);
     }
 
     fn metadataActiveTransitions(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -3151,6 +3546,176 @@ fn jsonBodyOrEmptyObject(body: []const u8) []const u8 {
     return if (body.len == 0) "{}" else body;
 }
 
+test "metadata route wire conversion preserves its absolute deadline" {
+    const Source = struct {
+        json_responses: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .record_json_response_allocation = recordJsonResponseAllocation,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn recordJsonResponseAllocation(ptr: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.json_responses += 1;
+        }
+    };
+
+    var groups = [_]api_table_catalog.CatalogGroupRoute{
+        .{
+            .group_id = 7001,
+            .range_id = 71,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 71 },
+        },
+        .{
+            .group_id = 7002,
+            .range_id = 72,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 72 },
+        },
+    };
+    const local_plan = api_table_catalog.CatalogRoutePlan{
+        .metadata_group_id = 91,
+        .metadata_incarnation = null,
+        .catalog_revision = 12,
+        .table_id = 7,
+        .topology_epoch = 8,
+        .groups = groups[0..],
+    };
+
+    var wire_plan = try cloneRoutePlanForWireUntil(
+        std.testing.allocator,
+        local_plan,
+        platform_time.monotonicNs() + std.time.ns_per_s,
+    );
+    defer wire_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), wire_plan.groups.len);
+    try std.testing.expectEqual(@as(u64, 7002), wire_plan.groups[1].group_id);
+    try std.testing.expectError(
+        error.CatalogRoutingSnapshotTimeout,
+        cloneRoutePlanForWireUntil(
+            std.testing.allocator,
+            local_plan,
+            platform_time.monotonicNs(),
+        ),
+    );
+
+    var source = Source{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var request = try httpx.Request.init(std.testing.allocator, .POST, routes.Routes.internal_await_route);
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try server.trackedCatalogRouteResultUntil(
+        &ctx,
+        .{ .disposition = .not_found, .token = .{ .metadata_group_id = 91, .revision = 12 } },
+        platform_time.monotonicNs(),
+    );
+    defer response.deinit();
+    const parsed = try std.json.parseFromSlice(metadata_api.CatalogRouteResolveResult, std.testing.allocator, response.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(metadata_api.CatalogRouteResolveResult.Disposition.timed_out, parsed.value.disposition);
+    try std.testing.expectEqual(@as(u64, 12), parsed.value.token.revision);
+    try std.testing.expectEqual(@as(usize, 1), source.json_responses);
+
+    const empty_snapshot = metadata_api.CatalogRoutingSnapshot{
+        .metadata_group_id = 91,
+        .catalog_revision = 12,
+        .change_token = .{ .metadata_group_id = 91, .revision = 12 },
+        .tables = &.{},
+        .ranges = &.{},
+    };
+    var expired_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer expired_request.deinit();
+    var expired_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &expired_request);
+    defer expired_ctx.deinit();
+    expired_ctx.application_deadline_ns = 1;
+    var expired_response = try server.trackedRoutingSnapshotJsonUntil(&expired_ctx, empty_snapshot);
+    defer expired_response.deinit();
+    try std.testing.expectEqual(@as(u16, 504), expired_response.status.code);
+    try std.testing.expectEqualStrings("request deadline exceeded", expired_response.body.?);
+    try std.testing.expectEqual(@as(usize, 1), source.json_responses);
+
+    var canceled = std.atomic.Value(bool).init(true);
+    var canceled_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer canceled_request.deinit();
+    var canceled_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &canceled_request);
+    defer canceled_ctx.deinit();
+    canceled_ctx.cancellation = &canceled;
+    var canceled_response = try server.trackedRoutingSnapshotJsonUntil(&canceled_ctx, empty_snapshot);
+    defer canceled_response.deinit();
+    try std.testing.expectEqual(@as(u16, 408), canceled_response.status.code);
+    try std.testing.expectEqualStrings("request canceled", canceled_response.body.?);
+    try std.testing.expectEqual(@as(usize, 1), source.json_responses);
+
+    const CancelAfterCheckpoints = struct {
+        checks: usize = 0,
+
+        fn isCanceled(ptr: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr.?)));
+            self.checks += 1;
+            return self.checks >= 3;
+        }
+    };
+    var projection_tables = [_]metadata_table_manager.TableRecord{
+        .{ .table_id = 7, .name = "docs" },
+    } ** 65;
+    const large_snapshot = metadata_api.CatalogRoutingSnapshot{
+        .metadata_group_id = 91,
+        .catalog_revision = 12,
+        .change_token = .{ .metadata_group_id = 91, .revision = 12 },
+        .tables = &projection_tables,
+        .ranges = &.{},
+    };
+    var cancellation_probe = CancelAfterCheckpoints{};
+    var interrupted_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer interrupted_request.deinit();
+    var interrupted_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &interrupted_request);
+    defer interrupted_ctx.deinit();
+    interrupted_ctx.cancellation_probe = .{
+        .ptr = &cancellation_probe,
+        .is_cancelled = CancelAfterCheckpoints.isCanceled,
+    };
+    var interrupted_response = try server.trackedRoutingSnapshotJsonUntil(&interrupted_ctx, large_snapshot);
+    defer interrupted_response.deinit();
+    try std.testing.expectEqual(@as(u16, 408), interrupted_response.status.code);
+    try std.testing.expectEqualStrings("request canceled", interrupted_response.body.?);
+    try std.testing.expectEqual(@as(usize, 3), cancellation_probe.checks);
+    try std.testing.expectEqual(@as(usize, 1), source.json_responses);
+
+    var snapshot_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer snapshot_request.deinit();
+    var snapshot_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &snapshot_request);
+    defer snapshot_ctx.deinit();
+    snapshot_ctx.application_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    var snapshot_response = try server.trackedRoutingSnapshotJsonUntil(&snapshot_ctx, empty_snapshot);
+    defer snapshot_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), snapshot_response.status.code);
+    const parsed_snapshot = try std.json.parseFromSlice(
+        metadata_api.CatalogRoutingSnapshot,
+        std.testing.allocator,
+        snapshot_response.body.?,
+        .{},
+    );
+    defer parsed_snapshot.deinit();
+    try std.testing.expectEqual(@as(u64, 91), parsed_snapshot.value.metadata_group_id);
+    try std.testing.expectEqual(@as(u64, 12), parsed_snapshot.value.change_token.revision);
+    try std.testing.expectEqual(@as(usize, 2), source.json_responses);
+}
+
 fn freeStoreStatusReport(alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) void {
     node_operations.freeStoreStatusReport(alloc, report);
 }
@@ -3190,6 +3755,185 @@ test "metadata http server reports reallocation protocol upgrade gating" {
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 503), response.status.code);
     try std.testing.expectEqualStrings("metadata voter upgrade required", response.body.?);
+}
+
+test "metadata routing server converts relative budget to local deadline" {
+    const RoutingSource = struct {
+        const tables = [_]metadata_table_manager.TableRecord{
+            .{ .table_id = 7, .name = "docs", .placement_role = "data" },
+        };
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .range_id = 4, .group_id = 71, .table_id = 7, .start_key = "", .end_key = null },
+        };
+
+        observed_deadline_ns: ?u64 = null,
+        observed_change_token: ?metadata_api.CatalogRoutingChangeToken = null,
+        observed_confirm_absence: bool = false,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = routingSnapshot,
+                .linearizable_routing_snapshot = linearizableRoutingSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
+                .wait_for_routing_change = waitForRoutingChange,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observed_deadline_ns = deadline_ns;
+            return .{
+                .metadata_group_id = 1,
+                .catalog_revision = 9,
+                .change_token = .{ .metadata_group_id = 1, .revision = 9 },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn linearizableRoutingSnapshot(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingSnapshot {
+            return routingSnapshot(ptr, request.deadline_ns);
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+
+        fn waitForRoutingChange(ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, confirm_absence: bool) !metadata_api.CatalogRoutingChangeResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.observed_change_token = observed_token;
+            self.observed_deadline_ns = deadline_ns;
+            self.observed_confirm_absence = confirm_absence;
+            return .{ .token = .{ .revision = 9 }, .disposition = .advanced, .changed = true };
+        }
+    };
+
+    var source = RoutingSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer request.deinit();
+    try request.headers.append(routes.routing_remaining_ms_header, "250");
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    const before_ns = platform_time.monotonicNs();
+    var response = try server.metadataRoutingSnapshot(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const observed = source.observed_deadline_ns orelse return error.TestExpectedDeadline;
+    try std.testing.expect(observed >= before_ns + 250 * std.time.ns_per_ms);
+    try std.testing.expect(observed <= platform_time.monotonicNs() + 250 * std.time.ns_per_ms);
+
+    var default_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer default_request.deinit();
+    var default_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &default_request);
+    defer default_ctx.deinit();
+    const default_before_ns = platform_time.monotonicNs();
+    try MetadataHttpServer.applyRoutingBudget(&default_ctx);
+    const default_deadline_ns = default_ctx.application_deadline_ns orelse return error.TestExpectedDeadline;
+    try std.testing.expect(default_deadline_ns >= default_before_ns + (MetadataHttpServer.max_routing_request_budget_ms - 100) * std.time.ns_per_ms);
+    try std.testing.expect(default_deadline_ns <= platform_time.monotonicNs() + MetadataHttpServer.max_routing_request_budget_ms * std.time.ns_per_ms);
+
+    var capped_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer capped_request.deinit();
+    try capped_request.headers.append(routes.routing_remaining_ms_header, "60000");
+    var capped_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &capped_request);
+    defer capped_ctx.deinit();
+    const capped_before_ns = platform_time.monotonicNs();
+    try MetadataHttpServer.applyRoutingBudget(&capped_ctx);
+    const capped_deadline_ns = capped_ctx.application_deadline_ns orelse return error.TestExpectedDeadline;
+    try std.testing.expect(capped_deadline_ns >= capped_before_ns + (MetadataHttpServer.max_routing_request_budget_ms - 100) * std.time.ns_per_ms);
+    try std.testing.expect(capped_deadline_ns <= platform_time.monotonicNs() + MetadataHttpServer.max_routing_request_budget_ms * std.time.ns_per_ms);
+
+    var ingress_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer ingress_request.deinit();
+    try ingress_request.headers.append(routes.routing_remaining_ms_header, "2000");
+    var ingress_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &ingress_request);
+    defer ingress_ctx.deinit();
+    const ingress_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    ingress_ctx.application_deadline_ns = ingress_deadline_ns;
+    try MetadataHttpServer.applyRoutingBudget(&ingress_ctx);
+    try std.testing.expectEqual(ingress_deadline_ns, ingress_ctx.application_deadline_ns.?);
+
+    source.observed_deadline_ns = null;
+    var canceled = std.atomic.Value(bool).init(true);
+    var canceled_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
+    defer canceled_request.deinit();
+    var canceled_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &canceled_request);
+    defer canceled_ctx.deinit();
+    canceled_ctx.cancellation = &canceled;
+    var canceled_response = try server.metadataRoutingSnapshot(&canceled_ctx);
+    defer canceled_response.deinit();
+    try std.testing.expectEqual(@as(u16, 408), canceled_response.status.code);
+    try std.testing.expect(source.observed_deadline_ns == null);
+
+    source.observed_deadline_ns = null;
+    var linearizable_request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        routes.Routes.internal_linearizable_routing_snapshot,
+    );
+    defer linearizable_request.deinit();
+    try linearizable_request.headers.append(routes.routing_remaining_ms_header, "125");
+    var linearizable_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &linearizable_request);
+    defer linearizable_ctx.deinit();
+    const linearizable_before_ns = platform_time.monotonicNs();
+    var linearizable_response = try server.metadataLinearizableRoutingSnapshot(&linearizable_ctx);
+    defer linearizable_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), linearizable_response.status.code);
+    const linearizable_observed = source.observed_deadline_ns orelse return error.TestExpectedDeadline;
+    try std.testing.expect(linearizable_observed >= linearizable_before_ns + 125 * std.time.ns_per_ms);
+    try std.testing.expect(linearizable_observed <= platform_time.monotonicNs() + 125 * std.time.ns_per_ms);
+
+    source.observed_deadline_ns = null;
+    var change_request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        routes.Routes.internal_routing_change,
+    );
+    defer change_request.deinit();
+    change_request.body = "{\"observed_token\":{\"metadata_group_id\":4,\"revision\":8},\"confirm_absence\":true}";
+    try change_request.headers.append(routes.routing_remaining_ms_header, "100");
+    var change_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &change_request);
+    defer change_ctx.deinit();
+    var change_response = try server.metadataRoutingChange(&change_ctx);
+    defer change_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), change_response.status.code);
+    try std.testing.expectEqual(@as(u64, 8), source.observed_change_token.?.revision);
+    try std.testing.expect(source.observed_confirm_absence);
+    const parsed_change = try std.json.parseFromSlice(metadata_api.CatalogRoutingChangeResult, std.testing.allocator, change_response.body.?, .{});
+    defer parsed_change.deinit();
+    try std.testing.expect(parsed_change.value.changed);
+    try std.testing.expectEqual(@as(u64, 9), parsed_change.value.token.revision);
+
+    var route_request = try httpx.Request.init(
+        std.testing.allocator,
+        .POST,
+        routes.Routes.internal_await_route,
+    );
+    defer route_request.deinit();
+    route_request.body = "{\"query\":{\"table_name\":\"docs\",\"selector\":\"all_ranges\"}}";
+    try route_request.headers.append(routes.routing_remaining_ms_header, "100");
+    var route_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &route_request);
+    defer route_ctx.deinit();
+    var route_response = try server.metadataAwaitRoute(&route_ctx);
+    defer route_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), route_response.status.code);
+    const parsed_route = try std.json.parseFromSlice(metadata_api.CatalogRouteResolveResult, std.testing.allocator, route_response.body.?, .{});
+    defer parsed_route.deinit();
+    try std.testing.expectEqual(metadata_api.CatalogRouteResolveResult.Disposition.found, parsed_route.value.disposition);
+    try std.testing.expectEqual(@as(u64, 71), parsed_route.value.plan.?.groups[0].group_id);
 }
 
 test "metadata http server serves status and filtered admin routes" {

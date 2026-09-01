@@ -16,6 +16,7 @@ const std = @import("std");
 const lease_executor = @import("lease_executor.zig");
 const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
+const platform_clock = @import("antfly_platform").clock;
 const httpx = @import("httpx");
 const antfly = @import("runtime_root.zig");
 const group_ids = @import("../common/group_ids.zig");
@@ -842,6 +843,10 @@ const LocalStandaloneMetadata = struct {
             .vtable = &.{
                 .admin_snapshot = catalogAdminSnapshot,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
+                .routing_snapshot = catalogRoutingSnapshot,
+                .linearizable_routing_snapshot = catalogRoutingSnapshot,
+                .free_routing_snapshot = catalogFreeRoutingSnapshot,
+                .wait_for_routing_change = catalogWaitForRoutingChange,
             },
         };
     }
@@ -849,12 +854,16 @@ const LocalStandaloneMetadata = struct {
     fn statusSource(self: *LocalStandaloneMetadata) antfly.public_api.http_server.StatusSource {
         return .{
             .ptr = self,
+            .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .status = status,
                 .admin_snapshot = catalogAdminSnapshot,
                 .cached_admin_snapshot = cachedAdminSnapshot,
                 .linearizable_snapshot = linearizableSnapshot,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
+                .routing_snapshot = catalogRoutingSnapshot,
+                .linearizable_routing_snapshot = catalogRoutingSnapshot,
+                .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .create_table = createTable,
                 .replace_table_definition = replaceTableDefinition,
                 .restore_table = restoreTable,
@@ -990,6 +999,97 @@ const LocalStandaloneMetadata = struct {
             .split_transitions = try self.alloc.alloc(antfly.metadata.SplitTransitionRecord, 0),
             .merge_transitions = try self.alloc.alloc(antfly.metadata.MergeTransitionRecord, 0),
         };
+    }
+
+    fn catalogRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        defer self.mutex.unlock();
+
+        const tables = try self.manager.listTables(self.alloc);
+        errdefer self.manager.freeTables(self.alloc, tables);
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
+        const ranges = try self.manager.listRanges(self.alloc);
+        errdefer self.manager.freeRanges(self.alloc, ranges);
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
+        return .{
+            .metadata_group_id = group_ids.main_metadata_group_id,
+            .catalog_revision = self.epoch,
+            .change_token = .{
+                .metadata_group_id = group_ids.main_metadata_group_id,
+                .revision = self.epoch,
+            },
+            .tables = tables,
+            .ranges = ranges,
+        };
+    }
+
+    fn catalogWaitForRoutingChange(
+        ptr: *anyopaque,
+        observed_token: antfly.metadata_api.CatalogRoutingChangeToken,
+        deadline_ns: u64,
+        probe_interval_ns: u64,
+    ) !antfly.public_api.table_catalog.CatalogChangeWaitResult {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return .retry;
+        if (standaloneCatalogTokenChanged(self, observed_token)) {
+            self.mutex.unlock();
+            return .changed;
+        }
+        self.mutex.unlock();
+
+        var now_ns = platform_time.monotonicNs();
+        if (now_ns < deadline_ns) {
+            // Finish the passive watch before the outer deadline and reserve
+            // bounded time for the authoritative mutex confirmation. Waiting
+            // all the way to the deadline makes lockAtomicUntil reject the
+            // final read and turns a stable absence into a false timeout.
+            const remaining_ns = deadline_ns - now_ns;
+            const confirmation_budget_ns = @min(
+                10 * std.time.ns_per_ms,
+                @max(std.time.ns_per_ms, remaining_ns / 4),
+            );
+            const watch_deadline_ns = deadline_ns -| confirmation_budget_ns;
+            while (now_ns < watch_deadline_ns) {
+                const wait_ns = @min(
+                    watch_deadline_ns - now_ns,
+                    @max(probe_interval_ns, std.time.ns_per_ms),
+                );
+                platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
+                if (!lockAtomicUntil(&self.mutex, deadline_ns)) return .retry;
+                const changed = standaloneCatalogTokenChanged(self, observed_token);
+                self.mutex.unlock();
+                if (changed) return .changed;
+                now_ns = platform_time.monotonicNs();
+            }
+        }
+        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return .retry;
+        defer self.mutex.unlock();
+        if (standaloneCatalogTokenChanged(self, observed_token)) return .changed;
+        return .authoritative_absence;
+    }
+
+    fn standaloneCatalogTokenChanged(
+        self: *const LocalStandaloneMetadata,
+        observed_token: antfly.metadata_api.CatalogRoutingChangeToken,
+    ) bool {
+        if (observed_token.metadata_group_id != 0 and
+            observed_token.metadata_group_id != group_ids.main_metadata_group_id)
+        {
+            return true;
+        }
+        return observed_token.revision != self.epoch;
+    }
+
+    fn catalogFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *antfly.metadata_api.CatalogRoutingSnapshot) void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        self.manager.freeTables(self.alloc, snapshot.tables);
+        self.manager.freeRanges(self.alloc, snapshot.ranges);
+        snapshot.* = undefined;
     }
 
     fn catalogFreeAdminSnapshot(ptr: *anyopaque, snapshot: *antfly.metadata_api.AdminSnapshot) void {
@@ -3471,6 +3571,18 @@ fn runLocalReplicaRootReconcilePermitHook(ptr: *anyopaque) bool {
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
+}
+
+fn lockAtomicUntil(mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
+    const deadline = deadline_ns orelse {
+        lockAtomic(mutex);
+        return true;
+    };
+    while (true) {
+        if (platform_time.monotonicNs() >= deadline) return false;
+        if (mutex.tryLock()) return true;
+        std.Thread.yield() catch {};
+    }
 }
 
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -7780,6 +7892,40 @@ test "standalone metadata advertises a linearizable owned snapshot" {
     try std.testing.expectEqualStrings("http://127.0.0.1:49152", rebound_snapshot.stores[0].api_url);
 }
 
+test "standalone routing watch does not report absence after one probe" {
+    const alloc = std.testing.allocator;
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, ".zig-cache/unused-routing-watch-catalog"),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+    metadata.epoch = 9;
+
+    const start_ns = platform_time.monotonicNs();
+    const result = try (try metadata.catalogSource().routingSource()).waitForChange(
+        .{ .metadata_group_id = group_ids.main_metadata_group_id, .revision = 9 },
+        start_ns + 60 * std.time.ns_per_ms,
+        2 * std.time.ns_per_ms,
+    );
+    try std.testing.expectEqual(
+        antfly.public_api.table_catalog.CatalogChangeWaitResult.authoritative_absence,
+        result,
+    );
+    // The old one-probe implementation returned in roughly 2 ms. Keep a
+    // generous lower bound so scheduler jitter can only make the test safer.
+    try std.testing.expect(platform_time.monotonicNs() -| start_ns >= 30 * std.time.ns_per_ms);
+}
+
 test "standalone metadata rejects corrupt catalog without double-freeing owned paths" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7925,6 +8071,11 @@ test "runtime lease watchdog publishes active self-fenced proof from exact expir
     try std.testing.expectEqual(@as(i64, 0), proof.authority_remaining_ms);
     try std.testing.expectEqual(@as(i64, 3), proof.observed_lease_transitions);
     try std.testing.expectEqualStrings("primary-a", proof.observed_holder_node_id);
+}
+
+test "standalone metadata catalog source provides compact routing" {
+    var metadata: LocalStandaloneMetadata = undefined;
+    _ = try metadata.catalogSource().routingSource();
 }
 
 test "runtime lease watchdog fetch and validation failures publish no bootstrap capability" {
