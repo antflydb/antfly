@@ -57044,7 +57044,7 @@ test "db portable resolver activation stops partial startup before retry reload"
             .kind = .graph,
             .config_json =
             \\{
-            \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+            \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
             \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
             \\}
             ,
