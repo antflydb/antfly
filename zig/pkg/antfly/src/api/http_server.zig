@@ -3786,7 +3786,7 @@ pub const ApiHttpServer = struct {
                 artifact_backup_id: []u8,
                 format: backups_api.BackupFormat,
                 action: TableAction,
-                release_writer_lease: bool,
+                writer_state_cleanup: backups_api.TableBackupWriterStateCleanup,
             },
             cluster: struct { attempt_id: []u8 },
         };
@@ -3822,7 +3822,7 @@ pub const ApiHttpServer = struct {
                         table.backup_id,
                         table.artifact_backup_id,
                         table.format,
-                        table.release_writer_lease,
+                        table.writer_state_cleanup,
                         cancellation,
                     ),
                     .committed_state => try backups_api.releaseCommittedTableBackupWriterStateAtLocation(
@@ -3929,7 +3929,7 @@ pub const ApiHttpServer = struct {
         artifact_backup_id: []const u8,
         format: backups_api.BackupFormat,
         action: BackupAttemptCleanupWork.TableAction,
-        release_writer_lease: bool,
+        writer_state_cleanup: backups_api.TableBackupWriterStateCleanup,
     ) !void {
         const work = try self.owner_alloc.create(BackupAttemptCleanupWork);
         errdefer self.owner_alloc.destroy(work);
@@ -3950,7 +3950,7 @@ pub const ApiHttpServer = struct {
                 .artifact_backup_id = owned_artifact_id,
                 .format = format,
                 .action = action,
-                .release_writer_lease = release_writer_lease,
+                .writer_state_cleanup = writer_state_cleanup,
             } },
         };
         try self.submitBackupAttemptCleanup(work);
@@ -7639,6 +7639,7 @@ pub const ApiHttpServer = struct {
             artifact_backup_id,
             format,
             connection,
+            receipt,
             .logical_create,
             request,
         );
@@ -7662,11 +7663,76 @@ pub const ApiHttpServer = struct {
         fn ownsCommittedRetirement(self: @This()) bool {
             return self == .logical_create;
         }
+
+        fn rollbackWriterStateCleanup(self: @This()) backups_api.TableBackupWriterStateCleanup {
+            return if (self.createsLease()) .retire_if_owned else .preserve;
+        }
     };
 
     fn isBackupInterruption(err: anyerror) bool {
         return err == error.Canceled or err == error.Cancelled or
             err == error.Timeout or err == error.DeadlineExceeded;
+    }
+
+    /// Converges every failed creator through the same reservation-last
+    /// rollback protocol. The durable logical reservation remains the retry
+    /// address until any possibly-created writer lease has been retired. A
+    /// foreground cleanup failure is therefore ambiguous, never retryable, and
+    /// leaves enough identity for the bounded maintenance lane to finish it.
+    fn rollbackFailedTableBackupAttempt(
+        self: *ApiHttpServer,
+        io: std.Io,
+        backup_location: *backups_api.BackupLocation,
+        location_uri: []const u8,
+        connection: []const u8,
+        backup_id: []const u8,
+        artifact_backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        writer_state_cleanup: backups_api.TableBackupWriterStateCleanup,
+        operation_control: *backups_api.BackupOperationControl,
+        failure: anyerror,
+        phase: []const u8,
+    ) anyerror {
+        const normalized_err = operation_control.normalizeInterruption(failure);
+        if (!isBackupInterruption(normalized_err)) {
+            backups_api.cleanupUnpublishedTableBackupAttemptAndWriterStateAtLocationWithCancellation(
+                self.alloc,
+                io,
+                backup_location,
+                backup_id,
+                artifact_backup_id,
+                format,
+                writer_state_cleanup,
+                operation_control.token(),
+            ) catch |cleanup_err| {
+                std.log.err("table backup rollback incomplete phase={s} class={s}", .{ phase, @errorName(cleanup_err) });
+                self.scheduleTableBackupAttemptCleanup(
+                    location_uri,
+                    connection,
+                    backup_id,
+                    artifact_backup_id,
+                    format,
+                    .rollback,
+                    writer_state_cleanup,
+                ) catch |schedule_err| {
+                    std.log.warn("table backup rollback cleanup scheduling deferred phase={s} class={s}", .{ phase, @errorName(schedule_err) });
+                };
+                return error.BackupOutcomeAmbiguous;
+            };
+            return normalized_err;
+        }
+        self.scheduleTableBackupAttemptCleanup(
+            location_uri,
+            connection,
+            backup_id,
+            artifact_backup_id,
+            format,
+            .rollback,
+            writer_state_cleanup,
+        ) catch |schedule_err| {
+            std.log.warn("table backup interrupted rollback cleanup scheduling deferred phase={s} class={s}", .{ phase, @errorName(schedule_err) });
+        };
+        return normalized_err;
     }
 
     fn backupOwnedTableWithArtifactId(
@@ -7681,6 +7747,7 @@ pub const ApiHttpServer = struct {
         artifact_backup_id: []const u8,
         format: backups_api.BackupFormat,
         connection: []const u8,
+        receipt: ?*public_table_http.TableApi.BackupExecutionReceipt,
         writer_lease_role: TableBackupWriterLeaseRole,
         request: api_operation.RequestContext,
     ) !void {
@@ -7720,7 +7787,7 @@ pub const ApiHttpServer = struct {
                     artifact_backup_id,
                     format,
                     .committed_logical_state,
-                    false,
+                    .preserve,
                 ) catch |schedule_err| {
                     std.log.warn("committed table backup writer-state reconciliation scheduling deferred class={s}", .{@errorName(schedule_err)});
                 };
@@ -7751,6 +7818,8 @@ pub const ApiHttpServer = struct {
                 };
                 if (retained_artifact_id) |value| {
                     defer self.alloc.free(value);
+                    if (receipt) |execution_receipt|
+                        execution_receipt.recordArtifactBackupId(value);
                     self.scheduleTableBackupAttemptCleanup(
                         location_uri,
                         connection,
@@ -7758,7 +7827,7 @@ pub const ApiHttpServer = struct {
                         value,
                         format,
                         .stale_reclaim,
-                        false,
+                        .preserve,
                     ) catch |schedule_err| {
                         std.log.warn("stale table backup reclamation scheduling deferred class={s}", .{@errorName(schedule_err)});
                     };
@@ -7786,29 +7855,27 @@ pub const ApiHttpServer = struct {
                 operation_control.token(),
             ) catch |err| {
                 const normalized_err = operation_control.normalizeInterruption(err);
-                if (isBackupInterruption(normalized_err)) {
-                    self.scheduleTableBackupAttemptCleanup(
-                        location_uri,
-                        connection,
-                        backup_id,
-                        artifact_backup_id,
-                        format,
-                        .rollback,
-                        false,
-                    ) catch |schedule_err| {
-                        std.log.warn("table backup interrupted admission cleanup scheduling deferred class={s}", .{@errorName(schedule_err)});
-                    };
-                    return normalized_err;
-                }
-                backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
-                    self.alloc,
+                // A known precondition failure did not create this lease. It
+                // nevertheless proves another same-generation writer may be
+                // live, so retain both fences and require reconciliation.
+                if (normalized_err == error.BackupAlreadyExists)
+                    return error.BackupOutcomeAmbiguous;
+                // Any other provider failure may have happened after the
+                // conditional create committed. Owner-checked lease release is
+                // idempotent, so creators must include it in rollback.
+                return self.rollbackFailedTableBackupAttempt(
                     io,
                     backup_location,
+                    location_uri,
+                    connection,
                     backup_id,
                     artifact_backup_id,
                     format,
-                ) catch {};
-                return normalized_err;
+                    .retire_if_owned,
+                    &operation_control,
+                    normalized_err,
+                    "writer_lease_admission",
+                );
             },
             .adopt => {
                 const adopt_now: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
@@ -7822,25 +7889,26 @@ pub const ApiHttpServer = struct {
                         artifact_backup_id,
                         format,
                         .rollback,
-                        false,
+                        .preserve,
                     ) catch |schedule_err| {
                         std.log.warn("expired adopted table backup cleanup scheduling deferred class={s}", .{@errorName(schedule_err)});
                     };
                     return error.BackupAttemptLeaseLost;
                 }
                 writer_lease_heartbeat.ensureOwned() catch |err| {
-                    self.scheduleTableBackupAttemptCleanup(
+                    return self.rollbackFailedTableBackupAttempt(
+                        io,
+                        backup_location,
                         location_uri,
                         connection,
                         backup_id,
                         artifact_backup_id,
                         format,
-                        .rollback,
-                        false,
-                    ) catch |schedule_err| {
-                        std.log.warn("adopted table backup cleanup scheduling deferred class={s}", .{@errorName(schedule_err)});
-                    };
-                    return operation_control.normalizeInterruption(err);
+                        .preserve,
+                        &operation_control,
+                        err,
+                        "writer_lease_adoption",
+                    );
                 };
             },
         }
@@ -7852,33 +7920,34 @@ pub const ApiHttpServer = struct {
             artifact_backup_id,
             operation_control.token(),
         ) catch |err| {
-            const normalized_err = operation_control.normalizeInterruption(err);
-            if (isBackupInterruption(normalized_err)) {
-                self.scheduleTableBackupAttemptCleanup(
-                    location_uri,
-                    connection,
-                    backup_id,
-                    artifact_backup_id,
-                    format,
-                    .rollback,
-                    writer_lease_role.createsLease(),
-                ) catch |schedule_err| {
-                    std.log.warn("table backup interrupted ownership cleanup scheduling deferred class={s}", .{@errorName(schedule_err)});
-                };
-                return normalized_err;
-            }
-            return error.BackupOutcomeAmbiguous;
+            return self.rollbackFailedTableBackupAttempt(
+                io,
+                backup_location,
+                location_uri,
+                connection,
+                backup_id,
+                artifact_backup_id,
+                format,
+                writer_lease_role.rollbackWriterStateCleanup(),
+                &operation_control,
+                err,
+                "reservation_ownership_read",
+            );
         };
         if (!reservation_owned) {
-            if (writer_lease_role.createsLease()) {
-                _ = backups_api.releaseTableBackupWriterLeaseAtLocation(
-                    self.alloc,
-                    io,
-                    backup_location,
-                    artifact_backup_id,
-                ) catch false;
-            }
-            return error.BackupAttemptLeaseLost;
+            return self.rollbackFailedTableBackupAttempt(
+                io,
+                backup_location,
+                location_uri,
+                connection,
+                backup_id,
+                artifact_backup_id,
+                format,
+                writer_lease_role.rollbackWriterStateCleanup(),
+                &operation_control,
+                error.BackupAttemptLeaseLost,
+                "reservation_ownership_lost",
+            );
         }
         var writer_lease_future = std.Io.async(
             io,
@@ -7899,47 +7968,19 @@ pub const ApiHttpServer = struct {
                 std.log.warn("table backup publication outcome ambiguous phase=commit class={s}; retaining fenced attempt", .{@errorName(err)});
                 return error.BackupOutcomeAmbiguous;
             }
-            const normalized_err = operation_control.normalizeInterruption(err);
-            if (isBackupInterruption(normalized_err)) {
-                self.scheduleTableBackupAttemptCleanup(
-                    location_uri,
-                    connection,
-                    backup_id,
-                    artifact_backup_id,
-                    format,
-                    .rollback,
-                    writer_lease_role.createsLease(),
-                ) catch |schedule_err| {
-                    std.log.warn("table backup interrupted rollback cleanup scheduling deferred class={s}", .{@errorName(schedule_err)});
-                };
-                return normalized_err;
-            }
-            backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
-                self.alloc,
+            return self.rollbackFailedTableBackupAttempt(
                 io,
                 backup_location,
+                location_uri,
+                connection,
                 backup_id,
                 artifact_backup_id,
                 format,
-            ) catch |cleanup_err| {
-                // A retained reservation fences retries when cleanup cannot be
-                // confirmed. Surface ambiguity rather than preserving a
-                // retryable authority/storage error from before rollback.
-                std.log.err("table backup cleanup failed phase=rollback class={s}", .{@errorName(cleanup_err)});
-                return error.BackupOutcomeAmbiguous;
-            };
-            if (writer_lease_role.createsLease()) {
-                _ = backups_api.releaseTableBackupWriterLeaseAtLocation(
-                    self.alloc,
-                    io,
-                    backup_location,
-                    artifact_backup_id,
-                ) catch |release_err| blk: {
-                    std.log.warn("table backup writer lease release deferred phase=rollback class={s}", .{@errorName(release_err)});
-                    break :blk false;
-                };
-            }
-            return normalized_err;
+                writer_lease_role.rollbackWriterStateCleanup(),
+                &operation_control,
+                err,
+                "execution",
+            );
         };
         writer_lease_heartbeat.stop_event.set(io);
         writer_lease_future.await(io);
@@ -7952,7 +7993,7 @@ pub const ApiHttpServer = struct {
                 artifact_backup_id,
                 format,
                 .committed_state,
-                true,
+                .retire_if_owned,
             ) catch |schedule_err| {
                 // The manifest is already the durable result. Same-ID
                 // reconciliation remains the fallback if the cleanup lane is
@@ -10979,6 +11020,7 @@ pub const ApiHttpServer = struct {
                 backup_id,
                 format,
                 connection,
+                receipt,
                 // Legacy coordinators forward only the original four-field
                 // fence and cannot pre-create a writer lease. Preserve that
                 // one rolling-upgrade direction by letting the new owner
@@ -12386,6 +12428,7 @@ pub const ApiHttpServer = struct {
                 attempt_table.artifact_backup_id,
                 req.format,
                 connection,
+                null,
                 .logical_create,
                 operation_request,
             ) catch |err| {
@@ -38498,6 +38541,7 @@ test "table backup retry preserves the retained ambiguous generation" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
     defer server.deinit();
+    var execution_receipt: public_table_http.TableApi.BackupExecutionReceipt = .{};
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 7,
         .name = "docs",
@@ -38517,6 +38561,7 @@ test "table backup retry preserves the retained ambiguous generation" {
             "new-generation",
             .portable,
             "backups",
+            &execution_receipt,
             .logical_create,
             .{},
         ),
@@ -38529,6 +38574,83 @@ test "table backup retry preserves the retained ambiguous generation" {
     )).?;
     defer alloc.free(retained);
     try std.testing.expectEqualStrings("retained-generation", retained);
+    try std.testing.expectEqualStrings("retained-generation", execution_receipt.artifactBackupId().?);
+}
+
+test "table backup lease conflict retains the retry address and live writer fence" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ambiguous-writer-lease", .{tmp.sub_path});
+    defer alloc.free(root);
+    var location: backups_api.BackupLocation = .{ .file = root };
+    const fence: backups_api.TableBackupFence = .{
+        .metadata_group_id = 3,
+        .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+        .table_id = 7,
+        .definition_digest = [_]u8{0x11} ** 32,
+        .topology_range_count = 1,
+        .topology_digest = [_]u8{0x22} ** 32,
+    };
+    try backups_api.reserveTableBackupWriterLeaseAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "generation",
+        std.math.maxInt(u64),
+    );
+
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = tables_api.default_indexes_json,
+        .placement_role = "data",
+    };
+    try std.testing.expectError(
+        error.BackupOutcomeAmbiguous,
+        server.backupOwnedTableWithArtifactId(
+            std.testing.io,
+            &table,
+            fence,
+            table.name,
+            &location,
+            "file:///backups",
+            "logical",
+            "generation",
+            .portable,
+            "backups",
+            null,
+            .logical_create,
+            .{},
+        ),
+    );
+
+    try std.testing.expect(try backups_api.tableBackupAttemptMatchesAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "logical",
+        "generation",
+    ));
+    try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(
+        alloc,
+        std.testing.io,
+        &location,
+        "generation",
+        std.math.maxInt(u64),
+    ));
 }
 
 test "table backup writer roles enforce rolling forwarded lease lifecycle" {
@@ -38633,6 +38755,7 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         "logical-artifact",
         .portable,
         "backups",
+        null,
         .logical_create,
         .{},
     );
@@ -38655,6 +38778,7 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         "legacy",
         .portable,
         "backups",
+        null,
         .legacy_forwarded_create,
         .{},
     );
@@ -38686,6 +38810,7 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         "adopt-artifact",
         .portable,
         "backups",
+        null,
         .adopt,
         .{},
     );

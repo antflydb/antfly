@@ -7485,6 +7485,15 @@ pub fn cleanupUnpublishedTableBackupAttemptAtLocation(
 /// second, and the logical reservation is deleted last. Any intermediate
 /// failure therefore leaves the exact backup/artifact binding available for
 /// an idempotent retry instead of stranding an undiscoverable lease.
+pub const TableBackupWriterStateCleanup = enum {
+    /// The lease belongs to a forwarding coordinator and must outlive this
+    /// storage-owner rollback.
+    preserve,
+    /// This executor created, or may have created, the lease. Conditionally
+    /// retire it when the durable owner still matches this artifact.
+    retire_if_owned,
+};
+
 pub fn cleanupUnpublishedTableBackupAttemptAndWriterStateAtLocation(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -7492,7 +7501,7 @@ pub fn cleanupUnpublishedTableBackupAttemptAndWriterStateAtLocation(
     backup_id: []const u8,
     artifact_backup_id: []const u8,
     format: BackupFormat,
-    release_writer_lease: bool,
+    writer_state_cleanup: TableBackupWriterStateCleanup,
 ) !void {
     return cleanupUnpublishedTableBackupAttemptAndWriterStateAtLocationWithCancellation(
         alloc,
@@ -7501,7 +7510,7 @@ pub fn cleanupUnpublishedTableBackupAttemptAndWriterStateAtLocation(
         backup_id,
         artifact_backup_id,
         format,
-        release_writer_lease,
+        writer_state_cleanup,
         .none,
     );
 }
@@ -7513,7 +7522,7 @@ pub fn cleanupUnpublishedTableBackupAttemptAndWriterStateAtLocationWithCancellat
     backup_id: []const u8,
     artifact_backup_id: []const u8,
     format: BackupFormat,
-    release_writer_lease: bool,
+    writer_state_cleanup: TableBackupWriterStateCleanup,
     cancellation: CancellationToken,
 ) !void {
     return cleanupUnpublishedTableBackupAttemptAndWriterStateAtLocationWithHook(
@@ -7523,7 +7532,7 @@ pub fn cleanupUnpublishedTableBackupAttemptAndWriterStateAtLocationWithCancellat
         backup_id,
         artifact_backup_id,
         format,
-        release_writer_lease,
+        writer_state_cleanup,
         cancellation,
         null,
     );
@@ -7538,7 +7547,7 @@ fn cleanupUnpublishedTableBackupAttemptAndWriterStateAtLocationWithHook(
     backup_id: []const u8,
     artifact_backup_id: []const u8,
     format: BackupFormat,
-    release_writer_lease: bool,
+    writer_state_cleanup: TableBackupWriterStateCleanup,
     cancellation: CancellationToken,
     before_writer_state: ?TableBackupCleanupBeforeWriterStateHook,
 ) !void {
@@ -7557,7 +7566,7 @@ fn cleanupUnpublishedTableBackupAttemptAndWriterStateAtLocationWithHook(
     );
     if (before_writer_state) |hook| try hook();
     try cancellation.check();
-    if (release_writer_lease) {
+    if (writer_state_cleanup == .retire_if_owned) {
         _ = try releaseTableBackupWriterLeaseAtLocationWithCancellation(
             alloc,
             io,
@@ -15761,7 +15770,7 @@ test "unpublished table cleanup retains its retry address until writer state ret
             "logical",
             "artifact",
             .portable,
-            true,
+            .retire_if_owned,
             .none,
             InjectedFailure.fail,
         ),
@@ -15787,7 +15796,7 @@ test "unpublished table cleanup retains its retry address until writer state ret
         "logical",
         "artifact",
         .portable,
-        true,
+        .retire_if_owned,
     );
     try std.testing.expect(!try tableBackupAttemptMatchesAtLocation(alloc, io, &location, "logical", "artifact"));
     try std.testing.expectError(

@@ -6881,6 +6881,8 @@ pub fn build(b: *std.Build) void {
             "backup manifest cancellation prevents late publication",
             "backup root publication cancellation leaves no visible control record",
             "unpublished table cleanup retains its retry address until writer state retires",
+            "table backup retry preserves the retained ambiguous generation",
+            "table backup lease conflict retains the retry address and live writer fence",
             "cluster backup manifest rejects incomplete coverage",
             "restore source identities are bounded and canonical",
             "portable backup integrity rejects changed staged bytes",
