@@ -1,5 +1,8 @@
 export function detectLinuxLibc(report = process.report) {
   try {
+    // Node 24's supported GNU/Linux floor is glibc 2.28, matching the GNU
+    // Antfly archive. The shell installer separately handles older glibc by
+    // selecting the portable musl build.
     return report?.getReport()?.header?.glibcVersionRuntime ? "glibc" : "musl";
   } catch {
     return "musl";

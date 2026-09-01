@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import stat
 import subprocess
 import sys
@@ -89,6 +90,38 @@ class CompletionPackagingTests(unittest.TestCase):
 
 
 class CAbiPackagingTests(unittest.TestCase):
+    def test_linux_abi_release_contract_stays_consistent(self) -> None:
+        installer = (REPO_ROOT / "scripts" / "install.sh").read_text()
+        minimum_match = re.search(r'^ANTFLY_MIN_GLIBC="([0-9]+\.[0-9]+)"$', installer, re.MULTILINE)
+        self.assertIsNotNone(minimum_match)
+        minimum_glibc = minimum_match.group(1)
+
+        release_workflow = (REPO_ROOT / ".github" / "workflows" / "antfly-release.yml").read_text()
+        container_workflow = (REPO_ROOT / ".github" / "workflows" / "antfly-container.yml").read_text()
+        dev_publish = (REPO_ROOT / "scripts" / "publish-zig-runtime-dev.sh").read_text()
+        for source in (release_workflow, container_workflow, dev_publish):
+            gnu_floors = set(re.findall(r"(?:x86_64|aarch64)-linux-gnu\.([0-9]+\.[0-9]+)", source))
+            self.assertEqual(gnu_floors, {minimum_glibc})
+
+        wheel_floor = minimum_glibc.replace(".", "_")
+        gnu_platforms = [platform for platform in package_cli_release.PLATFORMS if platform.npm_libc == "glibc"]
+        self.assertEqual(len(gnu_platforms), 2)
+        for platform in gnu_platforms:
+            self.assertTrue(platform.wheel_platform.startswith(f"manylinux_{wheel_floor}_"))
+
+        npm_cli = json.loads((REPO_ROOT / "ts" / "packages" / "cli" / "package.json").read_text())
+        self.assertEqual(npm_cli["engines"]["node"], ">=24.0")
+
+        cloud_build = (REPO_ROOT / "zig" / "cloudbuild.runtime.yaml").read_text()
+        self.assertIn("_ARTIFACT_URI: __required__", cloud_build)
+        self.assertIn("_ARTIFACT_URI must be an explicit gs:// GNU runtime artifact", cloud_build)
+
+        release_design = (REPO_ROOT / "RELEASE.md").read_text()
+        self.assertIn(f"glibc {minimum_glibc}", release_design)
+        for platform in package_cli_release.PLATFORMS:
+            expected_archive = package_cli_release.archive_name("<version>", platform)
+            self.assertIn(f"`{expected_archive}`", release_design)
+
     def test_cli_platforms_select_libc_specific_linux_archives(self) -> None:
         names = {
             platform.key: package_cli_release.archive_name("1.2.3", platform)

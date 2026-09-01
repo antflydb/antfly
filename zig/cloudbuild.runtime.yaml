@@ -1,7 +1,7 @@
 # Cloud Build config for packaging a prebuilt Antfly Zig runtime artifact.
 #
 # Substitutions:
-#   _ARTIFACT_URI: gs:// URI of a release tar.gz containing antfly and share/
+#   _ARTIFACT_URI: required gs:// URI of a GNU release tar.gz containing antfly and share/
 #   _IMAGE_NAME: image name in the containers repo
 #   _DOCKERFILE: runtime Dockerfile path relative to repo root
 #   _CONTEXT: extracted runtime image build context path
@@ -18,6 +18,10 @@ steps:
       - -c
       - |
         set -eux
+        case "${_ARTIFACT_URI}" in
+          gs://*) ;;
+          *) echo "_ARTIFACT_URI must be an explicit gs:// GNU runtime artifact" >&2; exit 2 ;;
+        esac
         rm -rf "${_CONTEXT}"
         mkdir -p "${_CONTEXT}"
         gsutil cp "${_ARTIFACT_URI}" /tmp/antfly-zig-runtime.tar.gz
@@ -61,7 +65,8 @@ options:
 timeout: 1800s
 
 substitutions:
-  _ARTIFACT_URI: gs://antfly-image-artifacts-zig-build-artifacts/zig/latest/antfly-zig-amd64.tar.gz
+  # Callers must supply the immutable, architecture-specific GNU artifact.
+  _ARTIFACT_URI: __required__
   _IMAGE_NAME: antfly
   _DOCKERFILE: zig/Dockerfile.runtime
   _CONTEXT: /workspace/.zig-container

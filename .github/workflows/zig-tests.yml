@@ -184,6 +184,7 @@ jobs:
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             scripts/install.sh \
+            scripts/publish-zig-runtime-dev.sh \
             scripts/test_install_download_markers.sh \
             scripts/test_quickstart_docs.py \
             scripts/packaging/package_cli_release.py \
@@ -194,6 +195,9 @@ jobs:
             ':(glob)ts/packages/cli*/**' \
             docs/cli-packaging.md \
             docs/guides/quickstart.mdx \
+            RELEASE.md \
+            zig/cloudbuild.runtime.yaml \
+            .github/workflows/antfly-container.yml \
             .github/workflows/antfly-release.yml \
             .github/workflows/cli-publish.yml \
             .github/workflows/zig-tests.yml

@@ -79,7 +79,10 @@ EOF
 cat >"$test_root/bin/getconf" <<'EOF'
 #!/bin/sh
 if [ "${1:-}" = "GNU_LIBC_VERSION" ]; then
-  printf 'glibc 2.28\n'
+  if [ "${TEST_GLIBC_VERSION:-2.28}" = "unavailable" ]; then
+    exit 1
+  fi
+  printf 'glibc %s\n' "${TEST_GLIBC_VERSION:-2.28}"
   exit 0
 fi
 exit 1
@@ -114,11 +117,13 @@ run_installer() {
   local arguments_file="$2"
   local stderr_file="$3"
   local libc="${4:-auto}"
+  local glibc_version="${5:-2.28}"
   CURL_ARGUMENTS_FILE="$arguments_file" \
     TEST_CHECKSUM="$checksum" \
     TEST_ACTUAL_CHECKSUM="${TEST_ACTUAL_CHECKSUM:-$checksum}" \
     TEST_FAIL_ACTIVATION="${TEST_FAIL_ACTIVATION:-}" \
     TEST_FAIL_GNU_DOWNLOAD="${TEST_FAIL_GNU_DOWNLOAD:-}" \
+    TEST_GLIBC_VERSION="$glibc_version" \
     ANTFLY_DOWNLOAD_CLASS="$class" \
     ANTFLY_LIBC="$libc" \
     HOME="$test_root/home" \
@@ -212,6 +217,25 @@ external_arguments="$(printf '%s\n' "$external_files" | sed -n '1p')"
 assert_line "antfly-installer/1" "$external_arguments"
 assert_no_audience_header "$external_arguments"
 assert_line "https://releases.antfly.io/antfly/v1.2.3/antfly_1.2.3_Linux_x86_64_gnu.tar.gz" "$external_arguments"
+
+for old_glibc in 2.17 2.27; do
+  old_glibc_arguments="$test_root/curl-glibc-${old_glibc}.txt"
+  old_glibc_stderr="$test_root/stderr-glibc-${old_glibc}.txt"
+  run_installer external "$old_glibc_arguments" "$old_glibc_stderr" auto "$old_glibc"
+  assert_line "https://releases.antfly.io/antfly/v1.2.3/antfly_1.2.3_Linux_x86_64.tar.gz" "$old_glibc_arguments"
+  grep -Fq "older than the supported GNU archive floor (2.28)" "$old_glibc_stderr"
+done
+
+unknown_libc_arguments="$test_root/curl-unknown-libc.txt"
+unknown_libc_stderr="$test_root/stderr-unknown-libc.txt"
+run_installer external "$unknown_libc_arguments" "$unknown_libc_stderr" auto unavailable
+assert_line "https://releases.antfly.io/antfly/v1.2.3/antfly_1.2.3_Linux_x86_64.tar.gz" "$unknown_libc_arguments"
+grep -Fq "Could not detect the Linux libc" "$unknown_libc_stderr"
+
+forced_gnu_arguments="$test_root/curl-forced-gnu-old-glibc.txt"
+forced_gnu_stderr="$test_root/stderr-forced-gnu-old-glibc.txt"
+run_installer external "$forced_gnu_arguments" "$forced_gnu_stderr" gnu 2.17
+assert_line "https://releases.antfly.io/antfly/v1.2.3/antfly_1.2.3_Linux_x86_64_gnu.tar.gz" "$forced_gnu_arguments"
 
 musl_files="$(run_case external musl)"
 musl_arguments="$(printf '%s\n' "$musl_files" | sed -n '1p')"

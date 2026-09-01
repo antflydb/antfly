@@ -1,8 +1,8 @@
 # Release Design
 
 This repo releases the native Zig runtime, CLI installer packages, container
-image, and SDKs from tags. The intended long-term shape is that the Zig runtime
-is built once per supported native platform and every downstream channel
+image, and SDKs from tags. The intended long-term shape is that each supported
+OS, architecture, and libc ABI is built once and every downstream channel
 consumes those same archives.
 
 ## Release Artifacts
@@ -11,30 +11,48 @@ The canonical Zig runtime artifacts are tarballs named:
 
 - `antfly_<version>_Darwin_arm64.tar.gz`
 - `antfly_<version>_Linux_arm64.tar.gz`
+- `antfly_<version>_Linux_arm64_gnu.tar.gz`
 - `antfly_<version>_Linux_x86_64.tar.gz`
+- `antfly_<version>_Linux_x86_64_gnu.tar.gz`
 
 Each archive has this root layout:
 
 ```text
 antfly
+completions/
 share/
+lib/
+include/antfly.h
 README.md
 LICENSE
+THIRD_PARTY_NOTICES.md
 ```
 
-Linux archives are built with musl on native Linux runners. Linux amd64 uses
-`ReleaseFast`; Linux arm64 currently uses `ReleaseSmall` because the full
-ReleaseFast build hits a single-process LLVM allocation failure in CI even with
-`-j1`. macOS arm64 is built on a macOS runner with Metal enabled. We do not
-cross-compile the Zig runtime because ReleaseFast cross-compiles have repeatedly
-failed under CI memory pressure, especially Linux arm64 from amd64.
+Linux has an explicit two-ABI contract:
+
+- Unsuffixed archives are portable musl builds. They remain CPU-only and are
+  used on musl, glibc older than 2.28, and unknown Linux libc environments.
+- `_gnu` archives target glibc 2.28 and include the runtime-loaded CUDA and
+  PJRT/XLA integrations. Containers, Linux Homebrew, and Python manylinux wheels
+  consume these archives.
+
+The npm CLI publishes both Linux ABIs and selects by OS, CPU, and libc. Its
+supported Node.js 24 runtime has the same glibc 2.28 floor as the GNU archive.
+The standalone shell installer also checks the glibc version and falls back to
+the portable musl archive when the GNU compatibility floor is not met.
+
+All release targets use `ReleaseFast`. Linux amd64 and GNU arm64 build on their
+native Linux architectures; portable musl arm64 and macOS arm64 cross-compile
+from the amd64 Linux runner. The macOS build uses the pinned cross-compilation
+SDK and enables Metal and Accelerate.
 
 ## Pipeline Ownership
 
 `.github/workflows/antfly-release.yml` is the tag release pipeline.
 
-1. `build-zig-runtime-archives` builds the native Zig archives on native runners
-   and uploads them as GitHub Actions artifacts.
+1. `build-zig-runtime-archives` builds the canonical Zig archives on the
+   appropriate native or cross-compilation runners and uploads them as GitHub
+   Actions artifacts.
 2. `publish-release-assets` builds the release payload, creates or updates the
    draft GitHub Release, uploads the Zig archives and release metadata as GitHub
    Release assets, then publishes the payload to object storage.
@@ -53,10 +71,12 @@ publishes, Homebrew, and container publishing fan out independently. A PyPI or
 npm publish failure must not block the container image for the same tag.
 
 `.github/workflows/antfly-container.yml` still supports standalone container
-publishes. In standalone mode it builds the Linux archives on native Linux
+publishes. In standalone mode it builds the GNU Linux archives on native Linux
 runners, uploads them to the container artifact bucket, and packages images from
 those tarballs. In release mode it skips the redundant build and uploads the
-already-built release archives to the same bucket path expected by Cloud Build.
+already-built GNU release archives to the same bucket path expected by Cloud
+Build. Cloud Build requires an explicit immutable artifact URI; the config does
+not carry a mutable or ABI-ambiguous default artifact.
 
 Release metadata and object-storage publishing are implemented as explicit
 scripts under `scripts/release/`:

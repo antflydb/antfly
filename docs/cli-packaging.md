@@ -54,7 +54,7 @@ integrations:
 
 | Consumer | Linux archive | Reason |
 | --- | --- | --- |
-| `scripts/install.sh` | auto-detected | `_gnu` on glibc; musl on musl or unknown Linux |
+| `scripts/install.sh` | auto-detected | `_gnu` on glibc 2.28+; musl on older glibc, musl, or unknown Linux |
 | Direct portable archive downloads | musl (unsuffixed) | Portable standalone CLI |
 | Python `manylinux` wheels | `_gnu` | glibc-compatible executable and C ABI library |
 | npm Linux platform packages | libc-specific | GNU and musl packages preserve both supported Linux ABIs |
@@ -83,9 +83,11 @@ CUDA and PJRT/XLA backends, which discover their driver or plugin at runtime and
 remain usable on CPU-only glibc hosts. PJRT/XLA use still requires a compatible
 plugin supplied by the runtime environment.
 
-The shell installer detects glibc with `getconf` and otherwise checks for musl.
-Set `ANTFLY_LIBC=gnu` or `ANTFLY_LIBC=musl` to override detection, for example
-when preparing an installation for a different host. In automatic mode it
+The shell installer reads the glibc version with `getconf` and selects the GNU
+archive only when the host meets its 2.28 compatibility floor. Older glibc,
+musl, and unknown Linux libc environments use the portable musl archive. Set
+`ANTFLY_LIBC=gnu` or `ANTFLY_LIBC=musl` to override selection, for example when
+preparing an installation for a different host. In automatic mode it also
 falls back to musl when an older release does not provide a GNU archive.
 
 For prerelease tags, npm uses the release version directly. Python wheels use
