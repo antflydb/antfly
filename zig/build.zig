@@ -6643,6 +6643,7 @@ pub fn build(b: *std.Build) void {
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
             "managed structural catch-up leaves pending enrichment with the asynchronous owner",
             "managed structural catch-up does not delegate an empty producer handoff",
+            "standalone managed structural catch-up owns admitted enrichment progress",
             "managed catch-up reaches durable generation repair when dense replay needs an artifact rebuild",
             "managed create publication handoff ignores unrelated index debt",
             "db managed vector admission captures writes while durable repair is pending",

@@ -11546,17 +11546,21 @@ pub const ProvisionedTableWriteSource = struct {
         defer if (startup_status_active) {
             // Every post-acquisition exit retires the transient startup marker
             // while the generation lease is still alive.
-            publishStartupCatchUpRuntimeStatusSnapshot(
+            finishManagedMaintenanceStatusPublication(
                 self,
-                alloc,
                 table_name,
-                group_id,
-                .{},
-                db,
-                configured_indexes,
+                publishStartupCatchUpRuntimeStatusSnapshot(
+                    self,
+                    alloc,
+                    table_name,
+                    group_id,
+                    .{},
+                    db,
+                    configured_indexes,
+                ),
             ) catch {};
         };
-        try finishManagedMaintenanceStatusPublication(publishStartupCatchUpRuntimeStatusSnapshot(
+        try finishManagedMaintenanceStatusPublication(self, table_name, publishStartupCatchUpRuntimeStatusSnapshot(
             self,
             alloc,
             table_name,
@@ -11750,7 +11754,7 @@ pub const ProvisionedTableWriteSource = struct {
             // bounded best-effort overlay intentionally does not reload. Take
             // one authoritative snapshot at that boundary so a removed repair
             // intent cannot remain operator-visible in the cached status.
-            try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhaseMode(
+            try finishManagedMaintenanceStatusPublication(self, table_name, publishRuntimeStatusSnapshotWithStartupPhaseMode(
                 self,
                 alloc,
                 table_name,
@@ -11761,7 +11765,7 @@ pub const ProvisionedTableWriteSource = struct {
             ));
             startup_status_active = false;
         } else {
-            try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db));
+            try finishManagedMaintenanceStatusPublication(self, table_name, publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db));
             startup_status_active = false;
         }
         // A fenced status observation cannot carry its clear authorization
@@ -22699,6 +22703,21 @@ const ManagedIndexCreateCatchUp = union(enum) {
     asynchronous: u64,
 };
 
+/// A standalone/embedded structural reconciler is the progress owner for the
+/// transient DB it opens. Advance the generated/enrichment work admitted by
+/// the preceding durable repair quantum before that owner closes the DB. The
+/// drain deliberately does not wait through provider retry backoff: one
+/// structural turn remains bounded, and the durable replay plus repair intent
+/// make the next turn restartable. A resident DataServer never uses this path;
+/// its BackendRuntime owns both dependency progress and retry scheduling.
+fn drainStandaloneManagedIndexRepairDependencies(db: *db_mod.DB) !bool {
+    db.runUntilIdleWithoutWaitingForEnrichmentRetries() catch |err| switch (err) {
+        error.EnrichmentRetryInProgress, error.ArtifactRepairRequired => return false,
+        else => return err,
+    };
+    return true;
+}
+
 fn catchUpManagedIndexCreate(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -22720,7 +22739,13 @@ fn catchUpManagedIndexCreate(
     });
     defer generation_repair.deinit(alloc);
     if (generation_repair.debt_remaining) {
-        return if (delegate_background_repair) .delegated else .retry;
+        if (delegate_background_repair) return .delegated;
+        // The repair quantum may have appended a bounded source-replay page.
+        // Make its provider/publication dependency progress under the same
+        // explicit standalone owner instead of relying on a worker belonging
+        // to a DB that is about to be closed.
+        _ = try drainStandaloneManagedIndexRepairDependencies(db);
+        return .retry;
     }
 
     const requires_enrichment_replay = try db.core.indexRequiresEnrichmentReplay(index_name);
@@ -22757,11 +22782,11 @@ fn catchUpManagedIndexCreate(
         // sources keep the synchronous readiness barrier below.
     }
 
-    try db.runUntilIdle();
+    if (!try drainStandaloneManagedIndexRepairDependencies(db)) return .retry;
 
     if (try db.denseArtifactRebuildMaintenanceNeeded(alloc)) {
         _ = try db.runDenseArtifactRebuildMaintenanceWithProgress(alloc, null, null);
-        try db.runUntilIdle();
+        if (!try drainStandaloneManagedIndexRepairDependencies(db)) return .retry;
     }
     if (requires_enrichment_replay) {
         const debt_remaining = try repairManagedEmbeddingArtifactsForIndex(alloc, db, index_name);
@@ -23010,6 +23035,55 @@ test "managed structural catch-up does not replay a completed dense generation" 
     );
     try std.testing.expectEqual(dense_target_before, try db.core.store.latestReplaySequenceForHint(.dense_vector, 0));
     try std.testing.expectEqual(enrichment_target_before, try db.core.store.latestReplaySequenceForHint(.enrichment, 0));
+}
+
+test "standalone managed structural catch-up owns admitted enrichment progress" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/standalone-managed-create-progress-owner",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    var deterministic = db_embedder.DeterministicDenseEmbedder{};
+    var db = try db_mod.DB.open(alloc, path, .{
+        // Make the ownership contract deterministic: no resident worker can
+        // hide a transient reconciler that closes before driving its work.
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"alpha beta gamma delta epsilon zeta eta theta iota kappa\"}",
+        }},
+        .sync_level = .write,
+    });
+    const cfg = db_mod.types.IndexConfig{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","chunk_name":"semantic_chunks","chunk_size":4,"chunk_overlap":1}}
+        ,
+        .coverage_generation = 74,
+    };
+    _ = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+
+    var outcome: ManagedIndexCreateCatchUp = .retry;
+    for (0..8) |_| {
+        outcome = try catchUpManagedIndexCreate(alloc, &db, cfg.name, false);
+        if (outcome == .complete) break;
+        try std.testing.expectEqual(ManagedIndexCreateCatchUp.retry, outcome);
+    }
+    try std.testing.expectEqual(ManagedIndexCreateCatchUp.complete, outcome);
+    try std.testing.expect(try db.completedManagedDenseGenerationIsServiceable(alloc, cfg.name));
+    try std.testing.expect(db.core.index_manager.denseIndex(cfg.name).?.index.stats().active_count > 0);
 }
 
 const ManagedIndexReplayPosition = struct {
@@ -25728,7 +25802,7 @@ fn publishStartupCatchUpRuntimeStatusSnapshot(
     } else {
         markRuntimeStatusFromDb(&status, .idle);
     }
-    _ = try snapshot_cache.publishGroup(publication_token, table_name, status);
+    try acceptRuntimeStatusPublication(try snapshot_cache.publishGroup(publication_token, table_name, status));
 }
 
 fn syntheticStartupRuntimeStatusFromConfiguredIndexes(
@@ -25826,12 +25900,24 @@ fn publishTerminalStartupCatchUpRuntimeStatus(
     return true;
 }
 
-fn finishManagedMaintenanceStatusPublication(publication: anyerror!void) !void {
+fn finishManagedMaintenanceStatusPublication(
+    source: *ProvisionedTableWriteSource,
+    table_name: []const u8,
+    publication: anyerror!void,
+) !void {
     publication catch |err| switch (err) {
         // Runtime status is an observation of repair, never its commit point.
         // A table-epoch change must reject the stale snapshot without aborting
         // durable replay/generation progress or stranding its active intent.
-        error.RuntimeStatusPublicationFenced => return,
+        // It must, however, leave a coalesced observation edge for the runtime
+        // owner. Otherwise the maintenance owner can retire after its final
+        // idle snapshot loses the fence, leaving the preceding catching-up
+        // heartbeat visible indefinitely even though durable work completed.
+        error.RuntimeStatusPublicationFenced => {
+            source.markWriteCacheDirty(table_name);
+            source.notifyLocalChange(table_name, .runtime_status);
+            return;
+        },
         else => return err,
     };
 }
@@ -25979,7 +26065,7 @@ fn catchUpManagedDb(
         // therefore an owner boundary, not a disposable heartbeat. Serialize it against the
         // concurrent status refresher so a placeholder cannot win the fence
         // and leave operators blind for the duration of recovery seeding.
-        try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhaseMode(
+        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhaseMode(
             source,
             alloc,
             table_name,
@@ -26026,7 +26112,7 @@ fn catchUpManagedDb(
 
         fn run(ptr: *anyopaque, _: []const u8, _: db_mod.ReplayProgress) !void {
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
-            try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(ctx.source, ctx.alloc, ctx.table_name, ctx.group_id, ctx.phase, ctx.db));
+            try finishManagedMaintenanceStatusPublication(ctx.source, ctx.table_name, publishRuntimeStatusSnapshotWithStartupPhase(ctx.source, ctx.alloc, ctx.table_name, ctx.group_id, ctx.phase, ctx.db));
         }
     };
 
@@ -26113,16 +26199,16 @@ fn catchUpManagedDb(
     };
     if (runs_broad_debt and repair_metadata_rebuild_pending) {
         progress_ctx.phase = .artifact_rebuild;
-        try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
+        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
         try db.runArtifactRepairMetadataMaintenanceUntilIdle();
         repaired_artifact_metadata = true;
         made_progress = true;
-        try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
+        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
     }
     if (runs_broad_debt and restore_repair_needed) {
         std.log.info("managed restore repair begin group_id={d}", .{group_id});
         progress_ctx.phase = .artifact_rebuild;
-        try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
+        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
         repaired_restore_runtime = db.repairRestoreRuntimeStateStepIfNeeded(alloc) catch |err| {
             if (owner == .live_writer and isPendingRestoreRuntimeRepairError(err)) {
                 // A resident writer keeps its managed workers enabled. Some
@@ -26148,13 +26234,13 @@ fn catchUpManagedDb(
         // Dense mutation phases retire their own HBC state inside DB repair.
         // Keep the resident writer's warm cache across watermark, graph, and
         // phase-marker-only quanta.
-        try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
+        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
         std.log.info("managed restore repair step complete group_id={d} repaired={}", .{ group_id, repaired_restore_runtime });
     } else if (runs_broad_debt and derived_replay_debt) {
         var pass: usize = 0;
         var last_debt_signature = try startupReplayDebtSignature(alloc, db);
         while (pass < max_startup_catch_up_replay_passes) : (pass += 1) {
-            try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .startup_catch_up, db));
+            try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .startup_catch_up, db));
             try runTestBeforeStartupCatchUpReplayHook(db);
             db.catchUpPendingDerivedReplayWithProgress(&progress_ctx, ProgressCtx.run) catch |err| {
                 std.log.warn("managed startup catch-up replay failed table={s} err={}", .{ table_name, err });
@@ -26222,13 +26308,13 @@ fn catchUpManagedDb(
     }
 
     if (mode == .all_debt and !initial_repair_debt) {
-        try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .idle, db));
+        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .idle, db));
         return .{};
     }
 
     if (runs_broad_debt and !restore_repair_needed and needs_dense_artifact_maintenance) {
         progress_ctx.phase = .artifact_rebuild;
-        try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
+        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
         repaired_dense_artifacts = db.runDenseArtifactRebuildMaintenanceWithProgress(alloc, &progress_ctx, ProgressCtx.run) catch |err| {
             std.log.warn("managed startup catch-up dense rebuild failed table={s} err={}", .{ table_name, err });
             return err;
@@ -26254,7 +26340,7 @@ fn catchUpManagedDb(
             };
             try db.core.index_manager.syncAll(true);
         }
-        try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
+        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
     }
 
     if (mode == .all_debt and !initial_repair_debt and !repaired_restore_runtime and !repaired_dense_artifacts) {
@@ -26281,7 +26367,7 @@ fn catchUpManagedDb(
     var repair_summary = try db.indexRepairIntentSummary(alloc);
     if (repair_summary.runnable != 0) {
         progress_ctx.phase = .artifact_rebuild;
-        try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
+        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
         if (!advance_index_repairs) {
             return .{
                 .had_debt = true,
@@ -41464,9 +41550,56 @@ test "runtime status hook orders completed observation without crossing invalida
     ));
 
     // Maintenance preserves the publication fence but does not let that
-    // observational rejection roll back or strand already-durable work.
-    try finishManagedMaintenanceStatusPublication(error.RuntimeStatusPublicationFenced);
-    try std.testing.expectError(error.OutOfMemory, finishManagedMaintenanceStatusPublication(error.OutOfMemory));
+    // observational rejection roll back already-durable work. It must re-arm
+    // the coalesced owner so the superseded catching-up snapshot cannot remain
+    // visible after this maintenance lease retires.
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+            } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const Hook = struct {
+        calls: usize = 0,
+        table_name: ?[]const u8 = null,
+        kind: ?ProvisionedTableWriteSource.LocalChangeKind = null,
+
+        fn onChange(ptr: *anyopaque, table_name: []const u8, kind: ProvisionedTableWriteSource.LocalChangeKind) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.table_name = table_name;
+            self.kind = kind;
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-fenced-maintenance-status", NoCatalog.iface());
+    defer source.deinit();
+    var hook = Hook{};
+    source.setLocalChangeHook(.{ .ptr = &hook, .on_change = Hook.onChange });
+
+    try finishManagedMaintenanceStatusPublication(&source, "docs", error.RuntimeStatusPublicationFenced);
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqualStrings("docs", hook.table_name.?);
+    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.runtime_status, hook.kind.?);
+
+    try finishManagedMaintenanceStatusPublication(&source, "docs", {});
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectError(
+        error.OutOfMemory,
+        finishManagedMaintenanceStatusPublication(&source, "docs", error.OutOfMemory),
+    );
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
 }
 
 test "structural runtime observations publish as one table-epoch batch" {
