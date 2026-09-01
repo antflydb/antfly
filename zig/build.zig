@@ -4621,6 +4621,7 @@ pub fn build(b: *std.Build) void {
         "remote metadata catalog source provides compact routing",
         "remote metadata routing negotiation upgrades the N-1 adapter",
         "data runtime treats metadata leadership churn as retryable bootstrap failure",
+        "data runtime retries incomplete split provisioning projections",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
         "data runtime heartbeat cache cannot regress to an older full report",
         "idle cached runtime status stays fresh only for the published root generation",
